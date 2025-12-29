@@ -95,6 +95,8 @@ class Grok1Config(EasyDeLBaseConfig):
         output_multiplier_scale: float = 1.0,
         initializer_range=0.02,
         rms_norm_eps=1e-5,
+        attention_dropout: float = 0.0,
+        resid_pdrop: float = 0.0,
         use_cache=True,
         pad_token_id=None,
         bos_token_id=1,
@@ -107,6 +109,7 @@ class Grok1Config(EasyDeLBaseConfig):
         rope_theta: float = 10000,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes a Grok1Config object.
@@ -155,6 +158,8 @@ class Grok1Config(EasyDeLBaseConfig):
 
         self.num_key_value_heads = num_key_value_heads
         self.rms_norm_eps = rms_norm_eps
+        self.attention_dropout = attention_dropout
+        self.resid_pdrop = resid_pdrop
         self.use_cache = use_cache
         self.rope_theta = rope_theta
         self.num_experts_per_tok = num_experts_per_tok
@@ -163,6 +168,9 @@ class Grok1Config(EasyDeLBaseConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

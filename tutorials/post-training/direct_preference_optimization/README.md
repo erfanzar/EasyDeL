@@ -206,7 +206,6 @@ def main():
         max_completion_length=max_length - sequence_length, # Max length for the completion.
         max_training_steps=None, # Max number of training steps (None for full dataset).
         max_evaluation_steps=None, # Max number of evaluation steps (None for full test set).
-        max_sequence_length=max_length, # Redundant but for clarity.
         loss_config=ed.LossConfig(z_loss=0.0), # DPO loss configuration, z_loss regularizes logits.
         track_memory=False, # Set to True to track memory usage (can add minor overhead).
         save_steps=1_000, # Save checkpoint every 1000 steps.

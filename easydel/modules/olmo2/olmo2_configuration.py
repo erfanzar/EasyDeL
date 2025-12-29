@@ -129,37 +129,9 @@ class Olmo2Config(EasyDeLBaseConfig):
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
-        """Initializes an Olmo2Config object.
-
-        Args:
-            vocab_size (int, optional): Vocabulary size. Defaults to 50304.
-            hidden_size (int, optional): Hidden size. Defaults to 4096.
-            intermediate_size (int, optional): Intermediate size of the feed-forward network. Defaults to 11008.
-            num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
-            num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
-            num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to `num_attention_heads`.
-            hidden_act (str, optional): Activation function. Defaults to "silu".
-            max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
-            initializer_range (float, optional): Initializer range. Defaults to 0.02.
-            use_cache (bool, optional): Whether to use KV cache. Defaults to True.
-            pad_token_id (int, optional): Padding token ID. Defaults to 1.
-            bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to None.
-            eos_token_id (int, optional): End-of-sequence token ID. Defaults to 50279.
-            tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
-            rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
-            rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
-            attention_bias (bool, optional): Whether to use bias in attention layers. Defaults to False.
-            attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
-            rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-5.
-            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
-                Defaults to EasyDeLGradientCheckPointers.NONE.
-            use_scan_mlp (bool, optional): Whether to use scan for MLP layers. Defaults to False.
-            scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
-            bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
-            **kwargs: Additional keyword arguments.
-        """
         self.gradient_checkpointing = gradient_checkpointing
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
@@ -193,6 +165,9 @@ class Olmo2Config(EasyDeLBaseConfig):
         self.attention_dropout = attention_dropout
 
         self.rms_norm_eps = rms_norm_eps
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
 
     def _rope_scaling_validation(self):
         """
@@ -218,10 +193,31 @@ class Olmo2Config(EasyDeLBaseConfig):
             raise ValueError(f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}")
 
     def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+        """Get the partition rules for distributed training of the OLMo2 model.
+
+        This method defines how model parameters should be partitioned across devices
+        for tensor parallelism. It specifies which dimensions of each parameter should
+        be sharded and which should be replicated.
+
+        Args:
+            *args: Additional positional arguments (unused).
+            **kwargs: Additional keyword arguments (unused).
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            tuple: A tuple of tuples, where each inner tuple contains:
+                - str: Regular expression pattern matching parameter names
+                - PartitionSpec: Specification for how to partition the parameter
+
+        Note:
+            The partition rules follow these patterns:
+            - Token embeddings: Column-wise partitioning for vocabulary parallelism
+            - Query/Key/Value projections: Column-wise partitioning
+            - Output projections: Row-wise partitioning to match column-wise inputs
+            - Q/K normalization: Replicated (small parameters)
+            - Feed-forward layers: Column-wise for gate/up, row-wise for down
+            - All normalization layers: Replicated across devices
+            - LM head: Column-wise for vocabulary parallelism
+            - Classification head: Row-wise for output dimension
         """
         pmag = self.partition_manager
         return (

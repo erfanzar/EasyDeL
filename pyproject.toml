@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "easydel"
-version = "0.1.5.dev22"
+version = "0.2.0"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
 readme = "README.md"
@@ -24,7 +24,6 @@ classifiers = [
 	"Intended Audience :: Developers",
 	"Topic :: Scientific/Engineering :: Artificial Intelligence",
 	"License :: OSI Approved :: Apache Software License",
-	"Programming Language :: Python :: 3.10",
 	"Programming Language :: Python :: 3.11",
 	"Programming Language :: Python :: 3.12",
 	"Programming Language :: Python :: 3.13",
@@ -34,7 +33,7 @@ dependencies = [
 	"jaxlib>=0.8.0",
 	"ray[default]==2.51.0",
 	"eformer==0.0.85",
-	"ejkernel==0.0.24",
+	"ejkernel[triton]==0.0.45",
 	"einops~=0.8.0",
 	"transformers~=4.57.3",
 	"flax==0.11.2",
@@ -47,6 +46,7 @@ dependencies = [
 	"datasets>=3.6.0",
 	"gcsfs>=2024.2,<2026",
 	"zstandard>=0.23.0",
+	"pyyaml>=6.0",
 	"msgspec~=0.19.0",
 	"partial-json-parser>=0.2.1.1.post6",
 	"google-api-python-client>=2.179.0",
@@ -59,7 +59,6 @@ dependencies = [
 "Homepage" = "https://github.com/erfanzar/EasyDeL"
 "Repository" = "https://github.com/erfanzar/EasyDeL"
 "Documentation" = "https://easydel.readthedocs.io/en/latest/"
-
 
 
 [tool.uv.build-backend]
@@ -77,8 +76,13 @@ where = ["."]
 
 [project.optional-dependencies]
 torch = ["torch==2.8.0", "tensorboard>=2.19.0"]
-gpu = ["jax[cuda12]>=0.8.0", "torch==2.8.0", "tensorboard>=2.19.0"]
-tpu = ["jax[tpu]>=0.8.0", "tensorboard>=2.19.0"]
+gpu = [
+	"jax[cuda12]>=0.8.0",
+	"torch==2.8.0",
+	"tensorboard>=2.19.0",
+	"ejkernel[gpu]==0.0.45",
+]
+tpu = ["jax[tpu]>=0.8.0", "tensorboard>=2.19.0", "ejkernel[tpu]==0.0.45"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
 lm_eval = ["lm_eval~=0.4.9.1"]
 profile = [
@@ -98,17 +102,22 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
 ignore = [
-    "F722",  # Forward annotations needed for jaxtyping
-    "B008",  # Do not perform function calls in argument defaults
-    "UP015", # Unnecessary open mode
-    "A005",  # Module-level shadowing
-    "UP037", # Remove quotes from type annotation - needed for jaxtyping string literals
-    "E501",  # Line too long (handled by formatter)
+	"F722",  # Forward annotations needed for jaxtyping
+	"B008",  # Do not perform function calls in argument defaults
+	"UP015", # Unnecessary open mode
+	"A005",  # Module-level shadowing
+	"UP037", # Remove quotes from type annotation - needed for jaxtyping string literals
+	"E501",  # Line too long (handled by formatter)
+	"RUF001", # Ruff's own complexity check - handled by other tools
+	"RUF002", # Ruff's own complexity check - handled by other tools
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401"]
-"**/modeling_*.py" = ["UP037", "F821"]  # Allow quoted type annotations and forward refs in model files
+"**/modeling_*.py" = [
+	"UP037",
+	"F821",
+] # Allow quoted type annotations and forward refs in model files
 
 [tool.mypy]
 python_version = "3.11"
@@ -150,6 +159,11 @@ reportUninitializedInstanceVariable = "none"
 reportIncompatibleVariableOverride = "none"
 reportPrivateImportUsage = "none"
 reportUnusedParameter = "none"
+
+[tool.pytest.ini_options]
+markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.uv]
 conflicts = [

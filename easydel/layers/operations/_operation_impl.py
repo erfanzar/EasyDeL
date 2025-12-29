@@ -64,6 +64,7 @@ from jaxtyping import Bool, Float
 
 from ._base_operation import BaseOperation, OperationRegistry
 from ._operation_meta import OperationMetadata
+from .requirements import ExecutionMode, OperationRequirements
 
 OperationRegistry = OperationRegistry
 
@@ -112,6 +113,42 @@ class OperationImpl(BaseOperation):
                 and context for this attention operation.
         """
         self.metadata = metadata
+
+    def get_instance_requirements(
+        self,
+        mode: ExecutionMode = ExecutionMode.MIXED,
+    ) -> OperationRequirements:
+        """
+        Returns the operation requirements, applying instance-level overrides.
+
+        This method wraps the class-level `get_requirements()` and applies
+        any instance-level overrides from metadata (e.g., `requires_cache`).
+
+        This is the preferred method to call when you need requirements that
+        respect instance configuration, such as when determining cache needs
+        for vision encoders that don't need KV cache.
+
+        Args:
+            mode: The execution mode (prefill, decode, or mixed).
+
+        Returns:
+            OperationRequirements with instance-level overrides applied.
+
+        Example:
+            >>> op = GatedDeltaRuleOp(metadata)
+            >>> # Class default: requires_cache=True
+            >>> class_reqs = op.get_requirements()
+            >>> # Instance override: metadata.requires_cache=False
+            >>> instance_reqs = op.get_instance_requirements()
+        """
+        # Get class-level requirements
+        reqs = self.get_requirements(mode)
+
+        # Apply instance-level requires_cache override from metadata
+        if self.metadata is not None and self.metadata.requires_cache is not None:
+            reqs = reqs.with_requires_cache(self.metadata.requires_cache)
+
+        return reqs
 
     def get_mode(self, query: Float[Array, "batch ... num_heads head_dim"], BTHD: bool = True) -> RUNTIME_MODE_TYPES:  # type:ignore
         """

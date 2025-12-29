@@ -62,8 +62,16 @@ from jax import numpy as jnp
 from jax import random as jr
 from jaxtyping import Array, Float, PRNGKeyArray
 
+from easydel.layers.caching import TransformerCacheView
+
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from ..requirements import (
+    CacheType,
+    ExecutionMode,
+    MetadataField,
+    OperationRequirements,
+)
 
 
 @OperationRegistry.register
@@ -98,6 +106,23 @@ class VanillaAttn(OperationImpl):
             The `OperationMetadata` provided during initialization.
         """
         return self.metadata
+
+    @classmethod
+    def get_requirements(
+        cls,
+        mode: ExecutionMode = ExecutionMode.MIXED,
+    ) -> OperationRequirements:
+        """Returns requirements for VanillaAttn.
+
+        Vanilla attention requires basic metadata and uses TransformerCacheView
+        for KV-cache management.
+        """
+        return OperationRequirements.create(
+            name="vanilla",
+            required_metadata=MetadataField.basic(),
+            supported_cache=CacheType.TRANSFORMER | CacheType.HYBRID,
+            cache_view_class=TransformerCacheView,
+        )
 
     @jax.named_scope("easydel-vanillaimpl-native-xla")
     def forward_native(
@@ -164,12 +189,19 @@ class VanillaAttn(OperationImpl):
             else:
                 bias = None
 
-            # Compute attention
             runtime_dtype: jnp.dtype = self.metadata.runtime_dtype
             softmax_dtype: jnp.dtype | None = self.metadata.runtime_softmax_dtype
             is_decode_mode: bool = model_mode == common_types.MODE_DECODE
             causal_computed: bool = causal if not is_decode_mode else False
-            outputs, weights = attention(
+            if mask_info is not None:
+                attention_mask = mask_info.attention_mask
+                if attention_mask is not None and attention_mask.ndim == 4:
+                    q_len = query.shape[1]
+                    kv_len = key.shape[1]
+                    if attention_mask.shape[-2] != q_len or attention_mask.shape[-1] != kv_len:
+                        attention_mask = attention_mask[..., :q_len, :kv_len]
+                        mask_info = MaskInfo(_attention_mask=attention_mask)
+            attn_result = attention(
                 query,
                 key,
                 value,
@@ -187,6 +219,10 @@ class VanillaAttn(OperationImpl):
                 causal=causal_computed,
                 logits_soft_cap=logits_soft_cap,
             )
+            if isinstance(attn_result, tuple):
+                outputs, weights = attn_result
+            else:
+                outputs, weights = attn_result, None
 
             # Apply output sharding
             outputs_sharded = with_sharding_constraint(arr=outputs, sharding=shardings.output)

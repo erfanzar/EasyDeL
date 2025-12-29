@@ -73,7 +73,7 @@ class DistillationTrainer(Trainer):
         ...     processing_class=tokenizer
         ... )
         >>> trainer.train()
-    """  # noqa
+    """
 
     teacher_state: EasyDeLState
     arguments: DistillationConfig  # type hinting

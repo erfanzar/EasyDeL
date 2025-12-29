@@ -218,6 +218,7 @@ class MptConfig(EasyDeLBaseConfig):
         use_norm_bias: bool = False,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes an MptConfig object.
@@ -286,6 +287,9 @@ class MptConfig(EasyDeLBaseConfig):
         self.bits = bits
         self.layer_norm_epsilon = layer_norm_epsilon
         self.from_pt = False
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.n_layers
 
         super().__init__(bits=bits, **kwargs)
 

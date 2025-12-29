@@ -140,7 +140,7 @@ def main():
     arguments = ed.SFTConfig(
         num_train_epochs=1,
         total_batch_size=total_batch_size,
-        max_sequence_length=max_length,
+        max_length=max_length,
         learning_rate=1e-5, # LoRA can sometimes use a higher LR, e.g., 1e-4
         use_wandb=WANDB_ENTITY is not None,
         wandb_entity=WANDB_ENTITY,

@@ -20,7 +20,7 @@ Examples include Qwen3Next which alternates between full attention
 layers (using KV cache) and linear attention layers (using recurrent state).
 
 Key Components:
-    - HybridCacheMetaData: Configuration for hybrid cache dimensions
+    - HybridCacheConfig: Configuration for hybrid cache dimensions
     - HybridCacheView: Per-layer cache supporting both KV and recurrent state
     - HybridCache: Multi-layer hybrid cache orchestration
     - HybridMetadata: Runtime metadata for hybrid cache operations
@@ -32,7 +32,7 @@ Features:
     - Functional cache updates for JAX compatibility
 
 Example:
-    >>> metadata = HybridCacheMetaData.create(
+    >>> metadata = HybridCacheConfig.create(
     ...     num_hidden_layers=48,
     ...     partition_axis=partition_axis,
     ...     batch_size=2,
@@ -54,18 +54,22 @@ from .cache import (
     FULL_ATTENTION,
     KDA_LINEAR_ATTENTION,
     LINEAR_ATTENTION,
+    PARALLEL_HYBRID,
     HybridCache,
-    HybridCacheMetaData,
+    HybridCacheConfig,
     HybridCacheView,
     HybridMetadata,
+    ParallelHybridCacheView,
 )
 
 __all__ = (
     "FULL_ATTENTION",
     "KDA_LINEAR_ATTENTION",
     "LINEAR_ATTENTION",
+    "PARALLEL_HYBRID",
     "HybridCache",
-    "HybridCacheMetaData",
+    "HybridCacheConfig",
     "HybridCacheView",
     "HybridMetadata",
+    "ParallelHybridCacheView",
 )

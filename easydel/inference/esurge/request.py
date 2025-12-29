@@ -129,6 +129,8 @@ class EngineRequest:
         self.stop_reason: int | str | None = None
 
         self.kv_transfer_params: dict[str, Any] | None = None
+        self.structured_output_request = getattr(sampling_params, "guided_decoding", None) if sampling_params else None
+        self.use_structured_output = self.structured_output_request is not None
 
         if sampling_params is not None:
             assert sampling_params.max_tokens is not None
@@ -162,11 +164,7 @@ class EngineRequest:
     @property
     def has_vision(self) -> bool:
         """Check if request has vision data (images or videos)."""
-        return (
-            self.pixel_values is not None
-            or self.pixel_values_videos is not None
-            or len(self.mm_features) > 0
-        )
+        return self.pixel_values is not None or self.pixel_values_videos is not None or len(self.mm_features) > 0
 
     def clear_vision_data(self) -> None:
         """Clear raw vision data after prefill to free memory.

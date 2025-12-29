@@ -32,7 +32,6 @@
 
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -50,6 +49,8 @@ from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -168,19 +169,19 @@ class OPTAttention(AttentionModule):
         mask_info: MaskInfo | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-        key_value_states: chex.Array | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        key_value_states: Array | None = None,
         output_attentions: bool = False,
     ) -> AttentionLayerOutput:
         """Forward pass of the OPTAttention module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states. Shape: (batch_size, sequence_length, embed_dim).
+            hidden_states (Array): Input hidden states. Shape: (batch_size, sequence_length, embed_dim).
             mask_info (MaskInfo | None): Mask information for attention.
             mode (common_types.RUNTIME_MODE_TYPES): Runtime mode (train/eval/infer).
             cache_view (TransformerCacheView | RaggedPagesCacheView | None): Cache view for attention KVs.
             cache_metadata (TransformerMetadata | RaggedPagesMetadata | None): Metadata for paged attention.
-            key_value_states (chex.Array | None): Optional hidden states for cross-attention. If provided,
+            key_value_states (Array | None): Optional hidden states for cross-attention. If provided,
                 these are used as keys and values. Shape: (batch_size, key_sequence_length, embed_dim).
             output_attentions (bool): Whether to return attention weights.
 
@@ -272,6 +273,15 @@ class OPTDecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize OPT decoder layer.
+
+        Args:
+            config: OPTConfig containing model hyperparameters.
+            dtype: Data type for computations (default: jnp.bfloat16).
+            param_dtype: Data type for parameters (default: jnp.bfloat16).
+            precision: JAX precision setting for matrix operations (default: None).
+            rngs: Flax NNX random number generators.
+        """
         super().__init__()
 
         self.config = config
@@ -333,23 +343,28 @@ class OPTDecoderLayer(nn.Module):
         mask_info: MaskInfo | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
     ) -> DecoderLayerOutput:
         """Forward pass of the OPTDecoderLayer.
 
+        Applies pre-norm or post-norm architecture based on config.do_layer_norm_before:
+        - Pre-norm (default): LayerNorm -> Attention -> Residual, LayerNorm -> FFN -> Residual
+        - Post-norm: Attention -> Residual -> LayerNorm, FFN -> Residual -> LayerNorm
+
         Args:
-            hidden_states (chex.Array): Input hidden states. Shape: (batch_size, sequence_length, embed_dim).
-            causal_mask (tp.Optional[chex.Array]): Causal mask for self-attention.
-                Shape: (1, 1, query_len, key_len) or inferred.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
+            hidden_states: Input hidden states with shape (batch_size, sequence_length, hidden_size).
+            mask_info: Masking information containing attention masks and positions.
+            mode: Runtime mode (train/decode/prefill) for cache handling.
+            cache_view: Optional cache view for key/value states in decoder inference.
+            cache_metadata: Optional metadata for cache handling.
+            output_attentions: Whether to return attention weights (default: False).
 
         Returns:
-            tp.Tuple[chex.Array]: A tuple containing the output hidden states
-                (shape: batch_size, sequence_length, embed_dim)
-                and the attention weights (shape: batch_size, num_heads, sequence_length, key_sequence_length).
-                Attention weights are returned only if `output_attentions` is True in the base attention module.
+            DecoderLayerOutput containing:
+                - hidden_states: Output hidden states with shape (batch_size, sequence_length, hidden_size).
+                - attention_weight: Optional attention weights if output_attentions=True.
+                - cache_view: Updated cache view if cache is used.
         """
         residual = hidden_states
 
@@ -469,7 +484,7 @@ class OPTLearnedPositionalEmbedding(nn.Module):
                 key=rngs.params(),
             )
 
-    def __call__(self, inputs: chex.Array) -> chex.Array:
+    def __call__(self, inputs: Array) -> Array:
         """Apply learned positional embeddings with offset.
 
         Args:
@@ -552,14 +567,16 @@ class OPTDecoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_positions = OPTLearnedPositionalEmbedding(
-            self.config.max_position_embeddings,
+        self.position_offset = offset
+        # Use `nn.Embed` directly so HF -> EasyDeL conversion treats this as an embedding
+        # (no weight transpose) and maps `*.weight` -> `*.embedding`.
+        self.embed_positions = nn.Embed(
+            self.config.max_position_embeddings + offset,
             embed_dim,
             embedding_init=nn.initializers.normal(config.init_std),
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
-            offset=offset,
         )
 
         if self.config.word_embed_proj_dim != self.config.hidden_size:
@@ -615,8 +632,8 @@ class OPTDecoder(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -624,10 +641,10 @@ class OPTDecoder(EasyDeLBaseModule):
         """Forward pass of the OPTDecoder.
 
         Args:
-            input_ids (chex.Array): Input token IDs. Shape: (batch_size, sequence_length).
-            attention_mask (tp.Optional[chex.Array]): Mask to prevent attention to padding tokens.
+            input_ids (Array): Input token IDs. Shape: (batch_size, sequence_length).
+            attention_mask (tp.Optional[Array]): Mask to prevent attention to padding tokens.
                 Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+            position_ids (tp.Optional[Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
             past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
                 Precomputed key/value states for attention.
@@ -658,10 +675,11 @@ class OPTDecoder(EasyDeLBaseModule):
         )
 
         if position_ids is None:
-            position_ids_full = jnp.clip(jnp.cumsum(mask_info.q_segment_ids, axis=-1) - 1, min=0)
-            position_ids = position_ids_full[:, :sequence_length].astype(jnp.int32)
+            # OPT uses absolute (learned) positional embeddings. `MaskInfo` already
+            # provides per-token positions via `q_position_ids`.
+            position_ids = jnp.clip(mask_info.q_position_ids[:, :sequence_length], min=0).astype(jnp.int32)
 
-        positions = self.embed_positions(position_ids)
+        positions = self.embed_positions((position_ids + self.position_offset).astype("i4"))
         hidden_states = inputs_embeds + positions
 
         if mode is None:
@@ -765,8 +783,8 @@ class OPTModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -774,10 +792,10 @@ class OPTModel(EasyDeLBaseModule):
         """Forward pass of the OPTModel.
 
         Args:
-            input_ids (chex.Array): Input token IDs. Shape: (batch_size, sequence_length).
-            attention_mask (tp.Optional[chex.Array]): Mask to prevent attention to padding tokens.
+            input_ids (Array): Input token IDs. Shape: (batch_size, sequence_length).
+            attention_mask (tp.Optional[Array]): Mask to prevent attention to padding tokens.
                 Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+            position_ids (tp.Optional[Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
             past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
                 Precomputed key/value states for attention.
@@ -873,11 +891,10 @@ class OPTForCausalLM(BaseCausalLMModule[OPTModel, OPTConfig]):
         )
 
     def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Apply LM head with OPT's special tie_word_embeddings handling."""
+        """Apply LM head, supporting tied embeddings without mutating params."""
         if self.config.tie_word_embeddings:
-            # OPT's unique approach: tie at forward pass time
             shared_kernel = self.base_model.decoder.embed_tokens.embedding.value.T
-            self.lm_head.kernel.value = shared_kernel
+            return self.lm_head(hidden_states, w=shared_kernel)
         return self.lm_head(hidden_states)
 
     def prepare_inputs_for_generation(

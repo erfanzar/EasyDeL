@@ -176,7 +176,7 @@ def main():
         use_wandb=WANDB_ENTITY is not None,
         wandb_entity=WANDB_ENTITY,
         do_last_save=True,
-        max_sequence_length=max_length,
+        max_length=max_length,
         learning_rate=1e-5,
         learning_rate_end=7e-6,
         optimizer=ed.EasyDeLOptimizers.ADAMW,
@@ -266,7 +266,7 @@ if __name__ == "__main__":
     )
     ```
 
-* **`packing=True` for Efficiency:** If your dataset contains many short examples (e.g., single-turn Q&A), setting `packing=True` in `SFTConfig` can significantly speed up training. It works by concatenating multiple short examples into a single sequence of `max_sequence_length`, separated by an EOS token. This ensures the model is always processing full-length sequences, maximizing TPU utilization.
+* **`packing=True` for Efficiency:** If your dataset contains many short examples (e.g., single-turn Q&A), setting `packing=True` in `SFTConfig` can significantly speed up training. It works by concatenating multiple short examples into a single sequence of `max_length`, separated by an EOS token. This ensures the model is always processing full-length sequences, maximizing TPU utilization.
 * **Evaluation Dataset:** For a more meaningful evaluation of how your model is learning to generalize, you should always use a separate validation or test split.
 
     ```python

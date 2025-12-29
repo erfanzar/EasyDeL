@@ -27,7 +27,7 @@ from easydel.workers.esurge.auth import (
     RateLimitExceeded,
 )
 
-from .api_server import ErrorResponse, ServerMetrics, ServerStatus, create_error_response, eSurgeAdapter, eSurgeApiServer
+from .api_server import ServerStatus, create_error_response, eSurgeAdapter, eSurgeApiServer
 from .auth_endpoints import AuthEndpointsMixin, CreateApiKeyRequest, UpdateApiKeyRequest
 
 __all__ = (
@@ -39,13 +39,11 @@ __all__ = (
     "AuthStorage",
     "CreateApiKeyRequest",
     "EnhancedApiKeyManager",
-    "ErrorResponse",
     "PermissionDenied",
     "QuotaConfig",
     "QuotaExceeded",
     "RateLimitConfig",
     "RateLimitExceeded",
-    "ServerMetrics",
     "ServerStatus",
     "ToolParserWorkerClient",
     "ToolParserWorkerManager",

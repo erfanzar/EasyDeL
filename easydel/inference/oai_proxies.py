@@ -46,6 +46,7 @@ Example:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import typing as tp
@@ -58,7 +59,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .openai_api_modules import ChatCompletionRequest, CompletionRequest
+from .openai_api_modules import ChatCompletionRequest, CompletionRequest, ResponsesRequest
 
 if tp.TYPE_CHECKING:
     from pydantic import BaseModel
@@ -184,6 +185,13 @@ class InferenceApiRouter:
     def _endpoints(self) -> list[EndpointConfig]:
         """Define all API endpoints matching EasyDeL API servers."""
         return [
+            EndpointConfig(
+                path="/v1/responses",
+                handler=self.responses,
+                methods=["POST"],
+                tags=["Responses"],
+                summary="Create a response (new OpenAI Responses API)",
+            ),
             EndpointConfig(
                 path="/v1/chat/completions",
                 handler=self.chat_completions,
@@ -367,6 +375,62 @@ class InferenceApiRouter:
             Tuple of (processed_params, optional_metadata)
         """
         return openai_params, None
+
+    async def responses(self, request: ResponsesRequest, raw_request: Request) -> tp.Any:
+        """Handle OpenAI Responses API requests.
+
+        This proxies `POST /v1/responses` to the configured backend using the
+        official OpenAI client, enabling clients that use `client.responses.*`
+        to work with either OpenAI or an OpenAI-compatible EasyDeL server.
+        """
+        request_id = raw_request.headers.get("X-Request-ID")
+
+        try:
+            self.metrics.total_requests += 1
+            params = request.model_dump(exclude_none=True)
+            if not bool(params.get("stream", False)):
+                response = await self.client.responses.create(**params)
+                self.metrics.successful_requests += 1
+                return response
+
+            async def stream_events() -> tp.AsyncGenerator[bytes, None]:
+                try:
+                    stream = await self.client.responses.create(**params)
+                    async for event in stream:
+                        event_type = getattr(event, "type", None) or getattr(event, "event", None)
+                        if hasattr(event, "model_dump_json"):
+                            data = event.model_dump_json(exclude_unset=True)
+                        else:
+                            data = json.dumps(event)
+                        if event_type:
+                            yield f"event: {event_type}\ndata: {data}\n\n".encode()
+                        else:
+                            yield f"data: {data}\n\n".encode()
+                    self.metrics.successful_requests += 1
+                except Exception as e:
+                    self.metrics.failed_requests += 1
+                    error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
+                    yield f"data: {error_response.body.decode()}\n\n".encode()
+
+            return StreamingResponse(
+                stream_events(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Request-ID": request_id or "",
+                },
+            )
+
+        except self.openai_module.APIError as e:
+            self.metrics.failed_requests += 1
+            raise HTTPException(status_code=e.status_code, detail=str(e)) from e
+        except HTTPException:
+            self.metrics.failed_requests += 1
+            raise
+        except Exception as e:
+            self.metrics.failed_requests += 1
+            return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
 
     async def chat_completions(self, request: ChatCompletionRequest) -> tp.Any:
         """

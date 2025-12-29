@@ -16,7 +16,6 @@
 import functools
 from typing import ClassVar
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -41,11 +40,13 @@ from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
     TransformerCache,
-    TransformerCacheMetaData,
+    TransformerCacheConfig,
     TransformerCacheView,
     TransformerMetadata,
 )
@@ -379,9 +380,9 @@ class Xerxes2MoeMLPStack(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        group_sizes: chex.Array,
-        sorted_experts: chex.Array | None = None,
-    ) -> chex.Array:
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
         """Forward pass through MoE MLP."""
         return checkpoint_name(
             self.down_proj(
@@ -461,16 +462,16 @@ class Xerxes2MoeSparseBlock(BaseMoeModule):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Forward pass of the Sparse MoE block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states (batch_size * sequence_length, hidden_dim).
+            hidden_states (Array): Input hidden states (batch_size * sequence_length, hidden_dim).
 
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing:
-                - final_hidden_states (chex.Array): The output hidden states after MoE processing.
-                - router_logits (chex.Array): The logits output by the gating network.
+            tp.Tuple[Array, Array]: A tuple containing:
+                - final_hidden_states (Array): The output hidden states after MoE processing.
+                - router_logits (Array): The logits output by the gating network.
         """
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
@@ -555,10 +556,10 @@ class Xerxes2DecoderLayer(nn.Module):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
-        frequencies: tuple[chex.Array, chex.Array],
+        frequencies: tuple[Array, Array],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
     ):
@@ -566,10 +567,10 @@ class Xerxes2DecoderLayer(nn.Module):
         Forward pass of the module block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
         """
         residual = hidden_states
 
@@ -681,8 +682,8 @@ class Xerxes2Model(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -847,8 +848,8 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -858,10 +859,10 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):
         Forward pass of the causal language model.
 
         Args:
-            input_ids (Optional[chex.Array], optional): Token IDs to process. Defaults to None.
-            inputs_embeds (Optional[chex.Array], optional): Pre-computed input embeddings. Defaults to None.
-            attention_mask (Optional[chex.Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
-            position_ids (Optional[chex.Array], optional): Position IDs. Defaults to None.
+            input_ids (Optional[Array], optional): Token IDs to process. Defaults to None.
+            inputs_embeds (Optional[Array], optional): Pre-computed input embeddings. Defaults to None.
+            attention_mask (Optional[Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
+            position_ids (Optional[Array], optional): Position IDs. Defaults to None.
             mode (Optional[common_types.RUNTIME_MODE_TYPES], optional): Runtime mode. Defaults to None.
             past_key_values (Optional[TransformerCache | RaggedPagesCache], optional): Cached key/values.
                 Defaults to None.
@@ -905,55 +906,18 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):
 
         return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
-    def create_cache_metadata(
-        self,
-        batch_size: int,
-        max_length: int,
-        pad_token_id: int | None = None,
-    ):
-        if pad_token_id is None:
-            if hasattr(self, "generation_config"):
-                pad_token_id = self.generation_config.pad_token_id
-            elif hasattr(self.config, "pad_token_id"):
-                pad_token_id = self.config.pad_token_id
-            else:
-                pad_token_id = 0
+    def create_transformer_cache_config(self, batch_size: int, max_length: int):
         head_dim = getattr(self.config, "head_dim", None)
         if head_dim is None:
             head_dim = self.config.hidden_size // self.config.num_attention_heads
         num_key_value_heads = getattr(self.config, "num_key_value_heads", None)
         if num_key_value_heads is None:
             num_key_value_heads = self.config.num_attention_heads
-        return TransformerCacheMetaData.create(
+        return TransformerCacheConfig.create(
             num_hidden_layers=self.config.num_hidden_layers,
             batch_size=batch_size,
             sequence_length=max_length,
-            num_heads=1,
+            num_heads=self.config.num_attention_heads,
             key_dim=self.config.qk_rope_head_dim + self.config.qk_nope_head_dim,
             value_dim=self.config.vhead_dim,
-        )
-
-    def init_cache(
-        self,
-        batch_size: int,
-        max_length: int,
-        starts: int | None = None,
-        shardings: dict | None = None,
-        pad_token_id: int | None = None,
-    ):
-        shardings = shardings or dict()
-        return TransformerCache.init_cache(
-            dtype=self.config.kvdtype,
-            partition_manager=self.config.partition_manager,
-            metadata=self.create_cache_metadata(
-                batch_size=batch_size,
-                max_length=max_length,
-                pad_token_id=pad_token_id,
-            ),
-            quantizer=self._quant_class(
-                quantization_config=self.config.kv_cache_quantization_config,
-            ),
-            mesh=self.config.mesh,
-            starts=starts,
-            mask_type_details=self.config.get_mask_details(),
         )

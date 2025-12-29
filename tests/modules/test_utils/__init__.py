@@ -46,13 +46,30 @@ from .task_testers import (
 )
 
 __all__ = [
+    # Task testers
+    "BaseModuleTester",
+    "BaseTester",
+    "CausalLMTester",
     # Comparators
     "ComparisonResult",
+    "EasyDeLOnlyTester",
+    "Seq2SeqTester",
+    "SequenceClassificationTester",
+    "TestResult",
+    "VisionLanguageTester",
+    # Model factory
+    "cleanup_models",
     "compare_hidden_states",
     "compare_logits",
     "compare_loss",
     "compare_outputs",
-    "print_comparison_result",
+    "create_base_config",
+    "create_ed_model",
+    "create_ed_model_only",
+    "create_hf_model",
+    "create_model_pair",
+    "get_hf_model_from_hub",
+    "get_module_classes",
     # Input generators
     "make_audio_inputs",
     "make_classification_inputs",
@@ -62,24 +79,7 @@ __all__ = [
     "make_seq2seq_inputs",
     "make_text_inputs",
     "make_vlm_inputs",
-    # Model factory
-    "cleanup_models",
-    "create_base_config",
-    "create_ed_model",
-    "create_ed_model_only",
-    "create_hf_model",
-    "create_model_pair",
-    "get_hf_model_from_hub",
-    "get_module_classes",
+    "print_comparison_result",
     "setup_config",
     "transfer_weights",
-    # Task testers
-    "BaseModuleTester",
-    "BaseTester",
-    "CausalLMTester",
-    "EasyDeLOnlyTester",
-    "Seq2SeqTester",
-    "SequenceClassificationTester",
-    "TestResult",
-    "VisionLanguageTester",
 ]

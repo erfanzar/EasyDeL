@@ -21,11 +21,13 @@ system, providing type safety and documentation for configuration schemas.
 
 from __future__ import annotations
 
+import os
 import typing as tp
 from typing import Any, Literal, NotRequired, Required, TypedDict
 
 import jax
 from eformer.escale import PartitionAxis
+from eformer.paths import ePathLike
 from jax import numpy as jnp
 
 from easydel.infra.base_config import EasyDeLBaseConfigDict
@@ -43,7 +45,18 @@ if tp.TYPE_CHECKING:
 DTypeLike = tp.Union[str, jnp.dtype, type, tp.Literal["fp8", "bf16", "fp16", "fp32"]]  # noqa
 PrecisionLike = tp.Union[str, jax.lax.Precision, None, tp.Literal["HIGH", "DEFAULT", "HIGHEST"]]  # noqa
 PartitionRules = tuple[tuple[str, Any], ...]
-DatasetTypeLike = tp.Literal["json", "jsonl", "parquet", "csv", "arrow", "huggingface", "tsv", "txt"]
+DatasetTypeLike = tp.Literal[
+    "json",
+    "jsonl",
+    "parquet",
+    "csv",
+    "arrow",
+    "huggingface",
+    "hf",
+    "tsv",
+    "txt",
+    "text",
+]
 
 # Operation config type aliases - must match registered names in OperationRegistry
 OperationImplName = tp.Literal[
@@ -146,6 +159,7 @@ class LoaderCfg(TypedDict, total=False):
     precision: NotRequired[PrecisionLike]
     verbose: NotRequired[bool]
     from_torch: NotRequired[bool | None]
+    trust_remote_code: NotRequired[bool]
 
 
 class ShardingCfg(TypedDict, total=False):
@@ -251,7 +265,12 @@ class eSurgeCfg(TypedDict, total=False):
     Attributes:
         max_model_len: Maximum sequence length for the model.
         min_input_pad: Minimum padding for input sequences (default: 16).
+        min_token_pad: Optional minimum token bucket size for compilation. When set
+            below `min_input_pad`, decode steps can use smaller token buckets (e.g.
+            `tok=1/b1`), at the cost of more compilation variants.
         max_num_seqs: Maximum number of concurrent sequences (default: 256).
+        max_num_seq_buckets: Optional explicit request-capacity buckets used for
+            compilation (e.g., [8, 16, 32]).
         max_num_batched_tokens: Optional cap on total tokens per batch.
         hbm_utilization: HBM memory utilization ratio (default: 0.85).
         page_size: Page size for paged attention (default: 128).
@@ -283,7 +302,9 @@ class eSurgeCfg(TypedDict, total=False):
 
     max_model_len: NotRequired[int]
     min_input_pad: NotRequired[int]
+    min_token_pad: NotRequired[int | None]
     max_num_seqs: NotRequired[int]
+    max_num_seq_buckets: NotRequired[tp.Sequence[int] | None]
     max_num_batched_tokens: NotRequired[int | None]
     hbm_utilization: NotRequired[float]
     page_size: NotRequired[int]
@@ -328,15 +349,16 @@ class TextDatasetInformCfg(TypedDict, total=False):
         format_fields: Optional mapping for renaming fields {'old_name': 'new_name'}
     """
 
-    type: NotRequired[DatasetTypeLike | str]
-    data_files: Required[str | list[str]]
+    type: NotRequired[DatasetTypeLike | str | None]
+    data_files: NotRequired[str | os.PathLike | list[str | os.PathLike] | None]
     dataset_split_name: NotRequired[str | None]
     split: NotRequired[str]
     content_field: NotRequired[str]
-    additional_fields: NotRequired[list[str]]
+    additional_fields: NotRequired[list[str] | None]
     num_rows: NotRequired[int | None]
-    format_callback: NotRequired[tp.Callable[[dict], dict] | None]
+    format_callback: NotRequired[tp.Callable[[dict[str, Any]], dict[str, Any]] | None]
     format_fields: NotRequired[dict[str, str] | None]
+    preprocessing_fn: NotRequired[tp.Callable[[dict[str, Any]], dict[str, Any]] | None]
 
 
 class VisualDatasetInformCfg(TypedDict, total=False):
@@ -355,16 +377,17 @@ class VisualDatasetInformCfg(TypedDict, total=False):
         format_fields: Optional mapping for renaming fields {'old_name': 'new_name'}
     """
 
-    type: NotRequired[DatasetTypeLike | str]
-    data_files: Required[str | list[str]]
+    type: NotRequired[DatasetTypeLike | str | None]
+    data_files: NotRequired[str | os.PathLike | list[str | os.PathLike] | None]
     dataset_split_name: NotRequired[str | None]
     split: NotRequired[str]
     pixel_field: NotRequired[str]
     content_field: NotRequired[str | None]
     image_size: NotRequired[tuple[int, int] | None]
     num_rows: NotRequired[int | None]
-    format_callback: NotRequired[tp.Callable[[dict], dict] | None]
+    format_callback: NotRequired[tp.Callable[[dict[str, Any]], dict[str, Any]] | None]
     format_fields: NotRequired[dict[str, str] | None]
+    preprocessing_fn: NotRequired[tp.Callable[[dict[str, Any]], dict[str, Any]] | None]
 
 
 class TokenizationCfg(TypedDict, total=False):
@@ -429,58 +452,11 @@ class DatasetSaveCfg(TypedDict, total=False):
     hub_token: NotRequired[str | None]
 
 
-class DataMixtureCfg(TypedDict, total=False):
-    """Data mixture configuration for training/evaluation datasets.
-
-    Attributes:
-        informs: List of dataset configurations (text or visual)
-        cache_dir: Directory for caching datasets (default: ~/.cache/easydel)
-        streaming: Whether to use streaming mode for large datasets (default: True)
-        text_target_field: Target field name for text in unified dataset (default: "text")
-        image_target_field: Target field name for images in unified dataset (default: "image")
-        batch_size: Batch size for data loading (default: 1)
-        shuffle_buffer_size: Buffer size for shuffling in streaming mode (default: None)
-        seed: Random seed for shuffling and sampling (default: 42)
-
-        # Token packing configuration
-        pack_tokens: Enable pre-tokenized sequence packing (default: False)
-        tokens_field_name: Field name containing token IDs (default: "tokens")
-        pack_seq_length: Target sequence length for packing (default: None)
-        pack_eos_token_id: EOS token ID for padding/separation (default: 0)
-        pack_shuffle: Shuffle packed sequences (default: True)
-        pack_shuffle_buffer_factor: Buffer size multiplier for shuffle (default: 16)
-        dask_storage_options: Storage options for dask/remote files (default: None)
-
-        # On-the-fly tokenization and packing
-        pack_on_the_fly: Enable on-the-fly tokenization and packing (default: False)
-        tokenize_callback: Function to tokenize examples, returns token IDs (default: None)
-
-        # Block-deterministic mixture configuration
-        block_mixture: Use deterministic block mixing instead of standard interleave (default: True)
-        mixture_block_size: Number of examples per block (default: 2048)
-        stop_strategy: Strategy when dataset exhausted - "restart" or "first_exhausted" (default: "restart")
-        mixture_weights: Per-dataset weights as dict mapping dataset identifier to weight (default: None)
-
-        # Tokenization configuration
-        tokenization: Configuration for tokenizing the dataset (default: None)
-
-        # Save configuration
-        save: Configuration for saving the processed dataset (default: None)
-
-        # ShardedDataSource configuration (new data pipeline)
-        use_sharded_source: Use new ShardedDataSource architecture (default: False)
-            When True, builds a ShardedDataSource instead of HF Dataset for more
-            efficient streaming and lazy transforms.
-
-        # Legacy/deprecated attributes (kept for compatibility)
-        use_fast_loader: Enable fast data loading with fsspec (deprecated)
-        num_workers: Number of parallel workers for data loading (deprecated)
-        prefetch_size: Number of batches to prefetch (deprecated)
-        enable_caching: Enable dataset caching for faster reloads (deprecated)
-    """
+class DatasetMixtureCfg(TypedDict, total=False):
+    """`easydel.data.DatasetMixture`-compatible configuration."""
 
     informs: Required[list[TextDatasetInformCfg | VisualDatasetInformCfg]]
-    cache_dir: NotRequired[str]
+    cache_dir: NotRequired[str | ePathLike]
     streaming: NotRequired[bool]
     text_target_field: NotRequired[str]
     image_target_field: NotRequired[str]
@@ -495,17 +471,31 @@ class DataMixtureCfg(TypedDict, total=False):
     pack_eos_token_id: NotRequired[int]
     pack_shuffle: NotRequired[bool]
     pack_shuffle_buffer_factor: NotRequired[int]
-    dask_storage_options: NotRequired[dict | None]
+    dask_storage_options: NotRequired[dict[str, Any] | None]
 
     # On-the-fly tokenization and packing
     pack_on_the_fly: NotRequired[bool]
-    tokenize_callback: NotRequired[tp.Callable[[dict], list[int]] | None]
+    tokenize_callback: NotRequired[tp.Callable[[dict[str, Any]], list[int]] | None]
+
+    # Prefetch configuration
+    prefetch_workers: NotRequired[int]
+    prefetch_buffer_size: NotRequired[int]
+
+    # Cloud storage options
+    cloud_max_retries: NotRequired[int]
+    cloud_retry_delay: NotRequired[float]
+    cache_remote_files: NotRequired[bool]
+    cache_expiry_seconds: NotRequired[int]
 
     # Block-deterministic mixture configuration
     block_mixture: NotRequired[bool]
     mixture_block_size: NotRequired[int]
     stop_strategy: NotRequired[str]
     mixture_weights: NotRequired[dict[str, float] | None]
+
+
+class DataMixtureCfg(DatasetMixtureCfg, total=False):
+    """Dataset mixture config with EasyDeL extras (tokenization/saving/sharded source)."""
 
     # Tokenization configuration
     tokenization: NotRequired[TokenizationCfg | None]

@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -23,7 +21,7 @@ from ..training_configurations import TrainingArguments
 
 
 @Registry.register("trainer-arguments", "orpo")
-@auto_pytree
+@dataclass
 class ORPOConfig(TrainingArguments):
     """Configuration class for Odds Ratio Preference Optimization training.
 
@@ -64,8 +62,6 @@ class ORPOConfig(TrainingArguments):
             initialization.
         dataset_num_proc (int | None): Number of processes for parallel dataset
             preprocessing. None uses sequential processing.
-        max_sequence_length (int): Computed attribute for maximum sequence length
-            used in training (2 * max_length for concatenated chosen/rejected).
 
     Example:
         >>> config = ORPOConfig(
@@ -132,27 +128,25 @@ class ORPOConfig(TrainingArguments):
         metadata={"help": "Number of processes to use for dataset processing."},
     )
 
-    def __post_init__(self):
+    def __post_init__(self, max_sequence_length: int | None):
         """
         Post-initialization processing.
 
         This method is automatically called after the dataclass __init__ method.
         It sets the 'max_completion_length' if it is not provided by subtracting the
-        'max_prompt_length' from 'max_length'. It also defines 'max_sequence_length'
-        (here set to twice the max_length, based on a chosen/rejected policy).
+        'max_prompt_length' from 'max_length'.
 
         Returns:
             The result of the superclass __post_init__ method.
         """
         # If max_completion_length is not provided, derive it from max_length and max_prompt_length.
-        if self.max_completion_length is None:
-            self.max_completion_length = self.max_length - self.max_prompt_length
+        self._handle_deprecated_max_sequence_length(max_sequence_length)
 
-        # Set max_sequence_length based on a chosen policy.
-        self.max_sequence_length = self.max_length * 2  # Chosen - Rejected
+        if self.max_completion_length is None and self.max_length is not None and self.max_prompt_length is not None:
+            self.max_completion_length = self.max_length - self.max_prompt_length
 
         # Call the post_init of the parent class if it exists.
         if hasattr(super(), "__post_init__"):
-            super().__post_init__()
+            super().__post_init__(max_sequence_length=None)
 
     __hash__ = hash_fn

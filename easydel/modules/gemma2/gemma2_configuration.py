@@ -117,11 +117,6 @@ class Gemma2Config(EasyDeLBaseConfig):
         attn_logit_softcapping: bool | None = None,
         **kwargs,
     ):
-        """The __init__ function is called when the class is instantiated.
-        It sets up the attributes of an object, which are sometimes called fields or properties.
-        The __init__ function can accept arguments, but self must be the first one.
-        """
-
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
         self.scan_layers = scan_layers

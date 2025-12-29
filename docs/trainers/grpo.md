@@ -113,42 +113,9 @@ trainer.train()
 
 ## Command Line Training
 
-You can run GRPO training directly from the command line for math problem solving:
+The legacy `easydel.scripts.finetune.*` entrypoints have been removed.
 
-```bash
-python -m easydel.scripts.finetune.gsm8k_grpo \
-  --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --attn_mechanism vanilla \
-  --max_prompt_length 2048 \
-  --max_completion_length 1024 \
-  --beta 0.04 \
-  --top_p 0.95 \
-  --top_k 50 \
-  --num_return_sequences 4 \
-  --xml_reward 0.125 \
-  --correctness_reward 2.0 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --num_train_epochs 3 \
-  --use_wandb
-```
-
-Or for NuminaMath fine-tuning:
-
-```bash
-python -m easydel.scripts.finetune.numinamath_grpo \
-  --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --attn_mechanism vanilla \
-  --max_prompt_length 2048 \
-  --max_completion_length 1024 \
-  --beta 0.04 \
-  --top_p 0.95 \
-  --num_return_sequences 4 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --num_train_epochs 3 \
-  --use_wandb
-```
+GRPO requires Python reward function callables, so use the programmatic API shown above (or write a small wrapper that calls `eLargeModel.train(reward_funcs=...)`).
 
 ## Dataset Format
 

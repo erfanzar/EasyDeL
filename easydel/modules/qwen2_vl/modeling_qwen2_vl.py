@@ -15,7 +15,6 @@ import math
 import typing as tp
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -41,6 +40,8 @@ from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseVisionLanguageModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -54,7 +55,6 @@ from easydel.layers.norms import RMSNorm
 from .qwen2_vl_configuration import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
 
 
-# TODO: Convert this to a jitable jax fn and use that inside model instead of precall
 def get_rope_index(
     input_ids: np.ndarray,
     image_grid_thw: np.ndarray | None = None,
@@ -225,15 +225,15 @@ class Qwen2VLCausalLMOutputWithPast(ModelOutput):
     Base class for Qwen2VL causal language model (or autoregressive) outputs.
     """
 
-    loss: chex.Array | None = None
-    logits: chex.Array = None
-    past_key_values: list[chex.Array] | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
-    rope_deltas: chex.Array | None = None
+    loss: Array | None = None
+    logits: Array = None
+    past_key_values: list[Array] | None = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    rope_deltas: Array | None = None
 
 
-def create_attention_mask(cu_seqlens: chex.Array, seq_length: int, dtype: jnp.dtype) -> chex.Array:
+def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
     """Create block-diagonal attention mask from cumulative sequence lengths.
 
     Vectorized implementation that works correctly with JAX tracing.
@@ -312,11 +312,11 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb_vision(
-    q: chex.Array,
-    k: chex.Array,
-    cos: chex.Array,
-    sin: chex.Array,
-) -> tuple[chex.Array, chex.Array]:
+    q: Array,
+    k: Array,
+    cos: Array,
+    sin: Array,
+) -> tuple[Array, Array]:
     """Apply rotary positional embedding to vision features.
 
     Matches HuggingFace's implementation exactly.
@@ -378,7 +378,7 @@ class Qwen2VLPatchEmbed(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> chex.Array:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
         hidden_states = jnp.transpose(
             hidden_states.reshape(
                 -1,
@@ -440,7 +440,7 @@ class Qwen2VLPatchMerger(nn.Module):
             ),
         ]
 
-    def __call__(self, x: chex.Array) -> chex.Array:
+    def __call__(self, x: Array) -> Array:
         x = self.ln_q(x).reshape(-1, self.hidden_size)
         for mlp in self.mlp:
             x = mlp(x)
@@ -482,7 +482,7 @@ class Qwen2VLVisionMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: chex.Array) -> chex.Array:
+    def __call__(self, x: Array) -> Array:
         return self.fc2(self.act(self.fc1(x)))
 
 
@@ -568,14 +568,15 @@ class Qwen2VLVisionAttention(UnifiedAttention):
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
             attn_mechanism="vanilla",
+            requires_cache=False,  # Vision encoder doesn't need KV cache
         )
 
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        cu_seqlens: chex.Array,
-        position_embeddings: tuple[chex.Array, chex.Array] | None = None,
-    ) -> chex.Array:
+        cu_seqlens: Array,
+        position_embeddings: tuple[Array, Array] | None = None,
+    ) -> Array:
         seq_length = hidden_states.shape[0]
         qkv = self.qkv(hidden_states)
         q, k, v = map(
@@ -660,7 +661,7 @@ class Qwen2VLVisionBlock(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states, cu_seqlens, position_embeddings) -> chex.Array:
+    def __call__(self, hidden_states, cu_seqlens, position_embeddings) -> Array:
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
@@ -774,7 +775,7 @@ class Qwen2VLAttention(UnifiedAttention):
         position_ids: Int[Array, "batch seq_len"] | Int[Array, "3 batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> AttentionLayerOutput:
@@ -856,7 +857,7 @@ class Qwen2VLDecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
@@ -1012,9 +1013,9 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        grid_thw: chex.Array,
+        grid_thw: Array,
         max_grid_size,
-    ) -> chex.Array:
+    ) -> Array:
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw, max_grid_size)
 
@@ -1127,8 +1128,8 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -1280,7 +1281,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
     def set_embeddings(self, value):
         self.language_model.set_embeddings(value)
 
-    def get_video_features(self, pixel_values_videos: chex.Array, video_grid_thw: chex.Array | None = None):
+    def get_video_features(self, pixel_values_videos: Array, video_grid_thw: Array | None = None):
         pixel_values_videos = pixel_values_videos.astype(self.visual.dtype)
         max_grid_size = int(video_grid_thw[:, 1:].max()) if video_grid_thw is not None else 1
         video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw, max_grid_size=max_grid_size)
@@ -1290,7 +1291,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
             video_embeds = jnp.split(video_embeds, indices)
         return video_embeds
 
-    def get_image_features(self, pixel_values: chex.Array, image_grid_thw: chex.Array | None = None):
+    def get_image_features(self, pixel_values: Array, image_grid_thw: Array | None = None):
         pixel_values = pixel_values.astype(self.visual.dtype)
         max_grid_size = int(image_grid_thw[:, 1:].max()) if image_grid_thw is not None else 1
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw, max_grid_size=max_grid_size)
@@ -1302,10 +1303,10 @@ class Qwen2VLModel(EasyDeLBaseModule):
 
     def get_rope_index(
         self,
-        input_ids: chex.Array = None,
-        image_grid_thw: chex.Array = None,
-        video_grid_thw: chex.Array = None,
-        attention_mask: chex.Array = None,
+        input_ids: Array = None,
+        image_grid_thw: Array = None,
+        video_grid_thw: Array = None,
+        attention_mask: Array = None,
     ):
         return get_rope_index(
             input_ids=input_ids,
@@ -1318,26 +1319,71 @@ class Qwen2VLModel(EasyDeLBaseModule):
             vision_start_token_id=self.config.vision_start_token_id,
         )
 
+    def compute_embedding(
+        self,
+        input_ids: Int[Array, "batch seq_len"],
+        *,
+        pixel_values: Array | None = None,
+        pixel_values_videos: Array | None = None,
+        image_grid_thw: Array | None = None,
+        video_grid_thw: Array | None = None,
+        image_embeds: Array | None = None,
+        video_embeds: Array | None = None,
+        **kwargs,
+    ) -> Array:
+        if input_ids is None:
+            raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
+
+        inputs_embeds = super().compute_embedding(input_ids)
+
+        if image_embeds is None and pixel_values is not None:
+            image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            if isinstance(image_embeds, (list, tuple)):
+                image_embeds = jnp.concatenate(image_embeds, axis=0)
+
+        if image_embeds is not None:
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=image_embeds.astype(inputs_embeds.dtype),
+                placeholder_token_id=self.config.image_token_id,
+            )
+
+        if video_embeds is None and pixel_values_videos is not None:
+            video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
+            if isinstance(video_embeds, (list, tuple)):
+                video_embeds = jnp.concatenate(video_embeds, axis=0)
+
+        if video_embeds is not None:
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=video_embeds.astype(inputs_embeds.dtype),
+                placeholder_token_id=self.config.video_token_id,
+            )
+
+        return inputs_embeds
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
-        pixel_values: chex.Array | None = None,
-        pixel_values_videos: chex.Array | None = None,
-        image_grid_thw: chex.Array | None = None,
-        video_grid_thw: chex.Array | None = None,
-        rope_deltas: chex.Array | None = None,
-        cache_position: chex.Array | None = None,
+        pixel_values: Array | None = None,
+        pixel_values_videos: Array | None = None,
+        image_grid_thw: Array | None = None,
+        video_grid_thw: Array | None = None,
+        rope_deltas: Array | None = None,
+        cache_position: Array | None = None,
         mask_info: MaskInfo | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         **kwargs,
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1347,41 +1393,21 @@ class Qwen2VLModel(EasyDeLBaseModule):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if inputs_embeds is None:
-            inputs_embeds = self.get_embedding()(input_ids)
-
-        if pixel_values is not None:
-            image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-            if isinstance(image_embeds, (list, tuple)):
-                image_embeds = jnp.concatenate(image_embeds, axis=0)
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                multimodal_embeddings=image_embeds,
-                placeholder_token_id=self.config.image_token_id,
-            )
-
-        if pixel_values_videos is not None:
-            video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
-            if isinstance(video_embeds, (list, tuple)):
-                video_embeds = jnp.concatenate(video_embeds, axis=0)
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                multimodal_embeddings=video_embeds,
-                placeholder_token_id=self.config.video_token_id,
-            )
-
-        if rope_deltas is not None:
-            self.rope_deltas = rope_deltas
-
-        if position_ids is None:
-            position_ids, rope_deltas = self.get_rope_index(
-                input_ids=input_ids,
+            inputs_embeds = self.compute_embedding(
+                input_ids,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
+            )
+
+        if position_ids is None:
+            position_ids, _rope_deltas = self.get_rope_index(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw if pixel_values is not None else None,
+                video_grid_thw=video_grid_thw if pixel_values_videos is not None else None,
                 attention_mask=attention_mask,
             )
-            self.rope_deltas = rope_deltas
         elif position_ids.ndim == 2:
             batch_size, seq_length = position_ids.shape
             position_ids = jnp.broadcast_to(position_ids[None, :, :], (3, batch_size, seq_length))
@@ -1523,6 +1549,9 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         """
         return self.base_model.get_image_features(pixel_values, image_grid_thw)
 
+    def compute_embedding(self, input_ids, *args, **kwargs):
+        return self.base_model.compute_embedding(input_ids, *args, **kwargs)
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] = None,
@@ -1530,44 +1559,76 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        pixel_values: chex.Array | None = None,
-        pixel_values_videos: chex.Array | None = None,
+        pixel_values: Array | None = None,
+        pixel_values_videos: Array | None = None,
         image_grid_thw: tuple | None = None,
         video_grid_thw: tuple | None = None,
-        rope_deltas: chex.Array | None = None,
-        cache_position: chex.Array | None = None,
+        rope_deltas: Array | None = None,
+        cache_position: Array | None = None,
         **kwargs,
     ) -> VLMCausalLMOutput:
-        """Forward pass for the Qwen2-VL model.
+        """Forward pass for Qwen2-VL conditional generation model.
+
+        This method processes multimodal inputs (text, images, and/or videos) and generates
+        language model outputs. Vision inputs are encoded via the vision encoder and fused
+        with text embeddings using placeholder tokens.
 
         Args:
-            input_ids: Input token IDs
-            attention_mask: Attention mask
-            mask_info: Mask information
-            position_ids: 3D position IDs for mRoPE (3, batch, seq_len)
-            mode: Runtime mode
-            past_key_values: Cached keys/values
-            cache_metadata: Metadata for paged attention
-            apply_lm_head: Whether to apply the LM head
-            inputs_embeds: Input embeddings
-            output_attentions: Whether to output attentions
-            output_hidden_states: Whether to output hidden states
-            pixel_values: Image pixel values
-            pixel_values_videos: Video pixel values
-            image_grid_thw: Image grid shape for mRoPE
-            video_grid_thw: Video grid shape for mRoPE
-            rope_deltas: Position deltas for mRoPE
-            cache_position: Cache position for generation
-            **kwargs: Additional arguments
+            input_ids (Int[Array, "batch seq_len"] | None): Input token IDs of shape (batch_size, sequence_length).
+                Should contain special vision tokens (image_token_id, video_token_id) at positions where
+                visual content should be inserted. Defaults to None.
+            attention_mask (Bool[Array, "batch seq_len"] | None): Attention mask of shape (batch_size, sequence_length).
+                Defaults to None.
+            mask_info (MaskInfo | None): Precomputed mask information. Overrides attention_mask if provided.
+                Defaults to None.
+            position_ids (Int[Array, "3 batch seq_len"] | None): 3D position IDs for multi-dimensional RoPE
+                of shape (3, batch_size, sequence_length) encoding [temporal, height, width] dimensions.
+                Auto-computed from image/video grids if None. Defaults to None.
+            mode (common_types.RUNTIME_MODE_TYPES | None): Runtime mode controlling attention implementation.
+                Defaults to None (auto-inferred).
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None): Cached key-value states
+                from previous forward passes for efficient generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None): Metadata for
+                paged attention operations. Defaults to None.
+            apply_lm_head (bool): Whether to apply the language modeling head to produce logits. Defaults to True.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"] | None): Pre-computed text embeddings of shape
+                (batch_size, sequence_length, hidden_size). Mutually exclusive with input_ids. Defaults to None.
+            output_attentions (bool | None): Whether to return attention weights from all layers. Defaults to None.
+            output_hidden_states (bool | None): Whether to return hidden states from all layers. Defaults to None.
+            pixel_values (Array | None): Image pixel values of shape (num_images, channels, height, width) where
+                channels=3 (RGB). Images are patchified and encoded by the vision encoder. Defaults to None.
+            pixel_values_videos (Array | None): Video pixel values of shape
+                (num_videos, channels, num_frames, height, width). Defaults to None.
+            image_grid_thw (tuple | None): Image grid dimensions as array of shape (num_images, 3) where each row
+                contains [temporal, height_patches, width_patches]. Used for computing M-RoPE positions. Defaults to None.
+            video_grid_thw (tuple | None): Video grid dimensions as array of shape (num_videos, 3) where each row
+                contains [temporal_frames, height_patches, width_patches]. Defaults to None.
+            rope_deltas (Array | None): Position deltas for M-RoPE of shape (batch_size, 1). Represents offset
+                added to position indices due to variable-length vision sequences. Defaults to None.
+            cache_position (Array | None): Explicit cache position indices for generation. Defaults to None.
+            **kwargs: Additional keyword arguments (unused).
 
         Returns:
-            VLMCausalLMOutput: Model outputs including logits and optional states
+            VLMCausalLMOutput: Named tuple containing:
+                - logits (Array | None): Language modeling logits of shape (batch_size, sequence_length, vocab_size)
+                  if apply_lm_head=True, otherwise None.
+                - past_key_values (TransformerCache | RaggedPagesCache | HybridCache): Updated KV cache.
+                - hidden_states (tuple[Array, ...] | None): Hidden states from all layers if output_hidden_states=True.
+                - last_hidden_state (Array): Final hidden state of shape (batch_size, sequence_length, hidden_size).
+                - attentions (tuple[Array, ...] | None): Attention weights from all layers if output_attentions=True.
+                - rope_deltas (Array | None): Position deltas used for M-RoPE.
+
+        Note:
+            The model uses special token IDs to determine where to insert vision embeddings:
+            - vision_start_token_id: Marks the beginning of a vision sequence
+            - image_token_id or video_token_id: Indicates the type of vision content
+            - vision_end_token_id: Marks the end of a vision sequence
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1605,9 +1666,6 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         if apply_lm_head:
             lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
             lm_logits = self.apply_logit_cap(lm_logits)
-
-        if rope_deltas is None:
-            rope_deltas = getattr(self.base_model, "rope_deltas", None)
 
         return VLMCausalLMOutput(
             logits=lm_logits,
@@ -1716,7 +1774,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
 
     def _create_required_props_from_kwargs(
         self,
-        model_kwargs: dict[str, chex.Array],
+        model_kwargs: dict[str, Array],
     ) -> tp.Mapping[str, dict[str, tp.Any]] | None:
         basics = {}
         if "image_grid_thw" in model_kwargs.keys():
@@ -1757,8 +1815,8 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
 
     def prepare_inputs_for_call(
         self,
-        image_grid_thw: chex.Array | None = None,
-        video_grid_thw: chex.Array | None = None,
+        image_grid_thw: Array | None = None,
+        video_grid_thw: Array | None = None,
         drop_ids: bool = True,
         **others,
     ):
@@ -1836,7 +1894,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
 
     def _create_required_props_from_kwargs(
         self,
-        model_kwargs: dict[str, chex.Array],
+        model_kwargs: dict[str, Array],
     ) -> tp.Mapping[str, dict[str, tp.Any]] | None:
         basics = {}
         if "image_grid_thw" in model_kwargs.keys():

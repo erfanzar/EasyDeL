@@ -805,22 +805,32 @@ class BaseMoeModule(nn.Module, ABC):
         wubps = self.get_moe_spec("column", use_expert_tensor, is_bias=True) if wu_bias is not None else None
         wdbps = self.get_moe_spec("row", use_expert_tensor, is_bias=True) if wd_bias is not None else None
 
-        gmm_kws = {"preferred_element_type": jnp.bfloat16}
+        preferred_element_type = jnp.bfloat16
+        if jnp.dtype(self.dtype) == jnp.float32:
+            preferred_element_type = jnp.float32
+        gmm_kws = {"preferred_element_type": preferred_element_type}
         if self.config.moe_force_xla_gmm:
             gmm_kws.update(dict(cfg=GroupedMatmulConfig(platform="xla", bypass_xla_tiling=True)))
         else:
             if jax.default_backend() == "tpu":
-                gmm_kws.update(platform="pallas")
-                if check_bool_flag("DISABLE_MOE_AUTOTUNE_ON_TPU", False):
-                    gmm_kws.update(
-                        cfg=GroupedMatmulConfig(
-                            platform="pallas",
-                            bypass_xla_tiling=True,
-                            block_m=1024,
-                            block_n=1024,
-                            block_k=512,
+                moe_block_m = int(getattr(self.config, "moe_tiling_size_batch", 1024))
+                moe_block_n = int(getattr(self.config, "moe_tiling_size_dim", 1024))
+                # Pallas TPU lowering requires block shapes that satisfy hardware constraints.
+                # If the configured tile sizes are incompatible, fall back to XLA.
+                if (moe_block_m % 8 != 0) or (moe_block_n % 128 != 0):
+                    gmm_kws.update(dict(cfg=GroupedMatmulConfig(platform="xla", bypass_xla_tiling=True)))
+                else:
+                    gmm_kws.update(platform="pallas")
+                    if check_bool_flag("DISABLE_MOE_AUTOTUNE_ON_TPU", False):
+                        gmm_kws.update(
+                            cfg=GroupedMatmulConfig(
+                                platform="pallas",
+                                bypass_xla_tiling=True,
+                                block_m=moe_block_m,
+                                block_n=moe_block_n,
+                                block_k=512,
+                            )
                         )
-                    )
 
         @partial(
             shard_map,
@@ -1296,6 +1306,10 @@ class BaseMoeModule(nn.Module, ABC):
                     Ensures weights for each token sum to 1.0, creating a proper
                     probability distribution over selected experts.
                     """
+                    # Match HF Mixtral-style behavior: for top-1 routing keep the selected
+                    # probability as-is; for top-k>1 normalize by the sum across selected experts.
+                    if weights.shape[-1] <= 1:
+                        return weights
                     return weights / jnp.maximum(weights.sum(axis=-1, keepdims=True), 1e-8)
 
                 refine_weights_hook = normalize_selected_weights

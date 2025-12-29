@@ -16,7 +16,6 @@
 import typing
 from functools import partial
 
-import chex
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
@@ -40,6 +39,8 @@ from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -259,8 +260,8 @@ class ArcticMLPMoE(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        group_sizes: chex.Array,
-        sorted_experts: chex.Array | None = None,
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
     ):
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -427,10 +428,10 @@ class ArcticMoeBlock(BaseMoeModule):
         Otherwise, it passes the input through the standard MLP.
 
         Args:
-                hidden_states (chex.Array): Input hidden states.
+                hidden_states (Array): Input hidden states.
 
         Returns:
-                tp.Tuple[chex.Array, chex.Array]: Tuple containing the output
+                tp.Tuple[Array, Array]: Tuple containing the output
                     hidden state and router_logits (or None if not MoE).
         """
         if self.is_moe_layer:
@@ -542,7 +543,7 @@ class ArcticDecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -680,17 +681,17 @@ class ArcticModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> MoeModelOutput:
         """Forward pass through the ArcticModel.
 
         Args:
-                input_ids (Optional[chex.Array]): Input token IDs.
-                inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
-                attention_mask (Optional[chex.Array]): Mask to avoid attending to padding tokens.
-                position_ids (Optional[chex.Array]): Position IDs for positional embeddings.
-                segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
+                input_ids (Optional[Array]): Input token IDs.
+                inputs_embeds (Optional[Array]): Input embeddings (alternative to input_ids).
+                attention_mask (Optional[Array]): Mask to avoid attending to padding tokens.
+                position_ids (Optional[Array]): Position IDs for positional embeddings.
+                segment_ids (Optional[Array]): Segment IDs (if applicable).
                 output_attentions (Optional[bool]): Whether to return attention weights.
                 output_hidden_states (Optional[bool]): Whether to return all hidden states.
                 output_router_logits (Optional[bool]): Whether to return router logits.
@@ -865,8 +866,8 @@ class ArcticForCausalLM(BaseCausalLMModule[ArcticModel, ArcticConfig]):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
         """Forward pass of the ArcticForCausalLM model."""
@@ -941,8 +942,8 @@ class ArcticForSequenceClassification(BaseSequenceClassificationModule[ArcticMod
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:

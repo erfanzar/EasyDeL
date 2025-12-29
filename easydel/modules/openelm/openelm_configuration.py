@@ -163,6 +163,7 @@ class OpenELMConfig(EasyDeLBaseConfig):
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """The __init__ function is called when the class is instantiated.
@@ -230,6 +231,9 @@ class OpenELMConfig(EasyDeLBaseConfig):
         self.gradient_checkpointing = gradient_checkpointing
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_transformer_layers
 
         super().__init__(
             bos_token_id=bos_token_id,

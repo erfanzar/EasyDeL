@@ -13,7 +13,7 @@
  </div>
 </div>
 
------
+--
 
 # Getting Started with EasyDeL on TPU Research Cloud (TRC)
 
@@ -30,46 +30,17 @@ EasyDeL is designed for maximum performance and flexibility on TPU hardware:
 
 ## Initial Setup
 
-### 1. Install and Configure `eopod`
+### 1. Run the TPU setup script
 
-#### You can also setup and install easydel with running command belowe
+Use the official setup script to install and configure everything needed on TRC (eopod, virtualenvs, EasyDeL TPU deps, Ray) and run a quick health check.
 
 ```shell
 bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/tpu_setup.sh)
 ```
 
-First, install `eopod`, the command-line tool for managing TPU pods:
+If `eopod` is not available right away after the script finishes, restart your shell (or `source ~/.bashrc` / `source ~/.zshrc`) to pick up the alias it adds.
 
-```shell
-pip install eopod
-```
-
-> **Troubleshooting**: If you encounter a "command not found" error, add your local bin to PATH:
->
-> ```shell
-> echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-> source ~/.bashrc
-> ```
-
-Configure `eopod` with your TPU project details:
-
-```shell
-eopod configure --project-id YOUR_PROJECT_ID --zone YOUR_ZONE --tpu-name YOUR_TPU_NAME
-```
-
-### 2. Install Required Dependencies
-
-Install the necessary packages for model training and conversion:
-
-```shell
-# Install required dependencies
-eopod run pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-# Install EasyDeL from the latest source
-eopod run pip install git+https://github.com/erfanzar/easydel
-```
-
-### 3. Set Up Authentication
+### 2. Set Up Authentication
 
 Connect to your experiment tracking and model hosting accounts:
 
@@ -81,185 +52,450 @@ eopod run "python -c 'from huggingface_hub import login; login(token=\"YOUR_HF_T
 eopod run python -m wandb login YOUR_WANDB_TOKEN
 ```
 
-## Fine-Tuning Methods
+## eLargeModel & YAML Runner
 
-EasyDeL provides several state-of-the-art fine-tuning techniques. Below you'll find examples for each method with explanations of their use cases.
+EasyDeL provides `eLargeModel`, a unified high-level API for training, evaluation, and serving. The YAML runner (`python -m easydel.scripts.elarge`) lets you define complete pipelines declaratively.
 
-> **Tip**: To explore all available parameters for any script, use the `--help` flag:
->
-> ```shell
-> eopod run python -m easydel.scripts.finetune.dpo --help
-> ```
-
-### Direct Preference Optimization (DPO)
-
-**Use Case**: Fine-tune a model from human preference data to align with human preferences without needing a separate reward model.
+### Basic Usage
 
 ```shell
-eopod run python -m easydel.scripts.finetune.dpo \
-  --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --dataset_name trl-lib/ultrafeedback_binarized \
-  --dataset_split "train[:90%]" \
-  --refrence_model_repo_id meta-llama/Llama-3.3-70B-Instruct \
-  --attn_mechanism vanilla \
-  --beta 0.08 \
-  --loss_type sigmoid \
-  --max_length 2048 \
-  --max_prompt_length 1024 \
-  --ref_model_sync_steps 128 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --learning_rate_end 6e-7 \
-  --log_steps 50 \
-  --shuffle_train_dataset \
-  --report_steps 1 \
-  --progress_bar_type tqdm \
-  --num_train_epochs 3 \
-  --auto_shard_states \
-  --optimizer adamw \
-  --scheduler linear \
-  --do_last_save \
-  --save_steps 1000 \
-  --use_wandb
+# Run a YAML config
+eopod run python -m easydel.scripts.elarge config.yaml
+
+# Dry run (parse and validate without executing)
+eopod run python -m easydel.scripts.elarge config.yaml --dry-run
+
+# Get help
+eopod run python -m easydel.scripts.elarge --help
 ```
 
-### Odds Ratio Policy Optimization (ORPO)
+### YAML Structure
 
-**Use Case**: An enhanced version of DPO that uses odds ratios to stabilize training and often results in better preference alignment.
+Every config file has two parts:
 
-```shell
-eopod run python -m easydel.scripts.finetune.orpo \
-  --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --dataset_name trl-lib/ultrafeedback_binarized \
-  --dataset_split "train" \
-  --attn_mechanism vanilla \
-  --beta 0.12 \
-  --max_length 2048 \
-  --max_prompt_length 1024 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --learning_rate_end 6e-7 \
-  --log_steps 50 \
-  --shuffle_train_dataset \
-  --report_steps 1 \
-  --progress_bar_type json \
-  --num_train_epochs 3 \
-  --auto_shard_states \
-  --optimizer adamw \
-  --scheduler linear \
-  --do_last_save \
-  --save_steps 1000 \
-  --use_wandb
+1. **Configuration** - Model, sharding, data, trainer settings
+2. **Actions** - Operations to execute sequentially
+
+```yaml
+# Model and training configuration
+model:
+  name_or_path: meta-llama/Llama-3.1-8B-Instruct
+
+loader:
+  dtype: bf16
+
+sharding:
+  axis_dims: [1, -1, 1, 1, 1]  # (dp, fsdp, ep, tp, sp)
+
+# Actions to execute
+actions:
+  - validate
+  - train
 ```
 
-### Supervised Fine-Tuning (SFT)
+### Available Actions
 
-**Use Case**: The most basic fine-tuning approach for adapting a model to a specific task or dataset, including multimodal models.
+| Action                | Description                             |
+| --------------------- | --------------------------------------- |
+| `validate`            | Validate configuration before execution |
+| `train`               | Run training with configured trainer    |
+| `eval`                | Evaluate with lm-evaluation-harness     |
+| `serve`               | Start OpenAI-compatible API server      |
+| `to_yaml` / `to_json` | Save normalized config                  |
 
-```shell
-eopod run python -m easydel.scripts.finetune.sft \
-  --repo_id Qwen/Qwen2.5-VL-72B-Instruct \
-  --dataset_name trl-lib/Capybara \
-  --dataset_split "train" \
-  --dataset_text_field messages \
-  --sharding_axis 1,-1,1,1 \
-  --attn_mechanism vanilla \
-  --max_sequence_length 2048 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --learning_rate_end 6e-7 \
-  --log_steps 50 \
-  --shuffle_train_dataset \
-  --report_steps 1 \
-  --progress_bar_type json \
-  --num_train_epochs 3 \
-  --auto_shard_states \
-  --optimizer adamw \
-  --scheduler linear \
-  --do_last_save \
-  --save_steps 1000 \
-  --use_wandb
+## Training Examples
+
+### SFT (Supervised Fine-Tuning)
+
+```yaml
+model:
+  name_or_path: meta-llama/Llama-3.1-8B-Instruct
+
+loader:
+  dtype: bf16
+  param_dtype: bf16
+
+sharding:
+  axis_dims: [1, -1, 1, 1, 1]
+
+mixture:
+  informs:
+    - type: databricks/dolly-15k
+      content_field: text
+      split: train
+  batch_size: 32
+  pack_tokens: true
+  pack_seq_length: 2048
+
+trainer:
+  trainer_type: sft
+  learning_rate: 2.0e-5
+  num_train_epochs: 3
+  total_batch_size: 32
+  gradient_accumulation_steps: 4
+  warmup_steps: 100
+  save_directory: ./sft-output
+  save_steps: 500
+  log_steps: 10
+
+actions:
+  - validate
+  - train
 ```
 
-### Group Relative Policy Optimization for GSM8K (GRPO)
+### DPO (Direct Preference Optimization)
 
-**Use Case**: Specifically designed for enhancing mathematical reasoning capabilities by using group-based preference comparisons on the GSM8K dataset.
+```yaml
+model:
+  name_or_path: meta-llama/Llama-3.1-8B-Instruct
 
-```shell
-eopod run python -m easydel.scripts.finetune.gsm8k_grpo \
-  --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --attn_mechanism vanilla \
-  --sharding_axis 1,1,1,-1 \
-  --max_prompt_length 2048 \
-  --max_completion_length 1024 \
-  --beta 0.04 \
-  --top_p 0.95 \
-  --top_k 50 \
-  --num_return_sequences 4 \
-  --xml_reward 0.125 \
-  --xml_full_match_reward 0.5 \
-  --xml_full_match_reject 0.0 \
-  --correctness_reward 2.0 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --learning_rate_end 6e-7 \
-  --log_steps 50 \
-  --shuffle_train_dataset \
-  --report_steps 1 \
-  --progress_bar_type tqdm \
-  --num_train_epochs 3 \
-  --auto_shard_states \
-  --optimizer adamw \
-  --scheduler linear \
-  --do_last_save \
-  --save_steps 1000 \
-  --use_wandb \
-  --kv-cache-quantization int8
+reference_model:
+  name_or_path: meta-llama/Llama-3.1-8B-Instruct
+
+loader:
+  dtype: bf16
+
+sharding:
+  axis_dims: [1, -1, 1, 1, 1]
+
+mixture:
+  informs:
+    - type: trl-lib/ultrafeedback_binarized
+      split: "train[:90%]"
+  batch_size: 16
+
+trainer:
+  trainer_type: dpo
+  beta: 0.1
+  learning_rate: 5.0e-7
+  num_train_epochs: 1
+  total_batch_size: 16
+  save_directory: ./dpo-output
+
+actions:
+  - validate
+  - train
+```
+
+### ORPO (Odds Ratio Preference Optimization)
+
+```yaml
+model:
+  name_or_path: meta-llama/Llama-3.1-8B-Instruct
+
+loader:
+  dtype: bf16
+
+sharding:
+  axis_dims: [1, -1, 1, 1, 1]
+
+mixture:
+  informs:
+    - type: argilla/distilabel-capybara-dpo-7k-binarized
+      split: train
+  batch_size: 16
+
+trainer:
+  trainer_type: orpo
+  beta: 0.1
+  learning_rate: 8.0e-6
+  num_train_epochs: 1
+  total_batch_size: 16
+  save_directory: ./orpo-output
+
+actions:
+  - validate
+  - train
 ```
 
 ### Reward Model Training
 
-**Use Case**: Train a reward model that can later be used for RLHF (Reinforcement Learning from Human Feedback) pipelines.
+```yaml
+model:
+  name_or_path: meta-llama/Llama-3.1-8B-Instruct
 
-```shell
-eopod run python -m easydel.scripts.finetune.reward \
-  --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --dataset_name trl-lib/ultrafeedback_binarized \
-  --dataset_split "train" \
-  --attn_mechanism vanilla \
-  --max_sequence_length 2048 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --learning_rate_end 6e-7 \
-  --log_steps 50 \
-  --shuffle_train_dataset \
-  --report_steps 1 \
-  --progress_bar_type json \
-  --num_train_epochs 3 \
-  --auto_shard_states \
-  --optimizer adamw \
-  --scheduler linear \
-  --do_last_save \
-  --save_steps 1000 \
-  --use_wandb
+loader:
+  dtype: bf16
+
+sharding:
+  axis_dims: [1, -1, 1, 1, 1]
+
+mixture:
+  informs:
+    - type: Anthropic/hh-rlhf
+      split: train
+  batch_size: 16
+
+trainer:
+  trainer_type: reward
+  learning_rate: 1.0e-5
+  num_train_epochs: 1
+  save_directory: ./reward-output
+
+actions:
+  - validate
+  - train
 ```
 
-## Common Parameters Explained
+### Knowledge Distillation
 
-The fine-tuning scripts share many parameters:
+```yaml
+model:
+  name_or_path: meta-llama/Llama-3.2-1B
 
-- `--repo_id`: The Hugging Face model repository to fine-tune
-- `--dataset_name`: Dataset from Hugging Face Hub for training
-- `--attn_mechanism`: Attention computation method (vanilla, flash, etc.)
-- `--total_batch_size`: Total batch size across all TPU devices
-- `--learning_rate` & `--learning_rate_end`: Initial and final learning rates for scheduling
-- `--auto_shard_states`: Automatically shard model parameters across TPU devices
-- `--save_steps`: Number of steps between model checkpoints
-- `--kv-cache-quantization`: Enable KV cache quantization (e.g., int8) to reduce memory usage
+teacher_model:
+  name_or_path: meta-llama/Llama-3.1-8B-Instruct
 
-## Advanced Usage
+loader:
+  dtype: bf16
 
-For advanced scenarios, the EasyDeL library offers full programmatic access to customize training loops, architectures, and optimization strategies. Check out the [documentation](https://easydel.readthedocs.io/) for more examples and API details.
+sharding:
+  axis_dims: [1, -1, 1, 1, 1]
+
+mixture:
+  informs:
+    - type: json
+      data_files: "train/*.json"
+      content_field: text
+  batch_size: 32
+
+trainer:
+  trainer_type: distillation
+  learning_rate: 1.0e-5
+  num_train_epochs: 3
+  save_directory: ./distilled-output
+
+actions:
+  - validate
+  - train
+```
+
+## Evaluation
+
+Run benchmarks using lm-evaluation-harness:
+
+```yaml
+model:
+  name_or_path: meta-llama/Llama-3.1-8B-Instruct
+
+loader:
+  dtype: bf16
+
+sharding:
+  axis_dims: [1, 1, 1, -1, 1]
+
+esurge:
+  max_model_len: 4096
+  max_num_seqs: 64
+  hbm_utilization: 0.9
+  enable_prefix_caching: true
+
+eval:
+  max_new_tokens: 512
+  temperature: 0.0
+  batch_size: 32
+
+actions:
+  - validate
+  - eval:
+      tasks: [hellaswag, winogrande, arc_easy, arc_challenge, mmlu]
+      engine: esurge
+      num_fewshot: 5
+      output_path: ./eval_results.json
+      print_results: true
+```
+
+## Serving (OpenAI-Compatible API)
+
+Deploy a model as an API server:
+
+```yaml
+model:
+  name_or_path: meta-llama/Llama-3.1-8B-Instruct
+
+loader:
+  dtype: bf16
+
+sharding:
+  axis_dims: [1, 1, 1, -1, 1]
+
+esurge:
+  max_model_len: 8192
+  max_num_seqs: 256
+  hbm_utilization: 0.85
+  enable_prefix_caching: true
+
+actions:
+  - validate
+  - serve:
+      host: 0.0.0.0
+      port: 8000
+      log_level: info
+      enable_function_calling: true
+      tool_parser_name: hermes
+```
+
+Then query it with any OpenAI-compatible client:
+
+```shell
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+## Configuration Reference
+
+### Model (`model`)
+
+```yaml
+model:
+  name_or_path: meta-llama/Llama-3.1-8B-Instruct  # Required
+  tokenizer: custom/tokenizer                      # Optional
+  task: causal-language-model                      # Optional
+```
+
+### Loader (`loader`)
+
+```yaml
+loader:
+  dtype: bf16           # bf16, fp16, fp32
+  param_dtype: bf16     # Parameter storage dtype
+  precision: high       # JAX precision level
+  trust_remote_code: true
+```
+
+### Sharding (`sharding`)
+
+EasyDeL uses 5D sharding: `(dp, fsdp, ep, tp, sp)`
+
+```yaml
+sharding:
+  axis_dims: [1, -1, 1, 1, 1]  # Full FSDP
+  auto_shard_model: true
+```
+
+Common configurations:
+
+- `[1, -1, 1, 1, 1]` - Full FSDP (memory efficient)
+- `[1, 4, 1, 2, 1]` - FSDP + Tensor Parallel
+- `[1, 4, 8, 1, 1]` - FSDP + Expert Parallel (MoE)
+
+### Quantization (`quantization`)
+
+```yaml
+quantization:
+  model:
+    quantization_method: nf4  # nf4, 8bit
+    block_size: 64
+  kv_cache:
+    quantization_method: 8bit
+    block_size: 128
+```
+
+### eSurge Inference (`esurge`)
+
+```yaml
+esurge:
+  max_model_len: 8192
+  max_num_seqs: 256
+  hbm_utilization: 0.85
+  page_size: 128
+  enable_prefix_caching: true
+  use_aot_forward: true
+```
+
+### Dataset Mixture (`mixture`)
+
+```yaml
+mixture:
+  informs:
+    - type: databricks/dolly-15k  # HuggingFace dataset
+      content_field: text
+      split: train
+    - type: json                   # Local JSON files
+      data_files: "data/*.json"
+      content_field: text
+  batch_size: 32
+  pack_tokens: true
+  pack_seq_length: 2048
+```
+
+### Trainer (`trainer`)
+
+```yaml
+trainer:
+  trainer_type: sft  # sft, dpo, orpo, grpo, reward, distillation
+  learning_rate: 2.0e-5
+  num_train_epochs: 3
+  total_batch_size: 32
+  gradient_accumulation_steps: 4
+  warmup_steps: 100
+  weight_decay: 0.01
+  clip_grad: 1.0
+  save_directory: ./output
+  save_steps: 500
+  log_steps: 10
+```
+
+## GRPO (Group Relative Policy Optimization)
+
+GRPO requires Python reward functions and is best used with the programmatic API:
+
+```python
+from easydel.infra import eLargeModel
+
+def reward_func(completions, prompts, **kwargs):
+    # Your reward logic
+    return [compute_reward(c) for c in completions]
+
+elm = (
+    eLargeModel.from_yaml("grpo_config.yaml")
+    .set_trainer(trainer_type="grpo", group_size=4, kl_coef=0.1)
+)
+
+elm.train(reward_funcs=[reward_func])
+```
+
+## Best Practices for TRC
+
+1. **Always validate first**: Add `validate` as your first action to catch config errors early.
+
+2. **Use dry-run for debugging**:
+
+   ```shell
+   eopod run python -m easydel.scripts.elarge config.yaml --dry-run
+   ```
+
+3. **Enable token packing** for efficient training:
+
+   ```yaml
+   mixture:
+     pack_tokens: true
+     pack_seq_length: 2048
+   ```
+
+4. **Use appropriate sharding** for your TPU pod:
+
+   ```yaml
+   # v4-8 (single host)
+   sharding:
+     axis_dims: [1, 1, 1, -1, 1]
+
+   # v4-32+ (multi-host)
+   sharding:
+     axis_dims: [1, -1, 1, 1, 1]
+   ```
+
+5. **Save configs for reproducibility**:
+
+   ```yaml
+   actions:
+     - to_yaml: ./saved_config.yaml
+     - train
+   ```
 
 ## Getting Help
 
@@ -267,4 +503,5 @@ If you encounter any issues or have questions:
 
 - Join our [Discord community](https://discord.gg/FCAMNqnGtt) for direct support
 - Check the [documentation](https://easydel.readthedocs.io/) for detailed guides
+- See the [eLargeModel Guide](https://easydel.readthedocs.io/en/latest/infra/elarge_model.html) for complete YAML reference
 - Explore the [GitHub repository](https://github.com/erfanzar/easydel) for examples and source code

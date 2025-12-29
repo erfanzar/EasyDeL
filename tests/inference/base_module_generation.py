@@ -23,11 +23,11 @@ def main():
     sharding_axis_dims = (1, 1, 1, -1, 1)
     max_model_len = 2048
 
-    # _base = ed.AutoEasyDeLModelForCausalLM
-    _base = ed.AutoEasyDeLModelForImageTextToText
+    _base = ed.AutoEasyDeLModelForCausalLM
+    # _base = ed.AutoEasyDeLModelForImageTextToText
 
-    # pretrained_model_name_or_path = "Qwen/Qwen3-0.6B"
-    pretrained_model_name_or_path = "Qwen/Qwen2-VL-7B-Instruct"
+    pretrained_model_name_or_path = "Qwen/Qwen3-4B"
+    # pretrained_model_name_or_path = "Qwen/Qwen2-VL-7B-Instruct"
     # pretrained_model_name_or_path = "Qwen/Qwen2.5-0.5B-Instruct"
 
     model = _base.from_pretrained(
@@ -40,7 +40,7 @@ def main():
             freq_max_position_embeddings=max_model_len,
             mask_max_position_embeddings=max_model_len,
             kvdtype=jnp.bfloat16,
-            attn_mechanism=ed.AttentionMechanisms.VANILLA,
+            attn_mechanism=ed.AttentionMechanisms.BLOCKSPARSE,
             decode_attn_mechanism=ed.AttentionMechanisms.VANILLA,
             gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
         ),

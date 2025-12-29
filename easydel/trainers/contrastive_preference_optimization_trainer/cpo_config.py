@@ -14,9 +14,7 @@
 from __future__ import annotations
 
 import typing as tp
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -27,7 +25,7 @@ LOSS_TYPES = tp.Literal["sigmoid", "hinge", "ipo", "simpo", "alphapo"]
 
 
 @Registry.register("trainer-arguments", "cpo")
-@auto_pytree
+@dataclass
 class CPOConfig(TrainingArguments):
     """Configuration class for Contrastive Preference Optimization (CPO) training.
 
@@ -135,13 +133,11 @@ class CPOConfig(TrainingArguments):
         metadata={"help": "Number of processes used when tokenising datasets (datasets.map `num_proc`)."},
     )
 
-    def __post_init__(self):
+    def __post_init__(self, max_sequence_length: int | None):
+        self._handle_deprecated_max_sequence_length(max_sequence_length)
         if self.max_length is not None and self.max_prompt_length is not None:
             if self.max_completion_length is None:
                 self.max_completion_length = max(self.max_length - self.max_prompt_length, 0)
-            self.max_sequence_length = self.max_length + self.max_completion_length
-        else:
-            self.max_sequence_length = None
 
         # AlphaPO syntactic sugar: switch to SimPO loss with zero BC regularisation.
         if self.loss_type == "alphapo":
@@ -149,6 +145,6 @@ class CPOConfig(TrainingArguments):
             self.cpo_alpha = 0.0
 
         if hasattr(super(), "__post_init__"):
-            super().__post_init__()
+            super().__post_init__(max_sequence_length=None)
 
     __hash__ = hash_fn

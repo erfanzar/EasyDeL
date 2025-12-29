@@ -116,6 +116,7 @@ class InternLM2Config(EasyDeLBaseConfig):
         scan_mlp_chunk_size: int = 1024,
         bits: int | None = None,
         scan_layers: bool = False,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes an InternLM2Config object.
@@ -175,6 +176,9 @@ class InternLM2Config(EasyDeLBaseConfig):
         self.attn_implementation = "eager"
         # HF: AttributeError: 'InternLM2Config' object has no attribute 'attn_implementation'.
         # Did you mean: '_attn_implementation'?
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

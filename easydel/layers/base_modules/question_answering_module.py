@@ -30,6 +30,8 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.modeling_outputs import QuestionAnsweringModelOutput
 from easydel.infra.utils import auto_remat, get_dot_general_by_bits
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesMetadata,
     TransformerCache,
@@ -136,8 +138,8 @@ class BaseQuestionAnsweringModule(BaseTaskModule[ModelT, ConfigT]):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> QuestionAnsweringModelOutput:

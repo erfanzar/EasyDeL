@@ -114,6 +114,12 @@ class OperationMetadata:
     base_config: EasyDeLBaseConfig | None = None
     operation_configs: dict[str, BaseOperationConfig] | None = None
 
+    # Instance-level override for cache requirements.
+    # None means use the operation's class-level default.
+    # False disables cache (useful for encoder-only models like vision encoders).
+    # True forces cache requirement.
+    requires_cache: bool | None = None
+
     _stored_mesh: jax.sharding.Mesh | None = NOT_GIVEN
 
     def __post_init__(self) -> None:

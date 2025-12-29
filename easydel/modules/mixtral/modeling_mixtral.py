@@ -15,7 +15,6 @@
 
 import typing
 
-import chex
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
@@ -38,6 +37,8 @@ from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -168,10 +169,10 @@ class MixtralMoEMlp(nn.Module):
 
     def __call__(
         self,
-        x: chex.Array,
-        group_sizes: chex.Array,
-        sorted_experts: chex.Array | None = None,
-    ) -> chex.Array:
+        x: Array,
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
         """Forward pass through MoE MLP."""
         hidden_states = checkpoint_name(self.act_fn(self.w1(x, group_sizes, sorted_experts)), "mlp_gate")
         hidden_states = checkpoint_name(hidden_states * self.w3(x, group_sizes, sorted_experts), "mlp_up")
@@ -227,7 +228,7 @@ class MixtralSparseMoeBlock(BaseMoeModule):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_state: chex.Array) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, hidden_state: Array) -> tuple[Array, Array]:
         """Forward pass of the MoE block."""
         out, router_logits = self.moe_call(
             hidden_state=hidden_state,
@@ -311,7 +312,7 @@ class MixtralDecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -443,20 +444,20 @@ class MixtralModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> MoeModelOutput:
         """Forward pass of the MixtralModel.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
+            inputs_embeds (tp.Optional[Array]): Input embeddings.
                 Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
                 Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+            position_ids (tp.Optional[Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+            segment_ids (tp.Optional[Array]): Segment IDs (unused).
             output_attentions (tp.Optional[bool]): Whether to return attention weights.
                 Defaults to `config.output_attentions`.
             output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
@@ -631,8 +632,8 @@ class MixtralForCausalLM(BaseCausalLMModule[MixtralModel, MixtralConfig]):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
         """Forward pass of the MixtralForCausalLM model."""
@@ -706,8 +707,8 @@ class MixtralForSequenceClassification(BaseSequenceClassificationModule[MixtralM
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> SequenceClassifierOutput:
         """Forward pass of the MixtralForSequenceClassification model."""
         transformer_outputs = self.base_model(

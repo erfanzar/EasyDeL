@@ -15,9 +15,7 @@
 from __future__ import annotations
 
 import typing as tp
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -26,7 +24,7 @@ from ..training_configurations import TrainingArguments
 
 
 @Registry.register("trainer-arguments", "bco")
-@auto_pytree
+@dataclass
 class BCOConfig(TrainingArguments):
     """Configuration container for Binary Classifier Optimisation (BCO) training."""
 
@@ -111,15 +109,13 @@ class BCOConfig(TrainingArguments):
         metadata={"help": "Maximum clamp applied to the estimated density ratio when UDM is enabled."},
     )
 
-    def __post_init__(self):
+    def __post_init__(self, max_sequence_length: int | None):
+        self._handle_deprecated_max_sequence_length(max_sequence_length)
         if self.max_length is not None and self.max_prompt_length is not None:
             if self.max_completion_length is None:
                 self.max_completion_length = max(self.max_length - self.max_prompt_length, 0)
-            self.max_sequence_length = self.max_length
-        else:
-            self.max_sequence_length = None
 
         if hasattr(super(), "__post_init__"):
-            super().__post_init__()
+            super().__post_init__(max_sequence_length=None)
 
     __hash__ = hash_fn

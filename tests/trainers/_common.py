@@ -39,7 +39,7 @@ PREFERENCE_SPLIT = "train[:50%]"
 MAX_PROMPT_LENGTH = 256
 MAX_COMPLETION_LENGTH = 256
 MAX_TOTAL_LENGTH = MAX_PROMPT_LENGTH + MAX_COMPLETION_LENGTH  # 512, divisible by 128
-MAX_TRAINING_STEP = 512
+MAX_TRAINING_STEP = 1024
 SAVE_ROOT = Path("tmp-files") / "trainer-smoke-tests"
 
 
@@ -155,7 +155,7 @@ def make_config(
         "save_directory": _prepare_save_dir(name),
         "num_train_epochs": 1,
         "total_batch_size": 4,
-        "gradient_accumulation_steps": 1,
+        "gradient_accumulation_steps": 2,
         "log_steps": 1,
         "learning_rate": 8e-6,
         "max_training_steps": MAX_TRAINING_STEP,

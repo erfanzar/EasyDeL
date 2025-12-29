@@ -36,8 +36,10 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -138,10 +140,10 @@ class Gemma2Attention(UnifiedAttention):
         Merges the attention heads into a single hidden state tensor.
 
         Args:
-            hidden_states (chex.Array): The hidden states with separate head dimensions.
+            hidden_states (Array): The hidden states with separate head dimensions.
 
         Returns:
-            chex.Array: The hidden states with merged head dimensions.
+            Array: The hidden states with merged head dimensions.
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads * self.head_dim))
 
@@ -292,7 +294,7 @@ class Gemma2DecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
@@ -300,17 +302,17 @@ class Gemma2DecoderLayer(nn.Module):
         Forward pass of the module block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens.
+            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             deterministic (bool): If True, disables dropout for deterministic behavior.
             init_cache (bool): If True, initializes cache for caching keys and values.
             output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
         """
         residual = hidden_states
 
@@ -413,27 +415,63 @@ class Gemma2Model(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """
-        Forward pass through the Gemma2 module.
+        """Forward pass through the Gemma2 base model.
+
+        Processes input tokens through token embedding, applies scaling, and passes them through
+        the decoder layers with alternating sliding window and full attention patterns.
 
         Args:
-            input_ids (chex.Array): Input tensor containing token IDs.
-            attention_mask (chex.Array): Mask for attention.
-            position_ids (chex.Array): Positional indices.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
-            inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
-            output_attentions (tp.Optional[bool]): If True, output attention weights.
-            output_hidden_states (tp.Optional[bool]): If True, output hidden states.
-            init_cache (bool): If True, initialize cache for decoding.
-            deterministic (bool): If True, disable dropout.
+            input_ids (Int[Array, "batch seq_len"], optional): Input token IDs.
+                Shape: (batch_size, sequence_length). Must be provided if inputs_embeds is None.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"], optional): Pre-computed
+                input embeddings. Shape: (batch_size, sequence_length, hidden_size).
+                Must be provided if input_ids is None.
+            attention_mask (Bool[Array, "batch seq_len"], optional): Attention mask indicating
+                which tokens should be attended to (True) and which should be ignored (False).
+                Shape: (batch_size, sequence_length). Default: None (all tokens attended).
+            mask_info (MaskInfo, optional): Pre-computed mask information encoding attention
+                patterns and positions. If None, computed from attention_mask or input_ids.
+            position_ids (Int[Array, "batch seq_len"], optional): Position indices for each token.
+                Shape: (batch_size, sequence_length). If None, uses sequential positions.
+            mode (RUNTIME_MODE_TYPES, optional): Execution mode controlling attention computation.
+                Options: MODE_TRAIN (full attention), MODE_DECODE (single-token), MODE_PREFILL.
+                Auto-detected if None based on sequence length and cache presence.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                Cached key-value states from previous forward passes for efficient autoregressive
+                generation. Hybrid cache recommended for Gemma2's mixed attention pattern.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata, optional):
+                Metadata for managing paged attention caches in serving scenarios.
+            output_attentions (bool, optional): Whether to return attention weights from all layers.
+                Default: None (uses config value).
+            output_hidden_states (bool, optional): Whether to return hidden states from all layers.
+                Default: None (uses config value).
 
         Returns:
-            BaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+            BaseModelOutput: Model outputs containing:
+                - last_hidden_state (jnp.ndarray): Final layer hidden states after RMSNorm.
+                  Shape: (batch_size, sequence_length, hidden_size).
+                - hidden_states (tuple[jnp.ndarray], optional): Hidden states from each layer
+                  if output_hidden_states=True. Each tensor has shape
+                  (batch_size, sequence_length, hidden_size).
+                - attentions (tuple[jnp.ndarray], optional): Attention weights from each layer
+                  if output_attentions=True. Each tensor has shape
+                  (batch_size, num_heads, sequence_length, key_value_length).
+                - past_key_values (TransformerCache | RaggedPagesCache | HybridCache): Updated
+                  cache with new key-value states for all layers.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are None or both are provided.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
+
+        Note:
+            Gemma2 applies sqrt(hidden_size) scaling to input embeddings before processing.
+            The model alternates between sliding window attention (4096 tokens) on odd layers
+            and full attention on even layers for efficiency.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -569,29 +607,60 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
-        """Forward pass of the causal language model.
+        """Forward pass of the Gemma2 causal language model.
+
+        Processes input tokens through the base Gemma2 model and applies the language modeling
+        head to produce next-token prediction logits with optional soft-capping.
 
         Args:
-            input_ids (Optional[chex.Array], optional): Input token IDs. Defaults to None.
-            inputs_embeds (Optional[chex.Array], optional): Pre-computed input embeddings. Defaults to None.
-            attention_mask (Optional[chex.Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
-            position_ids (Optional[chex.Array], optional): Position IDs for positional embeddings. Defaults to None.
-            segment_ids (Optional[chex.Array], optional): Segment IDs for segment embeddings. Defaults to None.
-            output_attentions (Optional[bool], optional): Whether to return attention weights. Defaults to None.
-            output_hidden_states (Optional[bool], optional): Whether to return hidden states. Defaults to None.
-            past_key_values (Optional[TransformerCache | RaggedPagesCache], optional): Cached key values for faster
-                inference. Defaults to None.
-            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata], optional): Metadata for cache
-                handling. Defaults to None.
+            input_ids (Int[Array, "batch seq_len"], optional): Input token IDs.
+                Shape: (batch_size, sequence_length). Must be provided if inputs_embeds is None.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"], optional): Pre-computed
+                input embeddings. Shape: (batch_size, sequence_length, hidden_size).
+                Must be provided if input_ids is None.
+            attention_mask (Bool[Array, "batch seq_len"], optional): Attention mask indicating
+                which tokens should be attended to. Shape: (batch_size, sequence_length).
+                Default: None (all tokens attended).
+            mask_info (MaskInfo, optional): Pre-computed mask information. If None, computed
+                from attention_mask or input_ids.
+            position_ids (Int[Array, "batch seq_len"], optional): Position indices for each token.
+                Shape: (batch_size, sequence_length). If None, uses sequential positions.
+            mode (RUNTIME_MODE_TYPES, optional): Execution mode (MODE_TRAIN, MODE_DECODE, MODE_PREFILL).
+                Auto-detected if None based on sequence length and cache.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                Cached key-value states for efficient autoregressive generation. HybridCache
+                is recommended for Gemma2's mixed attention patterns.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata, optional):
+                Metadata for paged attention cache management.
+            apply_lm_head (bool): Whether to apply the language modeling head to produce logits.
+                Set to False to only get hidden states. Default: True.
+            output_attentions (bool, optional): Whether to return attention weights from all layers.
+                Default: None (uses config value).
+            output_hidden_states (bool, optional): Whether to return hidden states from all layers.
+                Default: None (uses config value).
 
         Returns:
-                Union[CausalLMOutput, Tuple]: Model outputs containing logits and optional hidden states and attentions.
+            CausalLMOutput: Model outputs containing:
+                - logits (jnp.ndarray, optional): Next-token prediction logits if apply_lm_head=True.
+                  Shape: (batch_size, sequence_length, vocab_size). Soft-capping is applied if
+                  final_logit_softcapping is configured (logits = tanh(logits / cap) * cap).
+                - hidden_states (tuple[jnp.ndarray], optional): Hidden states from each layer
+                  if output_hidden_states=True.
+                - attentions (tuple[jnp.ndarray], optional): Attention weights from each layer
+                  if output_attentions=True.
+                - past_key_values (TransformerCache | RaggedPagesCache | HybridCache): Updated
+                  cache with new key-value states.
+
+        Note:
+            Gemma2 applies final_logit_softcapping (default: 30.0) via tanh to prevent extreme
+            logit values and improve training stability. The formula is:
+            logits = tanh(logits / final_logit_softcapping) * final_logit_softcapping
         """
 
         outputs = self.model(
@@ -658,8 +727,12 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Gemma2Config, model_type="gemma2")
-class Gemma2ForSequenceClassification(EasyDeLBaseModule):
+class Gemma2ForSequenceClassification(BaseSequenceClassificationModule[Gemma2Model, Gemma2Config]):
     """Gemma2 text encoder with a classification head for sequence-level tasks."""
+
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "gemma2"
+    _config_class = Gemma2Config
 
     def __init__(
         self,
@@ -672,31 +745,14 @@ class Gemma2ForSequenceClassification(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=Gemma2Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = Gemma2Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            self.config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
+            pooling_strategy="last",
+            score_head_bias=False,
         )
 
     def __call__(
@@ -707,8 +763,8 @@ class Gemma2ForSequenceClassification(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:

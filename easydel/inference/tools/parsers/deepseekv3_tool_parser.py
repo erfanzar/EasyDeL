@@ -56,7 +56,7 @@ class DeepSeekV3ToolParser(ToolParser):
         tool_calls_end_token (str): Token marking end of tool calls section
         tool_call_start_token (str): Token marking start of individual tool call
         tool_call_end_token (str): Token marking end of individual tool call
-    """  # noqa
+    """
 
     def __init__(self, tokenizer: AnyTokenizer):
         super().__init__(tokenizer)
@@ -66,21 +66,21 @@ class DeepSeekV3ToolParser(ToolParser):
         self.current_tool_id: int = -1
         self.streamed_args_for_tool: list[str] = []
 
-        self.tool_calls_start_token: str = "<｜tool▁calls▁begin｜>"  # noqa
-        self.tool_calls_end_token: str = "<｜tool▁calls▁end｜>"  # noqa
+        self.tool_calls_start_token: str = "<｜tool▁calls▁begin｜>"
+        self.tool_calls_end_token: str = "<｜tool▁calls▁end｜>"
 
-        self.tool_call_start_token: str = "<｜tool▁call▁begin｜>"  # noqa
-        self.tool_call_end_token: str = "<｜tool▁call▁end｜>"  # noqa
+        self.tool_call_start_token: str = "<｜tool▁call▁begin｜>"
+        self.tool_call_end_token: str = "<｜tool▁call▁end｜>"
 
         self.tool_call_regex = re.compile(
-            r"<｜tool▁call▁begin｜>(?P<type>.*)<｜tool▁sep｜>(?P<function_name>.*)\n```json\n(?P<function_arguments>.*)\n```<｜tool▁call▁end｜>"  # noqa
+            r"<｜tool▁call▁begin｜>(?P<type>.*)<｜tool▁sep｜>(?P<function_name>.*)\n```json\n(?P<function_arguments>.*)\n```<｜tool▁call▁end｜>"
         )
 
         self.stream_tool_call_portion_regex = re.compile(
-            r"(?P<type>.*)<｜tool▁sep｜>(?P<function_name>.*)\n```json\n(?P<function_arguments>.*[^\n`])"  # noqa
+            r"(?P<type>.*)<｜tool▁sep｜>(?P<function_name>.*)\n```json\n(?P<function_arguments>.*[^\n`])"
         )
 
-        self.stream_tool_call_name_regex = re.compile(r"(?P<type>.*)<｜tool▁sep｜>(?P<function_name>.*)\n")  # noqa
+        self.stream_tool_call_name_regex = re.compile(r"(?P<type>.*)<｜tool▁sep｜>(?P<function_name>.*)\n")
 
         if not self.model_tokenizer:
             raise ValueError("The model tokenizer must be passed to the ToolParser constructor during construction.")

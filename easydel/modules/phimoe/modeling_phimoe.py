@@ -15,23 +15,24 @@
 
 import functools
 
-import chex
 import jax.lax
-from chex import Array
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
+from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention_unified import UnifiedAttention
+from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -229,37 +230,66 @@ class PhiMoeSparseMoeBlock(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        deterministic: bool = False,
-    ) -> tuple[chex.Array, chex.Array]:
+        hidden_states: Array,
+        deterministic: bool = True,
+    ) -> tuple[Array, Array]:
         """Forward pass of the Sparse MoE block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states. Shape: (batch_size * sequence_length, hidden_size).
+            hidden_states (Array): Input hidden states. Shape: (batch_size * sequence_length, hidden_size).
             deterministic (bool): If True, disables dropout/jitter for deterministic behavior. Defaults to False.
 
         Returns:
-            tp.Tuple[chex.Array, chex.Array]:
+            tp.Tuple[Array, Array]:
                 - final_hidden_states: Output hidden states after MoE processing.
                   Shape: (batch_size * sequence_length, hidden_size).
                 - router_logits: Logits computed by the router gate.
                   Shape: (batch_size * sequence_length, num_local_experts).
         """
-        _batch_size, _sequence_length, hidden_dim = hidden_states.shape
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_dim)
 
         router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
             jnp.promote_types(self.dtype, jnp.float32)
         )
-        routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
-        routing_weights = jax.nn.softmax(routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1)
-        if not deterministic and self.input_jitter_noise > 0:
-            final_hidden_state = jax.nn.initializers.uniform(
-                1.0 - self.input_jitter_noise,
-                1.0 + self.input_jitter_noise,
-            )(self.make_rng(), hidden_states.shape, hidden_states.dtype)
+
+        def _sparsemixer_eval(scores: Array, jitter_eps: float) -> tuple[Array, Array]:
+            tokens = scores.shape[0]
+            max_vals = jnp.max(scores, axis=-1, keepdims=True)
+            max_ind = jnp.argmax(scores, axis=-1, keepdims=True)
+
+            factor = jnp.maximum(jnp.abs(scores), max_vals)
+            threshold_mask = ((max_vals - scores) / factor) > (2 * jitter_eps)
+            masked_gates = jnp.where(threshold_mask, -jnp.inf, scores)
+            masked_probs = jax.nn.softmax(masked_gates, axis=-1)
+            multiplier_1 = jnp.take_along_axis(masked_probs, max_ind, axis=-1)
+
+            masked_scores = scores.at[jnp.arange(tokens), max_ind.squeeze(-1)].set(-jnp.inf)
+            max_vals_2 = jnp.max(masked_scores, axis=-1, keepdims=True)
+            max_ind_2 = jnp.argmax(masked_scores, axis=-1, keepdims=True)
+
+            factor_2 = jnp.maximum(jnp.abs(scores), max_vals_2)
+            threshold_mask_2 = ((max_vals_2 - scores) / factor_2) > (2 * jitter_eps)
+            masked_gates_2 = jnp.where(threshold_mask_2, -jnp.inf, masked_scores)
+            masked_probs_2 = jax.nn.softmax(masked_gates_2, axis=-1)
+            multiplier_2 = jnp.take_along_axis(masked_probs_2, max_ind_2, axis=-1)
+
+            multiplier = jnp.concatenate([multiplier_1, multiplier_2], axis=-1)
+            selected_experts = jnp.concatenate([max_ind, max_ind_2], axis=-1).astype(jnp.int32)
+            return multiplier, selected_experts
+
+        if deterministic:
+            routing_weights, selected_experts = _sparsemixer_eval(
+                router_logits,
+                jitter_eps=float(self.router_jitter_noise),
+            )
         else:
-            final_hidden_state = jnp.zeros_like(hidden_states)
+            routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
+            routing_weights = jax.nn.softmax(
+                routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)),
+                axis=-1,
+            )
+        final_hidden_state = jnp.zeros_like(hidden_states)
         for index in range(self.config.num_local_experts):
             expert_layer_output = (
                 block_wise_ffn(
@@ -270,11 +300,11 @@ class PhiMoeSparseMoeBlock(nn.Module):
                 if self.config.use_scan_mlp
                 else self.experts[index](hidden_states)
             )
-            expert_layer_output_exp = (
-                jnp.sum(jnp.multiply(selected_experts == index, routing_weights), axis=-1)[:, :, None]
-                * expert_layer_output
-            )
+            expert_weight = jnp.sum((selected_experts == index) * routing_weights, axis=-1)
+            expert_layer_output_exp = expert_layer_output * expert_weight[:, None]
             final_hidden_state += checkpoint_name(expert_layer_output_exp, "moe_expert_output")
+        final_hidden_state = final_hidden_state.reshape(batch_size, sequence_length, hidden_dim)
+        router_logits = router_logits.reshape(batch_size, sequence_length, -1)
         return final_hidden_state, checkpoint_name(router_logits, "moe_router_logits")
 
 
@@ -374,7 +404,7 @@ class PhiMoeDecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -382,20 +412,20 @@ class PhiMoeDecoderLayer(nn.Module):
         """Forward pass of the PhiMoeDecoderLayer module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
+            causal_mask (tp.Optional[Array | bool]): Causal mask for ensuring autoregressive behavior.
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
             cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
             output_attentions (bool): Whether to return attention weights. Default is False.
             output_router_logits (bool): Whether to return router logits from the MoE layer. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+            fcm_mask (tp.Optional[Array]): Flash Chunking Mask (FCM) for attention.
+            frequencies (tp.Optional[Array]): Precomputed rotary frequency embeddings.
 
         Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array], tp.Optional[chex.Array]]:
+            tp.Tuple[Array, tp.Optional[Array], tp.Optional[Array]]:
                 A tuple containing:
                 - hidden_states: Output hidden states after the decoder layer.
                 - self_attn_weights: Attention weights (if `output_attentions` is True).
@@ -434,14 +464,12 @@ class PhiMoeDecoderLayer(nn.Module):
         hidden_states = checkpoint_name(residual + hidden_states, "residual")
         hidden_states = checkpoint_name(hidden_states, "layer_output")
 
-        outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (self_attn_weights,)
-
-        if output_router_logits:
-            outputs += (router_logits,)
-        return outputs
+        return DecoderLayerOutput(
+            hidden_states=hidden_states,
+            attention_weight=self_attn_weights if output_attentions else None,
+            router_logits=router_logits if output_router_logits else None,
+            cache_view=attn_outputs.cache_view,
+        )
 
 
 @register_module(TaskType.BASE_MODULE, config=PhiMoeConfig, model_type="phimoe")
@@ -536,22 +564,22 @@ class PhiMoeModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
         """Forward pass of the PhiMoeModel.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
+            inputs_embeds (tp.Optional[Array]): Input embeddings.
                 Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
                 Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+            position_ids (tp.Optional[Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+            segment_ids (tp.Optional[Array]): Segment IDs (unused).
             output_attentions (tp.Optional[bool]): Whether to return attention weights.
                 Defaults to `config.output_attentions`.
             output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
@@ -669,7 +697,7 @@ class PhiMoeModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=PhiMoeConfig, model_type="phimoe")
-class PhiMoeForCausalLM(EasyDeLBaseModule):
+class PhiMoeForCausalLM(BaseCausalLMModule[PhiMoeModel, PhiMoeConfig]):
     """PhiMoE model with a Causal Language Modeling head.
 
     This model consists of the base PhiMoE transformer (`PhiMoeModel`) followed by a
@@ -686,6 +714,10 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
         model (PhiMoeModel): The core PhiMoE transformer model.
         lm_head (ParallelLinear): The linear layer for projecting hidden states to vocabulary logits.
     """
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "phimoe"
+    _config_class = PhiMoeConfig
 
     def __init__(
         self,
@@ -707,35 +739,13 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
         """
         super().__init__(
             config=config,
+            base_model_class=PhiMoeModel,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = PhiMoeModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.vocab_size = self.config.vocab_size
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            use_bias=config.lm_head_bias,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            lm_head_bias=config.lm_head_bias,
         )
 
     def __call__(
@@ -748,21 +758,21 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> CausalLMOutput:
         """Forward pass of the PhiMoeForCausalLM model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
+            inputs_embeds (tp.Optional[Array]): Input embeddings.
                 Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
                 Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+            position_ids (tp.Optional[Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+            segment_ids (tp.Optional[Array]): Segment IDs (unused).
             output_attentions (tp.Optional[bool]): Whether to return attention weights.
                 Defaults to `config.output_attentions`.
             output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.

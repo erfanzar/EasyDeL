@@ -4,16 +4,16 @@ EasyData integrates seamlessly with all EasyDeL trainers. This guide covers best
 
 ## Quick Reference
 
-| Trainer | Dataset Format | Preprocessing |
-|---------|---------------|---------------|
-| `SFTTrainer` | Text or chat messages | Chat template applied |
-| `DPOTrainer` | Chosen/rejected pairs | Prompt extraction + tokenization |
-| `ORPOTrainer` | Chosen/rejected pairs | Same as DPO |
-| `KTOTrainer` | Unpaired or paired preference | Unpairs + tokenizes |
-| `GRPOTrainer` | Prompts (with reward function) | Prompt extraction |
-| `RewardTrainer` | Chosen/rejected pairs | Tokenization |
-| `CPOTrainer` | Chosen/rejected pairs | Same as DPO |
-| `BCOTrainer` | Prompt/completion/label | Tokenization |
+| Trainer         | Dataset Format                 | Preprocessing                    |
+| --------------- | ------------------------------ | -------------------------------- |
+| `SFTTrainer`    | Text or chat messages          | Chat template applied            |
+| `DPOTrainer`    | Chosen/rejected pairs          | Prompt extraction + tokenization |
+| `ORPOTrainer`   | Chosen/rejected pairs          | Same as DPO                      |
+| `KTOTrainer`    | Unpaired or paired preference  | Unpairs + tokenizes              |
+| `GRPOTrainer`   | Prompts (with reward function) | Prompt extraction                |
+| `RewardTrainer` | Chosen/rejected pairs          | Tokenization                     |
+| `CPOTrainer`    | Chosen/rejected pairs          | Same as DPO                      |
+| `BCOTrainer`    | Prompt/completion/label        | Tokenization                     |
 
 ## SFT Training
 
@@ -31,7 +31,7 @@ trainer = ed.SFTTrainer(
     train_dataset=dataset,
     processing_class=tokenizer,
     arguments=ed.SFTConfig(
-        max_sequence_length=2048,
+        max_length=2048,
         # Chat template applied automatically
     ),
 )
@@ -83,7 +83,7 @@ trainer = ed.SFTTrainer(
     train_dataset=source,  # Works directly
     processing_class=tokenizer,
     arguments=ed.SFTConfig(
-        max_sequence_length=2048,
+        max_length=2048,
     ),
 )
 ```
@@ -521,7 +521,7 @@ ed.DPOConfig(
 
 # SFT: single length
 ed.SFTConfig(
-    max_sequence_length=2048,  # Total length
+    max_length=2048,  # Total length
 )
 
 # GRPO: prompt length + generation length

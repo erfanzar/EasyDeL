@@ -16,8 +16,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from eformer.pytree import auto_pytree
-
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
@@ -25,7 +23,6 @@ from ..training_configurations import TrainingArguments
 
 
 @Registry.register("trainer-arguments", "kto")
-@auto_pytree
 @dataclass
 class KTOConfig(TrainingArguments):
     """Configuration for the :class:`~easydel.trainers.KTOTrainer`."""
@@ -91,12 +88,11 @@ class KTOConfig(TrainingArguments):
         metadata={"help": "Whether to precompute reference log probabilities into the dataset."},
     )
 
-    def __post_init__(self):
+    def __post_init__(self, max_sequence_length: int | None):
+        self._handle_deprecated_max_sequence_length(max_sequence_length)
         if self.max_completion_length is None and self.max_length is not None and self.max_prompt_length is not None:
             self.max_completion_length = max(self.max_length - self.max_prompt_length, 1)
-        if self.max_length is not None:
-            self.max_sequence_length = self.max_length
         if hasattr(super(), "__post_init__"):
-            super().__post_init__()
+            super().__post_init__(max_sequence_length=None)
 
     __hash__ = hash_fn

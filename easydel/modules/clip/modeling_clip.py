@@ -14,7 +14,6 @@
 import typing as tp
 from functools import cached_property, partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -38,6 +37,7 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import ACT2FN, ArrayParam
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.base_modules import BaseImageClassificationModule
 from easydel.layers.linear import ColumnParallelLinear
 
 from .clip_configuration import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
@@ -136,10 +136,10 @@ class CLIPVisionEmbeddings(nn.Module):
         Forward pass for vision embeddings.
 
         Args:
-                pixel_values (chex.Array): Input pixel values (batch_size, num_channels, height, width).
+                pixel_values (Array): Input pixel values (batch_size, num_channels, height, width).
 
         Returns:
-                chex.Array: Combined class and patch embeddings.
+                Array: Combined class and patch embeddings.
         """
         patch_embeds = self.patch_embedding(pixel_values)
         batch_size, height, width, channels = patch_embeds.shape
@@ -203,11 +203,11 @@ class CLIPTextEmbeddings(nn.Module):
         Forward pass for text embeddings.
 
         Args:
-                input_ids (chex.Array): Input token IDs.
-                position_ids (chex.Array): Position IDs.
+                input_ids (Array): Input token IDs.
+                position_ids (Array): Position IDs.
 
         Returns:
-                chex.Array: Combined token and position embeddings.
+                Array: Combined token and position embeddings.
         """
         input_embeds = self.token_embedding(input_ids.astype("i4"))
         position_embeds = self.position_embedding(position_ids.astype("i4"))
@@ -271,6 +271,7 @@ class CLIPAttention(AttentionModule):
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
+            requires_cache=False,  # Vision/text encoder doesn't need KV cache
         )
 
     def _split_heads(self, hidden_states):
@@ -278,10 +279,10 @@ class CLIPAttention(AttentionModule):
         Splits hidden states into multiple heads.
 
         Args:
-                hidden_states (chex.Array): Input hidden states.
+                hidden_states (Array): Input hidden states.
 
         Returns:
-                chex.Array: Reshaped hidden states.
+                Array: Reshaped hidden states.
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads, self.head_dim))
 
@@ -290,10 +291,10 @@ class CLIPAttention(AttentionModule):
         Merges multiple heads back into a single hidden state tensor.
 
         Args:
-                hidden_states (chex.Array): Input hidden states.
+                hidden_states (Array): Input hidden states.
 
         Returns:
-                chex.Array: Merged hidden states.
+                Array: Merged hidden states.
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
 
@@ -307,13 +308,13 @@ class CLIPAttention(AttentionModule):
         Forward pass for the CLIP attention module.
 
         Args:
-                hidden_states (chex.Array): Input hidden states.
-                attention_mask (Optional[chex.Array]): Mask to prevent attention to certain positions.
-                causal_mask (Optional[chex.Array]): Causal mask for text attention.
+                hidden_states (Array): Input hidden states.
+                attention_mask (Optional[Array]): Mask to prevent attention to certain positions.
+                causal_mask (Optional[Array]): Causal mask for text attention.
                 output_attentions (bool): Whether to output attention weights.
 
         Returns:
-                Tuple[chex.Array, Optional[chex.Array]]: Attention output and optionally attention weights.
+                Tuple[Array, Optional[Array]]: Attention output and optionally attention weights.
         """
         query = checkpoint_name(self.q_proj(hidden_states), name="attn_query")
         key = checkpoint_name(self.k_proj(hidden_states), name="attn_key")
@@ -389,10 +390,10 @@ class CLIPMLP(nn.Module):
         Forward pass for the MLP layer.
 
         Args:
-                hidden_states (chex.Array): Input hidden states.
+                hidden_states (Array): Input hidden states.
 
         Returns:
-                chex.Array: Output hidden states.
+                Array: Output hidden states.
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -475,13 +476,13 @@ class CLIPEncoderLayer(nn.Module):
         Forward pass for the encoder layer.
 
         Args:
-                hidden_states (chex.Array): Input hidden states.
-                attention_mask (Optional[chex.Array]): Attention mask.
-                causal_mask (Optional[chex.Array]): Causal mask (for text).
+                hidden_states (Array): Input hidden states.
+                attention_mask (Optional[Array]): Attention mask.
+                causal_mask (Optional[Array]): Causal mask (for text).
                 output_attentions (bool): Whether to output attention weights.
 
         Returns:
-                Tuple[chex.Array, ...]: Output hidden states and optional attention weights.
+                Tuple[Array, ...]: Output hidden states and optional attention weights.
         """
         residual = hidden_states
 
@@ -548,7 +549,7 @@ class CLIPEncoder(nn.Module):
         Returns the causal mask if the encoder is for text, otherwise None.
 
         Returns:
-                Optional[chex.Array]: Causal mask.
+                Optional[Array]: Causal mask.
         """
         if isinstance(self.config, CLIPTextConfig):
             return self.config.get_basic_causal_mask()
@@ -565,8 +566,8 @@ class CLIPEncoder(nn.Module):
         Forward pass for the CLIP encoder.
 
         Args:
-                inputs_embeds (chex.Array): Input embeddings.
-                attention_mask (Optional[chex.Array]): Attention mask.
+                inputs_embeds (Array): Input embeddings.
+                attention_mask (Optional[Array]): Attention mask.
                 output_attentions (bool): Whether to output attention weights.
                 output_hidden_states (bool): Whether to output all hidden states.
 
@@ -666,9 +667,9 @@ class CLIPTextTransformer(EasyDeLBaseModule):
         """Forward pass for the text transformer.
 
         Args:
-                input_ids (chex.Array): Input token IDs.
-                attention_mask (chex.Array): Attention mask.
-                position_ids (chex.Array): Position IDs.
+                input_ids (Array): Input token IDs.
+                attention_mask (Array): Attention mask.
+                position_ids (Array): Position IDs.
                 output_attentions (bool): Whether to output attention weights.
                 output_hidden_states (bool): Whether to output all hidden states.
 
@@ -798,14 +799,14 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
 
     def __call__(
         self,
-        pixel_values: chex.Array | None = None,
+        pixel_values: Array | None = None,
         output_attentions=None,
         output_hidden_states=None,
     ):
         """Forward pass for the vision transformer.
 
         Args:
-                pixel_values (Optional[chex.Array]): Input pixel values.
+                pixel_values (Optional[Array]): Input pixel values.
                 output_attentions (Optional[bool]): Whether to output attention weights.
                 output_hidden_states (Optional[bool]): Whether to output all hidden states.
 
@@ -918,9 +919,9 @@ class CLIPTextModel(EasyDeLBaseModule):
         """Forward pass for the bare CLIP text model.
 
         Args:
-                input_ids (chex.Array): Input token IDs.
-                attention_mask (chex.Array): Attention mask (1 for tokens to attend, 0 for masked).
-                position_ids (chex.Array): Position IDs. If None, will be generated automatically.
+                input_ids (Array): Input token IDs.
+                attention_mask (Array): Attention mask (1 for tokens to attend, 0 for masked).
+                position_ids (Array): Position IDs. If None, will be generated automatically.
                 output_attentions (bool): Whether to output attention weights.
                 output_hidden_states (bool): Whether to output all hidden states.
 
@@ -1028,9 +1029,9 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
         """Forward pass for the CLIP text model with projection.
 
         Args:
-                input_ids (chex.Array): Input token IDs.
-                attention_mask (chex.Array): Attention mask.
-                position_ids (chex.Array): Position IDs.
+                input_ids (Array): Input token IDs.
+                attention_mask (Array): Attention mask.
+                position_ids (Array): Position IDs.
                 output_attentions (bool): Whether to output attention weights.
                 output_hidden_states (bool): Whether to output all hidden states.
 
@@ -1123,14 +1124,14 @@ class CLIPVisionModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        pixel_values: chex.Array,
+        pixel_values: Array,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
         """Forward pass for the bare CLIP vision model.
 
         Args:
-                pixel_values (chex.Array): Input pixel values.
+                pixel_values (Array): Input pixel values.
                 output_attentions (bool): Whether to output attention weights.
                 output_hidden_states (bool): Whether to output all hidden states.
 
@@ -1172,7 +1173,7 @@ class CLIPVisionModel(EasyDeLBaseModule):
 
 
 @register_module(config=CLIPVisionConfig, model_type="clip", task_type=TaskType.IMAGE_CLASSIFICATION)
-class CLIPForImageClassification(EasyDeLBaseModule):
+class CLIPForImageClassification(BaseImageClassificationModule[CLIPVisionTransformer, CLIPVisionConfig]):
     """
     CLIP vision model with an image classification head on top (a linear layer on the pooled final hidden state).
 
@@ -1196,30 +1197,18 @@ class CLIPForImageClassification(EasyDeLBaseModule):
         """Initializes the CLIPForImageClassification model."""
         super().__init__(
             config=config,
+            base_model_class=CLIPVisionTransformer,
+            base_model_name="vision_model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.vision_model = CLIPVisionTransformer(
-            config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.classifier = ColumnParallelLinear(
-            config.vision_config.hidden_size,
-            config.num_labels,
-            rngs=rngs,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
+            pooling_strategy="mean",
         )
 
     def __call__(
         self,
-        pixel_values: chex.Array | None = None,
+        pixel_values: Array | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> tuple | ImageClassifierOutput:
@@ -1342,13 +1331,44 @@ class CLIPModel(EasyDeLBaseModule):
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"],
-        pixel_values: chex.Array,
+        pixel_values: Array,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions=None,
         output_hidden_states=None,
     ) -> CLIPOutput:
+        """Performs forward pass through CLIP's dual-encoder architecture.
+
+        Processes images through the vision transformer and text through the text transformer,
+        projects both to a shared embedding space, and computes contrastive similarity logits
+        between all image-text pairs in the batch.
+
+        Args:
+            input_ids: Text token IDs of shape (batch_size, sequence_length). Tokenized text
+                inputs for the text encoder.
+            pixel_values: Image pixel values of shape (batch_size, channels, height, width)
+                or (batch_size, height, width, channels) depending on data format. Preprocessed
+                images for the vision encoder.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) for text,
+                indicating which tokens to attend to. Auto-generated as all-ones if not provided.
+            mask_info: Pre-computed mask information for text. If provided, overrides
+                `attention_mask`.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length)
+                for text. Auto-generated from attention_mask if not provided.
+            output_attentions: Whether to return attention weights from vision and text encoders.
+            output_hidden_states: Whether to return hidden states from all layers of both encoders.
+
+        Returns:
+            CLIPOutput containing:
+                - logits_per_image: Similarity scores of shape (batch, batch) where entry [i,j]
+                    is the scaled cosine similarity between image i and text j
+                - logits_per_text: Transposed similarity scores of shape (batch, batch)
+                - text_embeds: L2-normalized text embeddings of shape (batch, projection_dim)
+                - image_embeds: L2-normalized image embeddings of shape (batch, projection_dim)
+                - text_model_output: Full output from text encoder including hidden states
+                - vision_model_output: Full output from vision encoder including hidden states
+        """
         if attention_mask is None and input_ids is not None:
             attention_mask = jnp.ones_like(input_ids)
         if position_ids is None and attention_mask is not None:
@@ -1408,7 +1428,7 @@ class CLIPModel(EasyDeLBaseModule):
         text_features = checkpoint_name(self.text_projection(pooled_output), name="text_projection_output")
         return text_features
 
-    def get_image_features(self, pixel_values: chex.Array):
+    def get_image_features(self, pixel_values: Array):
         vision_outputs = self.vision_model(pixel_values=pixel_values)
         pooled_output = vision_outputs[1]  # pooled_output
         image_features = checkpoint_name(self.visual_projection(pooled_output), name="visual_projection_output")

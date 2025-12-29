@@ -321,7 +321,6 @@ class AsyncDataLoader(AsyncDataset[dict]):
         # Batch
         batches = batch_iterator(examples, self._batch_size, self._drop_last)
 
-        # Apply sharding
         if self._sharding_map:
             batches = (preshard_batch(b, self._sharding_map) for b in batches)
 

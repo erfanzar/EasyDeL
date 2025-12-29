@@ -95,6 +95,7 @@ class GPTNeoXConfig(EasyDeLBaseConfig):
         rope_scaling=None,
         attention_bias=True,
         gradient_checkpointing=EasyDeLGradientCheckPointers.NONE,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes a GPTNeoXConfig object.
@@ -147,6 +148,9 @@ class GPTNeoXConfig(EasyDeLBaseConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.from_pt = False
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
     def get_partition_rules(self, *args, **kwargs):

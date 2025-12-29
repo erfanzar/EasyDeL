@@ -4,10 +4,14 @@ easydel.layers.operations.modules package
 .. toctree::
    :maxdepth: 2
 
-   layers/operations/modules/blocksparse_attention
-   layers/operations/modules/decode_attention
-   layers/operations/modules/flash_attention
-   layers/operations/modules/ragged_page_attention
-   layers/operations/modules/ring_attention
-   layers/operations/modules/scaled_dot_product_attention
-   layers/operations/modules/vanilla_attention
+   blocksparse_attention
+   decode_attention
+   flash_attention
+   gated_delta_rule
+   kda
+   ragged_page_attention
+   ring_attention
+   scaled_dot_product_attention
+   ssm1
+   ssm2
+   vanilla_attention

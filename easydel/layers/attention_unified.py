@@ -45,7 +45,13 @@ from easydel.infra.modeling_outputs import AttentionLayerOutput
 from easydel.infra.utils import get_dot_general_by_bits
 
 from .attention import AttentionModule, FlexibleAttentionModule
-from .caching import RaggedPagesCacheView, RaggedPagesMetadata, TransformerCacheView, TransformerMetadata
+from .caching import (
+    OperationsMetadata,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from .linear import ColumnParallelLinear, RowParallelLinear
 from .norms import RMSNorm
 
@@ -745,7 +751,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
@@ -782,7 +788,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         batch_size: int = hidden_states.shape[0]
         sequence_length: int = hidden_states.shape[1]
 
-        # 1. Project Q/K/V
         if self.use_fused_qkv:
             qkv = checkpoint_name(self.query_key_value_projection(hidden_states), "attn_qkv")
             if self.use_gqa:
@@ -822,10 +827,17 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             self.num_key_value_heads,
             self.head_dim,
         )
-        # 3. POST-PROCESSING HOOK: Apply Q/K norm or other transformations
         query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
         query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
+
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
+
+        sliding_window_for_kernel = self.sliding_window
+        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            sliding_window_for_kernel = None
 
         (
             key_states,
@@ -841,13 +853,12 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             cache_view=cache_view,
             cache_metadata=cache_metadata,
             mask_info=mask_info,
-            sliding_window=self.sliding_window,
+            sliding_window=sliding_window_for_kernel,
         )
 
         softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
         softmax_aux = getattr(softmax_aux, "value", softmax_aux)
 
-        # 7. Compute attention
         attentions: AttentionLayerOutput = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -858,20 +869,18 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             cache_view=cache_view,
             init_bias=init_attention_bias,
             mask_info=mask_info,
-            causal=self.causal,
-            sliding_window=self.sliding_window,
+            causal=causal_for_kernel,
+            sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
         )
 
         if attentions.cache_view is not None:
             cache_view = attentions.cache_view
 
-        # 8. Merge heads and output projection
         attention_out = self._merge_heads(attentions.attention_outputs)
         attn_output = self.shard_attention_prod(attention_out)
         attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
 
-        # 9. Optional residual dropout
         if hasattr(self, "resid_dropout"):
             attn_output = self.resid_dropout(attn_output)
 
@@ -888,7 +897,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
@@ -969,6 +978,15 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         value_states = value_states.transpose(0, 2, 1, 3)
 
         # Concatenate with KV cache
+
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
+
+        sliding_window_for_kernel = self.sliding_window
+        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            sliding_window_for_kernel = None
+
         (
             key_states,
             value_states,
@@ -998,8 +1016,8 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             cache_view=cache_view,
             init_bias=init_attention_bias,
             mask_info=mask_info,
-            causal=self.causal,
-            sliding_window=self.sliding_window,
+            causal=causal_for_kernel,
+            sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
         )
 
@@ -1020,7 +1038,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
     ) -> AttentionLayerOutput:
@@ -1030,25 +1048,25 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         """
         batch_size, sequence_length = hidden_states.shape[:2]
 
-        # 1. Project Q/K/V (no RoPE)
         query_states = checkpoint_name(self.query_projection(hidden_states), "attn_query")
         key_states = checkpoint_name(self.key_projection(hidden_states), "attn_key")
         value_states = checkpoint_name(self.value_projection(hidden_states), "attn_value")
 
-        # 2. Reshape to multi-head format
         query_states = query_states.reshape(batch_size, sequence_length, self.num_heads, self.head_dim)
         key_states = key_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
         value_states = value_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
 
-        # 3. Post-processing (Q/K norm if configured)
         query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
 
-        # 4. Apply sharding
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
-        # 5. NO RoPE - ALiBi handles positions via bias
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
 
-        # 6. KV cache concatenation
+        sliding_window_for_kernel = self.sliding_window
+        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            sliding_window_for_kernel = None
         (
             key_states,
             value_states,
@@ -1065,7 +1083,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             mask_info=mask_info,
         )
 
-        # 7. Use external ALiBi bias if provided, otherwise compute it
         if alibi is not None:
             alibi_bias = alibi
         else:
@@ -1074,7 +1091,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
         softmax_aux = getattr(softmax_aux, "value", softmax_aux)
 
-        # 8. Compute attention with ALiBi bias
         attentions = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -1085,16 +1101,14 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             cache_view=cache_view,
             init_bias=init_attention_bias,
             mask_info=mask_info,
-            causal=self.causal,
-            sliding_window=self.sliding_window,
+            causal=causal_for_kernel,
+            sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
         )
 
-        # 9. Merge heads and output projection
         attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
         attn_output = checkpoint_name(self.output_projection(attn_output), "attn_output")
 
-        # 10. Optional residual dropout
         if hasattr(self, "resid_dropout"):
             attn_output = self.resid_dropout(attn_output)
 
@@ -1111,7 +1125,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
@@ -1170,3 +1184,42 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
                 frequencies,
                 alibi,
             )
+
+    # Operation access properties for dynamic discovery
+    @property
+    def operation_executor(self):
+        """Get the OperationExecutor from attention_performer.
+
+        Returns:
+            OperationExecutor if attention_performer exists, None otherwise.
+        """
+        if hasattr(self, "attention_performer") and self.attention_performer is not None:
+            return self.attention_performer.operation_executor
+        return None
+
+    @property
+    def operation(self):
+        """Get the primary operation from attention_performer."""
+        if hasattr(self, "attention_performer") and self.attention_performer is not None:
+            return self.attention_performer.operation
+        return None
+
+    @property
+    def operation_requirements(self):
+        """Get requirements from the attention performer.
+
+        Returns:
+            OperationRequirements if attention_performer exists, default otherwise.
+        """
+        from easydel.layers.operations.requirements import OperationRequirements
+
+        if hasattr(self, "attention_performer") and self.attention_performer is not None:
+            return self.attention_performer.operation_requirements
+        return OperationRequirements.default()
+
+    @property
+    def requires_cache(self) -> bool:
+        """Whether this attention layer requires cache."""
+        if hasattr(self, "attention_performer") and self.attention_performer is not None:
+            return self.attention_performer.requires_cache
+        return True

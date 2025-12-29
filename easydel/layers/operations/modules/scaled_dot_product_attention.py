@@ -76,8 +76,16 @@ from jax import random as jr
 from jax.sharding import PartitionSpec
 from jaxtyping import Float, Int
 
+from easydel.layers.caching import TransformerCacheView
+
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from ..requirements import (
+    CacheType,
+    ExecutionMode,
+    MetadataField,
+    OperationRequirements,
+)
 
 
 @OperationRegistry.register
@@ -113,6 +121,20 @@ class ScaledDotProductAttn(OperationImpl):
             The `OperationMetadata` provided during initialization.
         """
         return self.metadata
+
+    @classmethod
+    def get_requirements(cls, mode: ExecutionMode = ExecutionMode.MIXED) -> OperationRequirements:
+        """Returns requirements for ScaledDotProductAttn.
+
+        SDPA requires basic metadata and uses TransformerCacheView
+        for KV-cache management.
+        """
+        return OperationRequirements.create(
+            name="sdpa",
+            required_metadata=MetadataField.basic(),
+            supported_cache=CacheType.TRANSFORMER | CacheType.HYBRID,
+            cache_view_class=TransformerCacheView,
+        )
 
     @jax.named_scope("easydel-sdpa-impl-ejkernel")
     def forward_native(

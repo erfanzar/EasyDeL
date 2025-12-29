@@ -135,14 +135,14 @@ def swap_rows(arr, i1, i2):
         Array with rows i1 and i2 swapped.
 
     Note:
-        Works for both NumPy ndarrays and JAX arrays. Always returns a new array.
+        - NumPy: swaps in-place and returns the same array (no full-array copy).
+        - JAX: returns a new array via `.at[...]` updates.
     """
     if isinstance(arr, np.ndarray):
-        out = np.asarray(arr).copy()
-        tmp = out[i1].copy()
-        out[i1] = out[i2]
-        out[i2] = tmp
-        return out
+        tmp = arr[i1].copy()
+        arr[i1] = arr[i2]
+        arr[i2] = tmp
+        return arr
 
     if hasattr(arr, "at"):
         row_i1 = arr[i1]
@@ -185,12 +185,12 @@ def move_row(arr, from_idx, to_idx):
         Array with row moved from from_idx to to_idx.
 
     Note:
-        Works for both NumPy ndarrays and JAX arrays. Always returns a new array.
+        - NumPy: copies the source row into the destination in-place.
+        - JAX: returns a new array via `.at[...]`.
     """
     if isinstance(arr, np.ndarray):
-        out = np.asarray(arr).copy()
-        out[to_idx] = out[from_idx]
-        return out
+        arr[to_idx] = arr[from_idx]
+        return arr
 
     if hasattr(arr, "at"):
         return arr.at[to_idx].set(arr[from_idx])
@@ -286,7 +286,7 @@ class SequenceBuffer:
 
         self.temperature = np.full((max_num_reqs,), -1.0, dtype=np.float32)
         self.top_p = np.ones((max_num_reqs,), dtype=np.float32)
-        self.top_k = np.full((max_num_reqs,), vocab_size, dtype=np.int32)
+        self.top_k = np.zeros((max_num_reqs,), dtype=np.int32)
         self.min_p = np.zeros((max_num_reqs,), dtype=np.float32)
         self.frequency_penalties = np.zeros((max_num_reqs,), dtype=np.float32)
         self.presence_penalties = np.zeros((max_num_reqs,), dtype=np.float32)
@@ -298,15 +298,8 @@ class SequenceBuffer:
             max_model_len=max_model_len,
             max_num_batched_tokens=max_num_batched_tokens,
             page_sizes=page_sizes,
+            sharding=sharding,
         )
-
-        # Apply sharding only to page_table if provided
-        if sharding is not None:
-
-            def put(a):
-                return jax.device_put(a, sharding)
-
-            self.page_table = jax.tree_util.tree_map(lambda x: put(x) if hasattr(x, "dtype") else x, self.page_table)
 
         # Python bookkeeping
         self._req_ids: list[str | None] = []
@@ -436,13 +429,11 @@ class SequenceBuffer:
 
         # Copy tokens into arrays (NumPy in-place updates)
         num_prompt_tokens_val = min(len(request.prompt_token_ids), self.max_model_len)
-        new_num_prompt_tokens = self.num_prompt_tokens.copy()
-        new_num_prompt_tokens[req_index] = num_prompt_tokens_val
-
-        new_token_ids = self.token_ids.copy()
-        new_token_ids[req_index, :num_prompt_tokens_val] = np.array(
-            request.prompt_token_ids[:num_prompt_tokens_val], dtype=np.int32
-        )
+        self.num_prompt_tokens[req_index] = num_prompt_tokens_val
+        if num_prompt_tokens_val:
+            self.token_ids[req_index, :num_prompt_tokens_val] = np.asarray(
+                request.prompt_token_ids[:num_prompt_tokens_val], dtype=np.int32
+            )
 
         if request.output_token_ids:
             start_idx = num_prompt_tokens_val
@@ -450,28 +441,15 @@ class SequenceBuffer:
             output_tokens_to_copy = request.output_token_ids[:max_output_tokens]
             if output_tokens_to_copy:
                 end_idx = min(start_idx + len(output_tokens_to_copy), self.max_model_len)
-                new_token_ids[req_index, start_idx:end_idx] = np.array(output_tokens_to_copy, dtype=np.int32)
+                self.token_ids[req_index, start_idx:end_idx] = np.asarray(output_tokens_to_copy, dtype=np.int32)
 
         capped_num_tokens = min(int(request.num_tokens), self.max_model_len)
-        new_num_tokens = self.num_tokens.copy()
-        new_num_tokens[req_index] = capped_num_tokens
-
-        new_num_tokens_no_spec = self.num_tokens_no_spec.copy()
-        new_num_tokens_no_spec[req_index] = capped_num_tokens
-
-        new_num_computed_tokens = self.num_computed_tokens.copy()
-        new_num_computed_tokens[req_index] = min(int(request.num_computed_tokens), self.max_model_len)
-
-        # Update arrays in-place
-        self.token_ids = new_token_ids
-        self.num_prompt_tokens = new_num_prompt_tokens
-        self.num_tokens = new_num_tokens
-        self.num_tokens_no_spec = new_num_tokens_no_spec
-        self.num_computed_tokens = new_num_computed_tokens
+        self.num_tokens[req_index] = capped_num_tokens
+        self.num_tokens_no_spec[req_index] = capped_num_tokens
+        self.num_computed_tokens[req_index] = min(int(request.num_computed_tokens), self.max_model_len)
 
         # Page table - mutate in-place
         self.page_table.add_row(request.page_ids, req_index)
-        self.page_table.commit(self.num_reqs)
 
         # Sampling params
         sampling_params = request.sampling_params
@@ -517,6 +495,14 @@ class SequenceBuffer:
             self.has_allowed_token_ids,
         ]:
             req_set.discard(req_id)
+
+        self.temperature[req_index] = -1.0
+        self.top_p[req_index] = 1.0
+        self.top_k[req_index] = 0
+        self.min_p[req_index] = 0.0
+        self.frequency_penalties[req_index] = 0.0
+        self.presence_penalties[req_index] = 0.0
+        self.repetition_penalties[req_index] = 1.0
 
         self.min_tokens.pop(req_index, None)
         self.generator_seeds.pop(req_index, None)
@@ -587,7 +573,6 @@ class SequenceBuffer:
 
         # Page table - mutate in-place
         self.page_table.swap_row(i1, i2)
-        self.page_table.commit(self.num_reqs)
 
         self._update_request_distribution()
 
@@ -667,7 +652,6 @@ class SequenceBuffer:
 
         # Page table - mutate in-place
         self.page_table.move_row(from_idx, to_idx)
-        self.page_table.commit(self.num_reqs)
 
         # Sparse/optional data
         self._move_sparse_data(from_idx, to_idx)
@@ -720,57 +704,47 @@ class SequenceBuffer:
             Maintains separate tracking sets for different sampling strategies
             to enable optimized execution paths. Modifies the buffer in-place.
         """
-        # Copy arrays for modification (NumPy style)
-        temperature = self.temperature.copy()
-        top_p = self.top_p.copy()
-        top_k = self.top_k.copy()
-        min_p = self.min_p.copy()
-        frequency_penalties = self.frequency_penalties.copy()
-        presence_penalties = self.presence_penalties.copy()
-        repetition_penalties = self.repetition_penalties.copy()
+        # Reset defaults for reused slots to avoid stale params.
+        self.temperature[req_index] = -1.0
+        self.top_p[req_index] = 1.0
+        self.top_k[req_index] = 0
+        self.min_p[req_index] = 0.0
+        self.frequency_penalties[req_index] = 0.0
+        self.presence_penalties[req_index] = 0.0
+        self.repetition_penalties[req_index] = 1.0
 
         if sampling_params.sampling_type == SamplingType.GREEDY:
-            temperature[req_index] = -1.0
             self.greedy_reqs.add(req_id)
         else:
-            temperature[req_index] = sampling_params.temperature
+            self.temperature[req_index] = sampling_params.temperature
             self.random_reqs.add(req_id)
 
-        top_p[req_index] = sampling_params.top_p
+        self.top_p[req_index] = sampling_params.top_p
         if sampling_params.top_p < 1:
             self.top_p_reqs.add(req_id)
 
         tk = sampling_params.top_k
         if 0 < tk < self.vocab_size:
             self.top_k_reqs.add(req_id)
-            top_k[req_index] = tk
+            self.top_k[req_index] = tk
         else:
-            top_k[req_index] = self.vocab_size
+            self.top_k[req_index] = 0
 
-        min_p[req_index] = sampling_params.min_p
+        self.min_p[req_index] = sampling_params.min_p
         if sampling_params.min_p > 1e-5:
             self.min_p_reqs.add(req_id)
 
         if sampling_params.frequency_penalty != 0.0:
-            frequency_penalties[req_index] = sampling_params.frequency_penalty
+            self.frequency_penalties[req_index] = sampling_params.frequency_penalty
             self.frequency_penalties_reqs.add(req_id)
 
         if sampling_params.presence_penalty != 0.0:
-            presence_penalties[req_index] = sampling_params.presence_penalty
+            self.presence_penalties[req_index] = sampling_params.presence_penalty
             self.presence_penalties_reqs.add(req_id)
 
         if sampling_params.repetition_penalty != 1.0:
-            repetition_penalties[req_index] = sampling_params.repetition_penalty
+            self.repetition_penalties[req_index] = sampling_params.repetition_penalty
             self.repetition_penalties_reqs.add(req_id)
-
-        # Update arrays in-place
-        self.temperature = temperature
-        self.top_p = top_p
-        self.top_k = top_k
-        self.min_p = min_p
-        self.frequency_penalties = frequency_penalties
-        self.presence_penalties = presence_penalties
-        self.repetition_penalties = repetition_penalties
 
     def _process_optional_params(
         self,
@@ -986,7 +960,7 @@ class SequenceBuffer:
 
         self.temperature = np.full_like(self.temperature, -1.0)
         self.top_p = np.ones_like(self.top_p)
-        self.top_k = np.full_like(self.top_k, self.vocab_size)
+        self.top_k = np.zeros_like(self.top_k)
         self.min_p = np.zeros_like(self.min_p)
         self.frequency_penalties = np.zeros_like(self.frequency_penalties)
         self.presence_penalties = np.zeros_like(self.presence_penalties)

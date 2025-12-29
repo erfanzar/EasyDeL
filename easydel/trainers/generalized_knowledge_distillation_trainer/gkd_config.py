@@ -14,9 +14,7 @@
 
 from __future__ import annotations
 
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -25,7 +23,7 @@ from ..supervised_fine_tuning_trainer import SFTConfig
 
 
 @Registry.register("trainer-arguments", "gkd")
-@auto_pytree
+@dataclass
 class GKDConfig(SFTConfig):
     """Configuration for the :class:`~easydel.trainers.GKDTrainer`.
 
@@ -84,8 +82,8 @@ class GKDConfig(SFTConfig):
 
     __hash__ = hash_fn
 
-    def __post_init__(self):
-        super().__post_init__()
+    def __post_init__(self, max_sequence_length: int | None):
+        super().__post_init__(max_sequence_length=max_sequence_length)
         if not 0.0 <= self.lmbda <= 1.0:
             raise ValueError("`lmbda` must be within [0, 1].")
         if not 0.0 <= self.beta <= 1.0:

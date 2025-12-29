@@ -40,6 +40,8 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.modeling_outputs import VLMCausalLMOutput
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesMetadata,
     TransformerCache,
@@ -117,22 +119,19 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         precision: jax.lax.PrecisionLike = None,
         *,
         rngs: nn.Rngs,
-        # VLM-specific configuration
         vision_feature_layer: int | list[int] = -1,
         vision_feature_select_strategy: str = "default",
         image_token_index: int | None = None,
         video_token_index: int | None = None,
-        # Video processing config (optional)
         temporal_patch_size: int = 2,
         tokens_per_second: float = 1.0,
-        # mRoPE config (optional)
         spatial_merge_size: int = 2,
         mrope_section: tuple[int, int, int] = (24, 20, 20),
-        # Inherited feature flags
         tie_word_embeddings: bool = False,
         logit_cap: float | None = None,
         router_aux_loss_coef: float | None = None,
-        # LM head configuration
+        lm_head_name: str = "lm_head",
+        create_lm_head: bool = True,
         lm_head_bias: bool = False,
         lm_head_kernel_init: Callable | None = None,
     ):
@@ -158,6 +157,8 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             tie_word_embeddings: Whether to tie embeddings with LM head
             logit_cap: Maximum absolute value for logits
             router_aux_loss_coef: Coefficient for MoE router auxiliary loss
+            lm_head_name: Attribute name for the LM head
+            create_lm_head: Whether to create a new LM head on this wrapper
             lm_head_bias: Whether to use bias in LM head
             lm_head_kernel_init: Custom kernel initializer for LM head
         """
@@ -172,8 +173,10 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             rngs=rngs,
             tie_word_embeddings=tie_word_embeddings,
             logit_cap=logit_cap,
+            lm_head_name=lm_head_name,
             lm_head_bias=lm_head_bias,
             lm_head_kernel_init=lm_head_kernel_init,
+            create_lm_head=create_lm_head,
         )
 
         # Get token IDs from config if not provided
@@ -235,6 +238,49 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         """
         raise NotImplementedError(f"{self.__class__.__name__} must implement get_image_features()")
 
+    def compute_embedding(self, input_ids, *args, **kwargs):
+        """Compute input embeddings for vision-language models.
+
+        Delegates to the underlying VLM base model's `compute_embedding` when
+        available, so task wrappers expose the same embedding behavior.
+        """
+        return self.base_model.compute_embedding(input_ids, *args, **kwargs)
+
+    def compute_embedding_with_info(self, input_ids, *args, **kwargs):
+        """Compute embeddings and auxiliary info for vision-language models.
+
+        Delegates to the underlying VLM base model's `compute_embedding_with_info`
+        so task wrappers can surface any extra multimodal tensors needed when
+        passing `inputs_embeds` directly.
+        """
+        # When a wrapper overrides `compute_embedding`, we still want to expose
+        # any auxiliary embedding info (e.g. position_ids / rope_deltas /
+        # deepstack tensors) produced by the underlying base model. Some VLMs
+        # require this info when calling the forward with `inputs_embeds`.
+        if self.__class__.compute_embedding is BaseVisionLanguageModule.compute_embedding:
+            return self.base_model.compute_embedding_with_info(input_ids, *args, **kwargs)
+
+        inputs_embeds = self.compute_embedding(input_ids, *args, **kwargs)
+        embed_info = None
+
+        base_fn = getattr(self.base_model, "compute_embedding_with_info", None)
+        if callable(base_fn):
+            try:
+                _, embed_info = base_fn(input_ids, *args, **kwargs)
+            except TypeError:
+                # Some base models may not accept wrapper-specific kwargs
+                # (e.g. pixel_values). Fall back to passing only parameters that
+                # exist in the base signature.
+                import inspect
+
+                sig = inspect.signature(base_fn)
+                if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                    raise
+                filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+                _, embed_info = base_fn(input_ids, *args, **filtered_kwargs)
+
+        return inputs_embeds, embed_info
+
     def get_video_features(
         self,
         pixel_values_videos: Float[Array, "batch temporal channels height width"],
@@ -278,24 +324,23 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         Returns:
             Merged embeddings with vision features at placeholder positions
         """
-        # Create mask for multimodal positions
+        batch_size, seq_len, hidden = inputs_embeds.shape
         if isinstance(placeholder_token_id, list):
             placeholder_token_id = jnp.array(placeholder_token_id)
             is_multimodal = jnp.isin(input_ids, placeholder_token_id)
         else:
             is_multimodal = input_ids == placeholder_token_id
 
-        # Create dummy row for padding (index 0 maps to dummy)
+        flat_mask = is_multimodal.reshape(-1)
+        flat_embeds = inputs_embeds.reshape(-1, hidden)
+
         dummy_row = jnp.zeros_like(multimodal_embeddings[0:1])
         flattened_padded = jnp.concatenate([dummy_row, multimodal_embeddings], axis=0)
-
-        # Use cumsum to create gather indices
-        gather_indices = jnp.cumsum(is_multimodal)
+        gather_indices = jnp.cumsum(flat_mask)
         update_values = flattened_padded[gather_indices]
 
-        # Conditionally replace embeddings
-        condition = jnp.expand_dims(is_multimodal, axis=-1)
-        return jnp.where(condition, update_values, inputs_embeds)
+        merged = jnp.where(flat_mask[:, None], update_values, flat_embeds)
+        return merged.reshape(batch_size, seq_len, hidden)
 
     def _select_vision_features(
         self,
@@ -413,8 +458,8 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         video_grid_thw: tuple | None = None,
         # Common arguments
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -471,14 +516,12 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
 
         hidden_states = outputs.last_hidden_state
 
-        # Apply logical sharding
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
 
-        # Apply LM head if requested
         lm_logits = None
         if apply_lm_head:
             lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
@@ -504,7 +547,6 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
             router_logits=router_logits,
             aux_loss=aux_loss,
         )
-
 
     def prepare_inputs_for_generation(
         self,

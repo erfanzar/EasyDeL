@@ -74,7 +74,6 @@ from dataclasses import fields
 from functools import reduce
 from operator import mul
 
-import chex
 import flax
 import flax.struct
 import jax
@@ -84,6 +83,7 @@ from eformer.escale.partition.constraints import with_sharding_constraint
 from eformer.pytree import auto_pytree
 from jax import lax
 from jax.sharding import PartitionSpec
+from jaxtyping import Array
 
 from easydel.utils.compiling_utils import hash_fn
 
@@ -189,11 +189,11 @@ class LossMetrics:
     Container for various metrics related to loss computation and model training.
 
     Attributes:
-        loss (tp.Optional[tp.Union[float, chex.Array]]): The primary computed loss value.
-        z_loss (tp.Optional[tp.Union[float, chex.Array]]): The computed z-loss regularization term.
-        weight_sum (tp.Optional[tp.Union[float, chex.Array]]): The sum of weights used in the loss calculation.
-        accuracy (tp.Optional[tp.Union[float, chex.Array]]): Computed accuracy, if applicable.
-        learning_rate (tp.Optional[tp.Union[float, chex.Array]]): The learning rate used for the current step.
+        loss (tp.Optional[tp.Union[float, Array]]): The primary computed loss value.
+        z_loss (tp.Optional[tp.Union[float, Array]]): The computed z-loss regularization term.
+        weight_sum (tp.Optional[tp.Union[float, Array]]): The sum of weights used in the loss calculation.
+        accuracy (tp.Optional[tp.Union[float, Array]]): Computed accuracy, if applicable.
+        learning_rate (tp.Optional[tp.Union[float, Array]]): The learning rate used for the current step.
         max_grad_norm (tp.Optional[flax.struct.PyTreeNode]): The maximum gradient norm observed.
         mean_grad_norm (tp.Optional[flax.struct.PyTreeNode]): The mean gradient norm observed.
         grad_norms (tp.Optional[flax.struct.PyTreeNode]): A pytree containing the norms of gradients for each parameter.
@@ -203,11 +203,11 @@ class LossMetrics:
         execution_time (tp.Optional[float]): Time taken for the computation step.
     """
 
-    loss: float | chex.Array | None = None
-    z_loss: float | chex.Array | None = None
-    weight_sum: float | chex.Array | None = None
-    accuracy: float | chex.Array | None = None
-    learning_rate: float | chex.Array | None = None
+    loss: float | Array | None = None
+    z_loss: float | Array | None = None
+    weight_sum: float | Array | None = None
+    accuracy: float | Array | None = None
+    learning_rate: float | Array | None = None
     max_grad_norm: flax.struct.PyTreeNode | None = None
     mean_grad_norm: flax.struct.PyTreeNode | None = None
     grad_norms: flax.struct.PyTreeNode | None = None
@@ -392,6 +392,25 @@ def sparse_cross_entropy_chunked_vocab(
     chunk_size: int = 8192,
     compute_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Compute sparse cross-entropy loss with vocabulary chunking for memory efficiency.
+
+    This function chunks along the vocabulary dimension to reduce memory usage
+    when computing cross-entropy for large vocabularies.
+
+    Args:
+        logits: Model logits with shape [..., V] where V is vocabulary size.
+        targets: Target token indices with shape [...].
+        weights: Optional per-token weights with shape [...].
+        ignore_index: Index to ignore in loss computation (default: -100).
+        label_smoothing: Label smoothing factor in [0, 1] (default: 0.0).
+        z_loss: Coefficient for z-loss regularization (default: 0.0).
+        reduction: Reduction type, "mean" or "sum" (default: "mean").
+        chunk_size: Vocabulary chunk size for memory efficiency (default: 8192).
+        compute_dtype: Dtype for computation (default: jnp.float32).
+
+    Returns:
+        Tuple of (total_loss, total_z_loss, weight_sum, accuracy).
+    """
     logits = logits.astype(compute_dtype)
     valid = targets != ignore_index
     safe_targets = jnp.where(valid, targets, 0)
@@ -434,6 +453,25 @@ def sparse_cross_entropy_chunked_tokens(
     token_chunk_size: int = 8192,
     compute_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Compute sparse cross-entropy loss with token sequence chunking for memory efficiency.
+
+    This function chunks along the token/batch dimension to reduce memory usage
+    when computing cross-entropy for long sequences or large batches.
+
+    Args:
+        logits: Model logits with shape [B, T, V] or [N, V].
+        targets: Target token indices with shape [B, T] or [N].
+        weights: Optional per-token weights with shape matching targets.
+        ignore_index: Index to ignore in loss computation (default: -100).
+        label_smoothing: Label smoothing factor in [0, 1] (default: 0.0).
+        z_loss: Coefficient for z-loss regularization (default: 0.0).
+        reduction: Reduction type, "mean" or "sum" (default: "sum").
+        token_chunk_size: Token sequence chunk size for memory efficiency (default: 8192).
+        compute_dtype: Dtype for computation (default: jnp.float32).
+
+    Returns:
+        Tuple of (total_loss, total_z_loss, weight_sum, accuracy).
+    """
     logits = logits.astype(compute_dtype)
     V = logits.shape[-1]
     logits2d = logits.reshape(-1, V)
@@ -639,10 +677,10 @@ def onehot(labels, num_classes, on_value=1.0, off_value=0.0):
 
 @jax.custom_vjp
 def cross_entropy_with_logits(
-    logits: chex.Array,
-    targets: chex.Array,
+    logits: Array,
+    targets: Array,
     z_loss: float,
-) -> tuple[chex.Array, chex.Array]:
+) -> tuple[Array, Array]:
     """
     Computes cross-entropy loss with potential z-loss regularization.
 
@@ -652,12 +690,12 @@ def cross_entropy_with_logits(
     A custom VJP (vector-Jacobian product) is defined for efficient gradient computation.
 
     Args:
-        logits (chex.Array): The predicted logits from the model (batch_size, ..., num_classes).
-        targets (chex.Array): The target labels, typically one-hot encoded (batch_size, ..., num_classes).
+        logits (Array): The predicted logits from the model (batch_size, ..., num_classes).
+        targets (Array): The target labels, typically one-hot encoded (batch_size, ..., num_classes).
         z_loss (float): The coefficient for the z-loss regularization. If 0, z-loss is not computed.
 
     Returns:
-        tp.Tuple[chex.Array, chex.Array]:
+        tp.Tuple[Array, Array]:
             - loss: The cross-entropy loss for each example (batch_size, ...).
             - z_loss: The z-loss value for each example (batch_size, ...). Returns zero if `z_loss` coeff is 0.
     """
@@ -669,22 +707,22 @@ def cross_entropy_with_logits(
 
 
 def _cross_entropy_with_logits_fwd(
-    logits: chex.Array,
-    targets: chex.Array,
+    logits: Array,
+    targets: Array,
     z_loss: float = 0.0,
 ) -> tuple[
     tuple[
-        chex.Array,
-        chex.Array,
+        Array,
+        Array,
     ],
     tuple[
-        chex.Array,
-        chex.Array,
+        Array,
+        Array,
         float,
-        chex.Array,
-        chex.Array,
-        chex.Array,
-        chex.Array,
+        Array,
+        Array,
+        Array,
+        Array,
     ],
 ]:
     """
@@ -720,16 +758,16 @@ def _cross_entropy_with_logits_fwd(
 
 def _cross_entropy_with_logits_bwd(
     res: tuple[
-        chex.Array,
-        chex.Array,
+        Array,
+        Array,
         float,
-        chex.Array,
-        chex.Array,
-        chex.Array,
-        chex.Array,
+        Array,
+        Array,
+        Array,
+        Array,
     ],
-    g: tuple[chex.Array, chex.Array],
-) -> tuple[chex.Array, chex.Array, chex.Array]:
+    g: tuple[Array, Array],
+) -> tuple[Array, Array, Array]:
     """Backward pass for cross_entropy_with_logits custom VJP.
 
     Computes gradients with respect to logits and targets using saved intermediates
@@ -760,14 +798,14 @@ cross_entropy_with_logits.defvjp(_cross_entropy_with_logits_fwd, _cross_entropy_
 
 
 def compute_weighted_cross_entropy(
-    logits: chex.Array,
-    targets: chex.Array,
-    weights: chex.Array | None = None,
+    logits: Array,
+    targets: Array,
+    weights: Array | None = None,
     label_smoothing: float = 0.0,
     z_loss: float = 0.0,
     loss_normalizing_factor: float | None = None,
     compute_dtype: jnp.dtype = jnp.float32,
-) -> tuple[chex.Array, chex.Array, chex.Array]:
+) -> tuple[Array, Array, Array]:
     """
     Computes weighted cross-entropy loss, z-loss, and weight sum.
 
@@ -818,14 +856,14 @@ def compute_weighted_cross_entropy(
 
 
 def compute_weighted_cross_entropy_and_accuracy(
-    logits: chex.Array,
-    targets: chex.Array,
-    weights: chex.Array | None = None,
+    logits: Array,
+    targets: Array,
+    weights: Array | None = None,
     label_smoothing: float = 0.0,
     z_loss: float = 0.0,
     loss_normalizing_factor: float | None = None,
     compute_dtype: jnp.dtype = jnp.float32,
-) -> tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
+) -> tuple[Array, Array, Array, Array]:
     """
     Computes weighted cross-entropy loss, z-loss, weight sum, and accuracy.
 
@@ -923,10 +961,10 @@ def convert_special_loss_normalizing_factor_to_enum(x: str) -> SLNF:
 
 @jax.vmap
 def _sum_weights_per_segment(
-    positions: chex.Array,
-    segment_ids: chex.Array,
-    weights: chex.Array,
-) -> chex.Array:
+    positions: Array,
+    segment_ids: Array,
+    weights: Array,
+) -> Array:
     """Sum weights per packed segment to produce a normalizing vector.
 
     This function is used for handling packed sequences where multiple sequences
@@ -976,9 +1014,9 @@ def _sum_weights_per_segment(
 
 def get_factor_and_weight(
     loss_normalizing_factor: FACTOR_TYPE,
-    batch: tp.Mapping[str, chex.Array],
+    batch: tp.Mapping[str, Array],
     compute_dtype: jnp.dtype = jnp.float32,
-) -> tuple[float | None, chex.Array | None]:
+) -> tuple[float | None, Array | None]:
     """
     Gets the loss normalizing factor and weights from a batch of data.
 
@@ -1022,10 +1060,10 @@ def get_factor_and_weight(
 
 
 def auxiliary_load_balancing_loss_func(
-    gate_logits: chex.Array | tuple[chex.Array, ...],
+    gate_logits: Array | tuple[Array, ...],
     num_experts: int,
     top_k: int,
-    attention_mask: chex.Array | None = None,
+    attention_mask: Array | None = None,
     compute_dtype: jnp.dtype = jnp.float32,
 ) -> jax.Array | int:
     r"""
@@ -1139,7 +1177,7 @@ def fixed_cross_entropy(
     attention_mask: jax.Array | None = None,
     config: LossConfig | None = None,
     num_items_in_batch: int | None = None,
-    batch: tp.Mapping[str, chex.Array] | None = None,
+    batch: tp.Mapping[str, Array] | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
     """
@@ -1283,7 +1321,7 @@ def ForCausalLMLoss(
     config: LossConfig | None = None,
     paxis: PartitionAxis | None = None,
     num_items_in_batch: int | None = None,
-    batch: tp.Mapping[str, chex.Array] | None = None,
+    batch: tp.Mapping[str, Array] | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
     """
@@ -1350,7 +1388,7 @@ def ForSequenceClassificationLoss(
     attention_mask: jax.Array | None = None,
     config: LossConfig | None = None,
     paxis: PartitionAxis | None = None,
-    batch: tp.Mapping[str, chex.Array] | None = None,
+    batch: tp.Mapping[str, Array] | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
     """
@@ -1383,6 +1421,10 @@ def ForSequenceClassificationLoss(
     if config.problem_type == "regression":
         loss = jnp.mean((logits.squeeze() - labels.squeeze()) ** 2)
     elif config.problem_type == "single_label_classification":
+        # `attention_mask` is typically token-level (batch, seq_len) for encoder models.
+        # Sequence classification loss is computed per-sequence, so masking should not be applied here.
+        if attention_mask is not None and attention_mask.ndim != 1:
+            attention_mask = None
         return fixed_cross_entropy(
             source=logits.reshape(-1, num_labels),
             target=labels.reshape(-1),
@@ -1411,7 +1453,7 @@ def ForQuestionAnsweringLoss(
     end_positions: jax.Array,
     config: LossConfig | None = None,
     paxis: PartitionAxis | None = None,
-    batch: tp.Mapping[str, chex.Array] | None = None,
+    batch: tp.Mapping[str, Array] | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
     """
@@ -1456,7 +1498,7 @@ def ForTokenClassification(
     labels: jax.Array,
     config: LossConfig | None = None,
     paxis: PartitionAxis | None = None,
-    batch: tp.Mapping[str, chex.Array] | None = None,
+    batch: tp.Mapping[str, Array] | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
     """

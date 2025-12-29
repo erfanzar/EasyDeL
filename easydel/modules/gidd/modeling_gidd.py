@@ -29,7 +29,6 @@ import typing as tp
 import warnings
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -45,6 +44,8 @@ from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput
 from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -133,21 +134,17 @@ class GiddMLP(nn.Module):
         Returns:
             Output tensor of shape [..., hidden_size].
         """
-        # Apply logical sharding for distributed computation
         h = apply_logical_sharding(
             h,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
 
-        # First projection and activation
         h = checkpoint_name(self.up_proj(h), name="mlp_up")
-        h = nn.relu(h) ** 2  # Squared ReLU activation
+        h = nn.relu(h) ** 2
 
-        # Second projection
         h = checkpoint_name(self.down_proj(h), name="mlp_down")
 
-        # Apply logical sharding for distributed computation
         h = apply_logical_sharding(
             h,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -217,7 +214,6 @@ class GiddAttention(AttentionModule):
         self.qk_norm_eps = config.qk_norm_eps
 
         if self.use_qk_norm:
-            # Initialize learnable scale parameter for QK normalization
             qk_scale_value = jnp.full(
                 (1, 1, self.config.num_attention_heads, 1),
                 2 * jnp.log(config.max_position_embeddings),
@@ -234,7 +230,6 @@ class GiddAttention(AttentionModule):
             # Fixed scale based on head dimension
             self.qk_scale = 1.0
 
-        # Create linear projections for Q, K, V, and O
         column_parallel_linear = partial(
             ColumnParallelLinear,
             scale="fan_in",
@@ -273,7 +268,6 @@ class GiddAttention(AttentionModule):
         )
         self.o_proj = row_parallel_linear(config.num_attention_heads * self.head_dim, config.hidden_size, rngs=rngs)
 
-        # Initialize rotary position embeddings
         self.rotary = self.config.get_basic_rope(
             self.dtype,
             self.head_dim,
@@ -281,7 +275,6 @@ class GiddAttention(AttentionModule):
             True,
         )
 
-        # Initialize attention performer
         self.attention_performer = FlexibleAttentionModule(
             base_config=self.config,
             softmax_scale=1.0 if self.use_qk_norm else 1.0 / self.head_dim**0.5,
@@ -292,14 +285,14 @@ class GiddAttention(AttentionModule):
     def concatenate(
         self,
         *,
-        query: chex.Array,
-        key: chex.Array,
-        value: chex.Array,
+        query: Array,
+        key: Array,
+        value: Array,
         mask_info: MaskInfo,
-        noise_mask: chex.Array,
+        noise_mask: Array,
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
-    ) -> tuple[chex.Array, chex.Array, chex.Array, tp.Callable[[], chex.Array]]:
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+    ) -> tuple[Array, Array, Array, tp.Callable[[], Array]]:
         """
         Prepare and concatenate key, value, and attention mask for attention computation.
 
@@ -328,7 +321,6 @@ class GiddAttention(AttentionModule):
         # Validate that query and key have matching sequence lengths
         assert query.shape[1] == key.shape[1], "Query and Key lengths must match for GIDD attention."
 
-        # Process attention mask
         if attention_mask is not None:
             if attention_mask.dtype != jnp.bool:
                 warnings.warn("attention_mask should be a boolean array", stacklevel=1)
@@ -338,13 +330,11 @@ class GiddAttention(AttentionModule):
         attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
         attention_mask = jnp.repeat(attention_mask, query.shape[1], -2)  # [Batch, 1, q_len, kv_len]
 
-        # Process noise mask if provided
         if noise_mask is not None:
             if noise_mask.dtype != jnp.bool:
                 warnings.warn("noise_mask should be a boolean array", stacklevel=1)
                 noise_mask = (noise_mask == 1).astype("b1")
 
-            # Create noise attention mask
             noise_mask_q = jnp.expand_dims(noise_mask, axis=-1)
             noise_mask_kv = jnp.expand_dims(noise_mask, axis=-2)
             noise_attn_mask = jnp.expand_dims(noise_mask_q >= noise_mask_kv, axis=-3)
@@ -378,14 +368,14 @@ class GiddAttention(AttentionModule):
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
-        noise_mask: chex.Array,
+        noise_mask: Array,
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ) -> tuple[chex.Array, chex.Array]:
+    ) -> tuple[Array, Array]:
         """
         Forward pass through the attention module.
 
@@ -416,12 +406,10 @@ class GiddAttention(AttentionModule):
             checkpoint_name(self.v_proj(hidden_states), name="attn_value"),
         )
 
-        # Apply QK normalization if enabled
         if self.use_qk_norm:
             query_states = self._norm(query_states)
             key_states = self._norm(key_states)
 
-        # Reshape for multi-head attention
         qshape = (
             batch_size,
             sequence_length,
@@ -438,14 +426,12 @@ class GiddAttention(AttentionModule):
         key_states = key_states.reshape(kv_shape)
         value_states = value_states.reshape(kv_shape)
 
-        # Apply sharding for distributed computation
         (
             query_states,
             key_states,
             value_states,
         ) = self.apply_qkv_shardings(query_states, key_states, value_states)
 
-        # Apply rotary position embeddings
         query_states, key_states = self.rotary(
             positions=position_ids,
             query=query_states,
@@ -470,7 +456,6 @@ class GiddAttention(AttentionModule):
             noise_mask=noise_mask,
         )
 
-        # Compute attention
         attentions = self.attention_performer.forward(
             query_states=query_states * self.qk_scale,
             key_states=key_states,
@@ -607,7 +592,6 @@ class GiddLayer(nn.Module):
         self.precision = precision
         self.resid_scale = resid_scale
 
-        # Apply gradient checkpointing if enabled
         attn_block = GiddAttention
         mlp_block = GiddMLP
         attn_block, mlp_block = auto_remat(
@@ -618,7 +602,6 @@ class GiddLayer(nn.Module):
             exclude_names=config.gradient_checkpointing_targets,
         )
 
-        # Initialize sub-modules
         self.self_attn: GiddAttention = attn_block(
             config=config,
             dtype=dtype,
@@ -641,10 +624,10 @@ class GiddLayer(nn.Module):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
-        noise_mask: chex.Array,
+        noise_mask: Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
@@ -696,7 +679,6 @@ class GiddLayer(nn.Module):
             feed_forward_hidden_states = self.mlp(feed_forward_input)
         hidden_states = hidden_states + self.resid_scale * feed_forward_hidden_states
 
-        # Apply logical sharding for distributed computation
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -761,8 +743,6 @@ class GiddModel(EasyDeLBaseModule):
         # Calculate residual scale factor
         self.resid_scale = config.resid_scale / config.num_hidden_layers
 
-        # Initialize token embeddings
-
         embed_block = auto_remat(
             nn.Embed,
             policy=config.gradient_checkpointing,
@@ -778,7 +758,6 @@ class GiddModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        # Initialize transformer layers
         self.layers = [
             GiddLayer(
                 config=config,
@@ -800,11 +779,11 @@ class GiddModel(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        log_snr: chex.Array | None = None,
-        noise_mask: chex.Array | None = None,
+        log_snr: Array | None = None,
+        noise_mask: Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
@@ -838,13 +817,11 @@ class GiddModel(EasyDeLBaseModule):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
-        # Get input embeddings
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
 
         sequence_length = inputs_embeds.shape[1]
 
-        # Initialize outputs
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
@@ -854,7 +831,6 @@ class GiddModel(EasyDeLBaseModule):
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
 
-        # Process attention mask
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
             input_ids=input_ids,
@@ -877,18 +853,15 @@ class GiddModel(EasyDeLBaseModule):
                 else common_types.MODE_TRAIN
             )
 
-        # Initialize cache if not provided
         if past_key_values is None:
             past_key_values = TransformerCache.init_empty(len(self.layers))
 
-        # Apply logical sharding for distributed computation
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
 
-        # Process through transformer layers
         for idx, block in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1049,11 +1022,11 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
-        log_snr: chex.Array | None = None,
-        noise_mask: chex.Array | None = None,
+        log_snr: Array | None = None,
+        noise_mask: Array | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -1102,7 +1075,6 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
 
         hidden_states = outputs.last_hidden_state
 
-        # Apply logical sharding for distributed computation
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,

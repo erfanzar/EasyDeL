@@ -11,8 +11,8 @@ except ImportError:
     from test_utils import CausalLMTester
 
 
-# Check if Mistral3ForCausalLM is available in transformers
-HAS_MISTRAL3 = hasattr(transformers, "Mistral3ForCausalLM")
+# Check if Mistral3ForConditionalGeneration is available in transformers
+HAS_MISTRAL3 = hasattr(transformers, "Mistral3ForConditionalGeneration")
 
 
 class TestMistral3:
@@ -31,26 +31,26 @@ class TestMistral3:
             max_position_embeddings=small_model_config["max_position_embeddings"],
         )
 
-    @pytest.mark.skipif(not HAS_MISTRAL3, reason="transformers.Mistral3ForCausalLM not available")
+    @pytest.mark.skipif(not HAS_MISTRAL3, reason="transformers.Mistral3ForConditionalGeneration not available")
     def test_causal_lm(self, mistral3_config, small_model_config):
-        """Test Mistral3ForCausalLM."""
+        """Test Mistral3ForConditionalGeneration."""
         tester = CausalLMTester()
         result = tester.run(
             module_name="mistral3",
-            hf_class=transformers.Mistral3ForCausalLM,
+            hf_class=transformers.Mistral3ForConditionalGeneration,
             task=ed.TaskType.CAUSAL_LM,
             config=mistral3_config,
             small_model_config=small_model_config,
         )
         assert result.success, f"Mistral3 CAUSAL_LM failed: {result.error_message or result.comparison.details}"
 
-    @pytest.mark.skipif(not HAS_MISTRAL3, reason="transformers.Mistral3ForCausalLM not available")
+    @pytest.mark.skipif(not HAS_MISTRAL3, reason="transformers.Mistral3ForConditionalGeneration not available")
     def test_generation(self, mistral3_config, small_model_config):
         """Test Mistral3 text generation."""
         tester = CausalLMTester()
         result = tester.test_generation(
             module_name="mistral3",
-            hf_class=transformers.Mistral3ForCausalLM,
+            hf_class=transformers.Mistral3ForConditionalGeneration,
             config=mistral3_config,
             small_model_config=small_model_config,
             max_new_tokens=16,

@@ -24,6 +24,7 @@ This module provides:
 from __future__ import annotations
 
 import logging
+import os
 import typing as tp
 
 from ..core.config import (
@@ -304,7 +305,7 @@ def create_pipeline(
 
 
 def tokenize_and_save(
-    data_files: str | list[str],
+    data_files: str | os.PathLike | list[str | os.PathLike],
     tokenizer: str,
     output_path: str,
     output_format: str = "parquet",

@@ -60,27 +60,6 @@ EasyDeL provides powerful, production-ready serving solutions:
 - **Streaming Generation**: Optimized for low-latency response streaming
 - **Quantization Options**: Multiple precision options for optimal performance/quality trade-offs
 
-
-Installation on TPU Pods
------------------------
-
-For distributed installation on TPU pods, use the ``install_on_hosts`` script:
-
-.. code-block:: bash
-
-    python -m easydel.scripts.install_on_hosts --tpu-type v4-16 --source github
-
-This will install EasyDel and all required dependencies across all hosts in the specified TPU pod.
-Supported TPU types include v2, v3, v4, v5e, and v5p pod slices.
-
-For other TPU types you may need to overwrite that or customize the script.
-
-Options:
-- ``--source``: Choose between PyPI package (``pypi``) or latest GitHub version (``github``)
-- ``--tpu-type``: Specify your TPU pod slice type (default: v4-16)
-- ``--num-tpu-hosts``: Override default host count if needed
-
-
 Future Updates and Vision 🚀
 ============================
 
@@ -122,6 +101,18 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
 
 .. toctree::
    :maxdepth: 2
+   :caption: Infrastructure:
+
+   infra/index
+   infra/overview.md
+   infra/base_config.md
+   infra/base_module.md
+   infra/customization.md
+   infra/adding_models.md
+   infra/elarge_model.md
+
+.. toctree::
+   :maxdepth: 2
    :caption: Data Management:
 
    easydata/README.md
@@ -155,6 +146,17 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
    esurge
    esurge_examples
    whisper_api.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: CLI & Scripts:
+
+   scripts/index.md
+   scripts/model_conversion.md
+   scripts/hf_download_to_gcs.md
+   scripts/elarge_cli.md
+   scripts/model_cards.md
+   scripts/dev_tools.md
 
 .. toctree::
    :maxdepth: 2

@@ -25,6 +25,13 @@ from easydel.layers.caching import RaggedPagesCacheView, RaggedPagesMetadata
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from ..requirements import (
+    CacheType,
+    ExecutionMode,
+    MetadataField,
+    OperationRequirements,
+    RequirementsBuilder,
+)
 
 USE_SHARDMAP = True
 
@@ -386,6 +393,28 @@ class RaggedPageAttnV2(_RaggedPageAttn):
         """
         return "ragged_page_attention_v2"
 
+    @classmethod
+    def get_requirements(
+        cls,
+        mode: ExecutionMode = ExecutionMode.MIXED,
+    ) -> OperationRequirements:
+        """Returns requirements for RaggedPageAttnV2 (slot mapping based)."""
+        return (
+            RequirementsBuilder("ragged_page_attention_v2")
+            .require_metadata(
+                MetadataField.SEQ_LENS
+                | MetadataField.CONTEXT_LENS
+                | MetadataField.POSITIONS
+                | MetadataField.QUERY_START_LOC
+                | MetadataField.PAGES_TABLES
+                | MetadataField.SLOT_MAPPING
+            )
+            .optional_metadata(MetadataField.LOGITS_INDICES)
+            .support_cache(CacheType.RAGGED_PAGES)
+            .use_cache_view(RaggedPagesCacheView)
+            .build()
+        )
+
 
 @OperationRegistry.register
 class RaggedPageAttnV3(_RaggedPageAttn):
@@ -398,3 +427,25 @@ class RaggedPageAttnV3(_RaggedPageAttn):
             tp.Union[str, tp.Tuple[str]]: The name "ragged_page_attention_v3".
         """
         return "ragged_page_attention_v3"
+
+    @classmethod
+    def get_requirements(
+        cls,
+        mode: ExecutionMode = ExecutionMode.MIXED,
+    ) -> OperationRequirements:
+        """Returns requirements for RaggedPageAttnV3 (request distribution based)."""
+        return (
+            RequirementsBuilder("ragged_page_attention_v3")
+            .require_metadata(
+                MetadataField.SEQ_LENS
+                | MetadataField.CONTEXT_LENS
+                | MetadataField.POSITIONS
+                | MetadataField.QUERY_START_LOC
+                | MetadataField.PAGES_TABLES
+                | MetadataField.REQUEST_DISTRIBUTION
+            )
+            .optional_metadata(MetadataField.LOGITS_INDICES)
+            .support_cache(CacheType.RAGGED_PAGES)
+            .use_cache_view(RaggedPagesCacheView)
+            .build()
+        )

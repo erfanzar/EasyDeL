@@ -39,6 +39,19 @@ class TestQwen3Next:
         )
         assert result.success, f"Qwen3Next CAUSAL_LM failed: {result.error_message or result.comparison.details}"
 
+    def test_generation(self, qwen3_next_config, small_model_config):
+        """Test Qwen3Next text generation."""
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="qwen3_next",
+            hf_class=transformers.Qwen3NextForCausalLM,
+            task=ed.TaskType.CAUSAL_LM,
+            config=qwen3_next_config,
+            small_model_config=small_model_config,
+            max_new_tokens=16,
+        )
+        assert result.success, f"Qwen3Next generation failed: {result.error_message}"
+
 
 if __name__ == "__main__":
     import pytest

@@ -876,6 +876,7 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         mrope_section: tuple[int, int, int] | None = None,
         attention_scaling: float = 1.0,
         mrope_interleaved: bool = True,
+        repetition_style: bool = False,
     ):
         super().__init__(
             head_size=head_size,
@@ -885,7 +886,26 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
             is_neox_style=is_neox_style,
             dtype=dtype,
         )
-        self.mrope_section = mrope_section if mrope_section is not None else (24, 20, 20)
+        section = tuple(mrope_section) if mrope_section is not None else (24, 20, 20)
+        expected = self.rotary_dim // 2
+        actual = sum(section)
+        if expected <= 0:
+            raise ValueError(f"rotary_dim must be positive for mRoPE; got rotary_dim={self.rotary_dim}.")
+        if actual != expected:
+            scaled_section: list[int] = []
+            for size in section:
+                num = size * expected
+                if num % actual != 0:
+                    raise ValueError(
+                        "mrope_section is incompatible with rotary_dim. "
+                        f"Expected sum(mrope_section)={expected}, got {actual} for rotary_dim={self.rotary_dim}."
+                    )
+                scaled_section.append(num // actual)
+            if sum(scaled_section) != expected:
+                scaled_section[-1] += expected - sum(scaled_section)
+            section = tuple(scaled_section)
+        self.repetition_style = repetition_style
+        self.mrope_section = section
         self.attention_scaling = attention_scaling
         self.mrope_interleaved = mrope_interleaved
 
@@ -906,16 +926,24 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         Returns:
             Combined frequencies with shape (batch, seq, rotary_dim)
         """
-        t_size, h_size, _w_size = self.mrope_section
-        t_size_doubled = t_size * 2
-        h_size_doubled = h_size * 2
+        if self.repetition_style:
+            # HuggingFace splits using `mrope_section * 2` (list repetition), then
+            # takes chunk i from dimension (i % 3): T=0, H=1, W=2.
+            split_sizes = list(self.mrope_section) * 2
+            chunks = jax.lax.split(emb, split_sizes, axis=-1)
+            selected = [chunk[i % 3] for i, chunk in enumerate(chunks)]
+            return jnp.concatenate(selected, axis=-1)
+        else:
+            t_size, h_size, _w_size = self.mrope_section
+            t_size_doubled = t_size * 2
+            h_size_doubled = h_size * 2
 
-        # Extract chunks and select from appropriate dimension (T=0, H=1, W=2)
-        t_chunk = emb[0, ..., :t_size_doubled]
-        h_chunk = emb[1, ..., t_size_doubled : t_size_doubled + h_size_doubled]
-        w_chunk = emb[2, ..., t_size_doubled + h_size_doubled :]
+            # Extract chunks and select from appropriate dimension (T=0, H=1, W=2)
+            t_chunk = emb[0, ..., :t_size_doubled]
+            h_chunk = emb[1, ..., t_size_doubled : t_size_doubled + h_size_doubled]
+            w_chunk = emb[2, ..., t_size_doubled + h_size_doubled :]
 
-        return jnp.concatenate([t_chunk, h_chunk, w_chunk], axis=-1)
+            return jnp.concatenate([t_chunk, h_chunk, w_chunk], axis=-1)
 
     def _apply_interleaved_mrope(self, freqs: jax.Array) -> jax.Array:
         """Interleave THW frequencies from chunked layout."""
@@ -1010,12 +1038,41 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         cos = cos * self.attention_scaling
         sin = sin * self.attention_scaling
 
+        # HF mRoPE helpers may compute cos/sin in NeoX-style (duplicated halves) and then
+        # convert to GPT-J-style (repeat_interleave) depending on the rotation style.
+        #
+        # EasyDeL's mRoPE builds cos/sin by duplicating half-dim values. For GPT-J style
+        # rotation, we must interleave the half-dim values to match even/odd layout.
+        if not self.is_neox_style:
+            cos = jnp.repeat(cos[..., : cos.shape[-1] // 2], 2, axis=-1)
+            sin = jnp.repeat(sin[..., : sin.shape[-1] // 2], 2, axis=-1)
+
         cos = cos[:, :, jnp.newaxis, :]
         sin = sin[:, :, jnp.newaxis, :]
+        if self.repetition_style:
+            rotary_dim = self.rotary_dim
+            q_rot = query[..., :rotary_dim]
+            k_rot = key[..., :rotary_dim]
 
-        q_embed = (query * cos) + (_rotate_neox(query) * sin)
-        k_embed = (key * cos) + (_rotate_neox(key) * sin)
-        return q_embed.astype(self.dtype), k_embed.astype(self.dtype)
+            q_pass = None
+            k_pass = None
+            if rotary_dim < self.head_size:
+                q_pass = query[..., rotary_dim:]
+                k_pass = key[..., rotary_dim:]
+
+            rotate_fn = _rotate_neox if self.is_neox_style else _rotate_gptj
+            q_rot = (q_rot * cos) + (rotate_fn(q_rot) * sin)
+            k_rot = (k_rot * cos) + (rotate_fn(k_rot) * sin)
+
+            if q_pass is not None:
+                q_rot = jnp.concatenate([q_rot, q_pass], axis=-1)
+                k_rot = jnp.concatenate([k_rot, k_pass], axis=-1)
+
+            return q_rot.astype(self.dtype), k_rot.astype(self.dtype)
+        else:
+            q_embed = (query * cos) + (_rotate_neox(query) * sin)
+            k_embed = (key * cos) + (_rotate_neox(key) * sin)
+            return q_embed.astype(self.dtype), k_embed.astype(self.dtype)
 
 
 @rope_wraper("linear")
@@ -1678,6 +1735,7 @@ def get_rope(
                 dtype=dtype,
                 mrope_section=rope_scaling.get("mrope_section"),
                 mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+                repetition_style=rope_scaling.get("repetition_style", False),
             )
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
@@ -2050,12 +2108,15 @@ class RopeConfig:
     short_factor: float | None = None
     long_mscale: float | None = None
     short_mscale: float | None = None
+    extrapolation_factor: float | None = None
+    attn_factor: float | None = None
     beta_fast: int | None = None
     beta_slow: int | None = None
-    mscale: int | None = None
-    mscale_all_dim: int | None = None
+    mscale: float | None = None
+    mscale_all_dim: float | None = None
     mrope_interleaved: bool | None = None
     mrope_section: list[int] | None = None
+    repetition_style: bool | None = None
 
     @classmethod
     def from_dict(cls, config_dict: dict[str, tp.Any]) -> RopeConfig:
@@ -2071,9 +2132,17 @@ class RopeConfig:
             RopeConfig: An instance populated from the dictionary.
         """
 
+        rope_type = config_dict.get("rope_type")
+        if rope_type is None:
+            rope_type = config_dict.get("type", "default")
+
+        factor = config_dict.get("factor")
+        if factor is None:
+            factor = config_dict.get("scaling_factor")
+
         return cls(
-            rope_type=config_dict.get("rope_type") or config_dict.get("type", "default"),
-            factor=config_dict.get("factor") or config_dict.get("scaling_factor"),
+            rope_type=rope_type,
+            factor=factor,
             low_freq_factor=config_dict.get("low_freq_factor"),
             high_freq_factor=config_dict.get("high_freq_factor"),
             original_max_position_embeddings=config_dict.get("original_max_position_embeddings"),
@@ -2081,13 +2150,59 @@ class RopeConfig:
             short_factor=config_dict.get("short_factor"),
             long_mscale=config_dict.get("long_mscale"),
             short_mscale=config_dict.get("short_mscale"),
+            extrapolation_factor=config_dict.get("extrapolation_factor"),
+            attn_factor=config_dict.get("attn_factor"),
             beta_fast=config_dict.get("beta_fast"),
             beta_slow=config_dict.get("beta_slow"),
             mscale=config_dict.get("mscale"),
             mscale_all_dim=config_dict.get("mscale_all_dim"),
             mrope_interleaved=config_dict.get("mrope_interleaved"),
             mrope_section=config_dict.get("mrope_section"),
+            repetition_style=config_dict.get("repetition_style"),
         )
+
+    def update(
+        self,
+        config_dict: tp.Mapping[str, tp.Any] | RopeConfig | None = None,
+        /,
+        **kwargs: tp.Any,
+    ) -> None:
+        """Update the RopeConfig instance in-place.
+
+        Supports HuggingFace-style aliases:
+        - ``type`` -> ``rope_type``
+        - ``scaling_factor`` -> ``factor``
+        """
+        updates: dict[str, tp.Any]
+        if config_dict is None:
+            updates = {}
+        elif isinstance(config_dict, RopeConfig):
+            updates = dict(config_dict.to_dict())
+        else:
+            updates = dict(config_dict)
+        if kwargs:
+            updates.update(kwargs)
+
+        # Allow passing a full config dict containing a nested `rope_scaling` dict.
+        rope_scaling = updates.get("rope_scaling")
+        if isinstance(rope_scaling, dict):
+            updates.pop("rope_scaling", None)
+            updates = {**rope_scaling, **updates}
+
+        if "rope_type" not in updates and "type" in updates:
+            updates["rope_type"] = updates.pop("type")
+        else:
+            updates.pop("type", None)
+
+        if "factor" not in updates and "scaling_factor" in updates:
+            updates["factor"] = updates.pop("scaling_factor")
+        else:
+            updates.pop("scaling_factor", None)
+
+        valid_keys = set(self.__dataclass_fields__)
+        for key, value in updates.items():
+            if key in valid_keys:
+                setattr(self, key, value)
 
     def to_dict(self) -> dict[str, tp.Any]:
         """

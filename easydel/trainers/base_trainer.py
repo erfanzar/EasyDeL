@@ -67,6 +67,7 @@ from .trainer_protocol import (
     TrainerOutput,
 )
 from .training_configurations import MetricsType, TrainingArguments
+from .training_utils import resolve_total_steps
 from .utils import CollateMapTransform, HFDataSource, ToNumpy
 
 try:
@@ -1197,7 +1198,7 @@ class BaseTrainer(BaseTrainerProtocol):
             if hasattr(args, "esurge_silent_mode"):
                 esurge_kwargs["silent_mode"] = args.esurge_silent_mode
 
-            esurge_kwargs["max_model_len"] = sampling_params.max_tokens + args.max_sequence_length
+            esurge_kwargs["max_model_len"] = sampling_params.max_tokens + args.max_length
 
             logger.info_once(f"Creating eSurge {pprint.pformat(esurge_kwargs)}")
             logger.info_once(
@@ -1222,7 +1223,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 state.model.pause_esurge()
 
             # Build padded token arrays from eSurge outputs to ensure consistent shapes
-            max_seq_len = args.max_sequence_length or 2048
+            max_seq_len = args.max_length or 2048
             max_new_tokens = sampling_params.max_tokens
             max_total_len = max_seq_len + max_new_tokens
 
@@ -1386,7 +1387,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 if not normalized_prompts:
                     raise ValueError("No prompts provided for generation")
 
-                max_seq_len = args.max_sequence_length or 2048
+                max_seq_len = args.max_length or 2048
 
                 # Ensure left-padding for RL training (prompts should align at the right)
                 original_padding_side = getattr(processor, "padding_side", None)
@@ -1561,7 +1562,7 @@ class BaseTrainer(BaseTrainerProtocol):
             truncation_side="left",
             tokenize=True,
             padding="max_length",
-            max_length=self.arguments.max_sequence_length,
+            max_length=self.arguments.max_length,
             return_attention_mask=True,
             return_tensors="jax",
             return_dict=True,
@@ -2077,7 +2078,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     shuffle=shuffle,
                 )
             collate_fn = self.create_grain_collect_function(
-                max_sequence_length=self.arguments.max_sequence_length,
+                max_sequence_length=self.arguments.max_length,
                 truncation_mode=self.arguments.truncation_mode,
             )
             return grain.DataLoader(
@@ -2094,27 +2095,33 @@ class BaseTrainer(BaseTrainerProtocol):
             )
 
         def calculate_steps(dataset, is_train: bool) -> int:
-            try:
-                total_data_len = len(dataset)
-            except TypeError as e:
-                total_data_len = (
-                    self.arguments.per_epoch_training_steps if is_train else self.arguments.per_epoch_evaluation_steps
-                )
-                if total_data_len is None:
-                    raise ValueError(
-                        f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
-                        "steps for a generator/streaming dataset."
-                    ) from e
-            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
-            num_steps = (
-                (total_data_len + batch_size - 1) // batch_size * (self.arguments.num_train_epochs if is_train else 1)
-            )
             forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
-            steps = forced_steps if forced_steps is not None else num_steps
+            total_data_len: int | None = None
+            if forced_steps is None:
+                try:
+                    total_data_len = len(dataset)
+                except TypeError as e:
+                    total_data_len = (
+                        self.arguments.per_epoch_training_steps
+                        if is_train
+                        else self.arguments.per_epoch_evaluation_steps
+                    )
+                    if total_data_len is None:
+                        raise ValueError(
+                            f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
+                            "steps for a generator/streaming dataset."
+                        ) from e
 
-            if is_train:
-                steps = steps // self.arguments.gradient_accumulation_steps
-            return steps
+            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
+            num_epochs = self.arguments.num_train_epochs if is_train else 1
+            return resolve_total_steps(
+                forced_steps=forced_steps,
+                total_data_len=total_data_len,
+                batch_size=batch_size,
+                num_epochs=num_epochs,
+                gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+                is_train=is_train,
+            )
 
         max_training_steps = calculate_steps(self.dataset_train, is_train=True)
 
@@ -2204,7 +2211,7 @@ class BaseTrainer(BaseTrainerProtocol):
             return (
                 dataset.to_tf_dataset(
                     collate_fn=self.create_tfds_collect_function(
-                        max_sequence_length=self.arguments.max_sequence_length,
+                        max_sequence_length=self.arguments.max_length,
                         truncation_mode=self.arguments.truncation_mode,
                     ),
                     batch_size=batch_size,
@@ -2273,27 +2280,33 @@ class BaseTrainer(BaseTrainerProtocol):
             Raises:
               ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
             """
-            try:
-                total_data_len = len(dataset)
-            except TypeError as e:
-                total_data_len = (
-                    self.arguments.per_epoch_training_steps if is_train else self.arguments.per_epoch_evaluation_steps
-                )
-                if total_data_len is None:
-                    raise ValueError(
-                        f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
-                        "steps for a generator/streaming dataset."
-                    ) from e
-            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
-            num_steps = (
-                (total_data_len + batch_size - 1) // batch_size * (self.arguments.num_train_epochs if is_train else 1)
-            )
             forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
-            steps = forced_steps if forced_steps is not None else num_steps
+            total_data_len: int | None = None
+            if forced_steps is None:
+                try:
+                    total_data_len = len(dataset)
+                except TypeError as e:
+                    total_data_len = (
+                        self.arguments.per_epoch_training_steps
+                        if is_train
+                        else self.arguments.per_epoch_evaluation_steps
+                    )
+                    if total_data_len is None:
+                        raise ValueError(
+                            f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
+                            "steps for a generator/streaming dataset."
+                        ) from e
 
-            if is_train:
-                steps = steps // self.arguments.gradient_accumulation_steps
-            return steps
+            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
+            num_epochs = self.arguments.num_train_epochs if is_train else 1
+            return resolve_total_steps(
+                forced_steps=forced_steps,
+                total_data_len=total_data_len,
+                batch_size=batch_size,
+                num_epochs=num_epochs,
+                gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+                is_train=is_train,
+            )
 
         def to_tf_dataloader(dataset: Dataset | IterableDataset, is_train: bool) -> tp.Iterator[np.ndarray]:
             """
@@ -2645,7 +2658,7 @@ class BaseTrainer(BaseTrainerProtocol):
 - Optimizer: {self.arguments.optimizer}
 - Epochs: {self.arguments.num_train_epochs}
 - Batch Size: {self.arguments.total_batch_size}
-- Sequence Length: {self.arguments.max_sequence_length}
+- Sequence Length: {self.arguments.max_length}
 - Dtype: {model_data["dtype_str"]}
 - Params Dtype: {model_data["param_dtype_str"]}
 

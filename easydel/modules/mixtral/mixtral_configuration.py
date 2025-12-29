@@ -83,17 +83,31 @@ class MixtralConfig(EasyDeLBaseConfig):
         rope_theta (`float`, *optional*, defaults to 1e6):
             The theta value to use for rotary position embeddings.
         sliding_window (`int`, *optional*, defaults to 4096):
-            The sliding window size.
+            Size of the sliding window for local attention in lower layers. Tokens can only
+            attend to tokens within this window distance, reducing computational complexity
+            from O(n²) to O(n*window) while maintaining long-range modeling via stacked layers.
+            Set to None or a very large value to use full attention.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
         num_experts_per_tok (`int`, *optional*, defaults to 2):
-            The number of experts per token.
+            Number of expert networks to route each token to (top-k selection). The router selects
+            this many experts with the highest gating scores, and the token's representation is
+            computed as a weighted sum of these experts' outputs. Mixtral-8x7B uses k=2 (top-2),
+            activating only 2 out of 8 experts per token for sparse computation.
         num_local_experts (`int`, *optional*, defaults to 8):
-            The number of local experts.
+            Total number of expert feed-forward networks per MoE layer. Each layer contains this
+            many independent expert FFNs, and each token is routed to `num_experts_per_tok` of them.
+            Mixtral-8x7B uses 8 experts per layer, creating an 8x7B parameter model (8 experts of
+            ~7B params each) while only activating ~2x7B=14B params per token.
         output_router_logits (`bool`, *optional*, defaults to `False`):
-            Whether to output router logits.
+            Whether to return router logits in model outputs. When True, includes the raw gating
+            scores from the router network for each layer, which can be used to compute the
+            auxiliary load-balancing loss during training or analyze expert selection patterns.
         router_aux_loss_coef (`float`, *optional*, defaults to 0.001):
-            The router auxiliary loss coefficient.
+            Coefficient for the auxiliary load-balancing loss added to the main training loss.
+            This loss encourages balanced expert utilization by penalizing uneven token routing,
+            preventing expert collapse where some experts are overused and others underused.
+            Typical values are 0.001-0.01.
         gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
             The gradient checkpointing configuration.
         use_scan_mlp (`bool`, *optional*, defaults to `False`):
@@ -111,7 +125,9 @@ class MixtralConfig(EasyDeLBaseConfig):
         initialization_of_moe (`bool`, *optional*, defaults to `False`):
             Whether to initialize the MoE layers.
         router_jitter_noise (`float`, *optional*, defaults to 0.0):
-            The jitter noise for the router.
+            Amount of uniform noise to add to router logits during training to improve exploration
+            and prevent premature expert specialization. The noise is sampled from Uniform(-noise, +noise)
+            and added to gating scores before top-k selection. Set to 0.0 to disable noise injection.
     """
 
     model_type: str = "mixtral"
@@ -153,43 +169,6 @@ class MixtralConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
-        """Initializes a MixtralConfig object.
-
-        Args:
-            vocab_size (int, optional): Vocabulary size. Defaults to 32000.
-            hidden_size (int, optional): Hidden size. Defaults to 4096.
-            intermediate_size (int, optional): Intermediate size of the feed-forward network. Defaults to 14336.
-            num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
-            num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
-            num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to 8.
-            hidden_act (str, optional): Activation function. Defaults to "silu".
-            max_position_embeddings (int, optional): Maximum sequence length. Defaults to 4096 * 32.
-            initializer_range (float, optional): Initializer range. Defaults to 0.02.
-            rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-5.
-            use_cache (bool, optional): Whether to use KV cache. Defaults to True.
-            pad_token_id (int, optional): Padding token ID. Defaults to None.
-            bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 1.
-            eos_token_id (int, optional): End-of-sequence token ID. Defaults to 2.
-            tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
-            rope_theta (float, optional): Base value for RoPE. Defaults to 1e6.
-            sliding_window (int, optional): Sliding window size for attention. Defaults to 4096.
-            attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
-            num_experts_per_tok (int, optional): Number of experts to route per token. Defaults to 2.
-            num_local_experts (int, optional): Total number of local experts. Defaults to 8.
-            output_router_logits (bool, optional): Whether to output router logits. Defaults to False.
-            router_aux_loss_coef (float, optional): Coefficient for router auxiliary loss. Defaults to 0.001.
-            gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
-                Defaults to EasyDeLGradientCheckPointers.NONE.
-            use_scan_mlp (bool, optional): Whether to use scan for MLP layers. Defaults to False.
-            scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
-            number_rep_kv (int, optional): Number of repetitions for key/value heads. Defaults to 1.
-            bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
-            rope_scaling (tp.Dict[str, tp.Union[str, float]], optional): RoPE scaling configuration. Defaults to None.
-            attention_bias (bool, optional): Whether to use bias in attention layers. Defaults to False.
-            initialization_of_moe (bool, optional): Whether MoE layers are being initialized. Defaults to False.
-            router_jitter_noise (float, optional): Jitter noise for router gates. Defaults to 0.0.
-            **kwargs: Additional keyword arguments.
-        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -240,21 +219,13 @@ class MixtralConfig(EasyDeLBaseConfig):
         )
 
     def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
-        Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
-        """
         pmag = self.partition_manager
         return (
             (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
             (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
             (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
             (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r"block_sparse_moe/gate/kernel",
-                pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise),
-            ),
+            (r"block_sparse_moe/gate/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
             (r"block_sparse_moe/gate/bias", pmag.resolve(Replicated)),
             (
                 r"block_sparse_moe/experts/(w1|w3)/kernel",

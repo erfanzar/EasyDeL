@@ -64,13 +64,13 @@ class Step3ToolParser(ToolParser):
     <｜tool_calls_end｜>
 
     Note: Uses fullwidth vertical line characters (｜) as delimiters.
-    """  # noqa
+    """
 
-    TOOL_CALLS_BEGIN = "<｜tool_calls_begin｜>"  # noqa: RUF001
-    TOOL_CALLS_END = "<｜tool_calls_end｜>"  # noqa: RUF001
-    TOOL_CALL_BEGIN = "<｜tool_call_begin｜>"  # noqa: RUF001
-    TOOL_CALL_END = "<｜tool_call_end｜>"  # noqa: RUF001
-    TOOL_SEP = "<｜tool_sep｜>"  # noqa: RUF001
+    TOOL_CALLS_BEGIN = "<｜tool_calls_begin｜>"
+    TOOL_CALLS_END = "<｜tool_calls_end｜>"
+    TOOL_CALL_BEGIN = "<｜tool_call_begin｜>"
+    TOOL_CALL_END = "<｜tool_call_end｜>"
+    TOOL_SEP = "<｜tool_sep｜>"
     SPECIAL_TOKENS = [TOOL_CALLS_BEGIN, TOOL_CALLS_END, TOOL_CALL_BEGIN, TOOL_CALL_END]  # noqa: RUF012
 
     def __init__(self, tokenizer: AnyTokenizer):

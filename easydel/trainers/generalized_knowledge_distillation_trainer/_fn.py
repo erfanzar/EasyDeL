@@ -99,15 +99,15 @@ def generalized_jsd_loss(
         mixture_log_probs = jax.scipy.special.logsumexp(
             jnp.stack(
                 [
-                    student_log_probs + log_one_minus,
-                    teacher_log_probs + log_beta,
+                    teacher_log_probs + log_one_minus,
+                    student_log_probs + log_beta,
                 ]
             ),
             axis=0,
         )
         kl_teacher = _kl_div(teacher_log_probs, mixture_log_probs)
         kl_student = _kl_div(student_log_probs, mixture_log_probs)
-        per_token = beta * kl_teacher + (1.0 - beta) * kl_student
+        per_token = beta_val * kl_teacher + (jnp.asarray(1.0, dtype=beta_val.dtype) - beta_val) * kl_student
 
     if mask is None and labels is not None:
         mask = (labels != -100).astype(student_logits.dtype)

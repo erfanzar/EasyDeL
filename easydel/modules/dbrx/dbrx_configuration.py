@@ -215,6 +215,7 @@ class DbrxConfig(EasyDeLBaseConfig):
         output_router_logits: bool = False,
         router_aux_loss_coef: float = 0.05,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+        layer_types: list[str] | None = None,
         **kwargs: tp.Any,
     ):
         """Initialize the DbrxConfig with the specified parameters.
@@ -263,6 +264,9 @@ class DbrxConfig(EasyDeLBaseConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.gradient_checkpointing = gradient_checkpointing
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.n_layers
 
         tie_word_embeddings = kwargs.pop("tie_word_embeddings", False)
         if tie_word_embeddings:

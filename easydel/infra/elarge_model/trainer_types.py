@@ -21,10 +21,57 @@ available in EasyDeL, including DPO, ORPO, GRPO, SFT, Reward, and Distillation t
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Literal, NotRequired, TypedDict
+
+_TRAINER_TYPE_ALIASES: dict[str, str] = {
+    "nash_md": "nash-md",
+}
+
+
+def _normalize_trainer_type(trainer_type: str) -> str:
+    """Normalize trainer type string to canonical form.
+
+    Handles case normalization and known aliases (e.g., "nash_md" -> "nash-md").
+
+    Args:
+        trainer_type: Trainer type string to normalize.
+
+    Returns:
+        Normalized trainer type string in lowercase with aliases resolved.
+
+    Example:
+        >>> _normalize_trainer_type("DPO")
+        'dpo'
+        >>> _normalize_trainer_type("nash_md")
+        'nash-md'
+    """
+    normalized = trainer_type.lower()
+    return _TRAINER_TYPE_ALIASES.get(normalized, normalized)
 
 
 class LossConfig(TypedDict, total=False):
+    """Configuration for loss computation in training.
+
+    Attributes:
+        ignore_index: Token index to ignore in loss computation (default: -100 for padding).
+        label_smoothing: Label smoothing factor (0.0 = no smoothing).
+        z_loss: Z-loss regularization coefficient for router auxiliary loss.
+        loss_normalizing_factor: How to normalize loss across tokens/sequences.
+        num_labels: Number of labels for classification tasks.
+        problem_type: Type of classification problem.
+        divide_weight_sum: Whether to divide by sum of weights.
+        shift_tokens: Whether to shift tokens for causal LM loss computation.
+        break_on_nan: Whether to raise an error on NaN loss values.
+        reduction: Loss reduction method ("none", "mean", or "sum").
+        num_classification_labels: Number of classification labels.
+        classification_problem_type: Type of classification problem for sequence classification.
+        chunk_vocab_size: Chunk size for vocabulary-chunked cross entropy.
+        chunk_token_size: Chunk size for token-chunked cross entropy.
+        chunk_block_size: Block size for chunked computations.
+        compute_dtype: Dtype for loss computation ("fp32" or "bf16").
+    """
+
     ignore_index: NotRequired[int]
     label_smoothing: NotRequired[float]
     z_loss: NotRequired[float]
@@ -62,7 +109,22 @@ class BaseTrainerCfg(TypedDict, total=False):
 
     trainer_type: NotRequired[
         Literal[
-            "sft", "base", "dpo", "grpo", "orpo", "reward", "distillation", "bco", "cpo", "gkd", "kto", "nash_md", "xpo"
+            "sft",
+            "base",
+            "dpo",
+            "grpo",
+            "gfpo",
+            "gspo",
+            "orpo",
+            "reward",
+            "distillation",
+            "bco",
+            "cpo",
+            "gkd",
+            "kto",
+            "nash_md",
+            "nash-md",
+            "xpo",
         ]
     ]
     learning_rate: NotRequired[float]
@@ -108,6 +170,8 @@ class BaseTrainerCfg(TypedDict, total=False):
     step_start_point: NotRequired[int | None]
     resume_if_possible: NotRequired[bool]
     truncation_mode: NotRequired[Literal["keep_end", "keep_start"]]
+    max_length: NotRequired[int | None]
+    # Deprecated alias (kept for backward compatibility).
     max_sequence_length: NotRequired[int | None]
     save_interval_minutes: NotRequired[float | None]
     save_steps: NotRequired[int | None]
@@ -273,7 +337,7 @@ class SFTTrainerCfg(BaseTrainerCfg):
 class RewardTrainerCfg(BaseTrainerCfg):
     """Configuration for Reward Model trainer (RewardConfig)."""
 
-    max_sequence_length: NotRequired[int | None]
+    max_length: NotRequired[int | None]
     disable_dropout: NotRequired[bool]
     dataset_num_proc: NotRequired[int | None]
     center_rewards_coefficient: NotRequired[float | None]
@@ -417,7 +481,7 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "aux_loss_enabled": False,
     "resume_if_possible": True,
     "truncation_mode": "keep_end",
-    "max_sequence_length": 4096,
+    "max_length": 4096,
     "save_directory": "EasyDeL-Checkpoints",
     "save_optimizer_state": True,
     "remove_ckpt_after_load": False,
@@ -508,7 +572,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
     },
     "reward": {
         "trainer_prefix": "rewardtrainer",
-        "max_sequence_length": 1024,
+        "max_length": 1024,
         "disable_dropout": True,
         "center_rewards_coefficient": 0.1,
         "remove_unused_columns": False,
@@ -590,6 +654,23 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "top_k": 50,
         "temperature": 0.7,
     },
+    "nash-md": {
+        "trainer_prefix": "nashmdtrainer",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "beta": 0.1,
+        "mixture_coef": 0.5,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 1,
+        "top_p": 0.95,
+        "top_k": 50,
+        "temperature": 0.7,
+    },
     "xpo": {
         "trainer_prefix": "xpotrainer",
         "learning_rate": 1e-6,
@@ -631,7 +712,7 @@ def register_trainer_defaults(trainer_type: str, defaults: TrainerConfig) -> Non
         ...     "custom_param": 42,
         ... })
     """
-    TRAINER_SPECIFIC_DEFAULTS[trainer_type.lower()] = defaults
+    TRAINER_SPECIFIC_DEFAULTS[_normalize_trainer_type(trainer_type)] = defaults
 
 
 def get_trainer_defaults(trainer_type: str) -> TrainerConfig:
@@ -645,6 +726,7 @@ def get_trainer_defaults(trainer_type: str) -> TrainerConfig:
     Returns:
         Complete defaults dictionary for the trainer
     """
+    trainer_type = _normalize_trainer_type(trainer_type)
     defaults = dict(BASE_TRAINER_DEFAULTS)
     if trainer_type in TRAINER_SPECIFIC_DEFAULTS:
         defaults.update(TRAINER_SPECIFIC_DEFAULTS[trainer_type])
@@ -675,7 +757,26 @@ def normalize_trainer_config(config: dict[str, Any]) -> TrainerConfig:
     from copy import deepcopy
 
     config = deepcopy(config)
-    trainer_type = config.get("trainer_type", "sft").lower()
+    trainer_type = _normalize_trainer_type(config.get("trainer_type", "sft"))
+
+    if "max_sequence_length" in config and "max_length" not in config:
+        warnings.warn(
+            "`max_sequence_length` is deprecated; use `max_length` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        config["max_length"] = config.pop("max_sequence_length")
+    elif (
+        "max_sequence_length" in config
+        and "max_length" in config
+        and config["max_sequence_length"] != config["max_length"]
+    ):
+        warnings.warn(
+            "Both `max_length` and `max_sequence_length` are set; ignoring `max_sequence_length`.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        config.pop("max_sequence_length", None)
 
     # Get merged defaults from registry
     defaults = get_trainer_defaults(trainer_type)
@@ -722,7 +823,7 @@ def get_trainer_class(trainer_type: str):
     """
     from easydel.utils import Registry
 
-    return Registry.get_or_raise("trainer", trainer_type.lower())
+    return Registry.get_or_raise("trainer", _normalize_trainer_type(trainer_type))
 
 
 def get_training_arguments_class(trainer_type: str):
@@ -744,4 +845,4 @@ def get_training_arguments_class(trainer_type: str):
 
     from easydel.utils import Registry
 
-    return Registry.get_or_raise("trainer-arguments", trainer_type.lower())
+    return Registry.get_or_raise("trainer-arguments", _normalize_trainer_type(trainer_type))

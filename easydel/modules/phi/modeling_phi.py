@@ -17,14 +17,13 @@ import functools
 from typing import ClassVar
 
 import jax.lax
-from chex import Array
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -33,6 +32,8 @@ from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -314,26 +315,26 @@ class PhiDecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         """Forward pass of the PhiDecoderLayer module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
+            causal_mask (tp.Optional[Array | bool]): Causal mask for ensuring autoregressive behavior.
             cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
             cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+            fcm_mask (tp.Optional[Array]): Flash Chunking Mask (FCM) for attention.
+            frequencies (tp.Optional[Array]): Precomputed rotary frequency embeddings.
 
         Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array]]:
+            tp.Tuple[Array, tp.Optional[Array]]:
                 A tuple containing the output hidden states and optionally the attention weights.
         """
         residual = hidden_states
@@ -482,37 +483,51 @@ class PhiModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass of the PhiModel.
+        """Performs a forward pass through the Phi transformer model.
+
+        Processes input tokens through embedding, multiple decoder layers with partial RoPE
+        and optional Q/K normalization, and final layer normalization to produce contextualized
+        hidden states.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Either this
+                or `inputs_embeds` must be provided but not both.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length,
+                hidden_size). Use instead of `input_ids` for custom embeddings.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) where True
+                indicates tokens to attend to and False indicates padding to ignore.
+            mask_info: Pre-computed mask information object. If provided, `attention_mask`
+                is ignored.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length).
+                Auto-generated from mask_info if not provided.
+            mode: Runtime mode controlling behavior (MODE_TRAIN, MODE_DECODE, MODE_INFER).
+                Auto-detected based on sequence length and cache presence if None.
+            past_key_values: Cached key/value states from previous forward passes for
+                efficient autoregressive generation. Supports TransformerCache,
+                RaggedPagesCache, or HybridCache formats.
+            cache_metadata: Metadata for paged attention mechanisms, required when using
+                RaggedPagesCache.
+            output_attentions: Whether to return attention weights from all layers.
+                Defaults to config.output_attentions.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to config.output_hidden_states.
 
         Returns:
-            BaseModelOutput: The model's output.
-                returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-                and `attentions` (optional).
+            BaseModelOutput containing:
+                - last_hidden_state: Final layer output of shape (batch, seq_len, hidden_size)
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of all attention weights if output_attentions=True
+                - past_key_values: Updated cache for next generation step
 
         Raises:
-            ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
+            ValueError: If neither `input_ids` nor `inputs_embeds` is provided, or if both
+                are provided simultaneously.
+            AssertionError: If sequence length exceeds max_position_embeddings.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -651,34 +666,41 @@ class PhiForCausalLM(BaseCausalLMModule[PhiModel, PhiConfig]):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> CausalLMOutput:
-        """Forward pass of the PhiForCausalLM model.
+        """Performs forward pass for causal language modeling with Phi.
+
+        Processes input through the base Phi transformer and applies a language modeling
+        head to produce next-token prediction logits.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Either this
+                or `inputs_embeds` must be provided but not both.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length,
+                hidden_size). Use instead of `input_ids` for custom embeddings.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) indicating
+                which tokens to attend to (True) and which to ignore (False).
+            mask_info: Pre-computed mask information. If provided, overrides `attention_mask`.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length).
+                Auto-generated if not provided.
+            output_attentions: Whether to return attention weights from all layers.
+            output_hidden_states: Whether to return hidden states from all layers.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER). Auto-detected if None.
+            past_key_values: Cached key/value states for efficient generation.
+            cache_metadata: Metadata for paged attention caching.
+            apply_lm_head: Whether to apply the language modeling head. Set False to get
+                only hidden states without computing logits.
 
         Returns:
-            CausalLMOutput: The model's output.
-                returns a `CausalLMOutput` object containing `logits`, `hidden_states` (optional),
-                and `attentions` (optional).
+            CausalLMOutput containing:
+                - logits: Next-token prediction logits of shape (batch, seq_len, vocab_size)
+                    if apply_lm_head=True, else None
+                - hidden_states: Tuple of layer outputs if output_hidden_states=True
+                - last_hidden_state: Final layer output of shape (batch, seq_len, hidden_size)
+                - attentions: Tuple of attention weights if output_attentions=True
+                - past_key_values: Updated cache for next generation step
         """
         outputs = self.model(
             input_ids=input_ids,
