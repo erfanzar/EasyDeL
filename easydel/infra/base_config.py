@@ -504,6 +504,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.moe_tiling_size_batch = getattr(self, "moe_tiling_size_batch", moe_tiling_size_batch)
         self.moe_tiling_size_seqlen = getattr(self, "moe_tiling_size_seqlen", moe_tiling_size_seqlen)
         self.moe_tiling_size_dim = getattr(self, "moe_tiling_size_dim", moe_tiling_size_dim)
+        if isinstance(partition_axis, dict):
+            partition_axis = PartitionAxis(**partition_axis)
         self.partition_axis = getattr(self, "partition_axis", partition_axis)
         self.bits = getattr(self, "bits", bits)
         self.scan_attention_layers = getattr(self, "scan_attention_layers", scan_attention_layers)
