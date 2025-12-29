@@ -108,6 +108,8 @@ ignore = [
 	"A005",  # Module-level shadowing
 	"UP037", # Remove quotes from type annotation - needed for jaxtyping string literals
 	"E501",  # Line too long (handled by formatter)
+	"RUF001", # Ruff's own complexity check - handled by other tools
+	"RUF002", # Ruff's own complexity check - handled by other tools
 ]
 
 [tool.ruff.lint.per-file-ignores]

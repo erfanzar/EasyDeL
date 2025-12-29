@@ -55,7 +55,7 @@ class HunyuanA13BToolParser(ToolParser):
 
     Format:
     <tool_calls>[{"name": "func", "arguments": {...}}]</tool_calls>
-    """  # noqa
+    """
 
     def __init__(self, tokenizer: AnyTokenizer):
         super().__init__(tokenizer)
@@ -114,7 +114,7 @@ class HunyuanA13BToolParser(ToolParser):
 
             if not potential_tool_calls:
                 if content:
-                    content = content.replace("助手：", "", 1)  # noqa
+                    content = content.replace("助手：", "", 1)
                 return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=content)
 
             tool_calls_data = json.loads(potential_tool_calls)
