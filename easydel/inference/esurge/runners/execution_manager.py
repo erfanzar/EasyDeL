@@ -132,6 +132,29 @@ def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pa
     return min(res, upper_limit)
 
 
+def _compute_sampling_valid_mask(
+    *,
+    i_reqs: jax.Array,
+    num_requests: jax.Array,
+    active_mask_slice: jax.Array,
+    scheduled_slice: jax.Array,
+    seq_lens_now: jax.Array,
+    req_num_tokens_slice: jax.Array,
+) -> jax.Array:
+    """Compute which request slots are valid for sampling.
+
+    A slot is valid if:
+    - it is within the active request range (`i_reqs < num_requests`)
+    - it is marked active (`active_mask_slice`)
+    - it is scheduled (`scheduled_slice != 0`)
+    - it has not finished (`seq_lens_now < req_num_tokens_slice`)
+    """
+    in_range = i_reqs < num_requests
+    scheduled = scheduled_slice.astype(bool)
+    not_finished = seq_lens_now < req_num_tokens_slice
+    return in_range & active_mask_slice & scheduled & not_finished
+
+
 def _device_put_tree_with_shardings(tree, shardings_tree):
     return jax.tree_util.tree_map(lambda x, s: jax.device_put(x, s) if hasattr(x, "dtype") else x, tree, shardings_tree)
 

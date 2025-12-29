@@ -386,7 +386,7 @@ class Function(OpenAIBaseModel):
 class ToolCall(OpenAIBaseModel):
     """Represents a tool call in responses."""
 
-    id: str
+    id: str = Field(default_factory=lambda: f"call_{uuid.uuid4().hex}")
     type: str = "function"
     function: FunctionCall
 
