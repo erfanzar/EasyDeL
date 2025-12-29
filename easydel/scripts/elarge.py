@@ -50,16 +50,21 @@ as long as `actions:` exists.
 
 from __future__ import annotations
 
-import argparse
 import json
 import pprint
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
+from eformer.aparser import DataClassArgumentParser
 from eformer.loggings import get_logger
 
-from easydel.infra import eLargeModel
-
 logger = get_logger("eLargeScript")
+
+
+@dataclass
+class ElargeArgs:
+    config: Optional[str] = field(default=None, metadata={"help": "Path to YAML config.", "aliases": ["-c"]})  # noqa: UP045
+    dry_run: bool = field(default=False, metadata={"help": "Parse and print config/actions, then exit."})
 
 
 def _load_yaml(path: str) -> dict[str, Any]:
@@ -147,7 +152,7 @@ def _require_str(value: Any, *, ctx: str) -> str:
     return value
 
 
-def _run_action(elm: eLargeModel, name: str, value: Any | None) -> None:
+def _run_action(elm: Any, name: str, value: Any | None) -> None:
     action = name.strip().lower().replace("-", "_")
 
     if action == "validate":
@@ -303,21 +308,21 @@ def _run_action(elm: eLargeModel, name: str, value: Any | None) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(
+    parser = DataClassArgumentParser(
+        ElargeArgs,
         description="Unified YAML runner for easydel.infra.eLargeModel.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("config", nargs="?", help="Path to YAML config.")
-    parser.add_argument("-c", "--config", dest="config_flag", help="Path to YAML config.")
-    parser.add_argument("--dry-run", action="store_true", help="Parse and print config/actions, then exit.")
-    args = parser.parse_args(argv)
+    parser.add_argument("config_pos", nargs="?", help="Path to YAML config.")
+    args, extra = parser.parse_args_into_dataclasses(args=argv, look_for_args_file=False)
 
-    config_path = args.config_flag or args.config
+    config_path = args.config or getattr(extra, "config_pos", None)
     if not config_path:
         raise SystemExit("Missing config path. Provide `--config path.yaml` (or a positional path).")
 
     doc = _load_yaml(config_path)
     _, actions = _extract_config_and_actions(doc)
+    from easydel.infra import eLargeModel
+
     elm = eLargeModel.from_yaml(config_path)
 
     if args.dry_run:

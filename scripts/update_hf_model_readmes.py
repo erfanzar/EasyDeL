@@ -11,19 +11,61 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""
+How to use
+
+Regenerate Hugging Face model-card `README.md` files from each repo's `config.json`, using
+`easydel/utils/readme_generator.py`, and push the changes back to the Hub.
+
+Update all repos under an org/user:
+
+  python scripts/update_hf_model_readmes.py --author EasyDeL --token $HF_TOKEN
+
+Update a curated list and preview without pushing:
+
+  python scripts/update_hf_model_readmes.py \\
+    --repos-file models.txt \\
+    --dry-run \\
+    --output-dir /tmp/easydel-readmes \\
+    --token $HF_TOKEN
+"""
+
 from __future__ import annotations
 
-import argparse
 import importlib.util
 import io
 import json
 import os
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
+from eformer.aparser import DataClassArgumentParser
 from huggingface_hub import HfApi, hf_hub_download, list_models
 from huggingface_hub.errors import EntryNotFoundError
+
+
+@dataclass
+class ScriptArgs:
+    repo_id: str = field(default_factory=list, metadata={"action": "append", "help": "Model repo id (repeatable)."})
+    repos_file: Optional[str] = field(default=None, metadata={"help": "Path to a file with one repo id per line."})  # noqa: UP045
+    author: Optional[str] = field(default=None, metadata={"help": "Update all model repos owned by this HF user/org."})  # noqa: UP045
+    match: Optional[str] = field(default=None, metadata={"help": "Only process repo ids containing this substring."})  # noqa: UP045
+    token: Optional[str] = field(default=None, metadata={"help": "HF token (or set HF_TOKEN env var / hf auth login)."})  # noqa: UP045
+    revision: Optional[str] = field(default=None, metadata={"help": "Repo revision to read from (default: main)."})  # noqa: UP045
+    commit_message: str = field(
+        default="Update README.md (EasyDeL auto-generated)", metadata={"help": "Commit message."}
+    )
+    dry_run: bool = field(default=False, metadata={"help": "Generate but do not push changes."})
+    output_dir: Optional[str] = field(  # noqa: UP045
+        default=None,
+        metadata={"help": "Optional directory to write generated READMEs for review."},
+    )
+    template_dir: Optional[str] = field(default=None, metadata={"help": "Optional custom Jinja template directory."})  # noqa: UP045
+    template_name: Optional[str] = field(
+        default=None, metadata={"help": "Optional template filename inside template_dir."}
+    )  # noqa: UP045
 
 
 def _load_readme_generator():
@@ -43,7 +85,7 @@ def _read_text(path: str | os.PathLike) -> str:
 
 
 def _load_json(path: str | os.PathLike) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, dict):
         raise TypeError(f"Expected a JSON object in {path}, got {type(data).__name__}")
@@ -88,7 +130,7 @@ def _get_attn_mechanism(config: dict[str, Any]) -> str:
     return "auto"
 
 
-def _collect_repo_ids(args: argparse.Namespace) -> list[str]:
+def _collect_repo_ids(args: Any) -> list[str]:
     repo_ids: list[str] = []
 
     for repo_id in args.repo_id or []:
@@ -121,22 +163,11 @@ def _collect_repo_ids(args: argparse.Namespace) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
+    parser = DataClassArgumentParser(
+        ScriptArgs,
         description="Regenerate and push HF model-card README.md files from each repo's config.json.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--repo-id", action="append", default=[], help="Model repo id (repeatable).")
-    parser.add_argument("--repos-file", help="Path to a file with one repo id per line.")
-    parser.add_argument("--author", help="Update all model repos owned by this HF user/org.")
-    parser.add_argument("--match", default=None, help="Only process repo ids containing this substring.")
-    parser.add_argument("--token", default=None, help="HF token (or set HF_TOKEN env var / hf auth login).")
-    parser.add_argument("--revision", default=None, help="Repo revision to read from (default: main).")
-    parser.add_argument("--commit-message", default="Update README.md (EasyDeL auto-generated)", help="Commit message.")
-    parser.add_argument("--dry-run", action="store_true", help="Generate but do not push changes.")
-    parser.add_argument("--output-dir", default=None, help="Optional directory to write generated READMEs for review.")
-    parser.add_argument("--template-dir", default=None, help="Optional custom Jinja template directory.")
-    parser.add_argument("--template-name", default=None, help="Optional template filename inside template_dir.")
-    args = parser.parse_args(argv)
+    (args,) = parser.parse_args_into_dataclasses(args=argv, look_for_args_file=False)
 
     repo_ids = _collect_repo_ids(args)
     if not repo_ids:

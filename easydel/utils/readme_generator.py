@@ -394,7 +394,7 @@ tags:
 ---
 
 <p align="center">
-  <img alt="easydel" src="https://raw.githubusercontent.com/erfanzar/easydel/main/images/easydel-logo-with-text.png">
+  <img alt="EasyDeL" src="https://raw.githubusercontent.com/erfanzar/easydel/main/images/easydel-logo-with-text.png" height="80">
 </p>
 
 <h1 align="center">{{ model.name }}</h1>

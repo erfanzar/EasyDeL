@@ -15,7 +15,7 @@
 Compatibility wrapper.
 
 Prefer:
-  python -m easydel.scripts.convert_hf_to_easydel --help
+  python -m easydel.scripts.download_hf_large_weights_to_gcs --help
 """
 
 import runpy
@@ -27,6 +27,6 @@ if __name__ == "__main__":
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    target = repo_root / "easydel" / "scripts" / "convert_hf_to_easydel.py"
+    target = repo_root / "easydel" / "scripts" / "download_hf_large_weights_to_gcs.py"
     sys.argv[0] = str(target)
     runpy.run_path(str(target), run_name="__main__")

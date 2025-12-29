@@ -149,6 +149,17 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
 
 .. toctree::
    :maxdepth: 2
+   :caption: CLI & Scripts:
+
+   scripts/index.md
+   scripts/model_conversion.md
+   scripts/hf_download_to_gcs.md
+   scripts/elarge_cli.md
+   scripts/model_cards.md
+   scripts/dev_tools.md
+
+.. toctree::
+   :maxdepth: 2
    :caption: Advanced:
 
    multimodality/audio_language.md
