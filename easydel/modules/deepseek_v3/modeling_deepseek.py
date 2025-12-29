@@ -17,7 +17,6 @@ import typing
 from functools import partial
 from typing import ClassVar
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -41,6 +40,8 @@ from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -283,9 +284,9 @@ class DeepseekV3MLPMoE(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        group_sizes: chex.Array,
-        sorted_experts: chex.Array | None = None,
+        hidden_states: Array,
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
     ):
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -362,7 +363,7 @@ class DeepseekV3MoE(BaseMoeModule):
                 rngs=rngs,
             )
 
-    def __call__(self, hidden_states: chex.Array):
+    def __call__(self, hidden_states: Array):
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -541,7 +542,6 @@ class DeepseekV3Attention(UnifiedAttention):
             ),
         )
 
-        # Output projection
         setattr(
             self,
             self.projection_mapping["output_projection"],
@@ -663,31 +663,31 @@ class DeepseekV3DecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
+        hidden_states: Array,
         mask_info: MaskInfo,
-        position_ids: chex.Array,
+        position_ids: Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
-        frequencies: tuple[chex.Array, chex.Array] | None = None,
+        frequencies: tuple[Array, Array] | None = None,
     ) -> DecoderLayerOutput:
         """
         Forward pass of the module block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            frequencies (tp.Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            hidden_states (Array): Input hidden states.
+            frequencies (tp.Tuple[Array, Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens.
+            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             deterministic (bool): If True, disables dropout for deterministic behavior.
             init_cache (bool): If True, initializes cache for caching keys and values.
             output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
         """
         residual = hidden_states
 
@@ -807,8 +807,8 @@ class DeepseekV3Model(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -817,11 +817,11 @@ class DeepseekV3Model(EasyDeLBaseModule):
         Forward pass through the Deepseekv3 module.
 
         Args:
-            input_ids (chex.Array): Input tensor containing token IDs.
-            attention_mask (chex.Array): Mask for attention.
-            position_ids (chex.Array): Positional indices.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
-            inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
+            input_ids (Array): Input tensor containing token IDs.
+            attention_mask (Array): Mask for attention.
+            position_ids (Array): Positional indices.
+            segment_ids (tp.Optional[Array]): Segment IDs for different input parts.
+            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
             output_attentions (tp.Optional[bool]): If True, output attention weights.
             output_hidden_states (tp.Optional[bool]): If True, output hidden states.
             init_cache (bool): If True, initialize cache for decoding.
@@ -988,8 +988,8 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -999,10 +999,10 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         Forward pass of the causal language model.
 
         Args:
-            input_ids (Optional[chex.Array], optional): Token IDs to process. Defaults to None.
-            inputs_embeds (Optional[chex.Array], optional): Pre-computed input embeddings. Defaults to None.
-            attention_mask (Optional[chex.Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
-            position_ids (Optional[chex.Array], optional): Position IDs. Defaults to None.
+            input_ids (Optional[Array], optional): Token IDs to process. Defaults to None.
+            inputs_embeds (Optional[Array], optional): Pre-computed input embeddings. Defaults to None.
+            attention_mask (Optional[Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
+            position_ids (Optional[Array], optional): Position IDs. Defaults to None.
             output_attentions (Optional[bool], optional): Whether to output attention weights. Defaults to None.
             output_hidden_states (Optional[bool], optional): Whether to output hidden states. Defaults to None.
             output_router_logits (Optional[bool], optional): Whether to output router logits. Defaults to None.
@@ -1045,12 +1045,7 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         )
         return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
-    def create_cache_metadata(
-        self,
-        batch_size: int,
-        max_length: int,
-        pad_token_id: int | None = None,
-    ):
+    def create_transformer_cache_config(self, batch_size: int, max_length: int):
         """Create cache metadata for MLA attention.
 
         MLA uses different dimensions for keys and values:
@@ -1063,26 +1058,18 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
             pad_token_id: Padding token ID (optional)
 
         Returns:
-            TransformerCacheMetaData configured for MLA
+            TransformerCacheConfig configured for MLA
         """
-        from easydel.layers.caching import TransformerCacheMetaData
+        from easydel.layers.caching import TransformerCacheConfig
 
         config = self.config
-        if pad_token_id is None:
-            if hasattr(self, "generation_config") and self.generation_config is not None:
-                pad_token_id = self.generation_config.pad_token_id
-            elif hasattr(config, "pad_token_id"):
-                pad_token_id = config.pad_token_id
-            else:
-                pad_token_id = 0
 
         # MLA dimensions
         q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         v_head_dim = config.v_head_dim
 
-        return TransformerCacheMetaData.create(
+        return TransformerCacheConfig.create(
             num_hidden_layers=config.num_hidden_layers,
-            pad_token_id=pad_token_id,
             batch_size=batch_size,
             sequence_length=max_length,
             num_heads=config.num_attention_heads,
@@ -1092,11 +1079,13 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
             value_dim=v_head_dim,
         )
 
-    def create_paged_metadata(
+    def create_ragged_page_cache_config(
         self,
-        hbm_utilization: float,
-        page_size: int,
-        max_model_length: int,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
     ):
         """Create paged cache metadata for MLA attention.
 
@@ -1110,10 +1099,10 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
             max_model_length: Maximum model sequence length
 
         Returns:
-            RaggedPagesCacheMetaData configured for MLA
+            RaggedPagesCacheConfig configured for MLA
         """
-        from easydel.layers.caching import RaggedPagesCacheMetaData
         from easydel.layers.attention import AttentionMechanisms
+        from easydel.layers.caching import RaggedPagesCacheConfig
 
         config = self.config
         text_config = config.get_text_config()
@@ -1130,11 +1119,11 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
             case _:
                 version = "v3"
 
-        return RaggedPagesCacheMetaData.create(
+        return RaggedPagesCacheConfig.create(
             mesh=self.mesh,
             partition_manager=text_config.partition_manager,
             kvdtype=text_config.kvdtype,
-            max_model_length=max_model_length,
+            max_model_length=max_length,
             num_hidden_layers=config.num_hidden_layers,
             num_kv_heads=config.num_attention_heads,
             kv_head_dim_size=q_head_dim,

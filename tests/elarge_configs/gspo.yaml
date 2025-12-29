@@ -1,0 +1,57 @@
+# GSPO (Group Sequence Policy Optimization) test config
+# Mirrors tests/trainers/gspo_trainer.py
+# Note: Requires `reward_model` because YAML cannot supply python reward functions.
+
+model:
+  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+
+reward_model:
+  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+  task: sequence-classification
+  extra_kwargs:
+    num_labels: 1
+
+loader:
+  dtype: bf16
+  param_dtype: bf16
+  trust_remote_code: true
+
+sharding:
+  axis_dims: [1, -1, 1, 1, 1]
+  auto_shard_model: true
+
+base_config:
+  values:
+    freq_max_position_embeddings: 768
+    mask_max_position_embeddings: 768
+    attn_mechanism: auto
+    attn_dtype: bf16
+    gradient_checkpointing: ""
+
+mixture:
+  informs:
+    - type: trl-lib/ultrafeedback_binarized
+      split: "train"
+  batch_size: 2
+  streaming: false
+
+trainer:
+  trainer_type: gspo
+  learning_rate: 8.0e-6
+  num_train_epochs: 1
+  total_batch_size: 2
+  gradient_accumulation_steps: 2
+  max_training_steps: 1024
+  max_prompt_length: 512
+  max_completion_length: 256
+  max_sequence_length: 768
+  save_steps: 1000
+  save_total_limit: 1
+  log_steps: 1
+  shuffle_train_dataset: false
+  save_directory: ./tmp-files/elarge-tests/gspo
+
+actions:
+  - validate
+  - train
+

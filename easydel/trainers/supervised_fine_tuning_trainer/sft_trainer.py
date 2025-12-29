@@ -63,7 +63,7 @@ class SFTTrainer(Trainer):
         ...     per_device_train_batch_size=4,
         ...     learning_rate=2e-5,
         ...     packing=True,
-        ...     max_sequence_length=2048
+        ...     max_length=2048
         ... )
         >>> trainer = SFTTrainer(
         ...     arguments=config,
@@ -147,7 +147,7 @@ class SFTTrainer(Trainer):
 
         return SFTPreprocessTransform(
             tokenizer=self.processing_class,
-            max_length=self.arguments.max_sequence_length,
+            max_length=self.arguments.max_length,
             text_field=self._dataset_text_field or "text",
             mask_prompt=getattr(self.arguments, "completion_only_loss", False),
             formatting_func=self._formatting_func,
@@ -180,7 +180,7 @@ class SFTTrainer(Trainer):
         from easydel.data.transforms.pack import PackedShardedSource
 
         # Get packing parameters
-        seq_length = self.arguments.max_sequence_length
+        seq_length = self.arguments.max_length
         eos_token_id = getattr(self.processing_class, "eos_token_id", None)
         pad_token_id = getattr(self.processing_class, "pad_token_id", 0)
 

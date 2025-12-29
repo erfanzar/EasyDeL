@@ -14,9 +14,7 @@
 from __future__ import annotations
 
 import typing as tp
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -25,7 +23,7 @@ from ..training_configurations import TrainingArguments
 
 
 @Registry.register("trainer-arguments", "distillation")
-@auto_pytree
+@dataclass
 class DistillationConfig(TrainingArguments):
     """Configuration class for knowledge distillation training.
 
@@ -131,12 +129,12 @@ class DistillationConfig(TrainingArguments):
         },
     )
 
-    def __post_init__(self):
+    def __post_init__(self, max_sequence_length: int | None):
         if self.hidden_state_layers is not None:
             self.hidden_state_layers = tuple(int(i) for i in self.hidden_state_layers)
         if self.attention_layers is not None:
             self.attention_layers = tuple(int(i) for i in self.attention_layers)
         if hasattr(super(), "__post_init__"):
-            super().__post_init__()
+            super().__post_init__(max_sequence_length=max_sequence_length)
 
     __hash__ = hash_fn

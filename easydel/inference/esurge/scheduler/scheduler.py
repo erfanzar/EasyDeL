@@ -555,7 +555,6 @@ class Scheduler(SchedulerInterface):
                         num_cached_tokens=request.num_cached_tokens,
                     )
                 )
-            assert not prompt_logprobs_tensors
 
         if stopped_running_reqs:
             self.running = [req for req in self.running if req not in stopped_running_reqs]

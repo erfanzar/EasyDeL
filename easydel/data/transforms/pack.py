@@ -534,8 +534,7 @@ class PackedShardedSource(ShardedDataSource[dict]):
 
     def __repr__(self) -> str:
         return (
-            f"PackedShardedSource(seq_length={self._seq_length}, "
-            f"strategy={self._strategy!r}, source={self._source!r})"
+            f"PackedShardedSource(seq_length={self._seq_length}, strategy={self._strategy!r}, source={self._source!r})"
         )
 
 

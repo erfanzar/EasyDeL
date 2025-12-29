@@ -105,6 +105,7 @@ class OPTConfig(EasyDeLBaseConfig):
         enable_bias: bool = True,
         layer_norm_elementwise_affine: bool = True,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes the OPTConfig object.
@@ -160,6 +161,9 @@ class OPTConfig(EasyDeLBaseConfig):
         self.layer_norm_elementwise_affine = layer_norm_elementwise_affine
         self._remove_final_layer_norm = _remove_final_layer_norm
         self.from_pt = False
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
 
     def get_partition_rules(self, *args, **kwargs):
         """

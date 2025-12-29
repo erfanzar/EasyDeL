@@ -159,32 +159,23 @@ class KimiLinearConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size: int = 163840,
-        hidden_size: int = 4096,
-        intermediate_size: int = 11008,
-        num_hidden_layers: int = 32,
-        num_attention_heads: int = 32,
-        num_key_value_heads: int | None = None,
-        head_dim: int | None = None,
-        hidden_act: str = "silu",
-        max_position_embeddings: int = 2048,
-        initializer_range: float = 0.02,
-        rms_norm_eps: float = 1e-6,
-        use_cache: bool = True,
-        pad_token_id: int = 0,
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
-        tie_word_embeddings: bool = False,
-        rope_theta: float = 10000.0,
-        rope_scaling: dict | None = None,
-        attention_bias: bool = False,
-        attention_dropout: float = 0.0,
-        q_lora_rank: int | None = None,
-        kv_lora_rank: int | None = None,
-        qk_nope_head_dim: int | None = None,
-        qk_rope_head_dim: int | None = None,
-        v_head_dim: int | None = None,
-        mla_use_nope: bool = False,
+        vocab_size=163840,
+        hidden_size=4096,
+        head_dim=None,
+        intermediate_size=11008,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=None,
+        hidden_act="silu",
+        initializer_range=0.02,
+        rms_norm_eps=1e-6,
+        use_cache=True,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        rope_theta=10000.0,
+        rope_scaling=None,
+        tie_word_embeddings=False,
         moe_intermediate_size: int | None = None,
         moe_renormalize: bool = True,
         moe_router_activation_func: str = "sigmoid",
@@ -197,8 +188,15 @@ class KimiLinearConfig(EasyDeLBaseConfig):
         use_grouped_topk: bool = True,
         num_expert_group: int = 1,
         topk_group: int = 1,
+        q_lora_rank: int | None = None,
+        kv_lora_rank: int | None = 512,
+        qk_nope_head_dim: int | None = 128,
+        qk_rope_head_dim: int | None = 64,
+        v_head_dim: int | None = 128,
+        mla_use_nope: bool | None = True,
         num_nextn_predict_layers: int = 0,
         linear_attn_config: dict | None = None,
+        max_position_embeddings: int = 2**16,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -213,14 +211,11 @@ class KimiLinearConfig(EasyDeLBaseConfig):
 
         self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
         self.hidden_act = hidden_act
-        self.max_position_embeddings = max_position_embeddings
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
-        self.attention_bias = attention_bias
-        self.attention_dropout = attention_dropout
 
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
@@ -243,7 +238,7 @@ class KimiLinearConfig(EasyDeLBaseConfig):
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
         self.num_nextn_predict_layers = num_nextn_predict_layers
-
+        self.max_position_embeddings = max_position_embeddings
         if linear_attn_config is not None:
             assert linear_attn_config.get("kda_layers") is not None
             assert linear_attn_config.get("full_attn_layers") is not None

@@ -1,15 +1,33 @@
-#!/usr/bin/env python3
+# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
-Standalone script to format code and generate API documentation for easydel.
-This works as a pre-commit hook when called from .pre-commit-config.yaml.
+How to use
+
+Format code and generate API documentation for EasyDeL (also used by pre-commit):
+
+  python scripts/format_and_generate_docs.py
+
+Run with `--help` to see all options.
 """
 
-import argparse
 import shutil
 import subprocess
-import sys
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from eformer.aparser import DataClassArgumentParser
 
 PROJECT_NAME = "easydel"
 
@@ -69,9 +87,14 @@ def _write_package_index(pkg_docname: str, children: list[str], packages: set[st
         f.write(".. toctree::\n")
         f.write("   :maxdepth: 2\n\n")
 
-        # Show packages first, then modules
         for child in sorted(children, key=lambda c: (0 if c in packages else 1, c)):
-            entry = f"{child}/index" if child in packages else child
+            if pkg_docname:
+                prefix = f"{pkg_docname}/"
+                child_rel = child[len(prefix) :] if child.startswith(prefix) else child
+            else:
+                child_rel = child
+
+            entry = f"{child_rel}/index" if child in packages else child_rel
             f.write(f"   {entry}\n")
 
 
@@ -237,54 +260,42 @@ def run_tests(test_dir: str = "test") -> bool:
         return True
     else:
         print("✗ Some tests failed")
-        return False
+    return False
 
 
-def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(description=f"Format code and generate documentation for {PROJECT_NAME}")
+@dataclass
+class ScriptArgs:
+    format: bool = field(default=False, metadata={"help": "Format code with ruff"})
+    docs: bool = field(default=False, metadata={"help": "Generate API documentation"})
+    test: bool = field(default=False, metadata={"help": "Run tests"})
+    all: bool = field(default=False, metadata={"help": "Run all tasks"})
 
-    # Task selection
-    parser.add_argument("--format", action="store_true", help="Format code with ruff")
-    parser.add_argument("--docs", action="store_true", help="Generate API documentation")
-    parser.add_argument("--test", action="store_true", help="Run tests")
-    parser.add_argument("--all", action="store_true", help="Run all tasks")
-
-    # Options
-    parser.add_argument(
-        "--no-fix",
-        dest="fix",
-        action="store_false",
+    fix: bool = field(
         default=True,
-        help="Don't apply fixes automatically",
+        metadata={"help": "Apply fixes automatically (use --no-fix to disable)"},
     )
-    parser.add_argument(
-        "--no-clean",
-        dest="clean",
-        action="store_false",
+    clean: bool = field(
         default=True,
-        help="Don't clean old documentation",
+        metadata={"help": "Clean old documentation (use --no-clean to disable)"},
     )
-    parser.add_argument(
-        "--directory",
-        default=PROJECT_NAME,
-        help=f"Directory to format (default: {PROJECT_NAME})",
+    directory: str = field(default=PROJECT_NAME, metadata={"help": f"Directory to format (default: {PROJECT_NAME})"})
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = DataClassArgumentParser(
+        ScriptArgs,
+        description=f"Format code and generate documentation for {PROJECT_NAME}",
     )
+    (args,) = parser.parse_args_into_dataclasses(args=argv, look_for_args_file=False)
 
-    args = parser.parse_args()
-
-    # Default to all if no specific task selected
-    if not any([args.format, args.docs, args.test, args.all]):
-        args.all = True
-
+    run_all = args.all or not any([args.format, args.docs, args.test])
     exit_code = 0
 
-    # Run selected tasks
-    if args.all or args.format:
+    if run_all or args.format:
         if not format_code(args.directory, fix=args.fix):
             exit_code = 1
 
-    if args.all or args.docs:
+    if run_all or args.docs:
         if not generate_api_docs(clean=args.clean):
             exit_code = 1
 
@@ -292,7 +303,7 @@ def main():
         if not run_tests():
             exit_code = 1
 
-    sys.exit(exit_code)
+    raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

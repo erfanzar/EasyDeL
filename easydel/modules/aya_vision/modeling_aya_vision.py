@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -31,7 +28,14 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput, VLMCausalLMOutput
 from easydel.infra.utils import ACT2FN
 from easydel.layers.base_modules import BaseVisionLanguageModule
-from easydel.layers.caching import RaggedPagesCache, RaggedPagesMetadata, TransformerCache, TransformerMetadata
+from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerMetadata,
+)
 from easydel.layers.linear import RowParallelLinear
 from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 
@@ -46,41 +50,41 @@ class AyaVisionCausalLMOutputWithPast(ModelOutput):
     Base class for AyaVision causal language model (or autoregressive) outputs.
 
     Args:
-        loss (`chex.Array` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        loss (`Array` of shape `(1,)`, *optional*, returned when `labels` is provided):
             Language modeling loss (for next-token prediction).
-        logits (`chex.Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        logits (`Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        past_key_values (`tuple(tuple(chex.Array))`, *optional*, returned when `use_cache=True` is passed or
+        past_key_values (`tuple(tuple(Array))`, *optional*, returned when `use_cache=True` is passed or
             when `config.use_cache=True`):
-            Tuple of `tuple(chex.Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+            Tuple of `tuple(Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
             `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
 
             Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
             `past_key_values` input) to speed up sequential decoding.
-        hidden_states (`tuple(chex.Array)`, *optional*, returned when `output_hidden_states=True` is passed or
+        hidden_states (`tuple(Array)`, *optional*, returned when `output_hidden_states=True` is passed or
             when `config.output_hidden_states=True`):
-            Tuple of `chex.Array` (one for the output of the embeddings, if the model has an embedding layer, +
+            Tuple of `Array` (one for the output of the embeddings, if the model has an embedding layer, +
             one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
 
             Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-        attentions (`tuple(chex.Array)`, *optional*, returned when `output_attentions=True` is passed or
+        attentions (`tuple(Array)`, *optional*, returned when `output_attentions=True` is passed or
             when `config.output_attentions=True`):
-            Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            Tuple of `Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
-        image_hidden_states (`chex.Array`, *optional*):
-            A `chex.Array` of size (batch_size * num_patches, num_images, sequence_length, hidden_size)`.
+        image_hidden_states (`Array`, *optional*):
+            An `Array` of size (batch_size * num_patches, num_images, sequence_length, hidden_size)`.
             image_hidden_states of the model produced by the vision encoder and after projecting the last hidden state.
     """
 
-    loss: chex.Array | None = None
-    logits: chex.Array = None
+    loss: Array | None = None
+    logits: Array = None
     past_key_values: TransformerCache | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    last_hidden_state: chex.Array | None = None
-    attentions: tuple[chex.Array] | None = None
+    hidden_states: tuple[Array] | None = None
+    last_hidden_state: Array | None = None
+    attentions: tuple[Array] | None = None
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
@@ -106,7 +110,16 @@ class AyaVisionMultiModalProjector(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the AyaVisionMultiModalProjector."""
+        """Initializes the AyaVisionMultiModalProjector.
+
+        Args:
+            config (AyaVisionConfig): Model configuration containing vision/text settings and projector parameters.
+            dtype (jnp.dtype): Computation dtype for activations. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Parameter storage dtype for weights. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike): JAX matmul precision setting (e.g., jax.lax.Precision.DEFAULT).
+                None uses default precision.
+            rngs (nn.Rngs): Flax NNX random number generators for parameter initialization.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -154,11 +167,18 @@ class AyaVisionMultiModalProjector(nn.Module):
     def __call__(self, image_features: jax.Array) -> jax.Array:
         """Forward pass through the projector.
 
+        Applies pixel shuffling for spatial downsampling, layer normalization, and gated
+        linear projections to transform vision features to the language model's hidden dimension.
+
         Args:
-            image_features (jax.Array): Input image features.
+            image_features (jax.Array): Input image features from vision encoder.
+                Shape: (batch_size, num_patches, vision_hidden_size)
+                Example: (1, 576, 1152) for 384x384 image with patch_size=14
 
         Returns:
-            jax.Array: Processed hidden states.
+            jax.Array: Projected features ready for language model.
+                Shape: (batch_size, downsampled_patches, text_hidden_size)
+                Example: (1, 144, 4096) after 2x downsampling to Cohere2's hidden size
         """
         image_features = self.pixel_shuffle(image_features)
         image_features = self.layernorm(image_features)
@@ -227,7 +247,15 @@ class AyaVisionModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the AyaVisionForConditionalGeneration model."""
+        """Initializes the AyaVisionModel (base model without LM head).
+
+        Args:
+            config (AyaVisionConfig): Model configuration with vision, text, and projector settings.
+            dtype (jnp.dtype): Computation dtype for activations. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Parameter storage dtype for weights. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike): JAX matmul precision. Defaults to None (uses default precision).
+            rngs (nn.Rngs): Flax NNX random number generators for initializing all submodules.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -261,14 +289,14 @@ class AyaVisionModel(EasyDeLBaseModule):
         self.vision_feature_layer = config.vision_feature_layer
         self.vision_feature_select_strategy = getattr(config, "vision_feature_select_strategy", "default")
 
-    def get_image_features(self, pixel_values: chex.Array) -> chex.Array:
+    def get_image_features(self, pixel_values: Array) -> Array:
         """Extracts and projects image features from the vision tower.
 
         Args:
-            pixel_values (chex.Array): Input pixel values for the images.
+            pixel_values (Array): Input pixel values for the images.
 
         Returns:
-            chex.Array: Processed image features ready for the language model.
+            Array: Processed image features ready for the language model.
         """
         image_features = self.vision_tower(pixel_values, output_hidden_states=True)
         selected_image_feature = image_features.hidden_states[self.vision_feature_layer]
@@ -280,39 +308,90 @@ class AyaVisionModel(EasyDeLBaseModule):
 
         return image_features
 
+    def compute_embedding(
+        self,
+        input_ids: Int[Array, "batch seq_len"],
+        *,
+        image_features: Array | None = None,
+        pixel_values: Array | None = None,
+        **kwargs,
+    ) -> Array:
+        if input_ids is None:
+            raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
+
+        vocab_size = self.config.get_text_config().vocab_size
+        image_token_id = self.config.image_token_index
+        if image_token_id >= vocab_size:
+            llm_input_ids = jnp.where(input_ids == image_token_id, 0, input_ids)
+        else:
+            llm_input_ids = input_ids
+
+        inputs_embeds = super().compute_embedding(llm_input_ids)
+
+        if image_features is None and pixel_values is not None:
+            image_features = self.get_image_features(pixel_values)
+
+        if image_features is not None:
+            multimodal_embeddings = image_features.reshape(-1, image_features.shape[-1]).astype(inputs_embeds.dtype)
+            inputs_embeds = BaseVisionLanguageModule.merge_multimodal_embeddings(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=multimodal_embeddings,
+                placeholder_token_id=image_token_id,
+            )
+
+        return inputs_embeds
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: chex.Array = None,
+        pixel_values: Array = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         **lm_kwargs,
     ):
-        """Forward pass for the AyaVision model.
+        """Forward pass for the AyaVision base model (no LM head).
+
+        Processes images through the vision tower, merges image features with text embeddings,
+        and runs the combined embeddings through the language model.
 
         Args:
-            input_ids (chex.Array): Input token IDs. (batch_size, sequence_length)
-            pixel_values (chex.Array): Input pixel values for images. (batch_size, num_channels, height, width)
-            attention_mask (Optional[chex.Array]): Mask for text attention.
-            position_ids (Optional[chex.Array]): Position IDs for text.
-            segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
-            past_key_values (Optional[TransformerCache | RaggedPagesCache]): Cached keys/values for language model.
-            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
-            output_attentions (Optional[bool]): Whether to output attentions.
-            output_hidden_states (Optional[bool]): Whether to output hidden states.
-            **lm_kwargs: Additional arguments passed to the language model.
+            input_ids (Int[Array, "batch seq_len"]): Input token IDs including image token placeholders.
+                Shape: (batch_size, sequence_length). Image tokens should use config.image_token_index (255036).
+            pixel_values (Array): Input pixel values for images.
+                Shape: (batch_size, num_channels, height, width), e.g., (1, 3, 384, 384)
+            attention_mask (Bool[Array, "batch seq_len"] | None): Attention mask for text tokens.
+                Shape: (batch_size, sequence_length). True/1 for valid tokens, False/0 for padding.
+            mask_info (MaskInfo | None): Structured mask information for efficient attention computation.
+            position_ids (Int[Array, "batch seq_len"] | None): Position IDs for positional embeddings.
+                Shape: (batch_size, sequence_length)
+            mode (common_types.RUNTIME_MODE_TYPES | None): Runtime mode (e.g., "train", "eval", "generate").
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None): Cached attention
+                keys/values from previous generation steps for faster autoregressive decoding.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None):
+                Metadata for paged attention and cache management.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"] | None): Pre-computed input embeddings.
+                If provided, input_ids must be None. Shape: (batch_size, sequence_length, hidden_size)
+            output_attentions (bool | None): Whether to return attention weights from all layers.
+            output_hidden_states (bool | None): Whether to return hidden states from all layers.
+            **lm_kwargs: Additional keyword arguments passed to the language model.
 
         Returns:
-            AyaVisionCausalLMOutputWithPast: Model outputs including logits and potentially past key/values,
-                hidden states, attentions, and image hidden states.
+            AyaVisionCausalLMOutputWithPast: Model outputs containing:
+                - loss: None (not computed in base model)
+                - logits: None (no LM head in base model)
+                - past_key_values: Updated KV cache if caching is enabled
+                - last_hidden_state: Final hidden states (batch_size, sequence_length, hidden_size)
+                - hidden_states: Tuple of hidden states from all layers if output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+                - image_hidden_states: Projected image features if pixel_values is provided
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -321,27 +400,17 @@ class AyaVisionModel(EasyDeLBaseModule):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        if input_ids is not None and self.config.image_token_index >= self.config.get_text_config().vocab_size:
-            special_image_mask = input_ids == self.config.image_token_index
-            llm_input_ids = input_ids
-            llm_input_ids = jnp.where(special_image_mask, 0, llm_input_ids)
-        else:
-            llm_input_ids = input_ids
+        if pixel_values is not None and input_ids is None:
+            raise ValueError("`input_ids` must be provided when `pixel_values` is not None.")
 
-        if inputs_embeds is None:
-            inputs_embeds = self.language_model.get_embedding()(llm_input_ids)
-
+        image_features = None
         if pixel_values is not None:
             image_features = self.get_image_features(pixel_values)
 
-            special_image_mask = jnp.expand_dims((input_ids == self.config.image_token_index), -1)
-            special_image_mask = jnp.broadcast_to(special_image_mask, inputs_embeds.shape)
-            image_features = image_features.astype(inputs_embeds.dtype)
-            inputs_embeds = jnp.place(
-                inputs_embeds,
-                special_image_mask,
-                image_features,
-                inplace=False,
+        if inputs_embeds is None:
+            inputs_embeds = self.compute_embedding(
+                input_ids,
+                image_features=image_features,
             )
         outputs = self.language_model(
             attention_mask=attention_mask,
@@ -382,16 +451,16 @@ class AyaVisionModel(EasyDeLBaseModule):
         max_length: int,
         pad_token_id: int,
         starts: int | None = None,
-        pixel_values: chex.Array | None = None,
+        pixel_values: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
     ):
         """Prepares inputs for text generation, including pixel values if provided.
 
         Args:
-            input_ids (chex.Array): Initial input token IDs.
+            input_ids (Array): Initial input token IDs.
             max_length (int): Maximum generation length.
-            pixel_values (Optional[chex.Array]): Pixel values for image input.
-            attention_mask (Optional[chex.Array]): Attention mask.
+            pixel_values (Optional[Array]): Pixel values for image input.
+            attention_mask (Optional[Array]): Attention mask.
 
         Returns:
             dict: Model inputs ready for generation.
@@ -492,7 +561,15 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the AyaVisionForConditionalGeneration model."""
+        """Initializes the AyaVisionForConditionalGeneration model with LM head.
+
+        Args:
+            config (AyaVisionConfig): Model configuration with vision, text, and projector settings.
+            dtype (jnp.dtype): Computation dtype for activations. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Parameter storage dtype for weights. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike): JAX matmul precision. Defaults to None (uses default precision).
+            rngs (nn.Rngs): Flax NNX random number generators for initializing all submodules.
+        """
         super().__init__(
             config=config,
             base_model_class=AyaVisionModel,
@@ -531,16 +608,19 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
         """
         return self.base_model.get_image_features(pixel_values)
 
+    def compute_embedding(self, input_ids, *args, **kwargs):
+        return self.base_model.compute_embedding(input_ids, *args, **kwargs)
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: chex.Array = None,
+        pixel_values: Array = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
@@ -593,14 +673,12 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
 
         hidden_states = outputs.last_hidden_state
 
-        # Apply logical sharding
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
 
-        # Apply LM head if requested
         lm_logits = None
         if apply_lm_head:
             lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), name="lm_head_output")

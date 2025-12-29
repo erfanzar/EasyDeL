@@ -36,6 +36,8 @@ from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn, get_dot_
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -306,7 +308,7 @@ class CohereBlock(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
@@ -314,17 +316,17 @@ class CohereBlock(nn.Module):
         Forward pass of the module block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens.
+            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             deterministic (bool): If True, disables dropout for deterministic behavior.
             init_cache (bool): If True, initializes cache for caching keys and values.
             output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
         """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -431,27 +433,43 @@ class CohereModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass through the core Cohere model.
+        """Performs forward pass through the Cohere transformer model.
+
+        Processes input tokens through embeddings, stacked Cohere decoder blocks with RMSNorm,
+        optional Q/K normalization, SwiGLU gated FFNs, and RoPE position encoding.
 
         Args:
-            input_ids (Optional[chex.Array]): Input token IDs.
-            inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
-            attention_mask (Optional[chex.Array]): Attention mask.
-            position_ids (Optional[chex.Array]): Position IDs.
-            segment_ids (Optional[chex.Array]): Segment IDs.
-            output_attentions (Optional[bool]): Whether to output attentions.
-            output_hidden_states (Optional[bool]): Whether to output hidden states.
-            past_key_values (Optional[TransformerCache | RaggedPagesCache]): KV cache.
-            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]): Cache metadata.
-
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Either this
+                or `inputs_embeds` must be provided but not both.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length,
+                hidden_size). Use instead of `input_ids` for custom embeddings.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) indicating
+                which tokens to attend to (True) and which to ignore (False).
+            mask_info: Pre-computed mask information. If provided, overrides `attention_mask`.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length).
+                Auto-generated from mask_info if not provided.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER). Auto-detected if None.
+            past_key_values: Cached key/value states for efficient autoregressive generation.
+            cache_metadata: Metadata for paged attention mechanisms.
+            output_attentions: Whether to return attention weights from all layers.
+            output_hidden_states: Whether to return hidden states from all layers.
 
         Returns:
-            Union[BaseModelOutput, Tuple]: Model output.
+            BaseModelOutput containing:
+                - last_hidden_state: Final RMSNorm output of shape (batch, seq_len, hidden_size)
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of all attention weights if output_attentions=True
+                - past_key_values: Updated cache for next generation step
+
+        Raises:
+            ValueError: If neither `input_ids` nor `inputs_embeds` is provided, or if both
+                are provided simultaneously.
+            AssertionError: If sequence length exceeds max_position_embeddings.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -588,8 +606,8 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -598,11 +616,11 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
         Forward pass through the Cohere model for Causal Language Modeling.
 
         Args:
-            input_ids (Optional[chex.Array]): Input tensor containing token IDs.
-            inputs_embeds (Optional[chex.Array]): Embedded input tensor (alternative to input_ids).
-            attention_mask (Optional[chex.Array]): Mask for attention.
-            position_ids (Optional[chex.Array]): Positional indices.
-            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            input_ids (Optional[Array]): Input tensor containing token IDs.
+            inputs_embeds (Optional[Array]): Embedded input tensor (alternative to input_ids).
+            attention_mask (Optional[Array]): Mask for attention.
+            position_ids (Optional[Array]): Positional indices.
+            segment_ids (Optional[Array]): Segment IDs for different input parts.
             output_attentions (Optional[bool]): If True, output attention weights.
             output_hidden_states (Optional[bool]): If True, output hidden states.
             past_key_values (Optional[TransformerCache | RaggedPagesCache]): KV cache for faster generation.
@@ -713,18 +731,18 @@ class CohereForSequenceClassification(BaseSequenceClassificationModule[CohereMod
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> SequenceClassifierOutput:
         """
         Forward pass for sequence classification.
 
         Args:
-            input_ids (Optional[chex.Array]): Input token IDs.
-            inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
-            attention_mask (Optional[chex.Array]): Attention mask.
-            position_ids (Optional[chex.Array]): Position IDs.
-            segment_ids (Optional[chex.Array]): Segment IDs.
+            input_ids (Optional[Array]): Input token IDs.
+            inputs_embeds (Optional[Array]): Input embeddings (alternative to input_ids).
+            attention_mask (Optional[Array]): Attention mask.
+            position_ids (Optional[Array]): Position IDs.
+            segment_ids (Optional[Array]): Segment IDs.
             output_attentions (Optional[bool]): Whether to output attentions.
             output_hidden_states (Optional[bool]): Whether to output hidden states.
             past_key_values (Optional[TransformerCache | RaggedPagesCache]): KV cache.

@@ -43,6 +43,19 @@ class TestWhisper:
         )
         assert result.success, f"Whisper failed: {result.error_message or result.comparison.details}"
 
+    def test_generation(self, whisper_config, small_model_config):
+        """Test Whisper generation."""
+        tester = Seq2SeqTester()
+        result = tester.test_generation(
+            module_name="whisper",
+            hf_class=transformers.WhisperForConditionalGeneration,
+            task=ed.TaskType.SPEECH_SEQUENCE_TO_SEQUENCE,
+            config=whisper_config,
+            small_model_config=small_model_config,
+            max_new_tokens=16,
+        )
+        assert result.success, f"Whisper generation failed: {result.error_message}"
+
 
 if __name__ == "__main__":
     import pytest

@@ -22,7 +22,6 @@ from eformer.escale import apply_logical_sharding
 from einops import rearrange
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
-from jax import lax
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -35,6 +34,8 @@ from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -176,7 +177,6 @@ class MptAttention(UnifiedAttention):
         rngs: nn.Rngs,
     ):
         """Define MPT-specific network with fused QKV projection."""
-        # Fused QKV projection
         self.Wqkv = ColumnParallelLinear(
             config.hidden_size,
             config.hidden_size * 3,
@@ -189,7 +189,6 @@ class MptAttention(UnifiedAttention):
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-        # Output projection
         self.out_proj = RowParallelLinear(
             config.hidden_size,
             config.hidden_size,
@@ -202,16 +201,12 @@ class MptAttention(UnifiedAttention):
             **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
-        # Residual dropout (MPT-specific)
         self.resid_dropout = nn.Dropout(
             config.attn_config.attn_pdrop,
             rngs=rngs,
         )
 
-        # Create attention performer
         self.attention_performer = self._create_attention_performer(config, rngs)
-
-        # Create ALiBi slopes
         self._create_alibi_slopes(config)
 
     def _create_attention_performer(self, config: MptConfig, rngs: nn.Rngs):
@@ -238,26 +233,30 @@ class MptAttention(UnifiedAttention):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
     ) -> AttentionLayerOutput:
-        """Override ALiBi forward with MPT's custom bias computation and masking."""
+        """Override ALiBi forward with fused QKV projection.
+
+        Important: ALiBi does not enforce causality by itself, so we must still
+        apply causal masking (and padding masking) via `mask_info` / `causal`.
+        """
         batch_size, sequence_length = hidden_states.shape[:2]
 
-        # 1. Project Q/K/V from fused projection (computed ONCE)
         mixed_qkv = checkpoint_name(self.Wqkv(hidden_states), "attn_qkv")
         query_states, key_states, value_states = jnp.split(mixed_qkv, 3, -1)
 
-        # 2. Reshape to multi-head format
         query_states = rearrange(query_states, "b s (h d) -> b s h d", h=self.config.n_heads)
         key_states = rearrange(key_states, "b s (h d) -> b s h d", h=self.config.n_heads)
         value_states = rearrange(value_states, "b s (h d) -> b s h d", h=self.config.n_heads)
 
-        # 3. Apply sharding
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
-        # 4. KV cache concatenation
+        causal_for_kernel = self.causal
+        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+            causal_for_kernel = False
+
         (
             key_states,
             value_states,
@@ -274,46 +273,50 @@ class MptAttention(UnifiedAttention):
             mask_info=mask_info,
         )
 
-        # 5. Use external ALiBi bias if provided, otherwise compute it
-
-        if alibi is not None:
-            alibi_bias = alibi
+        if alibi is None:
+            alibi_bias = self._compute_alibi_bias(self.config.max_seq_len)
         else:
-            alibi_bias = self._compute_alibi_bias(key_states.shape[1])
+            alibi_bias = alibi
 
-        position_bias_query_index = max(0, alibi_bias.shape[2] - query_states.shape[1])
-        position_bias_key_index = max(0, alibi_bias.shape[3] - key_states.shape[1])
-        alibi_bias = alibi_bias[:, :, position_bias_query_index:, position_bias_key_index:]
+        alibi_bias = jnp.asarray(alibi_bias, dtype=self.dtype)
+        if alibi_bias.ndim == 3:
+            alibi_bias = alibi_bias[None, ...]
+        elif alibi_bias.ndim == 2:
+            alibi_bias = alibi_bias[None, :, None, :]
 
-        mask_ = mask_info.get_or_compute_attention_mask().repeat(alibi_bias.shape[1], 1)
+        q_len = query_states.shape[1]
+        kv_len = key_states.shape[1]
 
-        attention_bias = lax.select(
-            mask_,
-            jnp.full(mask_.shape, 0.0).astype(self.dtype) + alibi_bias.astype(self.dtype),
-            jnp.full(mask_.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-        )
+        if alibi_bias.shape[-1] != kv_len:
+            start_k = max(0, alibi_bias.shape[-1] - kv_len)
+            alibi_bias = alibi_bias[..., start_k:]
 
-        # 8. Compute attention
+        if alibi_bias.shape[0] == 1 and batch_size != 1:
+            alibi_bias = jnp.broadcast_to(alibi_bias, (batch_size, *alibi_bias.shape[1:]))
+
+        if alibi_bias.shape[-2] == 1 and q_len != 1:
+            alibi_bias = jnp.broadcast_to(alibi_bias, (*alibi_bias.shape[:-2], q_len, kv_len))
+        elif alibi_bias.shape[-2] != q_len:
+            start_q = max(0, alibi_bias.shape[-2] - q_len)
+            alibi_bias = alibi_bias[..., start_q:, :]
+
         attention = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
             value_states=value_states,
             mode=mode,
-            bias=attention_bias,
+            bias=alibi_bias,
             cache_metadata=cache_metadata,
             cache_view=cache_view,
-            init_bias=lambda: attention_bias,
-            mask_info=None,  # Mask already applied to bias
-            causal=False,  # ALiBi handles causality through bias
+            init_bias=None,
+            mask_info=mask_info,
+            causal=causal_for_kernel,
         )
 
-        # 9. Merge heads and output projection
         attn_output = self.shard_attention_prod(
             attention.attention_outputs.reshape(batch_size, sequence_length, self.config.hidden_size)
         )
         attn_output = checkpoint_name(self.out_proj(attn_output), name="attn_output")
-
-        # 10. Apply residual dropout
         attn_output = self.resid_dropout(attn_output)
 
         return AttentionLayerOutput(
@@ -421,7 +424,7 @@ class MptBlock(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         position_bias: Float[Array, "batch heads seq_len seq_len"] | None = None,
@@ -461,7 +464,7 @@ def build_mpt_alibi_tensor(num_heads, sequence_length, alibi_bias_max=8):
         alibi_bias_max (int, optional): The maximum bias value allowed by ALiBi. Defaults to 8.
 
     Returns:
-        chex.Array: The ALiBi tensor of shape (1, num_heads, sequence_length, sequence_length).
+        Array: The ALiBi tensor of shape (1, num_heads, sequence_length, sequence_length).
     """
     alibi = jnp.arange(
         1 - sequence_length,
@@ -513,7 +516,7 @@ class MptModel(EasyDeLBaseModule):
         emb_drop (nn.Dropout): Dropout layer applied after embeddings.
         blocks (tp.List[MptBlock]): List of transformer blocks.
         norm_f (nn.LayerNorm): Final layer normalization.
-        alibi (chex.Array, optional): Precomputed ALiBi tensor if using ALiBi.
+        alibi (Array, optional): Precomputed ALiBi tensor if using ALiBi.
     """
 
     def __init__(
@@ -585,8 +588,8 @@ class MptModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:

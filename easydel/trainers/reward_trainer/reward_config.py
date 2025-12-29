@@ -11,9 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -22,7 +20,7 @@ from ..training_configurations import TrainingArguments
 
 
 @Registry.register("trainer-arguments", "reward")
-@auto_pytree
+@dataclass
 class RewardConfig(TrainingArguments):
     """Configuration class for Reward Model training.
 
@@ -44,7 +42,7 @@ class RewardConfig(TrainingArguments):
     Attributes:
         trainer_prefix (str | None): Prefix for trainer logs and checkpoints.
             Default: "rewardtrainer"
-        max_sequence_length (int | None): Maximum length of sequences (prompt + completion).
+        max_length (int | None): Maximum length of sequences (prompt + completion).
             Sequences exceeding this limit are filtered out. Default: 1024
         disable_dropout (bool): Whether to disable dropout during training for
             more deterministic behavior. Recommended for reward models. Default: True
@@ -59,7 +57,7 @@ class RewardConfig(TrainingArguments):
 
     Example:
         >>> config = RewardConfig(
-        ...     max_sequence_length=2048,
+        ...     max_length=2048,
         ...     center_rewards_coefficient=0.01,
         ...     learning_rate=2e-5,
         ...     num_train_epochs=1
@@ -75,7 +73,7 @@ class RewardConfig(TrainingArguments):
         default="rewardtrainer",
         metadata={"help": "default prefix name for trainer."},
     )
-    max_sequence_length: int | None = field(
+    max_length: int | None = field(
         default=1024,
         metadata={
             "help": "Maximum length of the sequences (prompt + completion) in the batch, "

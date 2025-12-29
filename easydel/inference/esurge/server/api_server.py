@@ -17,19 +17,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import traceback
 import typing as tp
 import uuid
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from enum import Enum
 from http import HTTPStatus
 
 from eformer.loggings import get_logger
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
 from transformers import ProcessorMixin
 
 from easydel.workers.esurge.auth import (
@@ -40,7 +37,12 @@ from easydel.workers.esurge.auth import (
     RateLimitExceeded,
 )
 
-from ...inference_engine_interface import BaseInferenceApiServer, InferenceEngineAdapter
+from ...inference_engine_interface import (
+    BaseInferenceApiServer,
+    InferenceEngineAdapter,
+    ServerStatus,
+    create_error_response,
+)
 from ...openai_api_modules import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -52,6 +54,7 @@ from ...openai_api_modules import (
     CompletionResponse,
     CompletionResponseChoice,
     DeltaMessage,
+    ResponsesRequest,
     UsageInfo,
 )
 from ...sampling_params import SamplingParams
@@ -59,7 +62,6 @@ from ...tools.tool_calling_mixin import ToolCallingMixin
 from ..esurge_engine import RequestOutput, eSurge
 from .auth_endpoints import AuthEndpointsMixin
 
-TIMEOUT_KEEP_ALIVE = 5.0
 logger = get_logger("eSurgeApiServer")
 
 _STREAM_DATA = "data"
@@ -67,81 +69,11 @@ _STREAM_ERROR = "error"
 _STREAM_END = "end"
 
 
-class ServerStatus(str, Enum):
-    """Server status enumeration.
-
-    Represents the current operational state of the API server.
-    Used for health checks and monitoring.
-
-    Values:
-        STARTING: Server is initializing
-        READY: Server is ready to accept requests
-        BUSY: Server is processing at capacity
-        ERROR: Server encountered an error
-        SHUTTING_DOWN: Server is shutting down gracefully
-    """
-
-    STARTING = "starting"
-    READY = "ready"
-    BUSY = "busy"
-    ERROR = "error"
-    SHUTTING_DOWN = "shutting_down"
-
-
-@dataclass
-class ServerMetrics:
-    """Server performance metrics.
-
-    Tracks aggregate performance statistics for the API server.
-    Updated in real-time as requests are processed.
-
-    Attributes:
-        total_requests: Total number of requests received.
-        successful_requests: Number of successfully completed requests.
-        failed_requests: Number of failed requests.
-        total_tokens_generated: Cumulative tokens generated across all requests.
-        average_tokens_per_second: Rolling average generation throughput.
-        uptime_seconds: Server uptime in seconds.
-        start_time: Server start timestamp.
-    """
-
-    total_requests: int = 0
-    successful_requests: int = 0
-    failed_requests: int = 0
-    total_tokens_generated: int = 0
-    average_tokens_per_second: float = 0.0
-    uptime_seconds: float = 0.0
-    start_time: float = field(default_factory=time.time)
-
-
 RefineSamplingParamsFn = tp.Callable[
     [SamplingParams, ChatCompletionRequest | CompletionRequest, "eSurge"],
     SamplingParams | None,
 ]
 RefineChatRequestFn = tp.Callable[[ChatCompletionRequest], ChatCompletionRequest | None]
-
-
-class ErrorResponse(BaseModel):
-    """Standard error response model."""
-
-    error: dict[str, str]
-    request_id: str | None = None
-    timestamp: float = Field(default_factory=time.time)
-
-
-def create_error_response(status_code: HTTPStatus, message: str, request_id: str | None = None) -> JSONResponse:
-    """Creates a standardized JSON error response.
-
-    Args:
-        status_code: HTTP status code for the error.
-        message: Human-readable error message.
-        request_id: Optional request ID for tracking.
-
-    Returns:
-        JSONResponse with error details in OpenAI API format.
-    """
-    error_response = ErrorResponse(error={"message": message, "type": status_code.name}, request_id=request_id)
-    return JSONResponse(content=error_response.model_dump(), status_code=status_code.value)
 
 
 class eSurgeAdapter(InferenceEngineAdapter):
@@ -247,10 +179,15 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         enable_persistence: bool = True,
         auto_save_interval: float = 60.0,
         auth_worker_client: tp.Any | None = None,
+        response_store_worker_client: tp.Any | None = None,
         max_concurrent_generations: int | None = None,
         overload_message: str = "Server is busy, please try again later",
         refine_sampling_params: RefineSamplingParamsFn | None = None,
         refine_chat_request: RefineChatRequestFn | None = None,
+        enable_response_store: bool = True,
+        default_store_responses: bool = True,
+        max_stored_responses: int = 10_000,
+        max_stored_conversations: int = 1_000,
         **kwargs,
     ) -> None:
         """Initialize the eSurge API server.
@@ -268,6 +205,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             enable_persistence: Enable persistent storage of auth data to disk (default: True).
             auto_save_interval: Seconds between automatic saves (default: 60.0).
             auth_worker_client: Optional AuthWorkerClient instance for ZMQ-based auth (default: None, uses in-process auth).
+            response_store_worker_client: Optional ResponseStoreWorkerClient instance for persistent /v1/responses state.
             tool_parser_worker_client: Optional ToolParserWorkerClient instance for ZMQ-based tool parsing. If None and use_tool_parser_worker=True, spawns a worker automatically.
             use_tool_parser_worker: If True and enable_function_calling=True, automatically spawns a tool parser ZMQ worker (default: True).
             max_concurrent_generations: Maximum concurrent inference jobs allowed. Defaults to the smallest
@@ -303,21 +241,20 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         )
 
         self.oai_like_processor = oai_like_processor
-        self.metrics = ServerMetrics()
-        self.status = ServerStatus.STARTING
-        self._active_requests: dict[str, dict] = {}
         self.tool_parser_name = tool_parser_name
         self.model_processors = model_processors
         self._refine_sampling_params_callback = refine_sampling_params
         self._refine_chat_request_callback = refine_chat_request
+
         if max_concurrent_generations is not None:
-            max_slots = int(max_concurrent_generations)
+            try:
+                max_slots = int(max_concurrent_generations)
+            except (TypeError, ValueError):
+                max_slots = 0
         else:
             inferred = [esurge.max_num_seqs for esurge in esurge_map.values() if hasattr(esurge, "max_num_seqs")]
             max_slots = min(inferred) if inferred else 0
-        self._max_generation_slots = max(0, max_slots)
-        self._generation_slots: asyncio.Queue[int] | None = None
-        self._overload_message = overload_message
+        max_slots = max(0, max_slots)
 
         # Initialize authentication manager (either ZMQ worker or in-process)
         self._require_api_key = bool(require_api_key)
@@ -348,6 +285,13 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             server_name="EasyDeL eSurge API Server",
             server_description="High-performance eSurge inference server with OpenAI compatibility",
             enable_function_calling=enable_function_calling,
+            max_concurrent_generations=max_slots,
+            overload_message=overload_message,
+            enable_response_store=enable_response_store,
+            default_store_responses=default_store_responses,
+            max_stored_responses=max_stored_responses,
+            max_stored_conversations=max_stored_conversations,
+            response_store_client=response_store_worker_client,
             **kwargs,
         )
 
@@ -360,11 +304,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         logger.info(f"Loaded {len(self.adapters)} eSurge models")
         for name in self.adapters:
             logger.info(f"  - {name}")
-        if self._max_generation_slots > 0 and self._generation_slots is None:
-            self._generation_slots = asyncio.Queue(self._max_generation_slots)
-            for slot in range(self._max_generation_slots):
-                self._generation_slots.put_nowait(slot)
-        self.status = ServerStatus.READY
         logger.info("eSurge API Server is ready")
 
     async def on_shutdown(self) -> None:
@@ -602,110 +541,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
         self.auth_manager.record_usage(api_key, prompt_tokens, completion_tokens)
 
-    @staticmethod
-    def _compute_delta_text(current_text: str, previous_text: str, fallback_delta: str) -> str:
-        """Compute delta text by comparing accumulated text.
-
-        Prevents token loss under concurrent streaming by computing delta from
-        full accumulated text rather than relying on potentially incomplete
-        delta_text field.
-
-        This handles three cases:
-        1. Normal incremental streaming - extract new suffix from accumulated text
-        2. Empty delta despite accumulation - fallback to provided delta
-        3. Text doesn't build incrementally - possible reset or state corruption
-
-        Args:
-            current_text: Current accumulated text from the output.
-            previous_text: Previously accumulated text from last iteration.
-            fallback_delta: Fallback delta text from output.delta_text.
-
-        Returns:
-            The computed delta text to send to the client.
-
-        Example:
-            >>> delta = _compute_delta_text(
-            ...     current_text="Hello world",
-            ...     previous_text="Hello",
-            ...     fallback_delta=" world"
-            ... )
-            >>> # Returns " world" (extracted from accumulation)
-        """
-        current_text = current_text or ""
-
-        # Case 1: Normal incremental streaming - extract new suffix
-        if current_text.startswith(previous_text):
-            delta_text = current_text[len(previous_text) :]
-            if not delta_text:
-                # Empty delta, fallback to output's delta (might be empty too)
-                delta_text = fallback_delta or ""
-        # Case 2: Text doesn't build on previous (reset/error) - use fallback
-        else:
-            if previous_text:
-                # Log warning only if we had previous text (not first chunk)
-                logger.warning(
-                    f"Accumulated text doesn't start with previous text. "
-                    f"prev_len={len(previous_text)}, curr_len={len(current_text)}. "
-                    f"This may indicate state corruption or generation reset."
-                )
-            delta_text = fallback_delta or current_text
-
-        # Case 3: First chunk - send full current text
-        if not delta_text and not previous_text:
-            delta_text = current_text
-
-        return delta_text
-
-    @asynccontextmanager
-    async def _acquire_generation_slot(self) -> tp.AsyncIterator[None]:
-        """Acquire a generation slot or raise HTTP 503 when the server is saturated."""
-
-        queue = self._generation_slots
-        if queue is None:
-            yield
-            return
-
-        try:
-            token = queue.get_nowait()
-        except asyncio.QueueEmpty as e:
-            raise HTTPException(status_code=HTTPStatus.SERVICE_UNAVAILABLE, detail=self._overload_message) from e
-
-        try:
-            yield
-        finally:
-            try:
-                queue.put_nowait(token)
-            except asyncio.QueueFull:
-                logger.warning("Generation slot queue overfilled while releasing token")
-
-    def _start_stream_task(
-        self,
-        stream_fn: tp.Callable[[], tp.Iterator[RequestOutput]],
-    ) -> asyncio.Queue[tuple[str, tp.Any]]:
-        """Run blocking stream_fn in a worker thread and push results to an asyncio queue."""
-
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[tuple[str, tp.Any]] = asyncio.Queue()
-
-        def _producer() -> None:
-            try:
-                for output in stream_fn():
-                    asyncio.run_coroutine_threadsafe(queue.put((_STREAM_DATA, output)), loop).result()
-            except Exception as exc:
-                asyncio.run_coroutine_threadsafe(queue.put((_STREAM_ERROR, exc)), loop).result()
-            finally:
-                asyncio.run_coroutine_threadsafe(queue.put((_STREAM_END, None)), loop).result()
-
-        self.thread_pool.submit(_producer)
-        return queue
-
-    def _mark_stream_failure(self) -> None:
-        """Adjust metrics when a streaming response fails after headers are sent."""
-
-        if self.metrics.successful_requests > 0:
-            self.metrics.successful_requests -= 1
-        self.metrics.failed_requests += 1
-
     def _infer_sequence_length_from_engine(self, esurge: eSurge | None) -> int:
         """Infer maximum sequence length from the engine or fall back to 128 tokens."""
         if esurge is not None and getattr(esurge, "max_model_len", None):
@@ -808,7 +643,20 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             else:
                 if max_tokens < 0:
                     max_tokens = None
-        temperature = max(0.0, min(float(request.temperature or 1.0), 2.0))
+        raw_temperature = request.temperature
+        if raw_temperature is None:
+            temperature_f = 1.0
+        else:
+            temperature_f = float(raw_temperature)
+        temperature = max(0.0, min(temperature_f, 2.0))
+
+        raw_top_k = getattr(request, "top_k", None)
+        if raw_top_k is None:
+            top_k = 0
+        else:
+            top_k = int(raw_top_k)
+        if top_k < 0:
+            top_k = 0
 
         return SamplingParams(
             max_tokens=max_tokens,
@@ -816,7 +664,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             presence_penalty=float(request.presence_penalty or 0.0),
             frequency_penalty=float(request.frequency_penalty or 0.0),
             repetition_penalty=float(getattr(request, "repetition_penalty", 1.0)),
-            top_k=int(getattr(request, "top_k", 50)),
+            top_k=top_k,
             top_p=float(request.top_p or 1.0),
             min_p=float(getattr(request, "min_p", 0.0)),
             n=int(request.n or 1),
@@ -849,11 +697,39 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
         for msg in conversation:
             if isinstance(msg.get("content"), list):
-                text_parts = []
-                for part in msg["content"]:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        text_parts.append(part.get("text", ""))
-                msg["content"] = " ".join(text_parts)
+                content_parts = msg["content"]
+                has_non_text = False
+                for part in content_parts:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = part.get("type", "")
+                    if part_type in ("image", "image_url", "input_image", "video", "video_url", "input_video"):
+                        has_non_text = True
+                        break
+                    if any(k in part for k in ("image", "image_url", "video", "video_url")):
+                        has_non_text = True
+                        break
+                if has_non_text:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Multimodal content detected in messages, but the request was routed to the text-only "
+                            "chat-template path. Ensure your content parts use supported types (e.g. `image_url`) "
+                            "and that the server is configured with a processor for VLMs."
+                        ),
+                    )
+
+                text_parts: list[str] = []
+                for part in content_parts:
+                    if isinstance(part, str):
+                        if part:
+                            text_parts.append(part)
+                        continue
+                    if isinstance(part, dict):
+                        part_type = part.get("type")
+                        if part_type in ("text", "input_text"):
+                            text_parts.append(str(part.get("text", "")))
+                msg["content"] = " ".join([p for p in text_parts if p])
 
         try:
             if request.chat_template_kwargs is None:
@@ -925,6 +801,18 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             if not request.messages:
                 raise HTTPException(400, "Messages cannot be empty")
 
+            messages = self._prepare_messages_for_engine(request, esurge)
+            if self._messages_have_multimodal_content(messages):
+                if request.stream:
+                    return await self._handle_chat_streaming_multimodal(
+                        request,
+                        esurge,
+                        messages,
+                        request_id,
+                        raw_request,
+                    )
+                return await self._handle_chat_completion_multimodal(request, esurge, messages, request_id, raw_request)
+
             content = await self._prepare_chat_input_async(request, esurge)
 
             if request.stream:
@@ -938,6 +826,655 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             traceback.print_exc()
             logger.exception(f"Error in chat completion: {e}")
             return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
+
+    @staticmethod
+    def _messages_have_multimodal_content(messages: list[dict[str, tp.Any]]) -> bool:
+        """Check if the message list contains multimodal parts (image/video)."""
+        for msg in messages:
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "")
+                if item_type in ("image", "image_url", "input_image", "video", "video_url", "input_video"):
+                    return True
+                if any(k in item for k in ("image", "image_url", "video", "video_url")):
+                    return True
+        return False
+
+    def _prepare_messages_for_engine(self, request: ChatCompletionRequest, esurge: eSurge) -> list[dict[str, tp.Any]]:
+        """Convert pydantic request messages into dicts for the eSurge engine."""
+        conversation = request.model_dump(exclude_unset=True)["messages"]
+        processor = esurge.tokenizer
+
+        if isinstance(processor, ProcessorMixin) and self.oai_like_processor:
+            from easydel.trainers.prompt_utils import convert_to_openai_format
+
+            conversation = convert_to_openai_format(conversation)
+
+        return tp.cast(list[dict[str, tp.Any]], conversation)
+
+    async def _handle_chat_completion_multimodal(
+        self,
+        request: ChatCompletionRequest,
+        esurge: eSurge,
+        messages: list[dict[str, tp.Any]],
+        request_id: str,
+        raw_request: Request,
+    ) -> ChatCompletionResponse:
+        """Handle non-streaming multimodal chat completion via `eSurge.chat(...)`."""
+
+        async with self._acquire_generation_slot():
+            sampling_params = self._prepare_sampling_params(request, esurge)
+            loop = asyncio.get_running_loop()
+
+            def _run_chat() -> RequestOutput:
+                return tp.cast(
+                    RequestOutput,
+                    esurge.chat(
+                        messages=messages,
+                        tools=self.extract_tools(request=request),
+                        sampling_params=sampling_params,
+                        request_id=request_id,
+                        stream=False,
+                    ),
+                )
+
+            try:
+                output = await loop.run_in_executor(self.thread_pool, _run_chat)
+            except ValueError as e:
+                # Common case: multimodal requested but server isn't configured with a processor.
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
+            completion_tokens = int(output.num_generated_tokens or 0)
+            prompt_tokens = self._prompt_token_count_from_output(output)
+            self.metrics.total_tokens_generated += completion_tokens
+
+            tokens_per_second = output.tokens_per_second
+            processing_time = output.processing_time
+
+            if self.metrics.average_tokens_per_second == 0:
+                self.metrics.average_tokens_per_second = tokens_per_second
+            else:
+                self.metrics.average_tokens_per_second = (
+                    self.metrics.average_tokens_per_second * 0.9 + tokens_per_second * 0.1
+                )
+
+            response_text = output.accumulated_text or output.get_text()
+            choices: list[ChatCompletionResponseChoice] = []
+            for idx, completion in enumerate(output.outputs):
+                message, finish_reason_extracted = self.extract_tool_calls_batch(
+                    response_text=response_text,
+                    request=request,
+                    model_name=request.model,
+                )
+                if finish_reason_extracted != "function_call" and completion.finish_reason:
+                    finish_reason = completion.finish_reason
+                else:
+                    finish_reason = finish_reason_extracted
+                if finish_reason == "finished":
+                    finish_reason = "stop"
+                choices.append(ChatCompletionResponseChoice(index=idx, message=message, finish_reason=finish_reason))
+
+            usage = UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+                tokens_per_second=tokens_per_second,
+                processing_time=processing_time,
+                first_token_time=output.first_token_time,
+            )
+
+            self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
+
+            return ChatCompletionResponse(
+                model=request.model,
+                choices=choices,
+                usage=usage,
+            )
+
+    async def _handle_chat_streaming_multimodal(
+        self,
+        request: ChatCompletionRequest,
+        esurge: eSurge,
+        messages: list[dict[str, tp.Any]],
+        request_id: str,
+        raw_request: Request,
+    ) -> StreamingResponse:
+        """Handle streaming multimodal chat completion via `eSurge.chat(..., stream=True)`."""
+
+        sampling_params = self._prepare_sampling_params(request, esurge)
+
+        async def generate_stream():
+            async with self._acquire_generation_slot():
+                tool_parser = self.get_tool_parser_for_model(request.model)
+                previous_text = ""
+                previous_token_ids: list[int] = []
+                prompt_tokens = 0
+
+                queue = self._start_stream_task(
+                    lambda: tp.cast(
+                        tp.Iterator[RequestOutput],
+                        esurge.chat(
+                            messages=messages,
+                            tools=self.extract_tools(request=request),
+                            sampling_params=sampling_params,
+                            request_id=request_id,
+                            stream=True,
+                        ),
+                    )
+                )
+
+                total_generated = 0
+                last_output: RequestOutput | None = None
+
+                try:
+                    while True:
+                        kind, payload = await queue.get()
+                        if kind == _STREAM_END:
+                            break
+                        if kind == _STREAM_ERROR:
+                            raise tp.cast(Exception, payload)
+
+                        output = tp.cast(RequestOutput, payload)
+                        last_output = output
+
+                        if not prompt_tokens:
+                            prompt_tokens = self._prompt_token_count_from_output(output)
+
+                        current_completion_tokens = int(output.num_generated_tokens or 0)
+                        current_tps = output.tokens_per_second
+                        elapsed_time = output.processing_time
+
+                        current_text = output.accumulated_text or ""
+                        delta_text = self._compute_delta_text(current_text, previous_text, output.delta_text or "")
+
+                        if tool_parser:
+                            current_token_ids = output.outputs[0].token_ids if output.outputs else []
+                            delta_token_ids = (
+                                current_token_ids[len(previous_token_ids) :] if previous_token_ids else current_token_ids
+                            )
+
+                            delta_message = self.extract_tool_calls_streaming(
+                                model_name=request.model,
+                                previous_text=previous_text,
+                                current_text=current_text,
+                                delta_text=delta_text,
+                                previous_token_ids=previous_token_ids,
+                                current_token_ids=current_token_ids,
+                                delta_token_ids=delta_token_ids,
+                                request=request,
+                            )
+                            previous_text = current_text
+                            previous_token_ids = current_token_ids
+
+                            if delta_message:
+                                if not delta_message.role:
+                                    delta_message.role = "assistant"
+                            elif request.tools:
+                                continue
+                            else:
+                                delta_message = DeltaMessage(content=delta_text, role="assistant")
+                        else:
+                            previous_text = current_text
+                            current_token_ids = output.outputs[0].token_ids if output.outputs else []
+                            previous_token_ids = current_token_ids
+                            delta_message = DeltaMessage(content=delta_text, role="assistant")
+
+                        chunk = ChatCompletionStreamResponse(
+                            model=request.model,
+                            choices=[
+                                ChatCompletionStreamResponseChoice(
+                                    index=0,
+                                    delta=delta_message,
+                                    finish_reason=None,
+                                )
+                            ],
+                            usage=UsageInfo(
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=current_completion_tokens,
+                                total_tokens=prompt_tokens + current_completion_tokens,
+                                tokens_per_second=current_tps,
+                                processing_time=elapsed_time,
+                                first_token_time=output.first_token_time,
+                            ),
+                        )
+                        yield f"data: {chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
+
+                        total_generated = current_completion_tokens
+
+                    usage = UsageInfo(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=total_generated,
+                        total_tokens=prompt_tokens + total_generated,
+                        tokens_per_second=last_output.tokens_per_second if last_output is not None else 0.0,
+                        processing_time=last_output.processing_time if last_output is not None else 0.0,
+                        first_token_time=last_output.first_token_time if last_output is not None else None,
+                    )
+
+                    final_chunk = ChatCompletionStreamResponse(
+                        model=request.model,
+                        choices=[
+                            ChatCompletionStreamResponseChoice(
+                                index=0,
+                                delta=DeltaMessage(content="", role="assistant"),
+                                finish_reason="stop",
+                            )
+                        ],
+                        usage=usage,
+                    )
+
+                    yield f"data: {final_chunk.model_dump_json(exclude_unset=True)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                    self.metrics.total_tokens_generated += total_generated
+                    self._record_api_key_usage(raw_request, prompt_tokens, total_generated)
+
+                except Exception as e:
+                    self._mark_stream_failure()
+                    logger.exception(f"Error during multimodal streaming: {e}")
+                    error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), request_id)
+                    yield f"data: {error_response.body.decode()}\n\n"
+
+        return StreamingResponse(
+            generate_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Request-ID": request_id,
+            },
+        )
+
+    @staticmethod
+    def _prompt_token_count_from_output(output: RequestOutput) -> int:
+        prompt_ids = output.prompt_token_ids
+        if isinstance(prompt_ids, list) and prompt_ids:
+            first = prompt_ids[0]
+            if isinstance(first, list):
+                return len(first)
+        if isinstance(prompt_ids, list):
+            return len(prompt_ids)
+        return 0
+
+    async def responses(self, request: ResponsesRequest, raw_request: Request) -> tp.Any:
+        """Handle OpenAI Responses API requests (POST /v1/responses)."""
+
+        response_id = f"resp_{uuid.uuid4().hex}"
+        payload_api_keys = self._extract_payload_api_keys(request)
+        payload = request.model_dump(exclude_none=True, exclude_unset=True)
+
+        try:
+            store_flag = payload.get("store")
+            store_response = self._default_store_responses if store_flag is None else bool(store_flag)
+
+            previous_response_id = payload.get("previous_response_id")
+            if not isinstance(previous_response_id, str):
+                previous_response_id = None
+            else:
+                previous_response_id = previous_response_id.strip() or None
+
+            conversation_id = self._normalize_conversation_id(payload.get("conversation"))
+            if previous_response_id and conversation_id:
+                raise HTTPException(status_code=400, detail="Cannot use both 'previous_response_id' and 'conversation'")
+
+            model = payload.get("model")
+            if not isinstance(model, str) or not model.strip():
+                raise HTTPException(400, "Field 'model' is required")
+
+            adapter = self._get_adapter(model)
+            esurge = adapter.esurge
+
+            requested_tokens, max_tokens = self._parse_responses_max_tokens(payload, esurge)
+            self._authorize_request(
+                raw_request,
+                payload_api_keys=payload_api_keys,
+                endpoint="/v1/responses",
+                model=model,
+                requested_tokens=requested_tokens,
+            )
+
+            input_messages = self._responses_payload_to_messages(payload, include_instructions=False)
+            if not input_messages:
+                raise HTTPException(400, "Field 'input' (or 'messages') cannot be empty")
+
+            instructions = payload.get("instructions")
+            if not isinstance(instructions, str) or not instructions.strip():
+                instructions = None
+            else:
+                instructions = instructions.strip()
+
+            history_messages: list[dict[str, tp.Any]] = []
+            if previous_response_id:
+                if not self._enable_response_store:
+                    raise HTTPException(
+                        status_code=400, detail="previous_response_id requires enable_response_store=True"
+                    )
+                prev = await self._response_store_get_response(previous_response_id)
+                if prev is None:
+                    raise HTTPException(status_code=400, detail=f"Unknown previous_response_id '{previous_response_id}'")
+                history_messages = tp.cast(list[dict[str, tp.Any]], prev.get("conversation", []))
+            elif conversation_id:
+                if not self._enable_response_store:
+                    raise HTTPException(status_code=400, detail="conversation requires enable_response_store=True")
+                conversation_history = (await self._response_store_get_conversation(conversation_id)) or []
+                history_messages = list(tp.cast(list[dict[str, tp.Any]], conversation_history))
+
+            # `full_messages` is the persisted conversation state for this response (excludes `instructions`).
+            full_messages = list(history_messages) + list(input_messages)
+
+            # `engine_messages` is what we send to the model (may include ephemeral instructions).
+            engine_messages = list(full_messages)
+            if instructions:
+                engine_messages.insert(0, {"role": "system", "content": instructions})
+
+            raw_tools, tools_for_template = self._extract_responses_tools(payload)
+            tool_request: ChatCompletionRequest | None = None
+            if raw_tools:
+                try:
+                    tool_request = ChatCompletionRequest.model_validate(
+                        {
+                            "model": model,
+                            "messages": self._flatten_messages_to_text(engine_messages),
+                            "tools": raw_tools,
+                            "tool_choice": payload.get("tool_choice"),
+                            "temperature": payload.get("temperature", 1.0),
+                            "top_p": payload.get("top_p", 1.0),
+                            "max_tokens": max_tokens,
+                            "stream": bool(payload.get("stream", False)),
+                        }
+                    )
+                except Exception:
+                    tool_request = None
+
+            sampling_params = self._create_sampling_params_from_responses(payload, max_tokens)
+            stream = bool(payload.get("stream", False))
+
+            if not stream:
+                async with self._acquire_generation_slot():
+                    loop = asyncio.get_running_loop()
+
+                    def _run_chat() -> RequestOutput:
+                        return tp.cast(
+                            RequestOutput,
+                            esurge.chat(
+                                messages=engine_messages,
+                                tools=tools_for_template,
+                                sampling_params=sampling_params,
+                                request_id=response_id,
+                                stream=False,
+                            ),
+                        )
+
+                    try:
+                        output = await loop.run_in_executor(self.thread_pool, _run_chat)
+                    except ValueError as e:
+                        raise HTTPException(status_code=400, detail=str(e)) from e
+
+                completion_tokens = int(output.num_generated_tokens or 0)
+                prompt_tokens = self._prompt_token_count_from_output(output)
+
+                response_text = output.accumulated_text or output.get_text()
+                tool_calls_payload: list[tp.Any] | None = None
+                if tool_request is not None:
+                    message, _finish_reason = self.extract_tool_calls_batch(
+                        response_text=response_text,
+                        request=tool_request,
+                        model_name=model,
+                    )
+                    tool_calls_payload = self._jsonify_tool_calls(message.model_extra.get("tool_calls"))
+                    if tool_calls_payload is not None:
+                        response_text = tp.cast(str, message.content) if message.content is not None else ""
+                    elif message.content is not None:
+                        response_text = tp.cast(str, message.content)
+
+                self.metrics.total_tokens_generated += completion_tokens
+                self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
+
+                response_obj = self._build_responses_object(
+                    response_id=response_id,
+                    model=model,
+                    output_text=response_text,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    tool_calls=tool_calls_payload,
+                )
+                response_obj.update(
+                    {
+                        "error": None,
+                        "incomplete_details": None,
+                        "instructions": instructions,
+                        "max_output_tokens": payload.get("max_output_tokens"),
+                        "previous_response_id": previous_response_id,
+                        "store": store_response,
+                        "temperature": payload.get("temperature", 1.0),
+                        "top_p": payload.get("top_p", 1.0),
+                        "truncation": payload.get("truncation", "disabled"),
+                        "tool_choice": payload.get("tool_choice", "auto"),
+                        "tools": raw_tools or [],
+                        "parallel_tool_calls": payload.get("parallel_tool_calls", True),
+                        "metadata": payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
+                        "text": {"format": {"type": "text"}},
+                    }
+                )
+
+                if store_response and self._enable_response_store:
+                    conversation_after = self._conversation_from_messages(full_messages, response_text)
+                    await self._response_store_put_response(
+                        response_id,
+                        {
+                            "id": response_id,
+                            "model": model,
+                            "created_at": response_obj.get("created_at"),
+                            "previous_response_id": previous_response_id,
+                            "conversation_id": conversation_id,
+                            "conversation": conversation_after,
+                            "response": response_obj,
+                        },
+                    )
+                    if conversation_id:
+                        await self._response_store_put_conversation(conversation_id, conversation_after)
+
+                return response_obj
+
+            async def generate_stream():
+                async with self._acquire_generation_slot():
+                    message_id = f"msg_{uuid.uuid4().hex}"
+                    content_index = 0
+                    output_index = 0
+                    previous_text = ""
+                    prompt_tokens = 0
+                    completion_tokens = 0
+                    tool_calls_payload: list[tp.Any] | None = None
+                    last_output: RequestOutput | None = None
+
+                    yield self._sse_event(
+                        "response.created",
+                        {
+                            "type": "response.created",
+                            "response": {
+                                "id": response_id,
+                                "object": "response",
+                                "created_at": int(time.time()),
+                                "model": model,
+                                "status": "in_progress",
+                                "output": [],
+                            },
+                        },
+                    )
+                    yield self._sse_event(
+                        "response.output_item.added",
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": output_index,
+                            "item": {
+                                "id": message_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [],
+                            },
+                        },
+                    )
+                    yield self._sse_event(
+                        "response.content_part.added",
+                        {
+                            "type": "response.content_part.added",
+                            "output_index": output_index,
+                            "item_id": message_id,
+                            "content_index": content_index,
+                            "part": {"type": "output_text", "text": ""},
+                        },
+                    )
+
+                    queue = self._start_stream_task(
+                        lambda: tp.cast(
+                            tp.Iterator[RequestOutput],
+                            esurge.chat(
+                                messages=engine_messages,
+                                tools=tools_for_template,
+                                sampling_params=sampling_params,
+                                request_id=response_id,
+                                stream=True,
+                            ),
+                        )
+                    )
+
+                    try:
+                        while True:
+                            kind, stream_payload = await queue.get()
+                            if kind == _STREAM_END:
+                                break
+                            if kind == _STREAM_ERROR:
+                                raise tp.cast(Exception, stream_payload)
+
+                            output = tp.cast(RequestOutput, stream_payload)
+                            last_output = output
+                            if not prompt_tokens:
+                                prompt_tokens = self._prompt_token_count_from_output(output)
+                            completion_tokens = int(output.num_generated_tokens or 0)
+
+                            current_text = output.accumulated_text or ""
+                            delta_text = self._compute_delta_text(current_text, previous_text, output.delta_text or "")
+                            previous_text = current_text
+
+                            if not delta_text:
+                                continue
+
+                            yield self._sse_event(
+                                "response.output_text.delta",
+                                {
+                                    "type": "response.output_text.delta",
+                                    "output_index": output_index,
+                                    "item_id": message_id,
+                                    "content_index": content_index,
+                                    "delta": delta_text,
+                                },
+                            )
+
+                        full_text = last_output.accumulated_text if last_output is not None else previous_text
+                        if tool_request is not None and full_text:
+                            message, _finish_reason = self.extract_tool_calls_batch(
+                                response_text=full_text,
+                                request=tool_request,
+                                model_name=model,
+                            )
+                            tool_calls_payload = self._jsonify_tool_calls(message.model_extra.get("tool_calls"))
+                            if tool_calls_payload is not None:
+                                full_text = tp.cast(str, message.content) if message.content is not None else ""
+                            elif message.content is not None:
+                                full_text = tp.cast(str, message.content)
+
+                        if last_output is not None:
+                            completion_tokens = int(last_output.num_generated_tokens or completion_tokens)
+
+                        yield self._sse_event(
+                            "response.output_text.done",
+                            {
+                                "type": "response.output_text.done",
+                                "output_index": output_index,
+                                "item_id": message_id,
+                                "content_index": content_index,
+                                "text": full_text,
+                            },
+                        )
+
+                        final_obj = self._build_responses_object(
+                            response_id=response_id,
+                            model=model,
+                            output_text=full_text,
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            tool_calls=tool_calls_payload,
+                        )
+                        final_obj.update(
+                            {
+                                "error": None,
+                                "incomplete_details": None,
+                                "instructions": instructions,
+                                "max_output_tokens": payload.get("max_output_tokens"),
+                                "previous_response_id": previous_response_id,
+                                "store": store_response,
+                                "temperature": payload.get("temperature", 1.0),
+                                "top_p": payload.get("top_p", 1.0),
+                                "truncation": payload.get("truncation", "disabled"),
+                                "tool_choice": payload.get("tool_choice", "auto"),
+                                "tools": raw_tools or [],
+                                "parallel_tool_calls": payload.get("parallel_tool_calls", True),
+                                "metadata": payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
+                                "text": {"format": {"type": "text"}},
+                            }
+                        )
+
+                        if store_response and self._enable_response_store:
+                            conversation_after = self._conversation_from_messages(full_messages, full_text)
+                            await self._response_store_put_response(
+                                response_id,
+                                {
+                                    "id": response_id,
+                                    "model": model,
+                                    "created_at": final_obj.get("created_at"),
+                                    "previous_response_id": previous_response_id,
+                                    "conversation_id": conversation_id,
+                                    "conversation": conversation_after,
+                                    "response": final_obj,
+                                },
+                            )
+                            if conversation_id:
+                                await self._response_store_put_conversation(conversation_id, conversation_after)
+
+                        yield self._sse_event(
+                            "response.completed", {"type": "response.completed", "response": final_obj}
+                        )
+
+                        self.metrics.total_tokens_generated += completion_tokens
+                        self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
+
+                    except Exception as e:
+                        self._mark_stream_failure()
+                        logger.exception("Error during /v1/responses streaming: %s", e)
+                        error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), response_id)
+                        yield self._sse_event(
+                            "response.error",
+                            {"type": "response.error", "error": json.loads(error_response.body.decode())},
+                        )
+
+            return StreamingResponse(
+                generate_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Request-ID": response_id,
+                },
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("Error in /v1/responses: %s", e)
+            return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), response_id)
 
     async def _handle_chat_completion(
         self,

@@ -12,6 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""EasyDeL model modules.
+
+This package provides JAX/Flax implementations of various transformer and
+state-space model architectures. Each submodule contains configuration,
+base model, and task-specific variants (causal LM, sequence classification,
+vision-language, etc.).
+
+Available model families include:
+- Decoder-only transformers: LLaMA, Mistral, Qwen, Gemma, Phi, Falcon, etc.
+- Mixture-of-experts: DeepSeek, Mixtral, Grok, DBRX, Arctic, etc.
+- Vision-language: LLaVA, CLIP, SigLIP, Qwen-VL, GLM-4V, etc.
+- State-space: Mamba, Mamba2, RWKV, Falcon Mamba, etc.
+- Encoder-only: RoBERTa
+- Seq2Seq: Whisper, T5
+"""
+
 from . import (
     arctic,
     auto,
@@ -25,6 +41,8 @@ from . import (
     exaone,
     exaone4,
     falcon,
+    falcon_h1,
+    falcon_mamba,
     gemma,
     gemma2,
     gemma3,
@@ -32,6 +50,9 @@ from . import (
     glm,
     glm4,
     glm4_moe,
+    glm4v,
+    glm4v_moe,
+    glm46v,
     gpt2,
     gpt_j,
     gpt_neox,
@@ -39,12 +60,13 @@ from . import (
     grok_1,
     internlm2,
     kimi_linear,
+    kimi_vl,
     llama,
     llama4,
     llava,
     mamba,
     mamba2,
-    minimax_text_v1,
+    minimax,
     mistral,
     mistral3,
     mixtral,
@@ -91,6 +113,8 @@ __all__ = (
     "exaone",
     "exaone4",
     "falcon",
+    "falcon_h1",
+    "falcon_mamba",
     "gemma",
     "gemma2",
     "gemma3",
@@ -98,6 +122,9 @@ __all__ = (
     "glm",
     "glm4",
     "glm4_moe",
+    "glm4v",
+    "glm4v_moe",
+    "glm46v",
     "gpt2",
     "gpt_j",
     "gpt_neox",
@@ -105,11 +132,13 @@ __all__ = (
     "grok_1",
     "internlm2",
     "kimi_linear",
+    "kimi_vl",
     "llama",
     "llama4",
     "llava",
     "mamba",
     "mamba2",
+    "minimax",
     "minimax_text_v1",
     "mistral",
     "mistral3",

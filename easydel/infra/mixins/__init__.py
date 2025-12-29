@@ -43,6 +43,18 @@ Example:
 
 from .bridge import EasyBridgeMixin
 from .generation import EasyGenerationMixin
+from .operation_cache import (
+    LayerOperationInfo,
+    OperationCacheMixin,
+    OperationsCacheInfo,
+)
 from .protocol import BaseModuleProtocol
 
-__all__ = "BaseModuleProtocol", "EasyBridgeMixin", "EasyGenerationMixin"
+__all__ = (
+    "BaseModuleProtocol",
+    "EasyBridgeMixin",
+    "EasyGenerationMixin",
+    "LayerOperationInfo",
+    "OperationCacheMixin",
+    "OperationsCacheInfo",
+)

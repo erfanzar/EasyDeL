@@ -20,12 +20,32 @@ class TestQwen2VL:
         """Create Qwen2-VL-specific config."""
         org_config = ed.Qwen2VLConfig.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
         hf_config = transformers.Qwen2VLConfig.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
-        org_config.text_config.hidden_size = 1024
-        org_config.text_config.intermediate_size = 8192
-        org_config.text_config.num_attention_heads = org_config.text_config.hidden_size // 128
-        org_config.text_config.num_key_value_heads = 2
-        org_config.text_config.num_hidden_layers = 32
-        org_config.text_config.head_dim = 128
+
+        # Keep configs small for unit tests.
+        org_config.text_config.vocab_size = small_model_config["vocab_size"]
+        mrope_section = None
+        if hf_config.text_config.rope_scaling is not None:
+            mrope_section = hf_config.text_config.rope_scaling.get("mrope_section")
+        required_head_dim = int(sum(mrope_section) * 2) if mrope_section else small_model_config["head_dim"]
+
+        hidden_size = small_model_config["hidden_size"]
+        if hidden_size % required_head_dim != 0:
+            hidden_size = required_head_dim
+
+        org_config.text_config.hidden_size = hidden_size
+        org_config.text_config.intermediate_size = max(small_model_config["intermediate_size"], hidden_size * 2)
+        org_config.text_config.num_attention_heads = hidden_size // required_head_dim
+        org_config.text_config.num_key_value_heads = org_config.text_config.num_attention_heads
+        org_config.text_config.num_hidden_layers = small_model_config["num_hidden_layers"]
+        org_config.text_config.head_dim = required_head_dim
+
+        # Ensure special tokens are in-range for embedding lookup.
+        vocab_size = org_config.text_config.vocab_size
+        org_config.video_token_id = vocab_size - 4
+        org_config.vision_start_token_id = vocab_size - 3
+        org_config.vision_end_token_id = vocab_size - 2
+        org_config.image_token_id = vocab_size - 1
+
         org_config.text_config.rope_scaling = hf_config.text_config.rope_scaling
         org_config.text_config.layer_types = [
             "sliding_attention"
@@ -33,7 +53,12 @@ class TestQwen2VL:
             else "full_attention"
             for i in range(org_config.text_config.num_hidden_layers)
         ]
+
         org_config.vision_config.hidden_size = org_config.text_config.hidden_size
+        org_config.vision_config.embed_dim = org_config.text_config.hidden_size
+        org_config.vision_config.depth = small_model_config["num_hidden_layers"]
+        # Keep original vision head count to match rotary embedding dims.
+        org_config.vision_config.num_heads = hf_config.vision_config.num_heads
         return org_config
 
     @pytest.fixture
@@ -106,6 +131,22 @@ class TestQwen2VL:
             small_model_config=local_cfg,
         )
         assert result.success, f"Qwen2VL text-only failed: {result.error_message or result.comparison.details}"
+
+    def test_generation(self, qwen2_vl_config, small_model_config):
+        """Test Qwen2VL text-only generation."""
+        local_cfg = small_model_config.copy()
+        local_cfg["max_position_embeddings"] = 2048
+
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="qwen2_vl",
+            hf_class=transformers.Qwen2VLForConditionalGeneration,
+            task=ed.TaskType.IMAGE_TEXT_TO_TEXT,
+            config=qwen2_vl_config,
+            small_model_config=local_cfg,
+            max_new_tokens=16,
+        )
+        assert result.success, f"Qwen2VL generation failed: {result.error_message}"
 
 
 if __name__ == "__main__":

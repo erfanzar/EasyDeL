@@ -106,37 +106,9 @@ class GemmaConfig(EasyDeLBaseConfig):
         bits: int | None = None,
         scan_layers: bool = False,
         hidden_activation="gelu_pytorch_tanh",
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
-        """Initialize a new GemmaConfig instance.
-
-        Args:
-          vocab_size (int, optional): Size of the vocabulary. Defaults to 256000.
-          hidden_size (int, optional): Dimensionality of the embeddings and hidden states. Defaults to 3072.
-          intermediate_size (int, optional): Dimensionality of the feed-forward layer. Defaults to 24576.
-          num_hidden_layers (int, optional): Number of hidden layers. Defaults to 28.
-          num_attention_heads (int, optional): Number of attention heads. Defaults to 16.
-          num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to 16.
-          head_dim (int, optional): Dimension of each attention head. Defaults to 256.
-          hidden_act (str, optional): Activation function for hidden layers. Defaults to "gelu_pytorch_tanh".
-          max_position_embeddings (int, optional): Maximum sequence length. Defaults to 8192.
-          initializer_range (float, optional): Range for weight initialization. Defaults to 0.02.
-          rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-6.
-          use_cache (bool, optional): Whether to use KV cache for generation. Defaults to True.
-          pad_token_id (int, optional): ID for padding token. Defaults to 0.
-          eos_token_id (int, optional): ID for end of sequence token. Defaults to 1.
-          bos_token_id (int, optional): ID for beginning of sequence token. Defaults to 2.
-          tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to True.
-          rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
-          attention_bias (bool, optional): Whether to use bias in attention. Defaults to False.
-          attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
-          gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
-            Checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
-          bits (Optional[int], optional): Quantization bits. Defaults to None.
-          scan_layers (bool, optional): Whether to scan layers. Defaults to False.
-          hidden_activation (str, optional): Activation for hidden layers. Defaults to "gelu_pytorch_tanh".
-          **kwargs: Additional arguments.
-        """
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
         self.scan_layers = scan_layers
@@ -156,6 +128,9 @@ class GemmaConfig(EasyDeLBaseConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.hidden_activation = hidden_activation
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,

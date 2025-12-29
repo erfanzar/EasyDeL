@@ -107,6 +107,7 @@ class OlmoConfig(EasyDeLBaseConfig):
         use_scan_mlp: bool = False,
         scan_mlp_chunk_size: int = 1024,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes an OlmoConfig object.
@@ -162,6 +163,9 @@ class OlmoConfig(EasyDeLBaseConfig):
         self.use_scan_mlp = use_scan_mlp
         self.scan_mlp_chunk_size = scan_mlp_chunk_size
         self.bits = bits
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

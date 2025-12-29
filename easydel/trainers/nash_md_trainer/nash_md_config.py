@@ -15,9 +15,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -25,8 +23,8 @@ from easydel.utils.compiling_utils import hash_fn
 from ..group_relative_policy_optimization.grpo_config import GRPOConfig
 
 
-@Registry.register("trainer-arguments", "nash-md")
-@auto_pytree
+@Registry.register("trainer-arguments", ["nash-md", "nash_md"])
+@dataclass
 class NashMDConfig(GRPOConfig):
     """Configuration for the :class:`~easydel.trainers.NashMDTrainer`.
 
@@ -79,8 +77,8 @@ class NashMDConfig(GRPOConfig):
         },
     )
 
-    def __post_init__(self):
-        super().__post_init__()
+    def __post_init__(self, max_sequence_length: int | None):
+        super().__post_init__(max_sequence_length=max_sequence_length)
         if isinstance(self.mixture_coef, Sequence) and len(self.mixture_coef) == 1:
             self.mixture_coef = self.mixture_coef[0]
         if isinstance(self.beta, Sequence) and len(self.beta) == 1:

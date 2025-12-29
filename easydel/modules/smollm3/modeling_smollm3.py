@@ -39,6 +39,8 @@ from easydel.infra.utils import block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -213,7 +215,7 @@ class SmolLM3DecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
@@ -265,7 +267,6 @@ class SmolLM3DecoderLayer(nn.Module):
 
         hidden_states = residual + mlp_output
 
-        # Apply sharding and checkpointing
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -432,39 +433,54 @@ class SmolLM3Model(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass through SmolLM3 model.
+        """Forward pass through SmolLM3 base model.
+
+        Processes input tokens through embedding, multiple decoder layers with conditional RoPE,
+        and final normalization. Supports caching for efficient generation.
 
         Args:
-            input_ids: Input token IDs.
-            inputs_embeds: Input embeddings (if not using input_ids).
-            attention_mask: Attention mask.
-            mask_info: Mask information.
-            position_ids: Position IDs for RoPE.
-            mode: Runtime mode (train/eval/decode).
-            past_key_values: KV cache.
-            cache_metadata: Cache metadata.
-            output_attentions: Whether to return attention weights.
-            output_hidden_states: Whether to return all hidden states.
+            input_ids (Int[Array, "batch seq_len"] | None): Input token IDs.
+                Shape: (batch_size, sequence_length). Must be None if inputs_embeds is provided.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"] | None): Pre-computed embeddings.
+                Shape: (batch_size, sequence_length, hidden_size). Used instead of input_ids if provided.
+            attention_mask (Bool[Array, "batch seq_len"] | None): Attention mask for padding.
+                Shape: (batch_size, sequence_length). True/1 for valid tokens, False/0 for padding.
+            mask_info (MaskInfo | None): Structured mask information for efficient attention computation.
+                If None, computed from attention_mask.
+            position_ids (Int[Array, "batch seq_len"] | None): Position indices for RoPE.
+                Shape: (batch_size, sequence_length). If None, uses sequential positions from mask_info.
+            mode (common_types.RUNTIME_MODE_TYPES | None): Runtime mode controlling behavior:
+                - MODE_TRAIN: Training mode
+                - MODE_EVAL: Evaluation mode
+                - MODE_DECODE: Generation mode (auto-detected from seq_len=1 and cache presence)
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None): KV cache
+                from previous generation steps. None for first step or non-generation use.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None):
+                Metadata for cache management and paged attention.
+            output_attentions (bool | None): Whether to return attention weights from all layers.
+            output_hidden_states (bool | None): Whether to return hidden states from all layers.
 
         Returns:
-            BaseModelOutput with last hidden state and optional outputs.
+            BaseModelOutput containing:
+                - last_hidden_state: Final hidden states (batch_size, sequence_length, hidden_size)
+                - hidden_states: Tuple of hidden states from all layers if output_hidden_states=True
+                - attentions: Tuple of attention weights from all layers if output_attentions=True
+                - past_key_values: Updated KV cache if caching is enabled
         """
         # Validate inputs
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        # Get embeddings
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.embed_tokens(input_ids.astype("i4")), "embeddings")
 
         sequence_length = inputs_embeds.shape[1]
 
-        # Create MaskInfo dynamically if not provided
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
             input_ids=input_ids,
@@ -472,11 +488,9 @@ class SmolLM3Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
 
-        # Compute position_ids from mask_info if not provided
         if position_ids is None:
             position_ids = mask_info.q_position_ids
 
-        # Set mode
         if mode is None:
             mode = (
                 common_types.MODE_DECODE
@@ -491,7 +505,6 @@ class SmolLM3Model(EasyDeLBaseModule):
             else:
                 past_key_values = TransformerCache.init_empty(self.config)
 
-        # Initialize outputs
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 

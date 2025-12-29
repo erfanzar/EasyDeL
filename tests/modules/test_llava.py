@@ -32,7 +32,7 @@ class TestLLaVA:
             num_attention_heads=small_model_config["num_attention_heads"],
             num_key_value_heads=small_model_config["num_key_value_heads"],
             intermediate_size=small_model_config["intermediate_size"],
-            max_position_embeddings=small_model_config["max_position_embeddings"],
+            max_position_embeddings=max(small_model_config["max_position_embeddings"], 2048),
         )
         # Use a valid image token ID within vocab range
         image_token_id = small_model_config["vocab_size"] - 1
@@ -49,7 +49,8 @@ class TestLLaVA:
         num_images = 1
         image_size = llava_config.vision_config.image_size
         patch_size = llava_config.vision_config.patch_size
-        num_patches = (image_size // patch_size) ** 2 + 1  # +1 for CLS
+        # Llava's default vision feature selection drops the CLS token.
+        num_patches = (image_size // patch_size) ** 2
 
         return {
             "image_token_id": llava_config.image_token_id,
@@ -93,6 +94,22 @@ class TestLLaVA:
             small_model_config=local_cfg,
         )
         assert result.success, f"LLaVA text-only failed: {result.error_message or result.comparison.details}"
+
+    def test_generation(self, llava_config, small_model_config):
+        """Test LLaVA text-only generation."""
+        local_cfg = small_model_config.copy()
+        local_cfg["max_position_embeddings"] = 2048
+
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="llava",
+            hf_class=transformers.LlavaForConditionalGeneration,
+            task=ed.TaskType.IMAGE_TEXT_TO_TEXT,
+            config=llava_config,
+            small_model_config=local_cfg,
+            max_new_tokens=16,
+        )
+        assert result.success, f"LLaVA generation failed: {result.error_message}"
 
 
 if __name__ == "__main__":

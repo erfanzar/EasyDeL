@@ -33,6 +33,8 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.modeling_outputs import CausalLMOutput, MoeCausalLMOutput
 from easydel.infra.utils import auto_remat, get_dot_general_by_bits
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesMetadata,
     TransformerCache,
@@ -175,8 +177,8 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -221,14 +223,12 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
 
         hidden_states = outputs.last_hidden_state
 
-        # Apply logical sharding for distributed training
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
 
-        # Apply LM head if requested
         lm_logits = None
         if apply_lm_head:
             lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
@@ -319,7 +319,6 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             output_router_logits=output_router_logits,
         )
 
-        # Apply LM head if requested
         logits = None
         if apply_lm_head:
             logits = checkpoint_name(self.apply_lm_head(outputs.last_hidden_state), "lm_head_output")
@@ -346,18 +345,18 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         )
 
     def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Apply the language modeling head to hidden states.
-
-        This method is separated to allow easy customization in subclasses.
-
-        Args:
-            hidden_states: Hidden states from the model
-
-        Returns:
-            Logits over vocabulary
-        """
+        """Apply the language modeling head (optionally tied to input embeddings)."""
+        tie_embeddings = next(
+            (
+                getattr(self.config, key)
+                for key in ["tie_word_embeddings", "use_lm_head", "share_input_output_layers"]
+                if hasattr(self.config, key)
+            ),
+            False,
+        )
+        w = self.get_embedding().embedding.value.T if tie_embeddings else None
         lm_head = getattr(self, self._lm_head_name)
-        return lm_head(hidden_states)
+        return lm_head(hidden_states, w=w)
 
     def get_task_head(self):
         """Returns the language modeling head.

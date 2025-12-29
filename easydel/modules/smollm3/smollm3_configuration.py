@@ -122,8 +122,6 @@ class SmolLM3Config(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
-        """Initialize SmolLM3Config."""
-
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers

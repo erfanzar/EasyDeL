@@ -60,6 +60,7 @@ class Mistral3Config(EasyDeLBaseConfig):
         vision_feature_layer=-1,
         multimodal_projector_bias=False,
         spatial_merge_size=2,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -111,6 +112,9 @@ class Mistral3Config(EasyDeLBaseConfig):
         self.text_config = text_config
         self.multimodal_projector_bias = multimodal_projector_bias
         self.spatial_merge_size = spatial_merge_size
+        self.layer_types = layer_types
+        if self.layer_types is None and hasattr(self.text_config, "num_hidden_layers"):
+            self.layer_types = ["full_attention"] * self.text_config.num_hidden_layers
 
     def get_partition_rules(self, *args, **kwargs):
         """

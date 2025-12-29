@@ -36,7 +36,7 @@ Key Features:
 Example:
     >>> from easydel.trainers import SFTConfig, SFTTrainer
     >>> config = SFTConfig(
-    ...     max_sequence_length=2048,
+    ...     max_length=2048,
     ...     learning_rate=2e-5,
     ...     packing=True,
     ...     num_train_epochs=3

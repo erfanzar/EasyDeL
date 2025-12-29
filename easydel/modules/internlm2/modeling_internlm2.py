@@ -36,8 +36,10 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule
+from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -302,7 +304,7 @@ class InternLM2Block(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
@@ -312,19 +314,19 @@ class InternLM2Block(nn.Module):
         and then applies the MLP layer, followed by another residual connection and layer normalization.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for autoregressive behavior.
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens.
+            causal_mask (tp.Optional[Array | bool]): Causal mask for autoregressive behavior.
             cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
             cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused in standard InternLM2).
+            segment_ids (tp.Optional[Array]): Segment IDs (unused in standard InternLM2).
             output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+            fcm_mask (tp.Optional[Array]): Flash Chunking Mask (FCM) for attention.
+            frequencies (tp.Optional[Array]): Precomputed rotary frequency embeddings.
 
         Returns:
-            tp.Union[tp.Tuple[chex.Array, chex.Array], tp.Tuple[chex.Array]]:
+            tp.Union[tp.Tuple[Array, Array], tp.Tuple[Array]]:
                 A tuple containing the output hidden states. If `output_attentions` is True,
                 it also includes the attention weights.
         """
@@ -445,22 +447,22 @@ class InternLM2Model(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
         """Forward pass of the InternLM2Model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
+            inputs_embeds (tp.Optional[Array]): Input embeddings.
                 Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
                 Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+            position_ids (tp.Optional[Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+            segment_ids (tp.Optional[Array]): Segment IDs (unused).
             output_attentions (tp.Optional[bool]): Whether to return attention weights.
                 Defaults to `config.output_attentions`.
             output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
@@ -614,8 +616,8 @@ class InternLM2ForCausalLM(BaseCausalLMModule[InternLM2Model, InternLM2Config]):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -623,14 +625,14 @@ class InternLM2ForCausalLM(BaseCausalLMModule[InternLM2Model, InternLM2Config]):
         """Forward pass of the InternLM2ForCausalLM model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
+            inputs_embeds (tp.Optional[Array]): Input embeddings.
                 Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
                 Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+            position_ids (tp.Optional[Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+            segment_ids (tp.Optional[Array]): Segment IDs (unused).
             output_attentions (tp.Optional[bool]): Whether to return attention weights.
                 Defaults to `config.output_attentions`.
             output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
@@ -705,7 +707,7 @@ class InternLM2ForCausalLM(BaseCausalLMModule[InternLM2Model, InternLM2Config]):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=InternLM2Config, model_type="internlm2")
-class InternLM2ForSequenceClassification(EasyDeLBaseModule):
+class InternLM2ForSequenceClassification(BaseSequenceClassificationModule[InternLM2Model, InternLM2Config]):
     """InternLM2 model with a Sequence Classification head.
 
     This model consists of the base InternLM2 transformer (`InternLM2Model`) followed by a
@@ -721,6 +723,10 @@ class InternLM2ForSequenceClassification(EasyDeLBaseModule):
         module (InternLM2Model): The core InternLM2 transformer model.
         score (ParallelLinear): The linear layer for classification.
     """
+
+    _task_type = TaskType.SEQUENCE_CLASSIFICATION
+    _model_type = "internlm2"
+    _config_class = InternLM2Config
 
     def __init__(
         self,
@@ -742,31 +748,14 @@ class InternLM2ForSequenceClassification(EasyDeLBaseModule):
         """
         super().__init__(
             config=config,
+            base_model_class=InternLM2Model,
+            base_model_name="model",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.model = InternLM2Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        assert hasattr(config, "num_labels"), (
-            "in order to use `SequenceClassification` Models in `EasyDeL` "
-            "you first need to attach `num_labels` to model `config`"
-        )
-        self.score = ColumnParallelLinear(
-            self.config.hidden_size,
-            config.num_labels,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-            precision=self.precision,
-            rngs=rngs,
+            pooling_strategy="last",
+            score_head_bias=False,
         )
 
     def __call__(
@@ -777,22 +766,22 @@ class InternLM2ForSequenceClassification(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
         """Forward pass of the InternLM2ForSequenceClassification model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
+            inputs_embeds (tp.Optional[Array]): Input embeddings.
                 Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
                 Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+            position_ids (tp.Optional[Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+            segment_ids (tp.Optional[Array]): Segment IDs (unused).
             past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
                 Precomputed key/value states for attention.
             cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.

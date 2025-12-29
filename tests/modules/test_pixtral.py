@@ -1,6 +1,7 @@
 """Tests for Pixtral vision model."""
 
 import pytest
+import transformers
 
 import easydel as ed
 
@@ -25,14 +26,13 @@ class TestPixtral:
             patch_size=16,
         )
 
-    @pytest.mark.skip(reason="Pixtral is vision-only encoder, used by Mistral3")
     def test_vision_model(self, pixtral_config, small_model_config):
         """Test PixtralVisionModel."""
         tester = BaseModuleTester()
         result = tester.run(
             module_name="pixtral",
-            hf_class=None,
-            task=ed.TaskType.BASE_MODULE,
+            hf_class=transformers.PixtralVisionModel,
+            task=ed.TaskType.BASE_VISION,
             config=pixtral_config,
             small_model_config=small_model_config,
         )

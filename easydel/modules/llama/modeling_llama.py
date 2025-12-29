@@ -31,6 +31,8 @@ from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_gene
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -60,6 +62,16 @@ class LlamaMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama MLP block.
+
+        Args:
+            config (LlamaConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -131,7 +143,16 @@ class LlamaAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initialize attention layer with unified attention backend."""
+        """Initialize Llama attention layer with grouped-query attention support.
+
+        Args:
+            config (LlamaConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -161,6 +182,16 @@ class LlamaDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Llama decoder layer.
+
+        Args:
+            config (LlamaConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -213,10 +244,29 @@ class LlamaDecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x))
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
+        """
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
             mask_info,
@@ -277,6 +327,15 @@ class LlamaModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama base model.
+
+        Args:
+            config (LlamaConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -327,28 +386,45 @@ class LlamaModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass through the Llama model.
+        """Forward pass through the Llama base model.
+
+        Processes input tokens through embedding, all decoder layers with RoPE and RMSNorm,
+        and final normalization.
 
         Args:
-            input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-            segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
-            past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing
-                precomputed key/value states.
-            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
-            output_attentions (bool, optional): Whether to return attention weights.
-            output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            Union[BaseModelOutput, Tuple]: Model outputs (last hidden state, optional hidden states, optional attentions)
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -477,6 +553,15 @@ class LlamaForCausalLM(BaseCausalLMModule[LlamaModel, LlamaConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama model for causal language modeling.
+
+        Args:
+            config (LlamaConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=LlamaModel,
@@ -516,6 +601,15 @@ class LlamaForSequenceClassification(BaseSequenceClassificationModule[LlamaModel
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama model for sequence classification.
+
+        Args:
+            config (LlamaConfig): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=LlamaModel,

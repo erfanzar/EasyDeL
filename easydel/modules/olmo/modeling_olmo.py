@@ -31,6 +31,8 @@ from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_gene
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -277,26 +279,26 @@ class OlmoDecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         """Forward pass of the OlmoDecoderLayer module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
+            causal_mask (tp.Optional[Array | bool]): Causal mask for ensuring autoregressive behavior.
             cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
             cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+            fcm_mask (tp.Optional[Array]): Flash Chunking Mask (FCM) for attention.
+            frequencies (tp.Optional[Array]): Precomputed rotary frequency embeddings.
 
         Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array]]:
+            tp.Tuple[Array, tp.Optional[Array]]:
                 A tuple containing the output hidden states and optionally the attention weights.
         """
         residual = hidden_states
@@ -413,22 +415,22 @@ class OlmoModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
         """Forward pass of the OlmoModel.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings.
+            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
+            inputs_embeds (tp.Optional[Array]): Input embeddings.
                 Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
                 Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+            position_ids (tp.Optional[Array]): Position indices for the tokens.
                 Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+            segment_ids (tp.Optional[Array]): Segment IDs (unused).
             past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
                 Precomputed key/value states for attention.
             cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.

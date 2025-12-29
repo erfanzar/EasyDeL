@@ -35,6 +35,8 @@ from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -106,10 +108,10 @@ class Conv1D(nn.Module):
         """Forward pass of the Conv1D layer.
 
         Args:
-            inputs (chex.Array): Input tensor.
+            inputs (Array): Input tensor.
 
         Returns:
-            chex.Array: Output tensor after applying the 1D convolution.
+            Array: Output tensor after applying the 1D convolution.
         """
         inputs = jnp.asarray(inputs, self.dtype)
         bias = self.bias.value
@@ -243,10 +245,10 @@ class GPT2Attention(UnifiedAttention):
         Merges the attention heads into a single hidden state tensor.
 
         Args:
-            hidden_states (chex.Array): The hidden states with separate head dimensions.
+            hidden_states (Array): The hidden states with separate head dimensions.
 
         Returns:
-            chex.Array: The hidden states with merged head dimensions.
+            Array: The hidden states with merged head dimensions.
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
 
@@ -257,7 +259,7 @@ class GPT2Attention(UnifiedAttention):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         key_value_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -265,11 +267,11 @@ class GPT2Attention(UnifiedAttention):
         """Forward pass of the GPT2Attention module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            key_value_states (chex.Array, optional): Key/value states for cross-attention.
+            hidden_states (Array): Input hidden states.
+            key_value_states (Array, optional): Key/value states for cross-attention.
                 Defaults to None (self-attention).
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
+            attention_mask (Array): Mask to apply on the attention scores.
+            causal_mask (Array, optional): Causal mask for ensuring autoregressive behavior.
                 Defaults to None.
             cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional):
                 Cache view for key/value states.
@@ -278,7 +280,7 @@ class GPT2Attention(UnifiedAttention):
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
 
         Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array]]: A tuple containing the attention output and optionally
+            tp.Tuple[Array, tp.Optional[Array]]: A tuple containing the attention output and optionally
                 the attention weights.
         """
         is_cross_attention = key_value_states is not None
@@ -395,10 +397,10 @@ class GPT2MLP(nn.Module):
         """Forward pass of the GPT2MLP module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
+            hidden_states (Array): Input hidden states.
 
         Returns:
-            chex.Array: Output hidden states after processing through the MLP.
+            Array: Output hidden states after processing through the MLP.
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -515,7 +517,7 @@ class GPT2Block(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
@@ -524,12 +526,12 @@ class GPT2Block(nn.Module):
         """Forward pass of the GPT2Block module.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array, optional): Mask to apply on the self-attention scores. Defaults to None.
-            causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior. Defaults to None.
-            encoder_hidden_states (chex.Array, optional): Hidden states from the encoder for cross-attention.
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array, optional): Mask to apply on the self-attention scores. Defaults to None.
+            causal_mask (Array, optional): Causal mask for ensuring autoregressive behavior. Defaults to None.
+            encoder_hidden_states (Array, optional): Hidden states from the encoder for cross-attention.
                 Defaults to None.
-            encoder_attention_mask (chex.Array, optional): Mask for the encoder hidden states in cross-attention.
+            encoder_attention_mask (Array, optional): Mask for the encoder hidden states in cross-attention.
                 Defaults to None.
             cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional):
                 Cache view for key/value states.
@@ -538,7 +540,7 @@ class GPT2Block(nn.Module):
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
 
         Returns:
-            tp.Tuple[chex.Array, ...]: A tuple containing the output hidden states and
+            tp.Tuple[Array, ...]: A tuple containing the output hidden states and
                 optionally attention weights (self and cross).
         """
         residual = hidden_states
@@ -699,33 +701,47 @@ class GPT2Model(EasyDeLBaseModule):
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
-        """Forward pass through the GPT2Model.
+        """Performs forward pass through the GPT-2 transformer model.
+
+        Processes input tokens through learned token and position embeddings, multiple
+        transformer blocks with pre-norm architecture and absolute positional encoding,
+        and final layer normalization. Supports optional cross-attention for encoder-decoder tasks.
 
         Args:
-            input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-                Only one of input_ids or inputs_embeds should be provided.
-            attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens. Defaults to None.
-            position_ids (chex.Array, optional): Indices of positions of each input sequence token. Defaults to None.
-            encoder_hidden_states (chex.Array, optional): Hidden states from an encoder model for cross-attention.
-                Defaults to None.
-            encoder_attention_mask (chex.Array, optional): Mask for the encoder hidden states. Defaults to None.
-            past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing
-                precomputed key/value states. Defaults to None.
-            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
-                Defaults to None.
-            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
-            output_hidden_states (bool, optional): Whether to return hidden states of all layers. Defaults to False.
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Either this
+                or `inputs_embeds` must be provided but not both.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length,
+                hidden_size). Use instead of `input_ids` for custom embeddings.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) indicating
+                which tokens to attend to (True) and which to ignore (False).
+            mask_info: Pre-computed mask information. If provided, overrides `attention_mask`.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length).
+                Must be within [0, max_position_embeddings). Auto-generated if not provided.
+            encoder_hidden_states: Hidden states from encoder of shape (batch_size, encoder_length,
+                hidden_size) for cross-attention in encoder-decoder configurations.
+            encoder_attention_mask: Boolean mask for encoder hidden states.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER). Auto-detected if None.
+            past_key_values: Cached key/value states for efficient autoregressive generation.
+            cache_metadata: Metadata for paged attention mechanisms.
+            output_attentions: Whether to return self-attention and cross-attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
 
         Returns:
-            Union[BaseModelOutputWithPastAndCrossAttentions, Tuple]: Model outputs
-                (last hidden state, optional past KVs, optional hidden states, optional attentions,
-                    optional cross-attentions).
+            BaseModelOutputWithPastAndCrossAttentions containing:
+                - last_hidden_state: Final layer output of shape (batch, seq_len, hidden_size)
+                - past_key_values: Updated cache for next generation step
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of self-attention weights if output_attentions=True
+                - cross_attentions: Tuple of cross-attention weights if cross-attention enabled
+
+        Raises:
+            ValueError: If both `input_ids` and `inputs_embeds` are provided, or if neither
+                is provided.
         """
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
@@ -750,7 +766,6 @@ class GPT2Model(EasyDeLBaseModule):
         if position_ids is None:
             position_ids = mask_info.q_position_ids
 
-        # Get input embeddings
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.wte(input_ids.astype("i4")), "embeddings")
 

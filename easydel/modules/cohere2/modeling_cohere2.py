@@ -15,7 +15,6 @@
 
 from functools import partial
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -38,6 +37,8 @@ from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -303,7 +304,7 @@ class Cohere2Block(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
@@ -311,17 +312,17 @@ class Cohere2Block(nn.Module):
         Forward pass of the module block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            hidden_states (Array): Input hidden states.
+            attention_mask (Array): Mask to apply on the attention scores.
+            position_ids (Array): Position indices for the tokens.
+            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             deterministic (bool): If True, disables dropout for deterministic behavior.
             init_cache (bool): If True, initializes cache for caching keys and values.
             output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
         """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -428,8 +429,8 @@ class Cohere2Model(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
@@ -568,8 +569,8 @@ class Cohere2ForCausalLM(BaseCausalLMModule[Cohere2Model, Cohere2Config]):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -578,11 +579,11 @@ class Cohere2ForCausalLM(BaseCausalLMModule[Cohere2Model, Cohere2Config]):
         Forward pass through the Cohere module.
 
         Args:
-            input_ids (chex.Array): Input tensor containing token IDs.
-            attention_mask (chex.Array): Mask for attention.
-            position_ids (chex.Array): Positional indices.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
-            inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
+            input_ids (Array): Input tensor containing token IDs.
+            attention_mask (Array): Mask for attention.
+            position_ids (Array): Positional indices.
+            segment_ids (tp.Optional[Array]): Segment IDs for different input parts.
+            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
             output_attentions (tp.Optional[bool]): If True, output attention weights.
             output_hidden_states (tp.Optional[bool]): If True, output hidden states.
             init_cache (bool): If True, initialize cache for decoding.
@@ -624,15 +625,15 @@ class Cohere2ForCausalLM(BaseCausalLMModule[Cohere2Model, Cohere2Config]):
             past_key_values=outputs.past_key_values,
         )
 
-    def apply_lm_head(self, hidden_states: chex.Array) -> chex.Array:
+    def apply_lm_head(self, hidden_states: Array) -> Array:
         """
         Applies the language model head to the hidden states.
 
         Args:
-            hidden_states (chex.Array): The last hidden states from the model.
+            hidden_states (Array): The last hidden states from the model.
 
         Returns:
-            chex.Array: The logits after applying the language model head.
+            Array: The logits after applying the language model head.
         """
         lm_logits = self.lm_head(hidden_states)
         if self.logit_scale is not None:
@@ -706,8 +707,8 @@ class Cohere2ForSequenceClassification(BaseSequenceClassificationModule[Cohere2M
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> SequenceClassifierOutput:
         transformer_outputs = self.model(
             input_ids=input_ids,

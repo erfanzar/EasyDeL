@@ -126,6 +126,7 @@ class GPT2Config(EasyDeLBaseConfig):
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         tie_word_embeddings: bool = False,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initializes a GPT2Config object.
@@ -187,6 +188,9 @@ class GPT2Config(EasyDeLBaseConfig):
         self.eos_token_id = eos_token_id
         self.gradient_checkpointing = gradient_checkpointing
         self.bits = bits
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.n_layer
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,

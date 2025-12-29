@@ -82,31 +82,7 @@ eopod run python -m wandb login <API-TOKEN-HERE>
 Run the following command to fine-tune a model using EasyDeL's DPO framework:
 
 ```shell
-eopod run python -m easydel.scripts.finetune.dpo \
-  --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --dataset_name trl-lib/ultrafeedback_binarized \
-  --dataset_split "train[:90%]" \
-  --refrence_model_repo_id meta-llama/Llama-3.3-70B-Instruct \
-  --attn_mechanism vanilla \
-  --beta 0.08 \
-  --loss_type sigmoid \
-  --max_length 2048 \
-  --max_prompt_length 1024 \
-  --ref_model_sync_steps 128 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --learning_rate_end 6e-7 \
-  --log_steps 50 \
-  --shuffle_train_dataset \
-  --report_steps 1 \
-  --progress_bar_type tqdm \
-  --num_train_epochs 3 \
-  --auto_shard_states \
-  --optimizer adamw \
-  --scheduler linear \
-  --do_last_save \
-  --save_steps 1000 \
-  --use_wandb
+eopod run python -m easydel.scripts.elarge --config dpo.yaml
 ```
 
 This setup ensures proper installation and configuration for training large models using EasyDeL with TPUs and distributed environments.

@@ -140,6 +140,44 @@ class TestSFTPreprocessTransform:
         assert "input_ids" in result
         assert "attention_mask" in result
 
+    def test_messages_in_text_field(self):
+        tokenizer = MockTokenizer()
+        transform = SFTPreprocessTransform(
+            tokenizer=tokenizer,
+            max_length=128,
+            text_field="text",
+        )
+
+        example = {
+            "text": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there!"},
+            ]
+        }
+        result = transform(example)
+
+        assert "input_ids" in result
+        assert "attention_mask" in result
+
+    def test_messages_in_text_field_from_value(self):
+        tokenizer = MockTokenizer()
+        transform = SFTPreprocessTransform(
+            tokenizer=tokenizer,
+            max_length=128,
+            text_field="text",
+        )
+
+        example = {
+            "text": [
+                {"from": "human", "value": "Hello"},
+                {"from": "gpt", "value": "Hi there!"},
+            ]
+        }
+        result = transform(example)
+
+        assert "input_ids" in result
+        assert "attention_mask" in result
+
     def test_repr(self):
         """Test string representation."""
         tokenizer = MockTokenizer()

@@ -32,6 +32,8 @@ from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_gene
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -190,13 +192,12 @@ class StableLmLayerNormPerHead(nn.Module):
         """Applies LayerNorm per head.
 
         Args:
-            hidden_states (chex.Array): Input hidden states, expected shape (..., num_heads * head_dim).
+            hidden_states (Array): Input hidden states, expected shape (..., num_heads * head_dim).
 
         Returns:
-            chex.Array: Hidden states after applying LayerNorm per head, same shape as input.
+            Array: Hidden states after applying LayerNorm per head, same shape as input.
         """
         # hidden_states: [batch, seq_len, num_heads * head_dim]
-        # Reshape to [batch, seq_len, num_heads, head_dim]
         states_per_heads = jnp.split(hidden_states, 1, axis=1)
         # Normalize and merge the heads back together
         return jnp.concatenate(
@@ -290,7 +291,7 @@ class StableLmAttention(UnifiedAttention):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
@@ -304,7 +305,6 @@ class StableLmAttention(UnifiedAttention):
             checkpoint_name(self.value_projection(hidden_states), "attn_value"),
         )
 
-        # Reshape to multi-head format
         query_states = query_states.reshape(
             batch_size,
             sequence_length,
@@ -461,30 +461,30 @@ class StableLmDecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
         """Forward pass of the decoder layer.
 
         Args:
-            hidden_states (chex.Array): Input hidden states (batch, seq_len, hidden_size).
-            attention_mask (chex.Array): Attention mask (batch, 1, seq_len, kv_seq_len).
-            position_ids (chex.Array): Position IDs (batch, seq_len).
-            causal_mask (tp.Optional[chex.Array | bool]): Causal mask for autoregressive behavior.
+            hidden_states (Array): Input hidden states (batch, seq_len, hidden_size).
+            attention_mask (Array): Attention mask (batch, 1, seq_len, kv_seq_len).
+            position_ids (Array): Position IDs (batch, seq_len).
+            causal_mask (tp.Optional[Array | bool]): Causal mask for autoregressive behavior.
             cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]):
                 Cache view for key/value states (optional).
             cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]):
                 Metadata for paged attention (optional).
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             output_attentions (bool): Whether to output attention weights (default: False).
-            fcm_mask (tp.Optional[chex.Array]): Forward causal mask (FCM) mask (optional).
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequencies (optional).
+            fcm_mask (tp.Optional[Array]): Forward causal mask (FCM) mask (optional).
+            frequencies (tp.Optional[Array]): Precomputed rotary frequencies (optional).
 
         Returns:
-            tp.Tuple[chex.Array, chex.Array | None]: A tuple containing:
-                - hidden_states (chex.Array): Output hidden states after the decoder layer.
-                - attention_outputs (chex.Array | None): Attention weights (if `output_attentions` is True).
+            tp.Tuple[Array, Array | None]: A tuple containing:
+                - hidden_states (Array): Output hidden states after the decoder layer.
+                - attention_outputs (Array | None): Attention weights (if `output_attentions` is True).
         """
         assert hidden_states.ndim == 3, f"Input hidden_states should be 3 dimensions, got {hidden_states.ndim}"
 
@@ -639,21 +639,21 @@ class StableLmModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
         """Forward pass of the StableLM model.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs (batch, seq_len).
+            input_ids (tp.Optional[Array]): Input token IDs (batch, seq_len).
                 Mutually exclusive with `inputs_embeds`.
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings (batch, seq_len, hidden_size).
+            inputs_embeds (tp.Optional[Array]): Input embeddings (batch, seq_len, hidden_size).
                 Mutually exclusive with `input_ids`.
-            attention_mask (tp.Optional[chex.Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
-            position_ids (tp.Optional[chex.Array]): Position IDs (batch, seq_len). If None, automatically generated.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            attention_mask (tp.Optional[Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
+            position_ids (tp.Optional[Array]): Position IDs (batch, seq_len). If None, automatically generated.
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
             output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers
                 (default defined by config).
@@ -805,20 +805,20 @@ class StableLmForCausalLM(BaseCausalLMModule[StableLmModel, StableLmConfig]):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> CausalLMOutput:
         """Forward pass of the StableLM model for Causal Language Modeling.
 
         Args:
-            input_ids (tp.Optional[chex.Array]): Input token IDs (batch, seq_len).
+            input_ids (tp.Optional[Array]): Input token IDs (batch, seq_len).
                 Mutually exclusive with `inputs_embeds`.
-            inputs_embeds (tp.Optional[chex.Array]): Input embeddings (batch, seq_len, hidden_size).
+            inputs_embeds (tp.Optional[Array]): Input embeddings (batch, seq_len, hidden_size).
                 Mutually exclusive with `input_ids`.
-            attention_mask (tp.Optional[chex.Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
-            position_ids (tp.Optional[chex.Array]): Position IDs (batch, seq_len). If None, automatically generated.
-            segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            attention_mask (tp.Optional[Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
+            position_ids (tp.Optional[Array]): Position IDs (batch, seq_len). If None, automatically generated.
+            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
             output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
             output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all
                 layers (default defined by config).

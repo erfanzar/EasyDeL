@@ -16,7 +16,6 @@ import math
 import typing
 from functools import cached_property, partial
 
-import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -33,6 +32,7 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
     BaseModelOutput,
     DecoderLayerOutput,
+    EmbeddingInfo,
     ModelOutput,
     MoeCausalLMOutput,
     VLMCausalLMOutput,
@@ -42,6 +42,8 @@ from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseVisionLanguageModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -66,17 +68,29 @@ from .qwen3_vl_moe_configuration import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig, 
 class Qwen3VLMoeCausalLMOutputWithPast(ModelOutput):
     """Output class for Qwen3-VL-MoE causal language model."""
 
-    loss: chex.Array | None = None
-    logits: chex.Array = None
-    past_key_values: list[chex.Array] | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    attentions: tuple[chex.Array] | None = None
-    rope_deltas: chex.Array | None = None
+    loss: Array | None = None
+    logits: Array = None
+    past_key_values: list[Array] | None = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    rope_deltas: Array | None = None
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
-    router_logits: tuple[chex.Array] | None = None
+    router_logits: tuple[Array] | None = None
 
 
-def _dbg_tail(x: chex.Array) -> chex.Array:
+@auto_pytree
+class Qwen3VLMoeModelOutputWithPast(ModelOutput):
+    """Base-model output for Qwen3-VL-MoE with optional mRoPE deltas."""
+
+    last_hidden_state: Array = None
+    past_key_values: list[Array] | None = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    rope_deltas: Array | None = None
+    router_logits: tuple[Array] | None = None
+
+
+def _dbg_tail(x: Array) -> Array:
     """Return the last 5 flattened elements for compact debug prints."""
     flat = jnp.ravel(x)
     return flat[-5:]
@@ -276,16 +290,14 @@ def merge_multimodal_embeddings(
     return _merge_multimodal_embeddings(inputs_embeds, is_multimodal, multimodal_embeddings)
 
 
-def rotate_half(x: chex.Array) -> chex.Array:
+def rotate_half(x: Array) -> Array:
     """Rotate half the hidden dims of the input for RoPE."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return jnp.concatenate([-x2, x1], axis=-1)
 
 
-def apply_rotary_pos_emb_vision(
-    q: chex.Array, k: chex.Array, cos: chex.Array, sin: chex.Array
-) -> tuple[chex.Array, chex.Array]:
+def apply_rotary_pos_emb_vision(q: Array, k: Array, cos: Array, sin: Array) -> tuple[Array, Array]:
     """Apply rotary positional embeddings to vision features.
 
     RoPE is only applied to the first half of the head dimensions (head_dim_ro = head_dim // 2).
@@ -307,7 +319,7 @@ def apply_rotary_pos_emb_vision(
     return q_embed, k_embed
 
 
-def create_attention_mask(cu_seqlens: chex.Array, seq_length: int, dtype: jnp.dtype) -> chex.Array:
+def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
     """Create block-diagonal attention mask from cumulative sequence lengths.
 
     Vectorized implementation that works correctly with JAX tracing.
@@ -355,7 +367,7 @@ class Qwen3VLMoeVisionPatchEmbed(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, hidden_states: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Array) -> Array:
         hidden_states = jnp.transpose(
             hidden_states.reshape(
                 -1,
@@ -416,7 +428,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: chex.Array) -> chex.Array:
+    def __call__(self, x: Array) -> Array:
         x = self.norm(x.reshape(-1, self.hidden_size) if self.use_postshuffle_norm else x).reshape(-1, self.hidden_size)
         x = self.linear_fc2(nn.gelu(self.linear_fc1(x), approximate=False))
         return x
@@ -457,7 +469,7 @@ class Qwen3VLMoeVisionMLP(nn.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: chex.Array) -> chex.Array:
+    def __call__(self, x: Array) -> Array:
         return self.linear_fc2(self.act(self.linear_fc1(x)))
 
 
@@ -526,14 +538,15 @@ class Qwen3VLMoeVisionAttention(UnifiedAttention):
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
             attn_mechanism="vanilla",
+            requires_cache=False,  # Vision encoder doesn't need KV cache
         )
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        cu_seqlens: chex.Array,
-        rotary_pos_emb: chex.Array = None,
-    ) -> chex.Array:
+        hidden_states: Array,
+        cu_seqlens: Array,
+        rotary_pos_emb: Array = None,
+    ) -> Array:
         seq_length = hidden_states.shape[0]
         qkv = self.qkv(hidden_states)
         q, k, v = map(
@@ -616,10 +629,10 @@ class Qwen3VLMoeVisionBlock(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        cu_seqlens: chex.Array,
-        rotary_pos_emb: chex.Array,
-    ) -> chex.Array:
+        hidden_states: Array,
+        cu_seqlens: Array,
+        rotary_pos_emb: Array,
+    ) -> Array:
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
@@ -709,7 +722,7 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
     def get_dtype(self) -> jnp.dtype:
         return self.blocks[0].mlp.linear_fc2.kernel.value.dtype
 
-    def fast_pos_embed_interpolate(self, grid_thw: chex.Array) -> chex.Array:
+    def fast_pos_embed_interpolate(self, grid_thw: Array) -> Array:
         """Compute positional embeddings with bilinear interpolation.
 
         Args:
@@ -784,7 +797,7 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
 
         return jnp.concatenate(patch_pos_embeds_permute, axis=0)
 
-    def rot_pos_emb(self, grid_thw: chex.Array, max_grid_size: int) -> chex.Array:
+    def rot_pos_emb(self, grid_thw: Array, max_grid_size: int) -> Array:
         """Compute rotary position embeddings for vision features."""
         merge_size = self.spatial_merge_size
 
@@ -822,10 +835,10 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        grid_thw: chex.Array,
+        hidden_states: Array,
+        grid_thw: Array,
         max_grid_size: int,
-    ) -> tuple[chex.Array, list[chex.Array]]:
+    ) -> tuple[Array, list[Array]]:
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds
@@ -908,7 +921,7 @@ class Qwen3VLMoeTextMLP(nn.Module):
         self.down_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def __call__(self, hidden_states: chex.Array) -> chex.Array:
+    def __call__(self, hidden_states: Array) -> Array:
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -999,9 +1012,9 @@ class Qwen3VLMoeMLPStack(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        group_sizes: chex.Array,
-        sorted_experts: chex.Array | None = None,
-    ) -> chex.Array:
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
         """Forward pass through MoE MLP."""
         return self.down_proj(
             self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
@@ -1079,16 +1092,16 @@ class Qwen3VLMoeTextSparseBlock(BaseMoeModule):
         )
         self.layer_idx: int | None = None
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Forward pass of the Sparse MoE block.
 
         Args:
-            hidden_states (chex.Array): Input hidden states (batch_size * sequence_length, hidden_dim).
+            hidden_states (Array): Input hidden states (batch_size * sequence_length, hidden_dim).
 
         Returns:
-            tuple[chex.Array, chex.Array]: A tuple containing:
-                - final_hidden_states (chex.Array): The output hidden states after MoE processing.
-                - router_logits (chex.Array): The logits output by the gating network.
+            tuple[Array, Array]: A tuple containing:
+                - final_hidden_states (Array): The output hidden states after MoE processing.
+                - router_logits (Array): The logits output by the gating network.
         """
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
@@ -1212,15 +1225,15 @@ class Qwen3VLMoeTextDecoderLayer(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
+        hidden_states: Array,
         mask_info: MaskInfo,
-        position_ids: chex.Array,
+        position_ids: Array,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
-        frequencies: chex.Array | None = None,
+        frequencies: Array | None = None,
     ) -> DecoderLayerOutput:
         attn_input = self.input_layernorm(hidden_states)
         attn_outputs = self.self_attn(
@@ -1342,14 +1355,54 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         visual_pos_masks: Bool[Array, "batch seq_len"] | None = None,
-        deepstack_visual_embeds: list[chex.Array] | None = None,
+        deepstack_visual_embeds: list[Array] | None = None,
     ) -> BaseModelOutput:
+        """Forward pass through text decoder with MoE and optional deepstack visual integration.
+
+        Processes input embeddings through transformer layers with mixture-of-experts feedforward
+        networks. Supports deepstack visual feature injection at specified layer positions.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Mutually exclusive
+                with inputs_embeds. Converted to embeddings via self.embed_tokens.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length, hidden_size).
+                Mutually exclusive with input_ids. Use when embeddings are already prepared.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) where True indicates
+                valid tokens, False indicates padding.
+            mask_info: Pre-computed mask information for efficient attention operations. Auto-computed
+                if None using MaskInfo.dynamic_init.
+            position_ids: Position IDs of shape (3, batch_size, sequence_length) for 3D mRoPE.
+                Dimensions: [temporal, height, width]. Defaults to standard 1D positions if None.
+            mode: Runtime mode (MODE_TRAIN/DECODE/EVAL). Auto-detected: MODE_DECODE if seq_len=1
+                and cache exists, else MODE_TRAIN.
+            past_key_values: Cached key-value states from previous steps. Initialized as empty
+                TransformerCache if None.
+            cache_metadata: Metadata for paged attention (sequence lengths, block tables, etc.).
+            output_attentions: Whether to return attention weights from all layers. Defaults to
+                config.output_attentions.
+            output_hidden_states: Whether to return hidden states from all layers. Defaults to
+                config.output_hidden_states.
+            output_router_logits: Whether to return MoE router logits for auxiliary loss. Defaults
+                to config.output_router_logits.
+            visual_pos_masks: Boolean mask of shape (batch_size, sequence_length) indicating positions
+                where deepstack visual embeddings should be injected. Required if deepstack_visual_embeds provided.
+            deepstack_visual_embeds: List of visual embedding arrays (one per layer) for deepstack injection.
+                Each array shape: (num_visual_tokens, hidden_size). Injected additively at visual_pos_masks positions.
+
+        Returns:
+            MoeCausalLMOutput containing:
+                - last_hidden_state: Final layer hidden states of shape (batch_size, sequence_length, hidden_size).
+                - hidden_states: Tuple of all layer hidden states if output_hidden_states=True, else None.
+                - attentions: Tuple of attention weights from all layers if output_attentions=True, else None.
+                - past_key_values: Updated cache for next generation step.
+                - router_logits: Tuple of router logits from MoE layers if output_router_logits=True, else None.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify either input_ids or inputs_embeds, but not both.")
 
@@ -1449,10 +1502,10 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
 
     def _deepstack_process(
         self,
-        hidden_states: chex.Array,
-        visual_pos_masks: chex.Array,
-        visual_embeds: chex.Array,
-    ) -> chex.Array:
+        hidden_states: Array,
+        visual_pos_masks: Array,
+        visual_embeds: Array,
+    ) -> Array:
         """Add visual embeddings to hidden states at visual token positions."""
         batch_size, seq_len, hidden_dim = hidden_states.shape
         flat_hidden = hidden_states.reshape(-1, hidden_dim)
@@ -1549,11 +1602,11 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
 
     def get_rope_index(
         self,
-        input_ids: chex.Array,
-        image_grid_thw: chex.Array | None = None,
-        video_grid_thw: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-    ) -> tuple[chex.Array, chex.Array]:
+        input_ids: Array,
+        image_grid_thw: Array | None = None,
+        video_grid_thw: Array | None = None,
+        attention_mask: Array | None = None,
+    ) -> tuple[Array, Array]:
         """Calculate 3D RoPE indices for multimodal inputs.
 
         Different from Qwen2-VL, Qwen3-VL-MoE uses timestamps rather than absolute
@@ -1582,12 +1635,184 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
             tokens_per_second=tokens_per_second,
         )
 
+    def compute_embedding(
+        self,
+        input_ids: Int[Array, "batch seq_len"],
+        *,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        pixel_values: Array | None = None,
+        pixel_values_videos: Array | None = None,
+        image_grid_thw: Array | None = None,
+        video_grid_thw: Array | None = None,
+        image_max_grid_size: int | None = None,
+        video_max_grid_size: int | None = None,
+        image_embeds: Array | None = None,
+        video_embeds: Array | None = None,
+        **kwargs,
+    ) -> Array:
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
+            inputs_embeds = super().compute_embedding(input_ids)
+
+        if input_ids is None and (image_embeds is not None or video_embeds is not None):
+            raise ValueError("`input_ids` must be provided to merge multimodal embeddings.")
+
+        if image_embeds is None and pixel_values is not None:
+            image_embeds_tuple, _deepstack_image_embeds = self.get_image_features(
+                pixel_values,
+                image_grid_thw,
+                image_max_grid_size,
+            )
+            image_embeds = jnp.concatenate(image_embeds_tuple, axis=0)
+
+        if image_embeds is not None:
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=image_embeds.astype(inputs_embeds.dtype),
+                placeholder_token_id=self.config.image_token_id,
+            )
+
+        if video_embeds is None and pixel_values_videos is not None:
+            video_embeds_tuple, _deepstack_video_embeds = self.get_video_features(
+                pixel_values_videos,
+                video_grid_thw,
+                video_max_grid_size,
+            )
+            video_embeds = jnp.concatenate(video_embeds_tuple, axis=0)
+
+        if video_embeds is not None:
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=video_embeds.astype(inputs_embeds.dtype),
+                placeholder_token_id=self.config.video_token_id,
+            )
+
+        return inputs_embeds
+
+    def compute_embedding_with_info(
+        self,
+        input_ids: Int[Array, "batch seq_len"],
+        *,
+        inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
+        pixel_values: Array | None = None,
+        pixel_values_videos: Array | None = None,
+        image_grid_thw: Array | None = None,
+        video_grid_thw: Array | None = None,
+        image_max_grid_size: int | None = None,
+        video_max_grid_size: int | None = None,
+        image_embeds: Array | None = None,
+        video_embeds: Array | None = None,
+        attention_mask: Array | None = None,
+        **kwargs,
+    ) -> tuple[Array, EmbeddingInfo]:
+        if input_ids is None:
+            raise ValueError("`input_ids` must be provided when calling `compute_embedding_with_info`.")
+
+        if inputs_embeds is None:
+            inputs_embeds = super().compute_embedding(input_ids)
+
+        text_embeds = inputs_embeds
+
+        deepstack_image_embeds = None
+        deepstack_video_embeds = None
+
+        if image_embeds is None and pixel_values is not None:
+            image_embeds_tuple, deepstack_image_embeds = self.get_image_features(
+                pixel_values,
+                image_grid_thw,
+                image_max_grid_size,
+            )
+            image_embeds = jnp.concatenate(image_embeds_tuple, axis=0)
+
+        if video_embeds is None and pixel_values_videos is not None:
+            video_embeds_tuple, deepstack_video_embeds = self.get_video_features(
+                pixel_values_videos,
+                video_grid_thw,
+                video_max_grid_size,
+            )
+            video_embeds = jnp.concatenate(video_embeds_tuple, axis=0)
+
+        if image_embeds is not None:
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=image_embeds.astype(inputs_embeds.dtype),
+                placeholder_token_id=self.config.image_token_id,
+            )
+
+        if video_embeds is not None:
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=video_embeds.astype(inputs_embeds.dtype),
+                placeholder_token_id=self.config.video_token_id,
+            )
+
+        visual_pos_masks = None
+        deepstack_visual_embeds = None
+
+        has_deepstack_images = deepstack_image_embeds is not None and len(deepstack_image_embeds) > 0
+        has_deepstack_videos = deepstack_video_embeds is not None and len(deepstack_video_embeds) > 0
+        if has_deepstack_images or has_deepstack_videos:
+            image_mask, video_mask = self.get_placeholder_mask(
+                input_ids,
+                inputs_embeds=text_embeds,
+                image_features=image_embeds.astype(text_embeds.dtype) if image_embeds is not None else None,
+                video_features=video_embeds.astype(text_embeds.dtype) if video_embeds is not None else None,
+            )
+
+            if image_embeds is not None and video_embeds is not None and has_deepstack_images and has_deepstack_videos:
+                visual_pos_masks = image_mask | video_mask
+                deepstack_visual_embeds = []
+
+                image_mask_joint = image_mask[visual_pos_masks]
+                video_mask_joint = video_mask[visual_pos_masks]
+
+                for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds, strict=False):
+                    embed_joint = jnp.zeros((image_mask_joint.shape[0], img_embed.shape[-1]), dtype=img_embed.dtype)
+
+                    img_idx = jnp.cumsum(image_mask_joint) - 1
+                    img_idx = jnp.where(image_mask_joint, img_idx, 0)
+                    embed_joint = jnp.where(image_mask_joint[:, None], img_embed[img_idx], embed_joint)
+
+                    vid_idx = jnp.cumsum(video_mask_joint) - 1
+                    vid_idx = jnp.where(video_mask_joint, vid_idx, 0)
+                    embed_joint = jnp.where(video_mask_joint[:, None], vid_embed[vid_idx], embed_joint)
+
+                    deepstack_visual_embeds.append(embed_joint)
+            elif image_embeds is not None and has_deepstack_images:
+                visual_pos_masks = image_mask
+                deepstack_visual_embeds = deepstack_image_embeds
+            elif video_embeds is not None and has_deepstack_videos:
+                visual_pos_masks = video_mask
+                deepstack_visual_embeds = deepstack_video_embeds
+
+        position_ids, rope_deltas = self.get_rope_index(
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            attention_mask=attention_mask,
+        )
+
+        info = EmbeddingInfo(
+            position_ids=position_ids,
+            rope_deltas=rope_deltas,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+            deepstack_image_embeds=deepstack_image_embeds,
+            deepstack_video_embeds=deepstack_video_embeds,
+        )
+        return inputs_embeds, info
+
     def get_video_features(
         self,
-        pixel_values_videos: chex.Array,
-        video_grid_thw: chex.Array | None = None,
+        pixel_values_videos: Array,
+        video_grid_thw: Array | None = None,
         video_max_grid_size: int | None = None,
-    ) -> tuple[tuple[chex.Array, ...], list[chex.Array]]:
+    ) -> tuple[tuple[Array, ...], list[Array]]:
         """Encodes videos into continuous embeddings.
 
         The deepstack visual features are also returned.
@@ -1605,10 +1830,10 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
 
     def get_image_features(
         self,
-        pixel_values: chex.Array,
-        image_grid_thw: chex.Array | None = None,
+        pixel_values: Array,
+        image_grid_thw: Array | None = None,
         image_max_grid_size: int | None = None,
-    ) -> tuple[tuple[chex.Array, ...], list[chex.Array]]:
+    ) -> tuple[tuple[Array, ...], list[Array]]:
         """Encodes images into continuous embeddings.
 
         The deepstack visual features are also returned.
@@ -1643,11 +1868,11 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
 
     def get_placeholder_mask(
         self,
-        input_ids: chex.Array | None,
-        inputs_embeds: chex.Array,
-        image_features: chex.Array | None = None,
-        video_features: chex.Array | None = None,
-    ) -> tuple[chex.Array, chex.Array]:
+        input_ids: Array | None,
+        inputs_embeds: Array,
+        image_features: Array | None = None,
+        video_features: Array | None = None,
+    ) -> tuple[Array, Array]:
         """Obtains multimodal placeholder mask from input_ids or inputs_embeds.
 
         Checks that the placeholder token count equals the length of multimodal features.
@@ -1704,29 +1929,81 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        pixel_values: chex.Array | None = None,
-        pixel_values_videos: chex.Array | None = None,
+        visual_pos_masks: Bool[Array, "batch seq_len"] | None = None,
+        deepstack_visual_embeds: list[Array] | None = None,
+        pixel_values: Array | None = None,
+        pixel_values_videos: Array | None = None,
         image_grid_thw: tuple | None = None,
         video_grid_thw: tuple | None = None,
         image_max_grid_size: int | None = None,
         video_max_grid_size: int | None = None,
-        cache_position: chex.Array | None = None,
+        cache_position: Array | None = None,
     ) -> BaseModelOutput:
+        """Forward pass for multimodal base model without LM head.
+
+        Orchestrates vision-language fusion by:
+        1. Processing images/videos through vision encoder
+        2. Merging visual embeddings into text token sequence
+        3. Computing 3D mRoPE position IDs
+        4. Running fused embeddings through text decoder with MoE
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Must contain
+                special tokens (image_token_id, video_token_id) at positions where visual
+                features should be inserted.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length, hidden_size).
+                If provided, input_ids must still be provided for multimodal merging.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) where True=valid, False=padding.
+            mask_info: Pre-computed mask information for attention. Auto-computed if None.
+            position_ids: 3D position IDs of shape (3, batch_size, sequence_length) for mRoPE.
+                Dimensions: [temporal, height, width]. Auto-computed from grid_thw if None.
+            mode: Runtime mode (MODE_TRAIN/DECODE/EVAL). Auto-detected from context if None.
+            past_key_values: Cached key-value states for autoregressive generation.
+            cache_metadata: Metadata for paged attention (sequence lengths, block tables).
+            output_attentions: Whether to return attention weights. Defaults to config.output_attentions.
+            output_hidden_states: Whether to return all layer hidden states. Defaults to config.output_hidden_states.
+            output_router_logits: Whether to return MoE router logits. Defaults to config.output_router_logits.
+            visual_pos_masks: Boolean mask of shape (batch_size, sequence_length) indicating visual token
+                positions. Auto-computed from pixel_values if not provided.
+            deepstack_visual_embeds: List of visual embeddings for injection at each decoder layer.
+                Auto-computed from pixel_values if not provided.
+            pixel_values: Image pixel values of shape (num_images, channels, height, width).
+            pixel_values_videos: Video pixel values of shape (num_videos, channels, frames, height, width).
+            image_grid_thw: List of (temporal, height, width) tuples for each image grid.
+            video_grid_thw: List of (temporal, height, width) tuples for each video grid.
+            image_max_grid_size: Maximum grid size for adaptive image resolution.
+            video_max_grid_size: Maximum grid size for adaptive video resolution.
+            cache_position: Cache position indices for generation (internal use).
+
+        Returns:
+            Qwen3VLMoeModelOutputWithPast containing:
+                - last_hidden_state: Final hidden states of shape (batch_size, sequence_length, hidden_size).
+                - past_key_values: Updated cache for next generation step.
+                - hidden_states: Tuple of all layer hidden states if output_hidden_states=True.
+                - attentions: Tuple of attention weights if output_attentions=True.
+                - rope_deltas: mRoPE position deltas of shape (batch_size, 1).
+                - router_logits: Tuple of MoE router logits if output_router_logits=True.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
+        precomputed_visual_pos_masks = visual_pos_masks
+        precomputed_deepstack_visual_embeds = deepstack_visual_embeds
+
         if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings()(input_ids)
+            inputs_embeds = self.compute_embedding(input_ids)
 
         image_mask = None
         video_mask = None
         deepstack_image_embeds = None
         deepstack_video_embeds = None
+        image_embeds = None
+        video_embeds = None
 
         if pixel_values is not None:
             image_embeds_tuple, deepstack_image_embeds = self.get_image_features(
@@ -1739,12 +2016,6 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
                 input_ids,
                 inputs_embeds=inputs_embeds,
                 image_features=image_embeds,
-            )
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                multimodal_embeddings=image_embeds,
-                placeholder_token_id=self.config.image_token_id,
             )
 
         if pixel_values_videos is not None:
@@ -1759,51 +2030,61 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
                 inputs_embeds=inputs_embeds,
                 video_features=video_embeds,
             )
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids=input_ids,
+
+        if image_embeds is not None or video_embeds is not None:
+            inputs_embeds = self.compute_embedding(
+                input_ids,
                 inputs_embeds=inputs_embeds,
-                multimodal_embeddings=video_embeds,
-                placeholder_token_id=self.config.video_token_id,
+                image_embeds=image_embeds,
+                video_embeds=video_embeds,
             )
 
-        visual_pos_masks = None
-        deepstack_visual_embeds = None
+        computed_visual_pos_masks = None
+        computed_deepstack_visual_embeds = None
 
         if image_mask is not None and video_mask is not None:
-            visual_pos_masks = image_mask | video_mask
-            deepstack_visual_embeds = []
+            computed_visual_pos_masks = image_mask | video_mask
+            computed_deepstack_visual_embeds = []
 
-            image_mask_joint = image_mask[visual_pos_masks]
-            video_mask_joint = video_mask[visual_pos_masks]
+            image_mask_joint = image_mask[computed_visual_pos_masks]
+            video_mask_joint = video_mask[computed_visual_pos_masks]
 
             for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds, strict=False):
-                embed_joint = jnp.zeros((visual_pos_masks.sum(), img_embed.shape[-1]), dtype=img_embed.dtype)
-                embed_joint = jnp.where(
-                    image_mask_joint[:, None],
-                    img_embed,
-                    embed_joint,
-                )
-                embed_joint = jnp.where(
-                    video_mask_joint[:, None],
-                    vid_embed,
-                    embed_joint,
-                )
-                deepstack_visual_embeds.append(embed_joint)
-        elif image_mask is not None:
-            visual_pos_masks = image_mask
-            deepstack_visual_embeds = deepstack_image_embeds
-        elif video_mask is not None:
-            visual_pos_masks = video_mask
-            deepstack_visual_embeds = deepstack_video_embeds
+                embed_joint = jnp.zeros((image_mask_joint.shape[0], img_embed.shape[-1]), dtype=img_embed.dtype)
 
+                img_idx = jnp.cumsum(image_mask_joint) - 1
+                img_idx = jnp.where(image_mask_joint, img_idx, 0)
+                embed_joint = jnp.where(image_mask_joint[:, None], img_embed[img_idx], embed_joint)
+
+                vid_idx = jnp.cumsum(video_mask_joint) - 1
+                vid_idx = jnp.where(video_mask_joint, vid_idx, 0)
+                embed_joint = jnp.where(video_mask_joint[:, None], vid_embed[vid_idx], embed_joint)
+
+                computed_deepstack_visual_embeds.append(embed_joint)
+        elif image_mask is not None:
+            computed_visual_pos_masks = image_mask
+            computed_deepstack_visual_embeds = deepstack_image_embeds
+        elif video_mask is not None:
+            computed_visual_pos_masks = video_mask
+            computed_deepstack_visual_embeds = deepstack_video_embeds
+
+        if computed_visual_pos_masks is not None:
+            visual_pos_masks = computed_visual_pos_masks
+            deepstack_visual_embeds = computed_deepstack_visual_embeds
+        else:
+            visual_pos_masks = precomputed_visual_pos_masks
+            deepstack_visual_embeds = precomputed_deepstack_visual_embeds
+            if deepstack_visual_embeds is not None and visual_pos_masks is None:
+                raise ValueError("`visual_pos_masks` must be provided when `deepstack_visual_embeds` is not None.")
+
+        rope_deltas = None
         if position_ids is None:
             position_ids, rope_deltas = self.get_rope_index(
                 input_ids,
-                image_grid_thw,
-                video_grid_thw,
+                image_grid_thw if pixel_values is not None else None,
+                video_grid_thw if pixel_values_videos is not None else None,
                 attention_mask=attention_mask,
             )
-            self.rope_deltas = rope_deltas
 
         outputs = self.language_model(
             input_ids=None,
@@ -1821,11 +2102,14 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
 
-        return BaseModelOutput(
+        router_logits = getattr(outputs, "router_logits", None) if output_router_logits else None
+        return Qwen3VLMoeModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            rope_deltas=rope_deltas,
+            router_logits=router_logits,
         )
 
     def get_lm_head(self):
@@ -1918,21 +2202,24 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
 
     def get_video_features(
         self,
-        pixel_values_videos: chex.Array,
-        video_grid_thw: chex.Array | None = None,
+        pixel_values_videos: Array,
+        video_grid_thw: Array | None = None,
         video_max_grid_size: int | None = None,
-    ) -> tuple[tuple[chex.Array, ...], list[chex.Array]]:
+    ) -> tuple[tuple[Array, ...], list[Array]]:
         """Delegates to self.model.get_video_features."""
         return self.model.get_video_features(pixel_values_videos, video_grid_thw, video_max_grid_size)
 
     def get_image_features(
         self,
-        pixel_values: chex.Array,
-        image_grid_thw: chex.Array | None = None,
+        pixel_values: Array,
+        image_grid_thw: Array | None = None,
         image_max_grid_size: int | None = None,
-    ) -> tuple[tuple[chex.Array, ...], list[chex.Array]]:
+    ) -> tuple[tuple[Array, ...], list[Array]]:
         """Delegates to self.model.get_image_features."""
         return self.model.get_image_features(pixel_values, image_grid_thw, image_max_grid_size)
+
+    def compute_embedding(self, input_ids, *args, **kwargs):
+        return self.model.compute_embedding(input_ids, *args, **kwargs)
 
     def __call__(
         self,
@@ -1941,48 +2228,84 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        pixel_values: chex.Array | None = None,
-        pixel_values_videos: chex.Array | None = None,
+        visual_pos_masks: Bool[Array, "batch seq_len"] | None = None,
+        deepstack_visual_embeds: list[Array] | None = None,
+        pixel_values: Array | None = None,
+        pixel_values_videos: Array | None = None,
         image_grid_thw: tuple | None = None,
         video_grid_thw: tuple | None = None,
-        cache_position: chex.Array | None = None,
+        cache_position: Array | None = None,
         image_max_grid_size: int | None = None,
         video_max_grid_size: int | None = None,
         **kwargs,
     ) -> VLMCausalLMOutput:
-        """Forward pass for the Qwen3-VL-MoE model.
+        """Forward pass for vision-language generation with MoE.
+
+        Processes multimodal inputs (text, images, videos) through the full model pipeline
+        to generate next-token predictions. Handles vision encoding, multimodal fusion,
+        3D RoPE positioning, MoE routing, and language modeling.
 
         Args:
-            input_ids: Input token IDs
-            attention_mask: Attention mask
-            mask_info: Mask information
-            position_ids: 3D position IDs for mRoPE (3, batch, seq_len)
-            mode: Runtime mode
-            past_key_values: Cached keys/values
-            cache_metadata: Metadata for paged attention
-            apply_lm_head: Whether to apply the LM head
-            inputs_embeds: Input embeddings
-            output_attentions: Whether to output attentions
-            output_hidden_states: Whether to output hidden states
-            output_router_logits: Whether to output router logits
-            pixel_values: Image pixel values
-            pixel_values_videos: Video pixel values
-            image_grid_thw: Image grid shape for mRoPE
-            video_grid_thw: Video grid shape for mRoPE
-            cache_position: Cache position for incremental decoding
-            image_max_grid_size: Maximum grid size for images
-            video_max_grid_size: Maximum grid size for videos
-            **kwargs: Additional arguments
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+                Special tokens: config.image_token_id for images, config.video_token_id for videos.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) where True indicates
+                valid tokens and False indicates padding. Defaults to all-ones if not provided.
+            mask_info: Pre-computed mask information for attention operations. If None, computed
+                automatically from input_ids and attention_mask.
+            position_ids: 3D position IDs for mRoPE of shape (3, batch_size, sequence_length).
+                Dimensions are [temporal, height, width]. Auto-computed from grid_thw if None.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_EVAL). Auto-detected if None based on
+                sequence_length and past_key_values presence.
+            past_key_values: Cached key-value states from previous forward passes for autoregressive
+                generation. Can be TransformerCache, RaggedPagesCache, or HybridCache.
+            cache_metadata: Metadata for paged attention operations (sequence lengths, block tables).
+            apply_lm_head: Whether to apply the language modeling head to get logits. Set to False
+                if you only need hidden states. Defaults to True.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length, hidden_size).
+                If provided, input_ids is ignored. Useful for custom embedding manipulation.
+            output_attentions: Whether to return attention weights from all layers. Defaults to
+                config.output_attentions.
+            output_hidden_states: Whether to return hidden states from all layers. Defaults to
+                config.output_hidden_states.
+            output_router_logits: Whether to return MoE router logits for auxiliary loss computation.
+                Defaults to config.text_config.output_router_logits.
+            visual_pos_masks: Pre-computed boolean mask of shape (batch_size, sequence_length) indicating
+                positions where visual tokens appear. Auto-computed if pixel_values provided.
+            deepstack_visual_embeds: Pre-computed list of visual embeddings for deepstack injection at
+                each decoder layer. Auto-computed if pixel_values provided.
+            pixel_values: Image pixel values of shape (num_images, channels, height, width).
+                Images are processed through vision encoder and merged at image_token_id positions.
+            pixel_values_videos: Video pixel values of shape (num_videos, channels, frames, height, width).
+                Videos are processed similarly to images but with temporal modeling.
+            image_grid_thw: List of (temporal, height, width) tuples for each image specifying the
+                grid structure after patch embedding. Required if pixel_values provided.
+            video_grid_thw: List of (temporal, height, width) tuples for each video. Required if
+                pixel_values_videos provided.
+            cache_position: Position indices for cached states during generation. Used internally.
+            image_max_grid_size: Maximum grid size for adaptive image resolution. If None, uses
+                original resolution.
+            video_max_grid_size: Maximum grid size for adaptive video resolution. If None, uses
+                original resolution.
+            **kwargs: Additional arguments (unused, for API compatibility).
 
         Returns:
-            VLMCausalLMOutput: Model outputs including logits, router_logits, and optional states
+            VLMCausalLMOutput containing:
+                - logits: Language modeling logits of shape (batch_size, sequence_length, vocab_size)
+                    if apply_lm_head=True, else None.
+                - past_key_values: Updated cache for next generation step.
+                - hidden_states: Tuple of hidden states from all layers if output_hidden_states=True.
+                - last_hidden_state: Final hidden state of shape (batch_size, sequence_length, hidden_size).
+                - attentions: Tuple of attention weights if output_attentions=True.
+                - rope_deltas: mRoPE position deltas of shape (batch_size, 1) for tracking position offsets.
+                - router_logits: Tuple of router logits from MoE layers if output_router_logits=True.
+                - image_hidden_states: None (reserved for future use).
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -2006,6 +2329,8 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
@@ -2028,15 +2353,13 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
             lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
             lm_logits = self.apply_logit_cap(lm_logits)
 
-        rope_deltas = getattr(self.model, "rope_deltas", None)
-
         return VLMCausalLMOutput(
             logits=lm_logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             last_hidden_state=hidden_states,
             attentions=outputs.attentions,
-            rope_deltas=rope_deltas,
+            rope_deltas=getattr(outputs, "rope_deltas", None),
             image_hidden_states=None,
             router_logits=getattr(outputs, "router_logits", None) if output_router_logits else None,
         )

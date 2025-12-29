@@ -38,6 +38,19 @@ class TestRWKV:
         )
         assert result.success, f"RWKV CAUSAL_LM failed: {result.error_message or result.comparison.details}"
 
+    def test_generation(self, rwkv_config, small_model_config):
+        """Test RWKV text generation."""
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="rwkv",
+            hf_class=transformers.RwkvForCausalLM,
+            task=ed.TaskType.CAUSAL_LM,
+            config=rwkv_config,
+            small_model_config=small_model_config,
+            max_new_tokens=16,
+        )
+        assert result.success, f"RWKV generation failed: {result.error_message}"
+
 
 if __name__ == "__main__":
     import pytest

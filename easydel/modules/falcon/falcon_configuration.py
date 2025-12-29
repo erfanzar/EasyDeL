@@ -38,7 +38,10 @@ class FalconConfig(EasyDeLBaseConfig):
         num_attention_heads (`int`, *optional*, defaults to 71):
             Number of attention heads for each attention layer in the Transformer encoder.
         num_ln_in_parallel_attn (`int`, *optional*):
-            The number of layer norms in the parallel attention layer.
+            Number of separate layer normalizations when using parallel attention. When set to 2
+            with `new_decoder_architecture=True`, uses independent LayerNorms for the attention
+            and MLP parallel paths (ln_attn and ln_mlp). When 1 or 0, uses a single shared
+            LayerNorm (input_layernorm).
         layer_norm_epsilon (`float`, *optional*, defaults to 1e-5):
             The epsilon used by the layer normalization layers.
         initializer_range (`float`, *optional*, defaults to 0.02):
@@ -54,13 +57,24 @@ class FalconConfig(EasyDeLBaseConfig):
             Number of key and value heads for each attention layer in the Transformer encoder. Will default to
             `num_attention_heads` if not set.
         alibi (`bool`, *optional*):
-            Whether to use alibi attention.
+            Whether to use ALiBi (Attention with Linear Biases) for positional encoding instead
+            of RoPE. ALiBi adds learned linear biases to attention scores based on token distances,
+            enabling better extrapolation to longer sequences than seen during training. When False,
+            uses standard Rotary Position Embeddings (RoPE).
         new_decoder_architecture (`bool`, *optional*):
-            Whether to use the new decoder architecture.
+            Whether to use the improved decoder architecture with refined layer normalization
+            placement. When enabled, supports dual layer norms for parallel attention/MLP paths
+            via `num_ln_in_parallel_attn`. This architecture was introduced in later Falcon variants
+            for better training stability.
         multi_query (`bool`, *optional*, defaults to `True`):
-            Whether to use multi-query attention.
+            Whether to use Multi-Query Attention (MQA). When True, all query heads share a single
+            set of key and value heads, dramatically reducing memory bandwidth and KV cache size
+            during inference while maintaining quality. This is more aggressive than GQA (grouped-query).
         parallel_attn (`bool`, *optional*, defaults to `True`):
-            Whether to use parallel attention.
+            Whether to compute attention and MLP layers in parallel rather than sequentially.
+            When True, reduces the effective depth of each layer and improves training throughput,
+            as attention and FFN can be computed simultaneously and their outputs summed. This is
+            different from the standard sequential attention-then-FFN architecture.
         bias (`bool`, *optional*, defaults to `False`):
             Whether to use bias in the linear layers.
         max_position_embeddings (`int`, *optional*, defaults to 2048):
@@ -117,40 +131,9 @@ class FalconConfig(EasyDeLBaseConfig):
         activation="gelu",
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
-        """Initialize a new FalconConfig instance.
-
-        Args:
-          vocab_size (int, optional): Size of the vocabulary. Defaults to 65024.
-          hidden_size (int, optional): Dimensionality of hidden layers. Defaults to 4544.
-          num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
-          num_attention_heads (int, optional): Number of attention heads. Defaults to 71.
-          num_ln_in_parallel_attn (int, optional): Number of layer norms in parallel attention. Defaults to None.
-          layer_norm_epsilon (float, optional): Epsilon for layer normalization. Defaults to 1e-5.
-          initializer_range (float, optional): Range for weight initialization. Defaults to 0.02.
-          use_cache (bool, optional): Whether to use KV cache. Defaults to True.
-          hidden_dropout (float, optional): Dropout probability for hidden layers. Defaults to 0.0.
-          attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
-          num_kv_heads (int, optional): Number of key/value heads. Defaults to None (same as num_attention_heads).
-          alibi (bool, optional): Whether to use alibi attention. Defaults to False.
-          new_decoder_architecture (bool, optional): Whether to use new decoder architecture. Defaults to False.
-          multi_query (bool, optional): Whether to use multi-query attention. Defaults to True.
-          parallel_attn (bool, optional): Whether to use parallel attention. Defaults to True.
-          bias (bool, optional): Whether to use bias in linear layers. Defaults to False.
-          max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
-          rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
-          rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
-          bos_token_id (int, optional): Beginning of sequence token ID. Defaults to 11.
-          eos_token_id (int, optional): End of sequence token ID. Defaults to 11.
-          ffn_hidden_size (int, optional): Size of feed-forward hidden layer. Defaults to None.
-          ff_factor (int, optional): Factor for feed-forward size. Defaults to None.
-          activation (str, optional): Activation function. Defaults to "gelu".
-          gradient_checkpointing (EasyDeLGradientCheckPointers, optional):
-            Checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
-          bits (int, optional): Quantization bits. Defaults to None.
-          **kwargs: Additional arguments.
-        """
         self.vocab_size = vocab_size
         n_embed = kwargs.pop("n_embed", None)
         self.hidden_size = hidden_size if n_embed is None else n_embed
@@ -188,6 +171,9 @@ class FalconConfig(EasyDeLBaseConfig):
         if ff_factor is None:
             ff_factor = ffn_hidden_size // hidden_size
         self.ff_factor = ff_factor
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, bits=bits, **kwargs)
 
     @property

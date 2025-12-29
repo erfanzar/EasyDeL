@@ -20,7 +20,7 @@ Lightning attention combines keys and values into a single tensor,
 reducing memory bandwidth requirements.
 
 Key Components:
-    - LightningCacheMetaData: Configuration for Lightning cache
+    - LightningCacheConfig: Configuration for Lightning cache
     - LightningCacheView: Per-layer Lightning cache storage
     - LightningCache: Multi-layer Lightning cache container
     - LightningMetadata: Runtime metadata (placeholder)
@@ -32,7 +32,7 @@ Features:
     - Supports standard transformer operations
 
 Example:
-    >>> metadata = LightningCacheMetaData.create(
+    >>> metadata = LightningCacheConfig.create(
     ...     partition_axis=partition_axis,
     ...     batch_size=2,
     ...     num_heads=16,
@@ -56,7 +56,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 
-from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView, BaseRunTimeMetadata
+from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, BaseRunTimeMetadata
 
 if tp.TYPE_CHECKING:
     from easydel.layers.quantization.quantizers import EasyQuantizer
@@ -65,7 +65,7 @@ else:
 
 
 @auto_pytree
-class LightningCacheMetaData(BaseCacheMetadata):
+class LightningCacheConfig(BaseCacheConfig):
     """Metadata configuration for Lightning attention cache.
 
     Stores configuration parameters specific to Lightning attention,
@@ -111,7 +111,7 @@ class LightningCacheMetaData(BaseCacheMetadata):
         value_heads: int | None = None,
         key_dim: int | None = None,
         value_dim: int | None = None,
-    ) -> LightningCacheMetaData:
+    ) -> LightningCacheConfig:
         """Create and validate Lightning cache metadata.
 
         Factory method for creating Lightning cache configuration.
@@ -136,7 +136,7 @@ class LightningCacheMetaData(BaseCacheMetadata):
                 Defaults to None (same as head_dim).
 
         Returns:
-            LightningCacheMetaData: Configured metadata instance.
+            LightningCacheConfig: Configured metadata instance.
 
         Note:
             Lightning attention's unified representation means some
@@ -165,7 +165,7 @@ class LightningCacheView(BaseCacheView):
     Attributes:
         key_value (cx.Array | ImplicitArray): Unified key-value tensor.
             Lightning's special representation combining K and V.
-        metadata (LightningCacheMetaData): Static cache configuration.
+        metadata (LightningCacheConfig): Static cache configuration.
         layer_index (int | None): Index of this layer in the model.
 
     Note:
@@ -174,11 +174,18 @@ class LightningCacheView(BaseCacheView):
     """
 
     key_value: Float[Array, "batch seq_len num_heads head_dim"] | ImplicitArray | None
-    metadata: LightningCacheMetaData
+    metadata: LightningCacheConfig
     layer_index: int | None = field(pytree_node=False, default=None)
 
     @classmethod
-    def init(cls, metadata: LightningCacheMetaData, layer_index: int | None = None) -> LightningCacheView:
+    def init(
+        cls,
+        config: LightningCacheConfig,
+        layer_index: int | None = None,
+        *,
+        dtype: jnp.dtype = jnp.bfloat16,
+        partition_specs: PartitionSpec | None = None,
+    ) -> LightningCacheView:
         """Initialize a Lightning cache view for a single layer.
 
         Creates a cache view with placeholder for unified KV tensor.
@@ -186,15 +193,17 @@ class LightningCacheView(BaseCacheView):
         for dynamic shapes.
 
         Args:
-            metadata (LightningCacheMetaData): Cache configuration.
-            layer_index (int | None): Layer index in the model.
+            config: Cache configuration.
+            layer_index: Layer index in the model.
+            dtype: Data type for cache tensors (unused, allocation is lazy).
+            partition_specs: Sharding specification (unused, uses config.partition_axis).
 
         Returns:
             LightningCacheView: Initialized view with None placeholder.
         """
         return cls(
             key_value=None,
-            metadata=metadata,
+            metadata=config,
             layer_index=layer_index,
         )
 
@@ -344,7 +353,8 @@ class LightningCache(BaseCache):
     def init_cache(
         cls,
         num_hidden_layers: int,
-        metadata: LightningCacheMetaData,
+        config: LightningCacheConfig,
+        dtype: jnp.dtype | None = None,
     ) -> LightningCache:
         """Initialize Lightning cache for all model layers.
 
@@ -353,15 +363,16 @@ class LightningCache(BaseCache):
         allocated on first use.
 
         Args:
-            num_hidden_layers (int): Number of layers in the model.
-            metadata (LightningCacheMetaData): Cache configuration.
+            num_hidden_layers: Number of layers in the model.
+            config: Cache configuration.
+            dtype: Data type for cache tensors (unused, allocation is lazy).
 
         Returns:
             LightningCache: Initialized cache with views for all layers.
         """
         return cls(
             views=[
-                LightningCacheView.init(metadata=metadata, layer_index=layer_index)
+                LightningCacheView.init(config=config, layer_index=layer_index, dtype=dtype or jnp.bfloat16)
                 for layer_index in range(num_hidden_layers)
             ]
         )
@@ -383,6 +394,97 @@ class LightningCache(BaseCache):
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(\n  " + "\n  ".join(str(view) for view in self.views) + "\n)"
+
+    def to_pure(self) -> tuple[list[dict[str, tp.Any]], LightningCacheConfig | None]:
+        """Convert cache to pure Python data for serialization.
+
+        Returns:
+            Tuple of (cache_data, metadata) where cache_data is a list of dicts
+            containing serialized view data and metadata is the shared LightningCacheConfig.
+        """
+        cache_data: list[dict[str, tp.Any]] = []
+        metadata: LightningCacheConfig | None = None
+
+        for view in self.views:
+            if view is None:
+                cache_data.append({"is_none": True})
+            else:
+                if metadata is None:
+                    metadata = view.metadata
+                cache_data.append(
+                    {
+                        "is_none": False,
+                        "key_value": view.key_value,
+                        "layer_index": view.layer_index,
+                    }
+                )
+
+        return cache_data, metadata
+
+    @classmethod
+    def from_pure(
+        cls,
+        cache_data: list[dict[str, tp.Any]],
+        metadata: LightningCacheConfig | None = None,
+    ) -> "LightningCache":
+        """Reconstruct cache from pure Python data.
+
+        Args:
+            cache_data: List of dicts containing serialized view data.
+            metadata: Shared LightningCacheConfig for reconstruction.
+
+        Returns:
+            Reconstructed LightningCache instance.
+        """
+        views: list[LightningCacheView | None] = []
+
+        for layer_data in cache_data:
+            if layer_data.get("is_none", False):
+                views.append(None)
+            else:
+                view = LightningCacheView(
+                    key_value=layer_data["key_value"],
+                    metadata=metadata,
+                    layer_index=layer_data.get("layer_index"),
+                )
+                views.append(view)
+
+        return cls(views=views)
+
+    def insert(
+        self,
+        other: "LightningCache",
+        slot: int,
+    ) -> "LightningCache":
+        """Insert another cache's contents at a specific batch slot.
+
+        Args:
+            other: Source LightningCache to copy from (typically batch size 1).
+            slot: Batch index to insert at.
+
+        Returns:
+            New LightningCache with the inserted content.
+        """
+        new_views: list[LightningCacheView | None] = []
+
+        for self_view, other_view in zip(self.views, other.views, strict=False):
+            if self_view is None or other_view is None:
+                new_views.append(self_view)
+            else:
+                # Insert key_value at the specified slot
+                if self_view.key_value is not None and other_view.key_value is not None:
+                    new_key_value = self_view.key_value.at[slot].set(other_view.key_value[0])
+                else:
+                    new_key_value = self_view.key_value
+
+                new_view = LightningCacheView(
+                    key_value=new_key_value,
+                    metadata=self_view.metadata,
+                    layer_index=self_view.layer_index,
+                )
+                new_views.append(new_view)
+
+        return LightningCache(views=new_views)
 
     __str__ = __repr__
 

@@ -188,6 +188,7 @@ class DeepseekV2Config(EasyDeLBaseConfig):
         scan_mlp_chunk_size: int = 1024,
         bits: int | None = None,
         rope_scaling: dict[str, str | float] | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         """Initialize a new DeepseekV2Config instance.
@@ -282,6 +283,9 @@ class DeepseekV2Config(EasyDeLBaseConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.gradient_checkpointing = gradient_checkpointing
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -294,12 +298,7 @@ class DeepseekV2Config(EasyDeLBaseConfig):
         )
 
     def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
-        Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
-        """
-        pmag = self.partition_manager  # Handles resolving strategies
+        pmag = self.partition_manager
         return (
             (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
             (r"self_attn/q_proj/kernel", pmag.resolve(ColumnWise)),

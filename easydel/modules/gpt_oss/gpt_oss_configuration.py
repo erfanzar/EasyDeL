@@ -104,33 +104,6 @@ class GptOssConfig(EasyDeLBaseConfig):
         mlp_activations_limit: float = 7.0,
         **kwargs,
     ):
-        """Initialize GPT-OSS configuration.
-
-        Args:
-            num_hidden_layers: Number of transformer layers
-            num_local_experts: Number of expert networks per MoE layer
-            vocab_size: Size of the vocabulary
-            hidden_size: Dimension of hidden representations
-            intermediate_size: Dimension of MLP intermediate layer
-            head_dim: Dimension of each attention head
-            num_attention_heads: Number of attention heads
-            num_key_value_heads: Number of key-value heads for grouped-query attention
-            sliding_window: Size of sliding window for local attention
-            rope_theta: Base frequency for rotary position embeddings
-            tie_word_embeddings: Whether to tie input and output embeddings
-            hidden_act: Activation function name for MLP layers
-            initializer_range: Standard deviation for weight initialization
-            max_position_embeddings: Maximum sequence length the model can handle
-            rms_norm_eps: Epsilon value for RMS normalization layers
-            rope_scaling: Dictionary configuring RoPE scaling (e.g., YARN parameters)
-            attention_dropout: Dropout probability for attention weights
-            num_experts_per_tok: Number of experts each token is routed to
-            router_aux_loss_coef: Coefficient for the load balancing auxiliary loss
-            output_router_logits: Whether to output router logits for analysis
-            use_cache: Whether to use key-value caching for inference
-            layer_types: List specifying attention type for each layer
-            **kwargs: Additional configuration parameters
-        """
         if rope_scaling is None:
             rope_scaling = {"rope_type": "yarn", "factor": 32.0, "beta_fast": 32.0, "beta_slow": 1.0, "truncate": False}
         self.vocab_size = vocab_size

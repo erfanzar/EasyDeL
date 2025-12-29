@@ -17,7 +17,6 @@ import functools
 import itertools
 import typing as tp
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer.pytree import auto_pytree
@@ -26,14 +25,18 @@ from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
-from easydel.layers.caching import MambaCache, MambaCacheMetaData, MambaCacheView
+from easydel.layers.base_modules import BaseCausalLMModule
+from easydel.layers.caching import RecurrentCache, RecurrentCacheConfig, RecurrentCacheView
 from easydel.layers.linear import ColumnParallelLinear
 from easydel.layers.norms import RMSNorm as MambaRMSNorm
+from easydel.layers.operations import OperationMetadata
+from easydel.layers.operations.modules import SSM1Op
 
 from .mamba_configuration import MambaConfig as MambaConfig
 
@@ -47,19 +50,19 @@ def init_to_value(x, dtype):
 class MambaOutput(BaseModelOutput):
     """Output container for the base Mamba model with cached state."""
 
-    last_hidden_state: chex.Array = None
-    cache: MambaCache | None = None
-    hidden_states: tuple[chex.Array] | None = None
+    last_hidden_state: Array = None
+    cache: RecurrentCache | None = None
+    hidden_states: tuple[Array] | None = None
 
 
 @auto_pytree
 class MambaCausalLMOutput(BaseModelOutput):
     """Causal LM output including logits and cache for Mamba decoding."""
 
-    logits: chex.Array = None
-    cache: MambaCache | None = None
-    hidden_states: tuple[chex.Array] | None = None
-    last_hidden_state: chex.Array | None = None
+    logits: Array = None
+    cache: RecurrentCache | None = None
+    hidden_states: tuple[Array] | None = None
+    last_hidden_state: Array | None = None
 
 
 _T = tp.TypeVar("_T")
@@ -202,29 +205,31 @@ class MambaMixer(nn.Module):
             init_kernel_dt = nn.initializers.constant(dt_init_std, dtype=param_dtype)
         elif config.time_step_init_scheme == "random":
 
-            def init_kernel_dt(key, _shape, _dtype):
+            def init_kernel_dt(key, shape, dtype):
                 return (
-                    jax.nn.initializers.uniform(scale=dt_init_std * 2, dtype=param_dtype)(key, _shape, _dtype)
+                    jax.nn.initializers.uniform(scale=dt_init_std * 2, dtype=param_dtype)(key, shape, dtype)
                     - dt_init_std
                 )
 
         else:
             init_kernel_dt = nn.initializers.normal(config.initializer_range, param_dtype)
 
-        dt = jax.lax.clamp(
-            config.time_step_floor,
-            jnp.exp(
-                jax.random.normal(
-                    key=rngs.params(),
-                    shape=(intermediate_size,),
-                    dtype=jnp.float32,
-                )
-                * (jnp.log(config.time_step_max) - jnp.log(config.time_step_min))
-                + jnp.log(config.time_step_min)
-            ),
-            config.time_step_max,
-        )
-        inv_dt = dt + jnp.log(-jnp.expm1(-dt))
+        def init_bias_dt(key, shape, dtype):
+            dt = jax.lax.clamp(
+                config.time_step_floor,
+                jnp.exp(
+                    jax.random.normal(
+                        key=key,
+                        shape=shape,
+                        dtype=jnp.float32,
+                    )
+                    * (jnp.log(config.time_step_max) - jnp.log(config.time_step_min))
+                    + jnp.log(config.time_step_min)
+                ),
+                config.time_step_max,
+            )
+            inv_dt = dt + jnp.log(-jnp.expm1(-dt))
+            return inv_dt.astype(dtype)
 
         linear_class = functools.partial(
             ColumnParallelLinear,
@@ -250,7 +255,7 @@ class MambaMixer(nn.Module):
             intermediate_size,
             use_bias=True,
             kernel_init=init_kernel_dt,
-            bias_init=lambda _, shape, dtype: inv_dt,
+            bias_init=init_bias_dt,
             rngs=rngs,
         )
         self.out_proj = linear_class(
@@ -259,14 +264,14 @@ class MambaMixer(nn.Module):
             use_bias=config.use_bias,
             rngs=rngs,
         )
-        A = repeat(jnp.arange(1, ssm_state_size + 1), "n -> d n", d=intermediate_size)
+        A = repeat(jnp.arange(1, ssm_state_size + 1, dtype=jnp.float32), "n -> d n", d=intermediate_size)
 
         self.A_log = ArrayParam.bound(
             shape=A.shape,
-            dtype=A.dtype,
+            dtype=param_dtype,
             init_method="zeros",
             key=None,
-            value=jnp.log(A),
+            value=jnp.log(A).astype(param_dtype),
         )
         self.D = ArrayParam.bound(
             shape=(intermediate_size,),
@@ -280,61 +285,65 @@ class MambaMixer(nn.Module):
         self.conv_kernel_size = conv_kernel_size
         self.time_step_rank = time_step_rank
 
+        metadata = OperationMetadata(
+            runtime_dtype=dtype,
+            runtime_softmax_dtype=jnp.float32,
+            base_config=config,
+        )
+        self.ssm_op = SSM1Op(metadata)
+
     def __call__(
         self,
-        input_states: chex.Array,
-        cache: MambaCacheView | None = None,
-        position_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        input_states: Array,
+        cache: RecurrentCacheView | None = None,
+        position_ids: Array | None = None,
+        attention_mask: Array | None = None,
     ):
         batch_size, seq_len, _ = input_states.shape
         dtype = input_states.dtype
 
-        # 1. Gated MLP's linear projection
         projected_states = checkpoint_name(self.in_proj(input_states), name="ssm_input_proj")
         projected_states = jnp.swapaxes(projected_states, 2, 1)
-        # [batch, 2 * intermediate_size, seq_len]
         hidden_states, gate = jnp.split(projected_states, 2, axis=1)
 
         if attention_mask is not None:
             hidden_states = hidden_states * jnp.expand_dims(attention_mask, 1)
 
-        # 2. Convolution sequence transformation
-        if cache is not None:
-            ssm_state = jnp.array(cache.ssm_states)
-
-            if position_ids.shape[0] == self.conv_kernel_size:
-                conv_state = jnp.pad(
-                    hidden_states,
-                    (
-                        (0, 0),
-                        (0, 0),
-                        (self.conv_kernel_size - hidden_states.shape[-1], 0),
-                    ),
-                )
-
-                cache.update_conv_state(conv_state, position_ids)
-                hidden_states = self.act(
-                    self.conv1d(hidden_states)[..., :seq_len]
-                )  # [batch, intermediate_size, seq_len]
-            else:
-                conv_state = cache.update_conv_state(hidden_states, position_ids)
-                hidden_states = jnp.sum(conv_state * self.conv1d.weight[:, 0, :], axis=-1)
-                if self.use_conv_bias:
-                    hidden_states = hidden_states + self.conv1d.bias
-                hidden_states = jnp.expand_dims(
-                    self.act(hidden_states).astype(dtype), -1
-                )  # [batch, intermediate_size, 1]
+        cache_view = cache
+        if cache is not None and cache.recurrent_state is not None:
+            ssm_state = cache.recurrent_state
         else:
             ssm_state = jnp.zeros((batch_size, self.intermediate_size, self.ssm_state_size), dtype=dtype)
-            hidden_states = self.act(self.conv1d(hidden_states)[..., :seq_len])
-            # [batch, intermediate_size, seq_len]
+
+        is_inference = seq_len == 1 and cache is not None
+
+        if is_inference and cache is not None and cache.conv_state is not None:
+            new_hidden = hidden_states[:, :, 0]
+            conv_state, _, cache_view = cache.concatenate_to_cache(conv_state=new_hidden)
+
+            kernel = jnp.asarray(jnp.swapaxes(self.conv1d.kernel.value, 0, 2), dtype=dtype)
+            kernel = kernel[:, 0, :]
+            hidden_states = jnp.sum(conv_state * kernel[None, :, :], axis=-1)
+            if self.conv1d.use_bias:
+                hidden_states = hidden_states + jnp.asarray(self.conv1d.bias.value, dtype=dtype)[None, :]
+            hidden_states = jnp.expand_dims(self.act(hidden_states).astype(dtype), -1)
+        else:
+            conv_input = hidden_states
+            conv_out = self.conv1d(conv_input)[..., :seq_len]
+            hidden_states = self.act(conv_out).astype(dtype)
+
+            if cache is not None:
+                if seq_len >= self.conv_kernel_size:
+                    new_conv_state = conv_input[:, :, -self.conv_kernel_size :]
+                else:
+                    pad_width = self.conv_kernel_size - seq_len
+                    new_conv_state = jnp.pad(conv_input, ((0, 0), (0, 0), (pad_width, 0)))
+
+                cache_view = cache.replace(conv_state=new_conv_state) if cache_view is not None else cache_view
 
         if attention_mask is not None:
             hidden_states = hidden_states * jnp.expand_dims(attention_mask, 1)
 
-        # 3. State Space Model sequence transformation
-        # 3.a. Selection
         ssm_parameters = checkpoint_name(self.x_proj(jnp.swapaxes(hidden_states, 2, 1)), name="ssm_x_proj")
         time_step, B, C = jnp.split(
             ssm_parameters,
@@ -344,50 +353,32 @@ class MambaMixer(nn.Module):
             ],
             axis=-1,
         )
+
         discrete_time_step = checkpoint_name(self.dt_proj(time_step), name="ssm_dt_proj")
-        # [batch, seq_len, intermediate_size]
-        discrete_time_step = jnp.swapaxes(jax.nn.softplus(discrete_time_step), 2, 1)
-        # [batch, intermediate_size, seq_len]
+        discrete_time_step = jax.nn.softplus(discrete_time_step)
 
-        # 3.b. Discretization
-        A = -jnp.exp(self.A_log.value.astype(jnp.float32))
-        # [intermediate_size, ssm_state_size]
+        hidden_states_t = jnp.swapaxes(hidden_states, 1, 2)
+        gate_t = jnp.swapaxes(gate, 1, 2)
 
-        modified_a = jnp.expand_dims(jnp.expand_dims(A, axis=0), axis=2)
-        modified_time_step = jnp.expand_dims(discrete_time_step, axis=-1)
+        ssm_output = self.ssm_op(
+            hidden_states=hidden_states_t,
+            A=self.A_log.value,
+            B=B,
+            C=C,
+            D=self.D.value,
+            discrete_time_step=discrete_time_step,
+            gate=gate_t,
+            ssm_state=ssm_state,
+            activation=self.activation,
+        )
 
-        discrete_A = jnp.exp(modified_a * modified_time_step)
-        discrete_B = modified_time_step * B[:, jnp.newaxis, :, :].astype(jnp.float32)
+        scan_output = jnp.swapaxes(ssm_output.attention_outputs, 1, 2)
 
-        # [batch, intermediate_size, seq_len, ssm_state_size]
+        if cache_view is not None:
+            cache_view = cache_view.replace(recurrent_state=ssm_output.ssm_state)
 
-        deltaB_u = discrete_B * hidden_states[:, :, :, jnp.newaxis].astype(jnp.float32)
-        scan_outputs = []
-
-        for i in range(seq_len):
-            ssm_state = discrete_A[:, :, i, :] * ssm_state + deltaB_u[:, :, i, :]
-            # [batch, intermediate_size, 1, ssm_state]
-
-            scan_output = jax.lax.batch_matmul(
-                ssm_state.astype(dtype),
-                jnp.expand_dims(C[:, i, :], -1),
-            )
-
-            # [batch, intermediate_size, 1]
-
-            scan_outputs.append(scan_output[:, :, 0])
-
-        scan_output = jnp.stack(scan_outputs, axis=-1)
-
-        scan_output = scan_output + (hidden_states * self.D[None, :, None])
-        scan_output = scan_output * self.act(gate)
-
-        if cache is not None:
-            cache.ssm_states = ssm_state
-
-        # 4. Final linear projection
         contextualized_states = checkpoint_name(self.out_proj(jnp.swapaxes(scan_output, 2, 1)), name="ssm_output_proj")
-        return contextualized_states, cache
+        return contextualized_states, cache_view
 
 
 class MambaBlock(nn.Module):
@@ -432,11 +423,11 @@ class MambaBlock(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        cache: MambaCacheView | None = None,
-        position_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-    ) -> chex.Array:
+        hidden_states: Array,
+        cache: RecurrentCacheView | None = None,
+        position_ids: Array | None = None,
+        attention_mask: Array | None = None,
+    ) -> Array:
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
         if self.residual_in_fp32:
@@ -498,11 +489,11 @@ class MambaModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        cache: MambaCache | None = None,
-        position_ids: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        input_ids: Array | None = None,
+        inputs_embeds: Array | None = None,
+        cache: RecurrentCache | None = None,
+        position_ids: Array | None = None,
+        attention_mask: Array | None = None,
         output_hidden_states: bool | None = None,
         **kwargs,
     ) -> tuple | MambaOutput:
@@ -535,7 +526,7 @@ class MambaModel(EasyDeLBaseModule):
         if position_ids is None:
             position_ids = mask_info.q_position_ids
         if cache is None:
-            cache = MambaCache.init_empty(len(self.layers))
+            cache = RecurrentCache.init_empty(len(self.layers))
 
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
@@ -559,33 +550,6 @@ class MambaModel(EasyDeLBaseModule):
             last_hidden_state=hidden_states,
             cache=cache,
             hidden_states=all_hidden_states,
-        )
-
-    def init_cache(
-        self,
-        batch_size: int,
-        max_length: int,
-        starts: int | None = None,
-        shardings: dict | None = None,
-        pad_token_id: int | None = None,
-    ):
-        shardings = shardings or dict()
-        return MambaCache.init_cache(
-            dtype=self.dtype,
-            partition_specs=jax.sharding.PartitionSpec(
-                self.config.partition_axis.batch_axis,
-                self.config.partition_axis.key_sequence_axis,
-                self.config.partition_axis.head_axis,
-                self.config.partition_axis.attention_dim_axis,
-            ),
-            metadata=MambaCacheMetaData.create(
-                num_hidden_layers=self.config.num_hidden_layers,
-                partition_axis=self.config.partition_axis,
-                batch_size=batch_size,
-                sequence_length=max_length,
-                num_heads=self.config.num_key_value_heads,
-                head_dim=self.config.head_dim,
-            ),
         )
 
     def get_encoder(self):
@@ -616,8 +580,12 @@ class MambaModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=MambaConfig, model_type="mamba")
-class MambaForCausalLM(EasyDeLBaseModule):
+class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):
     """Causal language model head on top of the Mamba backbone."""
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "mamba"
+    _config_class = MambaConfig
 
     def __init__(
         self,
@@ -630,43 +598,23 @@ class MambaForCausalLM(EasyDeLBaseModule):
     ):
         super().__init__(
             config=config,
+            base_model_class=MambaModel,
+            base_model_name="backbone",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.backbone = MambaModel(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            lm_head_bias=False,
         )
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        cache: MambaCache | None = None,
-        position_ids: chex.Array | None = None,
+        input_ids: Array | None = None,
+        inputs_embeds: Array | None = None,
+        cache: RecurrentCache | None = None,
+        position_ids: Array | None = None,
         apply_lm_head: bool = True,
-        attention_mask: chex.Array | None = None,
+        attention_mask: Array | None = None,
         output_hidden_states: bool | None = None,
         **kwargs,
     ) -> tuple | MambaCausalLMOutput:
@@ -707,33 +655,29 @@ class MambaForCausalLM(EasyDeLBaseModule):
         starts: int | None = None,
         **kwargs,
     ):
-        return self.prepare_inputs_for_call(**{"cache": kwargs.get("cache", None)})
+        from eformer.escale import PartitionAxis
 
-    def init_cache(
-        self,
-        batch_size: int,
-        max_length: int,
-        starts: int | None = None,
-        shardings: dict | None = None,
-        pad_token_id: int | None = None,
-    ):
-        shardings = shardings or dict()
-        return MambaCache.init_cache(
-            dtype=self.dtype,
-            partition_specs=jax.sharding.PartitionSpec(
-                self.config.partition_axis.batch_axis,
-                self.config.partition_axis.key_sequence_axis,
-                self.config.partition_axis.head_axis,
-                self.config.partition_axis.attention_dim_axis,
-            ),
-            metadata=MambaCacheMetaData.create(
+        from easydel.layers.caching import RecurrentCache
+
+        cache = kwargs.get("cache", None)
+        attention_mask = kwargs.get("attention_mask", None)
+        position_ids = kwargs.get("position_ids", None)
+        if cache is None:
+            partition_axis = getattr(self.config, "partition_axis", None) or PartitionAxis()
+            cache_config = RecurrentCacheConfig.create_for_mamba(
                 num_hidden_layers=self.config.num_hidden_layers,
-                partition_axis=self.config.partition_axis,
-                batch_size=batch_size,
-                sequence_length=max_length,
-                num_heads=self.config.num_key_value_heads,
-                head_dim=self.config.head_dim,
-            ),
+                partition_axis=partition_axis,
+                batch_size=int(input_ids.shape[0]),
+                intermediate_size=int(self.config.intermediate_size),
+                ssm_state_size=int(self.config.state_size),
+                conv_kernel_size=int(self.config.conv_kernel),
+            )
+            cache = RecurrentCache.init_cache(cache_config, dtype=self.dtype)
+
+        return self.prepare_inputs_for_call(
+            cache=cache,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
         )
 
     def get_encoder(self):

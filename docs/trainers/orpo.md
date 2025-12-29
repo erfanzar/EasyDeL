@@ -96,24 +96,33 @@ trainer.train()
 
 ## Command Line Training
 
-You can run ORPO training directly from the command line:
+The legacy `easydel.scripts.finetune.*` entrypoints have been removed in favor of the unified YAML runner.
 
 ```bash
-python -m easydel.scripts.finetune.orpo \
-  --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --dataset_name trl-lib/ultrafeedback_binarized \
-  --dataset_split "train" \
-  --attn_mechanism vanilla \
-  --beta 0.12 \
-  --max_length 2048 \
-  --max_prompt_length 1024 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --learning_rate_end 6e-7 \
-  --num_train_epochs 3 \
-  --do_last_save \
-  --save_steps 1000 \
-  --use_wandb
+python -m easydel.scripts.elarge --config orpo.yaml
+```
+
+Example `orpo.yaml`:
+
+```yaml
+config:
+  model:
+    name_or_path: meta-llama/Llama-3.1-8B-Instruct
+  mixture:
+    informs:
+      - type: hf
+        data_files: trl-lib/ultrafeedback_binarized
+        split: train
+  trainer:
+    trainer_type: orpo
+    beta: 0.12
+    max_length: 2048
+    max_prompt_length: 1024
+    total_batch_size: 16
+    learning_rate: 1e-6
+    num_train_epochs: 3
+actions:
+  - train
 ```
 
 ## Dataset Format

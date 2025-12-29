@@ -13,9 +13,7 @@
 # limitations under the License.
 
 import typing as tp
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -39,7 +37,7 @@ LOSS_FN_VARIENTS = tp.Literal[
 
 
 @Registry.register("trainer-arguments", "dpo")
-@auto_pytree
+@dataclass
 class DPOConfig(TrainingArguments):
     """Configuration class for Direct Preference Optimization (DPO) training.
 
@@ -197,14 +195,13 @@ class DPOConfig(TrainingArguments):
         metadata={"help": "Additional tools for training process."},
     )
 
-    def __post_init__(self):
+    def __post_init__(self, max_sequence_length: int | None):
         """Post-initialization processing to derive dependent parameters."""
+        self._handle_deprecated_max_sequence_length(max_sequence_length)
         if self.max_completion_length is None:
             self.max_completion_length = self.max_length - self.max_prompt_length
-        # chosen + rejected sequences
-        self.max_sequence_length = self.max_length * 2
         # Call the post_init of the parent class if it exists. Important for inheritance
         if hasattr(super(), "__post_init__"):
-            super().__post_init__()
+            super().__post_init__(max_sequence_length=None)
 
     __hash__ = hash_fn

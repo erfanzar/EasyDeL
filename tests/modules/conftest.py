@@ -26,12 +26,13 @@ def test_seed():
 @pytest.fixture(scope="session")
 def small_model_config():
     """Standard small configuration for fast model testing."""
+    device_count = jax.device_count()
+    tp_dim = 2 if device_count >= 2 and device_count % 2 == 0 else 1
     return {
         "batch_size": 2,
         "vocab_size": 32000,
         "hidden_size": 128,
         "intermediate_size": 256,
-        # Reduce layers for faster MoE debugging.
         "num_hidden_layers": 2,
         "num_attention_heads": 4,
         "num_key_value_heads": 2,
@@ -42,9 +43,9 @@ def small_model_config():
         "layer_norm_eps": 1e-6,
         "initializer_range": 0.02,
         "use_cache": True,
-        # "moe_method": "standard_moe",
         "moe_method": "fused_moe",
-        "sharding_axis_dims": (1, 1, -1, 2, 1),
+        # Keep tensor parallelism when possible, but stay valid on single-device (CPU) setups.
+        "sharding_axis_dims": (1, 1, -1, tp_dim, 1),
         "use_expert_tensor_mode": False,
         "bos_token_id": 0,
         "eos_token_id": 1,

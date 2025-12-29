@@ -77,6 +77,7 @@ class PageTable:
         max_num_reqs: int,
         max_num_pages_per_req: int,
         max_num_batched_tokens: int,
+        sharding: jax.sharding.Sharding | None = None,
     ):
         """Initialize a PageTable with specified capacity.
 
@@ -84,6 +85,7 @@ class PageTable:
             max_num_reqs: Maximum number of concurrent requests.
             max_num_pages_per_req: Maximum pages per request.
             max_num_batched_tokens: Maximum tokens in a batch.
+            sharding: Optional sharding to use for the device page table.
         """
         self.max_num_reqs = max_num_reqs
         self.max_num_pages_per_req = max_num_pages_per_req
@@ -92,12 +94,17 @@ class PageTable:
         self.page_table = jnp.zeros(
             (max_num_reqs, max_num_pages_per_req),
             dtype=jnp.int32,
+            device=sharding,
         )
         self.page_table_cpu = np.zeros(
             (max_num_reqs, max_num_pages_per_req),
             dtype=np.int32,
         )
         self.num_pages_per_row = np.zeros(max_num_reqs, dtype=np.int32)
+        # Incremented whenever the CPU-side page table changes. This enables
+        # higher-level code to cache device views derived from `page_table_cpu`
+        # (e.g., `pages_tables`) and refresh only when necessary.
+        self.cpu_version: int = 0
 
     def append_row(
         self,
@@ -123,6 +130,7 @@ class PageTable:
         start = self.num_pages_per_row[row_idx]
         self.num_pages_per_row[row_idx] += num_pages
         self.page_table_cpu[row_idx, start : start + num_pages] = page_ids
+        self.cpu_version += 1
 
     def add_row(self, page_ids: list[int], row_idx: int) -> None:
         """Replace a row with new page IDs.
@@ -140,6 +148,9 @@ class PageTable:
         """
         self.num_pages_per_row[row_idx] = 0
         self.append_row(page_ids, row_idx)
+        # `append_row` already bumps `cpu_version` when non-empty.
+        if not page_ids:
+            self.cpu_version += 1
 
     def move_row(self, src: int, tgt: int) -> None:
         """Move row content from source to target.
@@ -158,6 +169,7 @@ class PageTable:
         num_pages = self.num_pages_per_row[src]
         self.page_table_cpu[tgt, :num_pages] = self.page_table_cpu[src, :num_pages]
         self.num_pages_per_row[tgt] = num_pages
+        self.cpu_version += 1
 
     def swap_row(self, src: int, tgt: int) -> None:
         """Swap two rows in the page table.
@@ -179,6 +191,7 @@ class PageTable:
         self.num_pages_per_row[tgt] = num_pages_src
 
         self.page_table_cpu[[src, tgt]] = self.page_table_cpu[[tgt, src]]
+        self.cpu_version += 1
 
     def commit(self, num_reqs: int) -> None:
         """Commit CPU modifications to GPU.
@@ -206,6 +219,7 @@ class PageTable:
         self.page_table = jnp.zeros_like(self.page_table)
         self.page_table_cpu.fill(0)
         self.num_pages_per_row.fill(0)
+        self.cpu_version += 1
 
     def get_device_tensor(self) -> jax.Array:
         """Get the GPU device tensor of the page table.
@@ -251,6 +265,7 @@ class MultiGroupPageTable:
         max_model_len: int,
         max_num_batched_tokens: int,
         page_sizes: list[int],
+        sharding: jax.sharding.Sharding | None = None,
     ) -> None:
         """Initialize a MultiGroupPageTable with page tables for each group.
 
@@ -259,12 +274,14 @@ class MultiGroupPageTable:
             max_model_len: Maximum model sequence length.
             max_num_batched_tokens: Maximum batch token count.
             page_sizes: List of page sizes, one per KV-cache group.
+            sharding: Optional sharding to use for the device page tables.
         """
         self.page_tables = [
             PageTable(
                 max_num_reqs,
                 cdiv(max_model_len, page_size),
                 max_num_batched_tokens,
+                sharding=sharding,
             )
             for page_size in page_sizes
         ]

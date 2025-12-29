@@ -284,7 +284,7 @@ class XPOTrainer(GRPOTrainer):
                         add_special_tokens=False,
                         truncation=True,
                         return_attention_mask=True,
-                        max_length=self.arguments.max_sequence_length,
+                        max_length=self.arguments.max_length,
                     )
                     logits = reward_func.apply_fn(
                         reward_func.graphdef,
@@ -297,7 +297,7 @@ class XPOTrainer(GRPOTrainer):
                     outputs = reward_func(
                         prompts=prompt_texts,
                         completions=completion_texts,
-                        max_length=self.arguments.max_sequence_length,
+                        max_length=self.arguments.max_length,
                     )
                     values = jnp.asarray(np.asarray(list(outputs), dtype=np.float32))
             rewards.append(values)

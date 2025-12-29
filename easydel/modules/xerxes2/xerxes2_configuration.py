@@ -127,6 +127,7 @@ class Xerxes2Config(EasyDeLBaseConfig):
         mlp_only_layers: list[int] | None = None,
         hidden_act: str | None = None,
         rope_scaling: dict | None = None,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         self.bits = bits
@@ -156,6 +157,9 @@ class Xerxes2Config(EasyDeLBaseConfig):
         self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
         self.hidden_act = hidden_act if hidden_act is not None else "silu"
         self.rope_scaling = rope_scaling
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -166,16 +170,6 @@ class Xerxes2Config(EasyDeLBaseConfig):
         )
 
     def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
-
-        Args:
-            fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-                Whether to use fully sharded data parallelism.
-
-        Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
-        """
         pmag = self.partition_manager
         return (
             (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
@@ -188,11 +182,9 @@ class Xerxes2Config(EasyDeLBaseConfig):
             (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
             (r"self_attn/(qa_norm|kv_norm)/scale", pmag.resolve(Replicated)),
             (r"self_attn/(qa_norm|kv_norm)/bias", pmag.resolve(Replicated)),
-            # Standard MLP rules
             (r"mlp/gate_up_proj/kernel", pmag.resolve(ColumnWise)),
             (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
             (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            # MoE specific rules
             (r"mlp/gate/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
             (r"mlp/gate/bias", pmag.resolve(Replicated)),
             (
@@ -232,7 +224,6 @@ class Xerxes2Config(EasyDeLBaseConfig):
                 ),
             ),
             (r"mlp/experts/.*/bias", pmag.resolve(Replicated)),
-            # Layer norms
             (
                 r".*/(input_layernorm|post_attention_layernorm|pre_feedforward_layernorm|post_feedforward_layernorm|norm)/kernel",
                 pmag.resolve(Replicated),

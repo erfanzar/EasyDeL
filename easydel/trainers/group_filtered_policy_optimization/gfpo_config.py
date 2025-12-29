@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import field
-
-from eformer.pytree import auto_pytree
+from dataclasses import dataclass, field
 
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
@@ -23,7 +21,7 @@ from ..group_relative_policy_optimization import GRPOConfig
 
 
 @Registry.register("trainer-arguments", "gfpo")
-@auto_pytree
+@dataclass
 class GFPOConfig(GRPOConfig):
     """Configuration class for Group Filtered Policy Optimization training.
 
@@ -103,9 +101,9 @@ class GFPOConfig(GRPOConfig):
         },
     )
 
-    def __post_init__(self):
+    def __post_init__(self, max_sequence_length: int | None):
         """Post initialization to validate GFPO-specific parameters."""
-        super().__post_init__()
+        super().__post_init__(max_sequence_length=max_sequence_length)
 
         if self.num_remains_in_group is not None:
             if self.num_remains_in_group < 2:

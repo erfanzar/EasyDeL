@@ -31,7 +31,6 @@ import typing
 from functools import partial
 from typing import ClassVar
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -54,14 +53,16 @@ from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
+    HybridCache,
+    KDACacheView,
+    KDAMetadata,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
     TransformerCache,
     TransformerCacheView,
     TransformerMetadata,
-)
-from easydel.layers.caching.hybrid import (
-    HybridCache,
-    HybridCacheView,
-    HybridMetadata,
 )
 from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.moe import (
@@ -77,11 +78,15 @@ from easydel.layers.operations.modules import KDAOutput, KernelDeltaAttnOp, fuse
 from .kimi_linear_configuration import KimiLinearConfig
 
 
-def apply_mask_to_padding_states(hidden_states, attention_mask):
-    """Apply attention mask to hidden states for padding tokens."""
-    if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+def apply_mask_to_padding_states(hidden_states: Array, attention_mask: Array | None) -> Array:
+    if (
+        attention_mask is not None
+        and attention_mask.shape[0] == hidden_states.shape[0]
+        and attention_mask.shape[1] == hidden_states.shape[1]
+        and attention_mask.shape[1] > 1
+    ):
         dtype = hidden_states.dtype
-        hidden_states = (hidden_states * attention_mask[:, :, None]).astype(dtype)
+        return (hidden_states * attention_mask[:, :, None]).astype(dtype)
     return hidden_states
 
 
@@ -355,7 +360,8 @@ class KimiMLPMoE(nn.Module):
         self.precision = precision
 
         intermediate_size = config.moe_intermediate_size
-
+        if intermediate_size is None:
+            intermediate_size = config.intermediate_size
         self.gate_proj = ColumnParallelMoELinear(
             num_experts=config.num_experts,
             in_features=config.hidden_size,
@@ -397,9 +403,9 @@ class KimiMLPMoE(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        group_sizes: chex.Array,
-        sorted_experts: chex.Array | None = None,
-    ) -> chex.Array:
+        group_sizes: Array,
+        sorted_experts: Array | None = None,
+    ) -> Array:
         return self.down_proj(
             self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
             * self.up_proj(hidden_states, group_sizes, sorted_experts),
@@ -468,7 +474,7 @@ class KimiSparseMoeBlock(BaseMoeModule):
                 rngs=rngs,
             )
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[chex.Array, chex.Array]:
+    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -578,7 +584,7 @@ class KimiMLAAttention(UnifiedAttention):
                     config.hidden_size,
                     config.q_lora_rank,
                     rngs=rngs,
-                    use_bias=config.attention_bias,
+                    use_bias=False,
                     dtype=dtype,
                     param_dtype=param_dtype,
                     kernel_init=jax.nn.initializers.normal(config.initializer_range),
@@ -620,7 +626,7 @@ class KimiMLAAttention(UnifiedAttention):
                 config.hidden_size,
                 config.kv_lora_rank + config.qk_rope_head_dim,
                 rngs=rngs,
-                use_bias=config.attention_bias,
+                use_bias=False,
                 dtype=dtype,
                 param_dtype=param_dtype,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
@@ -681,8 +687,8 @@ class KimiMLAAttention(UnifiedAttention):
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | None = None,
-        cache_metadata: TransformerMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
@@ -860,19 +866,12 @@ class KimiDeltaAttention(nn.Module):
             key=rngs.params(),
         )
 
-        self._kda_op = None
-
-    @property
-    def kda_op(self) -> KernelDeltaAttnOp:
-        """Lazily create the KDA operation."""
-        if self._kda_op is None:
-            metadata = OperationMetadata(
-                runtime_dtype=self.dtype,
-                runtime_softmax_dtype=jnp.float32,
-                base_config=self.config,
-            )
-            self._kda_op = KernelDeltaAttnOp(metadata)
-        return self._kda_op
+        metadata = OperationMetadata(
+            runtime_dtype=self.dtype,
+            runtime_softmax_dtype=jnp.float32,
+            base_config=self.config,
+        )
+        self.kda_op = KernelDeltaAttnOp(metadata)
 
     def _apply_conv_with_state(
         self,
@@ -899,7 +898,7 @@ class KimiDeltaAttention(nn.Module):
 
             kernel = conv_layer.kernel.value
             kernel = kernel.squeeze(1).T
-            output = jnp.sum(new_state * kernel[:, :, None], axis=-1).T
+            output = jnp.sum(new_state * kernel[None, :, :], axis=-1)
             output = output[:, None, :]
 
             return output, new_state
@@ -912,7 +911,7 @@ class KimiDeltaAttention(nn.Module):
                 pad_len = self.d_conv - seq_len
                 if conv_state is not None:
                     new_state = jnp.concatenate(
-                        [conv_state[:, :, pad_len:], x.transpose(0, 2, 1)],
+                        [conv_state[:, :, seq_len:], x.transpose(0, 2, 1)],
                         axis=-1,
                     )
                 else:
@@ -924,8 +923,8 @@ class KimiDeltaAttention(nn.Module):
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         mask_info: MaskInfo | None = None,
-        cache_view: HybridCacheView | None = None,
-        cache_metadata: HybridMetadata | None = None,
+        cache_view: KDACacheView | None = None,
+        cache_metadata: KDAMetadata | None = None,
     ) -> AttentionLayerOutput:
         """Forward pass for KDA attention.
 
@@ -939,8 +938,9 @@ class KimiDeltaAttention(nn.Module):
             AttentionLayerOutput with attention output and updated cache
         """
         if mask_info is not None:
-            q_mask = jnp.any(mask_info.attention_mask, axis=1)
-            q_mask = jnp.any(q_mask, axis=-1)
+            q_mask = mask_info.q_attention_mask
+            if q_mask is not None and q_mask.shape[1] != hidden_states.shape[1]:
+                q_mask = q_mask[:, : hidden_states.shape[1]]
             hidden_states = apply_mask_to_padding_states(hidden_states, q_mask)
 
         batch_size, seq_len, _ = hidden_states.shape
@@ -1069,7 +1069,7 @@ class KimiDecoderLayer(nn.Module):
                 precision=precision,
                 rngs=rngs,
             )
-        else:
+        elif config.is_mla:
             self.self_attn = mla_block(
                 config=config,
                 layer_idx=layer_idx,
@@ -1078,6 +1078,8 @@ class KimiDecoderLayer(nn.Module):
                 precision=precision,
                 rngs=rngs,
             )
+        else:
+            raise NotImplementedError
 
         if self.is_moe_layer:
             self.mlp = moe_block(
@@ -1117,8 +1119,8 @@ class KimiDecoderLayer(nn.Module):
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | HybridCacheView | None = None,
-        cache_metadata: TransformerMetadata | HybridMetadata | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | KDACacheView | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -1241,8 +1243,8 @@ class KimiLinearModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | HybridCache | None = None,
-        cache_metadata: TransformerMetadata | HybridMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> MoeModelOutput:
         """Forward pass."""
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1388,8 +1390,8 @@ class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | HybridCache | None = None,
-        cache_metadata: TransformerMetadata | HybridMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
         """Forward pass with language modeling head."""

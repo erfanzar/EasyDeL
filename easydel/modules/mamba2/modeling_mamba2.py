@@ -14,21 +14,24 @@
 import itertools
 import typing as tp
 
-import chex
 import jax
 import jax.numpy as jnp
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers.caching.mamba2 import Mamba2Cache, Mamba2CacheMetaData, Mamba2CacheView
+from easydel.layers.base_modules import BaseCausalLMModule
+from easydel.layers.caching import RecurrentCache, RecurrentCacheView
 from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 from easydel.layers.norms import RMSNorm as FlaxMamba2RMSNorm
+from easydel.layers.operations import OperationMetadata
+from easydel.layers.operations.modules import SSM2Op
 
 from .mamba2_configuration import Mamba2Config as Mamba2Config
 
@@ -42,18 +45,18 @@ def init_to_value(x, dtype):
 class Mamba2Output(BaseModelOutput):
     """Output type for the base Mamba2 model including cache state."""
 
-    last_hidden_state: chex.Array = None
-    cache_params: Mamba2Cache | None = None
-    hidden_states: tuple[chex.Array] | None = None
+    last_hidden_state: Array = None
+    cache_params: RecurrentCache | None = None
+    hidden_states: tuple[Array] | None = None
 
 
 @auto_pytree
 class Mamba2CausalLMOutput(BaseModelOutput):
     """Causal language modeling output with logits and cached state."""
 
-    logits: chex.Array = None
-    cache_params: Mamba2Cache | None = None
-    hidden_states: tuple[chex.Array] | None = None
+    logits: Array = None
+    cache_params: RecurrentCache | None = None
+    hidden_states: tuple[Array] | None = None
 
 
 def pad_tensor_by_size(input_tensor: jnp.ndarray, pad_size: int):
@@ -145,6 +148,22 @@ class Conv1D(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Conv1D layer.
+
+        Args:
+            features (int): Number of output features/channels.
+            kernel_size (int, optional): Size of the convolving kernel. Defaults to 1.
+            stride (int, optional): Stride of the convolution. Defaults to 1.
+            padding (int, optional): Padding added to both sides of the input. Defaults to 0.
+            dilation (int, optional): Spacing between kernel elements. Defaults to 1.
+            groups (int, optional): Number of blocked connections from input to output. Defaults to 1.
+            use_bias (bool, optional): Whether to add a learnable bias. Defaults to True.
+            num_spatial_dims (int, optional): Number of spatial dimensions. Defaults to 1.
+            dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
+            precision (str | lax.Precision | None, optional): Numerical precision for computations. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.kernel = ArrayParam.bound(
             shape=(kernel_size, 1, features),
             dtype=param_dtype,
@@ -173,14 +192,26 @@ class Conv1D(nn.Module):
         self.precision = precision
 
     def __call__(self, x):
+        """Apply 1D convolution.
+
+        Args:
+            x (Array): Input tensor of shape [batch, features, length] for 1D convolution.
+
+        Returns:
+            Array: Convolved output with same shape as input (after considering stride/padding).
+
+        Raises:
+            ValueError: If input rank doesn't match expected rank (num_spatial_dims + 2).
+        """
         unbatched_rank = self.num_spatial_dims + 2
         if x.ndim != unbatched_rank:
             raise ValueError(
                 f"Input to `Conv` needs to have rank {unbatched_rank}, but input has shape {x.shape}.",
             )
+        org_x_dtype = x.dtype
         rhs = jnp.asarray(jnp.swapaxes(self.kernel.value, 0, 2), dtype=self.dtype)
         x = lax.conv_general_dilated(
-            lhs=x,
+            lhs=x.astype(self.dtype),
             rhs=rhs,
             window_strides=(self.stride,),
             padding=((self.padding, self.padding),),
@@ -191,7 +222,7 @@ class Conv1D(nn.Module):
         if self.use_bias:
             x = x + jnp.asarray(self.bias.value.reshape(1, -1, 1), dtype=self.dtype)
 
-        return x
+        return x.astype(org_x_dtype)
 
 
 class MambaRMSNormGated(nn.Module):
@@ -203,6 +234,13 @@ class MambaRMSNormGated(nn.Module):
         eps: float = 1e-6,
         dtype: jnp.dtype = jnp.float32,
     ):
+        """Initialize gated RMSNorm layer.
+
+        Args:
+            hidden_size (int): Dimensionality of the hidden states.
+            eps (float, optional): Small constant for numerical stability. Defaults to 1e-6.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
+        """
         self.hidden_size = hidden_size
         self.eps = eps
         self.dtype = dtype
@@ -214,6 +252,16 @@ class MambaRMSNormGated(nn.Module):
         )
 
     def __call__(self, hidden_states, gate=None):
+        """Apply gated RMS normalization.
+
+        Args:
+            hidden_states (Array): Input tensor of shape [batch, seq_len, hidden_size].
+            gate (Array | None, optional): Gate tensor of same shape as hidden_states.
+                If provided, applies SiLU gating before normalization. Defaults to None.
+
+        Returns:
+            Array: Normalized (and optionally gated) output with same shape as input.
+        """
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.astype(jnp.float32)
 
@@ -240,6 +288,16 @@ class Mamba2Mixer(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize Mamba2Mixer.
+
+        Args:
+            config (Mamba2Config): Model configuration.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
+            precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -347,20 +405,56 @@ class Mamba2Mixer(nn.Module):
             rngs=rngs,
         )
 
+        metadata = OperationMetadata(
+            runtime_dtype=dtype,
+            runtime_softmax_dtype=jnp.float32,
+            base_config=config,
+        )
+        self.ssm_op = SSM2Op(metadata)
+
     def __call__(
         self,
-        input_states: chex.Array,
-        cache_params: Mamba2CacheView | None = None,
-        cache_position: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        input_states: Array,
+        cache_params: RecurrentCacheView | None = None,
+        cache_position: Array | None = None,
+        attention_mask: Array | None = None,
     ):
-        dtype = input_states.dtype
-        if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
-            input_states = (input_states * attention_mask[:, :, None]).astype(dtype)
-        batch_size, seq_len, _ = input_states.shape
+        """Apply selective state space transformation.
+
+        Args:
+            input_states (Array): Input tensor of shape [batch, seq_len, hidden_size].
+            cache_params (RecurrentCacheView | None, optional): Cache for efficient generation.
+                Contains conv_state [batch, conv_dim, conv_kernel] and recurrent_state
+                [batch, num_heads, head_dim, state_size]. Defaults to None.
+            cache_position (Array | None, optional): Position indices for cache updates.
+                Not used in current implementation. Defaults to None.
+            attention_mask (Array | None, optional): Mask tensor of shape [batch, seq_len]
+                where 1 indicates valid tokens and 0 indicates padding. Defaults to None.
+
+        Returns:
+            tuple: A tuple containing:
+                - contextualized_states (Array): Output tensor of shape [batch, seq_len, hidden_size].
+                - cache_view (RecurrentCacheView | None): Updated cache state for next iteration.
+        """
         dtype = input_states.dtype
 
-        # Gated MLP's linear projection
+        mask = None
+        if (
+            attention_mask is not None
+            and attention_mask.shape[0] == input_states.shape[0]
+            and attention_mask.shape[1] == input_states.shape[1]
+            and attention_mask.shape[1] > 1
+        ):
+            mask = attention_mask.astype(dtype)
+            input_states = (input_states * mask[:, :, None]).astype(dtype)
+
+        batch_size, seq_len, _ = input_states.shape
+
+        if self.num_heads % self.n_groups != 0:
+            raise ValueError("Expected `num_heads` to be divisible by `n_groups` for Mamba2.")
+        if self.intermediate_size != self.num_heads * self.head_dim:
+            raise ValueError("Expected `intermediate_size == num_heads * head_dim` for Mamba2.")
+
         projected_states = checkpoint_name(self.in_proj(input_states), name="ssm_input_proj")
         d_mlp = (
             projected_states.shape[-1]
@@ -368,7 +462,7 @@ class Mamba2Mixer(nn.Module):
             - 2 * self.n_groups * self.ssm_state_size
             - self.num_heads
         ) // 2
-        _, _, gate, hidden_states, dt = jnp.split(
+        _, _, gate, conv_in, dt = jnp.split(
             projected_states,
             [
                 d_mlp,
@@ -379,223 +473,80 @@ class Mamba2Mixer(nn.Module):
             axis=-1,
         )
 
-        if cache_params is not None:
-            ssm_state = cache_params.ssm_states[self.layer_idx].copy()
-            if cache_params.seqlen_offset > 0:
-                conv_state = cache_params.conv_states
-                # [batch, intermediate_size, conv_kernel_size]
-                conv_state = jnp.roll(conv_state, shifts=-1, axis=-1)
-                # handle batched generation - states are copied through
-                conv_state[:, :, -1] = hidden_states[:, 0, :] if hidden_states.ndim == 3 else hidden_states
-                cache_params.conv_states = jax.lax.dynamic_update_slice(
-                    cache_params.conv_states,
-                    conv_state,
-                    (0, 0, 0, 0),
-                )
-                hidden_states = jnp.sum(conv_state * self.conv1d.kernel.value[:, 0, :], dim=-1)
-                if self.use_conv_bias:
-                    hidden_states += self.conv1d.bias.value
-                hidden_states = self.act(hidden_states).astype(dtype)[:, None, ...]
-            # [batch, 1, intermediate_size] : decoding
-            else:
-                hidden_states = jnp.swapaxes(hidden_states, 2, 1)
+        if mask is not None:
+            gate = gate * mask[:, :, None]
+            conv_in = conv_in * mask[:, :, None]
+            dt = dt * mask[:, :, None]
 
-                pad_width = [
-                    (0, 0),
-                    (0, 0),
-                    (self.conv_kernel_size - hidden_states.shape[-1], 0),
-                ]
-                conv_state = jnp.pad(hidden_states, pad_width)
+        cache_view = cache_params
 
-                cache_params.conv_states = jax.lax.dynamic_update_slice(
-                    cache_params.conv_states,
-                    conv_state,
-                    (0, 0, 0, 0),
-                )
+        # Convolution on conv_in (depthwise, causal). Cache stores conv input, not conv output.
+        if seq_len == 1 and cache_params is not None and cache_params.conv_state is not None:
+            new_token = conv_in[:, 0, :]  # [batch, conv_dim]
+            conv_state, _, cache_view = cache_params.concatenate_to_cache(conv_state=new_token)
 
-                # Apply convolution and activation
-                hidden_states = self.conv1d(hidden_states)
-                hidden_states = jnp.swapaxes(hidden_states, 2, 1)
-                hidden_states = self.act(hidden_states)
-                hidden_states = hidden_states[:, :seq_len, :]
-
-                # Apply attention mask if necessary
-                def apply_mask(hidden_states, attention_mask):
-                    return hidden_states * attention_mask[:, :, None]
-
-                def identity(hidden_states):
-                    return hidden_states
-
-                mask_condition = (
-                    attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1
-                )
-
-                hidden_states = jax.lax.cond(
-                    mask_condition,
-                    lambda: apply_mask(hidden_states, attention_mask),
-                    lambda: identity(hidden_states),
-                )
+            conv_out_full = self.conv1d(conv_state)[..., : self.conv_kernel_size]  # [batch, conv_dim, k]
+            conv_out = self.act(conv_out_full[:, :, self.conv_kernel_size - 1]).astype(dtype)[:, None, :]
         else:
-            ssm_state = jnp.zeros(
-                (batch_size, self.num_heads, self.head_dim, self.ssm_state_size),
-                dtype=dtype,
-            )
+            conv_out = self.conv1d(jnp.swapaxes(conv_in, 2, 1))[..., :seq_len]
+            conv_out = self.act(jnp.swapaxes(conv_out, 2, 1)).astype(dtype)  # [batch, seq_len, conv_dim]
 
-            convin = self.conv1d(jnp.swapaxes(hidden_states, 2, 1))[..., :seq_len]
-            hidden_states = self.act(jnp.swapaxes(convin, 2, 1))
-
-            hidden_states, B, C = jnp.split(
-                hidden_states,
-                [
-                    self.intermediate_size,
-                    self.intermediate_size + self.n_groups * self.ssm_state_size,
-                ],
-                axis=-1,
-            )
-            A = -jnp.exp(self.A_log.value.astype("float32"))  # [num_heads]
-            if cache_params is not None and cache_params.seqlen_offset > 0:
-                dt = dt[:, None, ...] if dt.ndim == 2 else dt[:, 0, :][:, None, ...]
-                dt = dt.transpose(1, 2).expand(batch_size, dt.shape[-1], self.head_dim)
-                dt_bias = self.dt_bias[..., None].expand(self.dt_bias.shape[0], self.head_dim)
-
-                dt = jax.nn.softplus(dt + dt_bias.astype(dt.dtype))
-                dt = jnp.clip(dt, min=self.time_step_min)
-                A = (
-                    A[..., None, None]
-                    .expand(self.num_heads, self.head_dim, self.ssm_state_size)
-                    .astype(dtype=jnp.float32)
-                )
-                # [bsz, num_heads, head_dim, state_size]
-                dA = jnp.exp(dt[..., None] * A)
-
-                # Discretize B
-                # [bsz, n_groups * state_size] -> [bsz, n_groups, 1, state_size] ->
-                # -> [bsz, n_groups, group to head repetition factor, state_size] -> [bsz, num_heads, state_size]
-                batch_size = B.shape[0]
-
-                # Process B
-                B = B.reshape(batch_size, self.n_groups, -1, 1)
-                B = jnp.tile(B, (1, 1, self.num_heads // self.n_groups, 1))
-                B = B.reshape(batch_size, -1, B.shape[-1])
-                dB = dt[..., None] * B[..., None, :]
-
-                # Process hidden_states
-                hidden_states = hidden_states.reshape(batch_size, -1, self.head_dim)
-                dBx = dB * hidden_states[..., None]
-
-                # State calculation
-                dA = jnp.exp(dt[..., None] * A)
-                new_ssm_states = cache_params.ssm_states[self.layer_idx] * dA + dBx
-                cache_params = cache_params.ssm_states[self.layer_idx] = new_ssm_states
-
-                # Process C
-                C = C.reshape(batch_size, self.n_groups, -1, 1)
-                C = jnp.tile(C, (1, 1, self.num_heads // self.n_groups, 1))
-                C = C.reshape(batch_size, -1, C.shape[-1])
-
-                # Compute y
-                ssm_states = cache_params.ssm_states[self.layer_idx]
-                ssm_states_reshaped = ssm_states.reshape(batch_size * self.num_heads, self.head_dim, self.ssm_state_size)
-                C_reshaped = C.reshape(batch_size * self.num_heads, self.ssm_state_size, 1)
-                y = jnp.matmul(ssm_states_reshaped, C_reshaped)
-                y = y.reshape(batch_size, self.num_heads, self.head_dim)
-
-                # D skip connection
-                D = jnp.tile(self.D[:, None], (1, self.head_dim))
-                y = y + hidden_states * D
-
-                # Reshape y
-                y = y.reshape(batch_size, -1)[:, None, ...]
-            else:
-                # begin ssd naive implementation without einsums
-                dt = jax.nn.softplus(dt + self.dt_bias)
-                dt = jnp.clip(dt, min=self.time_step_min)
-                hidden_states = hidden_states.reshape(batch_size, seq_len, -1, self.head_dim).astype(jnp.float32)
-                B = B.reshape(batch_size, seq_len, -1, self.ssm_state_size).astype(jnp.float32)
-                C = C.reshape(batch_size, seq_len, -1, self.ssm_state_size).astype(jnp.float32)
-                B = B.repeat(self.num_heads // self.n_groups, 2)
-                C = C.repeat(self.num_heads // self.n_groups, 2)
-                pad_size = self.chunk_size - (seq_len % self.chunk_size)
-
-                D_residual = self.D[..., None] * pad_tensor_by_size(hidden_states, pad_size)
-
-                # Discretize x and A
-                hidden_states = hidden_states * dt[..., None]
-                A = A.astype(hidden_states.dtype) * dt
-
-                # Rearrange into blocks/chunks
-                hidden_states, A, B, C = (
-                    reshape_into_chunks(t, pad_size, self.chunk_size) for t in (hidden_states, A, B, C)
-                )
-
-                # [bsz, -1, chunk_size, num_heads] -> [bsz, num_heads, -1, chunk_size]
-                A = jnp.transpose(A, axes=(0, 3, 1, 2))
-                A_cumsum = jnp.cumsum(A, axis=-1)
-
-                # 1. Compute the output for each intra-chunk (diagonal blocks)
-                # This is the analog of a causal mask
-                L = jnp.exp(segment_sum(A))
-
-                # First, contraction of C and B to get G (attention-weights like)
-                G_intermediate = C[:, :, :, None, :, :] * B[:, :, None, :, :, :]  # shape: (b, c, l, s, h, n)
-                G = G_intermediate.sum(axis=-1)  # shape: (b, c, l, s, h)
-
-                # Step 2: Compute M, equivalent to applying attention mask to weights
-                M_intermediate = G[..., None] * jnp.transpose(L, (0, 2, 3, 4, 1))[..., None]
-                M = M_intermediate.sum(axis=-1)
-
-                # Step 3: Compute Y_diag (apply to values)
-                Y_diag = (M[..., None] * hidden_states[:, :, None]).sum(3)
-
-                # (right term of low-rank factorization of off-diagonal blocks; B terms)
-
-                decay_states = jnp.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
-                B_decay_contraction = B * jnp.transpose(decay_states, (0, 2, 3, 1))[..., None]
-                # permute back B * decay states
-                states = jnp.transpose(
-                    (
-                        jnp.transpose(B_decay_contraction, axes=(0, 1, 3, 2, 4))[..., None]
-                        * jnp.transpose(hidden_states, axes=(0, 1, 3, 2, 4))[..., None, :]
-                    ).sum(axis=3),
-                    axes=(0, 1, 2, 4, 3),
-                )
-                if cache_params is not None and cache_params.seqlen_offset > 0:
-                    previous_states = cache_params.ssm_states[self.layer_idx][:, None, ...]
+            if cache_params is not None:
+                conv_in_t = conv_in.transpose(0, 2, 1)  # [batch, conv_dim, seq_len]
+                if seq_len >= self.conv_kernel_size:
+                    new_conv_state = conv_in_t[:, :, -self.conv_kernel_size :]
                 else:
-                    previous_states = jnp.zeros_like(states[:, :1])
-                states = jnp.concatenate([previous_states, states], axis=1)
-                decay_chunk = jnp.exp(segment_sum(jnp.pad(A_cumsum[:, :, :, -1], ((0, 0), (0, 0), (1, 0)))))
+                    pad_width = self.conv_kernel_size - seq_len
+                    new_conv_state = jnp.pad(conv_in_t, ((0, 0), (0, 0), (pad_width, 0)))
+                cache_view = cache_params.replace(conv_state=new_conv_state)
 
-                states_permuted = jnp.transpose(states, axes=(0, 2, 1, 3, 4))
-                result = (decay_chunk[..., None, None] * states_permuted[:, :, None, ...]).sum(axis=2)
-                new_states = jnp.transpose(result, (0, 2, 1, 3, 4))
-                states, ssm_state = new_states[:, :-1], new_states[:, -1]
+        if mask is not None:
+            conv_out = conv_out * mask[:, :, None]
 
-                # Compute state -> output conversion per chunk
-                # (left term of low-rank factorization of off-diagonal blocks; C terms)
-                state_decay_out = jnp.exp(A_cumsum)
-                # compute Yoff
-                C_times_states = C[..., None, :] * states[:, :, None, ...]
-                state_decay_out_permuted = jnp.transpose(state_decay_out, axes=(0, 2, 3, 1))
-                Y_off = C_times_states.sum(-1) * state_decay_out_permuted[..., None]
-                # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
+        x, B, C = jnp.split(
+            conv_out,
+            [self.intermediate_size, self.intermediate_size + self.n_groups * self.ssm_state_size],
+            axis=-1,
+        )
 
-                y = Y_diag + Y_off
-                # [bsz, -1, self.chunk_size, num_heads, head_dim] -> [bsz, (padded) seq_len, num_heads, head_dim]
-                y = y.reshape(batch_size, -1, self.num_heads, self.head_dim)
+        x = x.reshape(batch_size, seq_len, self.num_heads, self.head_dim).astype(jnp.float32)
+        B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
+        C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
+        # Note: SSM2Op handles group expansion internally
 
-                y = y + D_residual
-                # Cutting off padded chunks
-                if pad_size > 0:
-                    y = y[:, :seq_len, :, :]
-                y = y.reshape(batch_size, seq_len, -1)
-                if ssm_state is not None and cache_params is not None:
-                    cache_params.ssm_states[self.layer_idx] = ssm_state
+        # Prepare dt with bias and clipping
+        dt = dt.astype(jnp.float32)
+        dt = jax.nn.softplus(dt + self.dt_bias.value.astype(jnp.float32))
+        dt = jnp.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
 
-                scan_output = self.norm(y, gate)
-                contextualized_states = checkpoint_name(self.out_proj(scan_output.astype(dtype)), name="ssm_output_proj")
-                # [batch, seq_len, hidden_size]
-                return contextualized_states, cache_params
+        if cache_params is not None and cache_params.recurrent_state is not None:
+            ssm_state0 = cache_params.recurrent_state.astype(jnp.float32)
+        else:
+            ssm_state0 = None
+
+        # Call SSM2Op
+        ssm_output = self.ssm_op(
+            x=x,  # [batch, seq_len, num_heads, head_dim]
+            A=self.A_log.value,  # [num_heads] in log form
+            B=B,  # [batch, seq_len, n_groups, ssm_state_size]
+            C=C,  # [batch, seq_len, n_groups, ssm_state_size]
+            D=self.D.value,  # [num_heads]
+            dt=dt,  # [batch, seq_len, num_heads]
+            gate=None,  # Gating handled by self.norm below
+            ssm_state=ssm_state0,
+            n_groups=self.n_groups,
+            use_gated_rmsnorm=False,  # We use self.norm below
+            precision=self.precision,
+        )
+
+        y = ssm_output.attention_outputs
+
+        if cache_view is not None:
+            cache_view = cache_view.replace(recurrent_state=ssm_output.ssm_state.astype(dtype))
+
+        scan_output = self.norm(y, gate)
+        contextualized_states = checkpoint_name(self.out_proj(scan_output.astype(dtype)), name="ssm_output_proj")
+        return contextualized_states, cache_view
 
 
 class Mamba2Block(nn.Module):
@@ -611,6 +562,16 @@ class Mamba2Block(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize Mamba2Block.
+
+        Args:
+            config (Mamba2Config): Model configuration.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
+            precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -642,11 +603,24 @@ class Mamba2Block(nn.Module):
 
     def __call__(
         self,
-        hidden_states: chex.Array,
-        cache_params: Mamba2CacheView | None = None,
-        cache_position: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
-    ) -> chex.Array:
+        hidden_states: Array,
+        cache_params: RecurrentCacheView | None = None,
+        cache_position: Array | None = None,
+        attention_mask: Array | None = None,
+    ) -> Array:
+        """Apply Mamba2 block with pre-normalization and residual connection.
+
+        Args:
+            hidden_states (Array): Input tensor of shape [batch, seq_len, hidden_size].
+            cache_params (RecurrentCacheView | None, optional): Cache for generation. Defaults to None.
+            cache_position (Array | None, optional): Position indices for cache. Defaults to None.
+            attention_mask (Array | None, optional): Attention mask of shape [batch, seq_len]. Defaults to None.
+
+        Returns:
+            tuple: A tuple containing:
+                - hidden_states (Array): Output tensor of shape [batch, seq_len, hidden_size].
+                - cache_params (RecurrentCacheView | None): Updated cache state.
+        """
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
         if self.residual_in_fp32:
@@ -674,6 +648,15 @@ class Mamba2Model(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize Mamba2Model.
+
+        Args:
+            config (Mamba2Config): Model configuration.
+            dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
+            precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -710,14 +693,39 @@ class Mamba2Model(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        cache_params: Mamba2Cache | None = None,
+        input_ids: Array | None = None,
+        inputs_embeds: Array | None = None,
+        cache_params: RecurrentCache | None = None,
         output_hidden_states: bool | None = None,
-        cache_position: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        cache_position: Array | None = None,
+        attention_mask: Array | None = None,
         **kwargs,
     ) -> tuple | Mamba2Output:
+        """Forward pass through Mamba2 model.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape [batch, seq_len].
+                Mutually exclusive with inputs_embeds. Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                [batch, seq_len, hidden_size]. Mutually exclusive with input_ids. Defaults to None.
+            cache_params (RecurrentCache | None, optional): Cache containing states for all layers.
+                Used for efficient autoregressive generation. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None (uses config value).
+            cache_position (Array | None, optional): Position indices for cache updates. Defaults to None.
+            attention_mask (Array | None, optional): Mask of shape [batch, seq_len] where 1 indicates
+                valid tokens and 0 indicates padding. Defaults to None.
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            Mamba2Output: Object containing:
+                - last_hidden_state (Array): Final hidden states of shape [batch, seq_len, hidden_size].
+                - cache_params (RecurrentCache | None): Updated cache for next iteration.
+                - hidden_states (tuple[Array] | None): Hidden states from all layers if output_hidden_states=True.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are specified or both are None.
+        """
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -731,7 +739,7 @@ class Mamba2Model(EasyDeLBaseModule):
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)
         if cache_params is None:
-            cache_params = Mamba2Cache.init_empty(len(self.layers))
+            cache_params = RecurrentCache.init_empty(len(self.layers))
         if attention_mask is None:
             attention_mask = jnp.ones(inputs_embeds.shape[:2], dtype="i4")
         hidden_states = inputs_embeds
@@ -785,8 +793,12 @@ class Mamba2Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Mamba2Config, model_type="mamba2")
-class Mamba2ForCausalLM(EasyDeLBaseModule):
+class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):
     """Mamba2 language model with tied backbone and projection head."""
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "mamba2"
+    _config_class = Mamba2Config
 
     def __init__(
         self,
@@ -797,48 +809,62 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize Mamba2ForCausalLM.
+
+        Args:
+            config (Mamba2Config): Model configuration.
+            dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
+            precision (str | lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
+            base_model_class=Mamba2Model,
+            base_model_name="backbone",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-        )
-        self.backbone = Mamba2Model(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
-            config.hidden_size,
-            config.vocab_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
+            lm_head_bias=False,
         )
 
     def __call__(
         self,
-        input_ids: chex.Array | None = None,
-        inputs_embeds: chex.Array | None = None,
-        cache_params: Mamba2Cache | None = None,
+        input_ids: Array | None = None,
+        inputs_embeds: Array | None = None,
+        cache_params: RecurrentCache | None = None,
         output_hidden_states: bool | None = None,
         apply_lm_head: bool = True,
-        cache_position: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        cache_position: Array | None = None,
+        attention_mask: Array | None = None,
         **kwargs,
     ) -> tuple | Mamba2CausalLMOutput:
+        """Forward pass for causal language modeling.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape [batch, seq_len].
+                Mutually exclusive with inputs_embeds. Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                [batch, seq_len, hidden_size]. Mutually exclusive with input_ids. Defaults to None.
+            cache_params (RecurrentCache | None, optional): Cache containing states for all layers.
+                Used for efficient autoregressive generation. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None (uses config value).
+            apply_lm_head (bool, optional): Whether to apply language modeling head to produce logits.
+                Set to False to get only hidden states. Defaults to True.
+            cache_position (Array | None, optional): Position indices for cache updates. Defaults to None.
+            attention_mask (Array | None, optional): Mask of shape [batch, seq_len] where 1 indicates
+                valid tokens and 0 indicates padding. Defaults to None.
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            Mamba2CausalLMOutput: Object containing:
+                - logits (Array | None): Next-token prediction logits of shape [batch, seq_len, vocab_size]
+                  if apply_lm_head=True, otherwise None.
+                - cache_params (RecurrentCache | None): Updated cache for next iteration.
+                - hidden_states (tuple[Array] | None): Hidden states from all layers if output_hidden_states=True.
+        """
         mamba_outputs = self.backbone(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -858,66 +884,45 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
             hidden_states=mamba_outputs.hidden_states,
         )
 
-    def init_cache(
-        self,
-        batch_size: int,
-        max_length: int,
-        starts: int | None = None,
-        shardings: dict | None = None,
-        pad_token_id: int | None = None,
-    ):
-        shardings = shardings or dict()
-        return Mamba2Cache.init_cache(
-            metadata=Mamba2CacheMetaData.create(
-                num_hidden_layers=self.config.num_hidden_layers,
-                partition_axis=self.config.partition_axis,
-                batch_size=batch_size,
-                intermediate_size=int(self.config.expand * self.config.hidden_size),
-                conv_kernel_size=self.config.conv_kernel,
-                head_dim=self.config.head_dim,
-                n_groups=self.config.n_groups,
-                state_size=self.config.state_size,
-                num_heads=self.config.num_heads,
-            ),
-            dtype=self.dtype,
-        )
-
     def prepare_inputs_for_generation(
         self,
         input_ids,
-        inputs_embeds=None,
-        cache_params: Mamba2Cache | None = None,
-        cache_position: chex.Array | None = None,
-        attention_mask: chex.Array | None = None,
+        max_length: int,
+        pad_token_id: int,
+        starts: int | None = None,
         **kwargs,
     ):
-        if inputs_embeds is not None:
-            past_len = inputs_embeds.shape[1] + input_ids.shape[1]
-        else:
-            past_len = input_ids.shape[1]
-        if cache_params is None:
-            cache_params = self.init_cache(input_ids.shape[0], 0)
-        if attention_mask.shape[1] < past_len:
-            extended_mask = jnp.ones(
-                (
-                    attention_mask.shape[0],
-                    past_len - attention_mask.shape[1],
-                ),
-                "i4",
-            )
-            attention_mask = jnp.concatenate([attention_mask, extended_mask], axis=1)
-        model_inputs = {}
-        if inputs_embeds is not None and cache_params is None:
-            model_inputs.update({"inputs_embeds": inputs_embeds})
+        from eformer.escale import PartitionAxis
 
-        model_inputs.update(
-            {
-                "attention_mask": attention_mask,
-                "cache_params": cache_params,
-                "cache_position": cache_position,
-            }
+        from easydel.layers.caching import RecurrentCache, RecurrentCacheConfig
+
+        cache_params = kwargs.get("cache_params", None)
+        cache_position = kwargs.get("cache_position", None)
+        attention_mask = kwargs.get("attention_mask", None)
+
+        if cache_params is None:
+            partition_axis = getattr(self.config, "partition_axis", None) or PartitionAxis()
+            cache_config = RecurrentCacheConfig.create_for_mamba2(
+                num_hidden_layers=int(self.config.num_hidden_layers),
+                partition_axis=partition_axis,
+                batch_size=int(input_ids.shape[0]),
+                intermediate_size=int(self.config.intermediate_size),
+                num_heads=int(self.config.num_heads),
+                head_dim=int(self.config.head_dim),
+                state_size=int(self.config.state_size),
+                conv_kernel_size=int(self.config.conv_kernel),
+                n_groups=int(self.config.n_groups),
+            )
+            cache_params = RecurrentCache.init_cache(cache_config, dtype=self.dtype)
+
+        if attention_mask is None:
+            attention_mask = jnp.ones(input_ids.shape, dtype="i4")
+
+        return self.prepare_inputs_for_call(
+            attention_mask=attention_mask,
+            cache_params=cache_params,
+            cache_position=cache_position,
         )
-        return self.prepare_inputs_for_call(model_inputs)
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
         model_outputs.cache_params.update_seq(1)

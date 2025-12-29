@@ -285,15 +285,9 @@ class ConvertInputOutputToChatML(Transform):
         messages = []
         for turn in conversation:
             if "input" in turn:
-                messages.append({
-                    "role": self._user_role,
-                    "content": turn["input"],
-                })
+                messages.append({"role": self._user_role, "content": turn["input"]})
             if "output" in turn:
-                messages.append({
-                    "role": self._assistant_role,
-                    "content": turn["output"],
-                })
+                messages.append({"role": self._assistant_role, "content": turn["output"]})
 
         # Remove old field if different from output
         if source_field and source_field != self._output_field:

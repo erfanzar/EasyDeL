@@ -26,8 +26,8 @@ def make_text_inputs(
     Returns:
         Dictionary with 'torch' and 'jax' keys containing input tensors
     """
-    np.random.seed(seed)
-    input_ids = np.random.randint(0, vocab_size, (batch_size, seq_len))
+    rng = np.random.default_rng(seed)
+    input_ids = rng.integers(0, vocab_size, (batch_size, seq_len))
     attention_mask = np.ones((batch_size, seq_len), dtype=np.int64)
 
     return {
@@ -39,6 +39,32 @@ def make_text_inputs(
             "input_ids": jnp.asarray(input_ids, dtype="i4"),
             "attention_mask": jnp.asarray(attention_mask, dtype="bool"),
         },
+    }
+
+
+def make_vision_inputs(
+    batch_size: int,
+    image_size: int = 224,
+    num_channels: int = 3,
+    seed: int = 42,
+) -> dict:
+    """Generate vision inputs for both PyTorch and JAX.
+
+    Args:
+        batch_size: Batch size
+        image_size: Image dimension (height = width)
+        num_channels: Number of image channels
+        seed: Random seed for reproducibility
+
+    Returns:
+        Dictionary with 'torch' and 'jax' keys containing pixel_values tensors
+    """
+    rng = np.random.default_rng(seed)
+    np_pixel_values = rng.standard_normal((batch_size, num_channels, image_size, image_size)).astype(np.float32)
+
+    return {
+        "torch": {"pixel_values": torch.from_numpy(np_pixel_values).to(torch.float32)},
+        "jax": {"pixel_values": jnp.asarray(np_pixel_values, dtype="f4")},
     }
 
 
@@ -57,8 +83,8 @@ def make_input_ids(
     Returns:
         Tuple of (torch_input_ids, jax_input_ids)
     """
-    np.random.seed(seed)
-    np_input_ids = np.random.randint(0, vocab_size, input_shape)
+    rng = np.random.default_rng(seed)
+    np_input_ids = rng.integers(0, vocab_size, input_shape)
     return (
         torch.from_numpy(np_input_ids).to(torch.long),
         jnp.asarray(np_input_ids, dtype="i4"),
@@ -74,6 +100,9 @@ def make_vlm_inputs(
     pixel_values_shape: tuple,
     num_images: int = 1,
     token_type_ids: bool = False,
+    image_grid_hws: np.ndarray | None = None,
+    image_grid_thw: np.ndarray | None = None,
+    video_grid_thw: np.ndarray | None = None,
     seed: int = 42,
 ) -> dict:
     """Generate Vision-Language Model inputs with image token placeholders.
@@ -87,16 +116,22 @@ def make_vlm_inputs(
         pixel_values_shape: Shape of pixel_values tensor (batch, channels, height, width)
         num_images: Number of images to include
         token_type_ids: Whether to generate token_type_ids (for Gemma3)
+        image_grid_hws: Optional per-image (height, width) grid for models that
+            accept `image_grid_hws` (e.g. Gemma3).
+        image_grid_thw: Optional per-image (temporal, height, width) grid for
+            models that accept `image_grid_thw` (e.g. GLM/Qwen style patch grids).
+        video_grid_thw: Optional per-video (temporal, height, width) grid for
+            models that accept `video_grid_thw`.
         seed: Random seed
 
     Returns:
         Dictionary with 'torch' and 'jax' keys containing all inputs
     """
-    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
     input_shape = (batch_size, seq_len)
 
     # Generate random input IDs
-    np_input_ids = np.random.randint(0, vocab_size, input_shape)
+    np_input_ids = rng.integers(0, vocab_size, input_shape)
 
     # Insert image token placeholders
     total_image_tokens = num_images * num_image_tokens
@@ -109,7 +144,7 @@ def make_vlm_inputs(
                 np_input_ids[:, img_start:img_end] = image_token_id
 
     # Create pixel values (random values in reasonable range)
-    np_pixel_values = np.random.randn(*pixel_values_shape).astype(np.float32) * 0.5
+    np_pixel_values = rng.standard_normal(pixel_values_shape).astype(np.float32) * 0.5
 
     # Create attention mask (all ones)
     np_attention_mask = np.ones(input_shape, dtype=np.int64)
@@ -138,10 +173,23 @@ def make_vlm_inputs(
             if img_end <= seq_len:
                 np_token_type_ids[:, img_start:img_end] = 1
 
-        result["torch"]["token_type_ids"] = torch.from_numpy(np_token_type_ids).to(
-            torch.long
-        )
+        result["torch"]["token_type_ids"] = torch.from_numpy(np_token_type_ids).to(torch.long)
         result["jax"]["token_type_ids"] = jnp.asarray(np_token_type_ids, dtype="i4")
+
+    if image_grid_hws is not None:
+        image_grid_hws = np.asarray(image_grid_hws, dtype=np.int64)
+        result["torch"]["image_grid_hws"] = torch.from_numpy(image_grid_hws).to(torch.long)
+        result["jax"]["image_grid_hws"] = jnp.asarray(image_grid_hws, dtype="i4")
+
+    if image_grid_thw is not None:
+        image_grid_thw = np.asarray(image_grid_thw, dtype=np.int64)
+        result["torch"]["image_grid_thw"] = torch.from_numpy(image_grid_thw).to(torch.long)
+        result["jax"]["image_grid_thw"] = jnp.asarray(image_grid_thw, dtype="i4")
+
+    if video_grid_thw is not None:
+        video_grid_thw = np.asarray(video_grid_thw, dtype=np.int64)
+        result["torch"]["video_grid_thw"] = torch.from_numpy(video_grid_thw).to(torch.long)
+        result["jax"]["video_grid_thw"] = jnp.asarray(video_grid_thw, dtype="i4")
 
     return result
 
@@ -177,11 +225,11 @@ def make_qwen_vlm_inputs(
     Returns:
         Dictionary with 'torch' and 'jax' keys containing all inputs
     """
-    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
     input_shape = (batch_size, seq_len)
 
     # Generate random input IDs
-    np_input_ids = np.random.randint(0, vocab_size, input_shape)
+    np_input_ids = rng.integers(0, vocab_size, input_shape)
 
     # Insert vision tokens: <vision_start> + image_tokens + <vision_end>
     tokens_per_image = num_image_tokens + 2  # start + tokens + end
@@ -195,14 +243,12 @@ def make_qwen_vlm_inputs(
                 # Vision start token
                 np_input_ids[:, base_pos] = vision_start_token_id
                 # Image tokens
-                np_input_ids[:, base_pos + 1 : base_pos + 1 + num_image_tokens] = (
-                    image_token_id
-                )
+                np_input_ids[:, base_pos + 1 : base_pos + 1 + num_image_tokens] = image_token_id
                 # Vision end token
                 np_input_ids[:, base_pos + 1 + num_image_tokens] = vision_end_token_id
 
     # Create pixel values
-    np_pixel_values = np.random.randn(*pixel_values_shape).astype(np.float32) * 0.5
+    np_pixel_values = rng.standard_normal(pixel_values_shape).astype(np.float32) * 0.5
 
     # Create attention mask
     np_attention_mask = np.ones(input_shape, dtype=np.int64)
@@ -246,14 +292,14 @@ def make_seq2seq_inputs(
     Returns:
         Dictionary with 'torch' and 'jax' keys containing encoder/decoder inputs
     """
-    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
 
     # Encoder inputs
-    np_input_ids = np.random.randint(0, vocab_size, (batch_size, src_len))
+    np_input_ids = rng.integers(0, vocab_size, (batch_size, src_len))
     np_attention_mask = np.ones((batch_size, src_len), dtype=np.int64)
 
     # Decoder inputs
-    np_decoder_input_ids = np.random.randint(0, vocab_size, (batch_size, tgt_len))
+    np_decoder_input_ids = rng.integers(0, vocab_size, (batch_size, tgt_len))
     np_decoder_attention_mask = np.ones((batch_size, tgt_len), dtype=np.int64)
 
     return {
@@ -261,9 +307,7 @@ def make_seq2seq_inputs(
             "input_ids": torch.from_numpy(np_input_ids).to(torch.long),
             "attention_mask": torch.from_numpy(np_attention_mask).to(torch.long),
             "decoder_input_ids": torch.from_numpy(np_decoder_input_ids).to(torch.long),
-            "decoder_attention_mask": torch.from_numpy(np_decoder_attention_mask).to(
-                torch.long
-            ),
+            "decoder_attention_mask": torch.from_numpy(np_decoder_attention_mask).to(torch.long),
         },
         "jax": {
             "input_ids": jnp.asarray(np_input_ids, dtype="i4"),
@@ -291,12 +335,10 @@ def make_audio_inputs(
     Returns:
         Dictionary with 'torch' and 'jax' keys containing audio features
     """
-    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
 
     # Input features shape: (batch_size, num_mel_bins, audio_length)
-    np_input_features = np.random.randn(batch_size, num_mel_bins, audio_length).astype(
-        np.float32
-    )
+    np_input_features = rng.standard_normal((batch_size, num_mel_bins, audio_length)).astype(np.float32)
 
     return {
         "torch": {
@@ -327,11 +369,11 @@ def make_classification_inputs(
     Returns:
         Dictionary with 'torch' and 'jax' keys containing inputs and labels
     """
-    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
 
-    np_input_ids = np.random.randint(0, vocab_size, (batch_size, seq_len))
+    np_input_ids = rng.integers(0, vocab_size, (batch_size, seq_len))
     np_attention_mask = np.ones((batch_size, seq_len), dtype=np.int64)
-    np_labels = np.random.randint(0, num_labels, (batch_size,))
+    np_labels = rng.integers(0, num_labels, (batch_size,))
 
     return {
         "torch": {
@@ -366,12 +408,10 @@ def make_image_classification_inputs(
     Returns:
         Dictionary with 'torch' and 'jax' keys containing pixel values and labels
     """
-    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
 
-    np_pixel_values = np.random.randn(
-        batch_size, num_channels, image_size, image_size
-    ).astype(np.float32)
-    np_labels = np.random.randint(0, num_labels, (batch_size,))
+    np_pixel_values = rng.standard_normal((batch_size, num_channels, image_size, image_size)).astype(np.float32)
+    np_labels = rng.integers(0, num_labels, (batch_size,))
 
     return {
         "torch": {

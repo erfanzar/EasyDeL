@@ -15,7 +15,6 @@
 
 import functools
 
-import chex
 import jax.lax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
@@ -40,12 +39,12 @@ def position_ids_in_meshgrid(patch_embeds_list, max_width):
     """Generates position IDs based on a meshgrid for a list of patch embeddings.
 
     Args:
-        patch_embeds_list (list[chex.Array]): A list of patch embeddings, where each element
+        patch_embeds_list (list[Array]): A list of patch embeddings, where each element
             has shape (..., height, width).
         max_width (int): The maximum width across all patches, used for calculating the linear index.
 
     Returns:
-        chex.Array: A 1D array of position IDs corresponding to the flattened patches.
+        Array: A 1D array of position IDs corresponding to the flattened patches.
     """
     positions = []
     for patch in patch_embeds_list:
@@ -57,7 +56,6 @@ def position_ids_in_meshgrid(patch_embeds_list, max_width):
     return jnp.concatenate(positions)
 
 
-# TODO:Make this jitable
 def generate_block_attention_mask(patch_embeds_list, tensor):
     """Generates a block-diagonal attention mask for multi-image processing.
 
@@ -66,11 +64,11 @@ def generate_block_attention_mask(patch_embeds_list, tensor):
 
     Args:
         patch_embeds_list (list[int]): A list containing the number of patches for each image.
-        tensor (chex.Array): The input tensor (e.g., hidden states) with shape
+        tensor (Array): The input tensor (e.g., hidden states) with shape
             (batch_size, sequence_length, ...).
 
     Returns:
-        chex.Array: A block-diagonal attention mask of shape
+        Array: A block-diagonal attention mask of shape
             (batch_size, 1, sequence_length, sequence_length).
             The mask contains 0.0 for allowed attention positions and a large negative number
             (minimum float value) for masked positions.
@@ -78,25 +76,17 @@ def generate_block_attention_mask(patch_embeds_list, tensor):
     dtype = tensor.dtype
     seq_len = tensor.shape[1]
     d_min = jnp.finfo(dtype).min
-    causal_mask = jnp.full((seq_len, seq_len), fill_value=d_min, dtype=dtype)
+    patch_lengths = jnp.asarray(patch_embeds_list, dtype=jnp.int32)
+    block_end_idx = jnp.cumsum(patch_lengths)
 
-    block_end_idx = jnp.cumsum(jnp.array(patch_embeds_list))
-    block_start_idx = jnp.cumsum(jnp.array([0, *patch_embeds_list[:-1]]))
+    positions = jnp.arange(seq_len, dtype=jnp.int32)
+    block_ids = jnp.sum(positions[:, None] >= block_end_idx[None, :], axis=-1)
+    same_block = block_ids[:, None] == block_ids[None, :]
 
-    def update_mask(mask, start_end):
-        start, end = start_end
-        return mask.at[start:end, start:end].set(0)
-
-    causal_mask = jax.lax.fori_loop(
-        0,
-        len(block_start_idx),
-        lambda i, mask: update_mask(mask, (block_start_idx[i], block_end_idx[i])),
-        causal_mask,
-    )
-
-    causal_mask = jnp.expand_dims(causal_mask, axis=(0, 1))
-    causal_mask = jnp.broadcast_to(causal_mask, (tensor.shape[0], 1, seq_len, seq_len))
-    return causal_mask
+    block_mask = jnp.where(same_block, jnp.array(0, dtype=dtype), d_min)
+    block_mask = jnp.expand_dims(block_mask, axis=(0, 1))
+    block_mask = jnp.broadcast_to(block_mask, (tensor.shape[0], 1, seq_len, seq_len))
+    return block_mask
 
 
 def compute_frequencies(dim: int, max_patches_per_side: int, theta: float = 10000.0):
@@ -161,8 +151,18 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=0):
     Returns:
         `tuple(jnp.ndarray)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    cos = jnp.expand_dims(cos, axis=unsqueeze_dim)
-    sin = jnp.expand_dims(sin, axis=unsqueeze_dim)
+    # Pixtral uses `[batch, seq_len, heads, head_dim]` layout for Q/K. Accept RoPE
+    # inputs as either `[seq_len, head_dim]` or `[batch, seq_len, head_dim]` and
+    # reshape to broadcast across `heads`.
+    if cos.ndim == 2:
+        cos = cos[None, :, None, :]
+        sin = sin[None, :, None, :]
+    elif cos.ndim == 3:
+        cos = cos[:, :, None, :]
+        sin = sin[:, :, None, :]
+    else:
+        cos = jnp.expand_dims(cos, axis=unsqueeze_dim)
+        sin = jnp.expand_dims(sin, axis=unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -246,13 +246,25 @@ class PixtralMLP(nn.Module):
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
-        """Forward pass of the PixtralMLP module.
+        """Forward pass of the PixtralMLP module implementing a Gated Linear Unit structure.
+
+        This method applies a two-stream gated feedforward transformation:
+        1. Gate stream: hidden_states -> gate_proj -> activation
+        2. Value stream: hidden_states -> up_proj
+        3. Combine: element-wise multiply gate and value
+        4. Project down: down_proj to original hidden dimension
 
         Args:
-            hidden_states (jnp.ndarray): Input hidden states.
+            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input hidden states tensor.
+                Shape: (batch_size, sequence_length, hidden_size)
 
         Returns:
             jnp.ndarray: Output hidden states after MLP transformation.
+                Shape: (batch_size, sequence_length, hidden_size)
+
+        Note:
+            The method applies logical sharding for distributed training and uses
+            checkpoint_name for gradient checkpointing at intermediate steps.
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -354,6 +366,7 @@ class PixtralAttention(AttentionModule):
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=config.attention_dropout,
+            requires_cache=False,  # Vision encoder doesn't need KV cache
         )
 
     def __call__(
@@ -364,19 +377,40 @@ class PixtralAttention(AttentionModule):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
-        """Forward pass of the PixtralAttention module.
+        """Forward pass of the PixtralAttention module with Rotary Position Embeddings.
+
+        This method implements multi-head self-attention with the following steps:
+        1. Project input to queries, keys, and values
+        2. Reshape projections to separate attention heads
+        3. Apply Rotary Position Embeddings (RoPE) to queries and keys
+        4. Compute attention scores and apply masking
+        5. Apply attention to values and project output
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input hidden states.
+                Shape: (batch_size, sequence_length, hidden_size)
+            mask_info (MaskInfo): Mask information object containing attention masks
+                and position information for proper masking of attention scores.
+            position_ids (Int[Array, "batch seq_len"]): Position indices for the tokens.
+                Shape: (batch_size, sequence_length). Used to index into RoPE frequencies.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+            frequencies (Float[Array, "seq_len head_dim"], optional): Precomputed 2D rotary
+                frequency embeddings for position encoding. If None, standard behavior applies.
+                Shape: (max_positions, head_dim)
 
         Returns:
-            tp.Union[tp.Tuple[chex.Array, chex.Array], tp.Tuple[chex.Array]]:
-                A tuple containing the attention output hidden states. If `output_attentions` is True,
-                it also includes the attention weights.
+            AttentionLayerOutput: Object containing:
+                - attention_output (Array): Output hidden states after attention.
+                    Shape: (batch_size, sequence_length, hidden_size)
+                - attention_weight (Array, optional): Attention weights if output_attentions=True.
+                    Shape: (batch_size, num_heads, sequence_length, sequence_length)
+                - cache_view: Cache view for key-value caching (None for vision encoder)
+
+        Note:
+            Unlike causal language models, the vision encoder uses bidirectional attention
+            controlled by the mask_info parameter, allowing patches to attend to all other
+            patches within the same image (enforced via block-diagonal masking).
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
@@ -423,11 +457,10 @@ class PixtralAttention(AttentionModule):
         ) = self.concatenate(
             query=query_states,
             key=key_states,
-            cache_view=None,
             value=value_states,
             mask_info=mask_info,
-            causal_mask=None,
-            fcm_mask=None,
+            cache_view=None,
+            cache_metadata=None,
         )
 
         attentions = self.attention_performer.forward(
@@ -438,7 +471,7 @@ class PixtralAttention(AttentionModule):
             bias=None,
             cache_metadata=None,
             init_bias=init_attention_bias,
-            attention_mask=mask_info,
+            mask_info=mask_info,
             causal=True,
         )
 
@@ -540,18 +573,39 @@ class PixtralBlock(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
-        """Forward pass of the PixtralBlock module.
+        """Forward pass of the PixtralBlock implementing pre-norm transformer architecture.
+
+        This method applies a standard transformer block with:
+        1. Pre-normalization before attention (attention_norm)
+        2. Self-attention with residual connection
+        3. Pre-normalization before feed-forward (ffn_norm)
+        4. Feed-forward network with residual connection
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input hidden states.
+                Shape: (batch_size, sequence_length, hidden_size)
+            mask_info (MaskInfo): Mask information object containing attention masks
+                and position information.
+            position_ids (Int[Array, "batch seq_len"]): Position indices for the tokens.
+                Shape: (batch_size, sequence_length)
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+            frequencies (Float[Array, "seq_len head_dim"], optional): Precomputed rotary
+                frequency embeddings for position encoding.
+                Shape: (max_positions, head_dim)
 
         Returns:
-            tp.Tuple[chex.Array, tp.Optional[chex.Array]]:
-                A tuple containing the output hidden states and optionally the attention weights.
+            DecoderLayerOutput: Object containing:
+                - hidden_states (Array): Output hidden states after the transformer block.
+                    Shape: (batch_size, sequence_length, hidden_size)
+                - attention_weight (Array, optional): Attention weights if output_attentions=True.
+                    Shape: (batch_size, num_heads, sequence_length, sequence_length)
+                - cache_view: Cache view for key-value caching (None for vision encoder)
+
+        Note:
+            The block uses RMSNorm for layer normalization and supports optional
+            block-wise FFN computation via scan for memory efficiency when
+            config.use_scan_mlp is enabled.
         """
         residual = hidden_states
         attention_output = self.attention(
@@ -632,44 +686,59 @@ class PixtralTransformer(nn.Module):
     def __call__(
         self,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"],
-        position_embeddings: chex.Array | None = None,
+        position_embeddings: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass of the PixtralTransformer module.
+        """Forward pass of the PixtralTransformer processing patch embeddings through transformer layers.
+
+        This method processes patch embeddings through a stack of transformer blocks,
+        optionally collecting hidden states and attention weights from each layer.
 
         Args:
-            inputs_embeds (chex.Array): Input patch embeddings.
-            position_embeddings (tp.Optional[chex.Array]): Precomputed position embeddings (unused in standard RoPE).
-            attention_mask (tp.Optional[chex.Array]): Mask to apply on the attention scores.
-                Shape: (batch_size, 1, query_length, key_length).
-            position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"]): Input patch embeddings
+                from the patch convolution layer.
+                Shape: (batch_size, num_patches, hidden_size)
+            position_embeddings (Array, optional): Precomputed 2D RoPE position embeddings.
+                Shape: (num_patches, head_dim). These are the frequencies used for rotation.
+            attention_mask (Bool[Array, "batch seq_len"], optional): Boolean mask for attention.
+                Shape: (batch_size, 1, num_patches, num_patches).
+                True indicates positions to mask (no attention).
+            mask_info (MaskInfo, optional): Structured mask information object. If None,
+                will be constructed from attention_mask.
+            position_ids (Int[Array, "batch seq_len"], optional): Position indices for patches.
+                Shape: (batch_size, num_patches). If None, uses sequential positions.
+            output_attentions (bool, optional): Whether to return attention weights from all layers.
+                Defaults to config.output_attentions.
+            output_hidden_states (bool, optional): Whether to return hidden states from all layers.
+                Defaults to config.output_hidden_states.
 
         Returns:
-            BaseModelOutput: The transformer's output.
-                returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-                and `attentions` (optional).
+            BaseModelOutput: Object containing:
+                - last_hidden_state (Array): Final layer output.
+                    Shape: (batch_size, num_patches, hidden_size)
+                - hidden_states (tuple, optional): Hidden states from all layers if requested.
+                    Each element shape: (batch_size, num_patches, hidden_size)
+                - attentions (tuple, optional): Attention weights from all layers if requested.
+                    Each element shape: (batch_size, num_heads, num_patches, num_patches)
+                - past_key_values: Always None for vision encoder
+
+        Raises:
+            AssertionError: If sequence_length exceeds max_position_embeddings.
+
+        Note:
+            The transformer uses pre-normalization architecture with RMSNorm and
+            processes patches with bidirectional attention (controlled by mask_info).
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
-        sequence_length = inputs_embeds.shape[1]
-
-        assert sequence_length <= self.config.max_position_embeddings, (
-            f"Maximum Position Embedding Reached ! "
-            f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
-        )
 
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
-            input_ids=input_ids,
+            input_ids=None,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
         )
@@ -687,7 +756,7 @@ class PixtralTransformer(nn.Module):
                 mask_info=mask_info,
                 position_ids=position_ids,
                 output_attentions=output_attentions,
-                position_embeddings=position_embeddings,
+                frequencies=position_embeddings,
             )
             hidden_states = layer_outputs.hidden_states
 
@@ -785,31 +854,64 @@ class PixtralVisionModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        pixel_values: list[chex.Array],
+        pixel_values: list[Array],
         output_hidden_states: bool | None = False,
         output_attentions: bool | None = None,
         *args,
         **kwargs,
     ) -> tuple | BaseModelOutput:
-        """Forward pass of the PixtralVisionModel.
+        """Forward pass of the PixtralVisionModel for processing variable-resolution images.
 
-        Processes a list of input images through patch embedding and the transformer stack.
-        Handles multiple images by concatenating their patch embeddings and applying a block-diagonal attention mask.
+        This method processes a batch of images (potentially of different sizes) through:
+        1. Patch embedding via convolution
+        2. RMSNorm pre-normalization
+        3. 2D Rotary Position Embedding (RoPE) computation
+        4. Block-diagonal attention masking for multi-image batches
+        5. Transformer processing
+
+        The key innovation is supporting multiple images of different resolutions in a single
+        batch by using block-diagonal attention masks to prevent cross-image attention.
 
         Args:
-            pixel_values (tp.List[chex.Array]): A list of input images, where each image is a tensor of shape
-                (batch_size, num_channels, height, width).
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            *args: Additional positional arguments (unused).
-            **kwargs: Additional keyword arguments (unused).
+            pixel_values (list[Array]): List of input images, where each image is a tensor
+                of shape (num_channels, height, width). Images can have different heights
+                and widths. The list length determines the number of images in the batch.
+                Note: Each image should be in CHW format (channels, height, width).
+            output_hidden_states (bool, optional): Whether to return hidden states from all
+                transformer layers. Defaults to False.
+            output_attentions (bool, optional): Whether to return attention weights from all
+                transformer layers. Defaults to config.output_attentions.
+            *args: Additional positional arguments (unused, for compatibility).
+            **kwargs: Additional keyword arguments (unused, for compatibility).
 
         Returns:
-            tp.Union[tp.Tuple, BaseModelOutput]: The model's output.
-                returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-                and `attentions` (optional).
+            BaseModelOutput: Object containing:
+                - last_hidden_state (Array): Final vision encoder output.
+                    Shape: (1, total_num_patches, hidden_size) where total_num_patches
+                    is the sum of patches from all images in the batch.
+                - hidden_states (tuple, optional): Hidden states from all layers if requested.
+                    Each element has shape matching last_hidden_state.
+                - attentions (tuple, optional): Attention weights from all layers if requested.
+                    Each element shape: (1, num_heads, total_num_patches, total_num_patches)
+                    with block-diagonal structure for multi-image batches.
+
+        Example:
+            ```python
+            # Process images of different sizes
+            image1 = jnp.zeros((3, 1024, 1024))  # 64x64 patches
+            image2 = jnp.zeros((3, 512, 768))     # 32x48 patches
+
+            outputs = model(pixel_values=[image1, image2])
+            # outputs.last_hidden_state shape: (1, 4096 + 1536, 1024)
+            #   = (1, 64*64 + 32*48, hidden_size)
+            ```
+
+        Note:
+            The method handles variable image sizes by:
+            - Computing patches independently for each image
+            - Concatenating all patches into a single sequence
+            - Using 2D position IDs that preserve spatial structure
+            - Applying block-diagonal masks to isolate each image's attention
         """
         patch_embeds_list = [
             self.patch_conv(jnp.expand_dims(img, 0).astype(self.dtype).transpose(0, 2, 3, 1)) for img in pixel_values

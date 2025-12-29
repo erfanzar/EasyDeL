@@ -34,6 +34,8 @@ from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -434,7 +436,7 @@ class Glm4MoeDecoderLayer(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -537,12 +539,49 @@ class Glm4MoeModel(EasyDeLBaseModule):
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
-        past_key_values: TransformerCache | RaggedPagesCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
     ) -> MoeModelOutput:
+        """Forward pass through GLM-4-MoE base model with grouped expert routing.
+
+        Processes input through transformer layers with hybrid dense-sparse architecture.
+        Early layers use dense FFN, deeper layers use grouped mixture-of-experts routing.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Mutually exclusive
+                with inputs_embeds. Token indices in vocabulary [0, config.vocab_size).
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length, hidden_size).
+                Mutually exclusive with input_ids. Use for custom embedding manipulation.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) where True indicates
+                valid tokens and False indicates padding. Auto-computed if None.
+            mask_info: Pre-computed mask information for attention operations. Auto-computed via
+                MaskInfo.dynamic_init if None.
+            position_ids: Position indices of shape (batch_size, sequence_length) for RoPE. Defaults
+                to sequential positions from mask_info if None.
+            mode: Runtime mode (MODE_TRAIN/DECODE/EVAL). Auto-detected: MODE_DECODE if seq_len=1 and
+                cache exists, else MODE_TRAIN.
+            past_key_values: Cached key-value states from previous forward passes for autoregressive
+                generation. Can be TransformerCache, RaggedPagesCache, or HybridCache.
+            cache_metadata: Metadata for paged attention operations (sequence lengths, block tables).
+            output_attentions: Whether to return attention weights from all layers. Defaults to False.
+            output_hidden_states: Whether to return hidden states from all layers. Defaults to False.
+            output_router_logits: Whether to return MoE router logits for load balancing loss computation.
+                Defaults to False. Router logits are only returned from MoE layers (layers >= first_k_dense_replace).
+
+        Returns:
+            MoeModelOutput containing:
+                - last_hidden_state: Final layer output of shape (batch_size, sequence_length, hidden_size).
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True, else None.
+                    Each element has shape (batch_size, sequence_length, hidden_size).
+                - attentions: Tuple of attention weights if output_attentions=True, else None.
+                    Each element has shape (batch_size, num_heads, sequence_length, sequence_length).
+                - router_logits: Tuple of router logits from MoE layers if output_router_logits=True, else None.
+                    Each element has shape (batch_size, sequence_length, n_routed_experts).
+                - past_key_values: Updated cache for next generation step.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"

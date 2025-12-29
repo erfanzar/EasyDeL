@@ -23,7 +23,7 @@ by storing previously computed key and value states, avoiding redundant
 computation during inference.
 
 Key Components:
-    - TransformerCacheMetaData: Configuration for cache dimensions and behavior
+    - TransformerCacheConfig: Configuration for cache dimensions and behavior
     - TransformerCacheView: Per-layer cache storage and update logic
     - TransformerCache: Multi-layer cache orchestration
     - TransformerMetadata: Runtime metadata for cache operations
@@ -38,7 +38,7 @@ Features:
 
 Example:
     >>> # Initialize cache metadata
-    >>> metadata = TransformerCacheMetaData.create(
+    >>> metadata = TransformerCacheConfig.create(
     ...     batch_size=2,
     ...     sequence_length=1024,
     ...     num_hidden_layers=12,
@@ -88,12 +88,21 @@ from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array as JAXArray
 from jaxtyping import Float, Int
 
-from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView, BaseRunTimeMetadata
+from .._abstracts import (
+    BaseCache,
+    BaseCacheConfig,
+    BaseCacheView,
+    BaseRunTimeMetadata,
+    OperationsMetadata,
+    unwrap_metadata,
+)
 
 if tp.TYPE_CHECKING:
+    from easydel.layers.caching.hybrid import HybridMetadata
     from easydel.layers.quantization.quantizers import EasyQuantizer
 else:
     EasyQuantizer = object
+    HybridMetadata = object
 
 
 @auto_pytree
@@ -131,6 +140,94 @@ KV_HEAD_DIM = common_types.KV_HEAD_DIM
 BIAS_HEAD_SEQ = common_types.BIAS_HEAD_SEQ
 BIAS_KV_SEQ = common_types.BIAS_KV_SEQ
 MODE_PREFILL = common_types.MODE_PREFILL
+
+
+def _mesh_partition_product(mesh: Mesh, axis_spec: object) -> int:
+    """Return the number of shards implied by a PartitionSpec entry for a given mesh."""
+    if axis_spec is None:
+        return 1
+    if isinstance(axis_spec, tuple):
+        prod = 1
+        for axis_name in axis_spec:
+            prod *= int(mesh.shape[axis_name])
+        return prod
+    return int(mesh.shape[axis_spec])
+
+
+def _sanitize_sharding_axes_for_shape(
+    *,
+    mesh: Mesh,
+    partition_manager: PartitionManager,
+    axes: list[object | None],
+    mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+    shape: tuple[int, ...],
+) -> tuple[object | None, ...]:
+    """Disable incompatible sharding axes for a given shape.
+
+    Some logical axes (e.g., KV_HEAD) may map to a mesh axis whose size is larger than
+    the corresponding dimension (or not divisible). In that case, JAX raises at array
+    creation / sharding constraint time. We conservatively fall back to replication for
+    those dimensions by replacing the logical axis with None.
+    """
+    spec = partition_manager.resolve(axes=axes, mode=mode, shape=shape)
+    safe: list[object | None] = []
+    for logical_axis, axis_spec, dim in zip(axes, spec, shape, strict=False):
+        if logical_axis is None or axis_spec is None:
+            safe.append(logical_axis)
+            continue
+        shard_factor = _mesh_partition_product(mesh, axis_spec)
+        if dim % shard_factor != 0:
+            safe.append(None)
+        else:
+            safe.append(logical_axis)
+    return tuple(safe)
+
+
+def _expand_mask_kv_dim(
+    mask_info: MaskInfo,
+    target_kv_len: int,
+    cache_position: jnp.ndarray,
+    query_len: int,
+) -> MaskInfo:
+    """Expand mask's KV dimension to match cache size.
+
+    When using HybridCache with TransformerCacheView, the mask may have
+    a smaller KV dimension than the pre-allocated cache. This function
+    expands the mask by padding the KV dimension while preserving any existing
+    padding/segment masking.
+
+    Args:
+        mask_info: Original MaskInfo with potentially smaller KV dimension.
+        target_kv_len: Target KV dimension (cache's sequence length).
+        cache_position: Current position in the cache [batch].
+        query_len: Length of the query sequence.
+
+    Returns:
+        MaskInfo with expanded KV dimension.
+    """
+    current_kv_len = mask_info.kv_len
+
+    if current_kv_len >= target_kv_len:
+        return mask_info
+
+    # Preserve any existing padding/segment mask and expand the KV dimension.
+    #
+    # Important: the extra KV positions correspond to *future tokens* that will be written
+    # into the preallocated cache during generation. They must NOT be treated as padding
+    # (otherwise newly generated tokens will remain permanently masked). Instead, we mark
+    # them as "valid" and rely on `MaskInfo.apply_kv_lengths` and causal masking to keep
+    # them inactive until they are actually populated.
+    attn = mask_info.get_or_compute_attention_mask(dtype=jnp.bool_)  # (B, H, Q, K)
+    pad_k = target_kv_len - current_kv_len
+    attn = jnp.pad(attn, ((0, 0), (0, 0), (0, 0), (0, pad_k)), constant_values=True)
+
+    kv_seg = getattr(mask_info, "_kv_segment_ids", None)
+    if kv_seg is not None and kv_seg.shape[-1] == current_kv_len:
+        # Segment id -1 is reserved for padding; use 0 so future positions are considered valid.
+        kv_seg = jnp.pad(jnp.asarray(kv_seg, dtype=jnp.int32), ((0, 0), (0, pad_k)), constant_values=0)
+
+    del cache_position, query_len
+    return mask_info.replace(attention_mask=attn, kv_segment_ids=kv_seg)
 
 
 @register("dynamic_update_slice")
@@ -186,7 +283,7 @@ def _(
 
 
 @auto_pytree
-class TransformerCacheMetaData(BaseCacheMetadata):
+class TransformerCacheConfig(BaseCacheConfig):
     """Metadata configuration for transformer key-value caching.
 
     Stores all static configuration needed to initialize and operate
@@ -238,7 +335,7 @@ class TransformerCacheMetaData(BaseCacheMetadata):
         batch_size: int,
         sequence_length: int,
         num_hidden_layers: int,
-        pad_token_id: int,
+        pad_token_id: int = -100,
         num_heads: int | None = None,
         head_dim: int | None = None,
         key_heads: int | None = None,
@@ -248,9 +345,9 @@ class TransformerCacheMetaData(BaseCacheMetadata):
         update_causal_mask: bool = True,
         create_attention_bias: bool = True,
         sliding_window: int | None = None,
-    ) -> TransformerCacheMetaData:
+    ) -> TransformerCacheConfig:
         """
-        Create a TransformerCacheMetaData instance with validation.
+        Create a TransformerCacheConfig instance with validation.
 
         Arguments:
             batch_size: Size of the batch.
@@ -266,7 +363,7 @@ class TransformerCacheMetaData(BaseCacheMetadata):
             create_attention_bias: Whether to create attention bias.
 
         Returns:
-            TransformerCacheMetaData instance
+            TransformerCacheConfig instance
 
         Raises:
             ValueError: If required parameters are missing or invalid.
@@ -332,7 +429,7 @@ class TransformerCacheView(BaseCacheView):
             Shape: [batch_size]
         starts (cx.Array | ImplicitArray): Starting position per sequence.
             Shape: [batch_size]
-        metadata (TransformerCacheMetaData): Static cache configuration.
+        metadata (TransformerCacheConfig): Static cache configuration.
         maximum_sequence_length (int): Maximum cacheable sequence length.
         layer_index (int | None): Index of this layer in the model.
         masking_details (AttnMaskDetail | None): Attention mask configuration.
@@ -343,79 +440,108 @@ class TransformerCacheView(BaseCacheView):
     indexs: Int[JAXArray, "batch"] | ImplicitArray  # noqa: F821
     starts: Int[JAXArray, "batch"] | ImplicitArray  # noqa: F821
 
-    metadata: TransformerCacheMetaData
+    metadata: TransformerCacheConfig
 
     maximum_sequence_length: int = field(pytree_node=False)
 
     layer_index: int | None = field(pytree_node=False, default=None)
     masking_details: AttnMaskDetail | None = field(pytree_node=False, default=None)
+    kv_sharding_axes: tuple[object | None, ...] = field(
+        pytree_node=False, default_factory=lambda: (BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM)
+    )
+    batch_sharding_axes: tuple[object | None, ...] = field(pytree_node=False, default_factory=lambda: (BATCH,))
 
     @classmethod
     def init(
         cls,
-        mesh: Mesh,
-        dtype: jnp.dtype,
-        metadata: TransformerCacheMetaData,
-        quantizer: EasyQuantizer,
-        partition_manager: PartitionManager,
-        starts: Int[JAXArray, "batch"] | None = None,  # noqa: F821
+        config: TransformerCacheConfig,
         layer_index: int | None = None,
+        *,
+        mesh: Mesh | None = None,
+        dtype: jnp.dtype = jnp.bfloat16,
+        partition_manager: PartitionManager | None = None,
+        quantizer: EasyQuantizer | None = None,
         masking_details: AttnMaskDetail | None = None,
+        starts: Int[JAXArray, "batch"] | None = None,  # noqa: F821
     ):
-        """Initialize a transformer cache view for a single layer.
+        """Initialize a TransformerCacheView from a cache config.
 
         Creates and allocates cache tensors with appropriate shapes,
-        dtypes, and sharding for distributed execution. Applies
-        quantization if configured.
+        dtypes, and sharding for distributed execution.
 
         Args:
-            mesh (Mesh): JAX device mesh for distributed execution.
-            dtype (jnp.dtype): Data type for cache tensors.
-            metadata (TransformerCacheMetaData): Cache configuration.
-            quantizer (EasyQuantizer): Quantization configuration.
-            partition_manager (PartitionManager): Sharding strategy manager.
-            starts (jax.Array | None): Initial starting positions per sequence.
-                Defaults to zeros if not provided.
-            layer_index (int | None): Index of this layer in the model.
-            masking_details (AttnMaskDetail | None): Attention mask configuration.
+            config: TransformerCacheConfig with cache dimensions.
+            layer_index: Index of this layer in the model.
+            mesh: JAX device mesh for sharding.
+            dtype: Data type for cache tensors.
+            partition_manager: Partition manager for sharding.
+            quantizer: Quantization configuration.
+            masking_details: Attention mask configuration.
+            starts: Initial starting positions per sequence.
 
         Returns:
-            TransformerCacheView: Initialized cache view with allocated tensors.
-
-        Note:
-            For sliding window attention, cache dimensions are adjusted
-            based on the window size specified in masking_details.
+            TransformerCacheView: Initialized cache view.
         """
         from easydel.infra.utils import AttnMaskType
+        from easydel.layers.quantization.quantizers import EasyQuantizer as EQ
+
+        if quantizer is None:
+            quantizer = EQ(quantization_config=None)
 
         with jax.named_scope("easydel-transformer-cacheview-init"):
-            mt = metadata
+            mt = config
             kshape = (mt.batch_size, mt.sequence_length, mt.key_heads, mt.key_dim)
             vshape = (mt.batch_size, mt.sequence_length, mt.value_heads, mt.value_dim)
-            kv_sharding_axes = [BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM]
+            kv_sharding_axes: list[object | None] = [BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM]
             if masking_details is not None:
                 if masking_details.mask_type == AttnMaskType.SLIDING:
                     kshape = (mt.batch_size, min(masking_details.size, mt.sequence_length), mt.key_heads, mt.key_dim)
                     vshape = (mt.batch_size, min(masking_details.size, mt.sequence_length), mt.value_heads, mt.value_dim)
 
+            kv_safe_k = _sanitize_sharding_axes_for_shape(
+                mesh=mesh, partition_manager=partition_manager, axes=kv_sharding_axes, mode=MODE_PREFILL, shape=kshape
+            )
+            kv_safe_v = _sanitize_sharding_axes_for_shape(
+                mesh=mesh, partition_manager=partition_manager, axes=kv_sharding_axes, mode=MODE_PREFILL, shape=vshape
+            )
+            kv_sharding_axes = [
+                axis if (kv_safe_k[i] is not None and kv_safe_v[i] is not None) else None
+                for i, axis in enumerate(kv_sharding_axes)
+            ]
+
+            batch_axes: list[object | None] = [BATCH]
+            batch_safe = _sanitize_sharding_axes_for_shape(
+                mesh=mesh,
+                partition_manager=partition_manager,
+                axes=batch_axes,
+                mode=MODE_PREFILL,
+                shape=(mt.batch_size,),
+            )
+            if batch_safe[0] is None:
+                batch_axes = [None]
+
             kshardings = Ns(mesh, partition_manager.resolve(axes=kv_sharding_axes, mode=MODE_PREFILL, shape=kshape))
             vshardings = Ns(mesh, partition_manager.resolve(axes=kv_sharding_axes, mode=MODE_PREFILL, shape=vshape))
-            ishardings = Ns(mesh, partition_manager.resolve(axes=[BATCH], mode=MODE_PREFILL, shape=(mt.batch_size,)))
+            ishardings = Ns(mesh, partition_manager.resolve(axes=batch_axes, mode=MODE_PREFILL, shape=(mt.batch_size,)))
 
             if starts is None:
                 starts = jnp.zeros((mt.batch_size,), dtype=jnp.int32)
 
-            starts = apply_logical_sharding(starts, axes=[BATCH], mode=MODE_PREFILL, partition_manager=partition_manager)
+            starts = apply_logical_sharding(
+                starts, axes=batch_axes, mode=MODE_PREFILL, partition_manager=partition_manager
+            )
 
             out = cls(
                 key=quantizer(jnp.zeros(shape=kshape, dtype=dtype, device=kshardings)),
                 value=quantizer(jnp.zeros(shape=vshape, dtype=dtype, device=vshardings)),
-                indexs=jnp.zeros((metadata.batch_size,), dtype=jnp.int32, device=ishardings),
+                indexs=jnp.zeros((config.batch_size,), dtype=jnp.int32, device=ishardings),
                 starts=starts,
-                metadata=metadata,
+                metadata=config,
                 layer_index=layer_index,
                 masking_details=masking_details,
                 maximum_sequence_length=mt.sequence_length,
+                kv_sharding_axes=tuple(kv_sharding_axes),
+                batch_sharding_axes=tuple(batch_axes),
             )
         return out
 
@@ -427,7 +553,7 @@ class TransformerCacheView(BaseCacheView):
         value: Float[JAXArray, "batch query_len num_value_heads value_dim"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         quantizer: EasyQuantizer,
-        cache_metadata: TransformerMetadata | None,
+        cache_metadata: "TransformerMetadata | OperationsMetadata | HybridMetadata | None",
         mask_info: MaskInfo,
         partition_manager: PartitionManager,
     ) -> tuple[
@@ -458,16 +584,27 @@ class TransformerCacheView(BaseCacheView):
         """
         from easydel.infra.utils import AttnMaskType
 
+        # Unwrap OperationsMetadata to TransformerMetadata if needed
+        cache_metadata = unwrap_metadata(cache_metadata, "transformer")
+
         runtime_dtype = query.dtype
         num_updated_cache_vectors = query.shape[1]
         masking_details = self.masking_details
         indexs = self.indexs
         sharding_statics = dict(mode=MODE_PREFILL, partition_manager=partition_manager)
 
+        # Expand mask KV dimension if it doesn't match cache size
+        # This is needed when using HybridCache with TransformerCacheView
+        cache_kv_len = self.key.shape[1]
+        mask_kv_len = mask_info.kv_len
+        if mask_kv_len < cache_kv_len:
+            mask_info = _expand_mask_kv_dim(mask_info, cache_kv_len, indexs, num_updated_cache_vectors)
+
         def _kv_struct_shard(
             x: Float[JAXArray, "batch seq_len num_heads head_dim"],
         ) -> Float[JAXArray, "batch seq_len num_heads head_dim"]:
-            return apply_logical_sharding(x, axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM], **sharding_statics)
+            axes = getattr(self, "kv_sharding_axes", (BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM))
+            return apply_logical_sharding(x, axes=axes, **sharding_statics)
 
         def _maybe_materialize(x: JAXArray | ImplicitArray) -> JAXArray:
             if hasattr(x, "materialize"):
@@ -518,18 +655,29 @@ class TransformerCacheView(BaseCacheView):
         mask_info = mask_info.apply_kv_lengths(
             kv_lengths=indexs,
             q_len=num_updated_cache_vectors,
+            end_index=indexs,
             sliding_window=sliding_window,
         )
 
-        value_cache_updated = _kv_struct_shard(value_cache_updated).astype(runtime_dtype)
-        key_cache_updated = _kv_struct_shard(key_cache_updated).astype(runtime_dtype)
-        indexs_updated = apply_logical_sharding(indexs, axes=[BATCH], **sharding_statics)
+        # Keep the cache storage dtype stable (matches the cache allocation dtype) while
+        # returning KV in runtime dtype for the attention computation.
+        value_cache_storage = _kv_struct_shard(value_cache_updated)
+        key_cache_storage = _kv_struct_shard(key_cache_updated)
+        batch_axes = getattr(self, "batch_sharding_axes", (BATCH,))
+        indexs_updated = apply_logical_sharding(indexs, axes=batch_axes, **sharding_statics)
+
+        value_cache_out = value_cache_storage.astype(runtime_dtype)
+        key_cache_out = key_cache_storage.astype(runtime_dtype)
 
         return (
-            key_cache_updated,
-            value_cache_updated,
+            key_cache_out,
+            value_cache_out,
             mask_info,
-            self.replace(key=quantizer(key_cache_updated), value=quantizer(value_cache_updated), indexs=indexs_updated),
+            self.replace(
+                key=quantizer(key_cache_storage),
+                value=quantizer(value_cache_storage),
+                indexs=indexs_updated,
+            ),
             masking_details,
         )
 
@@ -574,7 +722,7 @@ class TransformerCache(BaseCache):
     def init_cache(
         cls,
         mesh: Mesh,
-        metadata: TransformerCacheMetaData,
+        config: TransformerCacheConfig,
         partition_manager: PartitionManager,
         dtype: jnp.dtype | None = None,
         starts: Int[JAXArray, "batch"] | None = None,  # noqa: F821
@@ -589,22 +737,21 @@ class TransformerCache(BaseCache):
         with mesh:
             return cls(
                 views=[
-                    # i have to somehow fix my OCD
                     TransformerCacheView.init(
+                        config=config,
+                        layer_index=layer_index,
                         mesh=mesh,
                         dtype=dtype,
                         starts=starts,
-                        metadata=metadata,
                         quantizer=quantizer,
-                        layer_index=layer_index,
                         masking_details=mask_type_details.get(layer_index) if mask_type_details is not None else None,
                         partition_manager=partition_manager,
                     )
-                    for layer_index in range(metadata.num_hidden_layers)
+                    for layer_index in range(config.num_hidden_layers)
                 ]
             )
 
-    def to_pure(self) -> tuple[list[list[JAXArray | ImplicitArray]], TransformerCacheMetaData]:
+    def to_pure(self) -> tuple[list[list[JAXArray | ImplicitArray]], TransformerCacheConfig]:
         """Convert cache to pure Python data structure for serialization.
 
         Extracts raw tensors and metadata for checkpointing or transfer.
@@ -621,9 +768,7 @@ class TransformerCache(BaseCache):
         )
 
     @classmethod
-    def from_pure(
-        cls, pure: list[list[JAXArray | ImplicitArray]], metadata: TransformerCacheMetaData
-    ) -> TransformerCache:
+    def from_pure(cls, pure: list[list[JAXArray | ImplicitArray]], metadata: TransformerCacheConfig) -> TransformerCache:
         """Reconstruct cache from pure Python data structure.
 
         Restores a cache from serialized tensors and metadata,

@@ -40,6 +40,19 @@ class TestGemma3Text:
         )
         assert result.success, f"Gemma3 text CAUSAL_LM failed: {result.error_message or result.comparison.details}"
 
+    def test_generation(self, gemma3_text_config, small_model_config):
+        """Test Gemma3 text generation."""
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="gemma3_text",
+            hf_class=transformers.Gemma3ForCausalLM,
+            task=ed.TaskType.CAUSAL_LM,
+            config=gemma3_text_config,
+            small_model_config=small_model_config,
+            max_new_tokens=16,
+        )
+        assert result.success, f"Gemma3 text generation failed: {result.error_message}"
+
 
 if __name__ == "__main__":
     import pytest

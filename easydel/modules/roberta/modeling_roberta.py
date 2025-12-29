@@ -39,7 +39,17 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.base_modules import (
+    BaseCausalLMModule,
+    BaseQuestionAnsweringModule,
+    BaseSequenceClassificationModule,
+    BaseTaskModule,
+    BaseTokenClassificationModule,
+)
 from easydel.layers.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
     TransformerCache,
@@ -150,6 +160,7 @@ class RobertaSelfAttention(AttentionModule):
             base_config=config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=0.0,
+            requires_cache=False,  # RoBERTa is encoder-only, doesn't need KV cache
         )
         self.query = ColumnParallelLinear(
             self.config.hidden_size,
@@ -187,10 +198,10 @@ class RobertaSelfAttention(AttentionModule):
         Merges the attention heads into a single hidden state tensor.
 
         Args:
-            hidden_states (chex.Array): The hidden states with separate head dimensions.
+            hidden_states (Array): The hidden states with separate head dimensions.
 
         Returns:
-            chex.Array: The hidden states with merged head dimensions.
+            Array: The hidden states with merged head dimensions.
         """
         return hidden_states.reshape((*hidden_states.shape[:2], self.config.hidden_size))
 
@@ -201,7 +212,7 @@ class RobertaSelfAttention(AttentionModule):
         layer_head_mask: Bool[Array, "num_heads"] | None,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         key_value_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool = False,
     ):
@@ -358,7 +369,7 @@ class RobertaAttention(nn.Module):
         layer_head_mask,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         key_value_states=None,
         output_attentions: bool = False,
     ):
@@ -514,7 +525,7 @@ class RobertaLayer(nn.Module):
         layer_head_mask,
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_mask_info: MaskInfo | None = None,
         output_attentions: bool = False,
@@ -599,8 +610,8 @@ class RobertaEncoder(nn.Module):
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_mask_info: MaskInfo | None = None,
-        past_key_values: TransformerCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -870,7 +881,7 @@ class RobertaModel(EasyDeLBaseModule):
         head_mask: Bool[Array, "num_heads"] | None = None,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        past_key_values: TransformerCache | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -880,9 +891,15 @@ class RobertaModel(EasyDeLBaseModule):
 
         # make sure `position_ids` is correctly initialized when not passed
         if attention_mask is None:
-            attention_mask = jnp.ones_like(input_ids)
+            attention_mask = jnp.ones_like(input_ids, dtype=jnp.bool_)
+        else:
+            attention_mask = attention_mask.astype(jnp.bool_)
         if position_ids is None:
-            position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
+            # Match HuggingFace RoBERTa's position id scheme:
+            # position_ids start at `padding_idx + 1` for non-padding tokens.
+            padding_idx = getattr(self.config, "pad_token_id", 0) or 0
+            position_ids = jnp.cumsum(attention_mask.astype("i4"), axis=1) + jnp.asarray(padding_idx, dtype="i4")
+            position_ids = jnp.where(attention_mask, position_ids, jnp.asarray(padding_idx, dtype="i4"))
 
         hidden_states = self.embeddings(
             input_ids=input_ids,
@@ -917,7 +934,6 @@ class RobertaModel(EasyDeLBaseModule):
                 # No padding - all ones
                 cross_attn_mask = jnp.ones((batch_size, decoder_seq_len, encoder_seq_len), dtype=jnp.bool_)
 
-            # Create MaskInfo from cross-attention mask [batch, 1, decoder_seq, encoder_seq]
             encoder_mask_info = MaskInfo.from_attention_mask(
                 attention_mask=cross_attn_mask[:, None, :, :],
             )
@@ -979,7 +995,7 @@ class RobertaModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=RobertaConfig, model_type="roberta")
-class RobertaForSequenceClassification(EasyDeLBaseModule):
+class RobertaForSequenceClassification(BaseSequenceClassificationModule[RobertaModel, RobertaConfig]):
     """RoBERTa backbone with a classification head for sequence-level labels."""
 
     def __init__(
@@ -991,20 +1007,24 @@ class RobertaForSequenceClassification(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.roberta = RobertaModel(
+        roberta = RobertaModel(
             config=config,
             dtype=dtype,
             add_pooling_layer=False,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
+        )
+        BaseTaskModule.__init__(
+            self,
+            config=config,
+            base_model=roberta,
+            base_model_name="roberta",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            pooling_strategy="first",
         )
         self.classifier = RobertaClassificationHead(
             config=config,
@@ -1016,11 +1036,11 @@ class RobertaForSequenceClassification(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids,
-        attention_mask,
-        token_type_ids,
-        position_ids,
-        head_mask,
+        input_ids: Int[Array, "batch seq_len"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        token_type_ids: Int[Array, "batch seq_len"] | None = None,
+        position_ids: Int[Array, "batch seq_len"] | None = None,
+        head_mask: Bool[Array, "num_heads"] | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -1181,7 +1201,7 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
         return self.roberta.get_embedding()
 
 
-class RobertaForTokenClassification(EasyDeLBaseModule):
+class RobertaForTokenClassification(BaseTokenClassificationModule[RobertaModel, RobertaConfig]):
     """RoBERTa encoder with token classification head for per-token labels."""
 
     def __init__(
@@ -1193,14 +1213,7 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.roberta = RobertaModel(
+        roberta = RobertaModel(
             config=config,
             dtype=dtype,
             add_pooling_layer=False,
@@ -1209,22 +1222,18 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
             rngs=rngs,
         )
         classifier_dropout = (
-            self.config.classifier_dropout
-            if self.config.classifier_dropout is not None
-            else self.config.hidden_dropout_prob
+            config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
         )
-        self.dropout = nn.Dropout(
-            rate=classifier_dropout,
-            rngs=rngs,
-        )
-        self.classifier = ColumnParallelLinear(
-            self.config.hidden_size,
-            self.config.num_labels,
+        super().__init__(
+            config=config,
+            base_model=roberta,
+            base_model_name="roberta",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
+            classifier_dropout=classifier_dropout,
+            classifier_bias=True,
         )
 
     def __call__(
@@ -1296,7 +1305,7 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
         return self.classifier
 
 
-class RobertaForQuestionAnswering(EasyDeLBaseModule):
+class RobertaForQuestionAnswering(BaseQuestionAnsweringModule[RobertaModel, RobertaConfig]):
     """RoBERTa encoder with start/end span heads for extractive QA."""
 
     def __init__(
@@ -1308,14 +1317,7 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.roberta = RobertaModel(
+        roberta = RobertaModel(
             config=config,
             dtype=dtype,
             add_pooling_layer=False,
@@ -1323,14 +1325,14 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.qa_outputs = ColumnParallelLinear(
-            self.config.hidden_size,
-            self.config.num_labels,
+        super().__init__(
+            config=config,
+            base_model=roberta,
+            base_model_name="roberta",
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
 
     def __call__(
@@ -1363,7 +1365,7 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
         )
 
         logits = self.qa_outputs(hidden_states)
-        start_logits, end_logits = jnp.split(logits, self.config.num_labels, axis=-1)
+        start_logits, end_logits = jnp.split(logits, 2, axis=-1)
         start_logits = start_logits.squeeze(-1)
         end_logits = end_logits.squeeze(-1)
 
@@ -1406,8 +1408,12 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=RobertaConfig, model_type="roberta")
-class RobertaForCausalLM(EasyDeLBaseModule):
+class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):
     """RoBERTa repurposed for causal language modeling with an LM head."""
+
+    _task_type = TaskType.CAUSAL_LM
+    _model_type = "roberta"
+    _config_class = RobertaConfig
 
     def __init__(
         self,
@@ -1418,14 +1424,7 @@ class RobertaForCausalLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(
-            config=config,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-        )
-        self.roberta = RobertaModel(
+        roberta = RobertaModel(
             config=config,
             add_pooling_layer=False,
             dtype=dtype,
@@ -1433,6 +1432,17 @@ class RobertaForCausalLM(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
+        BaseTaskModule.__init__(
+            self,
+            config=config,
+            base_model=roberta,
+            base_model_name="roberta",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self._lm_head_name = "lm_head"
         lm_head_block = RobertaLMHead
         lm_head_block = auto_remat(
             lm_head_block,
@@ -1448,6 +1458,12 @@ class RobertaForCausalLM(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+    def apply_lm_head(self, hidden_states: Array) -> Array:
+        shared_embedding = (
+            self.roberta.embeddings.word_embeddings.embedding.value if self.config.tie_word_embeddings else None
+        )
+        return self.lm_head(hidden_states, shared_embedding=shared_embedding)
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"],
@@ -1458,7 +1474,7 @@ class RobertaForCausalLM(EasyDeLBaseModule):
         head_mask: Bool[Array, "num_heads"] | None = None,
         encoder_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         encoder_attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        past_key_values: TransformerCache | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
@@ -1484,12 +1500,7 @@ class RobertaForCausalLM(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
-        if self.config.tie_word_embeddings:
-            shared_embedding = self.roberta.embeddings.word_embeddings.embedding.value
-        else:
-            shared_embedding = None
-
-        logits = self.lm_head(hidden_states, shared_embedding=shared_embedding)
+        logits = self.apply_lm_head(hidden_states)
 
         return CausalLMOutputWithCrossAttentions(
             logits=logits,

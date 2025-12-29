@@ -104,26 +104,36 @@ trainer.train()
 
 ## Command Line Training
 
-You can also run DPO training directly from the command line:
+The legacy `easydel.scripts.finetune.*` entrypoints have been removed in favor of the unified YAML runner.
 
 ```bash
-python -m easydel.scripts.finetune.dpo \
-  --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --dataset_name trl-lib/ultrafeedback_binarized \
-  --dataset_split "train[:90%]" \
-  --refrence_model_repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --attn_mechanism vanilla \
-  --beta 0.08 \
-  --loss_type sigmoid \
-  --max_length 2048 \
-  --max_prompt_length 1024 \
-  --total_batch_size 16 \
-  --learning_rate 1e-6 \
-  --log_steps 50 \
-  --num_train_epochs 3 \
-  --do_last_save \
-  --save_steps 1000 \
-  --use_wandb
+python -m easydel.scripts.elarge --config dpo.yaml
+```
+
+Example `dpo.yaml`:
+
+```yaml
+config:
+  model:
+    name_or_path: meta-llama/Llama-3.1-8B-Instruct
+  reference_model:
+    name_or_path: meta-llama/Llama-3.1-8B-Instruct
+  mixture:
+    informs:
+      - type: hf
+        data_files: trl-lib/ultrafeedback_binarized
+        split: "train[:90%]"
+  trainer:
+    trainer_type: dpo
+    beta: 0.08
+    loss_type: sigmoid
+    max_length: 2048
+    max_prompt_length: 1024
+    total_batch_size: 16
+    learning_rate: 1e-6
+    num_train_epochs: 3
+actions:
+  - train
 ```
 
 ## Dataset Format

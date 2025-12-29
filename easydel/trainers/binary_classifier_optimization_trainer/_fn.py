@@ -271,19 +271,21 @@ def training_step(
         Updated state and loss metrics.
     """
 
-    _, minibatch_size, batch_partition_spec = make_assertions_and_get_sizes(
-        batch=batch,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        batch_partition_spec=partition_spec,
-    )
-    batch = with_sharding_constraint(arr=batch, sharding=batch_partition_spec)
     running_delta = batch.get("running_mean")
     if running_delta is None:
         running_delta = jnp.array(0.0, dtype=jnp.float32)
     else:
         running_delta = jnp.asarray(running_delta).reshape(())
 
-    udm_weights_full = batch.get("udm_weights", None)
+    step_batch = dict(batch)
+    step_batch.pop("running_mean", None)
+
+    _, minibatch_size, batch_partition_spec = make_assertions_and_get_sizes(
+        batch=step_batch,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        batch_partition_spec=partition_spec,
+    )
+    step_batch = with_sharding_constraint(arr=step_batch, sharding=batch_partition_spec)
 
     def calculate_loss(tree: jax.ArrayTree, call_batch: dict[str, jax.Array]):
         model = state.merge(tree=tree)
@@ -304,8 +306,9 @@ def training_step(
             ref_outputs = concatenated_forward_fn(reference_model, call_batch)
             reference_completion_logps = jax.lax.stop_gradient(ref_outputs["completion_logps"])
 
-        if udm_weights_full is not None:
-            rejected_weights = jnp.where(rejected_mask, udm_weights_full.astype(completion_logps.dtype), 0.0)
+        udm_weights = call_batch.get("udm_weights", None)
+        if udm_weights is not None:
+            rejected_weights = jnp.where(rejected_mask, udm_weights.astype(completion_logps.dtype), 0.0)
         else:
             rejected_weights = None
 
@@ -351,7 +354,7 @@ def training_step(
 
     gradients, metrics = minibatch_call(
         state=state,
-        batch=batch,
+        batch=step_batch,
         minibatch_size=minibatch_size,
         grad_fn=jax.value_and_grad(calculate_loss, has_aux=True),
     )

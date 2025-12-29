@@ -191,6 +191,7 @@ class Glm4MoeConfig(EasyDeLBaseConfig):
         first_k_dense_replace=1,
         norm_topk_prob=True,
         use_qk_norm=False,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -225,6 +226,9 @@ class Glm4MoeConfig(EasyDeLBaseConfig):
         self.norm_topk_prob = norm_topk_prob
         self.use_qk_norm = use_qk_norm
         self.head_dim = hidden_size // num_attention_heads
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 

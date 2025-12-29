@@ -15,14 +15,21 @@
 # pyright:reportUnusedImport=none
 # pyright:reportImportCycles=none
 
-__version__ = "0.1.5"
+__version__ = "0.2.0"
 
 import os as _os
 import sys as _sys
 import typing as _tp
 from logging import getLogger as _getlogger
 
-from eformer.loggings import get_logger as _get_logger
+try:
+    from eformer.loggings import get_logger as _get_logger
+except ModuleNotFoundError:  # pragma: no cover
+
+    def _get_logger(name: str | None = None):
+        return _getlogger(name or __name__)
+
+
 from packaging.version import Version as _version
 from ray import is_initialized
 
@@ -289,6 +296,16 @@ _import_structure = {
         "FalconForCausalLM",
         "FalconModel",
     ],
+    "modules.falcon_h1": [
+        "FalconH1Config",
+        "FalconH1ForCausalLM",
+        "FalconH1Model",
+    ],
+    "modules.falcon_mamba": [
+        "FalconMambaConfig",
+        "FalconMambaForCausalLM",
+        "FalconMambaModel",
+    ],
     "modules.gemma": [
         "GemmaConfig",
         "GemmaForCausalLM",
@@ -333,6 +350,29 @@ _import_structure = {
         "Glm4MoeForSequenceClassification",
         "Glm4MoeModel",
     ],
+    "modules.glm4v": [
+        "Glm4vConfig",
+        "Glm4vForConditionalGeneration",
+        "Glm4vModel",
+        "Glm4vTextConfig",
+        "Glm4vTextModel",
+        "Glm4vVisionConfig",
+        "Glm4vVisionModel",
+    ],
+    "modules.glm4v_moe": [
+        "Glm4vMoeConfig",
+        "Glm4vMoeForConditionalGeneration",
+        "Glm4vMoeModel",
+        "Glm4vMoeTextConfig",
+        "Glm4vMoeTextModel",
+        "Glm4vMoeVisionConfig",
+        "Glm4vMoeVisionModel",
+    ],
+    "modules.glm46v": [
+        "Glm46VConfig",
+        "Glm46VForConditionalGeneration",
+        "Glm46VModel",
+    ],
     "modules.gpt2": [
         "GPT2Config",
         "GPT2LMHeadModel",
@@ -370,6 +410,11 @@ _import_structure = {
         "KimiLinearForCausalLM",
         "KimiLinearModel",
     ],
+    "modules.kimi_vl": [
+        "KimiVLConfig",
+        "KimiVLForConditionalGeneration",
+        "MoonViTConfig",
+    ],
     "modules.llama": [
         "LlamaConfig",
         "LlamaForCausalLM",
@@ -400,6 +445,11 @@ _import_structure = {
         "Mamba2Config",
         "Mamba2ForCausalLM",
         "Mamba2Model",
+    ],
+    "modules.minimax": [
+        "MiniMaxConfig",
+        "MiniMaxForCausalLM",
+        "MiniMaxModel",
     ],
     "modules.mistral": [
         "MistralConfig",
@@ -751,6 +801,8 @@ if _tp.TYPE_CHECKING:
     from .modules.exaone import ExaoneConfig, ExaoneForCausalLM, ExaoneForSequenceClassification, ExaoneModel
     from .modules.exaone4 import Exaone4Config, Exaone4ForCausalLM, Exaone4ForSequenceClassification, Exaone4Model
     from .modules.falcon import FalconConfig, FalconForCausalLM, FalconModel
+    from .modules.falcon_h1 import FalconH1Config, FalconH1ForCausalLM, FalconH1Model
+    from .modules.falcon_mamba import FalconMambaConfig, FalconMambaForCausalLM, FalconMambaModel
     from .modules.gemma import GemmaConfig, GemmaForCausalLM, GemmaForSequenceClassification, GemmaModel
     from .modules.gemma2 import Gemma2Config, Gemma2ForCausalLM, Gemma2ForSequenceClassification, Gemma2Model
     from .modules.gemma3 import (
@@ -766,6 +818,25 @@ if _tp.TYPE_CHECKING:
     from .modules.glm import GlmConfig, GlmForCausalLM, GlmForSequenceClassification, GlmModel
     from .modules.glm4 import Glm4Config, Glm4ForCausalLM, Glm4ForSequenceClassification, Glm4Model
     from .modules.glm4_moe import Glm4MoeConfig, Glm4MoeForCausalLM, Glm4MoeForSequenceClassification, Glm4MoeModel
+    from .modules.glm4v import (
+        Glm4vConfig,
+        Glm4vForConditionalGeneration,
+        Glm4vModel,
+        Glm4vTextConfig,
+        Glm4vTextModel,
+        Glm4vVisionConfig,
+        Glm4vVisionModel,
+    )
+    from .modules.glm4v_moe import (
+        Glm4vMoeConfig,
+        Glm4vMoeForConditionalGeneration,
+        Glm4vMoeModel,
+        Glm4vMoeTextConfig,
+        Glm4vMoeTextModel,
+        Glm4vMoeVisionConfig,
+        Glm4vMoeVisionModel,
+    )
+    from .modules.glm46v import Glm46VConfig, Glm46VForConditionalGeneration, Glm46VModel
     from .modules.gpt2 import GPT2Config, GPT2LMHeadModel, GPT2Model
     from .modules.gpt_j import GPTJConfig, GPTJForCausalLM, GPTJModel
     from .modules.gpt_neox import GPTNeoXConfig, GPTNeoXForCausalLM, GPTNeoXModel
@@ -778,6 +849,7 @@ if _tp.TYPE_CHECKING:
         InternLM2Model,
     )
     from .modules.kimi_linear import KimiLinearConfig, KimiLinearForCausalLM, KimiLinearModel
+    from .modules.kimi_vl import KimiVLConfig, KimiVLForConditionalGeneration, MoonViTConfig
     from .modules.llama import LlamaConfig, LlamaForCausalLM, LlamaForSequenceClassification, LlamaModel
     from .modules.llama4 import (
         Llama4Config,
@@ -792,6 +864,7 @@ if _tp.TYPE_CHECKING:
     from .modules.llava import LlavaConfig, LlavaForConditionalGeneration, LlavaModel
     from .modules.mamba import MambaConfig, MambaForCausalLM, MambaModel
     from .modules.mamba2 import Mamba2Config, Mamba2ForCausalLM, Mamba2Model
+    from .modules.minimax import MiniMaxConfig, MiniMaxForCausalLM, MiniMaxModel
     from .modules.mistral import MistralConfig, MistralForCausalLM, MistralForSequenceClassification, MistralModel
     from .modules.mistral3 import Mistral3Config, Mistral3ForConditionalGeneration, Mistral3Model, Mistral3Tokenizer
     from .modules.mixtral import MixtralConfig, MixtralForCausalLM, MixtralForSequenceClassification, MixtralModel
@@ -939,7 +1012,7 @@ else:
     )
 
     _targeted_eformer_versions = ["0.0.85"]
-    _targeted_ejkernel_versions = ["0.0.24"]
+    _targeted_ejkernel_versions = ["0.0.45"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version

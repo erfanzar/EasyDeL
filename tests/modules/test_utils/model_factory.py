@@ -137,7 +137,31 @@ def create_hf_model(
     Returns:
         HuggingFace model instance in eval mode
     """
-    hf_model = hf_class(config=copy.deepcopy(config))
+    hf_config = copy.deepcopy(config)
+
+    # Ensure deterministic attention backend for strict parity checks.
+    # HF defaults to SDPA which can introduce numerical differences vs EasyDeL/JAX.
+    if getattr(hf_config, "model_type", None) in {"glm4v", "glm4v_moe", "glm46v", "gemma3"}:
+
+        def _force_eager(cfg: Any) -> None:
+            if cfg is None:
+                return
+            if hasattr(cfg, "_attn_implementation"):
+                try:
+                    cfg._attn_implementation = "eager"
+                except Exception:
+                    pass
+            if hasattr(cfg, "attn_implementation"):
+                try:
+                    cfg.attn_implementation = "eager"
+                except Exception:
+                    pass
+
+        _force_eager(hf_config)
+        for _sub_cfg_name in ("text_config", "vision_config", "audio_config", "encoder_config", "decoder_config"):
+            _force_eager(getattr(hf_config, _sub_cfg_name, None))
+
+    hf_model = hf_class(config=hf_config)
     hf_model.eval()
     hf_model = hf_model.float()
     return hf_model

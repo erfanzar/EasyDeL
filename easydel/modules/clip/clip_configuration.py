@@ -36,7 +36,6 @@ def _get_partition_rules(self, *arg, **kwargs):
     """
     pmag = self.partition_manager  # Handles resolving strategies
     return (
-        # 1. Text Embeddings
         (r"text_model/embeddings/token_embedding/embedding", pmag.resolve(ColumnWise)),
         (r"text_model/embeddings/position_embedding/embedding", pmag.resolve(ColumnWise)),
         (r"vision_model/embeddings/class_embedding", pmag.resolve(Replicated)),

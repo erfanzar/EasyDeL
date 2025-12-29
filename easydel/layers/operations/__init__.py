@@ -60,6 +60,7 @@ from ejkernel.modules.operations.configs import (
 
 from ._attention_outputs import AttentionOutput
 from ._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from .executor import OperationExecutor
 from .modules import (
     AutoRegressiveDecodeAttn,
     BlockSparseAttn,
@@ -70,6 +71,19 @@ from .modules import (
     ScaledDotProductAttn,
     VanillaAttn,
 )
+from .requirements import (
+    CacheRequirements,
+    CacheType,
+    ExecutionMode,
+    MetadataField,
+    MetadataRequirements,
+    ModeSpecificBuilder,
+    ModeSpecificRequirements,
+    OperationRequirements,
+    RequirementsBuilder,
+    RequirementsValidator,
+    ValidationResult,
+)
 
 __all__ = (
     "AttentionConfig",
@@ -78,18 +92,30 @@ __all__ = (
     "BaseOperationConfig",
     "BlockSparseAttentionConfig",
     "BlockSparseAttn",
+    "CacheRequirements",
+    "CacheType",
+    "ExecutionMode",
     "FlashAttentionConfig",
     "FlashAttn",
+    "MetadataField",
+    "MetadataRequirements",
+    "ModeSpecificBuilder",
+    "ModeSpecificRequirements",
+    "OperationExecutor",
     "OperationImpl",
     "OperationMetadata",
     "OperationRegistry",
+    "OperationRequirements",
     "RaggedPageAttentionv2Config",
     "RaggedPageAttentionv3Config",
     "RaggedPageAttnV2",
     "RaggedPageAttnV3",
+    "RequirementsBuilder",
+    "RequirementsValidator",
     "RingAttentionConfig",
     "RingAttn",
     "ScaledDotProductAttentionConfig",
     "ScaledDotProductAttn",
+    "ValidationResult",
     "VanillaAttn",
 )

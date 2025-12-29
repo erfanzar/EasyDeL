@@ -7,28 +7,22 @@ import transformers
 import easydel as ed
 
 try:
-    from .test_utils import CausalLMTester, VisionLanguageTester, get_hf_model_from_hub
+    from .test_utils import CausalLMTester, VisionLanguageTester
 except ImportError:
-    from test_utils import CausalLMTester, VisionLanguageTester, get_hf_model_from_hub
+    from test_utils import CausalLMTester, VisionLanguageTester
 
 
 class TestQwen3VLMoE:
     """Test suite for Qwen3-VL-MoE vision-language model."""
 
     @pytest.fixture
-    def hf_qwen3_vl_moe_class(self, small_model_config):
-        """Load Qwen3-VL-MoE HF class from hub."""
-        hf_class, _ = get_hf_model_from_hub(
-            "Qwen/Qwen3-VL-8B-Thinking",
-            small_model_config,
-            factory=transformers.AutoModelForVision2Seq,
-        )
-        return hf_class
+    def hf_qwen3_vl_moe_class(self):
+        return getattr(transformers, "Qwen3VLMoeForConditionalGeneration", None)
 
     @pytest.fixture
     def qwen3_vl_moe_config(self, small_model_config):
         """Create Qwen3-VL-MoE-specific config."""
-        org_config = ed.Qwen3VLMoeConfig.from_pretrained("Qwen/Qwen3-VL-8B-Thinking")
+        org_config = ed.Qwen3VLMoeConfig.from_pretrained("Qwen/Qwen3-VL-30B-A3B-Instruct")
         org_config.text_config.hidden_size = 512
         org_config.text_config.intermediate_size = 1024
         org_config.text_config.num_attention_heads = 4
@@ -36,11 +30,16 @@ class TestQwen3VLMoE:
         org_config.text_config.num_hidden_layers = 2
         org_config.text_config.head_dim = 128
         org_config.text_config.moe_intermediate_size = 128
-        org_config.text_config.num_experts_per_tok = 2
-        org_config.text_config.num_experts = 8
         org_config.text_config.num_experts = small_model_config.get("num_experts", 8)
         org_config.text_config.num_experts_per_tok = small_model_config.get("num_experts_per_tok", 2)
-        org_config.text_config.rope_scaling = {"rope_type": "default", "mrope_section": [24, 20, 20]}
+        # Avoid TPU pallas grouped_matmul lowering in CI/dev environments.
+        org_config.text_config.moe_force_xla_gmm = True
+        org_config.moe_force_xla_gmm = True
+        org_config.text_config.rope_scaling = {
+            "rope_type": "default",
+            "mrope_section": [24, 20, 20],
+            "mrope_interleaved": True,
+        }
         org_config.vision_config.out_hidden_size = org_config.text_config.hidden_size
         return org_config
 
@@ -114,6 +113,22 @@ class TestQwen3VLMoE:
             small_model_config=local_cfg,
         )
         assert result.success, f"Qwen3-VL-MoE text-only failed: {result.error_message or result.comparison.details}"
+
+    def test_generation(self, qwen3_vl_moe_config, small_model_config, hf_qwen3_vl_moe_class):
+        """Test Qwen3-VL-MoE text-only generation."""
+        local_cfg = small_model_config.copy()
+        local_cfg["max_position_embeddings"] = 2048
+
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="qwen3_vl_moe",
+            hf_class=hf_qwen3_vl_moe_class,
+            task=ed.TaskType.IMAGE_TEXT_TO_TEXT,
+            config=qwen3_vl_moe_config,
+            small_model_config=local_cfg,
+            max_new_tokens=16,
+        )
+        assert result.success, f"Qwen3-VL-MoE generation failed: {result.error_message}"
 
 
 if __name__ == "__main__":

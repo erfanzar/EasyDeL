@@ -147,6 +147,7 @@ class Qwen3VLTextConfig(EasyDeLBaseConfig):
         use_sliding_window: bool = False,
         sliding_window: int = 4096,
         max_window_layers: int = 80,
+        layer_types: list[str] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -172,6 +173,9 @@ class Qwen3VLTextConfig(EasyDeLBaseConfig):
         self.use_sliding_window = use_sliding_window
         self.sliding_window = sliding_window
         self.max_window_layers = max_window_layers
+        self.layer_types = layer_types
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Get attention mask details for sliding window attention."""

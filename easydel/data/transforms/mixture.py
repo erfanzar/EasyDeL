@@ -283,7 +283,9 @@ class MixedShardedSource(ShardedDataSource[dict]):
 
     def __repr__(self) -> str:
         weights_str = ", ".join(f"{k}={v:.2f}" for k, v in self._weights.items())
-        return f"MixedShardedSource(sources={len(self._sources)}, weights=[{weights_str}], block_size={self._block_size})"
+        return (
+            f"MixedShardedSource(sources={len(self._sources)}, weights=[{weights_str}], block_size={self._block_size})"
+        )
 
 
 class MixStage(BaseStage):

@@ -255,10 +255,23 @@ class Olmo3Config(EasyDeLBaseConfig):
                 raise ValueError(f"`layer_types[{idx}]` must be one of {valid_types}, got '{layer_type}'")
 
     def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+        """Get the partition rules for distributed training of the OLMo3 model.
+
+        This method defines how model parameters should be partitioned across devices
+        for tensor parallelism, following the same patterns as OLMo2.
+
+        Args:
+            *args: Additional positional arguments (unused).
+            **kwargs: Additional keyword arguments (unused).
+
         Returns:
-                `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            tuple: A tuple of tuples, where each inner tuple contains:
+                - str: Regular expression pattern matching parameter names
+                - PartitionSpec: Specification for how to partition the parameter
+
+        Note:
+            The partition rules are identical to OLMo2, as sliding window attention
+            doesn't change the parameter structure, only the attention computation pattern.
         """
         pmag = self.partition_manager
         return (

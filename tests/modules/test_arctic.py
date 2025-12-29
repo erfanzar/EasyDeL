@@ -50,6 +50,20 @@ class TestArctic:
         )
         assert result.success, f"Arctic CAUSAL_LM failed: {result.error_message or result.comparison.details}"
 
+    def test_generation(self, arctic_config, hf_arctic_class, small_model_config):
+        """Test Arctic text generation."""
+        arctic_config.moe_force_xla_gmm = True
+        tester = CausalLMTester()
+        result = tester.test_generation(
+            module_name="arctic",
+            hf_class=hf_arctic_class,
+            task=ed.TaskType.CAUSAL_LM,
+            config=arctic_config,
+            small_model_config=small_model_config,
+            max_new_tokens=16,
+        )
+        assert result.success, f"Arctic generation failed: {result.error_message}"
+
 
 if __name__ == "__main__":
     import pytest
