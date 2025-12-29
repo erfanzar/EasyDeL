@@ -62,8 +62,14 @@ class FunctionGemmaToolParser(ToolParser):
         self.arg_regex = re.compile(r"(\w+):<escape>(.*?)<escape>", re.DOTALL)
 
         if self.model_tokenizer:
-            self.tool_call_start_token_ids = self.model_tokenizer.encode(self.tool_call_start_token, add_special_tokens=False)
-            self.tool_call_end_token_ids = self.model_tokenizer.encode(self.tool_call_end_token, add_special_tokens=False)
+            self.tool_call_start_token_ids = self.model_tokenizer.encode(
+                self.tool_call_start_token,
+                add_special_tokens=False,
+            )
+            self.tool_call_end_token_ids = self.model_tokenizer.encode(
+                self.tool_call_end_token,
+                add_special_tokens=False,
+            )
         else:
             self.tool_call_start_token_ids = []
             self.tool_call_end_token_ids = []
@@ -122,7 +128,9 @@ class FunctionGemmaToolParser(ToolParser):
             if tool_calls:
                 content_end = model_output.find(self.tool_call_start_token)
                 content = model_output[:content_end].strip() if content_end > 0 else None
-                return ExtractedToolCallInformation(tools_called=True, tool_calls=tool_calls, content=content if content else None)
+                return ExtractedToolCallInformation(
+                    tools_called=True, tool_calls=tool_calls, content=content if content else None
+                )
 
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
