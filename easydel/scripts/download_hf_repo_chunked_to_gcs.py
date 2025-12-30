@@ -311,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.enable_hf_transfer:
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
         try:
-            import hf_transfer  # noqa: F401
+            import hf_transfer  # noqa: F401 #type:ignore
         except Exception:
             print("warning: `hf_transfer` is not installed. Run: pip install -U hf_transfer", file=sys.stderr)
 
