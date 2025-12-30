@@ -28,7 +28,7 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
@@ -122,7 +122,6 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         self.out_proj = RowParallelLinear(
@@ -134,7 +133,6 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
             precision=precision,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         if config.normalize_qk_projections:
@@ -324,7 +322,6 @@ class OpenELMFeedForwardNetwork(nn.Module):
                 precision=precision,
                 rngs=rngs,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             )
             self.proj_2 = RowParallelLinear(
                 intermediate_dim,
@@ -335,7 +332,6 @@ class OpenELMFeedForwardNetwork(nn.Module):
                 precision=precision,
                 rngs=rngs,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             )
             self.ffn_with_glu = True
         else:
@@ -348,7 +344,6 @@ class OpenELMFeedForwardNetwork(nn.Module):
                 precision=precision,
                 rngs=rngs,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             )
             self.proj_2 = RowParallelLinear(
                 intermediate_dim,
@@ -359,7 +354,6 @@ class OpenELMFeedForwardNetwork(nn.Module):
                 precision=precision,
                 rngs=rngs,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             )
             self.ffn_with_glu = False
 

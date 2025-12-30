@@ -32,7 +32,7 @@ from easydel.infra.modeling_outputs import (
     CausalLMOutput,
     DecoderLayerOutput,
 )
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers.attention import MaskInfo
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
@@ -301,7 +301,6 @@ class FalconH1Mixer(nn.Module):
             rngs=rngs,
         )
 
-        dot_cfg = get_dot_general_by_bits(getattr(config, "bits", None), getattr(config, "easy_method", ""))
         self.in_proj = ColumnParallelLinear(
             self.hidden_size,
             self.intermediate_size + self.conv_dim + self.num_heads,
@@ -310,7 +309,6 @@ class FalconH1Mixer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            **dot_cfg,
         )
 
         self.dt_bias = ArrayParam.bound(
@@ -350,7 +348,6 @@ class FalconH1Mixer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            **dot_cfg,
         )
 
         metadata = OperationMetadata(
@@ -499,20 +496,17 @@ class FalconH1MLP(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        dot_cfg = get_dot_general_by_bits(getattr(config, "bits", None), getattr(config, "easy_method", ""))
         column = functools.partial(
             ColumnParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            **dot_cfg,
         )
         row = functools.partial(
             RowParallelLinear,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            **dot_cfg,
         )
 
         self.gate_proj = column(config.hidden_size, config.intermediate_size, use_bias=config.mlp_bias, rngs=rngs)

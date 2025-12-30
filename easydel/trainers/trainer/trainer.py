@@ -47,6 +47,7 @@ from easydel.utils.helpers import capture_time, get_logger
 
 from ..base_trainer import BaseTrainer, TrainerConfigureFunctionOutput
 from ..trainer_protocol import BaseProgressBar, MetricsTracker, StepMetrics
+from ..training_utils import resolve_straight_through_emulator
 from ._fn import evaluation_step, training_step
 from .modeling_output import TrainerOutput
 
@@ -218,15 +219,22 @@ class Trainer(BaseTrainer):
             - Empty sharding specs indicate replication across devices
         """
         empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=self.model.mesh)
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_block=self.arguments.quantization_block,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
         self._train_shared_fn_static_args = (
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
+            straight_through_emulator,
         )
         sharded_training_step_function = ejit(
             training_step,
-            static_argnums=(2, 3, 4, 5),
+            static_argnums=(2, 3, 4, 5, 6),
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),

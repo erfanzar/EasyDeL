@@ -26,7 +26,7 @@ from jax import numpy as jnp
 from jaxtyping import Array, Float
 
 from easydel.infra.modeling_outputs import ImageClassifierOutput
-from easydel.infra.utils import auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import auto_remat
 from easydel.layers.linear import ColumnParallelLinear
 
 from ._base_task_module import BaseTaskModule, ConfigT, ModelT
@@ -127,10 +127,6 @@ class BaseImageClassificationModule(BaseTaskModule[ModelT, ConfigT]):
                 kernel_init=self._head_kernel_init,
                 precision=precision,
                 rngs=rngs,
-                **get_dot_general_by_bits(
-                    getattr(config, "bits", None),
-                    getattr(config, "easy_method", ""),
-                ),
             )
 
     def __call__(

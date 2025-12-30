@@ -30,7 +30,7 @@ from jaxtyping import Array
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import RecurrentCache, RecurrentCacheConfig, RecurrentCacheView
 from easydel.layers.linear import ColumnParallelLinear
@@ -236,7 +236,6 @@ class MambaMixer(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.in_proj = linear_class(
             hidden_size,

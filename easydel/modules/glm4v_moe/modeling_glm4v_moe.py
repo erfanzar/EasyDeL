@@ -30,7 +30,7 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
     VLMCausalLMOutput,
 )
-from easydel.infra.utils import auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import auto_remat
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseVisionLanguageModule
 from easydel.layers.caching import (
@@ -106,7 +106,6 @@ class Glm4vMoeTextAttention(UnifiedAttention):
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
 

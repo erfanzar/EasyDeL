@@ -29,7 +29,7 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
@@ -133,7 +133,6 @@ class GPTJAttention(UnifiedAttention):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
@@ -147,7 +146,6 @@ class GPTJAttention(UnifiedAttention):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
@@ -161,7 +159,6 @@ class GPTJAttention(UnifiedAttention):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
@@ -175,7 +172,6 @@ class GPTJAttention(UnifiedAttention):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         return self.out_proj
 
@@ -269,7 +265,6 @@ class GPTJMLP(nn.Module):
             precision=precision,
             kernel_init=kernel_init,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.fc_out = RowParallelLinear(
             intermediate_size,
@@ -279,7 +274,6 @@ class GPTJMLP(nn.Module):
             precision=precision,
             kernel_init=kernel_init,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         self.act = ACT2FN[config.activation_function]

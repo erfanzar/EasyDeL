@@ -42,7 +42,6 @@ from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, DTypeLike, Float, Int, PRNGKeyArray
 
 from easydel.infra.modeling_outputs import AttentionLayerOutput
-from easydel.infra.utils import get_dot_general_by_bits
 
 from .attention import AttentionModule, FlexibleAttentionModule
 from .caching import (
@@ -348,7 +347,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def _create_k_proj(
@@ -369,7 +367,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def _create_v_proj(
@@ -390,7 +387,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def _create_o_proj(
@@ -411,7 +407,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def _create_fused_qkv_proj(
@@ -436,7 +431,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def _create_rotary(self, config: Cfg, dtype: DTypeLike):

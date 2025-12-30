@@ -31,7 +31,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.modeling_outputs import CausalLMOutput, MoeCausalLMOutput
-from easydel.infra.utils import auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import auto_remat
 from easydel.layers.caching import (
     HybridCache,
     OperationsMetadata,
@@ -160,10 +160,6 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
             kernel_init=self._head_kernel_init,
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(
-                getattr(config, "bits", None),
-                getattr(config, "easy_method", ""),
-            ),
         )
         setattr(self, lm_head_name, lm_head)
         if tie_word_embeddings:

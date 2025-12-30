@@ -47,7 +47,12 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
-from ..training_utils import make_assertions_and_get_sizes, minibatch_call, update_metrics, update_state_respectfully
+from ..training_utils import (
+    make_assertions_and_get_sizes,
+    minibatch_call,
+    update_metrics,
+    update_state_respectfully,
+)
 from ..utils import pad_to_length
 
 # Define allowed loss function variants.
@@ -779,6 +784,7 @@ def training_step(
     loss_config: LossConfig | None = None,
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
     """
     Performs a single training step.
@@ -830,7 +836,11 @@ def training_step(
         Returns:
             A tuple (loss, metrics) where loss is a scalar and metrics is a LossMetrics instance.
         """
-        model_output = concatenated_forward(state.merge(tree=tree), call_batch)
+        if straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
+        module = state.merge(tree=tree)
+
+        model_output = concatenated_forward(module, call_batch)
 
         if "ref_chosen_logps" in call_batch and "ref_rejected_logps" in call_batch:
             ref_chosen_logps = jax.lax.stop_gradient(call_batch["ref_chosen_logps"])

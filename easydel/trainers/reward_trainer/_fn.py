@@ -43,7 +43,12 @@ from jax.sharding import PartitionSpec
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
-from ..training_utils import make_assertions_and_get_sizes, minibatch_call, update_metrics, update_state_respectfully
+from ..training_utils import (
+    make_assertions_and_get_sizes,
+    minibatch_call,
+    update_metrics,
+    update_state_respectfully,
+)
 
 
 def training_step(
@@ -54,6 +59,7 @@ def training_step(
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
     center_rewards_coefficient: float | None = None,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
     """
     Performs a single training step by computing gradients via minibatch processing,
@@ -111,8 +117,9 @@ def training_step(
                 - The computed loss (scalar).
                 - Additional metrics (LossMetrics) produced during loss computation.
         """
-        # Merge the state with the provided tree update.
-        module = flax.nnx.merge(state.graphdef, tree, state.graphother)
+        if straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
+        module = state.merge(tree)
 
         rewards_chosen = module(
             input_ids=minibatch["input_ids_chosen"],

@@ -29,7 +29,7 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import auto_remat
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
@@ -91,7 +91,6 @@ class MptMLP(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.up_proj = linear_class(
             self.config.hidden_size,
@@ -186,7 +185,6 @@ class MptAttention(UnifiedAttention):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         self.out_proj = RowParallelLinear(
@@ -198,7 +196,6 @@ class MptAttention(UnifiedAttention):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         self.resid_dropout = nn.Dropout(

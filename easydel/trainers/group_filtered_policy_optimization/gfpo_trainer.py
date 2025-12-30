@@ -153,6 +153,7 @@ class GFPOTrainer(GRPOTrainer):
         the loss function uses the correct repeat count after filtering.
         """
         output = super().configure_functions()
+        straight_through_emulator = self._train_shared_fn_static_args[-1]
 
         # If filtering is active, replace num_generations with num_remains_in_group
         if self.arguments.num_remains_in_group is not None:
@@ -172,6 +173,7 @@ class GFPOTrainer(GRPOTrainer):
                 self.delta,
                 self.importance_sampling_level,
                 self.top_entropy_quantile,
+                straight_through_emulator,
             )
 
             self._eval_shared_fn_static_args = (
@@ -188,6 +190,7 @@ class GFPOTrainer(GRPOTrainer):
                 self.delta,
                 self.importance_sampling_level,
                 self.top_entropy_quantile,
+                straight_through_emulator,
             )
 
         return output

@@ -27,7 +27,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeCausalLMOutput, MoeModelOutput
-from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
@@ -101,7 +101,6 @@ class MiniMaxLightningAttention(nn.Module):
         self.block_size = config.block_size
         self.act_fn = ACT2FN[config.hidden_act]
 
-        dot_kws = get_dot_general_by_bits(config.bits, config.easy_method)
         self.qkv_proj = ColumnParallelLinear(
             config.hidden_size,
             self.num_attention_heads * self.head_dim * 3,
@@ -111,7 +110,6 @@ class MiniMaxLightningAttention(nn.Module):
             precision=precision,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            **dot_kws,
         )
         self.out_proj = RowParallelLinear(
             self.num_attention_heads * self.head_dim,
@@ -122,7 +120,6 @@ class MiniMaxLightningAttention(nn.Module):
             precision=precision,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            **dot_kws,
         )
         self.output_gate = ColumnParallelLinear(
             config.hidden_size,
@@ -133,7 +130,6 @@ class MiniMaxLightningAttention(nn.Module):
             precision=precision,
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            **dot_kws,
         )
         self.norm = RMSNorm(
             self.num_attention_heads * self.head_dim,
@@ -491,7 +487,6 @@ class MiniMaxSparseMoeBlock(BaseMoeModule):
         self.precision = precision
         self.rngs = rngs
 
-        dot_kws = get_dot_general_by_bits(config.bits, config.easy_method)
         self.gate = ColumnParallelLinear(
             config.hidden_size,
             config.num_local_experts,
@@ -501,7 +496,6 @@ class MiniMaxSparseMoeBlock(BaseMoeModule):
             precision=precision,
             rngs=rngs,
             kernel_init=nn.initializers.normal(config.initializer_range),
-            **dot_kws,
         )
         self.experts = MiniMaxExperts(
             config=config,

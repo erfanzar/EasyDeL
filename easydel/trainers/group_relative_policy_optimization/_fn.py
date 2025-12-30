@@ -30,8 +30,6 @@ All functions are JAX-compatible and support distributed training through shardi
 
 import typing as tp
 
-import flax
-import flax.nnx
 import jax
 import optax
 from eformer.escale import with_sharding_constraint
@@ -41,7 +39,12 @@ from jax.sharding import PartitionSpec
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
-from ..training_utils import make_assertions_and_get_sizes, minibatch_call, update_metrics, update_state_respectfully
+from ..training_utils import (
+    make_assertions_and_get_sizes,
+    minibatch_call,
+    update_metrics,
+    update_state_respectfully,
+)
 
 RewardFunc = tp.Union[EasyDeLState, tp.Callable[[list, list], list[float]]]  # noqa
 
@@ -134,6 +137,7 @@ def grpo_step(
     delta: float | None = None,
     importance_sampling_level: str = "token",
     top_entropy_quantile: float = 1.0,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
     # Determine batch size, minibatch size, and enforce partition spec.
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
@@ -144,7 +148,9 @@ def grpo_step(
     batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
     def loss_fn(tree, minibatch):
-        module = flax.nnx.merge(state.graphdef, tree, state.graphother)
+        if is_training and straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
+        module = state.merge(tree)
 
         (
             prompt_ids,

@@ -28,7 +28,7 @@ from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.modeling_outputs import TokenClassifierOutput
-from easydel.infra.utils import auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import auto_remat
 from easydel.layers.caching import (
     HybridCache,
     OperationsMetadata,
@@ -131,10 +131,6 @@ class BaseTokenClassificationModule(BaseTaskModule[ModelT, ConfigT]):
             kernel_init=self._head_kernel_init,
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(
-                getattr(config, "bits", None),
-                getattr(config, "easy_method", ""),
-            ),
         )
 
     def __call__(

@@ -36,7 +36,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
@@ -187,7 +187,6 @@ class DeepseekV2MLP(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             kernel_init=nn.initializers.normal(),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         imz = intermediate_size or config.intermediate_size
         hs = hidden_size or config.hidden_size
@@ -437,7 +436,6 @@ class DeepseekV2Attention(UnifiedAttention):
                     param_dtype=param_dtype,
                     kernel_init=jax.nn.initializers.normal(config.initializer_range),
                     precision=precision,
-                    **get_dot_general_by_bits(config.bits, config.easy_method),
                 ),
             )
         else:
@@ -453,7 +451,6 @@ class DeepseekV2Attention(UnifiedAttention):
                     param_dtype=param_dtype,
                     kernel_init=jax.nn.initializers.normal(config.initializer_range),
                     precision=precision,
-                    **get_dot_general_by_bits(config.bits, config.easy_method),
                 ),
             )
             setattr(
@@ -479,7 +476,6 @@ class DeepseekV2Attention(UnifiedAttention):
                     param_dtype=param_dtype,
                     kernel_init=jax.nn.initializers.normal(config.initializer_range),
                     precision=precision,
-                    **get_dot_general_by_bits(config.bits, config.easy_method),
                 ),
             )
 
@@ -496,7 +492,6 @@ class DeepseekV2Attention(UnifiedAttention):
                 param_dtype=param_dtype,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
                 precision=precision,
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             ),
         )
         setattr(
@@ -522,7 +517,6 @@ class DeepseekV2Attention(UnifiedAttention):
                 param_dtype=param_dtype,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
                 precision=precision,
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             ),
         )
 
@@ -538,7 +532,6 @@ class DeepseekV2Attention(UnifiedAttention):
                 param_dtype=param_dtype,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
                 precision=precision,
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             ),
         )
 

@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import typing as tp
+
 import flax.nnx
 import jax
 import jax.nn as jnn
@@ -25,7 +27,12 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..group_relative_policy_optimization._fn import get_per_token_logps
-from ..training_utils import make_assertions_and_get_sizes, minibatch_call, update_metrics, update_state_respectfully
+from ..training_utils import (
+    make_assertions_and_get_sizes,
+    minibatch_call,
+    update_metrics,
+    update_state_respectfully,
+)
 
 
 def _compute_logps(
@@ -79,6 +86,7 @@ def xpo_step(
     partition_spec: PartitionSpec | None,
     gradient_accumulation_steps: int,
     is_train: bool,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Execute a single XPO training or evaluation step.
 
@@ -111,6 +119,8 @@ def xpo_step(
     ref_graphdef = reference_state.graphdef
 
     def loss_fn(tree: flax.nnx.GraphState, minibatch: dict[str, jax.Array]):
+        if is_train and straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
         module = state.merge(tree=tree)
         ref_module = flax.nnx.merge(ref_graphdef, reference_state.graphstate, reference_state.graphother)
 

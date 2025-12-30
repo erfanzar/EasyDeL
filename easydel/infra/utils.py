@@ -46,7 +46,6 @@ Example:
 
 from __future__ import annotations
 
-import functools
 import inspect
 import re
 import types
@@ -75,7 +74,6 @@ from easydel.layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
-from .base_config import EasyMethod
 from .errors import EasyDeLBlockWiseFFNError
 from .etils import AVAILABLE_SPARSE_MODULE_TYPES, EasyDeLGradientCheckPointers
 
@@ -310,49 +308,6 @@ def add_start_docstrings(*docstr):
         return fn
 
     return docstring_decorator
-
-
-def get_dot_general_by_bits(
-    bits: int | None = None,
-    mode: tp.Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
-) -> dict:
-    """The get_general_dot function is a helper function that returns a q_flax.QDotGeneral object
-    with the specified number of bits for forward and backward passes. If no bits are specified,
-    the function returns None.
-
-    Args:
-        bits: tp.Optional[int]: Specify the number of bits for quantization
-        mode: EasyMethod: Specify the use of model to init the QDot
-            Method for (e.q TRAIN,SERVE,...)
-
-    Returns:
-        A dict that contain dot_general_cls
-    """
-    if bits is not None:
-        try:
-            from aqt.jax.v2 import config as q_config  # type: ignore
-            from aqt.jax.v2.flax import aqt_flax as q_flax  # type: ignore
-        except ModuleNotFoundError as e:
-            raise ModuleNotFoundError(
-                "No module named `aqt` has been found, please install aqt before using bits option in EasyDeL"
-            ) from e
-        if mode == EasyMethod.TRAIN:
-            rhs_quant_mode = q_flax.QuantMode.TRAIN
-        elif mode == EasyMethod.EVAL or mode == EasyMethod.SERVE:
-            rhs_quant_mode = q_flax.QuantMode.SERVE
-        elif mode == EasyMethod.CONVERT:
-            rhs_quant_mode = q_flax.QuantMode.CONVERT
-        else:
-            raise ValueError("Unknown Quant Method for EasyMethod")
-
-            return {
-                "dot_general_cls": functools.partial(
-                    q_flax.AqtDotGeneral,
-                    cfg=q_config.fully_quantized(fwd_bits=bits, bwd_bits=bits),
-                    rhs_quant_mode=rhs_quant_mode,
-                )
-            }
-    return {}  # empty just in case of not getting any error
 
 
 def block_wise_ffn(remat_ffn: tp.Callable, inputs: jax.Array, chunk_size: int) -> jax.Array:

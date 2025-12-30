@@ -25,7 +25,12 @@ from jax.sharding import PartitionSpec
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
-from ..training_utils import make_assertions_and_get_sizes, minibatch_call, update_metrics, update_state_respectfully
+from ..training_utils import (
+    make_assertions_and_get_sizes,
+    minibatch_call,
+    update_metrics,
+    update_state_respectfully,
+)
 
 KTO_LOSS_TYPES = ("kto", "apo_zero_unpaired")
 
@@ -152,6 +157,7 @@ def training_step(
     loss_config: LossConfig | None = None,
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
     """Execute KTO training step with gradient computation.
 
@@ -183,6 +189,8 @@ def training_step(
     batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
     def _loss_fn(tree: flax.nnx.GraphState, minibatch: dict[str, jax.Array]):
+        if straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
         module = state.merge(tree=tree)
         policy_out = forward_fn(module, minibatch)
         policy_logps = policy_out["completion_logps"]

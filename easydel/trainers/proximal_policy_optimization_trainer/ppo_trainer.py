@@ -53,6 +53,7 @@ from ..prompt_transforms import GRPOPreprocessTransform, is_conversational
 from ..prompt_utils import apply_chat_template
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
+from ..training_utils import resolve_straight_through_emulator
 from ._fn import ppo_step
 from .modeling_value_head import CausalLMWithValueHead
 from .ppo_config import PPOConfig
@@ -391,6 +392,12 @@ class PPOTrainer(Trainer):
         """
         mesh = self.model.mesh
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_block=self.arguments.quantization_block,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
 
         prompt_length = int(self.arguments.max_prompt_length)
 
@@ -405,8 +412,9 @@ class PPOTrainer(Trainer):
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
             True,  # is_train
+            straight_through_emulator,
         )
-        static_argnums = tuple(range(2, 12))
+        static_argnums = tuple(range(2, 13))
         sharded_training_step_function = ejit(
             ppo_step,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -426,6 +434,7 @@ class PPOTrainer(Trainer):
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
             False,  # is_train
+            straight_through_emulator,
         )
         sharded_evaluation_step_function = ejit(
             ppo_step,

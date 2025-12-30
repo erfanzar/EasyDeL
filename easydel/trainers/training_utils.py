@@ -26,6 +26,122 @@ from easydel.utils.helpers import check_bool_flag
 SCAN_TRAINER = check_bool_flag("SCAN_TRAINER")
 FAST_COMPILE = check_bool_flag("FAST_COMPILE")
 
+QuantizationMode = tp.Literal["fp8", "int8", "nf4"]
+DEFAULT_NF4_BLOCK_SIZE = 64
+
+
+def _ste(x: jax.Array, q: jax.Array) -> jax.Array:
+    q = q.astype(x.dtype)
+    return x + lax.stop_gradient(q - x)
+
+
+def _quantize_dequantize_int8(x: jax.Array) -> jax.Array:
+    from eformer.ops.quantization.quantization_functions import dequantize_int8, quantize_int8
+
+    q, scale = quantize_int8(x)
+    return dequantize_int8(q, scale)
+
+
+def _quantize_dequantize_nf4(x: jax.Array, *, block_size: int) -> jax.Array:
+    from eformer.ops.quantization.quantization_functions import dequantize_nf4, quantize_and_pack_nf4
+
+    if block_size <= 0:
+        raise ValueError(f"`quantization_block` must be > 0 for NF4, got {block_size}.")
+    original_last_dim = x.shape[-1]
+    if original_last_dim % block_size != 0:
+        pad_amount = block_size - (original_last_dim % block_size)
+        pad_width = [(0, 0)] * (x.ndim - 1) + [(0, pad_amount)]
+        x = jnp.pad(x, pad_width, mode="constant", constant_values=0)
+
+    packed, absmax = quantize_and_pack_nf4(x, block_size)
+    deq = dequantize_nf4(packed, absmax, block_size)
+    if deq.shape[-1] != original_last_dim:
+        deq = deq[..., :original_last_dim]
+    return deq
+
+
+def _quantize_dequantize_fp8(x: jax.Array) -> jax.Array:
+    # FP8 simulation via cast; STE is applied by the caller.
+    return x.astype(jnp.float8_e4m3fn).astype(x.dtype)
+
+
+def make_default_tensor_straight_through(
+    quantization_mode: QuantizationMode,
+    quantization_block: int | None = None,
+) -> tp.Callable[[jax.Array], jax.Array]:
+    """Create a per-tensor STE quantization function.
+
+    Forward path uses a quantize->dequantize simulation, while gradients flow as
+    if the transform is identity (STE).
+
+    Notes:
+        - `quantization_block` is used for NF4 block-wise quantization.
+    """
+    try:
+        from eformer.ops.quantization import straight_through as eformer_straight_through  # type: ignore
+    except Exception:  # pragma: no cover
+        eformer_straight_through = None
+
+    nf4_block_size: int | None = None
+    if quantization_mode == "nf4":
+        nf4_block_size = DEFAULT_NF4_BLOCK_SIZE if quantization_block is None else int(quantization_block)
+
+    def tensor_straight_through(x: jax.Array) -> jax.Array:
+        if not jnp.issubdtype(x.dtype, jnp.floating):
+            return x
+        if eformer_straight_through is not None and (quantization_mode != "nf4" or quantization_block is None):
+            try:
+                q = eformer_straight_through(x, method=quantization_mode)
+            except TypeError:
+                q = eformer_straight_through(x, quantization_mode)
+            return _ste(x, q)
+
+        if quantization_mode == "int8":
+            qdq = _quantize_dequantize_int8
+        elif quantization_mode == "nf4":
+            def qdq(y):
+                return _quantize_dequantize_nf4(y, block_size=tp.cast(int, nf4_block_size))
+        elif quantization_mode == "fp8":
+            qdq = _quantize_dequantize_fp8
+        else:  # pragma: no cover
+            raise ValueError(f"Unsupported `quantization_mode`: {quantization_mode!r}.")
+        return _ste(x, qdq(x))
+
+    return tensor_straight_through
+
+
+def resolve_straight_through_emulator(
+    *,
+    quantization_mode: QuantizationMode | None,
+    quantization_block: int | None,
+    tensor_straight_through: tp.Callable[[jax.Array], jax.Array] | None,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None,
+) -> tp.Callable[[tp.Any], tp.Any] | None:
+    """Resolve the graphstate-level straight-through emulator callable.
+
+    Priority:
+      1) `straight_through_emulator` (user-provided)
+      2) `tensor_straight_through` mapped over graphstate
+      3) default tensor STE built from (`quantization_mode`, `quantization_block`) and mapped over graphstate
+      4) None (disabled)
+    """
+    if straight_through_emulator is not None:
+        return straight_through_emulator
+
+    if tensor_straight_through is None and quantization_mode is None:
+        return None
+
+    if tensor_straight_through is None:
+        tensor_straight_through = make_default_tensor_straight_through(
+            quantization_mode,
+            quantization_block=quantization_block,
+        )
+
+    def _default_emulator(graphstate: tp.Any) -> tp.Any:
+        return tu.tree_map(tensor_straight_through, graphstate)
+
+    return _default_emulator
+
 
 def resolve_total_steps(
     *,

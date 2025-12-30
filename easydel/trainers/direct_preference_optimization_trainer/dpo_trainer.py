@@ -34,6 +34,7 @@ from ..base_trainer import TrainerConfigureFunctionOutput
 from ..prompt_transforms import DPOPreprocessTransform
 from ..trainer.trainer import Trainer
 from ..training_configurations import MetricsType
+from ..training_utils import resolve_straight_through_emulator
 from ..utils import DataCollatorForPreferenceGrain, DataCollatorForPreferenceTFDS
 from ._fn import concatenated_forward, evaluation_step, training_step
 from .dpo_config import DPOConfig
@@ -210,6 +211,12 @@ class DPOTrainer(Trainer):
         """Configure and JIT-compile training and evaluation step functions."""
         mesh = self.model.mesh
         empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_block=self.arguments.quantization_block,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
 
         partial_concatenated_forward = partial(
             concatenated_forward,
@@ -246,9 +253,10 @@ class DPOTrainer(Trainer):
             self.arguments.loss_config,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
+            straight_through_emulator,
         )
 
-        sharded_training_static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11)
+        sharded_training_static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
         sharded_training_step_function = ejit(
             training_step,
             in_shardings=(

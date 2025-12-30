@@ -49,7 +49,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
@@ -202,7 +202,6 @@ class KimiMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         self.gate_proj = linear_class(config.hidden_size, intermediate_size)
@@ -216,7 +215,6 @@ class KimiMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
@@ -573,7 +571,6 @@ class KimiMLAAttention(UnifiedAttention):
                     param_dtype=param_dtype,
                     kernel_init=jax.nn.initializers.normal(config.initializer_range),
                     precision=precision,
-                    **get_dot_general_by_bits(config.bits, config.easy_method),
                 ),
             )
         else:
@@ -589,7 +586,6 @@ class KimiMLAAttention(UnifiedAttention):
                     param_dtype=param_dtype,
                     kernel_init=jax.nn.initializers.normal(config.initializer_range),
                     precision=precision,
-                    **get_dot_general_by_bits(config.bits, config.easy_method),
                 ),
             )
             setattr(
@@ -615,7 +611,6 @@ class KimiMLAAttention(UnifiedAttention):
                     param_dtype=param_dtype,
                     kernel_init=jax.nn.initializers.normal(config.initializer_range),
                     precision=precision,
-                    **get_dot_general_by_bits(config.bits, config.easy_method),
                 ),
             )
 
@@ -631,7 +626,6 @@ class KimiMLAAttention(UnifiedAttention):
                 param_dtype=param_dtype,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
                 precision=precision,
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             ),
         )
         setattr(
@@ -657,7 +651,6 @@ class KimiMLAAttention(UnifiedAttention):
                 param_dtype=param_dtype,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
                 precision=precision,
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             ),
         )
 
@@ -673,7 +666,6 @@ class KimiMLAAttention(UnifiedAttention):
                 param_dtype=param_dtype,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
                 precision=precision,
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             ),
         )
 
@@ -782,7 +774,6 @@ class KimiDeltaAttention(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         self.q_proj = column_linear(config.hidden_size, self.key_dim)
@@ -840,7 +831,6 @@ class KimiDeltaAttention(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         self.o_norm = KimiRMSNormGated(
