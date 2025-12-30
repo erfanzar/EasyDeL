@@ -141,7 +141,7 @@ def create_hf_model(
 
     # Ensure deterministic attention backend for strict parity checks.
     # HF defaults to SDPA which can introduce numerical differences vs EasyDeL/JAX.
-    if getattr(hf_config, "model_type", None) in {"glm4v", "glm4v_moe", "glm46v", "gemma3"}:
+    if getattr(hf_config, "model_type", None) in {"glm4v", "glm4v_moe", "glm46v", "gemma3", "mistral3"}:
 
         def _force_eager(cfg: Any) -> None:
             if cfg is None:

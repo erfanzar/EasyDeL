@@ -70,6 +70,8 @@ Note:
     - State serialization and deserialization
 """
 
+import typing as tp
+
 from eformer import escale
 from eformer.escale import PartitionAxis
 from eformer.executor import DistributedConfig
@@ -77,11 +79,12 @@ from eformer.loggings import get_logger
 from eformer.pytree import PyTree, auto_pytree
 from flax.nnx import Rngs
 
-from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
-from .base_module import EasyDeLBaseModule
-from .base_state import EasyDeLState
-from .elarge_model import eLargeModel
-from .loss_utils import LossConfig
+if tp.TYPE_CHECKING:  # pragma: no cover
+    from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
+    from .base_module import EasyDeLBaseModule
+    from .base_state import EasyDeLState
+    from .elarge_model import eLargeModel
+    from .loss_utils import LossConfig
 
 
 def init_cluster():
@@ -127,3 +130,32 @@ __all__ = (
     "escale",
     "init_cluster",
 )
+
+
+def __getattr__(name: str):  # pragma: no cover
+    """Lazy attribute loader to avoid import cycles in core modules."""
+    if name in {"EasyDeLBaseConfig", "EasyDeLBaseConfigDict"}:
+        from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
+
+        return {"EasyDeLBaseConfig": EasyDeLBaseConfig, "EasyDeLBaseConfigDict": EasyDeLBaseConfigDict}[name]
+    if name == "EasyDeLBaseModule":
+        from .base_module import EasyDeLBaseModule
+
+        return EasyDeLBaseModule
+    if name == "EasyDeLState":
+        from .base_state import EasyDeLState
+
+        return EasyDeLState
+    if name == "LossConfig":
+        from .loss_utils import LossConfig
+
+        return LossConfig
+    if name == "eLargeModel":
+        from .elarge_model import eLargeModel
+
+        return eLargeModel
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():  # pragma: no cover
+    return sorted(set(globals().keys()) | set(__all__))

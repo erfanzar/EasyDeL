@@ -1,5 +1,6 @@
 """Tests for Mistral3 model."""
 
+import jax.numpy as jnp
 import pytest
 import transformers
 
@@ -21,7 +22,8 @@ class TestMistral3:
     @pytest.fixture
     def mistral3_config(self, small_model_config):
         """Create Mistral3-specific config."""
-        return ed.Mistral3Config(
+        image_token_id = small_model_config["vocab_size"] - 1
+        text_config = ed.MistralConfig(
             vocab_size=small_model_config["vocab_size"],
             hidden_size=small_model_config["hidden_size"],
             num_hidden_layers=small_model_config["num_hidden_layers"],
@@ -29,31 +31,55 @@ class TestMistral3:
             num_key_value_heads=small_model_config["num_key_value_heads"],
             intermediate_size=small_model_config["intermediate_size"],
             max_position_embeddings=small_model_config["max_position_embeddings"],
+            head_dim=small_model_config["head_dim"],
+            sliding_window=None,
+        )
+        vision_config = ed.PixtralVisionConfig(
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            image_size=224,
+            patch_size=14,
+        )
+        return ed.Mistral3Config(
+            text_config=text_config,
+            vision_config=vision_config,
+            image_token_index=image_token_id,
         )
 
     @pytest.mark.skipif(not HAS_MISTRAL3, reason="transformers.Mistral3ForConditionalGeneration not available")
     def test_causal_lm(self, mistral3_config, small_model_config):
         """Test Mistral3ForConditionalGeneration."""
+        local_cfg = small_model_config.copy()
+        local_cfg["attn_dtype"] = jnp.float32
+        local_cfg["attn_softmax_dtype"] = jnp.float32
+
         tester = CausalLMTester()
         result = tester.run(
             module_name="mistral3",
             hf_class=transformers.Mistral3ForConditionalGeneration,
-            task=ed.TaskType.CAUSAL_LM,
+            task=ed.TaskType.IMAGE_TEXT_TO_TEXT,
             config=mistral3_config,
-            small_model_config=small_model_config,
+            small_model_config=local_cfg,
         )
         assert result.success, f"Mistral3 CAUSAL_LM failed: {result.error_message or result.comparison.details}"
 
     @pytest.mark.skipif(not HAS_MISTRAL3, reason="transformers.Mistral3ForConditionalGeneration not available")
     def test_generation(self, mistral3_config, small_model_config):
         """Test Mistral3 text generation."""
+        local_cfg = small_model_config.copy()
+        local_cfg["attn_dtype"] = jnp.float32
+        local_cfg["attn_softmax_dtype"] = jnp.float32
+
         tester = CausalLMTester()
         result = tester.test_generation(
             module_name="mistral3",
             hf_class=transformers.Mistral3ForConditionalGeneration,
             config=mistral3_config,
-            small_model_config=small_model_config,
+            small_model_config=local_cfg,
             max_new_tokens=16,
+            task=ed.TaskType.IMAGE_TEXT_TO_TEXT,
         )
         assert result.success, f"Mistral3 generation failed: {result.error_message}"
 
