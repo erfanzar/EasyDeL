@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Proximal Policy Optimization (PPO) trainer for RLHF.
+
+This module implements the PPOTrainer class for training language models with
+Proximal Policy Optimization. PPO is a policy gradient method that uses clipped
+surrogate objectives to ensure stable policy updates during reinforcement learning
+from human feedback (RLHF).
+
+The trainer supports:
+- Online generation of completions
+- Multiple reward functions with configurable weights
+- Value head for advantage estimation (GAE)
+- KL penalty against a frozen reference model
+- Clipped policy and value function objectives
+"""
 
 from __future__ import annotations
 
@@ -39,9 +53,9 @@ from ..prompt_transforms import GRPOPreprocessTransform, is_conversational
 from ..prompt_utils import apply_chat_template
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
-from ..training_configurations import MetricsType
-from ._fn import get_per_token_logps, grpo_step
-from .grpo_config import GRPOConfig
+from ._fn import ppo_step
+from .modeling_value_head import CausalLMWithValueHead
+from .ppo_config import PPOConfig
 
 try:
     import wandb  # type:ignore
@@ -57,49 +71,45 @@ logger = get_logger(__name__)
 RewardFunc = tp.Union[EasyDeLBaseModule, EasyDeLState, tp.Callable[[list, list], list[float]]]  # noqa
 
 
-def _fileaf(x):
-    return isinstance(x, jax.Array)
+@Registry.register("trainer", "ppo")
+class PPOTrainer(Trainer):
+    """Proximal Policy Optimization trainer for RLHF.
 
-
-def delete_tree(pytree):
-    return jax.tree_util.tree_map(
-        lambda x: x.delete() if isinstance(x, jax.Array) else None,
-        pytree,
-        is_leaf=_fileaf,
-    )
-
-
-@Registry.register("trainer", "grpo")
-class GRPOTrainer(Trainer):
-    """Group Relative Policy Optimization trainer for RLHF.
-
-    GRPO is a reinforcement learning method that optimizes policies by comparing
-    responses within groups, providing more stable training than standard PPO.
-    It uses relative scoring within batches to reduce variance and improve
-    convergence in preference-based learning tasks.
+    PPO is a policy gradient method that uses clipped surrogate objectives to
+    ensure stable policy updates. This trainer implements online PPO where
+    completions are generated on-the-fly and scored by reward functions.
 
     Key features:
-    - Group-based advantage normalization
-    - Stable policy updates with KL regularization
-    - Support for multiple reward models
-    - Efficient generation and scoring pipeline
+    - Online generation with configurable sampling parameters
+    - Value head for advantage estimation via GAE
+    - KL penalty against a frozen reference model
+    - Support for multiple weighted reward functions
+    - Clipped policy and value function objectives
+
+    The training loop:
+    1. Sample prompts from the dataset
+    2. Generate completions using the current policy
+    3. Score completions with reward function(s)
+    4. Compute advantages using GAE with the value head
+    5. Update policy with clipped PPO objective
 
     Attributes:
-        arguments: GRPOConfig instance with training hyperparameters
-        ref_state: Reference model state for KL divergence computation
-        processing_class: Tokenizer or processor for text encoding
-        reward_processing_classes: Optional separate processors for reward models
-        generation_config: Configuration for response generation
-        data_tokenize_fn: Function to tokenize dataset samples
+        arguments: PPOConfig with training hyperparameters.
+        ref_state: Frozen reference model for KL computation.
+        reward_funcs: List of reward functions/models.
+        reward_weights: Weights for combining multiple rewards.
+        processing_class: Tokenizer for text encoding.
+        num_generations: Number of completions per prompt.
 
     Example:
-        >>> config = GRPOConfig(
+        >>> config = PPOConfig(
         ...     per_device_train_batch_size=4,
-        ...     grpo_n_samples=4,
-        ...     grpo_beta=0.1,
+        ...     num_return_sequences=4,
+        ...     kl_coef=0.05,
+        ...     cliprange=0.2,
         ...     learning_rate=1e-6
         ... )
-        >>> trainer = GRPOTrainer(
+        >>> trainer = PPOTrainer(
         ...     arguments=config,
         ...     model=model,
         ...     reward_funcs=reward_model,
@@ -109,11 +119,11 @@ class GRPOTrainer(Trainer):
         >>> trainer.train()
     """
 
-    arguments: GRPOConfig  # type hinting
+    arguments: PPOConfig
 
     def __init__(
         self,
-        arguments: GRPOConfig,
+        arguments: PPOConfig,
         model: EasyDeLBaseModule | EasyDeLState | None,
         reward_funcs: RewardFunc | list[RewardFunc],
         train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
@@ -122,28 +132,44 @@ class GRPOTrainer(Trainer):
         reward_processing_classes: ProcessingClassType = None,
         data_tokenize_fn: tp.Callable | None = None,
     ):
-        assert arguments is not None, (
-            "You Have to pass `arguments` that will be used for training, but you have passed `arguments=None`"
-        )
-        assert isinstance(arguments, GRPOConfig), f"arguments type must be `GRPOConfig` but got {type(arguments)}"
-        assert processing_class is not None, "processing_class must be specified to tokenize a DPO dataset."
+        """Initialize the PPO trainer.
+
+        Args:
+            arguments: PPOConfig instance with training hyperparameters.
+            model: The policy model to train. Will be wrapped with a value head
+                if not already present.
+            reward_funcs: Reward function(s) for scoring completions. Can be:
+                - A callable taking (prompts, completions) and returning scores
+                - An EasyDeLBaseModule/EasyDeLState reward model
+                - A list of multiple reward functions
+            train_dataset: Training dataset with prompt examples.
+            eval_dataset: Optional evaluation dataset(s).
+            processing_class: Tokenizer for encoding prompts and completions.
+            reward_processing_classes: Optional separate tokenizers for reward models.
+            data_tokenize_fn: Optional custom tokenization function.
+
+        Raises:
+            AssertionError: If arguments is None or not a PPOConfig.
+            ValueError: If model is None or reward weights don't match reward funcs.
+        """
+        assert arguments is not None, "PPOTrainer requires `arguments`."
+        assert isinstance(arguments, PPOConfig), f"arguments type must be `PPOConfig` but got {type(arguments)}"
+        assert processing_class is not None, "processing_class must be specified to tokenize PPO prompts."
 
         self.arguments = arguments
-        self.truncation_mode = arguments.truncation_mode
         self.processing_class = processing_class
-        self.loss_type = arguments.loss_type.lower() if isinstance(arguments.loss_type, str) else arguments.loss_type
-        self.epsilon = arguments.epsilon
-        self.epsilon_high = arguments.epsilon_high
-        self.delta = arguments.delta
-        self.importance_sampling_level = arguments.importance_sampling_level
-        if isinstance(self.importance_sampling_level, str):
-            self.importance_sampling_level = self.importance_sampling_level.lower()
-        self.scale_rewards = arguments.scale_rewards
-        if isinstance(self.scale_rewards, str):
-            self.scale_rewards = self.scale_rewards.lower()
-        self.top_entropy_quantile = arguments.top_entropy_quantile
 
-        if not isinstance(model, EasyDeLState):
+        if model is None:
+            raise ValueError("`model` must be provided for PPO training.")
+
+        # Ensure we have a value head attached.
+        if isinstance(model, EasyDeLState):
+            module = model.model
+            if not hasattr(module, "value_head"):
+                model = CausalLMWithValueHead(module).to_state()
+        else:
+            if not hasattr(model, "value_head"):
+                model = CausalLMWithValueHead(model)
             model = model.to_state()
 
         self.ref_state = deepcopy_model(model=model)
@@ -153,6 +179,7 @@ class GRPOTrainer(Trainer):
                 model.model.config._name_or_path,
                 padding_side="left",
             )
+
         if not isinstance(reward_funcs, list):
             reward_funcs = [reward_funcs]
         self.reward_funcs = reward_funcs
@@ -186,14 +213,7 @@ class GRPOTrainer(Trainer):
                     reward_func = reward_func.replace(apply_fn=apply_fn)
 
                 if reward_processing_class is None:
-                    reward_model_name = reward_func.model.config._name_or_path
-                    try:
-                        reward_processing_class = AutoTokenizer.from_pretrained(reward_model_name)
-                    except ValueError as exc:
-                        if "tiktoken" in str(exc).lower():
-                            reward_processing_class = AutoTokenizer.from_pretrained(reward_model_name, use_fast=False)
-                        else:
-                            raise
+                    reward_processing_class = AutoTokenizer.from_pretrained(reward_func.model.config._name_or_path)
                 if reward_processing_class.pad_token_id is None:
                     reward_processing_class.pad_token = reward_processing_class.eos_token
 
@@ -215,8 +235,7 @@ class GRPOTrainer(Trainer):
         self.num_generations = arguments.num_generations
         self.reward_processing_classes = reward_processing_classes
         self.reward_funcs = reward_funcs
-        self.arguments = arguments
-        self.processing_class = processing_class
+
         if getattr(self.arguments, "generation_num_return_sequences", None) is None:
             self.arguments.generation_num_return_sequences = self.num_generations
         if getattr(self.arguments, "generation_top_p", None) is None:
@@ -260,7 +279,6 @@ class GRPOTrainer(Trainer):
                 pass
             return None
 
-        # Check if datasets are conversational before passing to BaseTrainer
         self.train_is_conversational = False
         self.eval_is_conversational = False
         train_sample = _peek_first_example(train_dataset)
@@ -286,8 +304,11 @@ class GRPOTrainer(Trainer):
         )
 
     def _get_preprocess_transform(self) -> GRPOPreprocessTransform | None:
-        """Get GRPO preprocessing transform for ShardedDataSource."""
+        """Get the preprocessing transform for ShardedDataSource.
 
+        Returns:
+            GRPOPreprocessTransform if dataset needs tokenization, None otherwise.
+        """
         if self._is_pretokenized():
             return None
         return GRPOPreprocessTransform(
@@ -298,7 +319,11 @@ class GRPOTrainer(Trainer):
         )
 
     def _is_pretokenized(self) -> bool:
-        """Check if dataset already has tokenized fields."""
+        """Check if the dataset already has tokenized fields.
+
+        Returns:
+            True if dataset contains 'input_ids', False otherwise.
+        """
         if self._train_source is None:
             return False
         try:
@@ -312,7 +337,15 @@ class GRPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collator for Grain data loading."""
+        """Create a data collator for Grain data loading.
+
+        Args:
+            max_sequence_length: Maximum sequence length (unused, kept for API).
+            truncation_mode: How to truncate sequences (unused, kept for API).
+
+        Returns:
+            GRPODataCollatorGrain instance for batching prompt data.
+        """
         from ..utils import GRPODataCollatorGrain
 
         return GRPODataCollatorGrain(
@@ -325,7 +358,15 @@ class GRPOTrainer(Trainer):
         max_sequence_length: int,
         truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     ) -> tp.Callable:
-        """Create data collator for TFDS data loading."""
+        """Create a data collator for TFDS data loading.
+
+        Args:
+            max_sequence_length: Maximum sequence length (unused, kept for API).
+            truncation_mode: How to truncate sequences (unused, kept for API).
+
+        Returns:
+            GRPODataCollatorTFDS instance for batching prompt data.
+        """
         from ..utils import GRPODataCollatorTFDS
 
         return GRPODataCollatorTFDS(
@@ -333,76 +374,64 @@ class GRPOTrainer(Trainer):
             pad_token_id=self.padding_value,
         )
 
-    @property
-    def step_sharding(self):
-        return NamedSharding(
-            mesh=self.model.mesh,
-            spec=self.arguments.step_partition_spec,
-        )
-
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
-        """
-        Configures and JIT-compiles the training and evaluation step functions.
+        """Configure and JIT-compile training and evaluation step functions.
 
-        This method sets up the necessary functions for training and evaluation, including:
-            - Initialization of the model state.
-            - Sharding of the model parameters and optimizer state.
-            - JIT-compilation of the training and evaluation step functions.
+        Sets up the sharded training and evaluation functions with proper
+        JIT compilation and sharding specifications for distributed training.
+        Also configures helper functions for computing reference model log
+        probabilities and rollout statistics.
 
         Returns:
-            TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
+            TrainerConfigureFunctionOutput containing:
+                - sharded_training_step_function: JIT-compiled training step
+                - sharded_evaluation_step_function: JIT-compiled eval step
+                - mesh: Device mesh for sharding
+                - checkpoint_manager: For saving checkpoints
         """
         mesh = self.model.mesh
-
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
 
+        prompt_length = int(self.arguments.max_prompt_length)
+
         self._train_shared_fn_static_args = (
-            self.num_generations,
-            self.arguments.beta,
+            prompt_length,
+            float(self.arguments.cliprange),
+            float(self.arguments.vf_coef),
+            float(self.arguments.cliprange_value),
+            float(self.arguments.entropy_coef),
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
             True,  # is_train
-            self.loss_type,
-            self.epsilon,
-            self.epsilon_high,
-            self.delta,
-            self.importance_sampling_level,
-            self.top_entropy_quantile,
         )
-
-        static_argnames = tuple(range(2, 15))
-
+        static_argnums = tuple(range(2, 12))
         sharded_training_step_function = ejit(
-            grpo_step,
+            ppo_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=(self.state_shardings, empty_sharding),
             donate_argnums=(0,),
-            static_argnums=static_argnames,
+            static_argnums=static_argnums,
         )
 
         self._eval_shared_fn_static_args = (
-            self.num_generations,
-            self.arguments.beta,
+            prompt_length,
+            float(self.arguments.cliprange),
+            float(self.arguments.vf_coef),
+            float(self.arguments.cliprange_value),
+            float(self.arguments.entropy_coef),
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
             False,  # is_train
-            self.loss_type,
-            self.epsilon,
-            self.epsilon_high,
-            self.delta,
-            self.importance_sampling_level,
-            self.top_entropy_quantile,
         )
-
         sharded_evaluation_step_function = ejit(
-            grpo_step,
+            ppo_step,
             in_shardings=(self.state_shardings, empty_sharding),
             out_shardings=empty_sharding,
-            static_argnums=static_argnames,
+            static_argnums=static_argnums,
         )
 
         def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef):
@@ -410,11 +439,18 @@ class GRPOTrainer(Trainer):
             with apply.mesh:
                 ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
                 mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
-                return get_per_token_logps(apply, ids, mask, self.arguments.max_prompt_length)
+                # Reuse GRPO logps utility implementation via PPO step helpers (fast path).
+                outputs = apply(input_ids=ids, attention_mask=mask)
+                logits = outputs.logits[:, prompt_length - 1 :]
+                logits = logits[:, :-1, :]
+                log_probs = jax.nn.log_softmax(logits, axis=-1)
+                target_ids = ids[:, prompt_length:]
+                token_log_probs = jnp.take_along_axis(log_probs, jnp.expand_dims(target_ids, axis=-1), axis=-1)
+                return jnp.squeeze(token_log_probs, axis=-1)
 
         self.compute_refmodel_logps = ejit(
             partial(_compute_refmodel_logps, graphdef=self.model_state.graphdef),
-            static_argnames=("graphdef"),
+            static_argnames=("graphdef",),
             in_shardings=(
                 self.model_state.shardings.graphstate,
                 self.model_state.shardings.graphother,
@@ -424,8 +460,41 @@ class GRPOTrainer(Trainer):
             out_shardings=empty_sharding,
         )
 
-        sharded_training_step_function.static_argnums_ = static_argnames
-        sharded_evaluation_step_function.static_argnums_ = static_argnames
+        def _compute_rollout_logps_values(graphtree, graphother, ids, mask, graphdef):
+            apply = flax.nnx.merge(graphdef, graphtree, graphother)
+            with apply.mesh:
+                ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
+                mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
+                outputs = apply(input_ids=ids, attention_mask=mask, output_hidden_states=True)
+                logits = outputs.logits[:, prompt_length - 1 :]
+                logits = logits[:, :-1, :]
+                log_probs = jax.nn.log_softmax(logits, axis=-1)
+                target_ids = ids[:, prompt_length:]
+                token_log_probs = jnp.take_along_axis(log_probs, jnp.expand_dims(target_ids, axis=-1), axis=-1)
+                token_log_probs = jnp.squeeze(token_log_probs, axis=-1)
+
+                hidden_states = getattr(outputs, "last_hidden_state", None)
+                if hidden_states is None:
+                    hidden_states = getattr(outputs, "hidden_states", None)
+                    if hidden_states is None:
+                        raise ValueError("Model outputs do not provide hidden states; cannot compute value outputs.")
+                    hidden_states = hidden_states[-1]
+
+                values_full = apply.value_head(hidden_states).squeeze(-1)
+                values = values_full[:, prompt_length - 1 : -1]
+                return token_log_probs, values
+
+        self.compute_rollout_logps_values = ejit(
+            partial(_compute_rollout_logps_values, graphdef=self.model_state.graphdef),
+            static_argnames=("graphdef",),
+            in_shardings=(
+                self.model_state.shardings.graphstate,
+                self.model_state.shardings.graphother,
+                empty_sharding,
+                empty_sharding,
+            ),
+            out_shardings=(empty_sharding, empty_sharding),
+        )
 
         self.arguments.ensure_checkpoint_path()
         checkpoint_manager = self.arguments.get_streaming_checkpointer()
@@ -437,13 +506,103 @@ class GRPOTrainer(Trainer):
             checkpoint_manager=checkpoint_manager,
         )
 
+    def _masked_whiten(self, x: jax.Array, mask: jax.Array, *, shift_mean: bool) -> jax.Array:
+        """Normalize array values with optional mean shifting.
+
+        Args:
+            x: Input array to normalize.
+            mask: Binary mask for valid elements.
+            shift_mean: Whether to subtract the mean (True for advantages).
+
+        Returns:
+            Normalized array with unit variance (and zero mean if shift_mean).
+        """
+        mask = mask.astype(x.dtype)
+        denom = jnp.maximum(jnp.sum(mask), 1.0)
+        mean = jnp.sum(x * mask) / denom
+        var = jnp.sum(jnp.square(x - mean) * mask) / denom
+        std = jnp.sqrt(var + 1e-8)
+        if shift_mean:
+            x = x - mean
+        return x / std
+
+    def _compute_gae(
+        self,
+        rewards: jax.Array,
+        values: jax.Array,
+        mask: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Compute Generalized Advantage Estimation (GAE).
+
+        Computes advantages and returns using the GAE algorithm, which provides
+        a balance between bias and variance in advantage estimation.
+
+        Args:
+            rewards: Per-token rewards including KL penalty and final score.
+            values: Value head predictions for each position.
+            mask: Binary mask for valid completion tokens.
+
+        Returns:
+            Tuple of (advantages, returns):
+                - advantages: GAE-computed advantages for policy gradient.
+                - returns: Target values for value function training.
+        """
+        rewards = rewards.astype(jnp.float32)
+        values = values.astype(jnp.float32)
+        mask = mask.astype(jnp.float32)
+
+        batch_size, _gen_len = rewards.shape
+        values_next = jnp.concatenate([values[:, 1:], jnp.zeros((batch_size, 1), dtype=values.dtype)], axis=1)
+        mask_next = jnp.concatenate([mask[:, 1:], jnp.zeros((batch_size, 1), dtype=mask.dtype)], axis=1)
+
+        gamma = float(self.arguments.gamma)
+        lam = float(self.arguments.lam)
+
+        def scan_fn(adv_next, inputs):
+            r_t, v_t, v_next_t, m_t, m_next_t = inputs
+            delta = r_t + gamma * v_next_t * m_next_t - v_t
+            adv_t = delta + gamma * lam * adv_next * m_next_t
+            adv_t = adv_t * m_t
+            return adv_t, adv_t
+
+        inputs = (
+            rewards[:, ::-1].T,
+            values[:, ::-1].T,
+            values_next[:, ::-1].T,
+            mask[:, ::-1].T,
+            mask_next[:, ::-1].T,
+        )
+        _, adv_rev = jax.lax.scan(scan_fn, jnp.zeros((batch_size,), dtype=values.dtype), inputs)
+        advantages = adv_rev.T[:, ::-1]
+        returns = advantages + values
+        return advantages, returns
+
     def _preprocess_batch_input(
         self,
         state: EasyDeLState,
         batch: dict[str, jax.Array],
         is_train: bool,
     ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
-        # Purify batch first to handle list of dicts (uncollated batch)
+        """Preprocess a batch for PPO training.
+
+        Performs the full PPO rollout preprocessing:
+        1. Generate completions from prompts
+        2. Compute log probabilities and values from policy
+        3. Compute reference model log probabilities
+        4. Score completions with reward functions
+        5. Compute per-token rewards with KL penalty
+        6. Compute GAE advantages and returns
+
+        Args:
+            state: Current model state for generation.
+            batch: Input batch with prompt input_ids and attention_mask.
+            is_train: Whether this is for training (affects conversational format).
+
+        Returns:
+            Tuple of (processed_batch, metrics):
+                - processed_batch: Dictionary with all tensors needed for PPO step.
+                - metrics: Dictionary with timing and reward statistics.
+        """
         batch = self._purify_batch(batch)
         with capture_time() as preprocessing_time_fn:
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
@@ -453,9 +612,9 @@ class GRPOTrainer(Trainer):
                     input_ids=prompt_ids,
                     attention_mask=prompt_mask,
                     state=state,
-                    apply_chat_template=False,  # GRPO doesn't apply chat template to prompts
-                    shard_inputs=False,  # Already sharded
-                    all_gather=False,  # We'll handle gathering ourselves
+                    apply_chat_template=False,
+                    shard_inputs=False,
+                    all_gather=False,
                 )
                 sequences = results.sequences
                 prompt_ids = results.prompt_ids
@@ -464,47 +623,58 @@ class GRPOTrainer(Trainer):
                 completion_prompts = results.completion_prompts
 
             generation_time = generation_time_fn()
-            prompt_completion_ids = sequences
 
             completion_mask = self._make_attn_mask(completion_ids)
             if self.arguments.mask_truncated_completions:
                 eos_tokens = jnp.asarray(self._eos_token_id).reshape(-1)
                 has_eos = jnp.any(jnp.isin(completion_ids, eos_tokens), axis=1)
                 completion_mask = completion_mask * has_eos[:, None].astype(completion_mask.dtype)
-            # Derive how many completions we have per prompt instead of trusting config-only value.
+
             generation_factor = completion_ids.shape[0] // max(prompt_mask.shape[0], 1)
             generation_factor = max(generation_factor, 1)
-            ridmask = prompt_mask.repeat(generation_factor, 0)
+            prompt_mask_rep = prompt_mask.repeat(generation_factor, 0)
+            attention_mask = jnp.concatenate([prompt_mask_rep, completion_mask], axis=1)
+            input_ids = sequences
 
-            with capture_time() as token_logps_time_fn:
+            with capture_time() as ref_logps_time_fn:
                 ref_per_token_logps = self.compute_refmodel_logps(
                     self.ref_state.graphstate,
                     self.ref_state.graphother,
-                    prompt_completion_ids,
-                    jnp.concatenate([ridmask, completion_mask], -1),
+                    input_ids,
+                    attention_mask,
                 )
-            token_logps_time = token_logps_time_fn()
+            ref_logps_time = ref_logps_time_fn()
+
+            with capture_time() as rollout_stats_time_fn:
+                old_logps, old_values = self.compute_rollout_logps_values(
+                    state.graphstate,
+                    state.graphother,
+                    input_ids,
+                    attention_mask,
+                )
+            rollout_stats_time = rollout_stats_time_fn()
 
             completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
 
-            is_conversational = self.train_is_conversational if is_train else self.eval_is_conversational
-
-            if is_conversational:
+            is_conv = self.train_is_conversational if is_train else self.eval_is_conversational
+            if completion_prompts:
+                first_prompt = completion_prompts[0]
+                if not isinstance(first_prompt, list):
+                    is_conv = False
+            else:
+                is_conv = False
+            if is_conv:
                 completions = [[{"role": "assistant", "content": completion}] for completion in completions_text]
             else:
                 completions = completions_text
 
-            rewards_per_func = jnp.full(
-                (prompt_ids.shape[0] * generation_factor, len(self.reward_funcs)),
-                jnp.nan,
-                dtype="f4",
-            )
+            rewards_per_func = jnp.full((completion_ids.shape[0], len(self.reward_funcs)), jnp.nan, dtype="f4")
             with capture_time() as rewarding_time_fn:
                 for i, (reward_func, reward_processing_class) in enumerate(
                     zip(self.reward_funcs, self.reward_processing_classes, strict=False)
                 ):
                     if isinstance(reward_func, EasyDeLState):
-                        if is_conversational:
+                        if is_conv:
                             messages = [
                                 {"messages": p + c} for p, c in zip(completion_prompts, completions, strict=False)
                             ]
@@ -530,9 +700,8 @@ class GRPOTrainer(Trainer):
                             ),
                         ).logits[:, 0]
                     else:
-                        in_prompts = completion_prompts
                         output_reward_func = reward_func(
-                            prompts=in_prompts,
+                            prompts=completion_prompts,
                             completions=completions,
                             max_length=self.arguments.max_length,
                             batch=batch,
@@ -543,101 +712,73 @@ class GRPOTrainer(Trainer):
                         )
                     rewards_per_func = rewards_per_func.at[:, i].set(rew.reshape(-1))
             rewarding_time = rewarding_time_fn()
-            log_completion_ids = completion_ids
-            log_completion_length = jnp.sum(completion_mask, -1)
 
             prompt_ids = self._all_gather(prompt_ids)
             prompt_mask = self._all_gather(prompt_mask)
             completion_ids = self._all_gather(completion_ids)
             completion_mask = self._all_gather(completion_mask)
+            input_ids = self._all_gather(input_ids)
+            attention_mask = self._all_gather(attention_mask)
+            old_logps = self._all_gather(old_logps)
+            old_values = self._all_gather(old_values)
             ref_per_token_logps = self._all_gather(ref_per_token_logps)
             rewards_per_func = self._all_gather(rewards_per_func)
 
-            with capture_time() as grouped_comp_time_fn:
-                generation_factor = completion_ids.shape[0] // max(prompt_mask.shape[0], 1)
-                generation_factor = max(generation_factor, 1)
-                rewards = jnp.nansum(rewards_per_func * self.reward_weights[None, :], axis=1)
-                mean_grouped_rewards = jnp.nanmean(rewards.reshape(-1, generation_factor), axis=-1)
-                advantages = rewards - mean_grouped_rewards.repeat(generation_factor, axis=0)
+            scores = jnp.nansum(rewards_per_func * self.reward_weights[None, :], axis=1)
+            if self.arguments.missing_eos_penalty is not None:
+                eos_tokens = jnp.asarray(self._eos_token_id).reshape(-1)
+                has_eos = jnp.any(jnp.isin(completion_ids, eos_tokens), axis=1)
+                scores = scores - (~has_eos).astype(scores.dtype) * float(self.arguments.missing_eos_penalty)
 
-                if self.scale_rewards in ("group", "none"):
-                    std_rewards = jnp.nanstd(rewards.reshape(-1, generation_factor), axis=-1)
-                    std_rewards = std_rewards.repeat(generation_factor, axis=0)
-                elif self.scale_rewards == "batch":
-                    std_rewards = jnp.nanstd(rewards)
-                    std_rewards = jnp.broadcast_to(std_rewards, advantages.shape)
-                else:
-                    raise ValueError(
-                        f"Invalid value for scale_rewards: {self.scale_rewards}. Must be 'batch', 'group', or 'none'."
-                    )
-                is_std_zero = jnp.isclose(std_rewards, 0.0)
-                if self.scale_rewards != "none":
-                    advantages = advantages / (std_rewards + 1e-4)
-                advantages = jnp.nan_to_num(advantages)
-            grouped_comp_time = grouped_comp_time_fn()
+            logr = ref_per_token_logps - old_logps
+            if self.arguments.kl_estimator == "k1":
+                kl = -logr
+            else:
+                kl = jnp.exp(logr) - 1.0 - logr
+            non_score_reward = -float(self.arguments.kl_coef) * kl
+            rewards = non_score_reward
+
+            lengths = jnp.sum(completion_mask, axis=1).astype(jnp.int32)
+            last_idx = jnp.maximum(lengths - 1, 0)
+            batch_idx = jnp.arange(rewards.shape[0])
+            rewards = rewards.at[batch_idx, last_idx].add(scores.astype(rewards.dtype))
+            rewards = rewards * completion_mask
+
+            if self.arguments.whiten_rewards:
+                rewards = self._masked_whiten(rewards, completion_mask, shift_mean=False)
+                rewards = rewards * completion_mask
+
+            advantages, returns = self._compute_gae(rewards, old_values, completion_mask)
+            if self.arguments.whiten_advantages:
+                advantages = self._masked_whiten(advantages, completion_mask, shift_mean=True)
+                advantages = advantages * completion_mask
+
         preprocessing_time = preprocessing_time_fn()
-        completion_length = jnp.sum(completion_mask, -1)
+
+        token_count = jnp.maximum(jnp.sum(completion_mask), 1.0)
         metrics_dict = {
-            "reward_mean": jnp.nanmean(rewards, -1),
-            "reward_std": jnp.nanmean(std_rewards),
-            "completion_length": jnp.mean(completion_length),
-            "grouped_comp_time": grouped_comp_time,
+            "score_mean": jnp.nanmean(scores),
+            "reward_mean": jnp.sum(rewards) / token_count,
+            "mean_kl": jnp.sum(kl * completion_mask) / token_count,
+            "completion_length": jnp.mean(jnp.sum(completion_mask, axis=1)),
             "rewarding_time": rewarding_time,
-            "token_logps_time": token_logps_time,
+            "rollout_stats_time": rollout_stats_time,
+            "ref_logps_time": ref_logps_time,
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
-            "frac_reward_zero_std": jnp.mean(is_std_zero.astype(jnp.float32)),
         }
         for i, reward_func_name in enumerate(self.reward_func_names):
             metrics_dict[reward_func_name] = jnp.nanmean(rewards_per_func[:, i])
-        if self.log_table is not None:
-            cur_step = jax.device_get(state.step)
-            decoded_prompt = completion_prompts
-            decoded_text = self._decode_prompt_batch(
-                self.processing_class,
-                jax.device_get(log_completion_ids),
-                False,
-                self._pad_token_id,
-                True,
-            )
-            for decoded, prompt, length in zip(decoded_text, decoded_prompt, log_completion_length, strict=False):
-                prompt_repr = prompt if isinstance(prompt, str) else str(prompt)
-                self.log_table.add_data(decoded, prompt_repr, generation_time, float(jax.device_get(length)), cur_step)
-            wandb.log({"generations": self.log_table}, step=cur_step)
 
-        # i don't care who you are and what you do.
-        # ill find you and ill gather u...
         return (
             {
-                "prompt_ids": prompt_ids,
-                "prompt_mask": prompt_mask,
-                "completion_ids": completion_ids,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
                 "completion_mask": completion_mask,
-                "ref_per_token_logps": ref_per_token_logps,
+                "old_logps": old_logps,
+                "old_values": old_values,
                 "advantages": advantages,
-                "num_items_in_batch": jnp.sum(completion_mask),
+                "returns": returns,
             },
             metrics_dict,
         )
-
-    def on_step_end(
-        self,
-        state: EasyDeLState,
-        metrics: MetricsType,
-        step: int,
-    ) -> tuple[EasyDeLState, MetricsType]:
-        """hook process to call in start of the step."""
-
-        if (
-            self.arguments.sync_ref_model
-            and self.ref_state is not None
-            and (step % self.arguments.ref_model_sync_steps == 0)
-        ):
-            alpha = self.arguments.ref_model_mixup_alpha
-            new_graphstate = jax.tree_util.tree_map(
-                lambda new, old: alpha * new + (1 - alpha) * old,
-                deepcopy_model(state.graphstate),
-                self.ref_state.graphstate,
-            )
-            self.ref_state = self.ref_state.replace(graphstate=new_graphstate)
-        return state, metrics

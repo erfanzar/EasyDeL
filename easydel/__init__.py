@@ -668,6 +668,8 @@ _import_structure = {
         "KTOTrainer",
         "NashMDConfig",
         "NashMDTrainer",
+        "PPOConfig",
+        "PPOTrainer",
         "XPOConfig",
         "XPOTrainer",
         "ORPOConfig",

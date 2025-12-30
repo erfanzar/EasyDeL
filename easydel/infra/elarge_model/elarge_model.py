@@ -1454,7 +1454,26 @@ class eLargeModel:
             trainer_kwargs["train_dataset"] = train_dataset
             trainer_kwargs["eval_dataset"] = eval_dataset
             trainer_kwargs["processing_class"] = self._tokenizer
-            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", self._tokenizer)
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+
+        elif trainer_type == "ppo":
+            if reward_funcs is None and reward_model is None:
+                reward_model = self.build_reward_model()
+
+            resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if resolved_reward is None:
+                raise ValueError(
+                    "ppo training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
+                )
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = resolved_reward
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
             trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
 
         elif trainer_type in {"xpo", "nash-md", "nash_md"}:
@@ -1480,7 +1499,7 @@ class eLargeModel:
             trainer_kwargs["train_dataset"] = train_dataset
             trainer_kwargs["eval_dataset"] = eval_dataset
             trainer_kwargs["processing_class"] = self._tokenizer
-            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", self._tokenizer)
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
 
         elif trainer_type == "sft":
             trainer_kwargs["arguments"] = training_args

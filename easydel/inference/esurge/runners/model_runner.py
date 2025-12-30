@@ -1369,7 +1369,7 @@ class eSurgeRunner:
                 f"extra={total_prep_extra_put_time * 1e3:.2f}ms) "
             )
 
-        logger.info(
+        self.log_it(
             f"[perf] it={self._perf_iteration:06d} "
             f"win={num_windows} "
             f"reqs={len(req_ids_all)}(new={num_new},cached={num_cached},fin={num_finished},pad={_fmt_bucket(req_buckets_used)}) "

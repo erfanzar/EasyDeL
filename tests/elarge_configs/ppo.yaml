@@ -1,5 +1,5 @@
-# GSPO (Group Sequence Policy Optimization) test config
-# Mirrors tests/trainers/gspo_trainer.py
+# PPO (Proximal Policy Optimization) test config
+# Similar to GRPO config, but uses PPO trainer.
 # Note: Requires `reward_model` because YAML cannot supply python reward functions.
 
 model:
@@ -36,7 +36,7 @@ mixture:
   streaming: false
 
 trainer:
-  trainer_type: gspo
+  trainer_type: ppo
   learning_rate: 8.0e-6
   num_train_epochs: 1
   total_batch_size: 2
@@ -45,11 +45,12 @@ trainer:
   max_prompt_length: 512
   max_completion_length: 256
   max_sequence_length: 768
+  num_return_sequences: 1
   save_steps: 1000
   save_total_limit: 1
   log_steps: 1
   shuffle_train_dataset: false
-  save_directory: ./tmp-files/elarge-tests/gspo
+  save_directory: ./tmp-files/elarge-tests/ppo
 
 actions:
   - validate

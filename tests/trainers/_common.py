@@ -61,7 +61,14 @@ def _prepare_save_dir(name: str) -> str:
 
 @lru_cache(maxsize=4)
 def get_tokenizer(model_repo: str = MODEL_REPO):
-    tokenizer = AutoTokenizer.from_pretrained(model_repo)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_repo)
+    except ValueError as exc:
+        msg = str(exc).lower()
+        if "tiktoken" in msg:
+            tokenizer = AutoTokenizer.from_pretrained(model_repo, use_fast=False)
+        else:
+            raise
     if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
@@ -96,11 +103,12 @@ def load_causal_lm_model(model_repo: str | None = None) -> ed.AutoEasyDeLModelFo
     return model
 
 
-def load_sequence_classifier_model() -> ed.AutoEasyDeLModelForSequenceClassification:
-    tokenizer = get_tokenizer()
-    model = ed.AutoEasyDeLModelForSequenceClassification.from_pretrained(
-        MODEL_REPO, num_labels=1, **_load_model_kwargs()
-    )
+def load_sequence_classifier_model(
+    model_repo: str | None = None,
+) -> ed.AutoEasyDeLModelForSequenceClassification:
+    repo = model_repo or MODEL_REPO
+    tokenizer = get_tokenizer(repo)
+    model = ed.AutoEasyDeLModelForSequenceClassification.from_pretrained(repo, num_labels=1, **_load_model_kwargs())
     model.config.pad_token_id = tokenizer.pad_token_id
     return model
 
@@ -176,7 +184,6 @@ def make_config(
         "generation_temperature": 0.7,
         "generation_do_sample": True,
         "generation_num_return_sequences": 4,
-        "generation_max_new_tokens": 2048,
         "generation_interval": 100,
         "generation_prompts": ["Here's Fibo in c++"],
         "generation_use_train_prompts": False,
