@@ -25,6 +25,7 @@ try:
         GRPOPreprocessTransform,
         KTOPreprocessTransform,
         ORPOPreprocessTransform,
+        PPOPreprocessTransform,
         RewardPreprocessTransform,
         SFTPreprocessTransform,
     )
@@ -360,11 +361,7 @@ class TestKTOPreprocessTransform:
 
 
 class TestBCOPreprocessTransform:
-    """Tests for BCOPreprocessTransform (alias for KTOPreprocessTransform)."""
-
-    def test_is_alias(self):
-        """Test that BCO is an alias for KTO preprocessing."""
-        assert BCOPreprocessTransform is KTOPreprocessTransform
+    """Tests for BCOPreprocessTransform."""
 
     def test_bco_example(self):
         """Test processing a BCO example."""
@@ -380,7 +377,9 @@ class TestBCOPreprocessTransform:
             "completion": "Answer",
             "label": False,
         }
-        result = transform(example)
+        results = list(transform(example))
+        assert len(results) == 1
+        result = results[0]
 
         assert "prompt_input_ids" in result
         assert "completion_input_ids" in result
@@ -430,6 +429,31 @@ class TestGRPOPreprocessTransform:
         result = transform(example)
 
         assert "input_ids" in result
+
+
+class TestPPOPreprocessTransform:
+    """Tests for PPOPreprocessTransform."""
+
+    def test_init(self):
+        tokenizer = MockTokenizer()
+        transform = PPOPreprocessTransform(
+            tokenizer=tokenizer,
+            max_prompt_length=1024,
+        )
+        assert transform._max_prompt_length == 1024
+
+    def test_prompt_example(self):
+        tokenizer = MockTokenizer()
+        transform = PPOPreprocessTransform(
+            tokenizer=tokenizer,
+            max_prompt_length=1024,
+        )
+
+        example = {"prompt": "Explain PPO in one sentence."}
+        result = transform(example)
+
+        assert "input_ids" in result
+        assert "attention_mask" in result
 
 
 class TestRewardPreprocessTransform:

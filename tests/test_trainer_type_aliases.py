@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-
 _REQUIRES_PY311 = sys.version_info >= (3, 11)
 
 
@@ -28,9 +27,28 @@ def test_nash_md_alias_normalized():
 
 
 @pytest.mark.skipif(not _REQUIRES_PY311, reason="EasyDeL requires Python 3.11+")
+def test_ppo_normalized_and_defaults_present():
+    trainer_types = _load_trainer_types_module()
+    config = trainer_types.normalize_trainer_config({"trainer_type": "ppo"})
+    assert config["trainer_type"] == "ppo"
+    assert config["trainer_prefix"] == "ppotrainer"
+    assert "cliprange" in config
+    assert "vf_coef" in config
+
+
+@pytest.mark.skipif(not _REQUIRES_PY311, reason="EasyDeL requires Python 3.11+")
 def test_nash_md_alias_resolves_classes():
     pytest.importorskip("eformer.paths")
     from easydel.infra.elarge_model.trainer_types import get_trainer_class, get_training_arguments_class
 
     assert get_trainer_class("nash_md") is get_trainer_class("nash-md")
     assert get_training_arguments_class("nash_md") is get_training_arguments_class("nash-md")
+
+
+@pytest.mark.skipif(not _REQUIRES_PY311, reason="EasyDeL requires Python 3.11+")
+def test_ppo_resolves_classes():
+    pytest.importorskip("eformer.paths")
+    from easydel.infra.elarge_model.trainer_types import get_trainer_class, get_training_arguments_class
+
+    assert get_trainer_class("ppo").__name__ == "PPOTrainer"
+    assert get_training_arguments_class("ppo").__name__ == "PPOConfig"

@@ -171,7 +171,7 @@ def _normalize_attention(tensor: jax.Array) -> jax.Array:
 
 
 def _stop_gradient_tree(tree):
-    return jax.tree_map(lambda x: jax.lax.stop_gradient(x) if isinstance(x, JaxArray) else x, tree)
+    return jax.tree_util.tree_map(lambda x: jax.lax.stop_gradient(x) if isinstance(x, JaxArray) else x, tree)
 
 
 def distillation_step(

@@ -16,7 +16,7 @@
 """Comprehensive trainer configuration support for ELM.
 
 This module extends the ELM configuration system to support all trainer types
-available in EasyDeL, including DPO, ORPO, GRPO, SFT, Reward, and Distillation trainers.
+available in EasyDeL, including DPO, ORPO, GRPO, PPO, SFT, Reward, and Distillation trainers.
 """
 
 from __future__ import annotations
@@ -115,6 +115,7 @@ class BaseTrainerCfg(TypedDict, total=False):
             "grpo",
             "gfpo",
             "gspo",
+            "ppo",
             "orpo",
             "reward",
             "distillation",
@@ -321,6 +322,32 @@ class GRPOTrainerCfg(BaseTrainerCfg):
     temperature: NotRequired[float]
 
 
+class PPOTrainerCfg(BaseTrainerCfg):
+    """Configuration for Proximal Policy Optimization trainer (PPOConfig)."""
+
+    max_prompt_length: NotRequired[int]
+    max_completion_length: NotRequired[int]
+    dataset_num_proc: NotRequired[int | None]
+    reward_weights: NotRequired[list[float] | None]
+    kl_coef: NotRequired[float]
+    kl_estimator: NotRequired[Literal["k1", "k3"]]
+    cliprange: NotRequired[float]
+    vf_coef: NotRequired[float]
+    cliprange_value: NotRequired[float]
+    gamma: NotRequired[float]
+    lam: NotRequired[float]
+    whiten_rewards: NotRequired[bool]
+    whiten_advantages: NotRequired[bool]
+    entropy_coef: NotRequired[float]
+    missing_eos_penalty: NotRequired[float | None]
+    tools: NotRequired[list[dict | Any] | None]
+    skip_apply_chat_template: NotRequired[bool]
+    num_return_sequences: NotRequired[int]
+    top_p: NotRequired[float]
+    top_k: NotRequired[int]
+    temperature: NotRequired[float]
+
+
 class SFTTrainerCfg(BaseTrainerCfg):
     """Configuration for Supervised Fine-Tuning trainer (SFTConfig)."""
 
@@ -439,6 +466,7 @@ class XPOTrainerCfg(GRPOTrainerCfg):
 class TrainerConfig(
     ORPOTrainerCfg,
     GRPOTrainerCfg,
+    PPOTrainerCfg,
     SFTTrainerCfg,
     RewardTrainerCfg,
     DistillationTrainerCfg,
@@ -556,6 +584,31 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "sync_ref_model": False,
         "ref_model_mixup_alpha": 0.9,
         "ref_model_sync_steps": 64,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 1,
+        "top_p": 0.95,
+        "top_k": 50,
+        "temperature": 0.7,
+    },
+    "ppo": {
+        "trainer_prefix": "ppotrainer",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_length": 768,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "reward_weights": None,
+        "kl_coef": 0.05,
+        "kl_estimator": "k1",
+        "cliprange": 0.2,
+        "vf_coef": 0.1,
+        "cliprange_value": 0.2,
+        "gamma": 1.0,
+        "lam": 0.95,
+        "whiten_rewards": False,
+        "whiten_advantages": True,
+        "entropy_coef": 0.0,
+        "missing_eos_penalty": None,
         "skip_apply_chat_template": False,
         "num_return_sequences": 1,
         "top_p": 0.95,
@@ -692,7 +745,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
 }
 
 # Trainers that need max_completion_length auto-computed
-_TRAINERS_WITH_COMPLETION_LENGTH = frozenset({"dpo", "orpo", "kto", "bco", "cpo"})
+_TRAINERS_WITH_COMPLETION_LENGTH = frozenset({"dpo", "orpo", "kto", "bco", "cpo", "ppo"})
 
 
 def register_trainer_defaults(trainer_type: str, defaults: TrainerConfig) -> None:

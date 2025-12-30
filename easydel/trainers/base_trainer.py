@@ -1143,8 +1143,13 @@ class BaseTrainer(BaseTrainerProtocol):
             use_esurge = args.use_esurge_generation
 
         pad_token_id = self._pad_token_id
+        max_tokens = args.generation_max_new_tokens
+        if max_tokens is None:
+            max_tokens = getattr(args, "max_completion_length", None)
+        if max_tokens is None:
+            max_tokens = 1024
         sampling_params = SamplingParams(
-            max_tokens=args.generation_max_new_tokens or 1024,
+            max_tokens=int(max_tokens),
             temperature=args.generation_temperature or 0.7,
             top_p=args.generation_top_p or 0.95,
             top_k=args.generation_top_k or 64,
@@ -1172,6 +1177,18 @@ class BaseTrainer(BaseTrainerProtocol):
 
         # Handle eSurge generation path
         if use_esurge:
+            # When the caller provides tokenized prompts, respect their prompt length for
+            # eSurge padding/sequence construction. Using `args.max_length` here can lead
+            # to sequences where completions are truncated away when `args.max_length`
+            # exceeds the provided `input_ids` length (common in RL trainers where
+            # `input_ids` is padded to `max_prompt_length`, not `max_length`).
+            prompt_seq_len = None
+            if input_ids is not None:
+                try:
+                    prompt_seq_len = int(input_ids.shape[-1])
+                except Exception:  # pragma: no cover - defensive: odd prompt containers
+                    prompt_seq_len = None
+
             if prompts is None:
                 decoded_prompts = self._decode_prompt_batch(processor, input_ids, False, pad_token_id, True)
                 prompts = self._normalize_esurge_prompts(decoded_prompts, apply_chat_template)
@@ -1198,7 +1215,18 @@ class BaseTrainer(BaseTrainerProtocol):
             if hasattr(args, "esurge_silent_mode"):
                 esurge_kwargs["silent_mode"] = args.esurge_silent_mode
 
-            esurge_kwargs["max_model_len"] = sampling_params.max_tokens + args.max_length
+            effective_prompt_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
+            # eSurge reserves a few tokens from the context budget (defaults to
+            # `reserve_tokens = max_num_seqs`). When we tightly pack
+            # `prompt_len + max_new_tokens == max_model_len` (common in PPO/GRPO
+            # rollouts where prompt is padded to max_prompt_length), eSurge will
+            # cap max_new_tokens by the reserve amount. Include the reserve in
+            # the requested max_model_len so the user-visible generation length
+            # stays consistent with `max_new_tokens`.
+            reserve_tokens = esurge_kwargs.get("reserve_tokens")
+            if reserve_tokens is None:
+                reserve_tokens = esurge_kwargs.get("max_num_seqs", 0)
+            esurge_kwargs["max_model_len"] = sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens)
 
             logger.info_once(f"Creating eSurge {pprint.pformat(esurge_kwargs)}")
             logger.info_once(
@@ -1223,7 +1251,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 state.model.pause_esurge()
 
             # Build padded token arrays from eSurge outputs to ensure consistent shapes
-            max_seq_len = args.max_length or 2048
+            max_seq_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
             max_new_tokens = sampling_params.max_tokens
             max_total_len = max_seq_len + max_new_tokens
 

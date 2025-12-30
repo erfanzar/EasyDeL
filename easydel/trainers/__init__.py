@@ -33,9 +33,11 @@ from .prompt_transforms import (
     GRPOPreprocessTransform,
     KTOPreprocessTransform,
     ORPOPreprocessTransform,
+    PPOPreprocessTransform,
     RewardPreprocessTransform,
     SFTPreprocessTransform,
 )
+from .proximal_policy_optimization_trainer import PPOConfig, PPOTrainer
 from .ray_scaler import RayDistributedTrainer
 from .reward_trainer import RewardConfig, RewardTrainer
 from .supervised_fine_tuning_trainer import SFTConfig, SFTTrainer
@@ -73,6 +75,9 @@ __all__ = (
     "ORPOConfig",
     "ORPOPreprocessTransform",
     "ORPOTrainer",
+    "PPOConfig",
+    "PPOPreprocessTransform",
+    "PPOTrainer",
     "RayDistributedTrainer",
     "RewardConfig",
     "RewardPreprocessTransform",

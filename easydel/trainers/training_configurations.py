@@ -809,7 +809,7 @@ class TrainingArguments:
             current = getattr(self, attr, None)
             if current is None and hasattr(self, fallback_name):
                 fallback_value = getattr(self, fallback_name)
-                if fallback_value not in (None, False):
+                if fallback_value is not None and fallback_value is not False:
                     setattr(self, attr, fallback_value)
 
         _inherit_generation_attr("generation_num_return_sequences", "num_return_sequences")

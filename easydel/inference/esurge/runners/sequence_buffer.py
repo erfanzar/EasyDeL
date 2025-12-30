@@ -170,7 +170,7 @@ def swap_rows_pytree(arrs, i1, i2):
     Returns:
         PyTree with same structure but rows swapped in all arrays.
     """
-    return jax.tree_map(lambda a: swap_rows(a, i1, i2), arrs)
+    return jax.tree_util.tree_map(lambda a: swap_rows(a, i1, i2), arrs)
 
 
 def move_row(arr, from_idx, to_idx):

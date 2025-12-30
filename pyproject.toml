@@ -36,6 +36,7 @@ dependencies = [
 	"ejkernel[triton]==0.0.45",
 	"einops~=0.8.0",
 	"transformers~=4.57.3",
+	"sentencepiece>=0.2.0",
 	"flax==0.11.2",
 	"fastapi>=0.115.2",
 	"wandb>=0.22.2",

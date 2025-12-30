@@ -6,7 +6,7 @@ model:
   name_or_path: Qwen/Qwen2.5-0.5B-Instruct
 
 reward_model:
-  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+  name_or_path: Ray2333/Gemma-2B-rewardmodel-baseline
   task: sequence-classification
   extra_kwargs:
     num_labels: 1
@@ -58,4 +58,3 @@ trainer:
 actions:
   - validate
   - train
-

@@ -185,8 +185,17 @@ def extract_prompt_from_preference(example: dict) -> dict:
     Returns:
         Example with 'prompt' field extracted if applicable.
     """
-
-    return maybe_extract_prompt(example)
+    result = maybe_extract_prompt(example)
+    if "prompt" in result:
+        return result
+    # Some RL datasets store the prompt as a single-turn chat under `messages`.
+    # GRPO/PPO expect a prompt field (string or list-of-messages), so normalize it.
+    messages = result.get("messages")
+    if isinstance(messages, list):
+        out = dict(result)
+        out["prompt"] = messages
+        return out
+    return result
 
 
 def apply_chat_template_to_preference(
@@ -336,6 +345,17 @@ class GRPOPreprocessTransform(Transform):
 
     def __repr__(self) -> str:
         return f"GRPOPreprocessTransform(max_prompt={self._max_prompt_length})"
+
+
+class PPOPreprocessTransform(GRPOPreprocessTransform):
+    """Preprocessing transform for PPO training.
+
+    PPO uses the same prompt-only preprocessing as GRPO: prompts are tokenized and
+    left-padded; completions are generated online.
+    """
+
+    def __repr__(self) -> str:
+        return f"PPOPreprocessTransform(max_prompt={self._max_prompt_length})"
 
 
 class KTOPreprocessTransform(Transform):
