@@ -28,7 +28,7 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
@@ -94,7 +94,6 @@ class Phi3MLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         row_parallel_linear = functools.partial(
             RowParallelLinear,
@@ -104,7 +103,6 @@ class Phi3MLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.gate_up_proj = column_parallel_linear(
             config.hidden_size,
@@ -237,7 +235,6 @@ class Phi3Attention(UnifiedAttention):
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.o_proj = self._create_o_proj(config, dtype, param_dtype, precision, rngs)
         self.attention_performer = self._create_attention_performer(config, rngs)

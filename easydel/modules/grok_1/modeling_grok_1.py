@@ -28,7 +28,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeCausalLMOutput, MoeModelOutput
-from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import auto_remat, block_wise_ffn
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
@@ -93,7 +93,6 @@ class Grok1Attention(AttentionModule):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=self.precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.k_proj = ColumnParallelLinear(
             config.hidden_size,
@@ -104,7 +103,6 @@ class Grok1Attention(AttentionModule):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=self.precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.v_proj = ColumnParallelLinear(
             config.hidden_size,
@@ -115,7 +113,6 @@ class Grok1Attention(AttentionModule):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=self.precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.o_proj = RowParallelLinear(
             config.num_attention_heads * self.head_dim,
@@ -126,7 +123,6 @@ class Grok1Attention(AttentionModule):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=self.precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim, self.head_dim, True)
@@ -278,7 +274,6 @@ class Grok1BLockSparseMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=self.precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.linear_1 = RowParallelLinear(
             config.intermediate_size,
@@ -289,7 +284,6 @@ class Grok1BLockSparseMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=self.precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.linear_v = ColumnParallelLinear(
             config.hidden_size,
@@ -300,7 +294,6 @@ class Grok1BLockSparseMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=self.precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:

@@ -37,7 +37,7 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
     TokenClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.base_modules import (
     BaseCausalLMModule,
@@ -169,7 +169,6 @@ class RobertaSelfAttention(AttentionModule):
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             rngs=rngs,
-            **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
         self.key = ColumnParallelLinear(
             self.config.hidden_size,
@@ -178,7 +177,6 @@ class RobertaSelfAttention(AttentionModule):
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             rngs=rngs,
-            **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
         self.value = ColumnParallelLinear(
             self.config.hidden_size,
@@ -187,7 +185,6 @@ class RobertaSelfAttention(AttentionModule):
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             rngs=rngs,
-            **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
 
     def _split_heads(self, hidden_states):
@@ -310,7 +307,6 @@ class RobertaSelfOutput(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
         self.LayerNorm = nn.LayerNorm(
             self.config.hidden_size,
@@ -413,7 +409,6 @@ class RobertaIntermediate(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
         self.activation = ACT2FN[self.config.hidden_act]
 
@@ -449,7 +444,6 @@ class RobertaOutput(nn.Module):
             precision=precision,
             param_dtype=param_dtype,
             rngs=rngs,
-            **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
         self.dropout = nn.Dropout(
             rate=self.config.hidden_dropout_prob,
@@ -690,7 +684,6 @@ class RobertaPooler(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
 
     def __call__(
@@ -725,7 +718,6 @@ class RobertaLMHead(nn.Module):
             precision=precision,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             rngs=rngs,
-            **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
         self.layer_norm = nn.LayerNorm(
             self.config.hidden_size,
@@ -743,7 +735,6 @@ class RobertaLMHead(nn.Module):
             precision=precision,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             rngs=rngs,
-            **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
         self.bias = ArrayParam.bound(
             shape=(self.config.vocab_size,),
@@ -790,7 +781,6 @@ class RobertaClassificationHead(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
         classifier_dropout = (
             self.config.classifier_dropout
@@ -809,7 +799,6 @@ class RobertaClassificationHead(nn.Module):
             precision=precision,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             rngs=rngs,
-            **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
 
     def __call__(
@@ -1132,7 +1121,6 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
         )
 
     def __call__(

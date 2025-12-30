@@ -37,7 +37,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     VLMCausalLMOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseVisionLanguageModule
@@ -903,7 +903,6 @@ class Qwen3VLMoeTextMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         row_linear = partial(
             RowParallelLinear,
@@ -913,7 +912,6 @@ class Qwen3VLMoeTextMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         self.gate_proj = column_linear(config.hidden_size, config.intermediate_size, rngs=rngs)

@@ -29,7 +29,7 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import auto_remat, block_wise_ffn
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
@@ -159,7 +159,6 @@ class FalconAttention(UnifiedAttention):
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def _create_o_proj(
@@ -179,7 +178,6 @@ class FalconAttention(UnifiedAttention):
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(getattr(config, "initializer_range", 0.02)),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
 
@@ -208,7 +206,6 @@ class FalconMlp(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             use_bias=self.config.bias,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.dense_h_to_4h = linear(
             self.config.hidden_size,

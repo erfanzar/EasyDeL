@@ -274,6 +274,7 @@ def training_step(
     loss_config: LossConfig | None = None,
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
     """Execute CPO training step with gradient computation.
 
@@ -304,6 +305,8 @@ def training_step(
     batch = with_sharding_constraint(arr=batch, sharding=batch_partition_spec)
 
     def calculate_loss(tree: flax.nnx.GraphState, call_batch: dict[str, jax.Array]):
+        if straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
         policy_model = state.merge(tree=tree)
         model_outputs = concatenated_forward_fn(policy_model, call_batch)
 

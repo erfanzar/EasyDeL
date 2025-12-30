@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import typing as tp
+
 import flax.nnx
 import jax
 from eformer.escale import with_sharding_constraint
@@ -24,7 +26,12 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..group_relative_policy_optimization._fn import get_per_token_logps
-from ..training_utils import make_assertions_and_get_sizes, minibatch_call, update_metrics, update_state_respectfully
+from ..training_utils import (
+    make_assertions_and_get_sizes,
+    minibatch_call,
+    update_metrics,
+    update_state_respectfully,
+)
 
 
 def _compute_policy_logps(
@@ -62,6 +69,7 @@ def nash_md_step(
     partition_spec: PartitionSpec | None,
     gradient_accumulation_steps: int,
     is_train: bool,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Execute Nash-MD training or evaluation step.
 
@@ -88,6 +96,8 @@ def nash_md_step(
     beta = jnp.asarray(beta, dtype=jnp.float32)
 
     def loss_fn(tree: flax.nnx.GraphState, minibatch: dict[str, jax.Array]):
+        if is_train and straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
         module = state.merge(tree=tree)
 
         prompt_ids = minibatch["prompt_ids"]

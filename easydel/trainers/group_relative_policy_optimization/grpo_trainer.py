@@ -40,6 +40,7 @@ from ..prompt_utils import apply_chat_template
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_configurations import MetricsType
+from ..training_utils import resolve_straight_through_emulator
 from ._fn import get_per_token_logps, grpo_step
 from .grpo_config import GRPOConfig
 
@@ -355,6 +356,12 @@ class GRPOTrainer(Trainer):
         mesh = self.model.mesh
 
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_block=self.arguments.quantization_block,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
 
         self._train_shared_fn_static_args = (
             self.num_generations,
@@ -370,9 +377,10 @@ class GRPOTrainer(Trainer):
             self.delta,
             self.importance_sampling_level,
             self.top_entropy_quantile,
+            straight_through_emulator,
         )
 
-        static_argnames = tuple(range(2, 15))
+        static_argnames = tuple(range(2, 16))
 
         sharded_training_step_function = ejit(
             grpo_step,
@@ -396,6 +404,7 @@ class GRPOTrainer(Trainer):
             self.delta,
             self.importance_sampling_level,
             self.top_entropy_quantile,
+            straight_through_emulator,
         )
 
         sharded_evaluation_step_function = ejit(

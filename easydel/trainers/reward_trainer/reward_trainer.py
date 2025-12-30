@@ -28,6 +28,7 @@ from easydel.utils.compiling_utils import ejit
 
 from ..prompt_transforms import RewardPreprocessTransform
 from ..trainer import Trainer
+from ..training_utils import resolve_straight_through_emulator
 from ..utils import RewardDataCollatorWithPaddingGrain, RewardDataCollatorWithPaddingTFDS
 from ._fn import evaluation_step, training_step
 from .reward_config import RewardConfig
@@ -148,6 +149,12 @@ class RewardTrainer(Trainer):
             spec=PartitionSpec(),
             mesh=self.model.mesh,
         )
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_block=self.arguments.quantization_block,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
 
         self._train_shared_fn_static_args = (
             self.arguments.loss_config,
@@ -155,9 +162,10 @@ class RewardTrainer(Trainer):
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
             self.arguments.center_rewards_coefficient,
+            straight_through_emulator,
         )
 
-        sharded_training_static_argnums = (2, 3, 4, 5, 6)
+        sharded_training_static_argnums = (2, 3, 4, 5, 6, 7)
         sharded_training_step_function = ejit(
             training_step,
             static_argnums=sharded_training_static_argnums,

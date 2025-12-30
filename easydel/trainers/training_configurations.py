@@ -24,6 +24,7 @@ import warnings
 from copy import deepcopy
 from dataclasses import InitVar, dataclass, field, fields
 
+import flax.nnx
 import jax
 import jax.experimental
 import jax.experimental.multihost_utils
@@ -66,6 +67,8 @@ else:
 
 MetricsType = dict[str, float | list | tuple | np.ndarray | Array | Tensor]
 logger = get_logger(__name__)
+
+QuantizationMode = tp.Literal["fp8", "int8", "nf4"]
 
 
 def get_safe_arr(xs):
@@ -221,6 +224,46 @@ class TrainingArguments:
     loss_config: LossConfig | None = field(
         default=None,
         metadata={"help": "Configuration for the loss function."},
+    )
+    quantization_mode: QuantizationMode | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Quantization mode for quantization-aware training (QAT). Supported values: 'fp8', 'int8', 'nf4'. "
+                "When set (or when a straight-through callable is provided), trainers can apply a straight-through "
+                "estimator (STE) transform to `state.graphstate` for the forward pass without permanently modifying "
+                "the stored parameters."
+            )
+        },
+    )
+    quantization_block: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Quantization block size for block-wise quantizers (e.g. NF4). If None, the default block size for "
+                "the selected quantization mode is used."
+            )
+        },
+    )
+    tensor_straight_through: tp.Callable[[jax.Array], jax.Array] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Per-tensor straight-through transform used for QAT (e.g. tensor -> quantize(mode) -> dequantize "
+                "with identity gradients). If `straight_through_emulator` is not provided, this can be mapped over "
+                "`state.graphstate` via `jax.tree_util.tree_map`."
+            )
+        },
+    )
+    straight_through_emulator: tp.Callable[[flax.nnx.GraphState], flax.nnx.GraphState] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Callable that maps a graphstate pytree -> new graphstate pytree for the forward pass. "
+                "If None, and quantization is enabled, trainers can default to applying "
+                "`jax.tree_util.tree_map(tensor_straight_through, graphstate)`."
+            )
+        },
     )
     low_mem_usage: bool = field(
         default=True,

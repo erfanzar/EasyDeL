@@ -33,6 +33,7 @@ from easydel.utils.traversals import deepcopy_model
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_configurations import MetricsType
+from ..training_utils import resolve_straight_through_emulator
 from ._fn import xpo_step
 from .xpo_config import XPOConfig
 
@@ -175,6 +176,12 @@ class XPOTrainer(GRPOTrainer):
         """
         mesh = self.model.mesh
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_block=self.arguments.quantization_block,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
 
         self._train_shared_fn_static_args = (
             self.arguments.loss_config,
@@ -182,6 +189,7 @@ class XPOTrainer(GRPOTrainer):
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
             True,
+            straight_through_emulator,
         )
         self._eval_shared_fn_static_args = (
             self.arguments.loss_config,
@@ -189,9 +197,10 @@ class XPOTrainer(GRPOTrainer):
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
             False,
+            straight_through_emulator,
         )
 
-        static_argnums = (3, 4, 5, 6, 7)
+        static_argnums = (3, 4, 5, 6, 7, 8)
         sharded_training_step_function = ejit(
             xpo_step,
             in_shardings=(self.state_shardings, empty_sharding, self.ref_state.shardings),

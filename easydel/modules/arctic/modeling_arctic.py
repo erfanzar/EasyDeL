@@ -34,7 +34,7 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -111,7 +111,6 @@ class ArcticAttention(UnifiedAttention):
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
@@ -125,7 +124,6 @@ class ArcticAttention(UnifiedAttention):
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
@@ -139,7 +137,6 @@ class ArcticAttention(UnifiedAttention):
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
@@ -155,7 +152,6 @@ class ArcticAttention(UnifiedAttention):
             param_dtype=param_dtype,
             kernel_init=nn.initializers.normal(),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def _create_rotary(self, config: ArcticConfig, dtype: jnp.dtype):
@@ -318,7 +314,6 @@ class ArcticMLP(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             kernel_init=nn.initializers.normal(),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.w1 = linear_class(self.hidden_dim, self.ffn_dim, rngs=rngs)
         self.w3 = linear_class(self.hidden_dim, self.ffn_dim, rngs=rngs)

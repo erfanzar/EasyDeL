@@ -25,7 +25,12 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
-from ..training_utils import make_assertions_and_get_sizes, minibatch_call, update_metrics, update_state_respectfully
+from ..training_utils import (
+    make_assertions_and_get_sizes,
+    minibatch_call,
+    update_metrics,
+    update_state_respectfully,
+)
 
 
 class RunningMoments:
@@ -253,6 +258,7 @@ def training_step(
     loss_config: LossConfig | None,
     partition_spec: PartitionSpec | None,
     gradient_accumulation_steps: int,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
     """Execute BCO training step with gradient computation.
 
@@ -288,6 +294,8 @@ def training_step(
     step_batch = with_sharding_constraint(arr=step_batch, sharding=batch_partition_spec)
 
     def calculate_loss(tree: jax.ArrayTree, call_batch: dict[str, jax.Array]):
+        if straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
         model = state.merge(tree=tree)
         policy_outputs = concatenated_forward_fn(model, call_batch)
         completion_logps = policy_outputs["completion_logps"]

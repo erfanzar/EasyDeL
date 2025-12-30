@@ -33,7 +33,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -100,7 +100,6 @@ class InternLM2Attention(UnifiedAttention):
             rngs=rngs,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
@@ -113,7 +112,6 @@ class InternLM2Attention(UnifiedAttention):
             use_bias=config.bias,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def _create_rotary(self, config: InternLM2Config, dtype: jnp.dtype):
@@ -179,7 +177,6 @@ class InternLM2MLP(nn.Module):
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=self.precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.w1 = linear(config.hidden_size, config.intermediate_size, rngs=rngs)
         self.w3 = linear(config.hidden_size, config.intermediate_size, rngs=rngs)

@@ -28,8 +28,6 @@ and support various model architectures through the EasyDeLState abstraction.
 
 import typing as tp
 
-import flax
-import flax.nnx
 import jax
 import optax
 from eformer.escale import with_sharding_constraint
@@ -38,7 +36,12 @@ from jax.sharding import PartitionSpec
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
-from ..training_utils import make_assertions_and_get_sizes, minibatch_call, update_metrics, update_state_respectfully
+from ..training_utils import (
+    make_assertions_and_get_sizes,
+    minibatch_call,
+    update_metrics,
+    update_state_respectfully,
+)
 
 
 def training_step(
@@ -48,6 +51,7 @@ def training_step(
     learning_rate_fn: optax.Schedule = None,
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
     """
     Performs a single training step by computing gradients via minibatch processing,
@@ -103,8 +107,9 @@ def training_step(
                 - The computed loss (scalar).
                 - Additional metrics (LossMetrics) produced during loss computation.
         """
-        # Merge the state with the provided tree update.
-        module = flax.nnx.merge(state.graphdef, tree, state.graphother)
+        if straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
+        module = state.merge(tree)
         # Prepare inputs for the model call.
         call_batch = module.prepare_inputs_for_call(**minibatch)
         labels = call_batch.pop("labels", None)

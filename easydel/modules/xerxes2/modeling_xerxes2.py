@@ -35,7 +35,7 @@ from easydel.infra.modeling_outputs import (
     MoeCausalLMOutput,
     MoeModelOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
@@ -141,7 +141,6 @@ class Xerxes2Attention(UnifiedAttention):
                     param_dtype=param_dtype,
                     kernel_init=jax.nn.initializers.normal(config.initializer_range),
                     precision=precision,
-                    **get_dot_general_by_bits(config.bits, config.easy_method),
                 ),
             )
         else:
@@ -157,7 +156,6 @@ class Xerxes2Attention(UnifiedAttention):
                     param_dtype=param_dtype,
                     kernel_init=jax.nn.initializers.normal(config.initializer_range),
                     precision=precision,
-                    **get_dot_general_by_bits(config.bits, config.easy_method),
                 ),
             )
             setattr(
@@ -182,7 +180,6 @@ class Xerxes2Attention(UnifiedAttention):
                     param_dtype=param_dtype,
                     kernel_init=jax.nn.initializers.normal(config.initializer_range),
                     precision=precision,
-                    **get_dot_general_by_bits(config.bits, config.easy_method),
                 ),
             )
 
@@ -198,7 +195,6 @@ class Xerxes2Attention(UnifiedAttention):
                 param_dtype=param_dtype,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
                 precision=precision,
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             ),
         )
         setattr(
@@ -223,7 +219,6 @@ class Xerxes2Attention(UnifiedAttention):
                 param_dtype=param_dtype,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
                 precision=precision,
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             ),
         )
         setattr(
@@ -238,7 +233,6 @@ class Xerxes2Attention(UnifiedAttention):
                 param_dtype=param_dtype,
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
                 precision=precision,
-                **get_dot_general_by_bits(config.bits, config.easy_method),
             ),
         )
         self.rotary = self._create_rotary(config, dtype)
@@ -288,7 +282,6 @@ class Xerxes2MLP(nn.Module):
             precision=precision,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         row_parallel_linear = functools.partial(
             RowParallelLinear,
@@ -298,7 +291,6 @@ class Xerxes2MLP(nn.Module):
             precision=precision,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.gate_up_proj = column_parallel_linear(config.hidden_size, 2 * config.intermediate_size, rngs=rngs)
         self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size, rngs=rngs)

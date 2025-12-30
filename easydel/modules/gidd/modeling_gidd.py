@@ -41,7 +41,7 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
     HybridCache,
@@ -107,7 +107,6 @@ class GiddMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.init_scale),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         row_parallel_linear = partial(
             RowParallelLinear,
@@ -118,7 +117,6 @@ class GiddMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.init_scale),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         self.up_proj = column_parallel_linear(config.hidden_size, config.intermediate_size)
@@ -238,7 +236,6 @@ class GiddAttention(AttentionModule):
             use_bias=config.attention_bias,
             kernel_init=jax.nn.initializers.normal(config.init_scale),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         row_parallel_linear = partial(
             RowParallelLinear,
@@ -248,7 +245,6 @@ class GiddAttention(AttentionModule):
             use_bias=config.attention_bias,
             kernel_init=jax.nn.initializers.normal(config.init_scale),
             precision=precision,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         self.q_proj = column_parallel_linear(
@@ -1012,7 +1008,6 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
             kernel_init=jax.nn.initializers.normal(stddev=config.head_init_scale),
             precision=self.precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def __call__(

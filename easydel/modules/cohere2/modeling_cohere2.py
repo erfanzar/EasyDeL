@@ -32,7 +32,7 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn, get_dot_general_by_bits
+from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -207,7 +207,6 @@ class Cohere2MLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=self.precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         row_parallel_linear = partial(
             RowParallelLinear,
@@ -217,7 +216,6 @@ class Cohere2MLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=self.precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.gate_proj = column_parallel_linear(config.hidden_size, config.intermediate_size)
         self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size)

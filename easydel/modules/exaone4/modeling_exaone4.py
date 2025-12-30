@@ -31,7 +31,6 @@ from easydel.infra.utils import (
     ACT2FN,
     auto_remat,
     block_wise_ffn,
-    get_dot_general_by_bits,
 )
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -85,7 +84,6 @@ class Exaone4MLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         row_parallel_linear = functools.partial(
             RowParallelLinear,
@@ -95,7 +93,6 @@ class Exaone4MLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         self.gate_proj = column_parallel_linear(

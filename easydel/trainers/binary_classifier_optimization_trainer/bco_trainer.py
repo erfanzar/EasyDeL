@@ -32,6 +32,7 @@ from easydel.utils.traversals import deepcopy_model
 from ..prompt_transforms import BCOPreprocessTransform
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
+from ..training_utils import resolve_straight_through_emulator
 from ..utils import BCODataCollatorGrain, BCODataCollatorTFDS
 from ._fn import RunningMoments, concatenated_forward, evaluation_step, training_step
 from .bco_config import BCOConfig
@@ -350,6 +351,12 @@ class BCOTrainer(Trainer):
         """
         mesh = self.model.mesh
         empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_block=self.arguments.quantization_block,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
 
         def forward_fn(model, batch):
             return concatenated_forward(
@@ -372,11 +379,12 @@ class BCOTrainer(Trainer):
             self.arguments.loss_config,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
+            straight_through_emulator,
         )
 
         ref_sharding = self.reference_state.shardings if self.reference_state is not None else empty_sharding
 
-        train_static_argnums = (3, 4, 5, 6, 7, 8)
+        train_static_argnums = (3, 4, 5, 6, 7, 8, 9)
         sharded_training_step_function = ejit(
             training_step,
             in_shardings=(self.state_shardings, empty_sharding, ref_sharding),

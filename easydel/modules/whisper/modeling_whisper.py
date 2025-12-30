@@ -43,7 +43,7 @@ from easydel.infra.modeling_outputs import (
     Seq2SeqModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.base_modules import BaseConditionalGenerationModule
 from easydel.layers.caching import (
@@ -189,7 +189,6 @@ class WhisperAttention(AttentionModule):
             param_dtype=param_dtype,
             precision=precision,
             kernel_init=jax.nn.initializers.normal(self.config.init_std),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
         self.q_proj = linear(use_bias=self.bias, rngs=rngs)
@@ -355,7 +354,6 @@ class WhisperEncoderLayer(nn.Module):
             param_dtype=param_dtype,
             precision=precision,
             kernel_init=jax.nn.initializers.normal(self.config.init_std),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.self_attn_layer_norm = nn.LayerNorm(
             self.embed_dim,
@@ -523,7 +521,6 @@ class WhisperDecoderLayer(nn.Module):
             precision=self.precision,
             dtype=self.dtype,
             kernel_init=jax.nn.initializers.normal(self.config.init_std),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.fc1 = linear(
             self.embed_dim,
@@ -1778,7 +1775,6 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.classifier = ColumnParallelLinear(
             config.classifier_proj_size,
@@ -1787,7 +1783,6 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
 
     def __call__(

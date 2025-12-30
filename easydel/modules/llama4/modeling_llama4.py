@@ -37,7 +37,7 @@ from easydel.infra.modeling_outputs import (
     ModelOutput,
     VLMCausalLMOutput,
 )
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, get_dot_general_by_bits
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule, BaseVisionLanguageModule
@@ -285,7 +285,6 @@ class Llama4TextMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         row_parallel_linear = partial(
             RowParallelLinear,
@@ -295,7 +294,6 @@ class Llama4TextMLP(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.gate_proj = column_parallel_linear(config.hidden_size, intermediate_size)
         self.down_proj = row_parallel_linear(intermediate_size, config.hidden_size)
@@ -360,7 +358,6 @@ class Llama4TextMoe(BaseMoeModule):
             dtype=dtype,
             param_dtype=param_dtype,
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.shared_expert = Llama4TextMLP(
             config=config,
@@ -1064,7 +1061,6 @@ class Llama4VisionAttention(AttentionModule):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
-            **get_dot_general_by_bits(config.bits, config.easy_method),
         )
         self.q_proj = linear_class(self.embed_dim, self.num_heads * self.head_dim)
         self.k_proj = linear_class(self.embed_dim, self.num_heads * self.head_dim)

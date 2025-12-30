@@ -24,8 +24,6 @@ from __future__ import annotations
 
 import typing as tp
 
-import flax
-import flax.nnx
 import jax
 import optax
 from eformer.escale import with_sharding_constraint
@@ -35,7 +33,12 @@ from jax.sharding import PartitionSpec
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
-from ..training_utils import make_assertions_and_get_sizes, minibatch_call, update_metrics, update_state_respectfully
+from ..training_utils import (
+    make_assertions_and_get_sizes,
+    minibatch_call,
+    update_metrics,
+    update_state_respectfully,
+)
 
 
 def _masked_mean(x: jax.Array, mask: jax.Array) -> jax.Array:
@@ -136,6 +139,7 @@ def ppo_step(
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
     is_training: bool = True,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Execute a single PPO training or evaluation step.
 
@@ -176,7 +180,9 @@ def ppo_step(
     batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
     def loss_fn(tree, minibatch):
-        module = flax.nnx.merge(state.graphdef, tree, state.graphother)
+        if is_training and straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
+        module = state.merge(tree)
 
         input_ids = minibatch["input_ids"]
         attention_mask = minibatch["attention_mask"]
@@ -249,4 +255,3 @@ def ppo_step(
 
     _, metrics = loss_fn(state.graphstate, batch)
     return metrics
-
