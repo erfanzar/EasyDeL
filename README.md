@@ -25,7 +25,8 @@ TPU/GPU clusters.
 ## Contents
 
 - [Why EasyDeL?](#why-easydel)
-- [Key Features](#performance--hackability)
+- [Performance & Hackability](#performance--hackability)
+- [Key Features](#key-features)
 - [Supported Models](#supported-models)
 - [Quick Start](#quick-start)
 - [eLargeModel](#elargemodel---unified-model-management)
@@ -143,9 +144,11 @@ EasyDeL bridges the gap between ease-of-use and performance in the JAX ecosystem
 #### Attention Mechanisms (10+ implementations)
 
 - Flash Attention 2 (GPU/TPU optimized)
-- Ring Attention (distributed sequence parallelism)
-- Paged Attention (memory-efficient serving)
-- Blockwise, Splash, cuDNN, SDPA variants
+- Ring Attention (distributed sequence parallelism) + (BlockSparse Attn)
+- Ragged paged attention v2/v3 (paged KV cache for serving)
+- Block-sparse (Splash) attention (TPU optimized)
+- SDPA variants (sdpa / cudnn / cuda_flash_attn2)
+- Autoregressive decode attention (optimized generation)
 
 #### Mixture of Experts (MoE)
 
@@ -157,7 +160,7 @@ EasyDeL bridges the gap between ease-of-use and performance in the JAX ecosystem
 #### Quantization
 
 - NF4 (4-bit normal float)
-- A8BIT (8-bit affine quantization)
+- INT8 (8-bit affine quantization)
 - Post-training quantization
 - Quantized inference
 
@@ -320,7 +323,8 @@ print(f"\n\nTokens/s: {output.tokens_per_second:.2f}")
 - **Evaluation** - Built-in lm-evaluation-harness integration
 - **Serialization** - Save/load configurations as JSON for reproducibility
 
-> [!TIP] > `eLargeModel` is designed for common use cases and quick setup - perfect for getting started fast or when you want a simple, unified API. However, it doesn't expose all of EasyDeL's capabilities. For full modularity, fine-grained control, and access to advanced features, work directly with EasyDeL's underlying components (`AutoEasyDeLModelForCausalLM`, `eSurge`, trainers, etc.). The real power of EasyDeL lies in its hackable, composable architecture.
+> [!TIP]
+> `eLargeModel` is designed for common use cases and quick setup - perfect for getting started fast or when you want a simple, unified API. However, it doesn't expose all of EasyDeL's capabilities. For full modularity, fine-grained control, and access to advanced features, work directly with EasyDeL's underlying components (`AutoEasyDeLModelForCausalLM`, `eSurge`, trainers, etc.). The real power of EasyDeL lies in its hackable, composable architecture.
 
 ### Why eLargeModel?
 
@@ -350,7 +354,7 @@ eLargeModel accepts a dictionary with the following sections:
 | `sharding`     | Distributed setup     | `axis_dims`, `axis_names`, `auto_shard_model`                   |
 | `base_config`  | Model configuration   | `attn_mechanism`, `gradient_checkpointing`, `moe_method`        |
 | `esurge`       | Inference engine      | `max_model_len`, `max_num_seqs`, `hbm_utilization`, `page_size` |
-| `quantization` | Model quantization    | `dtype` (nf4/a8bit), `block_size`                               |
+| `quantization` | Model quantization    | `model.dtype` (nf4/int8), `model.block_size`                    |
 | `trainer`      | Training settings     | `trainer_type`, `learning_rate`, `num_train_epochs`             |
 | `mixture`      | Dataset configuration | `informs`, `batch_size`, `streaming`                            |
 | `eval`         | Evaluation settings   | `max_new_tokens`, `temperature`, `batch_size`                   |
@@ -609,7 +613,7 @@ dataset = elm.build_dataset()
 | `set_model(path)`                      | Set model name/path                      |
 | `set_dtype(dtype)`                     | Set computation dtype (bf16, fp16, fp32) |
 | `set_sharding(axis_dims, axis_names)`  | Configure distributed sharding           |
-| `set_quantization(method, block_size)` | Enable quantization (nf4, a8bit)         |
+| `set_quantization(method, block_size)` | Enable quantization (nf4, int8)          |
 | `set_esurge(...)`                      | Configure eSurge inference engine        |
 | `set_trainer(type, ...)`               | Configure training paradigm              |
 | `set_mixture(...)`                     | Configure dataset mixture                |
@@ -639,6 +643,7 @@ dataset = elm.build_dataset()
 import easydel as ed
 from transformers import AutoTokenizer
 from datasets import load_dataset
+import jax.numpy as jnp
 
 # Load model with configuration
 model_id = "Qwen/Qwen3-VL-8B-Thinking"
@@ -801,7 +806,7 @@ trainer = ed.GRPOTrainer(
     ),
     train_dataset=your_prompts_dataset,
     processing_class=AutoTokenizer.from_pretrained(model_id),
-    reward_function=your_custom_reward_fn,  # Custom reward logic
+    reward_funcs=your_custom_reward_fn,  # Custom reward logic
 )
 
 trainer.train()
@@ -857,15 +862,20 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 
 #### Available Attention Mechanisms
 
+- `AUTO` - Automatically selects the best mechanism for your hardware
 - `FLASH_ATTN2` - Optimized Flash Attention 2 (GPU/TPU)
-- `RING` - Ring attention for distributed training
-- `RAGGED_PAGE_ATTENTION_V3` - Paged attention for inference (default in eSurge)
-- `RAGGED_PAGE_ATTENTION_V2` - Paged attention for inference (default in eSurge)
-- `CUDNN` - cuDNN-accelerated attention
-- `SPLASH` - TPU-optimized splash attention
-- `BLOCKWISE` - Memory-efficient blockwise attention
 - `SDPA` - Scaled dot-product attention
+- `CUDNN` - Alias for `SDPA` (cuDNN path)
+- `CUDA_FLASH_ATTN2` - Alias for `SDPA` (CUDA FlashAttention-2 path)
+- `RING` - Ring attention for sequence parallelism
+- `SPLASH` / `BLOCKSPARSE` - Block-sparse attention (`blocksparse`)
+- `RAGGED_PAGE_ATTENTION_V3` - Paged attention for inference (default in eSurge)
+- `RAGGED_PAGE_ATTENTION_V2` - Paged attention for inference (legacy/compat)
+- `REGRESSIVE_DECODE` - Optimized autoregressive decoding attention
 - `VANILLA` - Standard attention
+
+> [!NOTE]
+> `BLOCKWISE` and `PAGED_ATTENTION` are present in the enum but are currently not registered in `OperationRegistry` (they will raise at runtime if selected).
 
 ### Sharding Recipes
 
@@ -930,6 +940,7 @@ Efficient fine-tuning with LoRA:
 ```python
 import easydel as ed
 import jax.numpy as jnp
+from transformers import AutoTokenizer
 
 # Load base model
 model_id = "meta-llama/Llama-3.1-8B"
@@ -951,9 +962,8 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 
 # Apply LoRA to specific layers (using regex)
 model = model.apply_lora_to_layers(
-    rank=32,
-    alpha=64,
-    target_modules=".*(q_proj|v_proj|gate_proj).*",  # Target query, value, and gate
+    lora_rank=32,
+    lora_pattern=".*(q_proj|v_proj|gate_proj).*",  # Target query, value, and gate
 )
 
 # Train normally with LoRA
@@ -970,14 +980,14 @@ trainer = ed.SFTTrainer(
 trainer.train()
 
 # Merge LoRA weights back into base model
-model = model.merge_lora()
+model = model.unwrap_lora_to_layers()
 model.save_pretrained("./merged-model")
 ```
 
 ### Quantization Workflow
 
 > [!IMPORTANT]
-> Quantization reduces memory usage but may impact model accuracy. NF4 (4-bit) offers the best compression, while A8BIT (8-bit) provides a balance between size and quality.
+> Quantization reduces memory usage but may impact model accuracy. NF4 (4-bit) offers the best compression, while INT8 (8-bit) provides a balance between size and quality.
 
 Reduce memory footprint with post-training quantization:
 
@@ -1102,7 +1112,7 @@ api_server.run(host="0.0.0.0", port=8000)
 - `POST /v1/completions` - Text completions
 - `GET /v1/models` - List available models
 - `GET /health` - Health check
-- `GET /metrics` - Prometheus metrics
+- `GET /metrics` - Server metrics (JSON). Prometheus metrics are exposed via `engine.start_monitoring(...)` on a separate port.
 
 #### Client Usage
 
