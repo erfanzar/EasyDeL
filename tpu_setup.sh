@@ -133,11 +133,11 @@ fi
 log_success "uv installed locally"
 
 log_info "Creating local orchestrator virtual environment at $LOCAL_VENV_PATH..."
-if ! "$UV" venv "$LOCAL_VENV_PATH" --clear --python 3.11.6; then
+if ! "$UV" venv "$LOCAL_VENV_PATH" --clear --python 3.13.5; then
   log_error "Failed to create local orchestrator virtual environment"
   exit 1
 fi
-if ! "$UV" venv "$REMOTE_VENV_PATH" --clear --python 3.11.6; then
+if ! "$UV" venv "$REMOTE_VENV_PATH" --clear --python 3.13.5; then
   log_error "Failed to create local orchestrator/remote virtual environment"
   exit 1
 fi
@@ -169,7 +169,7 @@ fi
 log_success "uv installed on TPU hosts"
 
 log_info "Creating virtual environment on TPU hosts at $REMOTE_VENV_PATH..."
-if ! "$LOCAL_EOPOD_PATH" run "~/.local/bin/uv venv $REMOTE_VENV_PATH --clear --python 3.11.6"; then
+if ! "$LOCAL_EOPOD_PATH" run "~/.local/bin/uv venv $REMOTE_VENV_PATH --clear --python 3.13.5"; then
   log_error "Failed to create virtual environment on TPU hosts"
   exit 1
 fi
