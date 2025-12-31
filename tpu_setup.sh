@@ -133,11 +133,11 @@ fi
 log_success "uv installed locally"
 
 log_info "Creating local orchestrator virtual environment at $LOCAL_VENV_PATH..."
-if ! "$UV" venv "$LOCAL_VENV_PATH" --clear --python 3.11.6; then
+if ! "$UV" venv "$LOCAL_VENV_PATH" --clear --python 3.13.5; then
   log_error "Failed to create local orchestrator virtual environment"
   exit 1
 fi
-if ! "$UV" venv "$REMOTE_VENV_PATH" --clear --python 3.11.6; then
+if ! "$UV" venv "$REMOTE_VENV_PATH" --clear --python 3.13.5; then
   log_error "Failed to create local orchestrator/remote virtual environment"
   exit 1
 fi
