@@ -229,6 +229,51 @@ class BaseTrainer(BaseTrainerProtocol):
         self.finetune = finetune
         self.processing_class = processing_class
 
+        if self.data_collator is None and getattr(self.arguments, "use_data_collactor", True):
+            base_collator = self.create_collect_function(
+                max_sequence_length=self.arguments.max_length,
+                truncation_mode=self.arguments.truncation_mode,
+            )
+
+            def _stack_per_example_outputs(per_example: list[dict[str, tp.Any]]) -> dict[str, tp.Any]:
+                if not per_example or not isinstance(per_example[0], dict):
+                    return {}
+                stacked: dict[str, tp.Any] = {}
+                for key in per_example[0].keys():
+                    values = [item.get(key) for item in per_example]
+                    if any(v is None for v in values):
+                        continue
+                    try:
+                        arrays = [jnp.asarray(v) for v in values]
+                    except Exception:
+                        continue
+                    first = arrays[0]
+                    if (
+                        getattr(first, "ndim", 0) >= 1
+                        and first.shape[0] == 1
+                        and all(getattr(a, "shape", None) == first.shape for a in arrays)
+                    ):
+                        stacked[key] = jnp.concatenate(arrays, axis=0)
+                    else:
+                        stacked[key] = jnp.stack(arrays, axis=0)
+                return stacked
+
+            def _auto_data_collator(batch):
+                if not isinstance(batch, (list, tuple)):
+                    return batch
+                batch_list = list(batch)
+                if not batch_list:
+                    return batch_list
+
+                try:
+                    return base_collator(batch_list)
+                except (TypeError, AttributeError):
+                    per_example = [base_collator(example) for example in batch_list]
+                    stacked = _stack_per_example_outputs(per_example)
+                    return stacked if stacked else batch_list
+
+            self.data_collator = _auto_data_collator
+
         # Convert datasets to ShardedDataSource for unified internal handling
         self._train_source = self._to_sharded_source(dataset_train)
         self._eval_source = self._to_sharded_source(dataset_eval)

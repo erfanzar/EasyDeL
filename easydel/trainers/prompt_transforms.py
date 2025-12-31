@@ -978,12 +978,14 @@ class RewardPreprocessTransform(Transform):
             chosen,
             truncation=self._truncation,
             max_length=self._max_length,
+            padding="max_length" if self._max_length else False,
             return_attention_mask=True,
         )
         rejected_tokens = self._tokenizer(
             rejected,
             truncation=self._truncation,
             max_length=self._max_length,
+            padding="max_length" if self._max_length else False,
             return_attention_mask=True,
         )
 

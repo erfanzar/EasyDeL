@@ -615,7 +615,7 @@ wheels = [
 
 [[package]]
 name = "easydel"
-version = "0.2.0"
+version = "0.2.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -680,9 +680,9 @@ requires-dist = [
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "eformer", specifier = "==0.0.85" },
     { name = "einops", specifier = "~=0.8.0" },
-    { name = "ejkernel", extras = ["gpu"], marker = "extra == 'gpu'", specifier = "==0.0.45" },
-    { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.45" },
-    { name = "ejkernel", extras = ["triton"], specifier = "==0.0.45" },
+    { name = "ejkernel", extras = ["gpu"], marker = "extra == 'gpu'", specifier = "==0.0.47" },
+    { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.47" },
+    { name = "ejkernel", extras = ["triton"], specifier = "==0.0.47" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "flax", specifier = "==0.11.2" },
     { name = "gcsfs", specifier = ">=2024.2,<2026" },
@@ -760,7 +760,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.45"
+version = "0.0.47"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beartype" },
@@ -771,9 +771,9 @@ dependencies = [
     { name = "jaxtyping" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c6/60/94bf44aef6c2ccc99e7ac9644f508d26955670761d9f602475c51d884b84/ejkernel-0.0.45.tar.gz", hash = "sha256:2b7fe059a3ad031cef203a941a9b2e920f206a09b366c04a1e62076ab9deb0f4", size = 493910, upload-time = "2025-12-29T21:53:30.261Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/11/f0/707167f0ec5e4999900c4e3ca32acacc7a7c6941793d9b6a096f33e136fd/ejkernel-0.0.47.tar.gz", hash = "sha256:fdc0b34e5a34053d231ea7fa31a70fa4f0ba53aab952ee39044520eb60fda173", size = 494010, upload-time = "2025-12-31T13:03:36.02Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/87/aa/8dc7d08c426a42e26de0f239ba4b0b207fc79ea9529d74bf2588fc8a9604/ejkernel-0.0.45-py3-none-any.whl", hash = "sha256:3a61d4980e72d7958145ade6a35e007e3bbe49e9bd495004aa4441fe28559500", size = 751040, upload-time = "2025-12-29T21:53:27.745Z" },
+    { url = "https://files.pythonhosted.org/packages/91/fb/b1bc8efac62744b885b69db3b82729623a218f756283e8ea14fb0a930dc7/ejkernel-0.0.47-py3-none-any.whl", hash = "sha256:fa3be460bfa89042612959dc1b47bf412f1a1228f6c6427b76453fd507085eb5", size = 750597, upload-time = "2025-12-31T13:03:34.47Z" },
 ]
 
 [package.optional-dependencies]
