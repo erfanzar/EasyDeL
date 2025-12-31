@@ -731,7 +731,12 @@ class EasyGenerationMixin:
                 head_dim = hidden_size // num_heads
 
         num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
-
+        if self.config.get_text_config().attn_mechanism == "ragged_page_attention_v3":
+            version = "v3"
+        elif self.config.get_text_config().attn_mechanism == "ragged_page_attention_v2":
+            version = "v2"
+        else:
+            version = "v3"
         return RaggedPagesCacheConfig.create(
             mesh=text_config.mesh,
             partition_manager=text_config.partition_manager,
@@ -742,6 +747,7 @@ class EasyGenerationMixin:
             kv_head_dim_size=head_dim,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
+            version=version,
         )
 
     def init_operations_cache(
