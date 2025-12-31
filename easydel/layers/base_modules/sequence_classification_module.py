@@ -228,11 +228,11 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
             batch_size = inputs_embeds.shape[0]
 
         # Validate batch size requirements
-        if self.config.pad_token_id is None and batch_size != 1:
+        if self.config.pad_token_id is None and attention_mask is None and batch_size != 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
 
         # Pool logits to get sequence-level predictions
-        pooled_logits = self.pool_sequence(logits, input_ids)
+        pooled_logits = self.pool_sequence(logits, input_ids=input_ids, attention_mask=attention_mask)
 
         # Compute router auxiliary loss if configured
         aux_loss = self.compute_router_aux_loss(outputs)

@@ -235,6 +235,7 @@ class SequenceLengthPoolingFeature:
         self,
         hidden_states: Float[Array, "batch seq_len hidden"],
         input_ids: Array | None = None,
+        attention_mask: Array | None = None,
     ) -> Float[Array, "batch hidden"]:
         """Pool hidden states to get sequence representation.
 
@@ -253,16 +254,19 @@ class SequenceLengthPoolingFeature:
 
         elif self.strategy == "last":
             # Use last non-padding token
+            if attention_mask is not None:
+                lengths = jnp.sum(attention_mask.astype("i4"), axis=-1) - 1
+                lengths = jnp.maximum(lengths, 0)
+                return hidden_states[jnp.arange(batch_size), lengths]
+
             if input_ids is None:
                 raise ValueError("input_ids required for 'last' pooling strategy")
 
-            if self.pad_token_id is None:
-                # If no padding token, use actual last token
-                sequence_lengths = jnp.full(batch_size, hidden_states.shape[1] - 1)
-            else:
-                # Find last non-padding position
-                sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.pad_token_id).astype("i4"), -1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
+            # Find last non-padding position using the configured pad_token_id.
+            # If pad_token_id is a sentinel that doesn't appear in input_ids (e.g. -1),
+            # argmax will return 0 and we fall back to the actual last token via modulo.
+            sequence_lengths = jnp.argmax(jnp.equal(input_ids, self.pad_token_id).astype("i4"), -1) - 1
+            sequence_lengths = sequence_lengths % input_ids.shape[-1]
 
             return hidden_states[jnp.arange(batch_size), sequence_lengths]
 

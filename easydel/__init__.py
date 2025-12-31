@@ -15,7 +15,7 @@
 # pyright:reportUnusedImport=none
 # pyright:reportImportCycles=none
 
-__version__ = "0.2.0"
+__version__ = "0.2.0.1"
 
 import os as _os
 import sys as _sys
@@ -1014,7 +1014,7 @@ else:
     )
 
     _targeted_eformer_versions = ["0.0.85"]
-    _targeted_ejkernel_versions = ["0.0.45"]
+    _targeted_ejkernel_versions = ["0.0.47"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version

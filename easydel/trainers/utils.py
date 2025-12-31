@@ -687,57 +687,70 @@ class RewardDataCollatorWithPaddingTFDS:
         Raises:
             ValueError: If required keys are missing from features.
         """
-        features_chosen = []
-        features_rejected = []
-        margin = []
+        if not features:
+            return {}
+
         has_margin = "margin" in features[0]
+        required = {
+            "input_ids_chosen",
+            "attention_mask_chosen",
+            "input_ids_rejected",
+            "attention_mask_rejected",
+        }
         for feature in features:
-            if (
-                "input_ids_chosen" not in feature
-                or "input_ids_rejected" not in feature
-                or "attention_mask_chosen" not in feature
-                or "attention_mask_rejected" not in feature
-            ):
+            missing = required.difference(feature.keys())
+            if missing:
                 raise ValueError(
                     "The features should include `input_ids_chosen`, `attention_mask_chosen`, "
                     "`input_ids_rejected` and `attention_mask_rejected`"
                 )
 
-            features_chosen.append(
-                {
-                    "input_ids": feature["input_ids_chosen"],
-                    "attention_mask": feature["attention_mask_chosen"],
-                }
-            )
-            features_rejected.append(
-                {
-                    "input_ids": feature["input_ids_rejected"],
-                    "attention_mask": feature["attention_mask_rejected"],
-                }
-            )
-            if has_margin:
-                margin.append(feature["margin"])
-        batch_chosen = self.tokenizer.pad(
-            features_chosen,
-            padding=self.padding,
-            max_length=self.max_length,
-            return_tensors="jax",
-        )
-        batch_rejected = self.tokenizer.pad(
-            features_rejected,
-            padding=self.padding,
-            max_length=self.max_length,
-            return_tensors="jax",
-        )
-        batch = {
-            "input_ids_chosen": batch_chosen["input_ids"],
-            "attention_mask_chosen": batch_chosen["attention_mask"],
-            "input_ids_rejected": batch_rejected["input_ids"],
-            "attention_mask_rejected": batch_rejected["attention_mask"],
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(getattr(self.tokenizer, "tokenizer", None), "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        if self.padding == "max_length":
+            target_len = self.max_length
+        elif self.padding:
+            target_len = None
+        else:
+            target_len = None
+
+        def _pad_right(arr: jnp.ndarray, pad_value: int) -> jnp.ndarray:
+            if target_len is None:
+                return arr
+            if arr.shape[-1] > target_len:
+                if self.truncation_mode == "keep_end":
+                    arr = arr[..., -target_len:]
+                else:
+                    arr = arr[..., :target_len]
+            if arr.shape[-1] < target_len:
+                pad_amount = target_len - arr.shape[-1]
+                arr = jnp.pad(arr, [(0, 0)] * (arr.ndim - 1) + [(0, pad_amount)], constant_values=pad_value)
+            return arr
+
+        chosen_ids = [_pad_right(jnp.asarray(f["input_ids_chosen"]), pad_token_id) for f in features]
+        chosen_mask = [_pad_right(jnp.asarray(f["attention_mask_chosen"]), 0) for f in features]
+        rejected_ids = [_pad_right(jnp.asarray(f["input_ids_rejected"]), pad_token_id) for f in features]
+        rejected_mask = [_pad_right(jnp.asarray(f["attention_mask_rejected"]), 0) for f in features]
+
+        if target_len is None:
+            target_len = max(x.shape[-1] for x in chosen_ids + rejected_ids)
+            chosen_ids = [_pad_right(x, pad_token_id) for x in chosen_ids]
+            chosen_mask = [_pad_right(x, 0) for x in chosen_mask]
+            rejected_ids = [_pad_right(x, pad_token_id) for x in rejected_ids]
+            rejected_mask = [_pad_right(x, 0) for x in rejected_mask]
+
+        batch: dict[str, tp.Any] = {
+            "input_ids_chosen": jnp.stack(chosen_ids, axis=0).astype(jnp.int32),
+            "attention_mask_chosen": jnp.stack(chosen_mask, axis=0).astype(jnp.int32),
+            "input_ids_rejected": jnp.stack(rejected_ids, axis=0).astype(jnp.int32),
+            "attention_mask_rejected": jnp.stack(rejected_mask, axis=0).astype(jnp.int32),
         }
         if has_margin:
-            margin = jnp.array(margin, dtype="f4")
-            batch["margin"] = margin
+            batch["margin"] = jnp.asarray([f["margin"] for f in features], dtype=jnp.float32)
         return batch
 
 
@@ -782,57 +795,51 @@ class RewardDataCollatorWithPaddingGrain:
         Raises:
             ValueError: If required keys are missing from features.
         """
-        features_chosen = []
-        features_rejected = []
-        margin = []
-        has_margin = "margin" in features.keys()
-
-        if (
-            "input_ids_chosen" not in features.keys()
-            or "input_ids_rejected" not in features.keys()
-            or "attention_mask_chosen" not in features.keys()
-            or "attention_mask_rejected" not in features.keys()
-        ):
+        required = {
+            "input_ids_chosen",
+            "attention_mask_chosen",
+            "input_ids_rejected",
+            "attention_mask_rejected",
+        }
+        missing = required.difference(features.keys())
+        if missing:
             raise ValueError(
                 "The features should include `input_ids_chosen`, `attention_mask_chosen`, "
                 "`input_ids_rejected` and `attention_mask_rejected`"
             )
 
-        features_chosen.append(
-            {
-                "input_ids": features["input_ids_chosen"],
-                "attention_mask": features["attention_mask_chosen"],
-            }
-        )
-        features_rejected.append(
-            {
-                "input_ids": features["input_ids_rejected"],
-                "attention_mask": features["attention_mask_rejected"],
-            }
-        )
-        if has_margin:
-            margin.append(features["margin"])
-        batch_chosen = self.tokenizer.pad(
-            features_chosen,
-            padding=self.padding,
-            max_length=self.max_length,
-            return_tensors="np",
-        )
-        batch_rejected = self.tokenizer.pad(
-            features_rejected,
-            padding=self.padding,
-            max_length=self.max_length,
-            return_tensors="np",
-        )
-        batch = {
-            "input_ids_chosen": batch_chosen["input_ids"],
-            "attention_mask_chosen": batch_chosen["attention_mask"],
-            "input_ids_rejected": batch_rejected["input_ids"],
-            "attention_mask_rejected": batch_rejected["attention_mask"],
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(getattr(self.tokenizer, "tokenizer", None), "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        def _pad_right(arr: np.ndarray, pad_value: int) -> np.ndarray:
+            if self.max_length is None or not self.padding:
+                return arr
+            if arr.shape[-1] > self.max_length:
+                if self.truncation_mode == "keep_end":
+                    arr = arr[..., -self.max_length :]
+                else:
+                    arr = arr[..., : self.max_length]
+            if arr.shape[-1] < self.max_length:
+                pad_amount = self.max_length - arr.shape[-1]
+                arr = np.pad(arr, [(0, 0)] * (arr.ndim - 1) + [(0, pad_amount)], constant_values=pad_value)
+            return arr
+
+        chosen_ids = _pad_right(np.asarray(features["input_ids_chosen"]), pad_token_id).astype(np.int32)
+        chosen_mask = _pad_right(np.asarray(features["attention_mask_chosen"]), 0).astype(np.int32)
+        rejected_ids = _pad_right(np.asarray(features["input_ids_rejected"]), pad_token_id).astype(np.int32)
+        rejected_mask = _pad_right(np.asarray(features["attention_mask_rejected"]), 0).astype(np.int32)
+
+        batch: dict[str, tp.Any] = {
+            "input_ids_chosen": chosen_ids,
+            "attention_mask_chosen": chosen_mask,
+            "input_ids_rejected": rejected_ids,
+            "attention_mask_rejected": rejected_mask,
         }
-        if has_margin:
-            margin = np.array(margin, dtype="f4")
-            batch["margin"] = margin
+        if "margin" in features:
+            batch["margin"] = np.asarray(features["margin"], dtype=np.float32)
         return batch
 
 

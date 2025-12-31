@@ -167,9 +167,10 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         self._router_aux_loss_feature = (
             RouterAuxLossFeature(router_aux_loss_coef) if router_aux_loss_coef is not None else None
         )
-        self._pooling_feature = SequenceLengthPoolingFeature(
-            strategy=pooling_strategy, pad_token_id=getattr(config, "pad_token_id", None) or -1
-        )
+        pad_token_id = getattr(config, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = -1
+        self._pooling_feature = SequenceLengthPoolingFeature(strategy=pooling_strategy, pad_token_id=pad_token_id)
         self._gradient_checkpointing_feature = GradientCheckpointingFeature(
             policy=getattr(config, "gradient_checkpointing", None),
             save_names=getattr(config, "gradient_checkpointing_targets", None),
@@ -216,7 +217,7 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
 
         return self._router_aux_loss_feature.compute_loss(router_losses)
 
-    def pool_sequence(self, hidden_states, input_ids=None):
+    def pool_sequence(self, hidden_states, input_ids=None, attention_mask=None):
         """Pool sequence of hidden states to single vector.
 
         Args:
@@ -226,7 +227,7 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         Returns:
             Pooled representation
         """
-        return self._pooling_feature.pool(hidden_states, input_ids)
+        return self._pooling_feature.pool(hidden_states, input_ids, attention_mask=attention_mask)
 
     @abstractmethod
     def __call__(self, *args, **kwargs):

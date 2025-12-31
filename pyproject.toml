@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "easydel"
-version = "0.2.0"
+version = "0.2.0.1"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
 readme = "README.md"
@@ -33,7 +33,7 @@ dependencies = [
 	"jaxlib>=0.8.2",
 	"ray[default]==2.51.0",
 	"eformer==0.0.85",
-	"ejkernel[triton]==0.0.45",
+	"ejkernel[triton]==0.0.47",
 	"einops~=0.8.0",
 	"transformers~=4.57.3",
 	"sentencepiece>=0.2.0",
@@ -81,9 +81,9 @@ gpu = [
 	"jax[cuda12]>=0.8.2",
 	"torch==2.8.0",
 	"tensorboard>=2.19.0",
-	"ejkernel[gpu]==0.0.45",
+	"ejkernel[gpu]==0.0.47",
 ]
-tpu = ["jax[tpu]>=0.8.2", "tensorboard>=2.19.0", "ejkernel[tpu]==0.0.45"]
+tpu = ["jax[tpu]>=0.8.2", "tensorboard>=2.19.0", "ejkernel[tpu]==0.0.47"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
 lm_eval = ["lm_eval~=0.4.9.1"]
 profile = [
