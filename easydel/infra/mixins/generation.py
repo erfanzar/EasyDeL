@@ -222,9 +222,9 @@ class EasyGenerationMixin:
             assert max_model_length is not None, "if your not passing config you should pass `max_model_length`"
 
             config = self.create_ragged_page_cache_config(
+                max_length=max_model_length,
                 hbm_utilization=hbm_utilization,
                 page_size=page_size,
-                max_model_length=max_model_length,
             )
         quantizer = self._quant_class(
             quantization_config=text_config.kv_cache_quantization_config,
@@ -239,6 +239,37 @@ class EasyGenerationMixin:
             )
 
         return RaggedPagesCache.init_cache(
+            mesh=text_config.mesh,
+            config=config,
+            partition_manager=text_config.partition_manager,
+            quantizer=quantizer,
+        )
+
+    def init_unified_attention_cache(
+        self,
+        config: UnifiedAttentionCacheConfig | None = None,
+        page_size: int | None = None,
+        hbm_utilization: float | None = None,
+        max_model_length: int | None = None,
+    ) -> UnifiedAttentionCache:
+        """Initialize and return the unified-attention paged KV cache tensors."""
+        text_config = self.config.get_text_config()
+        if config is None:
+            assert page_size is not None, "if your not passing config you should pass `page_size`"
+            assert hbm_utilization is not None, "if your not passing config you should pass `hbm_utilization`"
+            assert max_model_length is not None, "if your not passing config you should pass `max_model_length`"
+
+            config = self.create_unified_attention_cache_config(
+                max_length=max_model_length,
+                hbm_utilization=hbm_utilization,
+                page_size=page_size,
+            )
+
+        quantizer = self._quant_class(
+            quantization_config=text_config.kv_cache_quantization_config,
+        )
+
+        return UnifiedAttentionCache.init_cache(
             mesh=text_config.mesh,
             config=config,
             partition_manager=text_config.partition_manager,
@@ -809,6 +840,104 @@ class EasyGenerationMixin:
             page_size=page_size,
         )
 
+    def init_operations_cache_config(
+        self,
+        batch_size: int,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+        ragged_config=None,
+        unified_config=None,
+    ):
+        from easydel.layers.caching import (
+            KDACacheView,
+            LightningCacheView,
+            ParallelHybridCacheView,
+            RaggedPagesCacheView,
+            RecurrentCacheView,
+            TransformerCacheView,
+            UnifiedAttentionCacheView,
+        )
+
+        text_config = self.config.get_text_config()
+        cache_view_mapping = self.get_operations_cache_view()
+
+        # Resolve dtype
+        if dtype is None:
+            dtype = getattr(text_config, "kvdtype", jnp.bfloat16)
+            if isinstance(dtype, str):
+                dtype = getattr(jnp, dtype, jnp.bfloat16)
+
+        # Check if any layer needs paged caches and create shared configs.
+        shared_ragged_config = None
+        shared_unified_config = None
+        needs_ragged = any(view_class is RaggedPagesCacheView for view_class in cache_view_mapping.values())
+        needs_unified = any(view_class is UnifiedAttentionCacheView for view_class in cache_view_mapping.values())
+
+        if needs_ragged:
+            from easydel.layers.caching import RaggedPagesCacheConfig
+
+            if ragged_config is not None and not isinstance(ragged_config, RaggedPagesCacheConfig):
+                raise TypeError(f"`ragged_config` must be a RaggedPagesCacheConfig, got {type(ragged_config)}")
+            shared_ragged_config = ragged_config or self.create_ragged_page_cache_config(
+                max_length=max_length,
+                page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                dtype=dtype,
+            )
+
+        if needs_unified:
+            from easydel.layers.caching import UnifiedAttentionCacheConfig
+
+            if unified_config is not None and not isinstance(unified_config, UnifiedAttentionCacheConfig):
+                raise TypeError(f"`unified_config` must be a UnifiedAttentionCacheConfig, got {type(unified_config)}")
+            shared_unified_config = unified_config or self.create_unified_attention_cache_config(
+                max_length=max_length,
+                page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                dtype=dtype,
+            )
+        with self.mesh:
+            num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
+            if num_hidden_layers is None:
+                num_hidden_layers = (max(cache_view_mapping.keys(), default=-1) + 1) if cache_view_mapping else 0
+
+            views_config = [None] * num_hidden_layers
+
+            for idx in range(num_hidden_layers):
+                view_class = cache_view_mapping.get(idx)
+                if view_class is None:
+                    raise ValueError(
+                        f"Missing cache view class for layer {idx}. "
+                        "Operation discovery did not return a cache view for every layer."
+                    )
+
+                if view_class is ParallelHybridCacheView:
+                    t_config = self.create_transformer_cache_config(batch_size=batch_size, max_length=max_length)
+                    r_config = self.create_recurrent_cache_config(batch_size=batch_size)
+                    views_config[idx] = (t_config, r_config)
+                elif view_class is TransformerCacheView:
+                    config = self.create_transformer_cache_config(batch_size=batch_size, max_length=max_length)
+                    views_config[idx] = config
+                elif view_class is RecurrentCacheView:
+                    config = self.create_recurrent_cache_config(batch_size=batch_size)
+                    views_config[idx] = config
+                elif view_class is KDACacheView:
+                    config = self.create_kda_cache_config(batch_size=batch_size)
+                    views_config[idx] = config
+                elif view_class is RaggedPagesCacheView:
+                    views_config[idx] = shared_ragged_config
+                elif view_class is UnifiedAttentionCacheView:
+                    views_config[idx] = shared_unified_config
+                elif view_class is LightningCacheView:
+                    config = self.create_lightning_cache_config(batch_size=batch_size)
+                    views_config[idx] = config
+                else:
+                    raise ValueError(f"Unknown cache view class: {view_class}")
+        return views_config
+
     def init_operations_cache(
         self,
         batch_size: int,
@@ -821,6 +950,8 @@ class EasyGenerationMixin:
         quantizer=None,
         masking_details=None,
         starts: jnp.array | None = None,
+        ragged_config=None,
+        unified_config=None,
     ):
         """Initialize cache using HybridCache as the universal per-layer container.
 
@@ -864,36 +995,22 @@ class EasyGenerationMixin:
             UnifiedAttentionCacheView,
         )
 
+        views_config = self.init_operations_cache_config(
+            batch_size=batch_size,
+            max_length=max_length,
+            page_size=page_size,
+            hbm_utilization=hbm_utilization,
+            dtype=dtype,
+            ragged_config=ragged_config,
+            unified_config=unified_config,
+        )
         text_config = self.config.get_text_config()
         cache_view_mapping = self.get_operations_cache_view()
 
-        # Resolve dtype
         if dtype is None:
             dtype = getattr(text_config, "kvdtype", jnp.bfloat16)
             if isinstance(dtype, str):
                 dtype = getattr(jnp, dtype, jnp.bfloat16)
-
-        # Check if any layer needs paged caches and create shared configs.
-        shared_ragged_config = None
-        shared_unified_config = None
-        needs_ragged = any(view_class is RaggedPagesCacheView for view_class in cache_view_mapping.values())
-        needs_unified = any(view_class is UnifiedAttentionCacheView for view_class in cache_view_mapping.values())
-
-        if needs_ragged:
-            shared_ragged_config = self.create_ragged_page_cache_config(
-                max_length=max_length,
-                page_size=page_size,
-                hbm_utilization=hbm_utilization,
-                dtype=dtype,
-            )
-
-        if needs_unified:
-            shared_unified_config = self.create_unified_attention_cache_config(
-                max_length=max_length,
-                page_size=page_size,
-                hbm_utilization=hbm_utilization,
-                dtype=dtype,
-            )
 
         with self.mesh:
             num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
@@ -902,7 +1019,7 @@ class EasyGenerationMixin:
 
             views = [None] * num_hidden_layers
 
-            for idx in range(num_hidden_layers):
+            for idx, config_classes in zip(range(num_hidden_layers), views_config, strict=False):
                 view_class = cache_view_mapping.get(idx)
                 if view_class is None:
                     raise ValueError(
@@ -912,9 +1029,8 @@ class EasyGenerationMixin:
 
                 if view_class is ParallelHybridCacheView:
                     # Parallel hybrid layer: needs BOTH KV-cache and recurrent/SSM state.
-                    t_config = self.create_transformer_cache_config(batch_size=batch_size, max_length=max_length)
                     transformer_view = TransformerCacheView.init(
-                        config=t_config,
+                        config=config_classes[0],
                         layer_index=idx,
                         mesh=text_config.mesh,
                         dtype=dtype,
@@ -924,9 +1040,8 @@ class EasyGenerationMixin:
                         starts=starts,
                     )
 
-                    r_config = self.create_recurrent_cache_config(batch_size=batch_size)
                     recurrent_view = RecurrentCacheView.init(
-                        config=r_config,
+                        config=config_classes[1],
                         layer_index=idx,
                         dtype=dtype,
                     )
@@ -937,9 +1052,8 @@ class EasyGenerationMixin:
                         layer_index=idx,
                     )
                 elif view_class is TransformerCacheView:
-                    config = self.create_transformer_cache_config(batch_size=batch_size, max_length=max_length)
                     view = view_class.init(
-                        config=config,
+                        config=config_classes,
                         layer_index=idx,
                         mesh=text_config.mesh,
                         dtype=dtype,
@@ -949,22 +1063,20 @@ class EasyGenerationMixin:
                         starts=starts,
                     )
                 elif view_class is RecurrentCacheView:
-                    config = self.create_recurrent_cache_config(batch_size=batch_size)
                     view = view_class.init(
-                        config=config,
+                        config=config_classes,
                         layer_index=idx,
                         dtype=dtype,
                     )
                 elif view_class is KDACacheView:
-                    config = self.create_kda_cache_config(batch_size=batch_size)
                     view = view_class.init(
-                        config=config,
+                        config=config_classes,
                         layer_index=idx,
                         dtype=dtype,
                     )
                 elif view_class is RaggedPagesCacheView:
                     view = view_class.init(
-                        config=shared_ragged_config,
+                        config=config_classes,
                         layer_index=idx,
                         mesh=text_config.mesh,
                         partition_manager=text_config.partition_manager,
@@ -972,16 +1084,15 @@ class EasyGenerationMixin:
                     )
                 elif view_class is UnifiedAttentionCacheView:
                     view = view_class.init(
-                        config=shared_unified_config,
+                        config=config_classes,
                         layer_index=idx,
                         mesh=text_config.mesh,
                         partition_manager=text_config.partition_manager,
                         quantizer=quantizer,
                     )
                 elif view_class is LightningCacheView:
-                    config = self.create_lightning_cache_config(batch_size=batch_size)
                     view = view_class.init(
-                        config=config,
+                        config=config_classes,
                         layer_index=idx,
                         dtype=dtype,
                     )

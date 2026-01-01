@@ -69,6 +69,8 @@ import numpy as np
 from eformer.loggings import get_logger
 from jax import numpy as jnp
 
+from easydel.layers.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
+
 from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
 from ..scheduler import SchedulerOutput
@@ -603,11 +605,27 @@ class eSurgeRunner:
 
     def initialize_kv_cache(self) -> None:
         """Reinitialize the ragged KV cache if it has been destroyed."""
+
         if self.executor_manager.kv_pages is not None:
             logger.debug("KV cache already initialized; skipping reallocation")
             return
+
         logger.info("Reinitializing eSurgeRunner ragged KV cache pages")
-        self.executor_manager.kv_pages = self.model.init_ragged_pages(self.metadata)
+        text_config = self.model.config.get_text_config()
+        quantizer = self.model._quant_class(quantization_config=text_config.kv_cache_quantization_config)
+
+        self.executor_manager.kv_pages = self.model.init_operations_cache(
+            batch_size=int(self.max_num_reqs),
+            max_length=int(self.max_model_len),
+            page_size=int(getattr(self.metadata, "page_size", 128)),
+            hbm_utilization=float(getattr(self.metadata, "hbm_utilization", 0.9)),
+            dtype=getattr(self.metadata, "kvdtype", None),
+            quantizer=quantizer,
+            masking_details=getattr(text_config, "get_mask_details", lambda: None)(),
+            ragged_config=self.metadata if isinstance(self.metadata, RaggedPagesCacheConfig) else None,
+            unified_config=self.metadata if isinstance(self.metadata, UnifiedAttentionCacheConfig) else None,
+        )
+        return
 
     def _precompute_vlm_prefill(self, req_state: CachedRequestState) -> None:
         """Precompute prompt embeddings (+ optional mRoPE indices) for VLM requests.

@@ -85,7 +85,13 @@ from eformer.loggings import ProgressLogger, get_logger
 from eformer.pytree import key_path_to_str
 from jax import numpy as jnp
 
-from easydel.layers.caching import RaggedPagesCache, RaggedPagesCacheView
+from easydel.layers.caching import (
+    HybridCache,
+    RaggedPagesCache,
+    RaggedPagesCacheConfig,
+    UnifiedAttentionCache,
+    UnifiedAttentionCacheConfig,
+)
 
 from ..utils import model_uses_mrope
 from .execution_types import BatchMetadata, ModelStepOutputs, StepFunctionInputs
@@ -243,7 +249,7 @@ class ExecutionManager:
         max_model_len: Maximum sequence length supported by model.
         max_num_reqs: Maximum concurrent requests.
         max_num_tokens: Maximum tokens per batch (defaults to max_model_len).
-        metadata: KV cache metadata (RaggedPagesCacheView).
+        metadata: KV cache config (ragged pages or unified attention).
         graphdef: Model graph definition (static structure).
         graphstate: Model graph state (weights, device-resident).
         graphother: Auxiliary model state (buffers, etc.).
@@ -298,7 +304,7 @@ class ExecutionManager:
         max_model_len: int = 2**13,
         max_num_reqs: int = 16,
         max_num_tokens: int | None = None,
-        metadata: RaggedPagesCacheView = None,
+        metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig | None = None,
         verbose: bool = False,
     ):
         """Initialize the executor manager.
@@ -314,12 +320,15 @@ class ExecutionManager:
             max_model_len: Maximum model sequence length.
             max_num_reqs: Maximum number of requests.
             max_num_tokens: Maximum number of tokens for batching.
-            metadata: Pages cache metadata.
+            metadata: Paged KV-cache config (ragged pages or unified attention).
         """
+        if metadata is None:
+            raise ValueError("ExecutionManager requires a paged cache config `metadata`.")
+
         logger.info(f"initializing eSurge-ExecutionManager Version {metadata.version}")
         self.model = model
         self.mesh = model.mesh
-        self.kv_pages = model.init_ragged_pages(metadata)
+
         self.use_aot_forward = use_aot_forward
         self.min_input_pad = min_input_pad
         self.max_model_len = max_model_len
@@ -329,6 +338,24 @@ class ExecutionManager:
         self._metadata_version = metadata.version
         self._use_slot_mapping = metadata.version == "v2"
         self._use_request_distribution = not self._use_slot_mapping
+
+        text_config = model.config.get_text_config()
+        quantizer = model._quant_class(quantization_config=text_config.kv_cache_quantization_config)
+
+        # Prefer HybridCache (per-operation cache views) as the universal container.
+        # Keep paged-cache parameters consistent with the scheduler config.
+        self.kv_pages = model.init_operations_cache(
+            batch_size=int(self.max_num_reqs),
+            max_length=int(self.max_model_len),
+            page_size=int(getattr(metadata, "page_size", 128)),
+            hbm_utilization=float(getattr(metadata, "hbm_utilization", 0.9)),
+            dtype=getattr(metadata, "kvdtype", None),
+            quantizer=quantizer,
+            masking_details=getattr(text_config, "get_mask_details", lambda: None)(),
+            ragged_config=metadata if isinstance(metadata, RaggedPagesCacheConfig) else None,
+            unified_config=metadata if isinstance(metadata, UnifiedAttentionCacheConfig) else None,
+        )
+
         self.graphdef, self.graphstate, self.graphother = model.split_module()
 
         self.log_it = logger.info if verbose else logger.debug
@@ -676,7 +703,7 @@ class ExecutionManager:
         num_reqs_max_model_len: int,
         max_pages_per_req: int,
         max_num_reqs: int,
-        metadata: RaggedPagesCacheView,
+        metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig,
         num_reqs_paddings: list[int] | None = None,
     ) -> None:
         """Compile model execution functions for various input configurations.
@@ -745,7 +772,7 @@ class ExecutionManager:
         max_pages_per_req: int,
         max_num_reqs: int,
         padded_num_reqs: int,
-        metadata: RaggedPagesCacheView,
+        metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig,
     ) -> None:
         """Compile a single step configuration.
 
@@ -960,12 +987,12 @@ class ExecutionManager:
 
     def get_compile_configurations(
         self,
-        kv_pages: RaggedPagesCache,
+        kv_pages: HybridCache | RaggedPagesCache | UnifiedAttentionCache,
         rng_key: jax.random.PRNGKey,
         num_tokens: int,
         max_num_reqs: int,
         padded_num_reqs: int,
-        metadata: RaggedPagesCacheView,
+        metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig,
     ):
         """Generate compilation arguments for step function.
 
