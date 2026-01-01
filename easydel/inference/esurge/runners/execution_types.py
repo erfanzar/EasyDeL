@@ -31,7 +31,7 @@ import typing
 import jax
 from eformer.pytree import auto_pytree
 
-from easydel.layers.caching import RaggedPagesCache
+from easydel.layers.caching import RaggedPagesCache, UnifiedAttentionCache
 
 if typing.TYPE_CHECKING:
     pass
@@ -166,7 +166,7 @@ class BatchMetadata:
 class ModelStepOutputs:
     """Outputs returned from the pure model forward pass."""
 
-    kv_pages: RaggedPagesCache
+    kv_pages: RaggedPagesCache | UnifiedAttentionCache
     hidden_states: jax.Array
     logits: jax.Array
 
@@ -209,7 +209,7 @@ class StepFunctionInputs:
         ... )
     """
 
-    kv_pages: RaggedPagesCache
+    kv_pages: RaggedPagesCache | UnifiedAttentionCache
     scheduled_full: jax.Array  # [max_num_reqs] int32
     req_num_tokens_full: jax.Array  # [max_num_reqs] int32
     active_mask_full: jax.Array  # [max_num_reqs] bool
@@ -224,8 +224,15 @@ class StepFunctionInputs:
         lines.append("\nMinimalDeviceState:")
         lines.append(f"  token_ids:       {self.device_state.token_ids.shape}")
         lines.append(f"  num_tokens:      {self.device_state.num_tokens.shape}")
-        lines.append("\nRaggedPagesCache:")
-        lines.append(f"  kv_pages:        {len(self.kv_pages.views)}x{self.kv_pages.views[-1].kv_pages.shape}")
+        lines.append("\nPaged KV Cache:")
+        last_view = self.kv_pages.views[-1]
+        if hasattr(last_view, "kv_pages"):
+            lines.append(f"  kv_pages:        {len(self.kv_pages.views)}x{last_view.kv_pages.shape}")
+        elif hasattr(last_view, "key_cache") and hasattr(last_view, "value_cache"):
+            lines.append(f"  key_cache:       {len(self.kv_pages.views)}x{last_view.key_cache.shape}")
+            lines.append(f"  value_cache:     {len(self.kv_pages.views)}x{last_view.value_cache.shape}")
+        else:
+            lines.append(f"  views:           {len(self.kv_pages.views)}x{type(last_view)}")
         lines.append("\nRequest Arrays:")
         lines.append(f"  scheduled_full:      {self.scheduled_full.shape}")
         lines.append(f"  req_num_tokens_full: {self.req_num_tokens_full.shape}")

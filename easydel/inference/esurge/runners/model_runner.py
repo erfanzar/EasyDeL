@@ -190,11 +190,18 @@ class eSurgeRunner:
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
         logger.debug(f"Configuration: {hbm_utilization=}, {page_size=}")
         self.model = model.esurge_compatible_model
-        self.metadata = model.create_ragged_page_cache_config(
-            hbm_utilization=hbm_utilization,
-            page_size=page_size,
-            max_length=max_model_len,
-        )
+        if getattr(self.model.config.get_text_config(), "attn_mechanism", None) == "unified_attention":
+            self.metadata = self.model.create_unified_attention_cache_config(
+                hbm_utilization=hbm_utilization,
+                page_size=page_size,
+                max_length=max_model_len,
+            )
+        else:
+            self.metadata = self.model.create_ragged_page_cache_config(
+                hbm_utilization=hbm_utilization,
+                page_size=page_size,
+                max_length=max_model_len,
+            )
         self.max_num_seq_buckets = self._init_seq_buckets(max_num_seq_buckets, max_num_seqs, min_input_pad)
         self.max_num_seqs = max_num_seqs
         self.max_num_reqs = self.max_num_seq_buckets[-1]
@@ -215,7 +222,7 @@ class eSurgeRunner:
 
         logger.debug("Creating ExecutionManager and initializing pages cache")
         self.executor_manager = ExecutionManager(
-            model=model,
+            model=self.model,
             use_aot_forward=use_aot_forward,
             min_input_pad=self.min_input_pad,
             max_model_len=max_model_len,

@@ -122,6 +122,7 @@ class AttentionMetadataBuilder:
         "ragged_page_attention_v3",
         "page_attention",
         "paged_attention",
+        "unified_attention",
     }
 
     @classmethod

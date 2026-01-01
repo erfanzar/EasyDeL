@@ -96,6 +96,7 @@ from .recurrent import (
     RecurrentMetadata,
 )
 from .transformer import TransformerCache, TransformerCacheConfig, TransformerCacheView, TransformerMetadata
+from .unified_attention import UnifiedAttentionCache, UnifiedAttentionCacheConfig, UnifiedAttentionCacheView
 
 __all__ = (
     "AttentionMetadataBuilder",
@@ -134,5 +135,8 @@ __all__ = (
     "TransformerCacheConfig",
     "TransformerCacheView",
     "TransformerMetadata",
+    "UnifiedAttentionCache",
+    "UnifiedAttentionCacheConfig",
+    "UnifiedAttentionCacheView",
     "unwrap_metadata",
 )
