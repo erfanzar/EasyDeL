@@ -147,11 +147,7 @@ class Scheduler(SchedulerInterface):
             page_size=metadata.page_size,
             num_kv_heads=metadata.num_kv_heads,
             head_size=getattr(metadata, "k_headdim", None) or getattr(metadata, "head_dim", None),
-            dtype=(
-                runner.executor_manager.kv_pages.views[-1].kv_pages.dtype
-                if hasattr(runner.executor_manager.kv_pages.views[-1], "kv_pages")
-                else runner.executor_manager.kv_pages.views[-1].key_cache.dtype
-            ),
+            dtype=metadata.kvdtype,
             use_mla=False,
         )
 

@@ -29,6 +29,7 @@ import jax
 import numpy as np
 
 from easydel.layers.caching import (
+    HybridCache,
     RaggedPagesCache,
     RaggedPagesCacheConfig,
     UnifiedAttentionCache,
@@ -53,7 +54,7 @@ class ExecutionManagerProtocol(Protocol):
 
     model: "EasyDeLBaseModule"
     mesh: tp.Any
-    kv_pages: RaggedPagesCache | UnifiedAttentionCache
+    kv_pages: HybridCache | RaggedPagesCache | UnifiedAttentionCache
     rng_key: jax.Array
     max_model_len: int
     max_num_reqs: int

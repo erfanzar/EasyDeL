@@ -31,7 +31,7 @@ import typing
 import jax
 from eformer.pytree import auto_pytree
 
-from easydel.layers.caching import RaggedPagesCache, UnifiedAttentionCache
+from easydel.layers.caching import HybridCache, RaggedPagesCache, UnifiedAttentionCache
 
 if typing.TYPE_CHECKING:
     pass
@@ -166,7 +166,7 @@ class BatchMetadata:
 class ModelStepOutputs:
     """Outputs returned from the pure model forward pass."""
 
-    kv_pages: RaggedPagesCache | UnifiedAttentionCache
+    kv_pages: HybridCache | RaggedPagesCache | UnifiedAttentionCache
     hidden_states: jax.Array
     logits: jax.Array
 
@@ -209,7 +209,7 @@ class StepFunctionInputs:
         ... )
     """
 
-    kv_pages: RaggedPagesCache | UnifiedAttentionCache
+    kv_pages: HybridCache | RaggedPagesCache | UnifiedAttentionCache
     scheduled_full: jax.Array  # [max_num_reqs] int32
     req_num_tokens_full: jax.Array  # [max_num_reqs] int32
     active_mask_full: jax.Array  # [max_num_reqs] bool
@@ -315,7 +315,7 @@ class StepFunctionOutputs:
     """
 
     device_state: MinimalDeviceState
-    kv_pages: RaggedPagesCache
+    kv_pages: HybridCache | RaggedPagesCache | UnifiedAttentionCache
     input_ids_buf: jax.Array
     position_ids_buf: jax.Array
     query_start_loc: jax.Array

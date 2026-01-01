@@ -27,7 +27,7 @@ import typing as tp
 import jax
 import numpy as np
 
-from easydel.layers.caching import RaggedPagesCacheView
+from easydel.layers.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
 from easydel.layers.caching._metadatabuilder import AttentionMetadataBuilder
 
 from ...page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
@@ -40,7 +40,7 @@ class BatchMetadataPreparer:
     def __init__(
         self,
         *,
-        metadata: RaggedPagesCacheView,
+        metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig,
         empty_sharding: jax.sharding.Sharding,
         max_num_tokens: int,
         max_num_reqs: int,

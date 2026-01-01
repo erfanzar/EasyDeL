@@ -158,7 +158,7 @@ class _RaggedPageAttn(OperationImpl):
         softmax_scale: float | None = None,
         logits_soft_cap: float | None = None,
         sliding_window: int | None = None,
-        softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,  # noqa
+        softmax_aux: Float[Array, "num_sinks"] | None = None,  # noqa
         vmem_limit_bytes: int | None = None,
         **ignore,
     ) -> AttentionOutput:

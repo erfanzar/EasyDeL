@@ -30,7 +30,14 @@ from eformer import escale as es
 from flax import nnx as nn
 from jax import numpy as jnp
 
-from easydel.layers.caching import RaggedPagesCache, RaggedPagesCacheView, RaggedPagesMetadata
+from easydel.layers.caching import (
+    HybridCache,
+    RaggedPagesCache,
+    RaggedPagesCacheConfig,
+    RaggedPagesMetadata,
+    UnifiedAttentionCache,
+    UnifiedAttentionCacheConfig,
+)
 from easydel.utils import ejit
 
 from ..execution_types import BatchMetadata, ModelStepOutputs, StepFunctionInputs
@@ -47,8 +54,8 @@ class ModelStepExecutor:
         *,
         model: "EasyDeLBaseModule",
         mesh: tp.Any,
-        metadata: RaggedPagesCacheView,
-        kv_pages_template: RaggedPagesCache,
+        metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig,
+        kv_pages_template: HybridCache | RaggedPagesCache | UnifiedAttentionCache,
         graphstate_template: tp.Any,
         graphother_template: tp.Any,
         max_num_reqs: int,
@@ -137,7 +144,7 @@ class ModelStepExecutor:
     def _build_model_step_fn(
         self,
         *,
-        kv_pages_template: RaggedPagesCache,
+        kv_pages_template: HybridCache | RaggedPagesCache | UnifiedAttentionCache,
         graphstate_template: tp.Any,
         graphother_template: tp.Any,
     ) -> tp.Callable[..., ModelStepOutputs]:
@@ -181,7 +188,11 @@ class ModelStepExecutor:
         )
         @self._maybe_implicit
         def _model_step(
-            graphdef, graphstate, graphother, kv_pages: RaggedPagesCache, metadata: BatchMetadata
+            graphdef,
+            graphstate,
+            graphother,
+            kv_pages: HybridCache | RaggedPagesCache | UnifiedAttentionCache,
+            metadata: BatchMetadata,
         ) -> ModelStepOutputs:
             with self.model.mesh:
                 model: "EasyDeLBaseModule" = nn.merge(graphdef, graphstate, graphother)
