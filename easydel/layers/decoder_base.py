@@ -54,6 +54,7 @@ from .caching import (
     RaggedPagesMetadata,
     TransformerCacheView,
     TransformerMetadata,
+    UnifiedAttentionCacheView,
 )
 
 
@@ -78,7 +79,7 @@ class BaseDecoderLayer:
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -207,7 +208,7 @@ class BaseDecoderLayer:
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
         partition_manager,
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,

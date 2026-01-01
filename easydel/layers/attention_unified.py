@@ -50,6 +50,7 @@ from .caching import (
     RaggedPagesMetadata,
     TransformerCacheView,
     TransformerMetadata,
+    UnifiedAttentionCacheView,
 )
 from .linear import ColumnParallelLinear, RowParallelLinear
 from .norms import RMSNorm
@@ -744,7 +745,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -890,7 +891,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
@@ -1031,7 +1032,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
@@ -1118,7 +1119,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         mask_info: MaskInfo | None,
         position_ids: Int[Array, "batch seq_len"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,

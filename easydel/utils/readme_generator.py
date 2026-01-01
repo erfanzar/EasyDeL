@@ -165,6 +165,7 @@ _ATTN_ENUM_BY_MECHANISM_KEY: dict[str, str] = {
     "page_attention": "PAGED_ATTENTION",
     "ragged_page_attention_v2": "RAGGED_PAGE_ATTENTION_V2",
     "ragged_page_attention_v3": "RAGGED_PAGE_ATTENTION_V3",
+    "unified_attention": "UNIFIED_ATTENTION",
     "autoregressive_decodeattn": "REGRESSIVE_DECODE",
     "autoregressive_decode": "REGRESSIVE_DECODE",
 }
@@ -207,6 +208,7 @@ EASYDEL_TRAINER_README_TEMPLATE = """
     "paged": "RAGGED_PAGE_ATTENTION_V3", "paged_attn": "RAGGED_PAGE_ATTENTION_V3", "paged_attention": "RAGGED_PAGE_ATTENTION_V3",
     "page_attention": "PAGED_ATTENTION",
     "ragged_page_attention_v3": "RAGGED_PAGE_ATTENTION_V3", "ragged_page_attention_v2": "RAGGED_PAGE_ATTENTION_V2",
+    "unified_attention": "UNIFIED_ATTENTION",
     "autoregressive_decodeattn": "REGRESSIVE_DECODE", "autoregressive_decode": "REGRESSIVE_DECODE"
 } %}
 {%- set attn_enum = attn_enum_map.get(model.attn_mechanism_str.lower(), "AUTO") %}

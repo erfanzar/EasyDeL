@@ -196,6 +196,7 @@ AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",
     "page_attention",
+    "unified_attention",
 ]
 
 DEFAULT_ATTENTION_MECHANISM = "vanilla"
