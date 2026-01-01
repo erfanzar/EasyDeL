@@ -22,6 +22,7 @@ from .ring_attention import RingAttn
 from .scaled_dot_product_attention import ScaledDotProductAttn
 from .ssm1 import SSM1Op, SSM1Output
 from .ssm2 import SSM2Op, SSM2Output
+from .unified_attention import UnifiedAttn
 from .vanilla_attention import VanillaAttn
 
 __all__ = (
@@ -40,6 +41,7 @@ __all__ = (
     "SSM2Op",
     "SSM2Output",
     "ScaledDotProductAttn",
+    "UnifiedAttn",
     "VanillaAttn",
     "fused_kda_gate",
 )

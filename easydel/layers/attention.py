@@ -72,6 +72,7 @@ from .caching import (
     RaggedPagesMetadata,
     TransformerCacheView,
     TransformerMetadata,
+    UnifiedAttentionCacheView,
 )
 from .operations import AttentionOutput, OperationMetadata, OperationRegistry
 from .quantization.quantizers import EasyQuantizer
@@ -128,6 +129,7 @@ class AttentionMechanisms(str, Enum):
         CUDA_FLASH_ATTN2: CUDA-specific FlashAttention-2.
         RAGGED_PAGE_ATTENTION_V3: Paged attention for efficient inference.
         RAGGED_PAGE_ATTENTION_V2: Paged attention for efficient inference.
+        UNIFIED_ATTENTION: vLLM-style unified paged attention (Triton).
         REGRESSIVE_DECODE: Optimized autoregressive decoding.
     """
 
@@ -144,6 +146,7 @@ class AttentionMechanisms(str, Enum):
     RAGGED_PAGE_ATTENTION_V3: str = "ragged_page_attention_v3"
     RAGGED_PAGE_ATTENTION_V2: str = "ragged_page_attention_v2"
     PAGED_ATTENTION: str = "page_attention"
+    UNIFIED_ATTENTION: str = "unified_attention"
     REGRESSIVE_DECODE: str = "autoregressive_decodeattn"
 
 
@@ -354,7 +357,7 @@ class FlexibleAttentionModule(nn.Module):
         bias: Float[JArray, "batch heads seq_q seq_k"] | None = None,
         sliding_window: int | tuple[int, int] | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None = None,
         init_bias: tp.Callable[[], Float[JArray, "batch heads seq_q seq_k"]] | None = None,
         causal: bool = True,
         softmax_aux: Float[JArray, "..."] | None = None,
@@ -418,13 +421,13 @@ class FlexibleAttentionModule(nn.Module):
             AttentionOutput: An object containing the attention output tensor and potentially
                              attention weights (depending on the backend).
         """
-        is_ragged_page_cache: bool = isinstance(cache_view, RaggedPagesCacheView)
-        if is_ragged_page_cache:
-            mechanism_is_ragged_page = self.config.attn_mechanism in [
+        if isinstance(cache_view, RaggedPagesCacheView):
+            assert self.config.attn_mechanism in [
                 AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2,
                 AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3,
             ]
-            assert mechanism_is_ragged_page
+        elif isinstance(cache_view, UnifiedAttentionCacheView):
+            assert self.config.attn_mechanism == AttentionMechanisms.UNIFIED_ATTENTION
 
         # NOTE: Attention Dropout is disabled for now.
         # try:
@@ -903,7 +906,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         value: Array,
         mask_info: MaskInfo,
         mode: common_types.RUNTIME_MODE_TYPES | common_types.EMPTY_VAL = common_types.NOT_GIVEN,  # type:ignore
-        cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
+        cache_view: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         sliding_window: int | None = None,
     ) -> tuple[
@@ -911,7 +914,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         Array,
         Array,
         tp.Callable[[], Array],
-        TransformerCacheView | RaggedPagesCacheView | None,
+        TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None,
         TransformerMetadata | RaggedPagesMetadata | None,
     ]:
         """
@@ -966,7 +969,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         else:
             mode_computed = mode
 
-        is_ragged_cache: bool = isinstance(cache_view, RaggedPagesCacheView)
+        is_ragged_cache: bool = isinstance(cache_view, (RaggedPagesCacheView, UnifiedAttentionCacheView))
         if is_ragged_cache:
             cache_view = cache_view.concatenate_to_cache(key=key, value=value, cache_metadata=cache_metadata)
 

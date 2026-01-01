@@ -65,6 +65,7 @@ OperationImplName = tp.Literal[
     "blocksparse",
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",
+    "unified_attention",
     "sdpa",
     "cudnn",
     "cuda_flash_attn2",
@@ -87,6 +88,7 @@ class OperationConfigsDict(TypedDict, total=False):
         blocksparse: Config for block sparse attention.
         ragged_page_attention_v2: Config for ragged page attention v2.
         ragged_page_attention_v3: Config for ragged page attention v3.
+        unified_attention: Config for unified attention (vLLM-style paged attention).
         sdpa: Config for scaled dot product attention (also registered as cudnn, cuda_flash_attn2).
         vanilla: Config for vanilla attention.
 
@@ -103,6 +105,7 @@ class OperationConfigsDict(TypedDict, total=False):
     blocksparse: NotRequired["BaseOperationConfig | None"]
     ragged_page_attention_v2: NotRequired["BaseOperationConfig | None"]
     ragged_page_attention_v3: NotRequired["BaseOperationConfig | None"]
+    unified_attention: NotRequired["BaseOperationConfig | None"]
     sdpa: NotRequired["BaseOperationConfig | None"]
     vanilla: NotRequired["BaseOperationConfig | None"]
 
