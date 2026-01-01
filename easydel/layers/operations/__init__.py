@@ -56,6 +56,7 @@ from ejkernel.modules.operations.configs import (
     RaggedPageAttentionv3Config,
     RingAttentionConfig,
     ScaledDotProductAttentionConfig,
+    UnifiedAttentionConfig,
 )
 
 from ._attention_outputs import AttentionOutput
@@ -116,6 +117,7 @@ __all__ = (
     "RingAttn",
     "ScaledDotProductAttentionConfig",
     "ScaledDotProductAttn",
+    "UnifiedAttentionConfig",
     "ValidationResult",
     "VanillaAttn",
 )

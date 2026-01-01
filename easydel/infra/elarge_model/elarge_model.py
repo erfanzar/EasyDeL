@@ -510,6 +510,7 @@ class eLargeModel:
                 - "blocksparse": Block sparse attention
                 - "ragged_page_attention_v2": Ragged page attention v2
                 - "ragged_page_attention_v3": Ragged page attention v3
+                - "unified_attention": Unified paged attention (vLLM-style)
                 - "sdpa": Scaled dot product attention
                 - "vanilla": Vanilla attention
             **kwargs: Individual operation configs as keyword arguments.

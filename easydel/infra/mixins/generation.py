@@ -77,7 +77,12 @@ from easydel.inference.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
-from easydel.layers.caching import RaggedPagesCache, RaggedPagesCacheConfig
+from easydel.layers.caching import (
+    RaggedPagesCache,
+    RaggedPagesCacheConfig,
+    UnifiedAttentionCache,
+    UnifiedAttentionCacheConfig,
+)
 
 from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutput
@@ -177,11 +182,11 @@ class EasyGenerationMixin:
 
     def init_ragged_pages(
         self,
-        config: RaggedPagesCacheConfig | None = None,
+        config: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig | None = None,
         page_size: int | None = None,
         hbm_utilization: float | None = None,
         max_model_length: int | None = None,
-    ) -> RaggedPagesCache:
+    ) -> RaggedPagesCache | UnifiedAttentionCache:
         """
         Initializes and returns the actual Paged Attention KV Cache tensors.
 
@@ -221,13 +226,23 @@ class EasyGenerationMixin:
                 page_size=page_size,
                 max_model_length=max_model_length,
             )
+        quantizer = self._quant_class(
+            quantization_config=text_config.kv_cache_quantization_config,
+        )
+
+        if isinstance(config, UnifiedAttentionCacheConfig):
+            return UnifiedAttentionCache.init_cache(
+                mesh=text_config.mesh,
+                config=config,
+                partition_manager=text_config.partition_manager,
+                quantizer=quantizer,
+            )
+
         return RaggedPagesCache.init_cache(
             mesh=text_config.mesh,
             config=config,
             partition_manager=text_config.partition_manager,
-            quantizer=self._quant_class(
-                quantization_config=text_config.kv_cache_quantization_config,
-            ),
+            quantizer=quantizer,
         )
 
     def init_cache(
@@ -744,6 +759,50 @@ class EasyGenerationMixin:
             page_size=page_size,
         )
 
+    def create_unified_attention_cache_config(
+        self,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+    ):
+        """Create UnifiedAttentionCacheConfig for vLLM-style unified attention.
+
+        This cache layout matches ejkernel's Triton UnifiedAttention kernel:
+        `[num_blocks, block_size, num_kv_heads, head_dim]` for both K and V.
+        """
+        from easydel.layers.caching import UnifiedAttentionCacheConfig
+
+        text_config = self.config.get_text_config()
+
+        if dtype is None:
+            dtype = getattr(text_config, "kvdtype", jnp.bfloat16)
+            if isinstance(dtype, str):
+                dtype = getattr(jnp, dtype, jnp.bfloat16)
+
+        num_kv_heads = getattr(text_config, "num_key_value_heads", None)
+        head_dim = getattr(text_config, "head_dim", None)
+        if head_dim is None:
+            hidden_size = getattr(text_config, "hidden_size", None)
+            num_heads = getattr(text_config, "num_attention_heads", None)
+            if hidden_size and num_heads:
+                head_dim = hidden_size // num_heads
+
+        num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+
+        return UnifiedAttentionCacheConfig.create(
+            mesh=text_config.mesh,
+            partition_manager=text_config.partition_manager,
+            kvdtype=dtype,
+            num_hidden_layers=num_hidden_layers,
+            num_kv_heads=num_kv_heads,
+            max_model_length=max_length,
+            head_dim=head_dim,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+        )
+
     def init_operations_cache(
         self,
         batch_size: int,
@@ -765,6 +824,7 @@ class EasyGenerationMixin:
         - GatedDeltaRule operations -> RecurrentCacheView
         - KDA operations -> KDACacheView
         - RaggedPageAttention operations -> RaggedPagesCacheView
+        - UnifiedAttention operations -> UnifiedAttentionCacheView
         - Lightning attention operations -> LightningCacheView
 
         Args:
@@ -795,6 +855,7 @@ class EasyGenerationMixin:
             RaggedPagesCacheView,
             RecurrentCacheView,
             TransformerCacheView,
+            UnifiedAttentionCacheView,
         )
 
         text_config = self.config.get_text_config()
@@ -806,12 +867,22 @@ class EasyGenerationMixin:
             if isinstance(dtype, str):
                 dtype = getattr(jnp, dtype, jnp.bfloat16)
 
-        # Check if any layer needs RaggedPagesCacheView and create shared config
+        # Check if any layer needs paged caches and create shared configs.
         shared_ragged_config = None
+        shared_unified_config = None
         needs_ragged = any(view_class is RaggedPagesCacheView for view_class in cache_view_mapping.values())
+        needs_unified = any(view_class is UnifiedAttentionCacheView for view_class in cache_view_mapping.values())
 
         if needs_ragged:
             shared_ragged_config = self.create_ragged_page_cache_config(
+                max_length=max_length,
+                page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                dtype=dtype,
+            )
+
+        if needs_unified:
+            shared_unified_config = self.create_unified_attention_cache_config(
                 max_length=max_length,
                 page_size=page_size,
                 hbm_utilization=hbm_utilization,
@@ -888,6 +959,14 @@ class EasyGenerationMixin:
                 elif view_class is RaggedPagesCacheView:
                     view = view_class.init(
                         config=shared_ragged_config,
+                        layer_index=idx,
+                        mesh=text_config.mesh,
+                        partition_manager=text_config.partition_manager,
+                        quantizer=quantizer,
+                    )
+                elif view_class is UnifiedAttentionCacheView:
+                    view = view_class.init(
+                        config=shared_unified_config,
                         layer_index=idx,
                         mesh=text_config.mesh,
                         partition_manager=text_config.partition_manager,
@@ -2299,7 +2378,8 @@ class EasyGenerationMixin:
     def esurge_graphdef(self):
         """Returns a graph definition compatible with eSurge inference engine.
 
-        eSurge requires models to use ragged page attention mechanisms (v2 or v3).
+        eSurge requires models to use paged attention mechanisms compatible with its
+        continuous-batching KV cache (ragged v2/v3 or unified attention).
         If the current model uses a different attention mechanism, this property
         creates a new graph definition with ragged_page_attention_v3.
 
@@ -2315,7 +2395,11 @@ class EasyGenerationMixin:
             >>> # Use gdef for creating eSurge-compatible model instances
         """
         gdef = self.graphdef
-        if self.config.attn_mechanism not in ["ragged_page_attention_v2", "ragged_page_attention_v3"]:
+        if self.config.attn_mechanism not in [
+            "ragged_page_attention_v2",
+            "ragged_page_attention_v3",
+            "unified_attention",
+        ]:
             gdef = self.new_graphdef(attn_mechanism="ragged_page_attention_v3", recursive_update=True)
         return gdef
 
@@ -2323,7 +2407,8 @@ class EasyGenerationMixin:
     def esurge_compatible_model(self):
         """Returns a model instance compatible with eSurge inference engine.
 
-        eSurge requires models to use ragged page attention mechanisms (v2 or v3).
+        eSurge requires models to use paged attention mechanisms compatible with its
+        continuous-batching KV cache (ragged v2/v3 or unified attention).
         If the current model uses a different attention mechanism, this property
         returns a new model instance with ragged_page_attention_v3 while preserving
         all parameters and state.
@@ -2342,7 +2427,11 @@ class EasyGenerationMixin:
             >>> # Now safe to use with eSurge inference
             >>> outputs = esurge_model.esurge_generate("Hello world")
         """
-        if self.config.attn_mechanism in ["ragged_page_attention_v2", "ragged_page_attention_v3"]:
+        if self.config.attn_mechanism in [
+            "ragged_page_attention_v2",
+            "ragged_page_attention_v3",
+            "unified_attention",
+        ]:
             return self
         compat_graphdef = self.new_graphdef(attn_mechanism="ragged_page_attention_v3")
         return self.merge_module(compat_graphdef, self.graphstate, self.graphother)

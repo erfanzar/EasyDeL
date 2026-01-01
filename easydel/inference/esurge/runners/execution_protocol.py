@@ -28,7 +28,12 @@ from typing import Protocol, runtime_checkable
 import jax
 import numpy as np
 
-from easydel.layers.caching import RaggedPagesCache, RaggedPagesCacheView
+from easydel.layers.caching import (
+    RaggedPagesCache,
+    RaggedPagesCacheConfig,
+    UnifiedAttentionCache,
+    UnifiedAttentionCacheConfig,
+)
 
 from .execution_types import BatchMetadata, ModelStepOutputs, StepFunctionInputs
 
@@ -48,12 +53,12 @@ class ExecutionManagerProtocol(Protocol):
 
     model: "EasyDeLBaseModule"
     mesh: tp.Any
-    kv_pages: RaggedPagesCache
+    kv_pages: RaggedPagesCache | UnifiedAttentionCache
     rng_key: jax.Array
     max_model_len: int
     max_num_reqs: int
     max_num_tokens: int
-    metadata: RaggedPagesCacheView
+    metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig
 
     def clear_cache(self) -> None: ...
 
@@ -72,7 +77,7 @@ class ExecutionManagerProtocol(Protocol):
         num_reqs_max_model_len: int,
         max_pages_per_req: int,
         max_num_reqs: int,
-        metadata: RaggedPagesCacheView,
+        metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig,
         num_reqs_paddings: list[int] | None = None,
     ) -> None: ...
 
