@@ -22,12 +22,10 @@ logger = get_logger("eSurgeLMEvalAdapter")
 
 try:
     from lm_eval.api.model import LM  # type:ignore
-except Exception as e:
+except Exception:
     LM = object
-    logger.warning(
-        f"consider installing lm_eval if you want to use `eSurgeLMEvalAdapter` (err : {e}).",
-        stacklevel=1,
-    )
+    err = "consider installing easydel[lm_eval] if you want to use `eSurgeLMEvalAdapter`."
+    logger.warning(err, stacklevel=1)
 
 
 class eSurgeLMEvalAdapter(LM):

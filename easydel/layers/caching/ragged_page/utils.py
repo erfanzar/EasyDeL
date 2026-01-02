@@ -214,7 +214,7 @@ def kv_cache_update(
     return pallas_kernel(*prefetch_scalars, new_kv_tokens, kv_cache_pages)[0]
 
 
-@ejit(static_argnames=["page_size"])
+@ejit(static_argnames=["page_size"], donate_argnames=["kv_cache_pages"])
 def kv_cache_update_jax(
     new_kv_tokens: Float[Array, "total_tokens num_kv_heads head_dim"],
     slice_indices: Int[Array, "3 num_slices"],
@@ -223,113 +223,54 @@ def kv_cache_update_jax(
     *,
     page_size: int = 32,
 ) -> Float[Array, "total_cache_positions num_kv_heads head_dim"]:
-    """Pure JAX implementation of paged KV cache update.
+    """Portable JAX implementation of paged KV-cache update.
 
-    Provides a portable fallback implementation using JAX operations
-    instead of hardware-specific kernels. While slower than the TPU
-    kernel version, this ensures compatibility across all backends.
+    The v2 slot-mapping format describes updates as *slices* (start positions +
+    lengths) to minimize metadata size. A naive loop/scan over slices becomes
+    a latency bottleneck on GPU due to sequential dependence.
 
-    The implementation uses dynamic slicing and scanning to update
-    cache pages functionally, maintaining JAX's immutability guarantees.
-
-    Algorithm:
-    1. Pad new tokens to page boundaries
-    2. For each slice in slice_indices:
-       - Extract slice from new tokens
-       - Create mask for partial updates
-       - Merge with existing cache content
-       - Update cache slice
-    3. Return updated cache
-
-    Args:
-        new_kv_tokens (jax.Array): New key/value tokens to insert.
-            Shape: [total_tokens, num_kv_heads, head_dim]
-        slice_indices (jax.Array): Update mapping information.
-            Shape: [3, num_slices] where each column contains:
-            - Row 0: Cache starting position
-            - Row 1: New tokens starting position
-            - Row 2: Number of tokens to copy
-        kv_cache_pages (jax.Array): Existing cache to update.
-            Shape: [total_pages * page_size, num_kv_heads, head_dim]
-        total_update_slices (jax.Array): Number of valid slices.
-            Shape: [1] - wrapped scalar for XLA
-        page_size (int): Tokens per cache page. Default: 32.
-            Must be static for JIT compilation.
-
-    Returns:
-        jax.Array: Updated cache with same shape as kv_cache_pages.
-
-    Note:
-        This implementation is automatically used on non-TPU backends
-        or when the TPU kernel is unavailable.
-
-    Example:
-        >>> # Fallback for CPU/GPU
-        >>> updated_cache = kv_cache_update_jax(
-        ...     new_kv_tokens=tokens,
-        ...     slice_indices=indices,
-        ...     kv_cache_pages=cache,
-        ...     total_update_slices=jnp.array([5]),
-        ...     page_size=32
-        ... )
+    This implementation vectorizes the slice representation into per-token
+    scatter indices and applies a single `.at[...].set(...)` update. For GPU
+    workloads this is typically much faster than a `lax.scan` of
+    `dynamic_update_slice`.
     """
-    num_valid_slices = total_update_slices[0]
-    padded_new_kv = jnp.pad(new_kv_tokens, [(0, page_size), (0, 0), (0, 0)], mode="constant")
+    # `total_update_slices` is typically shape (1,), but accept scalar too.
+    num_valid_slices = jnp.asarray(total_update_slices).reshape(-1)[0].astype(jnp.int32)
+    if kv_cache_pages.size == 0:
+        return kv_cache_pages
 
-    def update_single_slice(
-        cache: Float[Array, "total_cache_positions num_kv_heads head_dim"], slice_idx: int
-    ) -> Float[Array, "total_cache_positions num_kv_heads head_dim"]:
-        """Update cache with a single slice of new tokens.
+    num_slices = int(slice_indices.shape[1])
+    slice_ids = jnp.arange(num_slices, dtype=jnp.int32)
+    active_slices = slice_ids < num_valid_slices
 
-        Performs a masked update of a cache slice, handling partial
-        page updates correctly by preserving unmodified elements.
+    # Slice lengths, masked to 0 for inactive slices.
+    slice_lens = jnp.where(active_slices, slice_indices[2].astype(jnp.int32), 0)
 
-        Args:
-            cache: Current cache state.
-            slice_idx: Index of slice to process.
+    # Build a monotonic "slice ends" vector via cumsum so we can map each token
+    # to the slice it belongs to using `searchsorted`.
+    slice_ends = jnp.cumsum(slice_lens, dtype=jnp.int32)  # [num_slices]
+    total_tokens = slice_ends[-1]  # scalar int32
 
-        Returns:
-            Updated cache array.
-        """
-        cache_start_pos = slice_indices[0, slice_idx]
-        new_kv_start_pos = slice_indices[1, slice_idx]
-        actual_length = slice_indices[2, slice_idx]
-        new_slice = jax.lax.dynamic_slice(
-            padded_new_kv,
-            (new_kv_start_pos, 0, 0),
-            (page_size, padded_new_kv.shape[1], padded_new_kv.shape[2]),
-        )
-        current_cache_slice = jax.lax.dynamic_slice(
-            cache,
-            (cache_start_pos, 0, 0),
-            (page_size, cache.shape[1], cache.shape[2]),
-        )
-        mask = jnp.arange(page_size)[:, None, None] < actual_length
-        updated_slice = jnp.where(mask, new_slice, current_cache_slice)
-        updated_cache = jax.lax.dynamic_update_slice(cache, updated_slice, (cache_start_pos, 0, 0))
+    # Make searchsorted safe even when `total_tokens == 0` by ensuring the last
+    # element is >= the maximum token index.
+    slice_ends_safe = slice_ends.at[-1].set(jnp.int32(new_kv_tokens.shape[0]))
 
-        return updated_cache
+    token_ids = jnp.arange(new_kv_tokens.shape[0], dtype=jnp.int32)  # [num_tokens_bucket]
+    slice_for_token = jnp.searchsorted(slice_ends_safe, token_ids, side="right").astype(jnp.int32)
 
-    def scan_fn(
-        cache: Float[Array, "total_cache_positions num_kv_heads head_dim"], slice_idx: Int[Array, ""]
-    ) -> tuple[Float[Array, "total_cache_positions num_kv_heads head_dim"], None]:
-        """Scan function for iterating over cache slices.
+    # Token offsets within their slice: offset = token_id - slice_start.
+    token_slice_len = slice_lens[slice_for_token]
+    token_slice_end = slice_ends[slice_for_token]
+    token_slice_start = token_slice_end - token_slice_len
+    token_offset = token_ids - token_slice_start
 
-        Conditionally updates cache based on slice validity.
+    # Destination indices in the flattened KV pages buffer.
+    dst_start = slice_indices[0].astype(jnp.int32)[slice_for_token]
+    dst = dst_start + token_offset
 
-        Args:
-            cache: Current cache state.
-            slice_idx: Current slice index.
+    # Drop tokens beyond the valid packed prefix (padding in the token bucket).
+    token_mask = token_ids < total_tokens
+    dst_oob = jnp.asarray(kv_cache_pages.shape[0], dtype=jnp.int32)
+    dst = jnp.where(token_mask, dst, dst_oob)
 
-        Returns:
-            tuple: (updated_cache, None)
-        """
-        updated_cache = jax.lax.cond(
-            slice_idx < num_valid_slices,
-            lambda c: update_single_slice(c, slice_idx),
-            lambda c: c,
-            cache,
-        )
-        return updated_cache, None
-
-    return jax.lax.scan(scan_fn, kv_cache_pages, jnp.arange(slice_indices.shape[1]))[0]
+    return kv_cache_pages.at[dst].set(new_kv_tokens, mode="drop")
