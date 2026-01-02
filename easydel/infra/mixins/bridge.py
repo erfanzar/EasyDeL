@@ -559,7 +559,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 step_policies=[],
             ).load_pytree(
                 mesh=mesh,
-                dtype=param_dtype,
+                dtype=param_dtype,  # legacy
                 partition_rules=model.config.get_partition_rules(),
                 prefix="model",
                 discover_latest=True,
@@ -582,7 +582,26 @@ class EasyBridgeMixin(PushToHubMixin):
             for unexpected_key in unexpected_keys:
                 del state[unexpected_key]
 
-            state = jax.tree_util.tree_map(lambda x: x.astype(param_dtype) if hasattr(x, "astype") else x, state)
+            def _convert(x):
+                if hasattr(x, "astype") and getattr(x, "dtype", None) != param_dtype:
+                    return x.astype(param_dtype)
+                return x
+
+            # Convert in-place to avoid holding both the original and converted
+            # parameter trees in memory at the same time (important for large
+            # dtype downcasts like bf16 -> fp8).
+            if isinstance(state, dict):
+                for k in list(state.keys()):
+                    v = state[k]
+                    new_v = _convert(v)
+                    state[k] = new_v
+                    # JAX is async; force completion so the old buffer can be freed
+                    # before converting the next leaf to reduce peak memory.
+                    if new_v is not v and hasattr(new_v, "block_until_ready"):
+                        new_v.block_until_ready()
+                    del v
+            else:
+                state = jax.tree_util.tree_map(_convert, state)
 
             return merge_model_and_tree(model=model, tree=unflatten_dict(state))
 
