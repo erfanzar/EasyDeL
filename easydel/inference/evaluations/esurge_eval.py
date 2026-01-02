@@ -12,7 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+import uuid
+from collections.abc import Iterable
+from typing import Any
+
+import jax.numpy as jnp
 from eformer.loggings import get_logger
+from jax.scipy.special import logsumexp
 
 from easydel.infra.utils import ProcessingClassType
 
@@ -26,6 +34,68 @@ except Exception:
     LM = object
     err = "consider installing easydel[lm_eval] if you want to use `eSurgeLMEvalAdapter`."
     logger.warning(err, stacklevel=1)
+
+_DEFAULT_REQUEST_ID_PREFIX = "lm_eval"
+
+
+def _chunked(seq: list[Any], size: int) -> Iterable[list[Any]]:
+    if size <= 0:
+        raise ValueError("chunk size must be > 0")
+    for start in range(0, len(seq), size):
+        yield seq[start : start + size]
+
+
+def _trim_stop_sequences(text: str, stop: list[str]) -> str:
+    if not stop:
+        return text
+    earliest = None
+    for s in stop:
+        if not s:
+            continue
+        idx = text.find(s)
+        if idx == -1:
+            continue
+        if earliest is None or idx < earliest:
+            earliest = idx
+    return text if earliest is None else text[:earliest]
+
+
+def _get_rolling_token_windows(
+    token_list: list[int],
+    *,
+    prefix_token: int,
+    max_seq_len: int,
+    context_len: int,
+) -> Iterable[tuple[list[int], list[int]]]:
+    """Port of `lm_eval.utils.get_rolling_token_windows` (v0.4.9.1)."""
+    if not token_list:
+        return
+    if not (1 <= context_len <= max_seq_len):
+        raise ValueError(f"context_len must be in [1, {max_seq_len}], got {context_len}")
+
+    pred_len = max_seq_len - context_len + 1
+    predicted = 0
+
+    # Special handling for first window: predict all tokens.
+    first_seq_len = min(max_seq_len, len(token_list))
+    yield [prefix_token, *token_list[: first_seq_len - 1]], token_list[:first_seq_len]
+    predicted += first_seq_len
+
+    while predicted < len(token_list):
+        window_pred_len = min(len(token_list) - predicted, pred_len)
+        window_end = predicted + window_pred_len
+        yield (
+            token_list[window_end - max_seq_len - 1 : window_end - 1],
+            token_list[window_end - window_pred_len : window_end],
+        )
+        predicted += window_pred_len
+
+
+def _make_disjoint_window(context: list[int], continuation: list[int]) -> tuple[list[int], list[int]]:
+    """Port of `lm_eval.utils.make_disjoint_window` (v0.4.9.1)."""
+    if not continuation:
+        return context, continuation
+    return context[: len(context) - (len(continuation) - 1)], continuation
 
 
 class eSurgeLMEvalAdapter(LM):
@@ -72,7 +142,7 @@ class eSurgeLMEvalAdapter(LM):
 
         self.surge = surge
         self._batch_size = batch_size or surge.max_num_seqs
-        self.model = None
+        self.model = getattr(getattr(surge, "runner", None), "model", None)
         self.setup_complete = False
         self._setup()
 
@@ -124,7 +194,7 @@ class eSurgeLMEvalAdapter(LM):
         if not self.setup_complete:
             self._setup()
 
-        import easydel as ed
+        from easydel.inference.sampling_params import SamplingParams
 
         if max_tokens is None:
             max_tokens = self.max_gen_toks
@@ -135,48 +205,52 @@ class eSurgeLMEvalAdapter(LM):
         if temperature is None:
             temperature = self.temperature
 
-        # Create sampling params for each prompt
-        sampling_params_list = []
-        for i, _ in enumerate(prompts):
-            current_stop_seq = None
-            if stop_sequences and i < len(stop_sequences):
-                current_stop_seq = stop_sequences[i]
+        if not prompts:
+            return []
 
-            sampling_params_list.append(
-                ed.SamplingParams(
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=current_stop_seq if current_stop_seq else [],
-                    n=1,
-                )
+        normalized_stops: list[list[str]] = []
+        if stop_sequences is None:
+            normalized_stops = [[] for _ in prompts]
+        else:
+            for i in range(len(prompts)):
+                stops = stop_sequences[i] if i < len(stop_sequences) else []
+                normalized_stops.append([str(s) for s in (stops or [])])
+
+        # eSurge doesn't accept per-prompt SamplingParams; group by stop sequences.
+        groups: dict[tuple[int, float, float, tuple[str, ...]], list[int]] = {}
+        for i, stops in enumerate(normalized_stops):
+            key = (int(max_tokens), float(temperature), float(top_p), tuple(stops))
+            groups.setdefault(key, []).append(i)
+
+        outputs: list[str] = [""] * len(prompts)
+        for (mt, temp, tp, stops_tuple), indices in groups.items():
+            group_prompts = [prompts[i] for i in indices]
+            request_ids = [f"{_DEFAULT_REQUEST_ID_PREFIX}-{uuid.uuid4().hex}" for _ in group_prompts]
+            sampling_params = SamplingParams(
+                max_tokens=mt,
+                temperature=temp,
+                top_p=tp,
+                stop=list(stops_tuple),
+                n=1,
             )
 
-        # Use eSurge's generate method
-        results = self.surge.generate(
-            prompts=prompts,
-            sampling_params=sampling_params_list[0]
-            if len(set(str(sp) for sp in sampling_params_list)) == 1
-            else sampling_params_list,
-            use_tqdm=True,
-        )
+            # eSurge.generate may return outputs in completion order; re-map via request_id.
+            results = self.surge.generate(
+                prompts=group_prompts,
+                sampling_params=sampling_params,
+                request_id=request_ids,
+                use_tqdm=False,
+            )
+            by_id = {r.request_id: r for r in results}
+            for prompt_index, request_id in zip(indices, request_ids, strict=False):
+                if request_id not in by_id:
+                    raise RuntimeError(
+                        f"eSurge.generate returned {len(results)}/{len(request_ids)} outputs; missing {request_id!r}."
+                    )
+                text = by_id[request_id].get_text()
+                outputs[prompt_index] = _trim_stop_sequences(text, list(stops_tuple))
 
-        generated_texts = []
-        for i, result in enumerate(results):
-            text = result.get_text()
-            # Apply stop sequences if present
-            if stop_sequences and i < len(stop_sequences):
-                for stop in stop_sequences[i]:
-                    if stop in text:
-                        text = text[: text.find(stop)]
-            generated_texts.append(text)
-
-        assert len(generated_texts) == len(prompts), (
-            f"Mismatch between prompts sent ({len(prompts)}) and results received "
-            f"({len(generated_texts)}) from surge.generate!."
-        )
-
-        return generated_texts
+        return outputs
 
     def _extract_choice_from_generation(self, generation: str) -> str:
         """Extract a multiple-choice answer (A, B, C, D) from generated text.
@@ -224,26 +298,32 @@ class eSurgeLMEvalAdapter(LM):
         Returns:
             List of generated strings, one for each instance.
         """
+        prompts: list[str] = []
+        stop_sequences: list[list[str]] = []
 
-        requests = []
         for instance in instances:
-            prompt = instance.arguments[0]
-
-            if len(instance.arguments) > 1 and isinstance(instance.arguments[1], dict):
-                config = instance.arguments[1]
-                stop_sequences = config.get("until", [])
+            if hasattr(instance, "arguments"):
+                arguments = instance.arguments
             else:
-                stop_sequences = []
+                arguments = instance
 
-            requests.append((prompt, stop_sequences))
+            prompt = str(arguments[0]) if arguments else ""
+            config = arguments[1] if len(arguments) > 1 else None
+            if isinstance(config, dict):
+                until = config.get("until", []) or []
+            elif isinstance(config, list):
+                until = config
+            else:
+                until = []
 
-        generations = self._generate(
-            [req[0] for req in requests],
+            prompts.append(prompt)
+            stop_sequences.append([str(s) for s in until])
+
+        return self._generate(
+            prompts,
             max_tokens=self.max_gen_toks,
-            stop_sequences=[req[1] for req in requests],
+            stop_sequences=stop_sequences,
         )
-
-        return generations
 
     @property
     def eot_token_id(self):
@@ -304,7 +384,15 @@ class eSurgeLMEvalAdapter(LM):
         Returns:
             String with the formatted chat template applied
         """
-        return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            return self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=add_generation_prompt
+            )
+
+        lines = [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in (messages or [])]
+        if add_generation_prompt:
+            lines.append("assistant:")
+        return "\n".join(lines)
 
     def tok_encode(self, string: str):
         """Encode a string into token IDs.
@@ -315,7 +403,10 @@ class eSurgeLMEvalAdapter(LM):
         Returns:
             A list of token IDs.
         """
-        return self.tokenizer.encode(string)
+        try:
+            return self.tokenizer.encode(string, add_special_tokens=False)
+        except TypeError:
+            return self.tokenizer.encode(string)
 
     def tok_decode(self, tokens):
         """Decode token IDs into a string.
@@ -327,6 +418,151 @@ class eSurgeLMEvalAdapter(LM):
             The decoded string.
         """
         return self.tokenizer.decode(tokens)
+
+    def _encode_text(self, text: str) -> list[int]:
+        try:
+            encoded = self.tokenizer(
+                text,
+                add_special_tokens=False,
+                return_attention_mask=False,
+            )
+            ids = encoded.get("input_ids", [])
+            if ids and isinstance(ids[0], list):
+                ids = ids[0]
+            return [int(t) for t in ids]
+        except Exception:
+            return [int(t) for t in self.tok_encode(text)]
+
+    def _loglikelihood_token_ids(
+        self,
+        context_token_ids: list[list[int]],
+        continuation_token_ids: list[list[int]],
+    ) -> list[tuple[float, bool]]:
+        if self.model is None:
+            raise RuntimeError("Scoring model is not available on the eSurge engine (missing `surge.runner.model`).")
+
+        if len(context_token_ids) != len(continuation_token_ids):
+            raise ValueError("context_token_ids and continuation_token_ids must have the same length")
+
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(self.tokenizer, "eos_token_id", None)
+        if isinstance(pad_id, list):
+            pad_id = pad_id[0] if pad_id else 0
+        if pad_id is None:
+            pad_id = 0
+        pad_id = int(pad_id)
+
+        bos_id = getattr(self.tokenizer, "bos_token_id", None)
+        if isinstance(bos_id, list):
+            bos_id = bos_id[0] if bos_id else None
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        if isinstance(eos_id, list):
+            eos_id = eos_id[0] if eos_id else None
+
+        # Prepare (possibly truncated) token sequences (mirror lm-eval's causal logic).
+        # For causal scoring, we keep the full continuation (<= max_length) and truncate the context from the left so
+        # that `len(context)+len(continuation) <= max_length+1`. The model is run on `tokens[:-1]` (<= max_length).
+        inputs: list[list[int]] = []
+        targets: list[list[int]] = []
+        context_lens: list[int] = []
+        cont_lens: list[int] = []
+
+        for ctx, cont in zip(context_token_ids, continuation_token_ids, strict=False):
+            ctx_ids = [int(t) for t in (ctx or [])]
+            cont_ids = [int(t) for t in (cont or [])]
+
+            if not ctx_ids:
+                if bos_id is not None:
+                    ctx_ids = [int(bos_id)]
+                elif eos_id is not None:
+                    ctx_ids = [int(eos_id)]
+                else:
+                    ctx_ids = [pad_id]
+
+            if len(cont_ids) > self.max_length:
+                raise ValueError(
+                    f"Continuation is too long for scoring (len={len(cont_ids)}) with max_length={self.max_length}."
+                )
+
+            total_len = len(ctx_ids) + len(cont_ids)
+            if total_len > self.max_length + 1:
+                # Keep the full continuation and truncate context from the left.
+                drop = total_len - (self.max_length + 1)
+                if drop >= len(ctx_ids):
+                    raise ValueError(
+                        "Context truncation would drop the entire context; "
+                        f"got ctx={len(ctx_ids)}, cont={len(cont_ids)}, max_length={self.max_length}."
+                    )
+                ctx_ids = ctx_ids[drop:]
+
+            full = ctx_ids + cont_ids
+            if len(full) < 2:
+                # No next-token targets; score is trivially 0.
+                inputs.append([])
+                targets.append([])
+                context_lens.append(len(ctx_ids))
+                cont_lens.append(len(cont_ids))
+                continue
+
+            context_lens.append(len(ctx_ids))
+            cont_lens.append(len(cont_ids))
+
+            # Shift for next-token prediction.
+            inputs.append(full[:-1])
+            targets.append(full[1:])
+
+        results: list[tuple[float, bool]] = [(0.0, True) for _ in inputs]
+        scored_indices = [i for i, n in enumerate(cont_lens) if n > 0]
+        if not scored_indices:
+            return results
+
+        inputs_scored = [inputs[i] for i in scored_indices]
+        targets_scored = [targets[i] for i in scored_indices]
+        context_lens_scored = [context_lens[i] for i in scored_indices]
+        cont_lens_scored = [cont_lens[i] for i in scored_indices]
+
+        max_len = max((len(x) for x in inputs_scored), default=0)
+        if max_len < 1:
+            return results
+
+        import numpy as np
+
+        input_ids = np.full((len(inputs_scored), max_len), pad_id, dtype=np.int32)
+        target_ids = np.full((len(inputs_scored), max_len), pad_id, dtype=np.int32)
+        attention_mask = np.zeros((len(inputs_scored), max_len), dtype=bool)
+
+        for i, ids in enumerate(inputs_scored):
+            input_ids[i, : len(ids)] = np.asarray(ids, dtype=np.int32)
+            target_ids[i, : len(ids)] = np.asarray(targets_scored[i], dtype=np.int32)
+            attention_mask[i, : len(ids)] = True
+
+        input_ids_jax = jnp.asarray(input_ids)
+        target_ids_jax = jnp.asarray(target_ids)
+        attention_mask_jax = jnp.asarray(attention_mask)
+
+        outputs = self.model(input_ids=input_ids_jax, attention_mask=attention_mask_jax)
+        logits = getattr(outputs, "logits", None)
+        if logits is None:
+            raise RuntimeError("Model forward did not return logits; cannot compute loglikelihood.")
+
+        log_denom = logsumexp(logits, axis=-1)
+        selected = jnp.take_along_axis(logits, target_ids_jax[..., None], axis=-1).squeeze(-1)
+        token_logprobs = selected - log_denom
+
+        greedy_ids = jnp.argmax(logits, axis=-1)
+
+        positions = jnp.arange(max_len)[None, :]
+        start = (jnp.asarray(context_lens_scored) - 1)[:, None]
+        end = (jnp.asarray(context_lens_scored) - 1 + jnp.asarray(cont_lens_scored))[:, None]
+        score_mask = (positions >= start) & (positions < end) & attention_mask_jax
+
+        seq_loglikelihood = jnp.sum(jnp.where(score_mask, token_logprobs, 0.0), axis=-1)
+        seq_is_greedy = jnp.all(jnp.where(score_mask, greedy_ids == target_ids_jax, True), axis=-1)
+
+        for out_i, (ll, is_g) in enumerate(zip(seq_loglikelihood, seq_is_greedy, strict=False)):
+            results[scored_indices[out_i]] = (float(ll), bool(is_g))
+        return results
 
     def _model_call(self, inps):
         """
@@ -361,7 +597,7 @@ class eSurgeLMEvalAdapter(LM):
         Compute log-likelihood of completions given contexts.
 
         This method is part of the lm-evaluation-harness LM interface.
-        It currently provides a placeholder implementation, especially for non-multiple-choice tasks.
+        It computes the exact teacher-forced log-likelihood of the continuation tokens.
 
         Args:
             instances: List of Instance objects from lm-evaluation-harness.
@@ -369,50 +605,26 @@ class eSurgeLMEvalAdapter(LM):
 
         Returns:
             List of (log_likelihood, is_greedy) tuples.
-                For multiple-choice tasks, log-likelihood is high if the extracted choice matches the continuation,
-                low otherwise. For other tasks, a placeholder value is returned.
         """
-        requests = []
+        requests: list[tuple[str, str]] = []
+
         for instance in instances:
-            if len(instance.arguments) >= 2:
-                context = instance.arguments[0]
-                continuation = instance.arguments[1]
-                requests.append((context, continuation))
+            if hasattr(instance, "arguments"):
+                arguments = instance.arguments
             else:
-                print(f"Warning: Invalid instance format: {instance}")
+                arguments = instance
+
+            if len(arguments) >= 2:
+                requests.append((str(arguments[0]), str(arguments[1])))
+            else:
+                logger.warning("Invalid loglikelihood instance format: %s", instance)
                 requests.append(("", ""))
-        contexts = [req[0] for req in requests]
-        continuations = [req[1] for req in requests]
 
-        is_mc_task = False
-        if contexts and len(contexts) > 0:
-            mc_pattern = r"[A-D]\.\s"
-            import re
-
-            if any(re.search(mc_pattern, ctx) for ctx in contexts):
-                is_mc_task = True
-
-        results = []
-
-        if is_mc_task:
-            choices = "ABCD"
-            max_tokens = 5
-            generations = self._generate(contexts, max_tokens=max_tokens)
-
-            for _i, (_, continuation, generation) in enumerate(zip(contexts, continuations, generations, strict=False)):
-                predicted_choice = self._extract_choice_from_generation(generation)
-
-                expected_choice = continuation.strip().upper()
-                if expected_choice and expected_choice[0] in choices:
-                    expected_choice = expected_choice[0]
-
-                log_likelihood = 0.0 if predicted_choice == expected_choice else -100.0
-                is_greedy = predicted_choice == expected_choice
-
-                results.append((log_likelihood, is_greedy))
-        else:
-            for _ in zip(contexts, continuations, strict=False):
-                results.append((-1.0, True))
+        results: list[tuple[float, bool]] = []
+        for chunk in _chunked(requests, self._batch_size):
+            ctx_ids = [self._encode_text(ctx) for ctx, _ in chunk]
+            cont_ids = [self._encode_text(cont) for _, cont in chunk]
+            results.extend(self._loglikelihood_token_ids(ctx_ids, cont_ids))
 
         return results
 
@@ -421,40 +633,63 @@ class eSurgeLMEvalAdapter(LM):
         Calculate log-likelihood of token sequences in a rolling fashion.
 
         This method is part of the lm-evaluation-harness LM interface.
-        It currently provides a placeholder implementation as actual rolling log-likelihood
-        calculation might not be directly supported by the current `eSurge` setup.
 
         Args:
             instances: List of Instance objects from lm-evaluation-harness.
-                       Instances are expected to contain the token sequence as the first argument.
+                       Instances contain either the raw string or a pre-tokenized sequence.
 
         Returns:
-            List of lists of (loglikelihood, is_greedy) pairs, one inner list per instance.
-            Each inner list contains pairs for each token in the sequence (except the first).
-            Currently returns placeholder values.
+            List of rolling log-likelihoods, one per instance.
         """
+        per_request_windows: list[tuple[int, list[int], list[int]]] = []
 
-        token_lists = []
-        for instance in instances:
-            if len(instance.arguments) >= 1 and isinstance(instance.arguments[0], list):
-                tokens = instance.arguments[0]
-                token_lists.append(tokens)
+        prefix = self.eot_token_id
+        max_seq_len = int(self.max_length)
+        context_len = 1  # matches lm-eval default for rolling perplexity
+
+        for req_idx, instance in enumerate(instances):
+            if hasattr(instance, "arguments"):
+                arguments = instance.arguments
             else:
-                print(f"Warning: Invalid instance format for rolling loglikelihood: {instance}")
-                token_lists.append([])
+                arguments = instance
 
-        results = []
+            if not arguments:
+                continue
 
-        for tokens in token_lists:
-            token_results = []
-            for _i in range(1, len(tokens)):
-                log_likelihood = -2.0
-                is_greedy = True
-                token_results.append((log_likelihood, is_greedy))
+            seq = arguments[0]
+            token_ids = [int(t) for t in seq] if isinstance(seq, list) else self.tok_encode(str(seq))
+            for ctx, cont in _get_rolling_token_windows(
+                token_ids,
+                prefix_token=int(prefix),
+                max_seq_len=max_seq_len,
+                context_len=context_len,
+            ):
+                ctx_disjoint, cont_disjoint = _make_disjoint_window(ctx, cont)
+                per_request_windows.append((req_idx, ctx_disjoint, cont_disjoint))
 
-            results.append(token_results)
+        if not instances:
+            return []
 
-        return results
+        totals = [0.0 for _ in range(len(instances))]
+        if not per_request_windows:
+            return totals
+
+        window_ctx = [w[1] for w in per_request_windows]
+        window_cont = [w[2] for w in per_request_windows]
+
+        for start in range(0, len(per_request_windows), self._batch_size):
+            batch_ctx = window_ctx[start : start + self._batch_size]
+            batch_cont = window_cont[start : start + self._batch_size]
+            batch_scores = self._loglikelihood_token_ids(batch_ctx, batch_cont)
+
+            for (req_idx, _ctx, _cont), (ll, _is_greedy) in zip(
+                per_request_windows[start : start + self._batch_size],
+                batch_scores,
+                strict=False,
+            ):
+                totals[req_idx] += float(ll)
+
+        return totals
 
     def greedy_until(self, requests):
         """
@@ -469,7 +704,34 @@ class eSurgeLMEvalAdapter(LM):
         Returns:
             List of generated completions.
 
-        Raises:
-            NotImplementedError: This method is not implemented as `generate_until` provides similar functionality.
         """
-        raise NotImplementedError("eSurgeLMEvalAdapter doesn't use greedy_until directly, use generate_until")
+        # Support both legacy (context, until) tuples and modern Instance objects.
+        if requests and not hasattr(requests[0], "arguments") and isinstance(requests[0], tuple):
+            prompts = [str(r[0]) for r in requests]
+            stop_sequences = [[str(s) for s in (r[1] or [])] for r in requests]
+        else:
+            prompts = []
+            stop_sequences = []
+            for instance in requests:
+                if hasattr(instance, "arguments"):
+                    arguments = instance.arguments
+                else:
+                    arguments = instance
+                prompt = str(arguments[0]) if arguments else ""
+                config = arguments[1] if len(arguments) > 1 else None
+                if isinstance(config, dict):
+                    until = config.get("until", []) or []
+                elif isinstance(config, list):
+                    until = config
+                else:
+                    until = []
+                prompts.append(prompt)
+                stop_sequences.append([str(s) for s in until])
+
+        return self._generate(
+            prompts,
+            max_tokens=self.max_gen_toks,
+            temperature=0.0,
+            top_p=1.0,
+            stop_sequences=stop_sequences,
+        )
