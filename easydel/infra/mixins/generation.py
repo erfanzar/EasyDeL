@@ -2550,7 +2550,12 @@ class EasyGenerationMixin:
             "unified_attention",
         ]:
             return self
-        compat_graphdef = self.new_graphdef(attn_mechanism="ragged_page_attention_v3")
+
+        if jax.default_backend() == "tpu":
+            compat_graphdef = self.new_graphdef(attn_mechanism="ragged_page_attention_v3")
+        else:
+            compat_graphdef = self.new_graphdef(attn_mechanism="unified_attention")
+
         return self.merge_module(compat_graphdef, self.graphstate, self.graphother)
 
     def pause_esurge(self, engine_id: str | None = None) -> None:

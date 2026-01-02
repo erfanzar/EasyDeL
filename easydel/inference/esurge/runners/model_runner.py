@@ -192,6 +192,25 @@ class eSurgeRunner:
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
         logger.debug(f"Configuration: {hbm_utilization=}, {page_size=}")
         self.model = model.esurge_compatible_model
+
+        backend = jax.default_backend()
+        attn_mechanism = getattr(self.model.config.get_text_config(), "attn_mechanism", None)
+        if backend == "gpu" and attn_mechanism in ("ragged_page_attention_v2", "ragged_page_attention_v3"):
+            logger.warning(
+                "GPU backend detected: `unified_attention` is preferred for eSurge inference; "
+                f"got attn_mechanism={attn_mechanism!r}."
+            )
+        elif backend == "tpu" and attn_mechanism == "unified_attention":
+            logger.warning(
+                "TPU backend detected: `ragged_page_attention_v3` is preferred for eSurge inference; "
+                f"got attn_mechanism={attn_mechanism!r}."
+            )
+        elif backend == "tpu" and attn_mechanism == "ragged_page_attention_v2":
+            logger.warning(
+                "TPU backend detected: `ragged_page_attention_v3` is preferred for eSurge inference; "
+                f"got attn_mechanism={attn_mechanism!r}."
+            )
+
         if getattr(self.model.config.get_text_config(), "attn_mechanism", None) == "unified_attention":
             self.metadata = self.model.create_unified_attention_cache_config(
                 hbm_utilization=hbm_utilization,

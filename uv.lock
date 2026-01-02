@@ -622,7 +622,7 @@ dependencies = [
     { name = "datasets" },
     { name = "eformer" },
     { name = "einops" },
-    { name = "ejkernel", extra = ["triton"] },
+    { name = "ejkernel" },
     { name = "fastapi" },
     { name = "flax" },
     { name = "gcsfs" },
@@ -647,7 +647,7 @@ dependencies = [
 
 [package.optional-dependencies]
 gpu = [
-    { name = "ejkernel", extra = ["gpu"], marker = "extra == 'extra-7-easydel-gpu'" },
+    { name = "ejkernel", extra = ["gpu", "triton"], marker = "extra == 'extra-7-easydel-gpu'" },
     { name = "jax", extra = ["cuda12"], marker = "extra == 'extra-7-easydel-gpu'" },
     { name = "tensorboard" },
 ]
@@ -680,9 +680,9 @@ requires-dist = [
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "eformer", specifier = "==0.0.85" },
     { name = "einops", specifier = "~=0.8.0" },
-    { name = "ejkernel", extras = ["gpu"], marker = "extra == 'gpu'", specifier = "==0.0.47" },
-    { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.47" },
-    { name = "ejkernel", extras = ["triton"], specifier = "==0.0.47" },
+    { name = "ejkernel", specifier = "==0.0.50" },
+    { name = "ejkernel", extras = ["gpu", "triton"], marker = "extra == 'gpu'", specifier = "==0.0.50" },
+    { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.50" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "flax", specifier = "==0.11.2" },
     { name = "gcsfs", specifier = ">=2024.2,<2026" },
@@ -760,7 +760,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.47"
+version = "0.0.50"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beartype" },
@@ -771,9 +771,9 @@ dependencies = [
     { name = "jaxtyping" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/11/f0/707167f0ec5e4999900c4e3ca32acacc7a7c6941793d9b6a096f33e136fd/ejkernel-0.0.47.tar.gz", hash = "sha256:fdc0b34e5a34053d231ea7fa31a70fa4f0ba53aab952ee39044520eb60fda173", size = 494010, upload-time = "2025-12-31T13:03:36.02Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/00/bf/351071d5832fecffc9cc85dc8786d187db266be9d61c9278d9429cd1b330/ejkernel-0.0.50.tar.gz", hash = "sha256:4031eac549c4a105520215edb9bb682956a0181ea24fd38b28e0bae726678cf1", size = 511598, upload-time = "2026-01-01T16:37:12.825Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/91/fb/b1bc8efac62744b885b69db3b82729623a218f756283e8ea14fb0a930dc7/ejkernel-0.0.47-py3-none-any.whl", hash = "sha256:fa3be460bfa89042612959dc1b47bf412f1a1228f6c6427b76453fd507085eb5", size = 750597, upload-time = "2025-12-31T13:03:34.47Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/5d/7fa4d1453e42ef697320eabfa2b0a8137c2fa001213574f97024fd3dbc61/ejkernel-0.0.50-py3-none-any.whl", hash = "sha256:da42803350004159497280a0aa9f214607c430ee21e5b4e165d56abd91d06268", size = 785575, upload-time = "2026-01-01T16:35:40.531Z" },
 ]
 
 [package.optional-dependencies]

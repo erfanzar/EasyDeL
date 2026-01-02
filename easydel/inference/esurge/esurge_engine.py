@@ -474,6 +474,44 @@ class eSurge:
         self._detokenizer_endpoint = self._worker_manager.detokenizer_endpoint
 
         if isinstance(model, str):
+            backend = jax.default_backend()
+            preferred_attn_mechanism = (
+                AttentionMechanisms.UNIFIED_ATTENTION
+                if backend == "gpu"
+                else AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3
+            )
+            user_provided_attn = "attn_mechanism" in kwargs
+            requested_attn = kwargs.get("attn_mechanism") if user_provided_attn else None
+            if requested_attn is None:
+                user_provided_attn = False
+
+            if user_provided_attn:
+                attn_value = (
+                    requested_attn.value
+                    if isinstance(requested_attn, AttentionMechanisms)
+                    else str(requested_attn)
+                    if requested_attn is not None
+                    else None
+                )
+                if backend == "gpu" and attn_value in (
+                    AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2.value,
+                    AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3.value,
+                ):
+                    logger.warning(
+                        "GPU backend detected: `unified_attention` is preferred for eSurge inference; "
+                        f"got attn_mechanism={attn_value!r}."
+                    )
+                elif backend == "tpu" and attn_value == AttentionMechanisms.UNIFIED_ATTENTION.value:
+                    logger.warning(
+                        "TPU backend detected: `ragged_page_attention_v3` is preferred for eSurge inference; "
+                        f"got attn_mechanism={attn_value!r}."
+                    )
+                elif backend == "tpu" and attn_value == AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2.value:
+                    logger.warning(
+                        "TPU backend detected: `ragged_page_attention_v3` is preferred for eSurge inference; "
+                        f"got attn_mechanism={attn_value!r}."
+                    )
+
             model = AutoEasyDeLModelForCausalLM.from_pretrained(
                 model,
                 dtype=dtype,
@@ -482,7 +520,7 @@ class eSurge:
                 auto_shard_model=auto_shard_model,
                 sharding_axis_dims=sharding_axis_dims,
                 config_kwargs=EasyDeLBaseConfigDict(
-                    attn_mechanism=kwargs.get("attn_mechanism", AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3),
+                    attn_mechanism=requested_attn if user_provided_attn else preferred_attn_mechanism,
                     attn_dtype=dtype,
                     kvdtype=dtype,
                     freq_max_position_embeddings=max_model_len,
