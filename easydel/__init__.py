@@ -48,10 +48,14 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _getlogger("jax._src.mesh_utils").setLevel(30)
     _getlogger("jax._src.distributed").setLevel(30)
     _getlogger("datasets").setLevel(30)
+
+    _getlogger("numexpr.utils").setLevel(30)
+    _getlogger("numexpr").setLevel(30)
+
     # these people talk too much
     _getlogger("eray-executor").setLevel(30)
     _getlogger("absl").setLevel(30)
-
+    _os.environ["NUMEXPR_NUM_THREADS"] = "8"
     _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     _os.environ["KMP_AFFINITY"] = "noverbose"
     _os.environ["GRPC_VERBOSITY"] = "3"
@@ -60,6 +64,9 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _os.environ["CACHE_TRITON_KERNELS"] = "1"
     _os.environ["TPU_MIN_LOG_LEVEL"] = "2"
     _os.environ["TPU_STDERR_LOG_LEVEL"] = "2"
+    _os.environ["JAX_ENABLE_PGLE"] = "true"
+    _os.environ["JAX_PGLE_PROFILING_RUNS"] = "3"
+    _os.environ["JAX_PGLE_AGGREGATION_PERCENTILE"] = "85"
     _os.environ["XLA_FLAGS"] = (
         _os.getenv("XLA_FLAGS", "") + " "
         "--xla_gpu_triton_gemm_any=true  "
@@ -81,7 +88,8 @@ if _check_bool_flag("EASYDEL_AUTO", True):
         "--xla_gpu_enable_shared_constants=true "
         "--xla_gpu_enable_triton_gemm=true "
         # "--xla_gpu_graph_level=3 " # deprecated in jax v0.7.2
-        "--xla_gpu_enable_command_buffer=  "
+        "--xla_gpu_enable_command_buffer='' "
+        "--xla_disable_hlo_passes=collective-permute-motion "
     )
     _os.environ["LIBTPU_INIT_ARGS"] = (
         _os.getenv("LIBTPU_INIT_ARGS", "") + " "
