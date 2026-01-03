@@ -166,10 +166,16 @@ class Olmo2MLP(nn.Module):
 
 
 class Olmo2Attention(UnifiedAttention):
-    """OLMo-2 Attention with Q/K normalization.
+    """Multi-head attention layer with Q/K normalization for OLMo-2 models.
 
-    Uses RMSNorm for Q/K normalization to improve training stability.
-    Standard RoPE-based attention without sliding window.
+    Extends UnifiedAttention with RMSNorm-based query and key normalization
+    for improved training stability. Uses standard RoPE-based causal attention
+    without sliding window.
+
+    Key differences from OLMo v1:
+        - Applies RMSNorm to query and key projections before attention
+        - Uses post-normalization architecture in the decoder layer
+        - No QKV clipping (relies on normalization instead)
     """
 
     def __init__(
@@ -182,7 +188,16 @@ class Olmo2Attention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initialize OLMo-2 attention with Q/K normalization."""
+        """Initialize OLMo-2 attention layer with Q/K normalization.
+
+        Args:
+            config (Olmo2Config): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         super().__init__(
             config,
             dtype,
@@ -196,7 +211,18 @@ class Olmo2Attention(UnifiedAttention):
         )
 
     def _create_k_norm(self, config: Olmo2Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: nn.Rngs):
-        """Create Q/K normalization layers (RMSNorm)."""
+        """Create key normalization layer using RMSNorm.
+
+        Args:
+            config (Olmo2Config): Model configuration with normalization parameters.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            rngs (nn.Rngs): Random number generator state.
+
+        Returns:
+            RMSNorm: Normalization layer for key projections with dimension
+                matching num_attention_heads * head_dim.
+        """
         return RMSNorm(
             dim=self.config.num_attention_heads * self.head_dim,
             eps=config.rms_norm_eps,
@@ -205,7 +231,18 @@ class Olmo2Attention(UnifiedAttention):
         )
 
     def _create_q_norm(self, config: Olmo2Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: nn.Rngs):
-        """Create Q/K normalization layers (RMSNorm)."""
+        """Create query normalization layer using RMSNorm.
+
+        Args:
+            config (Olmo2Config): Model configuration with normalization parameters.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            rngs (nn.Rngs): Random number generator state.
+
+        Returns:
+            RMSNorm: Normalization layer for query projections with dimension
+                matching num_key_value_heads * head_dim.
+        """
         return RMSNorm(
             dim=self.config.num_key_value_heads * self.head_dim,
             eps=config.rms_norm_eps,
@@ -214,6 +251,19 @@ class Olmo2Attention(UnifiedAttention):
         )
 
     def _preprocess_qkv(self, query_states, key_states, value_states):
+        """Apply Q/K normalization before attention computation.
+
+        Normalizes query and key projections using RMSNorm to improve
+        training stability in OLMo-2 models. Value states are passed through unchanged.
+
+        Args:
+            query_states: Query projections before normalization.
+            key_states: Key projections before normalization.
+            value_states: Value projections (unchanged).
+
+        Returns:
+            Tuple of (normalized_query, normalized_key, value_states).
+        """
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
@@ -635,7 +685,18 @@ class Olmo2Model(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=Olmo2Config, model_type="olmo2")
 class Olmo2ForCausalLM(BaseCausalLMModule[Olmo2Model, Olmo2Config]):
-    """OLMo-2 model with a Causal Language Modeling head."""
+    """OLMo-2 model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation. It uses Q/K normalization
+    and post-normalization architecture for improved training stability.
+
+    Attributes:
+        config (Olmo2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "olmo2"
@@ -650,6 +711,15 @@ class Olmo2ForCausalLM(BaseCausalLMModule[Olmo2Model, Olmo2Config]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize OLMo-2 model for causal language modeling.
+
+        Args:
+            config (Olmo2Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Olmo2Model,
@@ -775,7 +845,18 @@ class Olmo2ForCausalLM(BaseCausalLMModule[Olmo2Model, Olmo2Config]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Olmo2Config, model_type="olmo2")
 class Olmo2ForSequenceClassification(BaseSequenceClassificationModule[Olmo2Model, Olmo2Config]):
-    """OLMo-2 model with a Sequence Classification head."""
+    """OLMo-2 model for sequence classification tasks.
+
+    This class extends the base OLMo-2 model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+    Uses Q/K normalization and post-normalization architecture for improved training stability.
+
+    Attributes:
+        config (Olmo2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "olmo2"
@@ -790,6 +871,15 @@ class Olmo2ForSequenceClassification(BaseSequenceClassificationModule[Olmo2Model
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize OLMo-2 model for sequence classification.
+
+        Args:
+            config (Olmo2Config): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Olmo2Model,

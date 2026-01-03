@@ -46,6 +46,22 @@ from .falcon_h1_configuration import FalconH1Config
 
 
 def compute_mup_vector(config: FalconH1Config) -> jnp.ndarray:
+    """Compute the muP (maximal update parameterization) scaling vector for FalconH1 SSM.
+
+    This function creates a scaling vector used to apply muP multipliers to different
+    components of the SSM projection output. The vector applies different scaling
+    factors to: z (gate), x (hidden), B (input), C (output), and dt (timestep) projections.
+
+    Args:
+        config (FalconH1Config): Model configuration containing SSM parameters including
+            mamba_d_ssm, mamba_expand, hidden_size, mamba_n_groups, mamba_d_state,
+            mamba_n_heads, and ssm_multipliers.
+
+    Returns:
+        jnp.ndarray: A scaling vector of shape (1, 1, vector_shape) where vector_shape
+            equals 2 * intermediate_size + 2 * groups_time_state_size + num_heads.
+            The vector contains different multipliers for each SSM component region.
+    """
     intermediate_size = (
         int(config.mamba_d_ssm) if config.mamba_d_ssm is not None else int(config.mamba_expand * config.hidden_size)
     )
@@ -71,6 +87,21 @@ def compute_mup_vector(config: FalconH1Config) -> jnp.ndarray:
 
 
 def apply_mask_to_padding_states(hidden_states: Array, attention_mask: Array | None) -> Array:
+    """Apply attention mask to zero out hidden states at padding positions.
+
+    This function ensures that padding tokens don't contribute to the SSM state
+    by multiplying the hidden states with the attention mask. This is critical
+    for Mamba-style SSMs where padding tokens should not affect the recurrent state.
+
+    Args:
+        hidden_states (Array): Hidden states tensor of shape (batch_size, seq_len, hidden_dim).
+        attention_mask (Array | None): Boolean or float mask of shape (batch_size, seq_len)
+            where 1/True indicates valid tokens and 0/False indicates padding.
+
+    Returns:
+        Array: Masked hidden states with padding positions zeroed out, same shape
+            as input. Returns unchanged hidden_states if mask is None or incompatible.
+    """
     if (
         attention_mask is not None
         and attention_mask.shape[0] == hidden_states.shape[0]
@@ -83,9 +114,17 @@ def apply_mask_to_padding_states(hidden_states: Array, attention_mask: Array | N
 
 
 class FalconH1Attention(UnifiedAttention):
-    """RoPE GQA attention used by FalconH1 blocks.
+    """Multi-head attention layer for FalconH1 hybrid models.
 
-    Inherits from UnifiedAttention and applies key_multiplier via _postprocess_qkv.
+    Implements grouped query attention (GQA) with rotary position embeddings (RoPE)
+    for the FalconH1 architecture. This attention module applies muP-style key
+    scaling via the key_multiplier parameter for improved training stability.
+
+    Inherits from UnifiedAttention and customizes QKV post-processing to apply
+    the key_multiplier scaling factor.
+
+    Attributes:
+        key_multiplier (float): Scaling factor applied to key states for muP.
     """
 
     def __init__(
@@ -98,6 +137,17 @@ class FalconH1Attention(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize FalconH1 attention layer with RoPE and muP key scaling.
+
+        Args:
+            config (FalconH1Config): Model configuration with attention parameters.
+            layer_idx (int): Index of this layer in the model stack.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for matmuls.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state for initialization.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -120,16 +170,47 @@ class FalconH1Attention(UnifiedAttention):
         Float[Array, "batch_size seq_len num_kv_heads head_dim"],
         Float[Array, "batch_size seq_len num_kv_heads head_dim"],
     ]:
-        """Apply key_multiplier for muP scaling."""
+        """Apply muP key scaling after QKV projection.
+
+        This hook is called after the QKV projections to apply the key_multiplier
+        scaling factor for maximal update parameterization (muP). This scaling
+        helps maintain consistent learning dynamics across different model widths.
+
+        Args:
+            query_states (Array): Query tensor of shape (batch, seq_len, num_heads, head_dim).
+            key_states (Array): Key tensor of shape (batch, seq_len, num_kv_heads, head_dim).
+            value_states (Array): Value tensor of shape (batch, seq_len, num_kv_heads, head_dim).
+
+        Returns:
+            tuple: A tuple of (query_states, scaled_key_states, value_states) where
+                key_states has been multiplied by self.key_multiplier.
+        """
         key_states = key_states * self.key_multiplier
         return query_states, key_states, value_states
 
 
 class Conv1D(nn.Module):
-    """Depthwise causal 1D convolution used by the Mamba mixer.
+    """Depthwise causal 1D convolution layer for the Mamba SSM mixer.
 
-    Parameter layout matches HF after conversion:
-        - `kernel`: [kernel_size, 1, channels]
+    Implements a 1D convolution with depthwise grouping for processing sequential
+    features in the Mamba-style state space model. The convolution is applied
+    along the sequence dimension with optional causal padding.
+
+    Parameter layout matches HuggingFace after weight conversion:
+        - `kernel`: shape [kernel_size, 1, channels]
+        - `bias`: shape [channels] (optional)
+
+    Attributes:
+        features (int): Number of input/output channels.
+        kernel_size (int): Size of the convolutional kernel.
+        stride (int): Convolution stride.
+        padding (int): Amount of padding on each side.
+        dilation (int): Dilation factor for the kernel.
+        groups (int): Number of groups for grouped convolution.
+        use_bias (bool): Whether to include a bias term.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: JAX precision setting for matmuls.
     """
 
     def __init__(
@@ -147,6 +228,23 @@ class Conv1D(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
     ):
+        """Initialize the 1D convolution layer.
+
+        Args:
+            features (int): Number of input/output channels (depthwise).
+            kernel_size (int): Size of the convolutional kernel along sequence dim.
+            rngs (nn.Rngs): Random number generator state for initialization.
+            stride (int, optional): Convolution stride. Defaults to 1.
+            padding (int, optional): Padding on each side of input. Defaults to 0.
+            dilation (int, optional): Kernel dilation factor. Defaults to 1.
+            groups (int, optional): Number of groups for grouped convolution.
+                Set to features for depthwise convolution. Defaults to 1.
+            use_bias (bool, optional): Whether to add a bias term. Defaults to True.
+            dtype (jnp.dtype, optional): Computation dtype. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Parameter dtype. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision.
+                Defaults to None.
+        """
         self.features = features
         self.kernel_size = kernel_size
         self.stride = stride
@@ -173,6 +271,16 @@ class Conv1D(nn.Module):
             )
 
     def __call__(self, x: Array) -> Array:
+        """Apply 1D convolution to the input.
+
+        Args:
+            x (Array): Input tensor of shape (batch, channels, seq_len) where
+                channels equals self.features.
+
+        Returns:
+            Array: Convolved output of shape (batch, channels, output_seq_len)
+                where output_seq_len depends on padding, stride, and dilation.
+        """
         rhs = jnp.asarray(jnp.swapaxes(self.kernel.value, 0, 2), dtype=self.dtype)
         y = lax.conv_general_dilated(
             lhs=x.astype(self.dtype),
@@ -189,7 +297,23 @@ class Conv1D(nn.Module):
 
 
 class FalconH1RMSNormGated(nn.Module):
-    """Group RMSNorm with optional SiLU gating (FalconH1 Mamba block)."""
+    """Group RMS normalization with optional SiLU gating for FalconH1 Mamba blocks.
+
+    Implements grouped RMS normalization where the hidden dimension is divided into
+    groups and each group is normalized independently. Supports optional SiLU gating
+    that can be applied before or after normalization based on the norm_before_gate
+    parameter.
+
+    This layer is used in the Mamba SSM mixer to normalize the output before
+    the final projection, with gating providing additional non-linearity.
+
+    Attributes:
+        hidden_size (int): Total hidden dimension size.
+        variance_epsilon (float): Small constant for numerical stability.
+        n_groups (int): Number of groups for grouped normalization.
+        norm_before_gate (bool): If True, apply norm then gate; else gate then norm.
+        dtype (jnp.dtype): Data type for the learnable scale parameter.
+    """
 
     def __init__(
         self,
@@ -201,6 +325,19 @@ class FalconH1RMSNormGated(nn.Module):
         norm_before_gate: bool = True,
         dtype: jnp.dtype = jnp.float32,
     ):
+        """Initialize the gated group RMS normalization layer.
+
+        Args:
+            hidden_size (int): Size of the hidden dimension to normalize.
+            eps (float): Small epsilon for numerical stability in rsqrt.
+            rngs (nn.Rngs): Random number generator state for initialization.
+            n_groups (int, optional): Number of groups to divide hidden_size into.
+                Each group is normalized independently. Defaults to 1 (full RMSNorm).
+            norm_before_gate (bool, optional): If True, normalizes first then applies
+                SiLU gate. If False, applies gate first then normalizes. Defaults to True.
+            dtype (jnp.dtype, optional): Data type for the scale parameter.
+                Defaults to jnp.float32.
+        """
         self.hidden_size = hidden_size
         self.variance_epsilon = eps
         self.n_groups = n_groups
@@ -214,6 +351,18 @@ class FalconH1RMSNormGated(nn.Module):
         )
 
     def __call__(self, hidden_states: Array, gate: Array | None = None) -> Array:
+        """Apply grouped RMS normalization with optional SiLU gating.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_size)
+                or (batch, hidden_size).
+            gate (Array | None, optional): Optional gating tensor of same shape as
+                hidden_states. When provided, applies SiLU(gate) * normalized_output
+                (or vice versa based on norm_before_gate). Defaults to None.
+
+        Returns:
+            Array: Normalized (and optionally gated) output with same shape as input.
+        """
         input_dtype = hidden_states.dtype
         hs = hidden_states.astype(jnp.float32)
 
@@ -244,7 +393,30 @@ class FalconH1RMSNormGated(nn.Module):
 
 
 class FalconH1Mixer(nn.Module):
-    """Naive Mamba2-style SSM mixer used in FalconH1 blocks."""
+    """Mamba2-style selective state space model (SSM) mixer for FalconH1 blocks.
+
+    Implements a Mamba2-style SSM layer that provides efficient sequence modeling
+    through selective state spaces. The mixer consists of:
+    1. Input projection to expand hidden states into gate, x/B/C (conv input), and dt
+    2. Depthwise 1D convolution for local context
+    3. SSM computation with learned A, B, C, D matrices and timestep dt
+    4. Gated RMS normalization (optional) before output projection
+
+    This module supports both prefill (parallel) and decode (sequential) modes
+    with proper caching of convolution and recurrent states.
+
+    Attributes:
+        config (FalconH1Config): Model configuration.
+        layer_idx (int): Index of this layer in the model stack.
+        num_heads (int): Number of SSM heads.
+        hidden_size (int): Model hidden dimension.
+        ssm_state_size (int): Size of the SSM state (d_state).
+        conv_kernel_size (int): Size of the causal convolution kernel.
+        intermediate_size (int): Size of the expanded SSM dimension.
+        n_groups (int): Number of groups for grouped operations.
+        head_dim (int): Dimension per SSM head.
+        chunk_size (int): Chunk size for chunked SSM computation.
+    """
 
     def __init__(
         self,
@@ -256,6 +428,23 @@ class FalconH1Mixer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the FalconH1 Mamba mixer.
+
+        Args:
+            config (FalconH1Config): Model configuration with SSM parameters including
+                mamba_n_heads, mamba_d_state, mamba_d_conv, mamba_d_ssm, mamba_expand,
+                mamba_n_groups, mamba_d_head, and mamba_chunk_size.
+            layer_idx (int): Index of this layer in the model stack.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for matmuls.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state for initialization.
+
+        Raises:
+            ValueError: If mamba_n_heads is not divisible by mamba_n_groups.
+            ValueError: If intermediate_size != mamba_n_heads * mamba_d_head.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -363,15 +552,32 @@ class FalconH1Mixer(nn.Module):
         mask_info: MaskInfo,
         cache_view: HybridCacheView | None = None,
     ) -> tuple[Array, HybridCacheView | None]:
-        """Forward pass with optional cache support for autoregressive generation.
+        """Process input through the Mamba SSM mixer.
+
+        Applies the full Mamba2-style SSM computation pipeline:
+        1. Input projection with muP scaling
+        2. Split into gate, convolution input (x/B/C), and timestep (dt)
+        3. Causal convolution with activation
+        4. SSM computation (x, A, B, C, D, dt) -> y
+        5. Gated normalization and output projection
+
+        Supports both prefill mode (full sequence) and decode mode (single token)
+        with proper caching of convolution states and SSM recurrent states.
 
         Args:
-            hidden_states: Input tensor [batch, seq_len, hidden_size]
-            attention_mask: Optional mask for padding
-            cache_view: Optional cache view for conv_state and recurrent_state
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_size).
+            mask_info (MaskInfo): Mask information containing attention mask for
+                handling padding tokens in the SSM computation.
+            cache_view (HybridCacheView | None, optional): Cache view containing
+                conv_state (for convolution) and recurrent_state (for SSM). When
+                provided in decode mode, enables efficient single-token generation.
+                Defaults to None.
 
         Returns:
-            Tuple of (output tensor, updated cache_view or None)
+            tuple[Array, HybridCacheView | None]: A tuple containing:
+                - contextualized_states: Output tensor of shape (batch, seq_len, hidden_size)
+                - updated_cache_view: Updated cache with new conv_state and recurrent_state,
+                  or None if caching is disabled
         """
         q_mask = None
         if mask_info is not None:
@@ -480,7 +686,24 @@ class FalconH1Mixer(nn.Module):
 
 
 class FalconH1MLP(nn.Module):
-    """SwiGLU MLP used by FalconH1 blocks."""
+    """SwiGLU Multi-Layer Perceptron for FalconH1 models.
+
+    Implements a gated feedforward network using SwiGLU (Swish-Gated Linear Unit)
+    activation. The architecture consists of parallel gate and up projections
+    that are combined through element-wise multiplication with gating, followed
+    by a down projection.
+
+    The MLP applies muP-style scaling through gate_multiplier and down_multiplier
+    parameters for improved training stability at scale.
+
+    Attributes:
+        config (FalconH1Config): Model configuration.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: JAX precision setting for matmuls.
+        gate_multiplier (float): Scaling factor for gate projection (muP).
+        down_multiplier (float): Scaling factor for down projection output (muP).
+    """
 
     def __init__(
         self,
@@ -491,6 +714,17 @@ class FalconH1MLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the SwiGLU MLP block.
+
+        Args:
+            config (FalconH1Config): Model configuration with MLP parameters including
+                hidden_size, intermediate_size, mlp_bias, hidden_act, and mlp_multipliers.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for matmuls.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state for initialization.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -517,16 +751,45 @@ class FalconH1MLP(nn.Module):
         self.gate_multiplier, self.down_multiplier = config.mlp_multipliers
 
     def __call__(self, x: Array) -> Array:
+        """Apply SwiGLU feedforward transformation with muP scaling.
+
+        Computes: down_proj(up_proj(x) * act_fn(gate_proj(x) * gate_mul)) * down_mul
+
+        Args:
+            x (Array): Input tensor of shape (batch, seq_len, hidden_size).
+
+        Returns:
+            Array: Transformed tensor of shape (batch, seq_len, hidden_size).
+        """
         y = self.up_proj(x) * self.act_fn(self.gate_proj(x) * self.gate_multiplier)
         y = self.down_proj(y) * self.down_multiplier
         return y
 
 
 class FalconH1DecoderLayer(nn.Module):
-    """One FalconH1 decoder layer (Mamba mixer + attention + MLP).
+    """Single decoder layer for FalconH1 hybrid models.
 
-    FalconH1 uses parallel hybrid architecture where Mamba SSM and attention
-    run in parallel within each layer, then results are summed.
+    Implements a parallel hybrid architecture where the Mamba SSM mixer and
+    transformer attention run in parallel on the same input, with their outputs
+    summed together. This design combines the strengths of:
+    - Mamba SSM: Efficient O(n) sequence modeling with selective state spaces
+    - Transformer attention: Strong in-context learning and long-range dependencies
+
+    Layer structure:
+    1. Input LayerNorm
+    2. Parallel computation:
+       - Mamba SSM mixer (with muP scaling)
+       - Multi-head attention (with muP key scaling)
+    3. Sum of Mamba and attention outputs + residual
+    4. Pre-FFN LayerNorm
+    5. SwiGLU MLP + residual
+
+    Attributes:
+        config (FalconH1Config): Model configuration.
+        layer_idx (int): Index of this layer in the model stack.
+        attention_in_multiplier (float): muP scaling for attention input.
+        ssm_out_multiplier (float): muP scaling for SSM output.
+        attn_out_multiplier (float): muP scaling for attention output.
     """
 
     def __init__(
@@ -539,6 +802,17 @@ class FalconH1DecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the FalconH1 decoder layer.
+
+        Args:
+            config (FalconH1Config): Model configuration with layer parameters.
+            layer_idx (int): Index of this layer in the model stack.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for matmuls.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state for initialization.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -599,20 +873,39 @@ class FalconH1DecoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Array | None = None,
     ) -> DecoderLayerOutput:
-        """Forward pass for FalconH1 decoder layer.
+        """Forward pass through the FalconH1 decoder layer.
+
+        Processes input through parallel Mamba SSM and attention branches, combines
+        their outputs with residual connection, then applies MLP with another residual.
+        The cache is updated sequentially: first Mamba updates conv/recurrent states,
+        then attention updates key/value states.
 
         Args:
-            hidden_states: Input tensor [batch, seq_len, hidden_size]
-            mask_info: Mask information for attention
-            position_ids: Position indices for RoPE
-            mode: Runtime mode (MODE_TRAIN, MODE_PREFILL, MODE_DECODE)
-            cache_view: Optional HybridCacheView for caching (both KV and recurrent state)
-            cache_metadata: Optional cache metadata
-            output_attentions: Whether to return attention weights
-            frequencies: Optional precomputed RoPE frequencies
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_size).
+            mask_info (MaskInfo | None): Mask information for attention and SSM,
+                containing causal masks and padding information.
+            position_ids (Array): Position indices for RoPE of shape (batch, seq_len).
+            mode (RUNTIME_MODE_TYPES): Runtime mode controlling optimization paths:
+                - MODE_TRAIN: Training mode with full sequence processing
+                - MODE_PREFILL: Prefill phase for generation (parallel processing)
+                - MODE_DECODE: Decode phase for generation (sequential single tokens)
+            cache_view (HybridCacheView | None, optional): Cache view containing:
+                - key_states, value_states: For attention KV cache
+                - conv_state: For Mamba convolution state
+                - recurrent_state: For Mamba SSM state
+                Defaults to None.
+            cache_metadata (OperationsMetadata | None, optional): Metadata for
+                cache operations. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies of
+                shape (seq_len, head_dim). Defaults to None.
 
         Returns:
-            DecoderLayerOutput containing hidden states, attention weights, and updated cache
+            DecoderLayerOutput: Contains:
+                - hidden_states: Output tensor of shape (batch, seq_len, hidden_size)
+                - attention_weight: Attention weights if output_attentions=True, else None
+                - cache_view: Updated HybridCacheView with new states
         """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -660,7 +953,33 @@ class FalconH1DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=FalconH1Config, model_type="falcon_h1")
 class FalconH1Model(EasyDeLBaseModule):
-    """FalconH1 backbone (embeddings + stacked hybrid decoder layers)."""
+    """FalconH1 base model implementing a parallel hybrid Mamba-Attention architecture.
+
+    FalconH1 is a state-of-the-art language model that combines Mamba2 selective state
+    space models with transformer attention in a parallel hybrid design. Each layer
+    processes input through both Mamba SSM and attention branches simultaneously,
+    combining their outputs for enhanced sequence modeling.
+
+    Key features:
+    - Parallel hybrid architecture: SSM and attention run concurrently in each layer
+    - Mamba2 SSM: Efficient O(n) sequence modeling with selective state spaces
+    - Grouped Query Attention (GQA): Memory-efficient attention with RoPE
+    - muP (maximal update parameterization): Scaling factors for stable training
+    - HybridCache: Unified caching for both KV states and SSM recurrent states
+
+    Model structure:
+    1. Token embeddings with embedding_multiplier scaling
+    2. Stack of FalconH1DecoderLayer blocks
+    3. Final RMSNorm
+
+    Attributes:
+        config (FalconH1Config): Model configuration.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: JAX precision setting for matmuls.
+        embedding_multiplier (float): muP scaling for embeddings.
+        lm_head_multiplier (float): muP scaling for language model head output.
+    """
 
     def __init__(
         self,
@@ -671,6 +990,18 @@ class FalconH1Model(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the FalconH1 base model.
+
+        Args:
+            config (FalconH1Config): Model configuration containing architecture
+                parameters including vocab_size, hidden_size, num_hidden_layers,
+                and all Mamba/attention hyperparameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for matmuls.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state for initialization.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -727,23 +1058,56 @@ class FalconH1Model(EasyDeLBaseModule):
         cache_metadata: OperationsMetadata | None = None,
         **kwargs,
     ) -> BaseModelOutput:
-        """Forward pass for FalconH1 model.
+        """Perform forward pass through the FalconH1 transformer model.
+
+        Processes input tokens through embeddings and stacked hybrid decoder layers,
+        combining Mamba SSM and transformer attention at each layer. Supports both
+        training and inference modes with efficient caching for generation.
 
         Args:
-            input_ids: Input token IDs [batch, seq_len]
-            attention_mask: Attention mask [batch, seq_len]
-            position_ids: Position IDs for RoPE [batch, seq_len]
-            past_key_values: HybridCache for KV and recurrent state caching
-            inputs_embeds: Optional pre-computed embeddings
-            use_cache: Whether to use/return cache
-            output_attentions: Whether to return attention weights
-            output_hidden_states: Whether to return all hidden states
-            mode: Runtime mode (MODE_TRAIN, MODE_PREFILL, MODE_DECODE)
-            mask_info: MaskInfo for attention masking
-            cache_metadata: Cache metadata for operations
+            input_ids (Array | None, optional): Input token IDs of shape
+                (batch_size, sequence_length). Either this or inputs_embeds must
+                be provided, but not both. Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask of shape
+                (batch_size, sequence_length) where True indicates valid tokens
+                and False indicates padding. Defaults to None.
+            position_ids (Array | None, optional): Position indices for RoPE of
+                shape (batch_size, sequence_length). Auto-generated from mask if
+                not provided. Defaults to None.
+            past_key_values (HybridCache | None, optional): Cache containing:
+                - key_states, value_states: For attention KV cache
+                - conv_state: For Mamba convolution state
+                - recurrent_state: For Mamba SSM state
+                Enables efficient autoregressive generation. Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed embeddings of shape
+                (batch_size, sequence_length, hidden_size). Use instead of input_ids
+                for custom embeddings. Defaults to None.
+            use_cache (bool | None, optional): Whether to use and return cache for
+                generation. Defaults to config.use_cache.
+            output_attentions (bool | None, optional): Whether to return attention
+                weights from all layers. Defaults to config.output_attentions.
+            output_hidden_states (bool | None, optional): Whether to return hidden
+                states from all layers. Defaults to config.output_hidden_states.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode:
+                - MODE_TRAIN: Training with full sequences
+                - MODE_PREFILL: Prefill phase for generation
+                - MODE_DECODE: Token-by-token generation
+                Auto-detected if None. Defaults to None.
+            mask_info (MaskInfo | None, optional): Pre-computed mask information.
+                If provided, overrides attention_mask. Defaults to None.
+            cache_metadata (OperationsMetadata | None, optional): Metadata for
+                cache operations. Defaults to None.
+            **kwargs: Additional unused arguments (for compatibility).
 
         Returns:
-            BaseModelOutput with hidden states, attentions, and cache
+            BaseModelOutput: Contains:
+                - last_hidden_state: Final layer output of shape (batch, seq_len, hidden_size)
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+                - past_key_values: Updated HybridCache for next generation step
+
+        Raises:
+            ValueError: If neither input_ids nor inputs_embeds is provided, or both.
         """
         del kwargs
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -821,18 +1185,44 @@ class FalconH1Model(EasyDeLBaseModule):
         )
 
     def get_decoder(self):
+        """Return the decoder layers of the model.
+
+        Returns:
+            list[FalconH1DecoderLayer]: List of decoder layer modules.
+        """
         return self.layers
 
     def get_embedding(self):
+        """Return the token embedding layer of the model.
+
+        Returns:
+            nn.Embed: Token embedding layer.
+        """
         return self.embed_tokens
 
 
 @register_module(TaskType.CAUSAL_LM, config=FalconH1Config, model_type="falcon_h1")
 class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):
-    """FalconH1 model with a language modeling head.
+    """FalconH1 model with a language modeling head for causal language modeling.
 
-    FalconH1 is a parallel hybrid model combining Mamba2 SSM with transformer attention.
-    This class provides generation support with proper HybridCache handling.
+    This model combines the FalconH1 parallel hybrid architecture (Mamba2 SSM +
+    transformer attention) with a language modeling head for autoregressive text
+    generation. It supports efficient generation through HybridCache which maintains
+    both attention KV states and Mamba recurrent states.
+
+    Key features:
+    - Parallel hybrid backbone: Mamba SSM and attention in each layer
+    - muP (maximal update parameterization): Stable training at scale
+    - HybridCache: Unified caching for efficient generation
+    - Tied embeddings: Optional weight tying between embeddings and LM head
+
+    Attributes:
+        config (FalconH1Config): Model configuration.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: JAX precision setting for matmuls.
+        model (FalconH1Model): The base transformer model.
+        lm_head: Linear projection to vocabulary logits.
     """
 
     def __init__(
@@ -844,6 +1234,17 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the FalconH1 causal language model.
+
+        Args:
+            config (FalconH1Config): Model configuration containing all architecture
+                parameters and generation settings.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for matmuls.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state for initialization.
+        """
         super().__init__(
             config=config,
             base_model_class=FalconH1Model,
@@ -873,24 +1274,47 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):
         apply_lm_head: bool = True,
         **kwargs,
     ) -> CausalLMOutput:
-        """Forward pass for FalconH1 Causal LM.
+        """Perform forward pass for causal language modeling.
+
+        Processes input through the FalconH1 backbone and optionally applies the
+        language modeling head to produce vocabulary logits. Supports efficient
+        autoregressive generation with HybridCache.
 
         Args:
-            input_ids: Input token IDs [batch, seq_len]
-            attention_mask: Attention mask [batch, seq_len]
-            position_ids: Position IDs for RoPE
-            past_key_values: HybridCache for KV and recurrent state
-            inputs_embeds: Optional pre-computed embeddings
-            use_cache: Whether to use/return cache
-            output_attentions: Whether to return attention weights
-            output_hidden_states: Whether to return all hidden states
-            mode: Runtime mode (MODE_TRAIN, MODE_PREFILL, MODE_DECODE)
-            mask_info: MaskInfo for attention masking
-            cache_metadata: Cache metadata
-            apply_lm_head: Whether to apply LM head
+            input_ids (Array | None, optional): Input token IDs of shape
+                (batch_size, sequence_length). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask of shape
+                (batch_size, sequence_length) for valid tokens. Defaults to None.
+            position_ids (Array | None, optional): Position indices for RoPE.
+                Defaults to None.
+            past_key_values (HybridCache | None, optional): Cache containing
+                attention KV states and Mamba recurrent states. Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed embeddings.
+                Defaults to None.
+            use_cache (bool | None, optional): Whether to use/return cache.
+                Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention
+                weights. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return all
+                hidden states. Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode for optimization.
+                Defaults to None.
+            mask_info (MaskInfo | None, optional): Pre-computed mask information.
+                Defaults to None.
+            cache_metadata (OperationsMetadata | None, optional): Cache operation
+                metadata. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the LM head to produce
+                logits. Set to False to get only hidden states. Defaults to True.
+            **kwargs: Additional unused arguments (for compatibility).
 
         Returns:
-            CausalLMOutput with logits, hidden states, attentions, and cache
+            CausalLMOutput: Contains:
+                - logits: Vocabulary logits of shape (batch, seq_len, vocab_size),
+                  or None if apply_lm_head=False
+                - hidden_states: Tuple of layer outputs if output_hidden_states=True
+                - last_hidden_state: Final layer output
+                - attentions: Tuple of attention weights if output_attentions=True
+                - past_key_values: Updated HybridCache for next generation step
         """
         del kwargs
         outputs = self.model(
@@ -929,19 +1353,29 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):
         attention_mask: Array | None = None,
         **kwargs,
     ) -> dict[str, tp.Any]:
-        """Prepare inputs for autoregressive generation.
+        """Prepare inputs for the first step of autoregressive generation.
 
-        Creates a HybridCache with PARALLEL_HYBRID layer types for all layers.
+        Initializes the HybridCache with appropriate layer types for the parallel
+        hybrid architecture, computes mask information, and sets up position IDs.
+        This method is called once at the beginning of generation.
 
         Args:
-            input_ids: Input token IDs [batch, seq_len]
-            max_length: Maximum generation length
-            pad_token_id: Padding token ID
-            starts: Optional starting positions
-            attention_mask: Optional attention mask
+            input_ids (Array): Input token IDs of shape (batch_size, seq_len) for
+                the prompt/prefix.
+            max_length (int): Maximum total generation length (prompt + generated).
+            pad_token_id (int): Token ID used for padding.
+            starts (Array | None, optional): Starting positions for each sequence
+                in the batch, used for variable-length prompts. Auto-computed from
+                attention_mask if not provided. Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask of shape
+                (batch_size, seq_len) indicating valid tokens. Defaults to None.
+            **kwargs: Additional unused arguments (for compatibility).
 
         Returns:
-            Dictionary with prepared inputs for generation
+            dict[str, tp.Any]: Dictionary containing prepared inputs:
+                - past_key_values: Initialized HybridCache
+                - mask_info: Padded MaskInfo for causal attention
+                - position_ids: Position indices for RoPE
         """
         del kwargs
         batch_size, seq_length = input_ids.shape
@@ -981,14 +1415,22 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):
         model_outputs: CausalLMOutput,
         model_kwargs: dict[str, tp.Any],
     ) -> dict[str, tp.Any]:
-        """Update inputs for the next generation step.
+        """Update model inputs for the next autoregressive generation step.
+
+        Updates the cache and position IDs from the previous forward pass to prepare
+        for generating the next token. This method is called after each token is
+        generated during autoregressive decoding.
 
         Args:
-            model_outputs: Outputs from the previous forward pass
-            model_kwargs: Current model keyword arguments
+            model_outputs (CausalLMOutput): Outputs from the previous forward pass,
+                containing the updated cache with new KV states and Mamba recurrent states.
+            model_kwargs (dict[str, tp.Any]): Current model keyword arguments including
+                past_key_values and position_ids.
 
         Returns:
-            Updated model keyword arguments for next step
+            dict[str, tp.Any]: Updated model keyword arguments with:
+                - past_key_values: Updated HybridCache from model_outputs
+                - position_ids: Incremented position for the next token
         """
         # Update cache
         if model_outputs.past_key_values is not None:
@@ -1003,7 +1445,18 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):
         return model_kwargs
 
     def get_decoder(self):
+        """Return the decoder layers of the underlying model.
+
+        Returns:
+            list[FalconH1DecoderLayer]: List of decoder layer modules from the
+                base FalconH1Model.
+        """
         return self.model.get_decoder()
 
     def get_embedding(self):
+        """Return the token embedding layer of the underlying model.
+
+        Returns:
+            nn.Embed: Token embedding layer from the base FalconH1Model.
+        """
         return self.model.get_embedding()

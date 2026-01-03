@@ -48,11 +48,25 @@ from .gpt_neox_configuration import GPTNeoXConfig as GPTNeoXConfig
 
 
 class GPTNeoXAttention(UnifiedAttention):
-    """GPT-NeoX Attention with partial RoPE.
+    """GPT-NeoX Attention module with partial Rotary Position Embeddings (RoPE).
 
-    Inherits from UnifiedAttention.
-    Uses combined QKV projection (query_key_value) and partial rotary embeddings.
-    Overrides forward_standard to efficiently handle fused QKV projection.
+    This module implements the multi-head self-attention mechanism used in GPT-NeoX,
+    featuring partial rotary embeddings where only a fraction of the head dimensions
+    receive positional encoding. It inherits from UnifiedAttention and uses a combined
+    QKV projection (query_key_value) for computational efficiency.
+
+    The partial RoPE is controlled by `config.rotary_pct`, which determines what
+    percentage of the head dimension receives rotary embeddings.
+
+    Attributes:
+        config (GPTNeoXConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        layer_idx (int): Index of this layer in the model stack.
+        head_dim (int): Dimension of each attention head.
+        num_heads (int): Number of attention heads.
+        rngs (nn.Rngs): Random number generators.
     """
 
     projection_mapping: ClassVar[dict[str, str]] = {
@@ -104,7 +118,19 @@ class GPTNeoXAttention(UnifiedAttention):
         )
 
     def _create_rotary(self, config: GPTNeoXConfig, dtype: jnp.dtype):
-        """Create GPTNeoX-specific rotary embedding with partial RoPE."""
+        """Create GPT-NeoX specific rotary embedding with partial RoPE.
+
+        GPT-NeoX uses partial rotary embeddings where only a fraction of the
+        head dimension (determined by config.rotary_pct) receives rotary
+        position encodings. The remaining dimensions are left unchanged.
+
+        Args:
+            config: GPTNeoXConfig containing rotary_pct and rotary_emb_base.
+            dtype: Data type for the rotary embeddings.
+
+        Returns:
+            Rotary embedding module configured for partial rotation.
+        """
         return config.get_basic_rope(
             dtype=dtype,
             head_size=self.head_dim,
@@ -113,7 +139,15 @@ class GPTNeoXAttention(UnifiedAttention):
         )
 
     def _create_attention_performer(self, config: GPTNeoXConfig, rngs: nn.Rngs):
-        """Create attention performer with config dropout."""
+        """Create the attention performer with GPT-NeoX specific settings.
+
+        Args:
+            config: GPTNeoXConfig containing attention_dropout setting.
+            rngs: Random number generators for dropout.
+
+        Returns:
+            FlexibleAttentionModule configured for GPT-NeoX attention.
+        """
         return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
@@ -123,16 +157,23 @@ class GPTNeoXAttention(UnifiedAttention):
 
 
 class GPTNeoXMlp(nn.Module):
-    """GPT-NeoX MLP module.
+    """GPT-NeoX MLP (Feed-Forward Network) module.
 
-    This module implements the feed-forward network used in the GPT-NeoX model.
+    This module implements the feed-forward network used in GPT-NeoX transformer
+    blocks. It consists of two linear projections with column/row parallelism
+    support and an activation function in between.
+
+    The MLP expands the hidden dimension to an intermediate size, applies an
+    activation function, and projects back to the original hidden size.
 
     Attributes:
-            config (GPTNeoXConfig): Configuration object for the model.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+        config (GPTNeoXConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        dense_h_to_4h (ColumnParallelLinear): Up-projection layer.
+        dense_4h_to_h (RowParallelLinear): Down-projection layer.
+        act: Activation function (determined by config.hidden_act).
     """
 
     def __init__(
@@ -211,14 +252,26 @@ class GPTNeoXBlock(nn.Module):
 
     This module represents a single transformer block in the GPT-NeoX model,
     containing self-attention and MLP sub-layers with residual connections
-    and layer normalization. It supports both standard and parallel residual connections.
+    and layer normalization.
+
+    GPT-NeoX supports two residual connection strategies controlled by
+    `config.use_parallel_residual`:
+    - Parallel: Both attention and MLP operate on layer-normalized input,
+      and their outputs are summed together with the residual. This can
+      improve training stability for larger models.
+    - Sequential: Standard residual connections where attention output is
+      added to residual first, then MLP operates on the result.
 
     Attributes:
-            config (GPTNeoXConfig): Configuration object for the model.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+        config (GPTNeoXConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        use_parallel_residual (bool): Whether to use parallel residual connections.
+        input_layernorm (nn.LayerNorm): Layer normalization before attention.
+        post_attention_layernorm (nn.LayerNorm): Layer normalization before MLP.
+        attention (GPTNeoXAttention): Self-attention module.
+        mlp (GPTNeoXMlp): Feed-forward network module.
     """
 
     def __init__(
@@ -350,17 +403,28 @@ class GPTNeoXBlock(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=GPTNeoXConfig, model_type="gpt_neox")
 class GPTNeoXModel(EasyDeLBaseModule):
-    """GPT-NeoX model implementation.
+    """GPT-NeoX base transformer model.
 
     This class implements the main GPT-NeoX transformer model architecture, consisting of
-    an embedding layer, multiple GPTNeoXBlock layers, and a final layer normalization.
+    token embeddings, embedding dropout, multiple GPTNeoXBlock layers, and a final layer
+    normalization. GPT-NeoX is an autoregressive language model that uses rotary position
+    embeddings (RoPE) and optionally parallel residual connections.
+
+    Unlike GPT-2, GPT-NeoX:
+    - Uses rotary position embeddings instead of learned absolute positions
+    - Supports partial RoPE (only applying to a fraction of head dimensions)
+    - Can use parallel residual connections for improved training stability
+    - Uses untied input/output embeddings by default
 
     Attributes:
-            config (GPTNeoXConfig): Configuration object for the model.
-            dtype (jnp.dtype): Data type for computations.
-            param_dtype (jnp.dtype): Data type for parameters.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-            rngs (nn.Rngs): Random number generators.
+        config (GPTNeoXConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        embed_in (nn.Embed): Token embedding layer.
+        emb_dropout (nn.Dropout): Dropout applied after embeddings.
+        layers (list[GPTNeoXBlock]): List of transformer blocks.
+        final_layer_norm (nn.LayerNorm): Final layer normalization.
     """
 
     def __init__(
@@ -417,6 +481,16 @@ class GPTNeoXModel(EasyDeLBaseModule):
 
     @functools.cached_property
     def frequencies(self):
+        """Compute and cache the rotary position embedding frequencies.
+
+        Computes the sinusoidal frequencies used for partial rotary position
+        embeddings. The frequencies are cached after first computation for
+        efficiency during inference.
+
+        Returns:
+            Frequency tensor for rotary embeddings with shape determined by
+            the rotary dimension (head_dim * rotary_pct).
+        """
         head_dim = self.config.hidden_size // self.config.num_attention_heads
         return self.config.get_basic_frequencies(
             head_size=head_dim,
@@ -438,33 +512,41 @@ class GPTNeoXModel(EasyDeLBaseModule):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
-        """Forward pass through the GPTNeoXModel.
+        """Performs forward pass through the GPT-NeoX transformer model.
+
+        Processes input tokens through token embeddings (with optional extra embeddings),
+        multiple transformer blocks with partial rotary position embeddings and optional
+        parallel residual connections, and final layer normalization.
 
         Args:
-            input_ids: Input token IDs with shape (batch_size, sequence_length). Mutually exclusive
-                with inputs_embeds.
-            attention_mask: Boolean mask with shape (batch_size, sequence_length) to avoid attention
-                on padding tokens. Values are True for tokens to attend to, False for padding.
-            mask_info: Pre-computed masking information. If None, computed from attention_mask.
-            position_ids: Position indices with shape (batch_size, sequence_length). If None,
-                automatically generated as sequential positions.
-            mode: Runtime mode for cache handling. One of MODE_TRAIN, MODE_DECODE, or MODE_PREFILL.
-                Auto-detected if None.
-            past_key_values: Cache containing precomputed key/value states from previous decode steps.
-            cache_metadata: Metadata for cache operations (positions, sequence lengths, etc.).
-            inputs_embeds: Pre-computed input embeddings with shape (batch_size, sequence_length, hidden_size).
-                Mutually exclusive with input_ids.
-            extra_embedding: Additional embeddings to add to inputs_embeds, with shape
-                (batch_size, sequence_length, hidden_size).
-            output_attentions: Whether to return attention weights from all layers (default: False).
-            output_hidden_states: Whether to return hidden states from all layers (default: False).
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Either this
+                or `inputs_embeds` must be provided but not both.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) indicating
+                which tokens to attend to (True) and which to ignore (False).
+            mask_info: Pre-computed mask information. If provided, overrides `attention_mask`.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length).
+                Used for rotary position embeddings. Auto-generated if not provided.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER). Auto-detected if None.
+            past_key_values: Cached key/value states for efficient autoregressive generation.
+            cache_metadata: Metadata for paged attention mechanisms.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length,
+                hidden_size). Use instead of `input_ids` for custom embeddings.
+            extra_embedding: Additional embeddings to add to the token embeddings, with shape
+                (batch_size, sequence_length, hidden_size). Useful for adapter layers.
+            output_attentions: Whether to return attention weights from all layers.
+            output_hidden_states: Whether to return hidden states from all layers.
 
         Returns:
             BaseModelOutput containing:
-                - last_hidden_state: Final hidden states with shape (batch_size, sequence_length, hidden_size).
-                - hidden_states: Tuple of hidden states from all layers if output_hidden_states=True.
-                - attentions: Tuple of attention weights from all layers if output_attentions=True.
-                - past_key_values: Updated cache for next decode step.
+                - last_hidden_state: Final layer output of shape (batch, seq_len, hidden_size)
+                - past_key_values: Updated cache for next generation step
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+
+        Raises:
+            ValueError: If both `input_ids` and `inputs_embeds` are provided, or if neither
+                is provided.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -570,8 +652,20 @@ class GPTNeoXModel(EasyDeLBaseModule):
 class GPTNeoXForCausalLM(BaseCausalLMModule[GPTNeoXModel, GPTNeoXConfig]):
     """GPT-NeoX model with a language modeling head for autoregressive text generation.
 
-    This model extends GPTNeoXModel with a linear language modeling head that projects
-    hidden states to vocabulary logits for next-token prediction.
+    This model extends GPTNeoXModel with a linear language modeling head (embed_out) that
+    projects hidden states to vocabulary logits for next-token prediction. It is suitable
+    for causal language modeling tasks including text generation, completion, and chat.
+
+    Unlike GPT-2, GPT-NeoX typically uses untied input/output embeddings, meaning the
+    embedding layer and language model head have separate weight matrices.
+
+    Attributes:
+        config (GPTNeoXConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        gpt_neox (GPTNeoXModel): The base transformer model.
+        embed_out (nn.Linear): Language modeling head projecting to vocabulary size.
     """
 
     _task_type = TaskType.CAUSAL_LM

@@ -79,6 +79,7 @@ from typing import Any
 import flax
 import flax.nnx
 import jax
+from eformer.common_types import NOT_GIVEN, _Empty
 from eformer.loggings import get_logger
 from jax import numpy as jnp
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
@@ -259,7 +260,7 @@ class eSurge:
         min_token_pad: int | None = None,
         max_num_seqs: int = 256,
         max_num_seq_buckets: list[int] | None = None,
-        max_num_batched_tokens: int | None = None,
+        max_num_batched_tokens: int | None | _Empty = NOT_GIVEN,
         hbm_utilization: float = 0.85,
         page_size: int = 128,
         use_aot_forward: bool = True,
@@ -556,8 +557,28 @@ class eSurge:
             enable_sampler_metrics=sampler_metrics,
         )
         self._overlap_execution = overlap_execution
+        if max_num_batched_tokens is NOT_GIVEN and jax.default_backend() == "gpu":
+            max_num_batched_tokens = min(max(2048, max_num_seqs), max_model_len)
+            logger.info(
+                f"GPU backend detected and `max_num_batched_tokens` was not provided; defaulting to {max_num_batched_tokens} tokens/step. "
+                "Pass an explicit int to override, or pass `None` to disable this auto-default "
+                "(falls back to `max_model_len`)."
+            )
+        elif max_num_batched_tokens is NOT_GIVEN and jax.default_backend() == "tpu":
+            max_num_batched_tokens = min(max(8192, max_num_seqs), max_model_len)
+            logger.info(
+                f"TPU backend detected and `max_num_batched_tokens` was not provided; defaulting to {max_num_batched_tokens} tokens/step. "
+                "Pass an explicit int to override, or pass `None` to disable this auto-default "
+                "(falls back to `max_model_len`)."
+            )
+        elif max_num_batched_tokens is NOT_GIVEN:
+            max_num_batched_tokens = None
+
         if compile_runner:
-            self.runner.compile()
+            # Limit compilation to the scheduler's per-step token budget when provided.
+            # This avoids compiling long-context token buckets (e.g. 32K/64K) when
+            # the scheduler will only ever emit smaller batches (e.g. 512/2048).
+            self.runner.compile(max_num_batched_tokens=max_num_batched_tokens)
 
         self.scheduler = Scheduler.from_runner(
             self.runner,

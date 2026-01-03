@@ -54,11 +54,11 @@ from .internlm2_configuration import InternLM2Config
 
 
 class InternLM2Attention(UnifiedAttention):
-    """InternLM2 Attention with full RoPE.
+    """Multi-head attention layer with full RoPE embeddings for InternLM2 models.
 
-    Inherits from UnifiedAttention.
-    Uses combined QKV projection (wqkv) instead of separate projections.
-    Overrides forward_standard to efficiently handle fused QKV with GQA layout.
+    Implements attention mechanism with fused QKV projection and grouped-query attention (GQA).
+    Uses combined query-key-value projection (wqkv) instead of separate projections for
+    improved efficiency.
     """
 
     projection_mapping: ClassVar[dict[str, str]] = {
@@ -76,7 +76,16 @@ class InternLM2Attention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initialize InternLM2 attention."""
+        """Initialize InternLM2 attention layer with grouped-query attention support.
+
+        Args:
+            config (InternLM2Config): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         super().__init__(
             config,
             dtype,
@@ -134,17 +143,10 @@ class InternLM2Attention(UnifiedAttention):
 
 
 class InternLM2MLP(nn.Module):
-    """InternLM2 MLP module.
+    """Multi-Layer Perceptron module for InternLM2 models.
 
-    Attributes:
-        config (InternLM2Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation. Default is jnp.float32.
-        param_dtype (jnp.dtype): Data type for parameters. Default is jnp.float32.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Default is None.
-        w1 (ParallelLinear): First linear transformation (gate projection).
-        w3 (ParallelLinear): Second linear transformation (up projection).
-        w2 (ParallelLinear): Third linear transformation (down projection).
-        act_fn (callable): Activation function (e.g., SiLU).
+    Implements the feedforward network with SwiGLU activation function
+    for enhanced representation learning in InternLM2 architecture.
     """
 
     def __init__(
@@ -157,14 +159,16 @@ class InternLM2MLP(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initializes the InternLM2MLP module.
+        """Initialize InternLM2 MLP block.
 
         Args:
-            config (InternLM2Config): The configuration object for the InternLM2 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (InternLM2Config): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
         """
         self.config = config
         self.dtype = dtype
@@ -186,13 +190,13 @@ class InternLM2MLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Forward pass of the MLP module.
+        """Apply SwiGLU feedforward transformation.
 
         Args:
-            hidden_states (jnp.ndarray): Input hidden states.
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
-            jnp.ndarray: Output hidden states after MLP transformation.
+            Transformed hidden states [batch, seq_len, hidden_dim]
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -213,20 +217,10 @@ class InternLM2MLP(nn.Module):
 
 
 class InternLM2Block(nn.Module):
-    """InternLM2 Transformer Block.
+    """Single decoder layer for InternLM2 models.
 
-    This module combines the self-attention layer and the MLP layer with residual connections
-    and layer normalization.
-
-    Attributes:
-        config (InternLM2Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation. Default is jnp.float32.
-        param_dtype (jnp.dtype): Data type for parameters. Default is jnp.float32.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Default is None.
-        attention (InternLM2Attention): The self-attention module.
-        feed_forward (InternLM2MLP): The feed-forward (MLP) module.
-        attention_norm (RMSNorm): Layer normalization before the attention layer.
-        ffn_norm (RMSNorm): Layer normalization before the MLP layer.
+    Combines multi-head attention and feedforward networks with
+    RMS normalization and residual connections.
     """
 
     def __init__(
@@ -239,14 +233,15 @@ class InternLM2Block(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initializes the InternLM2Block module.
+        """Initialize InternLM2 decoder layer.
 
         Args:
-            config (InternLM2Config): The configuration object for the InternLM2 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (InternLM2Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
         """
         self.config = config
         self.dtype = dtype
@@ -304,28 +299,25 @@ class InternLM2Block(nn.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """Forward pass of the InternLM2Block.
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
 
-        Applies self-attention, followed by a residual connection and layer normalization,
-        and then applies the MLP layer, followed by another residual connection and layer normalization.
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x))
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens.
-            causal_mask (tp.Optional[Array | bool]): Causal mask for autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[Array]): Segment IDs (unused in standard InternLM2).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[Array]): Precomputed rotary frequency embeddings.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
 
         Returns:
-            tp.Union[tp.Tuple[Array, Array], tp.Tuple[Array]]:
-                A tuple containing the output hidden states. If `output_attentions` is True,
-                it also includes the attention weights.
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
         """
 
         attn_outputs = self.attention(
@@ -364,23 +356,16 @@ class InternLM2Block(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=InternLM2Config, model_type="internlm2")
 class InternLM2Model(EasyDeLBaseModule):
-    """The base InternLM2 model transformer.
+    """InternLM2 model implementation.
 
-    This class represents the core transformer architecture of the InternLM2 model,
-    consisting of embedding layers, multiple transformer blocks, and a final
-    layer normalization.
+    This implements the InternLM2 language model architecture, utilizing transformer blocks
+    with RMSNorm, rotary position embeddings, and grouped-query attention mechanism.
 
     Attributes:
-        config (InternLM2Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation. Default is jnp.float32.
-        param_dtype (jnp.dtype): Data type for parameters. Default is jnp.float32.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Default is None.
-        embed_tokens (nn.Embed): Embedding layer for input tokens.
-        layers (tp.Sequence[InternLM2Block]): Sequence of transformer blocks.
-        norm (RMSNorm): Final layer normalization.
-        gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
-        scan_layers (bool): Whether to use JAX scan for layer processing.
-        blocks_class (InternLM2Block): The class used for the transformer blocks.
+        config (InternLM2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
     """
 
     def __init__(
@@ -392,14 +377,14 @@ class InternLM2Model(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the InternLM2Model.
+        """Initialize InternLM2 base model.
 
         Args:
-            config (InternLM2Config): The configuration object for the InternLM2 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (InternLM2Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -449,32 +434,40 @@ class InternLM2Model(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass of the InternLM2Model.
+        """Forward pass through the InternLM2 base model.
+
+        Processes input tokens through embedding, all decoder layers with RoPE and RMSNorm,
+        and final normalization.
 
         Args:
-            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            BaseModelOutput: The model's output.
-                returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-                and `attentions` (optional).
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
 
         Raises:
-            ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         if inputs_embeds is None and input_ids is not None:
             inputs_embeds = self.tok_embeddings(input_ids.astype("i4"))
@@ -577,7 +570,17 @@ class InternLM2Model(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=InternLM2Config, model_type="internlm2")
 class InternLM2ForCausalLM(BaseCausalLMModule[InternLM2Model, InternLM2Config]):
-    """InternLM2 model with a Causal Language Modeling head."""
+    """InternLM2 model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation.
+
+    Attributes:
+        config (InternLM2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "internlm2"
@@ -592,6 +595,15 @@ class InternLM2ForCausalLM(BaseCausalLMModule[InternLM2Model, InternLM2Config]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize InternLM2 model for causal language modeling.
+
+        Args:
+            config (InternLM2Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=InternLM2Model,
@@ -619,30 +631,37 @@ class InternLM2ForCausalLM(BaseCausalLMModule[InternLM2Model, InternLM2Config]):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
-        """Forward pass of the InternLM2ForCausalLM model.
+        """Forward pass through the InternLM2 causal language model.
+
+        Processes input tokens through the base model and applies the language modeling head
+        to generate next token predictions.
 
         Args:
-            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language model head. Defaults to True.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            CausalLMOutput: The model's output.
-                returns a `CausalLMOutput` object containing `logits`, `hidden_states` (optional),
-                and `attentions` (optional).
+            CausalLMOutput: Contains logits, optional hidden_states, optional attentions,
+                last_hidden_state, and updated past_key_values.
         """
         outputs = self.model(
             input_ids=input_ids,
@@ -705,20 +724,16 @@ class InternLM2ForCausalLM(BaseCausalLMModule[InternLM2Model, InternLM2Config]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=InternLM2Config, model_type="internlm2")
 class InternLM2ForSequenceClassification(BaseSequenceClassificationModule[InternLM2Model, InternLM2Config]):
-    """InternLM2 model with a Sequence Classification head.
+    """InternLM2 model for sequence classification tasks.
 
-    This model consists of the base InternLM2 transformer (`InternLM2Model`) followed by a
-    linear layer (`score`) that projects the transformer's output hidden states
-    (typically the hidden state of the first token) to the number of classes for classification.
+    This class extends the base InternLM2 model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
 
     Attributes:
-        config (InternLM2Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation. Default is jnp.float32.
-        param_dtype (jnp.dtype): Data type for parameters. Default is jnp.float32.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Default is None.
-        rngs (nn.Rngs): Random number generators.
-        module (InternLM2Model): The core InternLM2 transformer model.
-        score (ParallelLinear): The linear layer for classification.
+        config (InternLM2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
     """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
@@ -734,14 +749,14 @@ class InternLM2ForSequenceClassification(BaseSequenceClassificationModule[Intern
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the InternLM2ForSequenceClassification model.
+        """Initialize InternLM2 model for sequence classification.
 
         Args:
-            config (InternLM2Config): The configuration object for the InternLM2 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (InternLM2Config): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -768,30 +783,39 @@ class InternLM2ForSequenceClassification(BaseSequenceClassificationModule[Intern
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
-        """Forward pass of the InternLM2ForSequenceClassification model.
+        """Forward pass through the InternLM2 sequence classification model.
+
+        Processes input tokens through the base model and applies the classification head
+        to generate class logits based on the pooled representation.
 
         Args:
-            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[Array]): Segment IDs (unused).
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            SequenceClassifierOutput: The model's output,
-                returns a `SequenceClassifierOutput` object containing `logits`, `hidden_states` (optional),
-                and `attentions` (optional).
+            SequenceClassifierOutput: Contains pooled logits, optional hidden_states, optional attentions,
+                and past_key_values.
+
+        Raises:
+            ValueError: If batch size > 1 and no pad_token_id is defined.
         """
         transformer_outputs = self.model(
             input_ids=input_ids,

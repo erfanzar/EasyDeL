@@ -66,7 +66,18 @@ from .qwen3_vl_moe_configuration import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig, 
 
 @auto_pytree
 class Qwen3VLMoeCausalLMOutputWithPast(ModelOutput):
-    """Output class for Qwen3-VL-MoE causal language model."""
+    """Output class for Qwen3-VL-MoE causal language model.
+
+    Attributes:
+        loss: Language modeling loss if labels provided.
+        logits: Prediction scores of the language model head.
+        past_key_values: Tuple of past key values for efficient generation.
+        hidden_states: Tuple of hidden states at each layer.
+        attentions: Tuple of attention weights at each layer.
+        rope_deltas: RoPE position deltas for mRoPE.
+        image_hidden_states: Hidden states from image processing.
+        router_logits: Tuple of router logits from MoE layers.
+    """
 
     loss: Array | None = None
     logits: Array = None
@@ -80,7 +91,16 @@ class Qwen3VLMoeCausalLMOutputWithPast(ModelOutput):
 
 @auto_pytree
 class Qwen3VLMoeModelOutputWithPast(ModelOutput):
-    """Base-model output for Qwen3-VL-MoE with optional mRoPE deltas."""
+    """Base-model output for Qwen3-VL-MoE with optional mRoPE deltas.
+
+    Attributes:
+        last_hidden_state: Final hidden state from the model.
+        past_key_values: Tuple of past key values for efficient generation.
+        hidden_states: Tuple of hidden states at each layer.
+        attentions: Tuple of attention weights at each layer.
+        rope_deltas: RoPE position deltas for mRoPE.
+        router_logits: Tuple of router logits from MoE layers.
+    """
 
     last_hidden_state: Array = None
     past_key_values: list[Array] | None = None
@@ -337,7 +357,11 @@ def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) 
 
 
 class Qwen3VLMoeVisionPatchEmbed(nn.Module):
-    """3D convolution-based patch embedding for Qwen3-VL-MoE vision encoder."""
+    """3D convolution-based patch embedding for Qwen3-VL-MoE vision encoder.
+
+    Converts input image/video pixels into patch embeddings using a 3D convolution
+    that operates over temporal and spatial dimensions simultaneously.
+    """
 
     def __init__(
         self,
@@ -348,6 +372,15 @@ class Qwen3VLMoeVisionPatchEmbed(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize Qwen3-VL-MoE vision patch embedding layer.
+
+        Args:
+            config (Qwen3VLMoeVisionConfig): Vision encoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.dtype = dtype
         self.patch_size = config.patch_size
         self.temporal_patch_size = config.temporal_patch_size
@@ -368,6 +401,14 @@ class Qwen3VLMoeVisionPatchEmbed(nn.Module):
         )
 
     def __call__(self, hidden_states: Array) -> Array:
+        """Apply 3D convolution to extract patch embeddings.
+
+        Args:
+            hidden_states (Array): Input pixel values flattened into patches.
+
+        Returns:
+            Array: Patch embeddings of shape (num_patches, hidden_size).
+        """
         hidden_states = jnp.transpose(
             hidden_states.reshape(
                 -1,
@@ -384,7 +425,11 @@ class Qwen3VLMoeVisionPatchEmbed(nn.Module):
 
 
 class Qwen3VLMoeVisionPatchMerger(nn.Module):
-    """Spatial patch merger with MLP gating for Qwen3-VL-MoE."""
+    """Spatial patch merger with MLP gating for Qwen3-VL-MoE.
+
+    Merges spatially adjacent patches to reduce sequence length while
+    preserving important visual information through a gated MLP.
+    """
 
     def __init__(
         self,
@@ -396,6 +441,17 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize Qwen3-VL-MoE vision patch merger.
+
+        Args:
+            config (Qwen3VLMoeVisionConfig): Vision encoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            use_postshuffle_norm (bool, optional): Whether to apply normalization after
+                spatial shuffling. Defaults to False.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.dtype = dtype
         self.spatial_merge_size = config.spatial_merge_size
@@ -429,13 +485,25 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         )
 
     def __call__(self, x: Array) -> Array:
+        """Merge patches through normalization and gated MLP.
+
+        Args:
+            x (Array): Input patch embeddings.
+
+        Returns:
+            Array: Merged patch embeddings with reduced spatial dimensions.
+        """
         x = self.norm(x.reshape(-1, self.hidden_size) if self.use_postshuffle_norm else x).reshape(-1, self.hidden_size)
         x = self.linear_fc2(nn.gelu(self.linear_fc1(x), approximate=False))
         return x
 
 
 class Qwen3VLMoeVisionMLP(nn.Module):
-    """Feed-forward network for Qwen3-VL-MoE vision encoder."""
+    """Feed-forward network for Qwen3-VL-MoE vision encoder.
+
+    Implements a two-layer MLP with GELU activation for vision feature
+    transformation within the vision transformer blocks.
+    """
 
     def __init__(
         self,
@@ -447,6 +515,17 @@ class Qwen3VLMoeVisionMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize Qwen3-VL-MoE vision MLP layer.
+
+        Args:
+            config (Qwen3VLMoeVisionConfig): Vision encoder configuration.
+            layer_idx (int | None, optional): Index of this layer in the encoder.
+                Defaults to None.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.layer_idx = layer_idx
         self.linear_fc1 = ColumnParallelLinear(
@@ -470,11 +549,23 @@ class Qwen3VLMoeVisionMLP(nn.Module):
         )
 
     def __call__(self, x: Array) -> Array:
+        """Apply feedforward transformation with GELU activation.
+
+        Args:
+            x (Array): Input tensor.
+
+        Returns:
+            Array: Transformed tensor with same shape as input.
+        """
         return self.linear_fc2(self.act(self.linear_fc1(x)))
 
 
 class Qwen3VLMoeVisionAttention(UnifiedAttention):
-    """Self-attention for Qwen3-VL-MoE vision encoder with rotary embeddings."""
+    """Self-attention for Qwen3-VL-MoE vision encoder with rotary embeddings.
+
+    Implements multi-head self-attention with 2D rotary position embeddings
+    for encoding spatial relationships in vision features.
+    """
 
     def __init__(
         self,
@@ -486,6 +577,16 @@ class Qwen3VLMoeVisionAttention(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Qwen3-VL-MoE vision attention layer.
+
+        Args:
+            config (Qwen3VLMoeVisionConfig): Vision encoder configuration.
+            layer_idx (int): Index of this layer in the encoder.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_heads
         self.head_dim = config.hidden_size // config.num_heads
@@ -532,6 +633,15 @@ class Qwen3VLMoeVisionAttention(UnifiedAttention):
         self.attention_performer = self._create_attention_performer(config, rngs)
 
     def _create_attention_performer(self, config, rngs: nn.Rngs):
+        """Create the attention performer module.
+
+        Args:
+            config: Vision configuration.
+            rngs (nn.Rngs): Random number generator state.
+
+        Returns:
+            FlexibleAttentionModule: Configured attention module.
+        """
         return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
@@ -547,6 +657,17 @@ class Qwen3VLMoeVisionAttention(UnifiedAttention):
         cu_seqlens: Array,
         rotary_pos_emb: Array = None,
     ) -> Array:
+        """Apply self-attention with rotary position embeddings.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (seq_len, hidden_size).
+            cu_seqlens (Array): Cumulative sequence lengths for block-diagonal attention.
+            rotary_pos_emb (Array, optional): Precomputed rotary position embeddings.
+                Defaults to None.
+
+        Returns:
+            Array: Attention output of shape (seq_len, hidden_size).
+        """
         seq_length = hidden_states.shape[0]
         qkv = self.qkv(hidden_states)
         q, k, v = map(
@@ -582,7 +703,11 @@ class Qwen3VLMoeVisionAttention(UnifiedAttention):
 
 
 class Qwen3VLMoeVisionBlock(nn.Module):
-    """Transformer block for Qwen3-VL-MoE vision encoder."""
+    """Transformer block for Qwen3-VL-MoE vision encoder.
+
+    Combines self-attention and MLP layers with pre-normalization
+    architecture and residual connections for vision feature processing.
+    """
 
     def __init__(
         self,
@@ -594,6 +719,16 @@ class Qwen3VLMoeVisionBlock(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize Qwen3-VL-MoE vision transformer block.
+
+        Args:
+            config (Qwen3VLMoeVisionConfig): Vision encoder configuration.
+            layer_idx (int): Index of this layer in the encoder.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.layer_idx = layer_idx
         self.norm1 = nn.LayerNorm(
@@ -633,6 +768,18 @@ class Qwen3VLMoeVisionBlock(nn.Module):
         cu_seqlens: Array,
         rotary_pos_emb: Array,
     ) -> Array:
+        """Forward pass through the vision transformer block.
+
+        Applies pre-normalization: x + attn(norm(x)) followed by x + mlp(norm(x)).
+
+        Args:
+            hidden_states (Array): Input tensor of shape (seq_len, hidden_size).
+            cu_seqlens (Array): Cumulative sequence lengths for block-diagonal attention.
+            rotary_pos_emb (Array): Precomputed rotary position embeddings.
+
+        Returns:
+            Array: Output tensor of shape (seq_len, hidden_size).
+        """
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
@@ -644,7 +791,20 @@ class Qwen3VLMoeVisionBlock(nn.Module):
 
 @register_module(TaskType.BASE_VISION, config=Qwen3VLMoeConfig, model_type="qwen3_vl_moe")
 class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
-    """Vision transformer encoder for Qwen3-VL-MoE."""
+    """Vision transformer encoder for Qwen3-VL-MoE.
+
+    Processes images and videos through patch embedding, positional encoding,
+    transformer blocks, and patch merging to produce visual features for the
+    language model.
+
+    Attributes:
+        config_class: Configuration class for the vision encoder.
+        patch_embed: 3D convolution-based patch embedding.
+        pos_embed: Learnable position embeddings.
+        blocks: List of vision transformer blocks.
+        merger: Patch merger for reducing spatial dimensions.
+        deepstack_merger_list: Additional mergers for deepstack visual features.
+    """
 
     config_class = Qwen3VLMoeVisionConfig
 
@@ -657,6 +817,15 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Qwen3-VL-MoE vision transformer encoder.
+
+        Args:
+            config (Qwen3VLMoeVisionConfig): Vision encoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -720,6 +889,11 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
         self.num_grid_per_side = int(math.sqrt(config.num_position_embeddings))
 
     def get_dtype(self) -> jnp.dtype:
+        """Get the data type used by the model parameters.
+
+        Returns:
+            jnp.dtype: Data type of the model parameters.
+        """
         return self.blocks[0].mlp.linear_fc2.kernel.value.dtype
 
     def fast_pos_embed_interpolate(self, grid_thw: Array) -> Array:
@@ -798,7 +972,17 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
         return jnp.concatenate(patch_pos_embeds_permute, axis=0)
 
     def rot_pos_emb(self, grid_thw: Array, max_grid_size: int) -> Array:
-        """Compute rotary position embeddings for vision features."""
+        """Compute rotary position embeddings for vision features.
+
+        Matches HuggingFace's Qwen3VLVisionModel.rot_pos_emb exactly.
+
+        Args:
+            grid_thw (Array): Grid dimensions (temporal, height, width) per image/video.
+            max_grid_size (int): Maximum grid size for embedding computation.
+
+        Returns:
+            Array: Rotary position embeddings.
+        """
         merge_size = self.spatial_merge_size
 
         freq_table = jnp.outer(
@@ -839,6 +1023,21 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
         grid_thw: Array,
         max_grid_size: int,
     ) -> tuple[Array, list[Array]]:
+        """Forward pass through the vision transformer encoder.
+
+        Processes input pixels through patch embedding, adds positional embeddings,
+        applies transformer blocks with rotary embeddings, and merges patches.
+
+        Args:
+            hidden_states (Array): Input pixel values.
+            grid_thw (Array): Grid dimensions (temporal, height, width) per image/video.
+            max_grid_size (int): Maximum grid size for positional embeddings.
+
+        Returns:
+            tuple[Array, list[Array]]: Tuple of (merged_features, deepstack_features).
+                merged_features: Final vision embeddings after patch merging.
+                deepstack_features: Intermediate features from specified layers.
+        """
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds
@@ -865,20 +1064,44 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
         return self.merger(hidden_states), deepstack_feature_lists
 
     def get_encoder(self):
+        """Get the encoder component.
+
+        Returns:
+            Qwen3VLMoeVisionTransformerPretrainedModel: The vision encoder itself.
+        """
         return self
 
     def get_decoder(self):
+        """Get the decoder component.
+
+        Raises:
+            NotImplementedError: Vision model does not have a decoder.
+        """
         raise NotImplementedError("Vision model does not have a decoder.")
 
     def get_lm_head(self):
+        """Get the language model head.
+
+        Raises:
+            NotImplementedError: Vision model does not have a language model head.
+        """
         raise NotImplementedError("Vision model does not have a language model head.")
 
     def get_embedding(self):
+        """Get the embedding layer.
+
+        Returns:
+            Qwen3VLMoeVisionPatchEmbed: The patch embedding layer.
+        """
         return self.patch_embed
 
 
 class Qwen3VLMoeTextMLP(nn.Module):
-    """SwiGLU feed-forward network for Qwen3-VL-MoE text decoder (dense MLP)."""
+    """SwiGLU feed-forward network for Qwen3-VL-MoE text decoder (dense MLP).
+
+    Implements the feedforward network with SwiGLU activation function
+    for enhanced representation learning in the text decoder.
+    """
 
     def __init__(
         self,
@@ -890,6 +1113,16 @@ class Qwen3VLMoeTextMLP(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Qwen3-VL-MoE text MLP block.
+
+        Args:
+            config (Qwen3VLMoeTextConfig): Text decoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the decoder.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -920,6 +1153,14 @@ class Qwen3VLMoeTextMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def __call__(self, hidden_states: Array) -> Array:
+        """Apply SwiGLU feedforward transformation.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+
+        Returns:
+            Array: Transformed hidden states of shape (batch, seq_len, hidden_dim).
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -937,7 +1178,11 @@ class Qwen3VLMoeTextMLP(nn.Module):
 
 
 class Qwen3VLMoeMLPStack(nn.Module):
-    """Qwen3-VL-MoE MoE MLP using the new ParallelMoELinear layers."""
+    """Qwen3-VL-MoE MoE MLP using the new ParallelMoELinear layers.
+
+    Implements the expert MLP stack for Mixture of Experts, where each expert
+    is a SwiGLU MLP that processes tokens routed to it.
+    """
 
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
@@ -964,6 +1209,15 @@ class Qwen3VLMoeMLPStack(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Qwen3-VL-MoE MLP stack for MoE.
+
+        Args:
+            config (Qwen3VLMoeTextConfig): Text decoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -1114,7 +1368,11 @@ class Qwen3VLMoeTextSparseBlock(BaseMoeModule):
 
 
 class Qwen3VLMoeTextAttention(UnifiedAttention):
-    """Causal self-attention for Qwen3-VL-MoE text decoder with mRoPE and QK-norm support."""
+    """Causal self-attention for Qwen3-VL-MoE text decoder with mRoPE and QK-norm support.
+
+    This attention module supports multi-dimensional rotary position embeddings (mRoPE)
+    for proper handling of multimodal inputs with temporal, height, and width dimensions.
+    """
 
     def __init__(
         self,
@@ -1126,6 +1384,16 @@ class Qwen3VLMoeTextAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Qwen3-VL-MoE text attention layer.
+
+        Args:
+            config (Qwen3VLMoeTextConfig): Text decoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the decoder.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1140,11 +1408,25 @@ class Qwen3VLMoeTextAttention(UnifiedAttention):
         )
 
     def _postprocess_qkv(self, query_states, key_states, value_states):
+        """Apply Q/K normalization after computing query, key, and value projections.
+
+        Args:
+            query_states: Query tensor from projection layer.
+            key_states: Key tensor from projection layer.
+            value_states: Value tensor from projection layer.
+
+        Returns:
+            Tuple of normalized query, normalized key, and value tensors.
+        """
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
 class Qwen3VLMoeTextDecoderLayer(nn.Module):
-    """Transformer decoder layer for Qwen3-VL-MoE text model with conditional MoE/dense MLP."""
+    """Transformer decoder layer for Qwen3-VL-MoE text model with conditional MoE/dense MLP.
+
+    Combines multi-head attention with Q/K normalization and feedforward networks
+    (either dense MLP or MoE) with RMS normalization and residual connections.
+    """
 
     def __init__(
         self,
@@ -1156,6 +1438,16 @@ class Qwen3VLMoeTextDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Qwen3-VL-MoE text decoder layer.
+
+        Args:
+            config (Qwen3VLMoeTextConfig): Text decoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the decoder.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -1233,6 +1525,27 @@ class Qwen3VLMoeTextDecoderLayer(nn.Module):
         output_router_logits: bool = False,
         frequencies: Array | None = None,
     ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x)).
+        Uses either dense MLP or MoE depending on layer configuration.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            position_ids (Array): Position indices, shape (3, batch, seq_len) for mRoPE.
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            output_router_logits (bool, optional): Whether to return MoE router logits. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, router logits, and cache view.
+        """
         attn_input = self.input_layernorm(hidden_states)
         attn_outputs = self.self_attn(
             attn_input,
@@ -1278,7 +1591,18 @@ class Qwen3VLMoeTextDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Qwen3VLMoeConfig, model_type="qwen3_vl_moe")
 class Qwen3VLMoeTextModel(EasyDeLBaseModule):
-    """Text decoder model for Qwen3-VL-MoE with MoE support."""
+    """Text decoder model for Qwen3-VL-MoE with MoE support.
+
+    Implements the text decoder component of Qwen3-VL-MoE, utilizing transformer blocks
+    with RMSNorm, Q/K normalization, multi-dimensional rotary position embeddings (mRoPE),
+    and Mixture of Experts (MoE) for handling multimodal inputs.
+
+    Attributes:
+        config: Configuration for the text decoder.
+        embed_tokens: Token embedding layer.
+        layers: List of transformer decoder layers (dense and MoE).
+        norm: Final layer normalization.
+    """
 
     def __init__(
         self,
@@ -1289,6 +1613,15 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Qwen3-VL-MoE text decoder model.
+
+        Args:
+            config (Qwen3VLMoeTextConfig): Text decoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         assert isinstance(config, Qwen3VLMoeTextConfig), (
             f"expected config to be of type Qwen3VLMoeTextConfig but got {type(config)}"
         )
@@ -1337,7 +1670,14 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
 
     @cached_property
     def frequencies(self):
-        """Cached RoPE frequency cache from config."""
+        """Get cached RoPE frequency tensor from config.
+
+        Computes and caches the rotary position embedding frequencies
+        based on the model's head dimension and rope_theta configuration.
+
+        Returns:
+            Array: Precomputed RoPE frequencies for position encoding.
+        """
         head_dim = getattr(self.config, "qk_rope_head_dim", None) or self.config.head_dim
         return self.config.get_basic_frequencies(
             head_size=head_dim,
@@ -1504,7 +1844,16 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         visual_pos_masks: Array,
         visual_embeds: Array,
     ) -> Array:
-        """Add visual embeddings to hidden states at visual token positions."""
+        """Add visual embeddings to hidden states at visual token positions.
+
+        Args:
+            hidden_states (Array): Current hidden states of shape (batch, seq_len, hidden_dim).
+            visual_pos_masks (Array): Boolean mask indicating visual token positions.
+            visual_embeds (Array): Visual embeddings to inject.
+
+        Returns:
+            Array: Updated hidden states with visual embeddings added.
+        """
         batch_size, seq_len, hidden_dim = hidden_states.shape
         flat_hidden = hidden_states.reshape(-1, hidden_dim)
         flat_mask = visual_pos_masks.reshape(-1)
@@ -1521,15 +1870,35 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         return flat_hidden.reshape(batch_size, seq_len, hidden_dim)
 
     def get_encoder(self):
+        """Get the encoder component.
+
+        Raises:
+            NotImplementedError: Text model does not have an encoder.
+        """
         raise NotImplementedError("Text model does not have an encoder.")
 
     def get_decoder(self):
+        """Get the decoder component.
+
+        Returns:
+            Qwen3VLMoeTextModel: The text decoder itself.
+        """
         return self
 
     def get_lm_head(self):
+        """Get the language model head.
+
+        Raises:
+            NotImplementedError: Base model does not have a language model head.
+        """
         raise NotImplementedError("Base model does not have a language model head.")
 
     def get_embedding(self):
+        """Get the embedding layer.
+
+        Returns:
+            nn.Embed: The token embedding layer.
+        """
         return self.embed_tokens
 
 
@@ -1557,6 +1926,15 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Qwen3-VL-MoE multimodal model.
+
+        Args:
+            config (Qwen3VLMoeConfig): Configuration for the multimodal model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1584,18 +1962,43 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         self.rope_deltas = None
 
     def get_input_embeddings(self):
+        """Get the input embeddings layer.
+
+        Returns:
+            nn.Embed: Token embedding layer from the language model.
+        """
         return self.language_model.get_embedding()
 
     def set_input_embeddings(self, value):
+        """Set the input embeddings layer.
+
+        Args:
+            value: New embedding layer to use.
+        """
         self.language_model.embed_tokens = value
 
     def set_decoder(self, decoder):
+        """Set the decoder component.
+
+        Args:
+            decoder: New decoder module to use.
+        """
         self.language_model = decoder
 
     def get_decoder(self):
+        """Get the decoder component.
+
+        Returns:
+            Qwen3VLMoeTextModel: The language model decoder.
+        """
         return self.language_model
 
     def get_encoder(self):
+        """Get the encoder component.
+
+        Returns:
+            Qwen3VLMoeVisionTransformerPretrainedModel: The vision encoder.
+        """
         return self.visual
 
     def get_rope_index(
@@ -1648,6 +2051,27 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         video_embeds: Array | None = None,
         **kwargs,
     ) -> Array:
+        """Compute embeddings with optional multimodal fusion.
+
+        Processes text embeddings and optionally merges visual embeddings
+        at placeholder token positions.
+
+        Args:
+            input_ids: Token IDs of shape (batch_size, sequence_length).
+            inputs_embeds: Pre-computed text embeddings.
+            pixel_values: Image pixel values.
+            pixel_values_videos: Video pixel values.
+            image_grid_thw: Grid dimensions for images.
+            video_grid_thw: Grid dimensions for videos.
+            image_max_grid_size: Maximum grid size for images.
+            video_max_grid_size: Maximum grid size for videos.
+            image_embeds: Pre-computed image embeddings.
+            video_embeds: Pre-computed video embeddings.
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            Array: Fused embeddings with visual features merged in.
+        """
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
@@ -1706,6 +2130,30 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         attention_mask: Array | None = None,
         **kwargs,
     ) -> tuple[Array, EmbeddingInfo]:
+        """Compute embeddings with full information for generation.
+
+        Similar to compute_embedding but returns additional metadata needed
+        for generation, including position IDs, rope deltas, and deepstack
+        visual embeddings.
+
+        Args:
+            input_ids: Token IDs of shape (batch_size, sequence_length).
+            inputs_embeds: Pre-computed text embeddings.
+            pixel_values: Image pixel values.
+            pixel_values_videos: Video pixel values.
+            image_grid_thw: Grid dimensions for images.
+            video_grid_thw: Grid dimensions for videos.
+            image_max_grid_size: Maximum grid size for images.
+            video_max_grid_size: Maximum grid size for videos.
+            image_embeds: Pre-computed image embeddings.
+            video_embeds: Pre-computed video embeddings.
+            attention_mask: Attention mask for padding.
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            Tuple of (embeddings, EmbeddingInfo) containing fused embeddings
+            and metadata for generation.
+        """
         if input_ids is None:
             raise ValueError("`input_ids` must be provided when calling `compute_embedding_with_info`.")
 
@@ -2111,9 +2559,19 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         )
 
     def get_lm_head(self):
+        """Get the language model head.
+
+        Raises:
+            NotImplementedError: Qwen3VLMoeModel does not have a language model head.
+        """
         raise NotImplementedError("Qwen3VLMoeModel does not have a language model head.")
 
     def get_embedding(self):
+        """Get the embedding layer.
+
+        Returns:
+            nn.Embed: The token embedding layer from the language model.
+        """
         return self.language_model.embed_tokens
 
 
@@ -2156,7 +2614,15 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen3VLMoeForConditionalGeneration model."""
+        """Initialize Qwen3-VL-MoE for conditional generation.
+
+        Args:
+            config (Qwen3VLMoeConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Qwen3VLMoeModel,
@@ -2177,25 +2643,53 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         self.vocab_size = config.text_config.vocab_size
 
     def get_input_embeddings(self):
+        """Get the input embeddings layer.
+
+        Returns:
+            nn.Embed: Token embedding layer.
+        """
         return self.model.get_input_embeddings()
 
     def set_input_embeddings(self, value):
+        """Set the input embeddings layer.
+
+        Args:
+            value: New embedding layer to use.
+        """
         self.model.set_input_embeddings(value)
 
     def set_decoder(self, decoder):
+        """Set the decoder component.
+
+        Args:
+            decoder: New decoder module to use.
+        """
         self.model.set_decoder(decoder)
 
     def get_decoder(self):
+        """Get the decoder component.
+
+        Returns:
+            Qwen3VLMoeTextModel: The language model decoder.
+        """
         return self.model.get_decoder()
 
     @property
     def visual(self):
-        """Property to access the vision transformer for backward compatibility."""
+        """Property to access the vision transformer for backward compatibility.
+
+        Returns:
+            Qwen3VLMoeVisionTransformerPretrainedModel: The vision encoder.
+        """
         return self.model.visual
 
     @property
     def language_model(self):
-        """Property to access the language model for backward compatibility."""
+        """Property to access the language model for backward compatibility.
+
+        Returns:
+            Qwen3VLMoeTextModel: The text decoder.
+        """
         return self.model.language_model
 
     def get_video_features(
@@ -2204,7 +2698,18 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         video_grid_thw: Array | None = None,
         video_max_grid_size: int | None = None,
     ) -> tuple[tuple[Array, ...], list[Array]]:
-        """Delegates to self.model.get_video_features."""
+        """Encode videos into continuous embeddings.
+
+        Delegates to self.model.get_video_features.
+
+        Args:
+            pixel_values_videos: The tensors corresponding to the input videos.
+            video_grid_thw: The temporal, height and width grid for each video.
+            video_max_grid_size: Maximum grid size for videos.
+
+        Returns:
+            Tuple of (video_embeds_tuple, deepstack_video_embeds).
+        """
         return self.model.get_video_features(pixel_values_videos, video_grid_thw, video_max_grid_size)
 
     def get_image_features(
@@ -2213,10 +2718,33 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         image_grid_thw: Array | None = None,
         image_max_grid_size: int | None = None,
     ) -> tuple[tuple[Array, ...], list[Array]]:
-        """Delegates to self.model.get_image_features."""
+        """Encode images into continuous embeddings.
+
+        Delegates to self.model.get_image_features.
+
+        Args:
+            pixel_values: The tensors corresponding to the input images.
+            image_grid_thw: The temporal, height and width grid for each image.
+            image_max_grid_size: Maximum grid size for images.
+
+        Returns:
+            Tuple of (image_embeds_tuple, deepstack_image_embeds).
+        """
         return self.model.get_image_features(pixel_values, image_grid_thw, image_max_grid_size)
 
     def compute_embedding(self, input_ids, *args, **kwargs):
+        """Compute embeddings with optional multimodal fusion.
+
+        Delegates to self.model.compute_embedding.
+
+        Args:
+            input_ids: Input token IDs.
+            *args: Positional arguments.
+            **kwargs: Keyword arguments.
+
+        Returns:
+            Array: Computed embeddings.
+        """
         return self.model.compute_embedding(input_ids, *args, **kwargs)
 
     def __call__(
@@ -2363,13 +2891,28 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         )
 
     def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Apply the language modeling head."""
+        """Apply the language modeling head.
+
+        Args:
+            hidden_states (Array): Hidden states from the model.
+
+        Returns:
+            Array: Logits over vocabulary.
+        """
         return self.lm_head(hidden_states)
 
     def get_vision_tower(self) -> nn.Module:
-        """Returns the vision tower component."""
+        """Get the vision tower component.
+
+        Returns:
+            Qwen3VLMoeVisionTransformerPretrainedModel: The vision encoder.
+        """
         return self.model.visual
 
     def get_language_model(self) -> nn.Module:
-        """Returns the language model component."""
+        """Get the language model component.
+
+        Returns:
+            Qwen3VLMoeTextModel: The text decoder.
+        """
         return self.model.language_model

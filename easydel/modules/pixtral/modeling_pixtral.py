@@ -169,21 +169,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=0):
 
 
 class PixtralMLP(nn.Module):
-    """Pixtral MLP module.
+    """Multi-Layer Perceptron module for Pixtral vision models.
 
-    This module implements the feed-forward network (MLP) used in the Pixtral vision model.
-    It uses a Gated Linear Unit (GLU) structure with SiLU activation.
-
-    Attributes:
-        config (PixtralVisionConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        gate_proj (ParallelLinear): Linear layer for the GLU gate.
-        down_proj (ParallelLinear): Linear layer for the down projection.
-        up_proj (ParallelLinear): Linear layer for the GLU value.
-        act_fn (callable): Activation function
-            (GELU in the original config, but SiLU is commonly used in similar models).
+    Implements the feedforward network with a Gated Linear Unit (GLU) structure
+    using SiLU activation for effective visual representation learning.
     """
 
     def __init__(
@@ -195,14 +184,15 @@ class PixtralMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the PixtralMLP module.
+        """Initialize Pixtral MLP block.
 
         Args:
-            config (PixtralVisionConfig): The configuration object for the Pixtral model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (PixtralVisionConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -243,26 +233,16 @@ class PixtralMLP(nn.Module):
         )
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
-        """Forward pass of the PixtralMLP module implementing a Gated Linear Unit structure.
-
-        This method applies a two-stream gated feedforward transformation:
-        1. Gate stream: hidden_states -> gate_proj -> activation
-        2. Value stream: hidden_states -> up_proj
-        3. Combine: element-wise multiply gate and value
-        4. Project down: down_proj to original hidden dimension
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply SiLU-gated feedforward transformation.
 
         Args:
-            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input hidden states tensor.
-                Shape: (batch_size, sequence_length, hidden_size)
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
-            jnp.ndarray: Output hidden states after MLP transformation.
-                Shape: (batch_size, sequence_length, hidden_size)
-
-        Note:
-            The method applies logical sharding for distributed training and uses
-            checkpoint_name for gradient checkpointing at intermediate steps.
+            Transformed hidden states [batch, seq_len, hidden_dim]
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -281,25 +261,12 @@ class PixtralMLP(nn.Module):
 
 
 class PixtralAttention(AttentionModule):
-    """Pixtral Attention module.
+    """Multi-head attention layer with 2D RoPE embeddings for Pixtral vision models.
 
-    This module implements the multi-head self-attention mechanism used in the Pixtral vision model.
-    It utilizes Rotary Position Embeddings (RoPE).
-
-    Attributes:
-        config (PixtralVisionConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        hidden_size (int): Dimensionality of the hidden states.
-        head_dim (int): Dimensionality of each attention head.
-        num_key_value_groups (int): Number of query head groups for each key/value head (typically 1 for MHA).
-        q_proj (ParallelLinear): Linear layer for query projection.
-        k_proj (ParallelLinear): Linear layer for key projection.
-        v_proj (ParallelLinear): Linear layer for value projection.
-        o_proj (ParallelLinear): Linear layer for the output projection.
-        attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
+    Implements vision-specific attention with:
+    - 2D Rotary Position Embeddings for spatial awareness
+    - Block-diagonal attention for multi-image batches
+    - Bidirectional attention within image patches
     """
 
     def __init__(
@@ -311,17 +278,14 @@ class PixtralAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the PixtralAttention module.
+        """Initialize Pixtral attention layer with 2D RoPE support.
 
         Args:
-            config (PixtralVisionConfig): The configuration object for the Pixtral model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
-
-        Raises:
-            ValueError: If `hidden_size` is not divisible by `num_attention_heads`.
+            config (PixtralVisionConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(config=config)
         self.dtype = dtype
@@ -372,41 +336,18 @@ class PixtralAttention(AttentionModule):
         position_ids: Int[Array, "batch seq_len"],
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """Forward pass of the PixtralAttention module with Rotary Position Embeddings.
-
-        This method implements multi-head self-attention with the following steps:
-        1. Project input to queries, keys, and values
-        2. Reshape projections to separate attention heads
-        3. Apply Rotary Position Embeddings (RoPE) to queries and keys
-        4. Compute attention scores and apply masking
-        5. Apply attention to values and project output
+    ) -> AttentionLayerOutput:
+        """Apply multi-head self-attention with 2D RoPE.
 
         Args:
-            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input hidden states.
-                Shape: (batch_size, sequence_length, hidden_size)
-            mask_info (MaskInfo): Mask information object containing attention masks
-                and position information for proper masking of attention scores.
-            position_ids (Int[Array, "batch seq_len"]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length). Used to index into RoPE frequencies.
-            output_attentions (bool, optional): Whether to return attention weights.
-                Defaults to False.
-            frequencies (Float[Array, "seq_len head_dim"], optional): Precomputed 2D rotary
-                frequency embeddings for position encoding. If None, standard behavior applies.
-                Shape: (max_positions, head_dim)
+            hidden_states (Array): Input tensor of shape (batch_size, num_patches, hidden_dim).
+            mask_info (MaskInfo): Attention mask information for block-diagonal masking.
+            position_ids (Array): Position indices for patches, shape (batch_size, num_patches).
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed 2D RoPE frequencies. Defaults to None.
 
         Returns:
-            AttentionLayerOutput: Object containing:
-                - attention_output (Array): Output hidden states after attention.
-                    Shape: (batch_size, sequence_length, hidden_size)
-                - attention_weight (Array, optional): Attention weights if output_attentions=True.
-                    Shape: (batch_size, num_heads, sequence_length, sequence_length)
-                - cache_view: Cache view for key-value caching (None for vision encoder)
-
-        Note:
-            Unlike causal language models, the vision encoder uses bidirectional attention
-            controlled by the mask_info parameter, allowing patches to attend to all other
-            patches within the same image (enforced via block-diagonal masking).
+            AttentionLayerOutput: Contains attention_output, optional attention_weight, and cache_view.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
@@ -482,22 +423,10 @@ class PixtralAttention(AttentionModule):
 
 
 class PixtralBlock(nn.Module):
-    """Pixtral Transformer Block.
+    """Single transformer block for Pixtral vision models.
 
-    This module represents a single transformer block in the Pixtral vision model,
-    containing self-attention and MLP sub-layers with residual connections
-    and RMS normalization.
-
-    Attributes:
-        config (PixtralVisionConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        ln_1 (RMSNorm): RMS normalization applied before the attention layer.
-        ln_2 (RMSNorm): RMS normalization applied before the MLP layer.
-        attention (PixtralAttention): The self-attention module.
-        feed_forward (PixtralMLP): The feed-forward (MLP) module.
+    Combines bidirectional attention with feedforward networks,
+    using RMS normalization and residual connections in a pre-norm architecture.
     """
 
     def __init__(
@@ -509,14 +438,14 @@ class PixtralBlock(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the PixtralBlock module.
+        """Initialize Pixtral transformer block.
 
         Args:
-            config (PixtralVisionConfig): The configuration object for the Pixtral model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (PixtralVisionConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -568,40 +497,20 @@ class PixtralBlock(nn.Module):
         position_ids: Int[Array, "batch seq_len"],
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """Forward pass of the PixtralBlock implementing pre-norm transformer architecture.
+    ) -> DecoderLayerOutput:
+        """Forward pass through the transformer block.
 
-        This method applies a standard transformer block with:
-        1. Pre-normalization before attention (attention_norm)
-        2. Self-attention with residual connection
-        3. Pre-normalization before feed-forward (ffn_norm)
-        4. Feed-forward network with residual connection
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x))
 
         Args:
-            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input hidden states.
-                Shape: (batch_size, sequence_length, hidden_size)
-            mask_info (MaskInfo): Mask information object containing attention masks
-                and position information.
-            position_ids (Int[Array, "batch seq_len"]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length)
-            output_attentions (bool, optional): Whether to return attention weights.
-                Defaults to False.
-            frequencies (Float[Array, "seq_len head_dim"], optional): Precomputed rotary
-                frequency embeddings for position encoding.
-                Shape: (max_positions, head_dim)
+            hidden_states (Array): Input tensor of shape (batch_size, num_patches, hidden_dim).
+            mask_info (MaskInfo): Attention mask information for block-diagonal masking.
+            position_ids (Array): Position indices for patches, shape (batch_size, num_patches).
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed 2D RoPE frequencies. Defaults to None.
 
         Returns:
-            DecoderLayerOutput: Object containing:
-                - hidden_states (Array): Output hidden states after the transformer block.
-                    Shape: (batch_size, sequence_length, hidden_size)
-                - attention_weight (Array, optional): Attention weights if output_attentions=True.
-                    Shape: (batch_size, num_heads, sequence_length, sequence_length)
-                - cache_view: Cache view for key-value caching (None for vision encoder)
-
-        Note:
-            The block uses RMSNorm for layer normalization and supports optional
-            block-wise FFN computation via scan for memory efficiency when
-            config.use_scan_mlp is enabled.
+            DecoderLayerOutput: Contains hidden_states, attention_weight, and cache_view.
         """
         residual = hidden_states
         attention_output = self.attention(
@@ -628,21 +537,10 @@ class PixtralBlock(nn.Module):
 
 
 class PixtralTransformer(nn.Module):
-    """Pixtral Transformer stack.
+    """Transformer stack for Pixtral vision models.
 
-    This module represents the main stack of transformer blocks in the Pixtral vision model.
-    It takes patch embeddings as input and processes them through multiple PixtralBlock layers,
-    applying a final layer normalization.
-
-    Attributes:
-        config (PixtralVisionConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        layers (tp.List[PixtralBlock]): List of transformer blocks.
-        ln_post (RMSNorm): Final layer normalization applied after the transformer blocks.
-        gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
+    Processes patch embeddings through multiple transformer blocks with
+    2D RoPE and block-diagonal attention for variable-resolution images.
     """
 
     def __init__(
@@ -654,14 +552,14 @@ class PixtralTransformer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the PixtralTransformer module.
+        """Initialize Pixtral transformer stack.
 
         Args:
-            config (PixtralVisionConfig): The configuration object for the Pixtral model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (PixtralVisionConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -689,45 +587,24 @@ class PixtralTransformer(nn.Module):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass of the PixtralTransformer processing patch embeddings through transformer layers.
+        """Forward pass through the Pixtral transformer stack.
 
-        This method processes patch embeddings through a stack of transformer blocks,
-        optionally collecting hidden states and attention weights from each layer.
+        Processes patch embeddings through all transformer blocks with RoPE and
+        block-diagonal attention.
 
         Args:
-            inputs_embeds (Float[Array, "batch seq_len hidden_dim"]): Input patch embeddings
-                from the patch convolution layer.
-                Shape: (batch_size, num_patches, hidden_size)
-            position_embeddings (Array, optional): Precomputed 2D RoPE position embeddings.
-                Shape: (num_patches, head_dim). These are the frequencies used for rotation.
-            attention_mask (Bool[Array, "batch seq_len"], optional): Boolean mask for attention.
-                Shape: (batch_size, 1, num_patches, num_patches).
-                True indicates positions to mask (no attention).
-            mask_info (MaskInfo, optional): Structured mask information object. If None,
-                will be constructed from attention_mask.
-            position_ids (Int[Array, "batch seq_len"], optional): Position indices for patches.
-                Shape: (batch_size, num_patches). If None, uses sequential positions.
-            output_attentions (bool, optional): Whether to return attention weights from all layers.
-                Defaults to config.output_attentions.
-            output_hidden_states (bool, optional): Whether to return hidden states from all layers.
-                Defaults to config.output_hidden_states.
+            inputs_embeds (Array): Input patch embeddings of shape (batch_size, num_patches, hidden_size).
+            position_embeddings (Array | None, optional): Precomputed 2D RoPE frequencies. Defaults to None.
+            attention_mask (Array | None, optional): Attention mask of shape
+                (batch_size, 1, num_patches, num_patches). Defaults to None.
+            mask_info (MaskInfo | None, optional): Structured mask information. Defaults to None.
+            position_ids (Array | None, optional): Position indices for patches. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return all hidden states. Defaults to None.
 
         Returns:
-            BaseModelOutput: Object containing:
-                - last_hidden_state (Array): Final layer output.
-                    Shape: (batch_size, num_patches, hidden_size)
-                - hidden_states (tuple, optional): Hidden states from all layers if requested.
-                    Each element shape: (batch_size, num_patches, hidden_size)
-                - attentions (tuple, optional): Attention weights from all layers if requested.
-                    Each element shape: (batch_size, num_heads, num_patches, num_patches)
-                - past_key_values: Always None for vision encoder
-
-        Raises:
-            AssertionError: If sequence_length exceeds max_position_embeddings.
-
-        Note:
-            The transformer uses pre-normalization architecture with RMSNorm and
-            processes patches with bidirectional attention (controlled by mask_info).
+            BaseModelOutput: Contains last_hidden_state, optional hidden_states, optional attentions,
+                and past_key_values (always None for vision encoder).
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -772,20 +649,17 @@ class PixtralTransformer(nn.Module):
 
 @register_module(TaskType.BASE_VISION, config=PixtralVisionConfig, model_type="pixtral")
 class PixtralVisionModel(EasyDeLBaseModule):
-    """The Pixtral Vision Model transformer.
+    """Pixtral vision encoder model.
 
-    This class implements the complete Pixtral vision model, including patch embedding
-    via convolution and the main transformer stack.
+    Implements the complete Pixtral vision model with patch embedding via convolution,
+    2D RoPE, and transformer stack. Supports variable-resolution images through
+    block-diagonal attention masking.
 
     Attributes:
-        config (PixtralVisionConfig): Configuration object for the model.
+        config (PixtralVisionConfig): Configuration for the model.
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        patch_conv (nn.Conv): Convolutional layer for patch embedding.
-        transformer (PixtralTransformer): The main transformer stack.
-        ln_pre (RMSNorm): Layer normalization applied before the transformer blocks.
+        precision: Precision setting for JAX operations.
     """
 
     def __init__(
@@ -797,14 +671,14 @@ class PixtralVisionModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the PixtralVisionModel.
+        """Initialize Pixtral vision model.
 
         Args:
-            config (PixtralVisionConfig): The configuration object for the Pixtral model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (PixtralVisionConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -840,8 +714,12 @@ class PixtralVisionModel(EasyDeLBaseModule):
         )
 
     @functools.cached_property
-    def frequencies(self):
-        """Cached property to compute and retrieve RoPE frequencies."""
+    def frequencies(self) -> Float[Array, "max_patches head_dim"]:
+        """Compute and cache 2D RoPE frequencies for patch positions.
+
+        Returns:
+            Array: Precomputed frequency embeddings of shape (max_patches_per_side^2, head_dim).
+        """
         return compute_frequencies(
             dim=self.config.head_dim,
             theta=self.config.rope_theta,
@@ -855,59 +733,25 @@ class PixtralVisionModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         *args,
         **kwargs,
-    ) -> tuple | BaseModelOutput:
-        """Forward pass of the PixtralVisionModel for processing variable-resolution images.
+    ) -> BaseModelOutput:
+        """Forward pass through the Pixtral vision model.
 
-        This method processes a batch of images (potentially of different sizes) through:
-        1. Patch embedding via convolution
-        2. RMSNorm pre-normalization
-        3. 2D Rotary Position Embedding (RoPE) computation
-        4. Block-diagonal attention masking for multi-image batches
-        5. Transformer processing
-
-        The key innovation is supporting multiple images of different resolutions in a single
-        batch by using block-diagonal attention masks to prevent cross-image attention.
+        Processes variable-resolution images through patch embedding, 2D RoPE,
+        and transformer with block-diagonal attention for multi-image batches.
 
         Args:
-            pixel_values (list[Array]): List of input images, where each image is a tensor
-                of shape (num_channels, height, width). Images can have different heights
-                and widths. The list length determines the number of images in the batch.
-                Note: Each image should be in CHW format (channels, height, width).
-            output_hidden_states (bool, optional): Whether to return hidden states from all
-                transformer layers. Defaults to False.
-            output_attentions (bool, optional): Whether to return attention weights from all
-                transformer layers. Defaults to config.output_attentions.
+            pixel_values (list[Array]): List of input images, each of shape (channels, height, width).
+                Images can have different resolutions.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all
+                layers. Defaults to False.
+            output_attentions (bool | None, optional): Whether to return attention weights.
+                Defaults to None.
             *args: Additional positional arguments (unused, for compatibility).
             **kwargs: Additional keyword arguments (unused, for compatibility).
 
         Returns:
-            BaseModelOutput: Object containing:
-                - last_hidden_state (Array): Final vision encoder output.
-                    Shape: (1, total_num_patches, hidden_size) where total_num_patches
-                    is the sum of patches from all images in the batch.
-                - hidden_states (tuple, optional): Hidden states from all layers if requested.
-                    Each element has shape matching last_hidden_state.
-                - attentions (tuple, optional): Attention weights from all layers if requested.
-                    Each element shape: (1, num_heads, total_num_patches, total_num_patches)
-                    with block-diagonal structure for multi-image batches.
-
-        Example:
-            ```python
-            # Process images of different sizes
-            image1 = jnp.zeros((3, 1024, 1024))  # 64x64 patches
-            image2 = jnp.zeros((3, 512, 768))     # 32x48 patches
-
-            outputs = model(pixel_values=[image1, image2])
-            # outputs.last_hidden_state shape: (1, 4096 + 1536, 1024)
-            #   = (1, 64*64 + 32*48, hidden_size)
-            ```
-
-        Note:
-            The method handles variable image sizes by:
-            - Computing patches independently for each image
-            - Concatenating all patches into a single sequence
-            - Using 2D position IDs that preserve spatial structure
-            - Applying block-diagonal masks to isolate each image's attention
+            BaseModelOutput: Contains last_hidden_state of shape (1, total_patches, hidden_size),
+                optional hidden_states, and optional attentions.
         """
         patch_embeds_list = [
             self.patch_conv(jnp.expand_dims(img, 0).astype(self.dtype).transpose(0, 2, 3, 1)) for img in pixel_values
@@ -941,28 +785,17 @@ class PixtralVisionModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        This vision model acts as the encoder.
-        """
+        """Returns the encoder (this vision model acts as the encoder)."""
         return self
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        This is an encoder-only model and does not have a decoder.
-        """
+        """Returns the decoder (not applicable for encoder-only vision model)."""
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        This vision model does not have a language model head.
-        """
+        """Returns the language model head (not applicable for vision encoder)."""
         raise NotImplementedError("This vision model does not have a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module. In this case, it's the patch convolution layer.
-        """
+        """Returns the patch embedding layer."""
         return self.patch_conv

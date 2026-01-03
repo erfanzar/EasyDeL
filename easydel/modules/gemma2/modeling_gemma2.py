@@ -64,6 +64,12 @@ class Gemma2RMSNorm(nn.Module):
     kernel_init = staticmethod(nn.initializers.ones)
 
     def __init__(self, config: Gemma2Config, dtype: jnp.dtype = jnp.float32):
+        """Initialize Gemma2 RMS normalization layer.
+
+        Args:
+            config (Gemma2Config): Model configuration containing hidden_size and rms_norm_eps.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
+        """
         self.config = config
         self.epsilon = self.config.rms_norm_eps
         self.dtype = dtype
@@ -74,7 +80,17 @@ class Gemma2RMSNorm(nn.Module):
             key=None,
         )
 
-    def __call__(self, hidden_states):
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply RMS normalization with learnable scale.
+
+        Args:
+            hidden_states: Input tensor to normalize.
+
+        Returns:
+            Normalized and scaled hidden states.
+        """
         variance = hidden_states.astype(jnp.float32)
         variance = jnp.power(variance, 2)
         variance = variance.mean(-1, keepdims=True)
@@ -103,7 +119,19 @@ class Gemma2Attention(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
-        """Initialize Gemma2 attention with sliding window configuration."""
+        """Initialize Gemma2 attention with sliding window configuration.
+
+        Args:
+            config (Gemma2Config): Model configuration with attention parameters.
+            layer_idx (int): Index of this layer in the model, determines attention type.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision for
+                matrix operations. Defaults to None.
+            causal (bool, optional): Whether to use causal attention masking. Defaults to True.
+            is_cross_attention (bool, optional): Whether this is cross-attention. Defaults to False.
+            rngs (nn.Rngs): Random number generator state.
+        """
         # Set layer-specific attributes before super().__init__
         self.is_cross_attention = is_cross_attention
 
@@ -148,6 +176,15 @@ class Gemma2Attention(UnifiedAttention):
         return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads * self.head_dim))
 
     def _split_heads(self, hidden_states, num_heads):
+        """Split hidden states into separate attention heads.
+
+        Args:
+            hidden_states (Array): The hidden states to split.
+            num_heads (int): Number of attention heads.
+
+        Returns:
+            Array: The hidden states with separate head dimensions.
+        """
         return hidden_states.reshape((*hidden_states.shape[:2], num_heads, self.head_dim))
 
 
@@ -167,6 +204,16 @@ class Gemma2MLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Gemma2 MLP block.
+
+        Args:
+            config (Gemma2Config): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision for
+                matrix operations. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -215,6 +262,16 @@ class Gemma2MLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Forward pass through the MLP block.
+
+        Applies gated linear units with activation function: down_proj(act(gate_proj(x)) * up_proj(x))
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+
+        Returns:
+            Array: Output tensor of shape (batch_size, sequence_length, hidden_dim).
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -248,6 +305,18 @@ class Gemma2DecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Gemma2 decoder layer.
+
+        Args:
+            config (Gemma2Config): Model configuration.
+            layer_idx (int): Index of this layer in the model, determines attention type
+                (sliding window on odd layers, full attention on even layers).
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision for
+                matrix operations. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -295,22 +364,26 @@ class Gemma2DecoderLayer(nn.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """
-        Forward pass of the module block.
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture with additional post-attention and post-feedforward
+        normalization: x + post_attn_norm(attn(norm(x))) followed by x + post_ff_norm(mlp(pre_ff_norm(x)))
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens.
-            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for each token, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): View into the
+                key-value cache for this layer. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
         Returns:
-            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
+            DecoderLayerOutput: Contains hidden states, optional attention weights, and updated cache view.
         """
         residual = hidden_states
 
@@ -358,7 +431,19 @@ class Gemma2DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Gemma2Config, model_type="gemma2")
 class Gemma2Model(EasyDeLBaseModule):
-    """Decoder-only Gemma2 transformer composed of embedding, decoder stack, and final norm."""
+    """Gemma2 model implementation.
+
+    This implements the Gemma2 language model architecture, utilizing transformer blocks
+    with RMSNorm, rotary position embeddings, and a hybrid attention mechanism that
+    alternates between sliding window attention and full attention across layers.
+    Gemma2 uses embedding scaling by sqrt(hidden_size) for training stability.
+
+    Attributes:
+        config (Gemma2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -369,6 +454,16 @@ class Gemma2Model(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Gemma2 base model.
+
+        Args:
+            config (Gemma2Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -571,7 +666,18 @@ class Gemma2Model(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=Gemma2Config, model_type="gemma2")
 class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
-    """Gemma2 model with a language modeling head for causal language modeling tasks."""
+    """Gemma2 model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation. Gemma2 includes final
+    logit softcapping for improved training stability.
+
+    Attributes:
+        config (Gemma2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "gemma2"
@@ -586,6 +692,16 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Gemma2 model for causal language modeling.
+
+        Args:
+            config (Gemma2Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Gemma2Model,
@@ -726,7 +842,17 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Gemma2Config, model_type="gemma2")
 class Gemma2ForSequenceClassification(BaseSequenceClassificationModule[Gemma2Model, Gemma2Config]):
-    """Gemma2 text encoder with a classification head for sequence-level tasks."""
+    """Gemma2 model for sequence classification tasks.
+
+    This class extends the base Gemma2 model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+
+    Attributes:
+        config (Gemma2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "gemma2"
@@ -741,6 +867,16 @@ class Gemma2ForSequenceClassification(BaseSequenceClassificationModule[Gemma2Mod
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Gemma2 model for sequence classification.
+
+        Args:
+            config (Gemma2Config): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Gemma2Model,
@@ -766,6 +902,33 @@ class Gemma2ForSequenceClassification(BaseSequenceClassificationModule[Gemma2Mod
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
+        """Forward pass through the Gemma2 sequence classification model.
+
+        Runs the base model and applies a classification head to the last token's hidden state
+        to produce class logits.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings. Defaults to None.
+            attention_mask (Array | None, optional): Mask to avoid attention on padding tokens.
+                Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information. Defaults to None.
+            position_ids (Array | None, optional): Position indices for tokens. Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cached states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return all hidden states. Defaults to None.
+
+        Returns:
+            SequenceClassifierOutput: Contains classification logits, hidden states, and attentions.
+
+        Raises:
+            ValueError: If batch size > 1 and no padding token is defined.
+        """
         transformer_outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

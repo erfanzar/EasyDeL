@@ -77,8 +77,16 @@ class MixtralAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initialize Mixtral attention with sliding window configuration."""
+        """Initialize Mixtral attention with sliding window configuration.
 
+        Args:
+            config (MixtralConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         super().__init__(
             config,
             dtype,
@@ -97,7 +105,11 @@ class MixtralAttention(UnifiedAttention):
 
 
 class MixtralMoEMlp(nn.Module):
-    """Mixtral MoE MLP using the new ParallelMoELinear layers."""
+    """Mixture of Experts MLP module for Mixtral models.
+
+    Implements the feedforward network used by each expert in the Sparse MoE block.
+    Uses SwiGLU activation with gated projections (w1, w3) and a down projection (w2).
+    """
 
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
@@ -124,6 +136,16 @@ class MixtralMoEMlp(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Mixtral MoE MLP block.
+
+        Args:
+            config (MixtralConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -173,7 +195,17 @@ class MixtralMoEMlp(nn.Module):
         group_sizes: Array,
         sorted_experts: Array | None = None,
     ) -> Array:
-        """Forward pass through MoE MLP."""
+        """Apply SwiGLU feedforward transformation for MoE.
+
+        Args:
+            x (Array): Input tensor for the expert MLP.
+            group_sizes (Array): Sizes of token groups assigned to each expert.
+            sorted_experts (Array | None, optional): Sorted expert indices for routing.
+                Defaults to None.
+
+        Returns:
+            Array: Transformed hidden states after expert MLP processing.
+        """
         hidden_states = checkpoint_name(self.act_fn(self.w1(x, group_sizes, sorted_experts)), "mlp_gate")
         hidden_states = checkpoint_name(hidden_states * self.w3(x, group_sizes, sorted_experts), "mlp_up")
         outputs = checkpoint_name(self.w2(hidden_states, group_sizes, sorted_experts), "mlp_down")
@@ -181,7 +213,11 @@ class MixtralMoEMlp(nn.Module):
 
 
 class MixtralSparseMoeBlock(BaseMoeModule):
-    """Mixtral Sparse MoE block using BaseMoeModule."""
+    """Sparse Mixture of Experts block for Mixtral models.
+
+    Implements the sparse MoE layer that routes tokens to a subset of expert MLPs.
+    Uses top-k routing with load balancing to distribute tokens across experts efficiently.
+    """
 
     def __init__(
         self,
@@ -192,6 +228,16 @@ class MixtralSparseMoeBlock(BaseMoeModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Mixtral Sparse MoE block.
+
+        Args:
+            config (MixtralConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             n_routed_experts=config.num_local_experts,
@@ -229,7 +275,18 @@ class MixtralSparseMoeBlock(BaseMoeModule):
         )
 
     def __call__(self, hidden_state: Array) -> tuple[Array, Array]:
-        """Forward pass of the MoE block."""
+        """Forward pass through the Sparse MoE block.
+
+        Routes input tokens to selected experts and combines their outputs.
+
+        Args:
+            hidden_state (Array): Input hidden states of shape (batch, seq_len, hidden_dim).
+
+        Returns:
+            tuple[Array, Array]: A tuple containing:
+                - Output hidden states after MoE processing (batch, seq_len, hidden_dim).
+                - Router logits for auxiliary loss computation (batch, seq_len, num_experts).
+        """
         out, router_logits = self.moe_call(
             hidden_state=hidden_state,
             gate_layer=self.gate,
@@ -243,7 +300,11 @@ class MixtralSparseMoeBlock(BaseMoeModule):
 
 
 class MixtralDecoderLayer(nn.Module):
-    """Mixtral Transformer Decoder Layer with updated MoE integration."""
+    """Single decoder layer for Mixtral models.
+
+    Combines multi-head attention with sliding window and Sparse MoE feedforward
+    networks, using RMS normalization and residual connections.
+    """
 
     def __init__(
         self,
@@ -255,6 +316,16 @@ class MixtralDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Mixtral decoder layer.
+
+        Args:
+            config (MixtralConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -317,7 +388,26 @@ class MixtralDecoderLayer(nn.Module):
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
-        """Forward pass of the MixtralDecoderLayer module."""
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + moe(norm(x))
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal and sliding window masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            output_router_logits (bool, optional): Whether to return router logits. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, router logits, and cache view.
+        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = apply_logical_sharding(
@@ -382,14 +472,14 @@ class MixtralModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the MixtralModel.
+        """Initialize Mixtral base model.
 
         Args:
-            config (MixtralConfig): The configuration object for the Mixtral model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (MixtralConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -447,35 +537,42 @@ class MixtralModel(EasyDeLBaseModule):
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> MoeModelOutput:
-        """Forward pass of the MixtralModel.
+        """Forward pass through the Mixtral base model.
+
+        Processes input tokens through embedding, all decoder layers with sliding window
+        attention, Sparse MoE, and final normalization.
 
         Args:
-            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            output_router_logits (tp.Optional[bool]): Whether to return router logits from the MoE layers.
-                Defaults to `config.output_router_logits`.
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None (uses config.output_attentions).
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None (uses config.output_hidden_states).
+            output_router_logits (bool | None, optional): Whether to return router logits from MoE layers.
+                Defaults to None (uses config.output_router_logits).
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
 
         Returns:
-            MoeModelOutput: The model's output.
-                returns a `MoeModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-                `attentions` (optional), and `router_logits` (optional).
+            MoeModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                optional router_logits, and updated past_key_values.
 
         Raises:
-            ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
@@ -594,7 +691,17 @@ class MixtralModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=MixtralConfig, model_type="mixtral")
 class MixtralForCausalLM(BaseCausalLMModule[MixtralModel, MixtralConfig]):
-    """Mixtral model with a Causal Language Modeling head."""
+    """Mixtral model with a language modeling head for causal language modeling tasks.
+
+    This model is a sparse MoE transformer-based language model with causal attention masks
+    and sliding window attention applied to perform autoregressive language generation.
+
+    Attributes:
+        config (MixtralConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "mixtral"
@@ -609,6 +716,15 @@ class MixtralForCausalLM(BaseCausalLMModule[MixtralModel, MixtralConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Mixtral model for causal language modeling.
+
+        Args:
+            config (MixtralConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=MixtralModel,
@@ -636,7 +752,38 @@ class MixtralForCausalLM(BaseCausalLMModule[MixtralModel, MixtralConfig]):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
-        """Forward pass of the MixtralForCausalLM model."""
+        """Forward pass through the Mixtral causal language model.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router logits from MoE layers.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply language model head projection.
+                Defaults to True.
+
+        Returns:
+            MoeCausalLMOutput: Contains logits, optional hidden_states, optional attentions,
+                optional router_logits, auxiliary loss, and updated past_key_values.
+        """
         return self.forward_moe(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -654,7 +801,15 @@ class MixtralForCausalLM(BaseCausalLMModule[MixtralModel, MixtralConfig]):
         )
 
     def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary loss from router logits."""
+        """Compute auxiliary load balancing loss from router logits.
+
+        Args:
+            outputs: Model outputs containing router_logits from MoE layers.
+            attention_mask: Attention mask to exclude padding tokens from loss computation.
+
+        Returns:
+            Optional auxiliary loss value for load balancing, or None if router_logits unavailable.
+        """
         if outputs.router_logits is None or len(outputs.router_logits) == 0:
             return None
         aux_loss = auxiliary_load_balancing_loss_func(
@@ -668,7 +823,17 @@ class MixtralForCausalLM(BaseCausalLMModule[MixtralModel, MixtralConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=MixtralConfig, model_type="mixtral")
 class MixtralForSequenceClassification(BaseSequenceClassificationModule[MixtralModel, MixtralConfig]):
-    """Mixtral model with a Sequence Classification head."""
+    """Mixtral model for sequence classification tasks.
+
+    This class extends the base Mixtral model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+
+    Attributes:
+        config (MixtralConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "mixtral"
@@ -683,6 +848,15 @@ class MixtralForSequenceClassification(BaseSequenceClassificationModule[MixtralM
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Mixtral model for sequence classification.
+
+        Args:
+            config (MixtralConfig): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=MixtralModel,
@@ -710,7 +884,36 @@ class MixtralForSequenceClassification(BaseSequenceClassificationModule[MixtralM
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> SequenceClassifierOutput:
-        """Forward pass of the MixtralForSequenceClassification model."""
+        """Forward pass through the Mixtral sequence classification model.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router logits from MoE layers.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+
+        Returns:
+            SequenceClassifierOutput: Contains classification logits, optional hidden_states,
+                optional attentions, auxiliary loss, and updated past_key_values.
+        """
         transformer_outputs = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,

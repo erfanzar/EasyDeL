@@ -112,6 +112,19 @@ class MptMLP(nn.Module):
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
         residual: Float[Array, "batch seq_len hidden_dim"],
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Forward pass of the MptMLP module.
+
+        Applies a two-layer feed-forward network with GELU activation.
+        The computation is: dropout(down_proj(gelu(up_proj(hidden_states)))) + residual.
+
+        Args:
+            hidden_states: Input hidden states of shape (batch_size, sequence_length, hidden_dim).
+            residual: Residual connection tensor of shape (batch_size, sequence_length, hidden_dim)
+                to be added to the output.
+
+        Returns:
+            Output hidden states with residual connection of shape (batch_size, sequence_length, hidden_dim).
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -155,7 +168,16 @@ class MptAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initialize MPT attention with ALiBi support."""
+        """Initialize MPT attention with ALiBi support.
+
+        Args:
+            config: Configuration object for the MPT model.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: Precision setting for JAX operations. Defaults to None.
+            rngs: Random number generators.
+            layer_idx: Index of this layer in the transformer stack.
+        """
         super().__init__(
             config,
             dtype,
@@ -175,7 +197,18 @@ class MptAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike,
         rngs: nn.Rngs,
     ):
-        """Define MPT-specific network with fused QKV projection."""
+        """Define MPT-specific network with fused QKV projection.
+
+        Creates the query/key/value projection layer (Wqkv), output projection (out_proj),
+        dropout, attention performer, and ALiBi slopes.
+
+        Args:
+            config: Configuration object for the MPT model.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            precision: Precision setting for JAX operations.
+            rngs: Random number generators.
+        """
         self.Wqkv = ColumnParallelLinear(
             config.hidden_size,
             config.hidden_size * 3,
@@ -207,7 +240,15 @@ class MptAttention(UnifiedAttention):
         self._create_alibi_slopes(config)
 
     def _create_attention_performer(self, config: MptConfig, rngs: nn.Rngs):
-        """Create attention performer with MPT-specific settings."""
+        """Create attention performer with MPT-specific settings.
+
+        Args:
+            config: Configuration object for the MPT model.
+            rngs: Random number generators.
+
+        Returns:
+            FlexibleAttentionModule configured for MPT attention.
+        """
         softmax_scale = config.attn_config.softmax_scale
         if softmax_scale is None:
             softmax_scale = 1 / math.sqrt(self.head_dim)
@@ -220,6 +261,14 @@ class MptAttention(UnifiedAttention):
         )
 
     def _compute_alibi_bias(self, sequence_length):
+        """Compute ALiBi positional bias tensor.
+
+        Args:
+            sequence_length: Maximum sequence length for the ALiBi tensor.
+
+        Returns:
+            ALiBi bias tensor of shape (1, num_heads, sequence_length, sequence_length).
+        """
         config: MptConfig = self.config
         return build_mpt_alibi_tensor(config.n_heads, sequence_length, config.attn_config.alibi_bias_max)
 
@@ -234,10 +283,27 @@ class MptAttention(UnifiedAttention):
         output_attentions: bool = False,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
     ) -> AttentionLayerOutput:
-        """Override ALiBi forward with fused QKV projection.
+        """Forward pass with ALiBi positional bias and fused QKV projection.
 
-        Important: ALiBi does not enforce causality by itself, so we must still
-        apply causal masking (and padding masking) via `mask_info` / `causal`.
+        Implements attention with ALiBi (Attention with Linear Biases) for positional
+        encoding. Uses a fused QKV projection for efficiency.
+
+        Important: ALiBi does not enforce causality by itself, so causal masking
+        is applied via `mask_info` and the `causal` flag.
+
+        Args:
+            hidden_states: Input hidden states of shape (batch_size, seq_len, hidden_dim).
+            mask_info: Mask information for attention computation.
+            position_ids: Position indices of shape (batch_size, seq_len).
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER).
+            cache_view: Cache view for key/value states in generation.
+            cache_metadata: Metadata for cache handling.
+            output_attentions: Whether to return attention weights.
+            alibi: Optional pre-computed ALiBi bias tensor. If None, computed internally.
+
+        Returns:
+            AttentionLayerOutput containing attention output, optional attention weights,
+            and updated cache view.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
 
@@ -426,6 +492,26 @@ class MptBlock(nn.Module):
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         position_bias: Float[Array, "batch heads seq_len seq_len"] | None = None,
     ) -> DecoderLayerOutput:
+        """Forward pass of the MptBlock.
+
+        Applies pre-norm architecture: LayerNorm -> Attention -> Residual -> LayerNorm -> MLP -> Residual.
+        Uses ALiBi positional encoding through the position_bias parameter.
+
+        Args:
+            hidden_states: Input hidden states of shape (batch_size, seq_len, hidden_dim).
+            mask_info: Mask information for attention computation.
+            position_ids: Position indices of shape (batch_size, seq_len).
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER).
+            cache_view: Cache view for key/value states in generation.
+            cache_metadata: Metadata for cache handling.
+            output_attentions: Whether to return attention weights.
+            frequencies: Unused, kept for interface compatibility.
+            position_bias: ALiBi positional bias tensor of shape (batch, heads, seq_len, seq_len).
+
+        Returns:
+            DecoderLayerOutput containing hidden states, optional attention weights,
+            and updated cache view.
+        """
         attn_outputs = self.attn(
             self.norm_1(hidden_states),
             mask_info,
@@ -572,6 +658,12 @@ class MptModel(EasyDeLBaseModule):
 
     @cached_property
     def alibi(self):
+        """Compute and cache the ALiBi positional bias tensor.
+
+        Returns:
+            ALiBi tensor of shape (1, num_heads, max_seq_len, max_seq_len) containing
+            position-dependent attention biases.
+        """
         return build_mpt_alibi_tensor(
             sequence_length=self.config.max_seq_len,
             num_heads=self.config.n_heads,
@@ -590,6 +682,39 @@ class MptModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
+        """Forward pass through the MPT transformer model.
+
+        Processes input tokens through learned token embeddings (no explicit positional
+        embeddings - uses ALiBi), multiple transformer blocks, and final layer normalization.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length). Either this
+                or `inputs_embeds` must be provided but not both.
+            inputs_embeds: Pre-computed input embeddings of shape (batch_size, sequence_length,
+                hidden_size). Use instead of `input_ids` for custom embeddings.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) indicating
+                which tokens to attend to (True) and which to ignore (False).
+            mask_info: Pre-computed mask information. If provided, overrides `attention_mask`.
+            position_ids: Position indices of shape (batch_size, sequence_length). Used for
+                ALiBi bias computation.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER). Auto-detected if None.
+            past_key_values: Cached key/value states for efficient autoregressive generation.
+            cache_metadata: Metadata for paged attention mechanisms.
+            output_attentions: Whether to return attention weights from all layers.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutput containing:
+                - last_hidden_state: Final layer output of shape (batch, seq_len, hidden_size)
+                - past_key_values: Updated cache for next generation step
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+
+        Raises:
+            ValueError: If both `input_ids` and `inputs_embeds` are provided, or if neither
+                is provided.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
+        """
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -680,7 +805,21 @@ class MptModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=MptConfig, model_type="mpt")
 class MptForCausalLM(BaseCausalLMModule[MptModel, MptConfig]):
-    """MPT model with a language modeling head."""
+    """MPT model with a language modeling head for causal language modeling.
+
+    This model extends the base MptModel by adding a linear layer on top to
+    predict the next token in a sequence, making it suitable for causal language
+    modeling tasks. It uses ALiBi for positional encoding.
+
+    Attributes:
+        config (MptConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        rngs (nn.Rngs): Random number generators.
+        transformer (MptModel): The base MPT transformer model.
+        lm_head (nn.Linear): Linear layer for language modeling predictions.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "mpt"
@@ -695,6 +834,15 @@ class MptForCausalLM(BaseCausalLMModule[MptModel, MptConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the MPT causal language model.
+
+        Args:
+            config: Configuration object for the MPT model.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: Precision setting for JAX operations. Defaults to None.
+            rngs: Random number generators.
+        """
         super().__init__(
             config=config,
             base_model_class=MptModel,

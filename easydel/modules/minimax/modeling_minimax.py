@@ -84,12 +84,13 @@ class MiniMaxLightningAttention(nn.Module):
         """Initialize the MiniMaxLightningAttention module.
 
         Args:
-            config: Model configuration containing attention parameters.
-            dtype: Data type for computation.
-            param_dtype: Data type for parameters.
-            precision: JAX precision setting for matrix operations.
-            rngs: Random number generators for initialization.
-            layer_idx: Index of this layer in the transformer stack.
+            config (MiniMaxConfig): Model configuration containing attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generators for initialization.
+            layer_idx (int): Index of this layer in the transformer stack.
         """
         super().__init__()
         self.config = config
@@ -146,7 +147,7 @@ class MiniMaxLightningAttention(nn.Module):
         with earlier layers having faster decay rates.
 
         Returns:
-            Array of shape (num_heads, 1, 1) containing decay rates per head.
+            Array: Decay rates per head of shape (num_heads, 1, 1).
         """
         base = 1.0 / (2.0 ** (8.0 / self.num_attention_heads))
         exponent = jnp.arange(self.num_attention_heads, dtype=jnp.float32) + 1.0
@@ -158,10 +159,10 @@ class MiniMaxLightningAttention(nn.Module):
         """Compute decay factors for block-wise attention computation.
 
         Args:
-            slope_rate: Decay rate per attention head, shape (num_heads, 1, 1).
+            slope_rate (Array): Decay rate per attention head, shape (num_heads, 1, 1).
 
         Returns:
-            A tuple of three arrays:
+            tuple[Array, Array, Array]: A tuple containing:
                 - query_decay: Decay factors for queries, shape (num_heads, block_size, 1).
                 - key_decay: Decay factors for keys, shape (num_heads, block_size, 1).
                 - diagonal_decay: Causal mask with decay, shape (1, 1, block_size, block_size).
@@ -190,15 +191,15 @@ class MiniMaxLightningAttention(nn.Module):
         """Perform lightning attention forward pass.
 
         Args:
-            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim).
-            attention_mask: Optional boolean mask of shape (batch, seq_len).
-            mode: Runtime mode (train, decode, etc.).
-            cache_view: Optional recurrent cache for incremental decoding.
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            attention_mask (Array | None): Optional boolean mask of shape (batch, seq_len).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.).
+            cache_view (RecurrentCacheView | None, optional): Recurrent cache for incremental
+                decoding. Defaults to None.
 
         Returns:
-            A tuple containing:
-                - Output hidden states of shape (batch, seq_len, hidden_dim).
-                - Updated cache view (or None if caching is disabled).
+            tuple[Array, RecurrentCacheView | None]: A tuple containing the output hidden states
+                of shape (batch, seq_len, hidden_dim) and the updated cache view.
         """
         batch_size, seq_len, _ = hidden_states.shape
         num_blocks = (seq_len + self.block_size - 1) // self.block_size
@@ -309,12 +310,13 @@ class MiniMaxAttention(UnifiedAttention[MiniMaxConfig]):
         """Initialize the MiniMaxAttention module.
 
         Args:
-            config: Model configuration containing attention parameters.
-            dtype: Data type for computation.
-            param_dtype: Data type for parameters.
-            precision: JAX precision setting for matrix operations.
-            rngs: Random number generators for initialization.
-            layer_idx: Index of this layer in the transformer stack.
+            config (MiniMaxConfig): Model configuration containing attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generators for initialization.
+            layer_idx (int): Index of this layer in the transformer stack.
         """
         super().__init__(
             config=config,
@@ -359,11 +361,12 @@ class MiniMaxExperts(nn.Module):
         """Initialize the MiniMaxExperts module.
 
         Args:
-            config: Model configuration containing MoE parameters.
-            dtype: Data type for computation.
-            param_dtype: Data type for parameters.
-            precision: JAX precision setting for matrix operations.
-            rngs: Random number generators for initialization.
+            config (MiniMaxConfig): Model configuration containing MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generators for initialization.
         """
         self.config = config
         self.dtype = dtype
@@ -420,12 +423,13 @@ class MiniMaxExperts(nn.Module):
         Computes gated feed-forward transformation: w2(act(w1(x)) * w3(x)).
 
         Args:
-            hidden_states: Input tensor of shape (tokens, hidden_dim).
-            group_sizes: Number of tokens assigned to each expert.
-            sorted_experts: Optional sorted expert indices for routing.
+            hidden_states (Array): Input tensor of shape (tokens, hidden_dim).
+            group_sizes (Array): Number of tokens assigned to each expert.
+            sorted_experts (Array | None, optional): Sorted expert indices for routing.
+                Defaults to None.
 
         Returns:
-            Output tensor of shape (tokens, hidden_dim).
+            Array: Output tensor of shape (tokens, hidden_dim).
         """
         return self.w2(
             self.act_fn(self.w1(hidden_states, group_sizes, sorted_experts))
@@ -464,11 +468,12 @@ class MiniMaxSparseMoeBlock(BaseMoeModule):
         """Initialize the MiniMaxSparseMoeBlock module.
 
         Args:
-            config: Model configuration containing MoE parameters.
-            dtype: Data type for computation.
-            param_dtype: Data type for parameters.
-            precision: JAX precision setting for matrix operations.
-            rngs: Random number generators for initialization.
+            config (MiniMaxConfig): Model configuration containing MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generators for initialization.
         """
         super().__init__(
             config=config,
@@ -523,14 +528,15 @@ class MiniMaxSparseMoeBlock(BaseMoeModule):
         Routes each token to top-k experts and combines their outputs.
 
         Args:
-            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim).
-            training: Whether the model is in training mode (enables jitter noise).
-            layer_idx: Optional layer index for auxiliary loss computation.
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            training (bool, optional): Whether the model is in training mode (enables jitter noise).
+                Defaults to False.
+            layer_idx (int | None, optional): Layer index for auxiliary loss computation.
+                Defaults to None.
 
         Returns:
-            A tuple containing:
-                - Output hidden states of shape (batch, seq_len, hidden_dim).
-                - Router logits for auxiliary loss computation.
+            tuple[Array, Array]: A tuple containing the output hidden states of shape
+                (batch, seq_len, hidden_dim) and router logits for auxiliary loss computation.
         """
         if training and self.jitter_noise > 0:
             hidden_states = hidden_states * jax.random.uniform(
@@ -586,12 +592,13 @@ class MiniMaxDecoderLayer(nn.Module):
         """Initialize the MiniMaxDecoderLayer module.
 
         Args:
-            config: Model configuration containing layer parameters.
-            dtype: Data type for computation.
-            param_dtype: Data type for parameters.
-            precision: JAX precision setting for matrix operations.
-            rngs: Random number generators for initialization.
-            layer_idx: Index of this layer in the transformer stack.
+            config (MiniMaxConfig): Model configuration containing layer parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generators for initialization.
+            layer_idx (int): Index of this layer in the transformer stack.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -667,20 +674,28 @@ class MiniMaxDecoderLayer(nn.Module):
     ) -> DecoderLayerOutput:
         """Forward pass through the decoder layer.
 
+        Applies pre-normalization architecture with attention (lightning or standard)
+        followed by sparse MoE feed-forward network.
+
         Args:
-            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim).
-            mask_info: Mask information for attention computation.
-            position_ids: Position indices of shape (batch, seq_len).
-            attention_mask: Optional boolean mask of shape (batch, seq_len).
-            mode: Runtime mode (train, decode, etc.).
-            cache_view: Optional cache view for key-value or recurrent state caching.
-            cache_metadata: Optional metadata for cache operations.
-            output_attentions: Whether to return attention weights.
-            output_router_logits: Whether to return router logits.
-            frequencies: Optional rotary embedding frequencies.
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo): Mask information for attention computation.
+            position_ids (Array): Position indices of shape (batch, seq_len).
+            attention_mask (Array | None): Optional boolean mask of shape (batch, seq_len).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.).
+            cache_view (TransformerCacheView | RecurrentCacheView | None, optional): Cache view
+                for key-value or recurrent state caching. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+            output_router_logits (bool, optional): Whether to return router logits.
+                Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
 
         Returns:
-            DecoderLayerOutput containing hidden states and optional attention/router outputs.
+            DecoderLayerOutput: Contains hidden states, attention weights, cache view,
+                and router logits.
         """
         residual = self.input_layernorm(hidden_states)
         residual = apply_logical_sharding(
@@ -768,11 +783,12 @@ class MiniMaxModel(EasyDeLBaseModule):
         """Initialize the MiniMaxModel.
 
         Args:
-            config: Model configuration containing architecture parameters.
-            dtype: Data type for computation.
-            param_dtype: Data type for parameters.
-            precision: JAX precision setting for matrix operations.
-            rngs: Random number generators for initialization.
+            config (MiniMaxConfig): Model configuration containing architecture parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generators for initialization.
         """
         super().__init__(
             config=config,
@@ -833,24 +849,39 @@ class MiniMaxModel(EasyDeLBaseModule):
     ) -> MoeModelOutput:
         """Forward pass through the MiniMax model.
 
+        Processes input tokens through embedding, all decoder layers with hybrid attention
+        (lightning and standard) and sparse MoE feed-forward networks, and final normalization.
+
         Args:
-            input_ids: Input token IDs of shape (batch, seq_len).
-            inputs_embeds: Pre-computed input embeddings. Mutually exclusive with input_ids.
-            attention_mask: Optional boolean mask of shape (batch, seq_len).
-            mask_info: Optional pre-computed mask information.
-            position_ids: Optional position indices of shape (batch, seq_len).
-            output_attentions: Whether to return attention weights from all layers.
-            output_hidden_states: Whether to return hidden states from all layers.
-            output_router_logits: Whether to return router logits from MoE layers.
-            mode: Runtime mode (train, decode, etc.).
-            past_key_values: Optional cache for incremental decoding.
-            cache_metadata: Optional metadata for cache operations.
+            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
+                Must be provided if inputs_embeds is None. Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch, seq_len, hidden_dim). Mutually exclusive with input_ids. Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask of shape (batch, seq_len)
+                to avoid attention on padding tokens. Defaults to None.
+            mask_info (MaskInfo | None, optional): Pre-computed mask information for attention.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices of shape (batch, seq_len).
+                Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights
+                from all layers. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states
+                from all layers. Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router logits
+                from MoE layers. Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train, decode, etc.).
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache for incremental decoding. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
 
         Returns:
-            MoeModelOutput containing last hidden state and optional intermediate outputs.
+            MoeModelOutput: Contains last_hidden_state, optional hidden_states, attentions,
+                router_logits, all_router_losses, and updated past_key_values.
 
         Raises:
-            ValueError: If neither or both of input_ids and inputs_embeds are provided.
+            ValueError: If both or neither of input_ids and inputs_embeds are provided.
             ValueError: If sequence length exceeds max_position_embeddings.
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1018,11 +1049,12 @@ class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):
         """Initialize the MiniMaxForCausalLM model.
 
         Args:
-            config: Model configuration containing architecture parameters.
-            dtype: Data type for computation.
-            param_dtype: Data type for parameters.
-            precision: JAX precision setting for matrix operations.
-            rngs: Random number generators for initialization.
+            config (MiniMaxConfig): Model configuration containing architecture parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): JAX precision setting for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generators for initialization.
         """
         super().__init__(
             config=config,
@@ -1053,22 +1085,38 @@ class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):
     ) -> MoeCausalLMOutput:
         """Forward pass for causal language modeling.
 
+        Processes input through the MiniMax backbone and applies the language model head
+        to produce next-token logits.
+
         Args:
-            input_ids: Input token IDs of shape (batch, seq_len).
-            inputs_embeds: Pre-computed input embeddings. Mutually exclusive with input_ids.
-            attention_mask: Optional boolean mask of shape (batch, seq_len).
-            mask_info: Optional pre-computed mask information.
-            position_ids: Optional position indices of shape (batch, seq_len).
-            output_attentions: Whether to return attention weights from all layers.
-            output_hidden_states: Whether to return hidden states from all layers.
-            output_router_logits: Whether to return router logits from MoE layers.
-            mode: Runtime mode (train, decode, etc.).
-            past_key_values: Optional cache for incremental decoding.
-            cache_metadata: Optional metadata for cache operations.
-            apply_lm_head: Whether to apply the language model head to compute logits.
+            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
+                Must be provided if inputs_embeds is None. Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch, seq_len, hidden_dim). Mutually exclusive with input_ids. Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask of shape (batch, seq_len)
+                to avoid attention on padding tokens. Defaults to None.
+            mask_info (MaskInfo | None, optional): Pre-computed mask information for attention.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices of shape (batch, seq_len).
+                Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights
+                from all layers. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states
+                from all layers. Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router logits
+                from MoE layers. Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train, decode, etc.).
+                Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache for incremental decoding. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language model head.
+                Defaults to True.
 
         Returns:
-            MoeCausalLMOutput containing logits and optional intermediate outputs.
+            MoeCausalLMOutput: Contains logits, optional hidden_states, attentions,
+                router_logits, auxiliary_loss, and updated past_key_values.
         """
         return self.forward_moe(
             input_ids=input_ids,
@@ -1099,9 +1147,9 @@ class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):
         """Get the cache view type for each layer.
 
         Returns:
-            A dictionary mapping layer indices to their respective cache view types
-            (RecurrentCacheView for lightning attention, TransformerCacheView for
-            standard attention).
+            dict[int, type]: A dictionary mapping layer indices to their respective
+                cache view types (RecurrentCacheView for lightning attention,
+                TransformerCacheView for standard attention).
         """
         from easydel.layers.caching import RecurrentCacheView, TransformerCacheView
 
@@ -1115,11 +1163,11 @@ class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):
         """Create configuration for recurrent cache used in lightning attention layers.
 
         Args:
-            batch_size: The batch size for cache allocation.
+            batch_size (int): The batch size for cache allocation.
 
         Returns:
-            RecurrentCacheConfig with appropriate dimensions for the model's
-            lightning attention layers.
+            RecurrentCacheConfig: Configuration with appropriate dimensions for the
+                model's lightning attention layers.
         """
         from eformer.escale import PartitionAxis
 

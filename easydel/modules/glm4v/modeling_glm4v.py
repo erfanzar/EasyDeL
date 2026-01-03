@@ -57,7 +57,19 @@ from .glm4v_configuration import Glm4vConfig, Glm4vTextConfig, Glm4vVisionConfig
 
 @auto_pytree
 class Glm4vModelOutputWithPast(ModelOutput):
-    """Base model output for GLM4V multimodal model."""
+    """Base model output for GLM4V multimodal model.
+
+    Contains outputs from the GLM4V multimodal model including hidden states,
+    cached key-values for generation, and position information for multimodal
+    rotary position embeddings.
+
+    Attributes:
+        last_hidden_state (Array | None): Hidden states from the final layer.
+        past_key_values (TransformerCache | None): Cached key-value states for generation.
+        hidden_states (tuple[Array] | None): Hidden states from all layers if requested.
+        attentions (tuple[Array] | None): Attention weights from all layers if requested.
+        rope_deltas (Array | None): Position deltas for multimodal rotary embeddings.
+    """
 
     last_hidden_state: Array | None = None
     past_key_values: TransformerCache | None = None
@@ -67,19 +79,51 @@ class Glm4vModelOutputWithPast(ModelOutput):
 
 
 def _rotate_half(x: Array) -> Array:
+    """Rotate half of the hidden dimensions for rotary position embeddings.
+
+    Args:
+        x (Array): Input tensor with shape (..., hidden_dim).
+
+    Returns:
+        Array: Rotated tensor with the same shape as input.
+    """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return jnp.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb_vision(q: Array, k: Array, cos: Array, sin: Array) -> tuple[Array, Array]:
+    """Apply rotary position embeddings to query and key tensors for vision attention.
+
+    Args:
+        q (Array): Query tensor of shape (seq_len, num_heads, head_dim).
+        k (Array): Key tensor of shape (seq_len, num_heads, head_dim).
+        cos (Array): Cosine component of rotary embeddings.
+        sin (Array): Sine component of rotary embeddings.
+
+    Returns:
+        tuple[Array, Array]: Rotated query and key tensors with the same shapes.
+    """
     cos = cos[:, None, :]
     sin = sin[:, None, :]
     return (q * cos) + (_rotate_half(q) * sin), (k * cos) + (_rotate_half(k) * sin)
 
 
 def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
-    """Create block-diagonal attention mask from cumulative sequence lengths."""
+    """Create block-diagonal attention mask from cumulative sequence lengths.
+
+    Creates a mask where tokens can only attend to other tokens within the same
+    segment, as defined by the cumulative sequence lengths. Tokens in different
+    segments are masked with negative infinity.
+
+    Args:
+        cu_seqlens (Array): Cumulative sequence lengths defining segment boundaries.
+        seq_length (int): Total sequence length.
+        dtype (jnp.dtype): Data type for the output mask.
+
+    Returns:
+        Array: Block-diagonal attention mask of shape (1, seq_length, seq_length).
+    """
     positions = jnp.arange(seq_length)
     starts = cu_seqlens[:-1]
     ends = cu_seqlens[1:]
@@ -91,7 +135,12 @@ def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) 
 
 
 class Glm4vVisionPatchEmbed(nn.Module):
-    """3D convolution-based patch embedding for GLM4V vision encoder."""
+    """3D convolution-based patch embedding for GLM4V vision encoder.
+
+    Converts image/video patches into embeddings using a 3D convolution that
+    operates across temporal and spatial dimensions. Handles both single images
+    and video frames.
+    """
 
     def __init__(
         self,
@@ -102,6 +151,15 @@ class Glm4vVisionPatchEmbed(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize vision patch embedding layer.
+
+        Args:
+            config (Glm4vVisionConfig): Vision encoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.dtype = dtype
         self.patch_size = config.patch_size
         self.temporal_patch_size = config.temporal_patch_size
@@ -122,6 +180,14 @@ class Glm4vVisionPatchEmbed(nn.Module):
         )
 
     def __call__(self, hidden_states: Array) -> Array:
+        """Convert image/video patches to embeddings.
+
+        Args:
+            hidden_states (Array): Input pixel values arranged as patches.
+
+        Returns:
+            Array: Patch embeddings of shape (num_patches, hidden_size).
+        """
         hidden_states = jnp.transpose(
             hidden_states.reshape(
                 -1,
@@ -138,7 +204,11 @@ class Glm4vVisionPatchEmbed(nn.Module):
 
 
 class Glm4vVisionMLP(nn.Module):
-    """SwiGLU-style MLP for GLM4V vision encoder blocks."""
+    """SwiGLU-style MLP for GLM4V vision encoder blocks.
+
+    Implements a gated feedforward network with SiLU activation
+    (SwiGLU) for the vision encoder transformer blocks.
+    """
 
     def __init__(
         self,
@@ -149,6 +219,15 @@ class Glm4vVisionMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize vision encoder MLP block.
+
+        Args:
+            config (Glm4vVisionConfig): Vision encoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.act = ACT2FN[config.hidden_act]
@@ -181,11 +260,23 @@ class Glm4vVisionMLP(nn.Module):
         )
 
     def __call__(self, x: Array) -> Array:
+        """Apply gated feedforward transformation.
+
+        Args:
+            x (Array): Input tensor of shape (seq_len, hidden_dim).
+
+        Returns:
+            Array: Transformed tensor of shape (seq_len, hidden_dim).
+        """
         return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Glm4vVisionAttention(UnifiedAttention):
-    """Self-attention for GLM4V vision encoder with rotary embeddings."""
+    """Self-attention for GLM4V vision encoder with rotary embeddings.
+
+    Implements multi-head self-attention with 2D rotary position embeddings
+    for encoding spatial relationships in vision patches.
+    """
 
     def __init__(
         self,
@@ -197,6 +288,16 @@ class Glm4vVisionAttention(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize vision attention layer.
+
+        Args:
+            config (Glm4vVisionConfig): Vision encoder configuration.
+            layer_idx (int): Index of this layer in the encoder.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_heads
         self.head_dim = config.hidden_size // config.num_heads
@@ -222,6 +323,18 @@ class Glm4vVisionAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike,
         rngs: nn.Rngs,
     ) -> None:
+        """Define the attention network components.
+
+        Creates the fused QKV projection, output projection, and attention performer
+        for the vision encoder attention mechanism.
+
+        Args:
+            config (Glm4vVisionConfig): Vision encoder configuration.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Numerical precision for operations.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.qkv = ColumnParallelLinear(
             self.hidden_size,
             self.hidden_size * 3,
@@ -243,6 +356,15 @@ class Glm4vVisionAttention(UnifiedAttention):
         self.attention_performer = self._create_attention_performer(config, rngs)
 
     def _create_attention_performer(self, config, rngs: nn.Rngs):
+        """Create the attention performer for vision encoding.
+
+        Args:
+            config: Vision encoder configuration.
+            rngs (nn.Rngs): Random number generator state.
+
+        Returns:
+            FlexibleAttentionModule: Configured attention performer.
+        """
         return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
@@ -258,6 +380,16 @@ class Glm4vVisionAttention(UnifiedAttention):
         cu_seqlens: Array,
         rotary_pos_emb: Array,
     ) -> Array:
+        """Apply self-attention with rotary position embeddings.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (seq_len, hidden_dim).
+            cu_seqlens (Array): Cumulative sequence lengths for block-diagonal masking.
+            rotary_pos_emb (Array): Rotary position embeddings for spatial encoding.
+
+        Returns:
+            Array: Attention output of shape (seq_len, hidden_dim).
+        """
         seq_length = hidden_states.shape[0]
         qkv = self.qkv(hidden_states)
         q, k, v = map(
@@ -295,7 +427,11 @@ class Glm4vVisionAttention(UnifiedAttention):
 
 
 class Glm4vVisionBlock(nn.Module):
-    """Transformer block for GLM4V vision encoder."""
+    """Transformer block for GLM4V vision encoder.
+
+    Implements a standard transformer block with pre-normalization,
+    self-attention with rotary embeddings, and a SwiGLU feedforward network.
+    """
 
     def __init__(
         self,
@@ -307,6 +443,16 @@ class Glm4vVisionBlock(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize vision encoder transformer block.
+
+        Args:
+            config (Glm4vVisionConfig): Vision encoder configuration.
+            layer_idx (int): Index of this layer in the encoder.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.norm1 = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs
         )
@@ -330,6 +476,18 @@ class Glm4vVisionBlock(nn.Module):
         )
 
     def __call__(self, hidden_states: Array, *, cu_seqlens: Array, rotary_pos_emb: Array) -> Array:
+        """Forward pass through the vision encoder block.
+
+        Applies pre-normalized attention and MLP with residual connections.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (seq_len, hidden_dim).
+            cu_seqlens (Array): Cumulative sequence lengths for block-diagonal masking.
+            rotary_pos_emb (Array): Rotary position embeddings for spatial encoding.
+
+        Returns:
+            Array: Output tensor of shape (seq_len, hidden_dim).
+        """
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states), cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
         )
@@ -338,7 +496,11 @@ class Glm4vVisionBlock(nn.Module):
 
 
 class Glm4vVisionPatchMerger(nn.Module):
-    """Projection + gated MLP merger for GLM4V vision features."""
+    """Projection + gated MLP merger for GLM4V vision features.
+
+    Merges vision patch embeddings using a projection layer followed by
+    a gated MLP to bridge vision and language hidden dimensions.
+    """
 
     def __init__(
         self,
@@ -351,6 +513,17 @@ class Glm4vVisionPatchMerger(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize patch merger module.
+
+        Args:
+            dim (int): Input and output dimension.
+            context_dim (int): Intermediate dimension for the gated MLP.
+            hidden_act (str): Activation function name for the gated MLP.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.proj = ColumnParallelLinear(
             dim,
             dim,
@@ -402,6 +575,14 @@ class Glm4vVisionPatchMerger(nn.Module):
         }
 
     def __call__(self, hidden_state: Array) -> Array:
+        """Merge and project vision patch embeddings.
+
+        Args:
+            hidden_state (Array): Input patch embeddings of shape (num_patches, dim).
+
+        Returns:
+            Array: Merged embeddings of shape (num_patches, dim).
+        """
         hidden_state = self.proj(hidden_state)
         hidden_state = self.act1(self.norm(hidden_state))
         return self.down_proj(self.act(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
@@ -409,7 +590,19 @@ class Glm4vVisionPatchMerger(nn.Module):
 
 @register_module(TaskType.BASE_VISION, config=Glm4vConfig, model_type="glm4v")
 class Glm4vVisionModel(EasyDeLBaseModule):
-    """Vision transformer encoder for GLM4V."""
+    """Vision transformer encoder for GLM4V.
+
+    Processes images and videos through patch embedding, transformer blocks with
+    2D rotary position embeddings, spatial downsampling, and patch merging to
+    produce vision features for the multimodal language model.
+
+    Attributes:
+        config_class: The configuration class for this model.
+        spatial_merge_size: Size factor for spatial downsampling.
+        patch_embed: 3D convolution patch embedding layer.
+        blocks: List of vision transformer blocks.
+        merger: Patch merger for bridging vision and language dimensions.
+    """
 
     config_class = Glm4vVisionConfig
 
@@ -422,6 +615,15 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM4V vision encoder.
+
+        Args:
+            config (Glm4vVisionConfig): Vision encoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -501,10 +703,26 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         )
 
     def get_dtype(self) -> jnp.dtype:
+        """Get the data type of the model's position embeddings.
+
+        Returns:
+            jnp.dtype: The data type of the position embedding parameters.
+        """
         return self.pos_embed.embedding.value.dtype
 
     def fast_pos_embed_interpolate(self, grid_thw: Array) -> Array:
-        """Bilinear-interpolate 2D position embeddings and apply merge-size permutation."""
+        """Bilinear-interpolate 2D position embeddings and apply merge-size permutation.
+
+        Interpolates learned position embeddings to match the input grid dimensions
+        and rearranges them according to the spatial merge pattern.
+
+        Args:
+            grid_thw (Array): Grid dimensions of shape (num_images, 3) containing
+                (temporal, height, width) for each image/video.
+
+        Returns:
+            Array: Interpolated position embeddings for all patches.
+        """
         grid_ts = grid_thw[:, 0]
         grid_hs = grid_thw[:, 1]
         grid_ws = grid_thw[:, 2]
@@ -568,6 +786,19 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         return jnp.concatenate(patch_pos_embeds_permute, axis=0)
 
     def rot_pos_emb(self, grid_thw: Array, max_grid_size: int) -> Array:
+        """Compute 2D rotary position embeddings for vision patches.
+
+        Generates position embeddings based on the spatial coordinates of each patch,
+        accounting for the merge pattern used in spatial downsampling.
+
+        Args:
+            grid_thw (Array): Grid dimensions of shape (num_images, 3) containing
+                (temporal, height, width) for each image/video.
+            max_grid_size (int): Maximum grid size for frequency computation.
+
+        Returns:
+            Array: Rotary position embeddings for all patches.
+        """
         merge_size = self.spatial_merge_size
         freq_table = jnp.outer(
             jnp.arange(0, max_grid_size, dtype=jnp.float32),
@@ -601,6 +832,19 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         return embeddings
 
     def __call__(self, hidden_states: Array, *, grid_thw: Array) -> Array:
+        """Encode image/video pixel values to vision features.
+
+        Processes input pixel values through patch embedding, transformer blocks
+        with rotary position embeddings, spatial downsampling, and patch merging.
+
+        Args:
+            hidden_states (Array): Input pixel values arranged as patches.
+            grid_thw (Array): Grid dimensions of shape (num_images, 3) containing
+                (temporal, height, width) for each image/video.
+
+        Returns:
+            Array: Encoded vision features of shape (total_patches, out_hidden_size).
+        """
         hidden_states = self.patch_embed(hidden_states)
         hidden_states = self.post_conv_layernorm(hidden_states)
 
@@ -629,20 +873,44 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         return hidden_states
 
     def get_encoder(self):
+        """Return the encoder (vision model itself).
+
+        Returns:
+            Glm4vVisionModel: This vision encoder.
+        """
         return self
 
     def get_decoder(self):
+        """Return the decoder (not available for vision model).
+
+        Raises:
+            NotImplementedError: Vision model does not have a decoder.
+        """
         raise NotImplementedError("Vision model does not have a decoder.")
 
     def get_lm_head(self):
+        """Return the language model head (not available for vision model).
+
+        Raises:
+            NotImplementedError: Vision model does not have a language model head.
+        """
         raise NotImplementedError("Vision model does not have a language model head.")
 
     def get_embedding(self):
+        """Return the patch embedding layer.
+
+        Returns:
+            Glm4vVisionPatchEmbed: The patch embedding layer.
+        """
         return self.patch_embed
 
 
 class Glm4vTextMLP(nn.Module):
-    """SwiGLU feed-forward network for GLM4V text decoder."""
+    """SwiGLU feed-forward network for GLM4V text decoder.
+
+    Implements a gated feedforward network with fused gate-up projections
+    for the text decoder transformer blocks.
+    """
 
     def __init__(
         self,
@@ -653,6 +921,15 @@ class Glm4vTextMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize text decoder MLP block.
+
+        Args:
+            config (Glm4vTextConfig): Text decoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -681,6 +958,14 @@ class Glm4vTextMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def __call__(self, hidden_states: Array) -> Array:
+        """Apply gated feedforward transformation.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+
+        Returns:
+            Array: Transformed tensor of shape (batch, seq_len, hidden_dim).
+        """
         gate_up_states = checkpoint_name(self.gate_up_proj(hidden_states), name="mlp_gate_up")
         gate, up_states = jnp.split(gate_up_states, 2, axis=-1)
         hidden_states = checkpoint_name(self.down_proj(up_states * self.act_fn(gate)), name="mlp_down")
@@ -688,7 +973,11 @@ class Glm4vTextMLP(nn.Module):
 
 
 class Glm4vTextAttention(UnifiedAttention):
-    """GLM4V attention with bias-free output projection (HF-compatible)."""
+    """GLM4V attention with bias-free output projection (HF-compatible).
+
+    Implements multi-head self-attention with GPT-J style rotary position
+    embeddings and grouped-query attention support for the text decoder.
+    """
 
     def __init__(
         self,
@@ -700,6 +989,16 @@ class Glm4vTextAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize text decoder attention layer.
+
+        Args:
+            config (Glm4vTextConfig): Text decoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the decoder.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -712,6 +1011,15 @@ class Glm4vTextAttention(UnifiedAttention):
         )
 
     def _create_rotary(self, config: Glm4vTextConfig, dtype: jnp.dtype):
+        """Create GPT-J style rotary position embeddings.
+
+        Args:
+            config (Glm4vTextConfig): Text decoder configuration.
+            dtype (jnp.dtype): Data type for the rotary embeddings.
+
+        Returns:
+            Rotary position embedding module.
+        """
         # HF Glm4vText uses GPT-J style rotary (even/odd rotation) with partial rotary factor.
         return config.get_basic_rope(
             dtype=dtype,
@@ -729,6 +1037,18 @@ class Glm4vTextAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike,
         rngs: nn.Rngs,
     ) -> RowParallelLinear:
+        """Create the output projection layer without bias.
+
+        Args:
+            config (Glm4vTextConfig): Text decoder configuration.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Numerical precision for operations.
+            rngs (nn.Rngs): Random number generator state.
+
+        Returns:
+            RowParallelLinear: Output projection layer.
+        """
         return RowParallelLinear(
             self.num_heads * self.head_dim,
             config.hidden_size,
@@ -742,7 +1062,12 @@ class Glm4vTextAttention(UnifiedAttention):
 
 
 class Glm4vTextDecoderLayer(nn.Module):
-    """Single GLM4V text decoder block combining attention and MLP."""
+    """Single GLM4V text decoder block combining attention and MLP.
+
+    Implements a transformer decoder layer with pre-normalization,
+    self-attention, and feedforward network with post-layer normalization
+    for improved training stability (same as GLM-4).
+    """
 
     def __init__(
         self,
@@ -754,6 +1079,16 @@ class Glm4vTextDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize text decoder layer.
+
+        Args:
+            config (Glm4vTextConfig): Text decoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the decoder.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -807,6 +1142,26 @@ class Glm4vTextDecoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
+        """Forward pass through the text decoder layer.
+
+        Applies pre-normalization architecture with post-attention and post-MLP normalization:
+        x + norm(attn(norm(x))) followed by x + norm(mlp(norm(x)))
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
+        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -846,7 +1201,18 @@ class Glm4vTextDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Glm4vTextConfig, model_type="glm4v")
 class Glm4vTextModel(EasyDeLBaseModule):
-    """GLM4V text decoder model."""
+    """GLM4V text decoder model.
+
+    Implements the text decoder component of GLM4V, utilizing transformer
+    blocks with RMSNorm, rotary position embeddings, and an enhanced attention
+    mechanism with additional post-layer normalization for improved stability.
+
+    Attributes:
+        config_class: The configuration class for this model.
+        embed_tokens: Token embedding layer.
+        layers: List of decoder layers.
+        norm: Final layer normalization.
+    """
 
     config_class = Glm4vTextConfig
 
@@ -859,6 +1225,15 @@ class Glm4vTextModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM4V text decoder.
+
+        Args:
+            config (Glm4vTextConfig): Text decoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -900,6 +1275,40 @@ class Glm4vTextModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
+        """Forward pass through the GLM4V text decoder.
+
+        Processes input tokens through embedding, all decoder layers with RoPE
+        and RMSNorm, and final normalization.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+
+        Returns:
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -972,21 +1381,50 @@ class Glm4vTextModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
+        """Return the encoder (not available for text model).
+
+        Raises:
+            NotImplementedError: Text model does not have an encoder.
+        """
         raise NotImplementedError("Text model does not have an encoder.")
 
     def get_decoder(self):
+        """Return the decoder (text model itself).
+
+        Returns:
+            Glm4vTextModel: This text decoder model.
+        """
         return self
 
     def get_lm_head(self):
+        """Return the language model head (not available for base text model).
+
+        Raises:
+            NotImplementedError: Text model does not have a language model head.
+        """
         raise NotImplementedError("Text model does not have a language model head.")
 
     def get_embedding(self):
+        """Return the token embedding layer.
+
+        Returns:
+            nn.Embed: The token embedding layer.
+        """
         return self.embed_tokens
 
 
 @register_module(TaskType.VISION_LM, config=Glm4vConfig, model_type="glm4v")
 class Glm4vModel(EasyDeLBaseModule):
-    """GLM4V multimodal model integrating vision encoder and text decoder."""
+    """GLM4V multimodal model integrating vision encoder and text decoder.
+
+    Combines a vision transformer encoder with a text decoder to process
+    both image/video and text inputs, supporting multimodal understanding
+    and generation with 3D rotary position embeddings for spatial-temporal reasoning.
+
+    Attributes:
+        visual (Glm4vVisionModel): Vision encoder for processing images/videos.
+        language_model (Glm4vTextModel): Text decoder for language understanding.
+    """
 
     def __init__(
         self,
@@ -997,6 +1435,15 @@ class Glm4vModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM4V multimodal model.
+
+        Args:
+            config (Glm4vConfig): Full model configuration including vision and text configs.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1020,12 +1467,27 @@ class Glm4vModel(EasyDeLBaseModule):
         )
 
     def get_input_embeddings(self):
+        """Return the input token embedding layer.
+
+        Returns:
+            nn.Embed: The token embedding layer from the language model.
+        """
         return self.language_model.get_embedding()
 
     def set_input_embeddings(self, value):
+        """Set the input token embedding layer.
+
+        Args:
+            value: New embedding layer to use.
+        """
         self.language_model.embed_tokens = value
 
     def get_decoder(self):
+        """Return the text decoder model.
+
+        Returns:
+            Glm4vTextModel: The language model decoder.
+        """
         return self.language_model
 
     def get_rope_index(
@@ -1036,6 +1498,28 @@ class Glm4vModel(EasyDeLBaseModule):
         video_grid_thw: Array | None = None,
         attention_mask: Array | None = None,
     ) -> tuple[Array, Array]:
+        """Compute 3D rotary position indices for multimodal inputs.
+
+        Generates position indices for multimodal rotary position embeddings (M-RoPE),
+        computing separate temporal, height, and width position coordinates for
+        image/video tokens and sequential positions for text tokens.
+
+        Args:
+            input_ids (Array | None): Input token IDs of shape (batch_size, sequence_length).
+            image_grid_thw (Array | None, optional): Grid dimensions for images,
+                shape (num_images, 3) with (temporal, height, width).
+            video_grid_thw (Array | None, optional): Grid dimensions for videos,
+                shape (num_videos, 3) with (temporal, height, width).
+            attention_mask (Array | None, optional): Attention mask of shape
+                (batch_size, sequence_length).
+
+        Returns:
+            tuple[Array, Array]: Position IDs of shape (3, batch_size, sequence_length)
+                and rope deltas for position tracking.
+
+        Raises:
+            ValueError: If input_ids is not provided.
+        """
         spatial_merge_size = self.config.vision_config.spatial_merge_size
         image_token_id = self.config.image_token_id
         video_start_token_id = self.config.video_start_token_id
@@ -1163,6 +1647,22 @@ class Glm4vModel(EasyDeLBaseModule):
         return jnp.asarray(position_ids), jnp.asarray(deltas)
 
     def get_video_features(self, pixel_values_videos: Array, video_grid_thw: Array | None = None):
+        """Extract video features using the vision encoder.
+
+        Processes video pixel values through the vision encoder to produce
+        video embeddings suitable for the language model.
+
+        Args:
+            pixel_values_videos (Array): Video pixel values.
+            video_grid_thw (Array | None): Grid dimensions for videos,
+                shape (num_videos, 3) with (temporal, height, width).
+
+        Returns:
+            tuple[Array, ...]: Video embeddings split by video.
+
+        Raises:
+            ValueError: If video_grid_thw is not provided.
+        """
         pixel_values_videos = pixel_values_videos.astype(self.visual.get_dtype())
         if video_grid_thw is None:
             raise ValueError("`video_grid_thw` must be provided when `pixel_values_videos` is not None.")
@@ -1180,6 +1680,22 @@ class Glm4vModel(EasyDeLBaseModule):
         return video_embeds
 
     def get_image_features(self, pixel_values: Array, image_grid_thw: Array | None = None):
+        """Extract image features using the vision encoder.
+
+        Processes image pixel values through the vision encoder to produce
+        image embeddings suitable for the language model.
+
+        Args:
+            pixel_values (Array): Image pixel values.
+            image_grid_thw (Array | None): Grid dimensions for images,
+                shape (num_images, 3) with (temporal, height, width).
+
+        Returns:
+            tuple[Array, ...]: Image embeddings split by image.
+
+        Raises:
+            ValueError: If image_grid_thw is not provided.
+        """
         pixel_values = pixel_values.astype(self.visual.get_dtype())
         if image_grid_thw is None:
             raise ValueError("`image_grid_thw` must be provided when `pixel_values` is not None.")
@@ -1203,6 +1719,29 @@ class Glm4vModel(EasyDeLBaseModule):
         video_embeds: Array | None = None,
         **kwargs,
     ) -> Array:
+        """Compute multimodal embeddings by merging text and vision features.
+
+        Combines token embeddings with image/video embeddings by inserting
+        vision features at the positions of placeholder tokens.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
+            inputs_embeds (Array | None, optional): Pre-computed text embeddings.
+            pixel_values (Array | None, optional): Image pixel values.
+            pixel_values_videos (Array | None, optional): Video pixel values.
+            image_grid_thw (Array | None, optional): Grid dimensions for images.
+            video_grid_thw (Array | None, optional): Grid dimensions for videos.
+            image_embeds (Array | None, optional): Pre-computed image embeddings.
+            video_embeds (Array | None, optional): Pre-computed video embeddings.
+            **kwargs: Additional arguments (ignored).
+
+        Returns:
+            Array: Merged embeddings of shape (batch_size, sequence_length, hidden_size).
+
+        Raises:
+            ValueError: If input_ids is None or both pixel_values and pixel_values_videos
+                are provided.
+        """
         if input_ids is None:
             raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
         if pixel_values is not None and pixel_values_videos is not None:
@@ -1246,6 +1785,20 @@ class Glm4vModel(EasyDeLBaseModule):
         attention_mask: Array | None = None,
         **kwargs,
     ) -> tuple[Array, EmbeddingInfo]:
+        """Compute embeddings and associated position information.
+
+        Computes multimodal embeddings and returns them along with the
+        3D position IDs and rope deltas needed for M-RoPE.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
+            attention_mask (Array | None, optional): Attention mask. Defaults to None.
+            **kwargs: Additional arguments passed to compute_embedding.
+
+        Returns:
+            tuple[Array, EmbeddingInfo]: Tuple of embeddings and embedding info
+                containing position_ids and rope_deltas.
+        """
         inputs_embeds = self.compute_embedding(input_ids, **kwargs)
         position_ids, rope_deltas = self.get_rope_index(
             input_ids=input_ids,
@@ -1275,6 +1828,37 @@ class Glm4vModel(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         **kwargs,
     ) -> Glm4vModelOutputWithPast:
+        """Forward pass through the GLM4V multimodal model.
+
+        Processes text and image/video inputs through the vision encoder and
+        text decoder to produce hidden representations.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
+            attention_mask (Array | None, optional): Attention mask of shape (batch, seq_len).
+            position_ids (Array | None, optional): Position IDs for M-RoPE,
+                shape (3, batch, seq_len) or (batch, seq_len).
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cached key-value states for generation.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings.
+            output_attentions (bool | None, optional): Whether to return attention weights.
+            output_hidden_states (bool | None, optional): Whether to return all hidden states.
+            pixel_values (Array | None, optional): Image pixel values.
+            pixel_values_videos (Array | None, optional): Video pixel values.
+            image_grid_thw (Array | None, optional): Grid dimensions for images.
+            video_grid_thw (Array | None, optional): Grid dimensions for videos.
+            rope_deltas (Array | None, optional): Pre-computed rope position deltas.
+            cache_position (Array | None, optional): Cache position (unused).
+            mask_info (MaskInfo | None, optional): Attention mask information.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode for optimization.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata for efficient caching.
+            **kwargs: Additional unused arguments.
+
+        Returns:
+            Glm4vModelOutputWithPast: Model outputs including hidden states, cache,
+                and rope deltas.
+        """
         del cache_position
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1324,18 +1908,48 @@ class Glm4vModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
+        """Return the vision encoder.
+
+        Returns:
+            Glm4vVisionModel: The vision encoder model.
+        """
         return self.visual
 
     def get_lm_head(self):
+        """Return the language model head (not available for base model).
+
+        Raises:
+            NotImplementedError: Base model does not have a language model head.
+        """
         raise NotImplementedError("Glm4vModel does not have a language model head.")
 
     def get_embedding(self):
+        """Return the token embedding layer.
+
+        Returns:
+            nn.Embed: The token embedding layer from the language model.
+        """
         return self.language_model.embed_tokens
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Glm4vConfig, model_type="glm4v")
 class Glm4vForConditionalGeneration(BaseVisionLanguageModule[Glm4vModel, Glm4vConfig]):
-    """GLM4V model for conditional generation."""
+    """GLM4V model for conditional generation.
+
+    Vision-language model that combines a vision encoder with a text decoder
+    and language modeling head for generating text conditioned on images,
+    videos, and/or text prompts.
+
+    Supports both image and video understanding with 3D rotary position
+    embeddings for spatial-temporal reasoning.
+
+    Attributes:
+        _task_type: The task type for this model (IMAGE_TEXT_TO_TEXT).
+        _model_type: Model type identifier ("glm4v").
+        _supports_video: Whether this model supports video inputs (True).
+        _uses_mrope: Whether this model uses multimodal RoPE (True).
+        vocab_size: Vocabulary size from the text configuration.
+    """
 
     _task_type = TaskType.IMAGE_TEXT_TO_TEXT
     _model_type = "glm4v"
@@ -1359,6 +1973,16 @@ class Glm4vForConditionalGeneration(BaseVisionLanguageModule[Glm4vModel, Glm4vCo
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM4V for conditional generation.
+
+        Args:
+            config (Glm4vConfig): Full model configuration including vision, text,
+                and generation settings.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Glm4vModel,
@@ -1379,19 +2003,61 @@ class Glm4vForConditionalGeneration(BaseVisionLanguageModule[Glm4vModel, Glm4vCo
 
     @property
     def visual(self):
+        """Return the vision encoder.
+
+        Returns:
+            Glm4vVisionModel: The vision encoder from the base model.
+        """
         return self.base_model.visual
 
     @property
     def language_model(self):
+        """Return the language model decoder.
+
+        Returns:
+            Glm4vTextModel: The language model from the base model.
+        """
         return self.base_model.language_model
 
     def get_video_features(self, pixel_values_videos: Array, video_grid_thw: Array | None = None, **kwargs):
+        """Extract video features using the vision encoder.
+
+        Args:
+            pixel_values_videos (Array): Video pixel values.
+            video_grid_thw (Array | None, optional): Grid dimensions for videos.
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            tuple[Array, ...]: Video embeddings split by video.
+        """
         return self.base_model.get_video_features(pixel_values_videos, video_grid_thw)
 
     def get_image_features(self, pixel_values: Array, image_grid_thw: Array | None = None, **kwargs):
+        """Extract image features using the vision encoder.
+
+        Args:
+            pixel_values (Array): Image pixel values.
+            image_grid_thw (Array | None, optional): Grid dimensions for images.
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            tuple[Array, ...]: Image embeddings split by image.
+        """
         return self.base_model.get_image_features(pixel_values, image_grid_thw)
 
     def compute_embedding(self, input_ids, *args, **kwargs):
+        """Compute multimodal embeddings.
+
+        Delegates to the base model's compute_embedding method.
+
+        Args:
+            input_ids: Input token IDs.
+            *args: Positional arguments passed to base model.
+            **kwargs: Keyword arguments passed to base model.
+
+        Returns:
+            Array: Merged multimodal embeddings.
+        """
         return self.base_model.compute_embedding(input_ids, *args, **kwargs)
 
     def __call__(
@@ -1415,6 +2081,37 @@ class Glm4vForConditionalGeneration(BaseVisionLanguageModule[Glm4vModel, Glm4vCo
         cache_position: Array | None = None,
         **kwargs,
     ) -> VLMCausalLMOutput:
+        """Forward pass for conditional generation.
+
+        Processes multimodal inputs through the vision encoder and text decoder,
+        then applies the language modeling head to produce logits for generation.
+
+        Args:
+            input_ids (Array, optional): Input token IDs of shape (batch, seq_len).
+            attention_mask (Array | None, optional): Attention mask of shape (batch, seq_len).
+            mask_info (MaskInfo | None, optional): Attention mask information.
+            position_ids (Array | None, optional): Position IDs for M-RoPE.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode for optimization.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cached key-value states for generation.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata for efficient caching.
+            apply_lm_head (bool, optional): Whether to apply the LM head. Defaults to True.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings.
+            output_attentions (bool | None, optional): Whether to return attention weights.
+            output_hidden_states (bool | None, optional): Whether to return all hidden states.
+            pixel_values (Array | None, optional): Image pixel values.
+            pixel_values_videos (Array | None, optional): Video pixel values.
+            image_grid_thw (Array | None, optional): Grid dimensions for images.
+            video_grid_thw (Array | None, optional): Grid dimensions for videos.
+            rope_deltas (Array | None, optional): Pre-computed rope position deltas.
+            cache_position (Array | None, optional): Cache position (unused).
+            **kwargs: Additional unused arguments.
+
+        Returns:
+            VLMCausalLMOutput: Model outputs including logits, hidden states, cache,
+                and rope deltas.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

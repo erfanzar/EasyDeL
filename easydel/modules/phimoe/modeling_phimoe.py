@@ -47,21 +47,11 @@ from .phimoe_configuration import PhiMoeConfig
 
 
 class PhiMoEBlockSparseTop2MLP(nn.Module):
-    """PhiMoE Block Sparse Top-2 MLP module.
+    """Expert MLP module for PhiMoE Sparse Mixture of Experts.
 
-    This module implements the feed-forward network (MLP) for a single expert
-    in the PhiMoE model's Mixture of Experts layer. It uses a Gated Linear Unit (GLU)
-    structure with SiLU activation.
-
-    Attributes:
-        config (PhiMoeConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        w1 (ParallelLinear): First linear layer (part of the GLU gate).
-        w2 (ParallelLinear): Second linear layer (down-projection).
-        w3 (ParallelLinear): Third linear layer (part of the GLU value).
-        act_fn (callable): Activation function (SiLU).
+    Implements the feedforward network used by each expert in the PhiMoE model's
+    Sparse MoE layer. Uses SwiGLU activation with gated projections (w1, w3)
+    and a down projection (w2) for efficient expert computation.
     """
 
     def __init__(
@@ -73,14 +63,15 @@ class PhiMoEBlockSparseTop2MLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the PhiMoEBlockSparseTop2MLP module.
+        """Initialize PhiMoE expert MLP block.
 
         Args:
-            config (PhiMoeConfig): The configuration object for the PhiMoE model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (PhiMoeConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -113,15 +104,15 @@ class PhiMoEBlockSparseTop2MLP(nn.Module):
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: Array) -> Array:
-        """Forward pass of the expert MLP module.
+        """Apply SwiGLU feedforward transformation for expert processing.
 
         Args:
-            hidden_states (Array): Input hidden states for this expert.
-                Shape: (num_tokens_routed_to_expert, hidden_size).
+            hidden_states (Array): Input tensor for the expert MLP of shape
+                (num_tokens_routed_to_expert, hidden_size).
 
         Returns:
-            Array: Output hidden states after processing by the expert.
-                Shape: (num_tokens_routed_to_expert, hidden_size).
+            Array: Transformed hidden states after expert MLP processing with shape
+                (num_tokens_routed_to_expert, hidden_size).
         """
         gate = checkpoint_name(self.act_fn(self.w1(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.w3(hidden_states), "mlp_up")
@@ -130,7 +121,13 @@ class PhiMoEBlockSparseTop2MLP(nn.Module):
 
 
 class PhiMoEAttention(UnifiedAttention):
-    """PhiMoE attention powered by UnifiedAttention with optional sharding constraint."""
+    """PhiMoE Attention module with sliding window support.
+
+    Inherits from UnifiedAttention with PhiMoE-specific customizations:
+    - Sliding window attention support for efficient long-context modeling
+    - Grouped Query Attention (GQA) for memory efficiency
+    - Rotary Position Embeddings (RoPE) for position encoding
+    """
 
     def __init__(
         self,
@@ -142,6 +139,16 @@ class PhiMoEAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize PhiMoE attention with sliding window configuration.
+
+        Args:
+            config (PhiMoeConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -156,21 +163,11 @@ class PhiMoEAttention(UnifiedAttention):
 
 
 class PhiMoeSparseMoeBlock(nn.Module):
-    """PhiMoE Sparse Mixture of Experts (MoE) Block.
+    """Sparse Mixture of Experts block for PhiMoE models.
 
-    This module implements the core MoE logic, including the router (gate)
-    and the expert layers. It routes each token to the top-k experts based
-    on the router logits and combines the expert outputs.
-
-    Attributes:
-        config (PhiMoeConfig): Configuration object for the model.
-        layer_idx (int): Index of the current layer.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        gate (ParallelLinear): Linear layer for the router gate.
-        experts (tp.List[PhiMoEBlockSparseTop2MLP]): List of expert MLP modules.
+    Implements the sparse MoE layer that routes tokens to a subset of expert MLPs.
+    Uses SparseMixer-style top-k routing with optional jitter noise for training
+    stability and load balancing across experts.
     """
 
     def __init__(
@@ -183,15 +180,16 @@ class PhiMoeSparseMoeBlock(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initializes the PhiMoeSparseMoeBlock module.
+        """Initialize PhiMoE Sparse MoE block.
 
         Args:
-            config (PhiMoeConfig): The configuration object for the PhiMoE model.
-            layer_idx (int): Index of the current layer.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (PhiMoeConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -231,18 +229,21 @@ class PhiMoeSparseMoeBlock(nn.Module):
         hidden_states: Array,
         deterministic: bool = True,
     ) -> tuple[Array, Array]:
-        """Forward pass of the Sparse MoE block.
+        """Forward pass through the Sparse MoE block.
+
+        Routes input tokens to selected experts and combines their outputs using
+        SparseMixer-style routing for deterministic mode or standard top-k softmax
+        for non-deterministic (training) mode.
 
         Args:
-            hidden_states (Array): Input hidden states. Shape: (batch_size * sequence_length, hidden_size).
-            deterministic (bool): If True, disables dropout/jitter for deterministic behavior. Defaults to False.
+            hidden_states (Array): Input hidden states of shape (batch, seq_len, hidden_dim).
+            deterministic (bool, optional): If True, uses SparseMixer routing with jitter
+                thresholds. If False, uses standard top-k with softmax. Defaults to True.
 
         Returns:
-            tp.Tuple[Array, Array]:
-                - final_hidden_states: Output hidden states after MoE processing.
-                  Shape: (batch_size * sequence_length, hidden_size).
-                - router_logits: Logits computed by the router gate.
-                  Shape: (batch_size * sequence_length, num_local_experts).
+            tuple[Array, Array]: A tuple containing:
+                - Output hidden states after MoE processing (batch, seq_len, hidden_dim).
+                - Router logits for auxiliary loss computation (batch, seq_len, num_experts).
         """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_dim)
@@ -307,25 +308,10 @@ class PhiMoeSparseMoeBlock(nn.Module):
 
 
 class PhiMoeDecoderLayer(nn.Module):
-    """PhiMoE Transformer Decoder Layer.
+    """Single decoder layer for PhiMoE models.
 
-    This module represents a single decoder layer in the PhiMoE model.
-    It combines self-attention and a Sparse Mixture of Experts (MoE) block
-    (or a standard MLP if not an MoE layer) with residual connections and
-    RMS normalization.
-
-    Attributes:
-        config (PhiMoeConfig): Configuration object for the model.
-        layer_idx (int): Index of the current layer.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        input_layernorm (RMSNorm): RMS normalization applied before the attention layer.
-        self_attn (PhiMoEAttention): The self-attention module.
-        mlp (PhiMoeSparseMoeBlock): The Sparse MoE block.
-        post_attention_layernorm (RMSNorm): RMS normalization applied after the attention layer and before the MoE block.
-        dropout (nn.Dropout): Dropout layer (potentially unused, dropout is often handled within submodules).
+    Combines multi-head attention with sliding window and Sparse MoE feedforward
+    networks, using LayerNorm normalization and residual connections.
     """
 
     def __init__(
@@ -338,15 +324,15 @@ class PhiMoeDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initializes the PhiMoeDecoderLayer.
+        """Initialize PhiMoE decoder layer.
 
         Args:
-            config (PhiMoeConfig): The configuration object for the PhiMoE model.
-            layer_idx (int): Index of the current layer.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (PhiMoeConfig): Model configuration with layer parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
         """
         self.config = config
         self.dtype = dtype
@@ -407,27 +393,25 @@ class PhiMoeDecoderLayer(nn.Module):
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
-        """Forward pass of the PhiMoeDecoderLayer module.
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + moe(norm(x))
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[Array | bool]): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            output_router_logits (bool): Whether to return router logits from the MoE layer. Default is False.
-            fcm_mask (tp.Optional[Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[Array]): Precomputed rotary frequency embeddings.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal and sliding window masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            output_router_logits (bool, optional): Whether to return router logits. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
 
         Returns:
-            tp.Tuple[Array, tp.Optional[Array], tp.Optional[Array]]:
-                A tuple containing:
-                - hidden_states: Output hidden states after the decoder layer.
-                - self_attn_weights: Attention weights (if `output_attentions` is True).
-                - router_logits: Router logits from the MoE layer (if `output_router_logits` is True).
+            DecoderLayerOutput: Contains hidden states, attention weights, router logits, and cache view.
         """
         residual = hidden_states
 
@@ -475,20 +459,15 @@ class PhiMoeModel(EasyDeLBaseModule):
     """The base PhiMoE model transformer.
 
     This class represents the core transformer architecture of the PhiMoE model,
-    consisting of an embedding layer, multiple PhiMoeDecoderLayer layers
-    (which include Sparse Mixture of Experts blocks), and a final RMS normalization layer.
+    consisting of an embedding layer, multiple PhiMoeDecoderLayer layers (with sparse MoE),
+    and a final layer normalization. Combines Phi architecture with sparse
+    Mixture of Experts for efficient scaling.
 
     Attributes:
         config (PhiMoeConfig): Configuration object for the model.
         dtype (jnp.dtype): Data type for computation.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        embed_tokens (nn.Embed): Embedding layer for input tokens.
-        layers (tp.List[PhiMoeDecoderLayer]): List of decoder layers.
-        norm (RMSNorm): Final layer normalization.
-        embed_dropout (nn.Dropout): Dropout layer applied after embeddings.
-        gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
     """
 
     def __init__(
@@ -500,14 +479,14 @@ class PhiMoeModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the PhiMoeModel.
+        """Initialize PhiMoE base model.
 
         Args:
-            config (PhiMoeConfig): The configuration object for the PhiMoE model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (PhiMoeConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -567,32 +546,40 @@ class PhiMoeModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass of the PhiMoeModel.
+        """Forward pass through the PhiMoE base model.
+
+        Processes input tokens through embedding, all decoder layers with sliding window
+        attention, Sparse MoE, and final normalization.
 
         Args:
-            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None (uses config.output_attentions).
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None (uses config.output_hidden_states).
 
         Returns:
-            BaseModelOutput: The model's output.
-                returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-                `attentions` (optional), and `router_logits` (optional).
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
 
         Raises:
-            ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -696,21 +683,16 @@ class PhiMoeModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=PhiMoeConfig, model_type="phimoe")
 class PhiMoeForCausalLM(BaseCausalLMModule[PhiMoeModel, PhiMoeConfig]):
-    """PhiMoE model with a Causal Language Modeling head.
+    """PhiMoE model with a language modeling head for causal language modeling tasks.
 
-    This model consists of the base PhiMoE transformer (`PhiMoeModel`) followed by a
-    linear layer (`lm_head`) that projects the transformer's output hidden states
-    to the vocabulary size, producing logits for next token prediction.
-    Optionally, the input token embeddings can be tied to the output projection layer.
+    This model is a sparse MoE transformer-based language model with causal attention masks
+    and sliding window attention applied to perform autoregressive language generation.
 
     Attributes:
-        config (PhiMoeConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        model (PhiMoeModel): The core PhiMoE transformer model.
-        lm_head (ParallelLinear): The linear layer for projecting hidden states to vocabulary logits.
+        config (PhiMoeConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
     """
 
     _task_type = TaskType.CAUSAL_LM
@@ -726,14 +708,14 @@ class PhiMoeForCausalLM(BaseCausalLMModule[PhiMoeModel, PhiMoeConfig]):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the PhiMoeForCausalLM model.
+        """Initialize PhiMoE model for causal language modeling.
 
         Args:
-            config (PhiMoeConfig): The configuration object for the PhiMoE model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (PhiMoeConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -760,30 +742,35 @@ class PhiMoeForCausalLM(BaseCausalLMModule[PhiMoeModel, PhiMoeConfig]):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> CausalLMOutput:
-        """Forward pass of the PhiMoeForCausalLM model.
+        """Forward pass through the PhiMoE causal language model.
 
         Args:
-            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply language model head projection.
+                Defaults to True.
 
         Returns:
-            CausalLMOutput: The model's output.
-                returns a `CausalLMOutput` object containing `logits`, `hidden_states` (optional),
-                `attentions` (optional), and `router_logits` (optional).
+            CausalLMOutput: Contains logits, optional hidden_states, optional attentions,
+                and updated past_key_values.
         """
         outputs = self.model(
             input_ids=input_ids,
