@@ -47,21 +47,11 @@ from .phi_configuration import PhiConfig
 
 
 class PhiMLP(nn.Module):
-    """Phi MLP module.
+    """Multi-Layer Perceptron module for Phi models.
 
-    This module implements the feed-forward network (MLP) used in the Phi model.
-    It consists of two linear projections with a GELU activation in between.
-
-    Attributes:
-        config (PhiConfig): Configuration object for the model.
-        layer_idx (int, optional): Index of the current layer.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        fc1 (ParallelLinear): First linear projection layer (up-projection).
-        fc2 (ParallelLinear): Second linear projection layer (down-projection).
-        act (callable): Activation function.
+    Implements the feedforward network with configurable activation function
+    for enhanced representation learning in Phi architecture. Uses a two-layer
+    structure with up-projection followed by activation and down-projection.
     """
 
     def __init__(
@@ -74,15 +64,16 @@ class PhiMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the PhiMLP module.
+        """Initialize Phi MLP block.
 
         Args:
-            config (PhiConfig): The configuration object for the Phi model.
-            layer_idx (int, optional): Index of the current layer. Defaults to None.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike, optional): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (PhiConfig): Model configuration with MLP parameters.
+            layer_idx (int | None, optional): Index of the current layer. Defaults to None.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.Precision | None, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -114,13 +105,13 @@ class PhiMLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Forward pass of the PhiMLP module.
+        """Apply feedforward transformation.
 
         Args:
-            hidden_states: Input hidden states.
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
-            Output hidden states after MLP transformation.
+            Transformed hidden states [batch, seq_len, hidden_dim]
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -138,14 +129,12 @@ class PhiMLP(nn.Module):
 
 
 class PhiAttention(UnifiedAttention):
-    """Phi Attention with Q/K normalization.
+    """Multi-head attention layer with optional Q/K normalization for Phi models.
 
-    Inherits Q/K normalization from QKNormAttention.
-    Features:
-    - Uses LayerNorm instead of RMSNorm
-    - Standard LayerNorm on full hidden_size (not per-head)
-    - Partial RoPE (partial_rotary_factor)
-    - Custom bias configuration
+    Implements attention with Phi-specific features including partial rotary
+    position embeddings, optional query/key layer normalization, and custom
+    bias configuration. Uses standard LayerNorm on full hidden_size rather
+    than per-head normalization.
     """
 
     norms_mapping: ClassVar[dict[str, str]] = {
@@ -169,6 +158,16 @@ class PhiAttention(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Phi attention layer with partial RoPE and optional Q/K normalization.
+
+        Args:
+            config (PhiConfig): Model configuration with attention parameters.
+            layer_idx (int | None, optional): Index of this layer in the model. Defaults to None.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.qk_layernorm = config.qk_layernorm
         config.attention_bias = True
         super().__init__(
@@ -190,8 +189,20 @@ class PhiAttention(UnifiedAttention):
         self.is_causal = True
 
     def _create_q_norm(self, config, dtype, param_dtype, rngs):
-        """Override to use standard LayerNorm on hidden_size if qk_layernorm is enabled."""
+        """Create query normalization layer.
 
+        Overrides base implementation to use standard LayerNorm on full hidden_size
+        instead of per-head normalization when qk_layernorm is enabled.
+
+        Args:
+            config: Model configuration.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            rngs: Random number generator state.
+
+        Returns:
+            LayerNorm applied to query states before attention.
+        """
         return nn.LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
@@ -202,8 +213,20 @@ class PhiAttention(UnifiedAttention):
         )
 
     def _create_k_norm(self, config, dtype, param_dtype, rngs):
-        """Override to use standard LayerNorm on hidden_size if qk_layernorm is enabled."""
+        """Create key normalization layer.
 
+        Overrides base implementation to use standard LayerNorm on full hidden_size
+        instead of per-head normalization when qk_layernorm is enabled.
+
+        Args:
+            config: Model configuration.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            rngs: Random number generator state.
+
+        Returns:
+            LayerNorm applied to key states before attention.
+        """
         return nn.LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
@@ -214,7 +237,18 @@ class PhiAttention(UnifiedAttention):
         )
 
     def _create_rotary(self, config, dtype):
-        """Override for partial RoPE."""
+        """Create rotary position embedding for partial RoPE.
+
+        Overrides base implementation to create rotary embeddings with
+        partial_rotary_factor applied to the head dimension.
+
+        Args:
+            config: Model configuration with partial_rotary_factor.
+            dtype: Data type for rotary embeddings.
+
+        Returns:
+            Rotary position embedding module configured for partial rotation.
+        """
         return config.get_basic_rope(
             dtype,
             head_size=int(config.partial_rotary_factor * (config.hidden_size // config.num_attention_heads)),
@@ -222,29 +256,30 @@ class PhiAttention(UnifiedAttention):
         )
 
     def _preprocess_qkv(self, query_states, key_states, value_states):
+        """Preprocess query, key, and value states before attention computation.
+
+        Applies optional Q/K layer normalization when qk_layernorm is enabled.
+
+        Args:
+            query_states: Query tensor from Q projection.
+            key_states: Key tensor from K projection.
+            value_states: Value tensor from V projection.
+
+        Returns:
+            Tuple of (query, key, value) with optional normalization applied.
+        """
         if self.use_qk_norm:
             return self.query_normalization(query_states), self.key_normalization(key_states), value_states
         return query_states, key_states, value_states
 
 
 class PhiDecoderLayer(nn.Module):
-    """Phi Transformer Decoder Layer.
+    """Single decoder layer for Phi models.
 
-    This module represents a single decoder layer in the Phi model,
-    combining self-attention and MLP sub-layers with residual connections
-    and layer normalization.
-
-    Attributes:
-        config (PhiConfig): Configuration object for the model.
-        layer_idx (int, optional): Index of the current layer.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        input_layernorm (nn.LayerNorm): Layer normalization applied before the attention and MLP blocks.
-        resid_dropout (nn.Dropout): Dropout applied to the residual connection after the MLP block.
-        self_attn (PhiAttention): The self-attention module.
-        mlp (PhiMLP): The feed-forward (MLP) module.
+    Combines multi-head attention and feedforward networks with parallel
+    residual connections and LayerNorm normalization. Phi uses a parallel
+    attention/MLP architecture where both sublayers receive the same input
+    and their outputs are combined.
     """
 
     def __init__(
@@ -257,15 +292,15 @@ class PhiDecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the PhiDecoderLayer.
+        """Initialize Phi decoder layer.
 
         Args:
-            config (PhiConfig): The configuration object for the Phi model.
-            layer_idx (int, optional): Index of the current layer. Defaults to None.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike, optional): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (PhiConfig): Model configuration.
+            layer_idx (int | None, optional): Index of this layer in the model. Defaults to None.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -318,24 +353,26 @@ class PhiDecoderLayer(nn.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """Forward pass of the PhiDecoderLayer module.
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies parallel architecture: residual + attn(norm(x)) + mlp(norm(x))
+        where attention and MLP receive the same normalized input.
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[Array]): Precomputed rotary frequency embeddings.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
 
         Returns:
-            tp.Tuple[Array, tp.Optional[Array]]:
-                A tuple containing the output hidden states and optionally the attention weights.
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
         """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -384,23 +421,17 @@ class PhiDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=PhiConfig, model_type="phi")
 class PhiModel(EasyDeLBaseModule):
-    """The base Phi model transformer.
+    """Phi model implementation.
 
-    This class represents the core transformer architecture of the Phi model,
-    consisting of an embedding layer, multiple PhiDecoderLayer layers,
-    and a final layer normalization.
+    This implements the Phi language model architecture, utilizing transformer blocks
+    with LayerNorm, partial rotary position embeddings, and a parallel attention/MLP
+    mechanism with optional Q/K normalization.
 
     Attributes:
-        config (PhiConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
+        config (PhiConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        embed_tokens (nn.Embed): Embedding layer for input tokens.
-        layers (tp.List[PhiDecoderLayer]): List of decoder layers.
-        final_layernorm (nn.LayerNorm): Final layer normalization.
-        embed_dropout (nn.Dropout): Dropout layer applied after embeddings.
-        gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
+        precision: Precision setting for JAX operations.
     """
 
     def __init__(
@@ -412,14 +443,14 @@ class PhiModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the PhiModel.
+        """Initialize Phi base model.
 
         Args:
-            config (PhiConfig): The configuration object for the Phi model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (PhiConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -466,6 +497,12 @@ class PhiModel(EasyDeLBaseModule):
 
     @functools.cached_property
     def frequencies(self):
+        """Compute rotary position embedding frequencies for partial RoPE.
+
+        Returns:
+            Precomputed frequency tensor for rotary embeddings with shape
+            determined by partial_rotary_factor and head dimension.
+        """
         return self.config.get_basic_frequencies(
             head_size=int(
                 self.config.partial_rotary_factor * (self.config.hidden_size // self.config.num_attention_heads)
@@ -630,7 +667,18 @@ class PhiModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=PhiConfig, model_type="phi")
 class PhiForCausalLM(BaseCausalLMModule[PhiModel, PhiConfig]):
-    """Phi model with a Causal Language Modeling head."""
+    """Phi model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation, featuring partial
+    rotary embeddings and optional Q/K normalization.
+
+    Attributes:
+        config (PhiConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "phi"
@@ -645,6 +693,15 @@ class PhiForCausalLM(BaseCausalLMModule[PhiModel, PhiConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Phi model for causal language modeling.
+
+        Args:
+            config (PhiConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=PhiModel,

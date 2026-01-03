@@ -46,7 +46,12 @@ from .glm_configuration import GlmConfig
 
 
 class GlmMLP(nn.Module):
-    """Feed-forward module for GLM decoder blocks."""
+    """Multi-Layer Perceptron module for GLM models.
+
+    Implements the feedforward network with gated activation function
+    using fused gate-up projections for enhanced representation learning
+    in the GLM architecture.
+    """
 
     def __init__(
         self,
@@ -57,6 +62,16 @@ class GlmMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM MLP block.
+
+        Args:
+            config (GlmConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -83,14 +98,16 @@ class GlmMLP(nn.Module):
         self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
-        """Forward pass through the GLM MLP.
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply gated feedforward transformation.
 
         Args:
-            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim).
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
-            Output tensor of shape (batch, seq_len, hidden_dim).
+            Transformed hidden states [batch, seq_len, hidden_dim]
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -109,7 +126,7 @@ class GlmMLP(nn.Module):
 
 
 class GlmAttention(UnifiedAttention):
-    """Attention block configured for the GLM architecture."""
+    """Multi-head attention layer with RoPE embeddings for GLM models."""
 
     def __init__(
         self,
@@ -121,6 +138,16 @@ class GlmAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize GLM attention layer with grouped-query attention support.
+
+        Args:
+            config (GlmConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         self.layer_idx = layer_idx
         super().__init__(
             config=config,
@@ -133,7 +160,11 @@ class GlmAttention(UnifiedAttention):
 
 
 class GlmDecoderLayer(nn.Module):
-    """Single GLM decoder layer mixing attention and MLP sublayers."""
+    """Single decoder layer for GLM models.
+
+    Combines multi-head attention and feedforward networks with
+    RMS normalization and residual connections.
+    """
 
     def __init__(
         self,
@@ -145,6 +176,16 @@ class GlmDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize GLM decoder layer.
+
+        Args:
+            config (GlmConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -200,21 +241,25 @@ class GlmDecoderLayer(nn.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """Forward pass through the GLM decoder layer.
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x))
 
         Args:
-            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim).
-            mask_info: Mask information for attention computation.
-            position_ids: Position indices of shape (batch, seq_len).
-            mode: Runtime mode (train, decode, etc.).
-            cache_view: Optional cache view for key-value caching.
-            cache_metadata: Optional metadata for cache operations.
-            output_attentions: Whether to return attention weights.
-            frequencies: Optional rotary embedding frequencies.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
 
         Returns:
-            DecoderLayerOutput containing hidden states and optional attention weights.
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
         """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -261,7 +306,17 @@ class GlmDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=GlmConfig, model_type="glm")
 class GlmModel(EasyDeLBaseModule):
-    """GLM model implementation."""
+    """GLM model implementation.
+
+    This implements the GLM (General Language Model) architecture, utilizing transformer blocks
+    with RMSNorm, rotary position embeddings, and a specific attention mechanism.
+
+    Attributes:
+        config (GlmConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -272,6 +327,15 @@ class GlmModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM base model.
+
+        Args:
+            config (GlmConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -328,25 +392,40 @@ class GlmModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass through the GLM model.
+        """Forward pass through the GLM base model.
+
+        Processes input tokens through embedding, all decoder layers with RoPE and RMSNorm,
+        and final normalization.
 
         Args:
-            input_ids: Input token IDs of shape (batch, seq_len).
-            inputs_embeds: Pre-computed input embeddings. Mutually exclusive with input_ids.
-            attention_mask: Optional boolean mask of shape (batch, seq_len).
-            mask_info: Optional pre-computed mask information.
-            position_ids: Optional position indices of shape (batch, seq_len).
-            mode: Runtime mode (train, decode, etc.).
-            past_key_values: Optional cache for incremental decoding.
-            cache_metadata: Optional metadata for cache operations.
-            output_attentions: Whether to return attention weights from all layers.
-            output_hidden_states: Whether to return hidden states from all layers.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            BaseModelOutput containing last hidden state and optional intermediate outputs.
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
 
         Raises:
-            ValueError: If neither or both of input_ids and inputs_embeds are provided.
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -428,21 +507,45 @@ class GlmModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
         return self
 
     def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
         raise NotImplementedError("The base model does not have a language model head.")
 
     def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
         return self.embed_tokens
 
 
 @register_module(TaskType.CAUSAL_LM, config=GlmConfig, model_type="glm")
 class GlmForCausalLM(BaseCausalLMModule[GlmModel, GlmConfig]):
-    """GLM model with a language modeling head for causal language modeling tasks."""
+    """GLM model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation.
+
+    Attributes:
+        config (GlmConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "glm"
@@ -457,6 +560,15 @@ class GlmForCausalLM(BaseCausalLMModule[GlmModel, GlmConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM model for causal language modeling.
+
+        Args:
+            config (GlmConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=GlmModel,
@@ -471,7 +583,17 @@ class GlmForCausalLM(BaseCausalLMModule[GlmModel, GlmConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=GlmConfig, model_type="glm")
 class GlmForSequenceClassification(BaseSequenceClassificationModule[GlmModel, GlmConfig]):
-    """GLM model for sequence classification tasks."""
+    """GLM model for sequence classification tasks.
+
+    This class extends the base GLM model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+
+    Attributes:
+        config (GlmConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "glm"
@@ -486,6 +608,15 @@ class GlmForSequenceClassification(BaseSequenceClassificationModule[GlmModel, Gl
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM model for sequence classification.
+
+        Args:
+            config (GlmConfig): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=GlmModel,

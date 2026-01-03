@@ -57,7 +57,12 @@ from .glm4_moe_configuration import Glm4MoeConfig
 
 
 class Glm4MoeMLP(nn.Module):
-    """Dense feed-forward block used in non-MoE GLM-4-MoE layers."""
+    """Dense feed-forward block used in non-MoE GLM-4-MoE layers.
+
+    Implements the standard gated feedforward network with separate gate and up
+    projections for dense layers in the GLM-4-MoE hybrid architecture.
+    Used in early layers before the MoE transition point.
+    """
 
     def __init__(
         self,
@@ -68,6 +73,16 @@ class Glm4MoeMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM-4 MoE dense MLP block.
+
+        Args:
+            config (Glm4MoeConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -96,6 +111,15 @@ class Glm4MoeMLP(nn.Module):
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
+        """Apply gated feedforward transformation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Tuple of (transformed hidden states [batch, seq_len, hidden_dim], None).
+            Returns None for router_logits compatibility with MoE interface.
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -113,7 +137,12 @@ class Glm4MoeMLP(nn.Module):
 
 
 class Glm4MoeMLPStack(nn.Module):
-    """Glm4Moe MoE MLP using the new ParallelMoELinear layers."""
+    """Expert MLP stack for GLM-4-MoE using parallel MoE linear layers.
+
+    Implements the feedforward network for multiple experts using efficient
+    batched computation with ColumnParallelMoELinear and RowParallelMoELinear
+    layers. Supports expert tensor mode for optimized expert computation.
+    """
 
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
@@ -140,6 +169,16 @@ class Glm4MoeMLPStack(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM-4 MoE expert MLP stack.
+
+        Args:
+            config (Glm4MoeConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -189,7 +228,16 @@ class Glm4MoeMLPStack(nn.Module):
         group_sizes: Array,
         sorted_experts: Array | None = None,
     ) -> Array:
-        """Forward pass through MoE MLP."""
+        """Forward pass through expert MLP stack.
+
+        Args:
+            x: Input tensor for expert computation.
+            group_sizes: Sizes of each expert group for batched computation.
+            sorted_experts: Optional sorted expert indices for routing.
+
+        Returns:
+            Expert output tensor after gated feedforward transformation.
+        """
         hidden_states = self.act_fn(checkpoint_name(self.gate_proj(x, group_sizes, sorted_experts), name="moe_gate"))
         hidden_states = hidden_states * checkpoint_name(self.up_proj(x, group_sizes, sorted_experts), name="moe_up")
         outputs = checkpoint_name(self.down_proj(hidden_states, group_sizes, sorted_experts), name="moe_expert_output")
@@ -197,7 +245,12 @@ class Glm4MoeMLPStack(nn.Module):
 
 
 class Glm4MoeTopKRouter(nn.Module):
-    """Selects top-k experts per token for GLM-4-MoE routing."""
+    """Top-K expert router for GLM-4-MoE with grouped expert selection.
+
+    Implements a two-stage routing strategy: first selects top groups based on
+    aggregated scores, then selects top-k experts within those groups. Uses
+    sigmoid scoring with e-score correction bias for improved load balancing.
+    """
 
     def __init__(
         self,
@@ -208,6 +261,16 @@ class Glm4MoeTopKRouter(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM-4 MoE Top-K router.
+
+        Args:
+            config (Glm4MoeConfig): Model configuration with routing parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -234,6 +297,17 @@ class Glm4MoeTopKRouter(nn.Module):
         )
 
     def get_selected_experts(self, scores):
+        """Select top-k experts using grouped routing strategy.
+
+        Performs two-stage selection: first selects top groups based on sum
+        of top-2 scores per group, then selects top-k experts from those groups.
+
+        Args:
+            scores: Router scores of shape [batch_size, n_routed_experts].
+
+        Returns:
+            Selected expert indices of shape [batch_size, top_k].
+        """
         scores_for_choice = scores + self.e_score_correction_bias.value
         batch_size = scores_for_choice.shape[0]
         group_scores = scores_for_choice.reshape(batch_size, self.n_group, self.n_routed_experts // self.n_group)
@@ -260,6 +334,15 @@ class Glm4MoeTopKRouter(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Compute routing weights for input tokens.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Selected expert weights [batch * seq_len, top_k] with optional
+            probability normalization and routed scaling factor applied.
+        """
         hidden_states = hidden_states.reshape(-1, self.config.hidden_size)
         router_logits = checkpoint_name(
             jnp.matmul(hidden_states.astype(jnp.float32), self.kernel.value.astype(jnp.float32)),
@@ -278,7 +361,12 @@ class Glm4MoeTopKRouter(nn.Module):
 
 
 class Glm4MoeMoE(BaseMoeModule):
-    """GLM-4-MoE feed-forward wrapper combining router and expert stacks."""
+    """Mixture-of-Experts feed-forward module for GLM-4-MoE.
+
+    Combines the Top-K router, expert MLP stack, and shared experts into
+    a unified MoE layer. Routes tokens to selected experts and combines
+    outputs with shared expert outputs for enhanced model capacity.
+    """
 
     def __init__(
         self,
@@ -289,6 +377,16 @@ class Glm4MoeMoE(BaseMoeModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM-4 MoE layer.
+
+        Args:
+            config (Glm4MoeConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             n_routed_experts=config.n_routed_experts,
@@ -329,6 +427,17 @@ class Glm4MoeMoE(BaseMoeModule):
         )
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+        """Forward pass through the MoE layer.
+
+        Routes tokens to top-k experts, computes expert outputs, and combines
+        with shared expert outputs for final result.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Tuple of (output tensor [batch, seq_len, hidden_dim], router_logits).
+        """
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -345,7 +454,11 @@ class Glm4MoeMoE(BaseMoeModule):
 
 
 class Glm4MoeAttention(UnifiedAttention):
-    """Attention layer variant used inside GLM-4-MoE decoder blocks."""
+    """Multi-head attention layer with RoPE embeddings for GLM-4-MoE models.
+
+    Extends UnifiedAttention with optional QK normalization support
+    for improved training stability in mixture-of-experts architectures.
+    """
 
     def __init__(
         self,
@@ -357,6 +470,16 @@ class Glm4MoeAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize GLM-4 MoE attention layer with grouped-query attention support.
+
+        Args:
+            config (Glm4MoeConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         self.layer_idx = layer_idx
         super().__init__(
             config=config,
@@ -370,7 +493,13 @@ class Glm4MoeAttention(UnifiedAttention):
 
 
 class Glm4MoeDecoderLayer(nn.Module):
-    """Single decoder block for GLM-4-MoE with attention and MoE MLP."""
+    """Single decoder layer for GLM-4-MoE models.
+
+    Combines multi-head attention and either dense MLP or MoE feedforward
+    networks with RMS normalization and residual connections. Uses dense
+    MLP for early layers (layer_idx < first_k_dense_replace) and MoE for
+    deeper layers to balance efficiency and capacity.
+    """
 
     def __init__(
         self,
@@ -382,6 +511,17 @@ class Glm4MoeDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize GLM-4 MoE decoder layer.
+
+        Args:
+            config (Glm4MoeConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model. Determines whether
+                to use dense MLP (layer_idx < first_k_dense_replace) or MoE.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -439,6 +579,27 @@ class Glm4MoeDecoderLayer(nn.Module):
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture with attention followed by
+        feedforward network (either dense MLP or MoE depending on layer index).
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            output_router_logits (bool, optional): Whether to return router logits. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, cache view, and router logits.
+        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -475,7 +636,19 @@ class Glm4MoeDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Glm4MoeConfig, model_type="glm4_moe")
 class Glm4MoeModel(EasyDeLBaseModule):
-    """GLM4 MoE model implementation."""
+    """GLM-4 MoE (Mixture-of-Experts) model implementation.
+
+    This implements the GLM-4 MoE architecture, a hybrid transformer model that
+    combines dense feedforward layers in early layers with mixture-of-experts
+    layers in deeper layers. Features include RMSNorm, rotary position embeddings,
+    grouped-query attention, and top-k expert routing with shared experts.
+
+    Attributes:
+        config (Glm4MoeConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -486,6 +659,15 @@ class Glm4MoeModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM-4 MoE base model.
+
+        Args:
+            config (Glm4MoeConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -664,21 +846,51 @@ class Glm4MoeModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
+        """Returns the encoder part of the model's graph definition.
+
+        Raises:
+            NotImplementedError: Decoder-only models don't have an encoder.
+        """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
+        """Returns the decoder part of the model's graph definition.
+
+        Returns:
+            The model itself, as this is a decoder-only architecture.
+        """
         return self
 
     def get_lm_head(self):
+        """Returns the language model head of the module.
+
+        Raises:
+            NotImplementedError: Base models don't have a Language Model Head.
+        """
         raise NotImplementedError("The base model does not have a language model head.")
 
     def get_embedding(self):
+        """Returns the embedding layer of the module.
+
+        Returns:
+            The token embedding layer.
+        """
         return self.embed_tokens
 
 
 @register_module(TaskType.CAUSAL_LM, config=Glm4MoeConfig, model_type="glm4_moe")
 class Glm4MoeForCausalLM(BaseCausalLMModule[Glm4MoeModel, Glm4MoeConfig]):
-    """GLM4 MoE model with a language modeling head for causal language modeling tasks."""
+    """GLM-4 MoE model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with mixture-of-experts layers
+    and causal attention masks applied to perform autoregressive language generation.
+
+    Attributes:
+        config (Glm4MoeConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "glm4_moe"
@@ -693,6 +905,15 @@ class Glm4MoeForCausalLM(BaseCausalLMModule[Glm4MoeModel, Glm4MoeConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM-4 MoE model for causal language modeling.
+
+        Args:
+            config (Glm4MoeConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Glm4MoeModel,
@@ -708,7 +929,17 @@ class Glm4MoeForCausalLM(BaseCausalLMModule[Glm4MoeModel, Glm4MoeConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Glm4MoeConfig, model_type="glm4_moe")
 class Glm4MoeForSequenceClassification(BaseSequenceClassificationModule[Glm4MoeModel, Glm4MoeConfig]):
-    """GLM4 MoE model for sequence classification tasks."""
+    """GLM-4 MoE model for sequence classification tasks.
+
+    This class extends the base GLM-4 MoE model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+
+    Attributes:
+        config (Glm4MoeConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "glm4_moe"
@@ -723,6 +954,15 @@ class Glm4MoeForSequenceClassification(BaseSequenceClassificationModule[Glm4MoeM
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM-4 MoE model for sequence classification.
+
+        Args:
+            config (Glm4MoeConfig): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Glm4MoeModel,

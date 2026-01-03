@@ -51,10 +51,25 @@ logger = get_logger(__name__)
 
 
 class GPTJAttention(UnifiedAttention):
-    """GPT-J Attention with partial RoPE.
+    """GPT-J Attention module with partial Rotary Position Embeddings (RoPE).
 
-    Inherits from UnifiedAttention.
-    Uses separate Q/K/V projections with partial rotary embeddings.
+    This module implements the multi-head self-attention mechanism used in GPT-J.
+    Unlike some other transformers, GPT-J applies rotary position embeddings to only
+    a portion of the head dimension (partial RoPE), which provides a balance between
+    position-sensitive and position-agnostic features.
+
+    Attributes:
+        config (GPTJConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        layer_idx (int): Index of this layer in the model (0-indexed).
+        rngs (nn.Rngs): Random number generators.
+        q_proj (ColumnParallelLinear): Query projection layer.
+        k_proj (ColumnParallelLinear): Key projection layer.
+        v_proj (ColumnParallelLinear): Value projection layer.
+        out_proj (ColumnParallelLinear): Output projection layer.
+        resid_dropout (nn.Dropout): Residual dropout layer.
     """
 
     projection_mapping: ClassVar[dict[str, str]] = {
@@ -104,7 +119,19 @@ class GPTJAttention(UnifiedAttention):
         )
 
     def _create_rotary(self, config: GPTJConfig, dtype: jnp.dtype):
-        """Create GPT-J-specific rotary embedding with partial RoPE."""
+        """Create GPT-J-specific rotary embedding with partial RoPE.
+
+        GPT-J uses partial rotary embeddings where only a portion of the head
+        dimension receives positional encoding. This is controlled by config.rotary_dim.
+
+        Args:
+            config: GPTJConfig containing rotary_dim and other hyperparameters.
+            dtype: Data type for the rotary embeddings.
+
+        Returns:
+            Rotary embedding module configured for partial RoPE with GPT-J style
+            (non-NeoX interleaving).
+        """
         return config.get_basic_rope(
             dtype,
             head_size=self.head_dim,
@@ -114,7 +141,16 @@ class GPTJAttention(UnifiedAttention):
         )
 
     def _create_attention_performer(self, config: GPTJConfig, rngs: nn.Rngs):
-        """Create attention performer with config dropout."""
+        """Create attention performer with GPT-J specific dropout settings.
+
+        Args:
+            config: GPTJConfig containing attn_pdrop and other hyperparameters.
+            rngs: Random number generators for dropout.
+
+        Returns:
+            FlexibleAttentionModule configured with GPT-J attention dropout
+            and softmax scaling.
+        """
         return FlexibleAttentionModule(
             rngs=rngs,
             dropout_prob=config.attn_pdrop,
@@ -123,7 +159,19 @@ class GPTJAttention(UnifiedAttention):
         )
 
     def _create_q_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Create query projection with checkpointing."""
+        """Create query projection layer.
+
+        Args:
+            config: Model configuration with hidden_size and num_attention_heads.
+            dtype: Data type for computations.
+            param_dtype: Data type for parameters.
+            precision: JAX precision setting.
+            rngs: Random number generators.
+
+        Returns:
+            ColumnParallelLinear layer projecting from hidden_size to
+            num_attention_heads * head_dim.
+        """
         return ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
@@ -136,7 +184,19 @@ class GPTJAttention(UnifiedAttention):
         )
 
     def _create_k_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Create key projection."""
+        """Create key projection layer.
+
+        Args:
+            config: Model configuration with hidden_size.
+            dtype: Data type for computations.
+            param_dtype: Data type for parameters.
+            precision: JAX precision setting.
+            rngs: Random number generators.
+
+        Returns:
+            ColumnParallelLinear layer projecting from hidden_size to
+            num_key_value_heads * head_dim.
+        """
         return ColumnParallelLinear(
             config.hidden_size,
             self.num_key_value_heads * self.head_dim,
@@ -149,7 +209,19 @@ class GPTJAttention(UnifiedAttention):
         )
 
     def _create_v_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Create value projection."""
+        """Create value projection layer.
+
+        Args:
+            config: Model configuration with hidden_size.
+            dtype: Data type for computations.
+            param_dtype: Data type for parameters.
+            precision: JAX precision setting.
+            rngs: Random number generators.
+
+        Returns:
+            ColumnParallelLinear layer projecting from hidden_size to
+            num_key_value_heads * head_dim.
+        """
         return ColumnParallelLinear(
             config.hidden_size,
             self.num_key_value_heads * self.head_dim,
@@ -162,7 +234,22 @@ class GPTJAttention(UnifiedAttention):
         )
 
     def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
-        """Create output projection (named out_proj for GPT-J)."""
+        """Create output projection layer.
+
+        Note: GPT-J names this 'out_proj' rather than 'o_proj' for weight
+        compatibility with the original implementation.
+
+        Args:
+            config: Model configuration with hidden_size and num_attention_heads.
+            dtype: Data type for computations.
+            param_dtype: Data type for parameters.
+            precision: JAX precision setting.
+            rngs: Random number generators.
+
+        Returns:
+            ColumnParallelLinear layer projecting from num_attention_heads * head_dim
+            back to hidden_size.
+        """
         self.out_proj = ColumnParallelLinear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
@@ -183,7 +270,18 @@ class GPTJAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike,
         rngs: nn.Rngs,
     ):
-        """Define GPT-J-specific network with residual dropout."""
+        """Define GPT-J-specific network architecture with residual dropout.
+
+        Creates the attention projection layers (Q, K, V, O) via the parent class
+        and adds GPT-J specific residual dropout.
+
+        Args:
+            config: GPTJConfig containing model hyperparameters.
+            dtype: Data type for computations.
+            param_dtype: Data type for parameters.
+            precision: JAX precision setting for matrix operations.
+            rngs: Random number generators.
+        """
         # Call parent to create standard Q/K/V/O projections
         super().define_network(config, dtype, param_dtype, precision, rngs)
 
@@ -191,26 +289,61 @@ class GPTJAttention(UnifiedAttention):
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
 
     def _split_heads(self, hidden_states):
-        """Split hidden states into attention heads."""
+        """Split hidden states into separate attention heads.
+
+        Args:
+            hidden_states: Input tensor with shape (batch, seq_len, num_heads * head_dim).
+
+        Returns:
+            Tensor reshaped to (batch, seq_len, num_heads, head_dim).
+        """
         return hidden_states.reshape((*hidden_states.shape[:2], self.config.num_attention_heads, self.head_dim))
 
     def _get_query_proj(self, hidden_states: Array) -> Array:
-        """Apply query projection with checkpoint naming and head splitting."""
+        """Apply query projection with checkpoint naming and head splitting.
+
+        Args:
+            hidden_states: Input hidden states with shape (batch, seq_len, hidden_size).
+
+        Returns:
+            Query states with shape (batch, seq_len, num_heads, head_dim).
+        """
         query_states = checkpoint_name(self.q_proj(hidden_states), "attn_query")
         return self._split_heads(query_states)
 
     def _get_key_proj(self, hidden_states: Array) -> Array:
-        """Apply key projection with checkpoint naming and head splitting."""
+        """Apply key projection with checkpoint naming and head splitting.
+
+        Args:
+            hidden_states: Input hidden states with shape (batch, seq_len, hidden_size).
+
+        Returns:
+            Key states with shape (batch, seq_len, num_kv_heads, head_dim).
+        """
         key_states = checkpoint_name(self.k_proj(hidden_states), "attn_key")
         return self._split_heads(key_states)
 
     def _get_value_proj(self, hidden_states: Array) -> Array:
-        """Apply value projection with checkpoint naming and head splitting."""
+        """Apply value projection with checkpoint naming and head splitting.
+
+        Args:
+            hidden_states: Input hidden states with shape (batch, seq_len, hidden_size).
+
+        Returns:
+            Value states with shape (batch, seq_len, num_kv_heads, head_dim).
+        """
         value_states = checkpoint_name(self.v_proj(hidden_states), "attn_value")
         return self._split_heads(value_states)
 
     def _get_output_proj(self, attn_output: Array) -> Array:
-        """Apply output projection with checkpoint naming and residual dropout."""
+        """Apply output projection with checkpoint naming and residual dropout.
+
+        Args:
+            attn_output: Attention output with shape (batch, seq_len, hidden_size).
+
+        Returns:
+            Projected output after applying dropout, with shape (batch, seq_len, hidden_size).
+        """
         attn_output = checkpoint_name(self.out_proj(attn_output), "attn_output")
         return self.resid_dropout(attn_output)
 
@@ -516,6 +649,16 @@ class GPTJModel(EasyDeLBaseModule):
 
     @cached_property
     def frequencies(self):
+        """Compute rotary position embedding frequencies for GPT-J.
+
+        Generates sinusoidal frequencies for partial rotary position embeddings.
+        GPT-J uses partial RoPE where only rotary_dim dimensions of each attention
+        head receive positional encoding.
+
+        Returns:
+            Array of shape (max_position_embeddings, rotary_dim) containing
+            precomputed sinusoidal frequencies for rotary position embeddings.
+        """
         embed_dim = self.config.hidden_size
         num_heads = self.config.num_attention_heads
         head_dim = embed_dim // num_heads
@@ -665,8 +808,18 @@ class GPTJModel(EasyDeLBaseModule):
 class GPTJForCausalLM(BaseCausalLMModule[GPTJModel, GPTJConfig]):
     """GPT-J model with a language modeling head for autoregressive text generation.
 
-    This model extends GPTJModel with a linear language modeling head that projects
-    hidden states to vocabulary logits for next-token prediction.
+    This model extends the base GPTJModel by adding a linear layer on top to
+    predict the next token in a sequence, making it suitable for causal language
+    modeling tasks such as text generation, completion, and conversation.
+
+    Attributes:
+        config (GPTJConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        rngs (nn.Rngs): Random number generators.
+        transformer (GPTJModel): The base GPT-J transformer model.
+        lm_head (nn.Linear): Linear layer projecting hidden states to vocabulary logits.
     """
 
     _task_type = TaskType.CAUSAL_LM

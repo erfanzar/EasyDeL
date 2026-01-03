@@ -175,6 +175,16 @@ class Llama4TextExperts(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama4 text experts module.
+
+        Args:
+            config (Llama4Config): Model configuration with expert parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -228,7 +238,16 @@ class Llama4TextExperts(nn.Module):
         group_sizes: Array,
         sorted_experts: Array | None = None,
     ) -> Array:
-        """Forward pass through MoE experts."""
+        """Forward pass through MoE experts.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim].
+            group_sizes: Array specifying the sizes of expert groups.
+            sorted_experts: Optional array of sorted expert indices.
+
+        Returns:
+            Transformed hidden states after expert processing [batch, seq_len, hidden_dim].
+        """
         gate = self.gate_proj(hidden_states, group_sizes, sorted_experts)
         up = self.up_proj(hidden_states, group_sizes, sorted_experts)
         return self.down_proj(self.act_fn(gate) * up, group_sizes, sorted_experts)
@@ -244,6 +263,11 @@ class Llama4TextL2Norm(nn.Module):
     kernel_init = staticmethod(nn.initializers.ones)
 
     def __init__(self, eps: float = 1e-6) -> None:
+        """Initialize L2 normalization layer.
+
+        Args:
+            eps (float, optional): Small constant for numerical stability. Defaults to 1e-6.
+        """
         self.eps = eps
 
     def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -251,6 +275,14 @@ class Llama4TextL2Norm(nn.Module):
 
     @jax.named_scope("easydel-L2norm")
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Apply L2 normalization.
+
+        Args:
+            x: Input tensor to normalize.
+
+        Returns:
+            L2-normalized tensor with the same shape as input.
+        """
         return self._norm(x.astype(jnp.float32)).astype(x.dtype)
 
 
@@ -271,6 +303,18 @@ class Llama4TextMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama4 text MLP block.
+
+        Args:
+            config (Llama4Config): Model configuration with MLP parameters.
+            intermediate_size (int, optional): Size of intermediate layer. If None, uses
+                config.intermediate_size. Defaults to None.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -301,6 +345,14 @@ class Llama4TextMLP(nn.Module):
         self.activation_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
+        """Apply SwiGLU feedforward transformation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim].
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim].
+        """
         gate = checkpoint_name(self.activation_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
@@ -323,6 +375,16 @@ class Llama4TextMoe(BaseMoeModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama4 Mixture of Experts layer.
+
+        Args:
+            config (Llama4Config): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             n_routed_experts=config.num_local_experts,
@@ -428,6 +490,20 @@ class Llama4TextMoe(BaseMoeModule):
         training: bool = False,
         layer_idx: int | None = None,
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Forward pass through the MoE layer.
+
+        Routes inputs through both shared and specialized experts,
+        combining their outputs for the final result.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim].
+            training (bool, optional): Whether in training mode. Defaults to False.
+            layer_idx (int | None, optional): Index of the current layer. Defaults to None.
+
+        Returns:
+            Tuple of (combined expert output, router logits) where output has
+            shape [batch, seq_len, hidden_dim].
+        """
         del training
 
         # Shared expert output
@@ -454,7 +530,11 @@ class Llama4TextMoe(BaseMoeModule):
 
 
 class Llama4TextAttention(UnifiedAttention):
-    """Attention module for the Llama4 text decoder with optional sliding windows."""
+    """Attention module for the Llama4 text decoder with optional sliding windows.
+
+    Implements multi-head attention with optional rotary position embeddings,
+    QK normalization, and temperature tuning for improved attention patterns.
+    """
 
     def __init__(
         self,
@@ -466,6 +546,16 @@ class Llama4TextAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Llama4 text attention layer.
+
+        Args:
+            config (Llama4TextConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model (determines RoPE usage).
+        """
         self.use_rope = (layer_idx + 1) % 4 != 0
         self.attn_scale = config.attn_scale
         self.floor_scale = config.floor_scale
@@ -533,7 +623,11 @@ class Llama4TextAttention(UnifiedAttention):
 
 
 class Llama4TextDecoderLayer(nn.Module):
-    """Single Llama4 text decoder block combining attention and MLP."""
+    """Single Llama4 text decoder block combining attention and MLP.
+
+    Combines multi-head attention and feedforward networks (dense or MoE)
+    with RMS normalization and residual connections.
+    """
 
     def __init__(
         self,
@@ -545,6 +639,16 @@ class Llama4TextDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Llama4 text decoder layer.
+
+        Args:
+            config (Llama4TextConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -618,6 +722,26 @@ class Llama4TextDecoderLayer(nn.Module):
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + ffn(norm(x)).
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            output_router_logits (bool, optional): Whether to return MoE router logits. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, router logits, and cache view.
+        """
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
             mask_info,
@@ -649,7 +773,17 @@ class Llama4TextDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Llama4TextConfig, model_type="llama4_text")
 class Llama4TextModel(EasyDeLBaseModule):
-    """Decoder-only Llama4 text model built from embeddings and decoder blocks."""
+    """Decoder-only Llama4 text model built from embeddings and decoder blocks.
+
+    Implements the Llama4 text language model architecture, utilizing transformer blocks
+    with RMSNorm, rotary position embeddings, and optional Mixture of Experts layers.
+
+    Attributes:
+        config (Llama4TextConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -660,6 +794,15 @@ class Llama4TextModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama4 text base model.
+
+        Args:
+            config (Llama4TextConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -714,23 +857,40 @@ class Llama4TextModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass through the Llama model.
+        """Forward pass through the Llama4 text base model.
+
+        Processes input tokens through embedding, all decoder layers with RoPE and RMSNorm,
+        and final normalization.
 
         Args:
-          input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
-          inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-          attention_mask (Array, optional): Mask to avoid attention on padding tokens.
-          position_ids (Array, optional): Indices of positions of each input sequence token.
-          segment_ids (Array, optional): Segment token indices for segment embeddings.
-          past_key_values (TransformerCache | RaggedPagesCache, optional):
-            Cache containing precomputed key/value states.
-          cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
-          output_attentions (bool, optional): Whether to return attention weights.
-          output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-          Union[BaseModelOutput, Tuple]: Model outputs (last hidden state, optional hidden states, optional attentions)
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -834,7 +994,17 @@ class Llama4TextModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=Llama4TextConfig, model_type="llama4_text")
 class Llama4ForCausalLM(BaseCausalLMModule[Llama4TextModel, Llama4TextConfig]):
-    """Llama4 model with a Causal Language Modeling head."""
+    """Llama4 model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation.
+
+    Attributes:
+        config (Llama4TextConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "llama4_text"
@@ -849,6 +1019,15 @@ class Llama4ForCausalLM(BaseCausalLMModule[Llama4TextModel, Llama4TextConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama4 model for causal language modeling.
+
+        Args:
+            config (Llama4TextConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Llama4TextModel,
@@ -863,7 +1042,17 @@ class Llama4ForCausalLM(BaseCausalLMModule[Llama4TextModel, Llama4TextConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Llama4TextConfig, model_type="llama4_text")
 class Llama4ForSequenceClassification(BaseSequenceClassificationModule[Llama4TextModel, Llama4TextConfig]):
-    """Llama4 model for sequence classification tasks."""
+    """Llama4 model for sequence classification tasks.
+
+    This class extends the base Llama4 model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+
+    Attributes:
+        config (Llama4TextConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "llama4_text"
@@ -878,6 +1067,15 @@ class Llama4ForSequenceClassification(BaseSequenceClassificationModule[Llama4Tex
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama4 model for sequence classification.
+
+        Args:
+            config (Llama4TextConfig): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Llama4TextModel,
@@ -907,6 +1105,16 @@ class Llama4MultiModalProjector(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama4 multi-modal projector.
+
+        Args:
+            config: Model configuration with vision and text parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -924,6 +1132,14 @@ class Llama4MultiModalProjector(nn.Module):
         )
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
+        """Project vision features to text embedding space.
+
+        Args:
+            hidden_states: Vision features [batch, seq_len, vision_hidden_dim].
+
+        Returns:
+            Projected features [batch, seq_len, text_hidden_dim].
+        """
         return self.linear_1(hidden_states)
 
 
@@ -970,6 +1186,16 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama4 vision pixel shuffle MLP.
+
+        Args:
+            config: Vision configuration with pixel shuffle parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -989,6 +1215,14 @@ class Llama4VisionPixelShuffleMLP(nn.Module):
         )
 
     def __call__(self, encoded_patches: Array) -> Array:
+        """Apply pixel shuffle and MLP transformation to vision features.
+
+        Args:
+            encoded_patches: Vision patch embeddings [batch, num_patches, hidden_dim].
+
+        Returns:
+            Downsampled and transformed features [batch, reduced_patches, output_dim].
+        """
         encoded_patches = pixel_shuffle(encoded_patches, self.pixel_shuffle_ratio)
         return self.mlp(encoded_patches)
 
@@ -1028,7 +1262,11 @@ def vision_apply_rotary_emb(
 
 
 class Llama4VisionAttention(AttentionModule):
-    """Attention module for the Llama4 vision transformer."""
+    """Attention module for the Llama4 vision transformer.
+
+    Implements multi-head self-attention with rotary position embeddings
+    for encoding visual features from image patches.
+    """
 
     def __init__(
         self,
@@ -1040,6 +1278,16 @@ class Llama4VisionAttention(AttentionModule):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Llama4 vision attention layer.
+
+        Args:
+            config (Llama4VisionConfig): Vision model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the encoder.
+        """
         super().__init__(config=config)
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -1081,6 +1329,16 @@ class Llama4VisionAttention(AttentionModule):
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         output_attentions: bool = False,
     ) -> AttentionLayerOutput:
+        """Forward pass through vision attention layer.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, num_patches, hidden_dim).
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+
+        Returns:
+            AttentionLayerOutput: Contains attention output and optional attention weights.
+        """
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         query_states, key_states, value_states = (
@@ -1134,6 +1392,16 @@ class Llama4VisionMLP2(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama4 vision two-layer MLP.
+
+        Args:
+            config: Vision configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -1155,6 +1423,14 @@ class Llama4VisionMLP2(nn.Module):
         self.fc2 = linear_class(config.projector_output_dim, config.projector_output_dim)
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
+        """Apply two-layer feedforward transformation with GELU activation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim].
+
+        Returns:
+            Transformed features [batch, seq_len, output_dim].
+        """
         hidden_states = self.fc2(self.activation_fn(self.fc1(hidden_states)))
         return self.activation_fn(hidden_states)
 
@@ -1175,6 +1451,16 @@ class Llama4VisionMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama4 vision MLP block.
+
+        Args:
+            config: Vision configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -1196,6 +1482,14 @@ class Llama4VisionMLP(nn.Module):
         self.activation_fn = ACT2FN["gelu"]
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
+        """Apply feedforward transformation with GELU activation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim].
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim].
+        """
         hidden_states = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
         hidden_states = self.fc2(hidden_states)
@@ -1219,6 +1513,16 @@ class Llama4VisionEncoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Llama4 vision encoder layer.
+
+        Args:
+            config (Llama4VisionConfig): Vision model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the encoder.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -1274,6 +1578,18 @@ class Llama4VisionEncoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
+        """Forward pass through the vision encoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x)).
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, num_patches, hidden_dim).
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            EncoderLayerOutput: Contains hidden states and optional attention weights.
+        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = apply_logical_sharding(
@@ -1320,6 +1636,15 @@ class Llama4VisionEncoder(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama4 vision encoder.
+
+        Args:
+            config (Llama4VisionConfig): Vision model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -1345,6 +1670,18 @@ class Llama4VisionEncoder(nn.Module):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
+        """Forward pass through all vision encoder layers.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, num_patches, hidden_dim).
+            frequencies (Array): Precomputed RoPE frequencies for positional encoding.
+            attention_mask (Array | None, optional): Attention mask. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return all hidden states. Defaults to None.
+
+        Returns:
+            BaseModelOutput: Contains last_hidden_state, optional hidden_states, and optional attentions.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1392,6 +1729,15 @@ class Llama4UnfoldConvolution(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama4 unfold convolution layer.
+
+        Args:
+            config (Llama4VisionConfig): Vision model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         patch_size_val = config.patch_size
         if isinstance(patch_size_val, int):
             self.kernel_size: tuple[int, int] = (patch_size_val, patch_size_val)
@@ -1418,6 +1764,14 @@ class Llama4UnfoldConvolution(nn.Module):
         )
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jax.Array:
+        """Extract and embed image patches.
+
+        Args:
+            hidden_states: Input image tensor [batch, channels, height, width].
+
+        Returns:
+            Patch embeddings [batch, num_patches, hidden_dim].
+        """
         batch_size = hidden_states.shape[0]
 
         hidden_states_nhwc = jnp.transpose(hidden_states, (0, 2, 3, 1))
@@ -1438,7 +1792,17 @@ class Llama4UnfoldConvolution(nn.Module):
 @register_module(TaskType.BASE_VISION, config=Llama4VisionConfig, model_type="llama4_vision")
 @register_module(TaskType.BASE_MODULE, config=Llama4VisionConfig, model_type="llama4_vision")
 class Llama4VisionModel(EasyDeLBaseModule):
-    """Vision transformer for Llama4 including patchify stem, transformer blocks, and final norm."""
+    """Vision transformer for Llama4 including patchify stem, transformer blocks, and final norm.
+
+    Implements the vision encoder for Llama4 vision-language models, processing
+    images into feature representations suitable for cross-modal fusion.
+
+    Attributes:
+        config (Llama4VisionConfig): Configuration for the vision model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -1449,6 +1813,15 @@ class Llama4VisionModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Llama4 vision model.
+
+        Args:
+            config (Llama4VisionConfig): Vision model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1524,6 +1897,21 @@ class Llama4VisionModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
+        """Forward pass through the Llama4 vision model.
+
+        Processes input images through patch embedding, transformer encoder layers,
+        and a vision adapter for output projection.
+
+        Args:
+            pixel_values (Array): Input images of shape (batch_size, num_channels, height, width).
+            attention_mask (Array | None, optional): Attention mask for the encoder. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return all hidden states. Defaults to None.
+
+        Returns:
+            BaseModelOutput: Contains last_hidden_state (processed vision features),
+                optional hidden_states, and optional attentions.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1657,7 +2045,15 @@ class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM,
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Llama4ForConditionalGeneration model."""
+        """Initialize Llama4 vision-language model for conditional generation.
+
+        Args:
+            config (Llama4Config): Full model configuration including vision and text configs.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         language_model = Llama4ForCausalLM(
             config=config.get_text_config(),
             dtype=dtype,
@@ -1771,6 +2167,36 @@ class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM,
         output_hidden_states: bool | None = None,
         **lm_kwargs,
     ):
+        """Forward pass through the vision-language model.
+
+        Processes images through the vision encoder if pixel_values are provided,
+        projects visual features, and generates text conditioned on both modalities.
+
+        Args:
+            input_ids (Array, optional): Input token IDs of shape (batch_size, sequence_length).
+            pixel_values (Array, optional): Input images of shape (batch_size, num_channels, height, width).
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens.
+                Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information. Defaults to None.
+            position_ids (Array | None, optional): Position indices for tokens. Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode for optimization. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states. Defaults to None.
+            **lm_kwargs: Additional arguments passed to the language model.
+
+        Returns:
+            VLMCausalLMOutput: Contains logits, past_key_values, hidden_states, attentions,
+                and image_hidden_states.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            ValueError: If pixel_values is provided without input_ids.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 

@@ -79,6 +79,15 @@ from .kimi_linear_configuration import KimiLinearConfig
 
 
 def apply_mask_to_padding_states(hidden_states: Array, attention_mask: Array | None) -> Array:
+    """Apply attention mask to hidden states by zeroing out padding positions.
+
+    Args:
+        hidden_states (Array): Hidden state tensor of shape (batch, seq_len, hidden_dim).
+        attention_mask (Array | None): Boolean or float mask of shape (batch, seq_len).
+
+    Returns:
+        Array: Masked hidden states with padding positions zeroed out.
+    """
     if (
         attention_mask is not None
         and attention_mask.shape[0] == hidden_states.shape[0]
@@ -111,6 +120,15 @@ class KimiRMSNorm(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize KimiRMSNorm layer.
+
+        Args:
+            hidden_size (int): Dimension of the input features.
+            eps (float, optional): Small constant for numerical stability. Defaults to 1e-6.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.hidden_size = hidden_size
         self.eps = eps
         self.dtype = dtype
@@ -120,7 +138,14 @@ class KimiRMSNorm(nn.Module):
         )
 
     def __call__(self, hidden_states: Float[Array, "... hidden_size"]) -> Float[Array, "... hidden_size"]:
-        """Apply RMSNorm."""
+        """Apply RMSNorm normalization.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (..., hidden_size).
+
+        Returns:
+            Array: Normalized tensor of the same shape as input.
+        """
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.astype(jnp.float32)
         variance = jnp.mean(hidden_states**2, axis=-1, keepdims=True)
@@ -131,7 +156,9 @@ class KimiRMSNorm(nn.Module):
 class KimiRMSNormGated(nn.Module):
     """Gated RMSNorm for Kimi Linear KDA attention.
 
-    Applies RMSNorm with a gating mechanism: output = silu(gate) * RMSNorm(x)
+    Applies RMSNorm with a gating mechanism: output = silu(gate) * RMSNorm(x).
+    This is used in the output path of KDA (Kernel Delta Attention) layers
+    for improved gradient flow and expressiveness.
 
     Attributes:
         hidden_size: Dimension of the input features.
@@ -149,6 +176,15 @@ class KimiRMSNormGated(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize KimiRMSNormGated layer.
+
+        Args:
+            hidden_size (int): Dimension of the input features.
+            eps (float, optional): Small constant for numerical stability. Defaults to 1e-6.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.hidden_size = hidden_size
         self.eps = eps
         self.dtype = dtype
@@ -162,7 +198,15 @@ class KimiRMSNormGated(nn.Module):
         hidden_states: Float[Array, "... hidden_size"],
         gate: Float[Array, "... hidden_size"],
     ) -> Float[Array, "... hidden_size"]:
-        """Apply gated RMSNorm."""
+        """Apply gated RMSNorm normalization.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (..., hidden_size).
+            gate (Array): Gate tensor of shape (..., hidden_size) for gating mechanism.
+
+        Returns:
+            Array: Gated normalized tensor of the same shape as input.
+        """
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.astype(jnp.float32)
         variance = jnp.mean(hidden_states**2, axis=-1, keepdims=True)
@@ -175,7 +219,9 @@ class KimiRMSNormGated(nn.Module):
 class KimiMLP(nn.Module):
     """Kimi Linear dense MLP module.
 
-    Standard gated MLP with SiLU activation.
+    Implements the feedforward network with SwiGLU activation function
+    for enhanced representation learning. Used in both dense layers
+    and as shared experts in MoE configurations.
     """
 
     def __init__(
@@ -188,6 +234,18 @@ class KimiMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Kimi MLP block.
+
+        Args:
+            config (KimiLinearConfig): Model configuration with MLP parameters.
+            intermediate_size (int | None, optional): Override intermediate size.
+                Defaults to None (uses config.intermediate_size).
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -219,6 +277,14 @@ class KimiMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
+        """Apply SwiGLU feedforward transformation.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+
+        Returns:
+            Array: Transformed hidden states of shape (batch, seq_len, hidden_dim).
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -238,8 +304,17 @@ class KimiMLP(nn.Module):
 class KimiMoEGate(nn.Module):
     """Kimi Linear MoE routing gate with sigmoid activation.
 
-    Uses sigmoid scoring with e_score_correction_bias like DeepSeek V3.
-    Supports grouped top-k selection.
+    Implements the routing mechanism for Mixture of Experts with:
+    - Sigmoid-based expert scoring with e_score_correction_bias (like DeepSeek V3)
+    - Grouped top-k expert selection for load balancing
+    - Optional probability renormalization
+
+    Attributes:
+        top_k: Number of experts to route each token to.
+        n_routed_experts: Total number of routed experts.
+        routed_scaling_factor: Scaling factor for routed expert outputs.
+        n_group: Number of expert groups for grouped routing.
+        topk_group: Number of groups to select in top-k routing.
     """
 
     def __init__(
@@ -251,6 +326,15 @@ class KimiMoEGate(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Kimi MoE routing gate.
+
+        Args:
+            config (KimiLinearConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -327,7 +411,12 @@ class KimiMoEGate(nn.Module):
 
 
 class KimiMLPMoE(nn.Module):
-    """Kimi Linear MoE MLP using parallel expert linear layers."""
+    """Kimi Linear MoE MLP using parallel expert linear layers.
+
+    Implements a collection of expert MLPs that can be efficiently
+    computed in parallel using grouped matrix operations.
+    Each expert follows the same SwiGLU architecture as KimiMLP.
+    """
 
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
@@ -352,6 +441,15 @@ class KimiMLPMoE(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Kimi MoE MLP experts.
+
+        Args:
+            config (KimiLinearConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -404,6 +502,17 @@ class KimiMLPMoE(nn.Module):
         group_sizes: Array,
         sorted_experts: Array | None = None,
     ) -> Array:
+        """Apply MoE expert computation.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            group_sizes (Array): Number of tokens assigned to each expert.
+            sorted_experts (Array | None, optional): Sorted expert indices for each token.
+                Defaults to None.
+
+        Returns:
+            Array: Expert outputs of shape (batch, seq_len, hidden_dim).
+        """
         return self.down_proj(
             self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
             * self.up_proj(hidden_states, group_sizes, sorted_experts),
@@ -415,10 +524,17 @@ class KimiMLPMoE(nn.Module):
 class KimiSparseMoeBlock(BaseMoeModule):
     """Sparse Mixture of Experts block for Kimi Linear.
 
-    Features:
-    - Sigmoid routing with e_score_correction_bias
-    - Shared experts processed for all tokens
-    - Grouped top-k expert selection
+    Implements the MoE feedforward layer with:
+    - Sigmoid routing with e_score_correction_bias (DeepSeek V3 style)
+    - Shared experts that process all tokens
+    - Grouped top-k expert selection for load balancing
+    - Optional auxiliary load balancing loss
+
+    Attributes:
+        config: Model configuration.
+        gate: Router module for expert selection.
+        experts: Collection of expert MLP modules.
+        shared_experts: Optional shared experts applied to all tokens.
     """
 
     def __init__(
@@ -430,6 +546,15 @@ class KimiSparseMoeBlock(BaseMoeModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Kimi Sparse MoE block.
+
+        Args:
+            config (KimiLinearConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             n_routed_experts=config.num_experts,
@@ -473,6 +598,19 @@ class KimiSparseMoeBlock(BaseMoeModule):
             )
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+        """Apply Sparse MoE feedforward transformation.
+
+        Routes tokens to top-k experts based on router scores, combines
+        expert outputs with routing weights, and optionally adds shared
+        expert contributions.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+
+        Returns:
+            tuple[Array, Array]: Tuple of (output tensor, router logits).
+                Output has shape (batch, seq_len, hidden_dim).
+        """
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -493,13 +631,21 @@ class KimiSparseMoeBlock(BaseMoeModule):
 class KimiMLAAttention(UnifiedAttention):
     """Kimi Linear MLA (Multi-Latent Attention) layer.
 
-    Inherits MLA implementation from UnifiedAttention with DeepSeek V3-style
-    latent KV compression.
+    Implements Multi-Latent Attention with DeepSeek V3-style latent KV compression
+    for efficient long-context processing while maintaining full attention expressiveness.
 
     Features:
-    - LoRA-style latent compression for KV
-    - Per-head RMSNorm on Q/K latent projections
-    - Supports YaRN RoPE scaling
+        - LoRA-style latent compression for key-value projections
+        - Per-head RMSNorm on query/key latent projections
+        - Support for YaRN RoPE position scaling
+        - Optional LoRA for query projections
+
+    Attributes:
+        q_head_dim: Total query head dimension (nope + rope).
+        qk_nope_head_dim: Query/key dimension without rotary embedding.
+        qk_rope_head_dim: Query/key dimension with rotary embedding.
+        v_head_dim: Value head dimension.
+        kv_lora_rank: Rank of KV LoRA compression.
     """
 
     projection_mapping: ClassVar[dict[str, str]] = {
@@ -523,6 +669,16 @@ class KimiMLAAttention(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Kimi MLA attention layer.
+
+        Args:
+            config (KimiLinearConfig): Model configuration with MLA parameters.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
@@ -556,7 +712,19 @@ class KimiMLAAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike,
         rngs: nn.Rngs,
     ):
-        """Define MLA-specific network structure."""
+        """Define MLA-specific network structure.
+
+        Creates the query, key-value projections with latent compression,
+        layer norms, and output projection. Uses LoRA-style compression
+        for KV and optionally for queries.
+
+        Args:
+            config (KimiLinearConfig): Model configuration.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Numerical precision.
+            rngs (nn.Rngs): Random number generator state.
+        """
 
         if not self.use_mla_lora:
             setattr(
@@ -685,10 +853,29 @@ class KimiMLAAttention(UnifiedAttention):
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
     ) -> AttentionLayerOutput:
-        """Override forward to use MLA forward path.
+        """Forward pass using MLA attention mechanism.
 
-        MLA (Multi-Latent Attention) uses LoRA-style compression for KV projections
-        and requires a different computation path than standard attention.
+        Applies Multi-Latent Attention with LoRA-style KV compression and
+        rotary position embeddings for efficient long-context processing.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch, seq_len).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional):
+                Cache view for KV caching. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies.
+                Defaults to None.
+            alibi (Array | None, optional): ALiBi position bias (not used in MLA).
+                Defaults to None.
+
+        Returns:
+            AttentionLayerOutput: Contains attention output, optional weights, and cache view.
         """
         return self.forward_mla(
             hidden_states=hidden_states,
@@ -706,21 +893,32 @@ class KimiMLAAttention(UnifiedAttention):
 class KimiDeltaAttention(nn.Module):
     """Kimi Linear KDA (Kernel Delta Attention) layer.
 
-    Implements linear attention with:
-    - Separate convolutions for Q, K, V
-    - Decay gate via two-layer MLP (f_a_proj -> f_b_proj)
-    - Update gate (beta) via b_proj with sigmoid
-    - Output gate via two-layer MLP (g_a_proj -> g_b_proj) with gated RMSNorm
+    Implements linear attention with O(N) complexity for efficient long-context
+    processing. Uses delta rule updates for recurrent state maintenance.
+
+    Architecture components:
+        - Separate causal convolutions for Q, K, V (d_conv kernel size)
+        - Decay gate via two-layer MLP (f_a_proj -> f_b_proj) with A_log/dt_bias
+        - Update gate (beta) via b_proj with sigmoid activation
+        - Output gate via two-layer MLP (g_a_proj -> g_b_proj) with gated RMSNorm
+        - Chunk-wise processing for memory efficiency
 
     HuggingFace-compatible parameter naming:
-    - q_proj, k_proj, v_proj: Input projections
-    - q_conv1d, k_conv1d, v_conv1d: Separate causal convolutions
-    - f_a_proj, f_b_proj: Decay gate MLP
-    - b_proj: Beta/update gate projection
-    - g_a_proj, g_b_proj: Output gate MLP
-    - A_log, dt_bias: Decay parameters
-    - o_norm: Gated RMSNorm
-    - o_proj: Output projection
+        - q_proj, k_proj, v_proj: Input linear projections
+        - q_conv1d, k_conv1d, v_conv1d: Separate causal convolutions
+        - f_a_proj, f_b_proj: Decay gate MLP layers
+        - b_proj: Beta/update gate projection
+        - g_a_proj, g_b_proj: Output gate MLP layers
+        - A_log, dt_bias: Decay parameters
+        - o_norm: Gated RMSNorm for output
+        - o_proj: Output projection
+
+    Attributes:
+        num_heads: Number of attention heads.
+        head_k_dim: Dimension per head for keys.
+        head_v_dim: Dimension per head for values.
+        d_conv: Convolution kernel size.
+        chunk_size: Size of chunks for chunk-wise processing.
     """
 
     reform_param: typing.ClassVar = {
@@ -748,6 +946,16 @@ class KimiDeltaAttention(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Kimi KDA (Kernel Delta Attention) layer.
+
+        Args:
+            config (KimiLinearConfig): Model configuration with KDA parameters.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -1011,14 +1219,23 @@ class KimiDeltaAttention(nn.Module):
 class KimiDecoderLayer(nn.Module):
     """Kimi Linear transformer decoder layer.
 
-    Combines either MLA (full attention) or KDA (linear attention) with MLP or MoE,
-    based on layer configuration.
+    Combines attention (MLA or KDA) with feedforward (MLP or MoE) based on
+    layer configuration. Uses pre-normalization architecture with RMSNorm
+    and residual connections.
+
+    The hybrid attention pattern alternates between:
+        - MLA (Multi-Latent Attention): Full attention with latent KV compression
+        - KDA (Kernel Delta Attention): Linear attention with O(N) complexity
+
+    The feedforward pattern supports:
+        - Dense MLP: Standard SwiGLU feedforward network
+        - Sparse MoE: Mixture of Experts with shared experts
 
     Attributes:
         config: Model configuration.
-        layer_idx: Index of this layer.
+        layer_idx: Index of this layer in the model.
         is_kda_layer: Whether this layer uses KDA linear attention.
-        is_moe_layer: Whether this layer uses MoE FFN.
+        is_moe_layer: Whether this layer uses MoE feedforward.
     """
 
     def __init__(
@@ -1031,6 +1248,16 @@ class KimiDecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Kimi decoder layer.
+
+        Args:
+            config (KimiLinearConfig): Model configuration.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -1115,7 +1342,32 @@ class KimiDecoderLayer(nn.Module):
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
-        """Forward pass for decoder layer."""
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + ffn(norm(x)).
+        Uses either MLA or KDA attention based on layer configuration, and either
+        dense MLP or sparse MoE for the feedforward network.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch, seq_len).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | KDACacheView | None, optional):
+                Cache view for attention caching. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesCacheView | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+            output_router_logits (bool, optional): Whether to return MoE router logits.
+                Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies.
+                Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, router logits,
+                and updated cache view.
+        """
         normed_hidden = self.input_layernorm(hidden_states)
 
         if self.is_kda_layer:
@@ -1164,9 +1416,22 @@ class KimiDecoderLayer(nn.Module):
 class KimiLinearModel(EasyDeLBaseModule):
     """Kimi Linear base transformer model.
 
-    Implements the core transformer architecture with hybrid attention
-    (alternating between MLA full attention and KDA linear attention)
-    and optional MoE FFN layers.
+    Implements the hybrid attention architecture combining MLA (Multi-Latent Attention)
+    and KDA (Kernel Delta Attention) for efficient long-context processing. The model
+    alternates between full attention (MLA) and linear attention (KDA) layers,
+    with optional Mixture of Experts (MoE) feedforward layers.
+
+    Key features:
+        - Hybrid attention with O(N) linear attention layers
+        - MLA with latent KV compression (DeepSeek V3 style)
+        - MoE with sigmoid routing and shared experts
+        - Support for very long contexts (100K+ tokens)
+
+    Attributes:
+        config (KimiLinearConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
     """
 
     def __init__(
@@ -1178,6 +1443,15 @@ class KimiLinearModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Kimi Linear base model.
+
+        Args:
+            config (KimiLinearConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1236,7 +1510,43 @@ class KimiLinearModel(EasyDeLBaseModule):
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> MoeModelOutput:
-        """Forward pass."""
+        """Forward pass through the Kimi Linear base model.
+
+        Processes input tokens through embedding, hybrid attention layers
+        (MLA and KDA), optional MoE feedforward, and final normalization.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch, seq_len, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on
+                padding tokens, shape (batch, seq_len). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch, seq_len). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states
+                from all layers. Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return MoE router logits.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode).
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+
+        Returns:
+            MoeModelOutput: Contains last_hidden_state, optional hidden_states, attentions,
+                past_key_values, and router_logits.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -1324,15 +1634,35 @@ class KimiLinearModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
+        """Return the encoder part of the model.
+
+        Raises:
+            NotImplementedError: This is a decoder-only model and does not have an encoder.
+        """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
+        """Return the decoder part of the model.
+
+        Returns:
+            KimiLinearModel: The decoder (this model itself).
+        """
         return self
 
     def get_lm_head(self):
+        """Return the language model head.
+
+        Raises:
+            NotImplementedError: The base model does not have a language model head.
+        """
         raise NotImplementedError("The base model does not have a language model head.")
 
     def get_embedding(self):
+        """Return the token embedding layer.
+
+        Returns:
+            nn.Embed: The token embedding layer.
+        """
         return self.embed_tokens
 
 
@@ -1341,7 +1671,17 @@ class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig
     """Kimi Linear model with a causal language modeling head.
 
     Extends the base KimiLinearModel with a linear output layer for
-    next-token prediction.
+    next-token prediction. Supports MoE auxiliary loss for load balancing.
+
+    This model is a hybrid transformer with causal attention masks
+    applied to perform autoregressive language generation, combining
+    efficient linear attention (KDA) with full attention (MLA).
+
+    Attributes:
+        config (KimiLinearConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
     """
 
     _task_type = TaskType.CAUSAL_LM
@@ -1357,6 +1697,15 @@ class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Kimi Linear model for causal language modeling.
+
+        Args:
+            config (KimiLinearConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=KimiLinearModel,
@@ -1384,7 +1733,41 @@ class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
-        """Forward pass with language modeling head."""
+        """Forward pass with language modeling head.
+
+        Processes inputs through the base model and applies the language modeling
+        head to produce next-token logits. Computes MoE auxiliary loss if enabled.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings.
+                Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask for padding tokens.
+                Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for tokens.
+                Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states.
+                Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router logits.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode).
+                Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the LM head projection.
+                Defaults to True.
+
+        Returns:
+            MoeCausalLMOutput: Contains logits, optional hidden_states, attentions,
+                past_key_values, router_logits, and aux_loss.
+        """
         return self.forward_moe(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -1402,7 +1785,18 @@ class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig
         )
 
     def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary loss from router logits."""
+        """Compute auxiliary loss from router logits for MoE load balancing.
+
+        Calculates the auxiliary load balancing loss to encourage uniform
+        expert utilization across the MoE layers.
+
+        Args:
+            outputs: Model outputs containing router_logits from MoE layers.
+            attention_mask: Attention mask to exclude padding tokens from loss.
+
+        Returns:
+            Array | None: Auxiliary loss value, or None if no router logits available.
+        """
         if outputs.router_logits is None or len(outputs.router_logits) == 0:
             return None
         aux_loss = auxiliary_load_balancing_loss_func(

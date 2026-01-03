@@ -32,6 +32,8 @@ if tp.TYPE_CHECKING:
 
     from easydel.data.core.protocols import ShardedDataSource
 
+from eformer.common_types import NOT_GIVEN
+
 from easydel.inference.esurge.esurge_engine import DEFAULT_DETOKENIZER_MAX_STATES
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType
@@ -208,8 +210,8 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     sharding_axis_dims_val = es.get("sharding_axis_dims", (1, 1, 1, -1, 1))
     sharding_axis_dims = tuple(sharding_axis_dims_val) if sharding_axis_dims_val is not None else None
 
-    max_num_batched_tokens = es.get("max_num_batched_tokens")
-    if max_num_batched_tokens is not None:
+    max_num_batched_tokens = es.get("max_num_batched_tokens", NOT_GIVEN)
+    if max_num_batched_tokens is not None and max_num_batched_tokens is not NOT_GIVEN:
         max_num_batched_tokens = int(max_num_batched_tokens)
 
     reserve_tokens = es.get("reserve_tokens")

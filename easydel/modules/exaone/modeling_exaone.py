@@ -51,7 +51,11 @@ logger = get_logger(__name__)
 
 
 class ExaoneGatedMLP(nn.Module):
-    """Gated feed-forward block used inside Exaone decoder layers."""
+    """Gated Multi-Layer Perceptron module for Exaone models.
+
+    Implements the gated feedforward network with configurable activation function
+    for enhanced representation learning in Exaone architecture.
+    """
 
     def __init__(
         self,
@@ -62,6 +66,16 @@ class ExaoneGatedMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize Exaone gated MLP block.
+
+        Args:
+            config (ExaoneConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         linear = functools.partial(
             ColumnParallelLinear,
@@ -79,6 +93,14 @@ class ExaoneGatedMLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply gated feedforward transformation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim]
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -100,7 +122,11 @@ class ExaoneGatedMLP(nn.Module):
 
 
 class ExaoneAttentionInner(UnifiedAttention):
-    """Exaone attention with partial RoPE."""
+    """Multi-head attention layer with partial RoPE embeddings for Exaone models.
+
+    This attention implementation supports partial rotary position embeddings,
+    which applies RoPE to only a portion of the head dimensions.
+    """
 
     projection_mapping: ClassVar[dict[str, str]] = {
         "query_projection": "q_proj",
@@ -120,6 +146,16 @@ class ExaoneAttentionInner(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Exaone attention layer with partial rotary embeddings.
+
+        Args:
+            config (ExaoneConfig): Model configuration with attention parameters.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config,
             dtype,
@@ -161,7 +197,11 @@ class ExaoneAttentionInner(UnifiedAttention):
 
 
 class ExaoneAttention(nn.Module):
-    """Wrapper around ExaoneAttentionInner to wire it into decoder layers."""
+    """Wrapper around ExaoneAttentionInner for Exaone decoder layers.
+
+    This module wraps the inner attention mechanism to provide a consistent
+    interface for integration with decoder layers.
+    """
 
     def __init__(
         self,
@@ -173,6 +213,16 @@ class ExaoneAttention(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Exaone attention wrapper.
+
+        Args:
+            config (ExaoneConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         super().__init__()
         self.attention = ExaoneAttentionInner(
             config=config,
@@ -194,6 +244,23 @@ class ExaoneAttention(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
+        """Forward pass through the attention layer.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            AttentionOutput: Contains attention output, optional attention weights, and cache view.
+        """
         return self.attention(
             hidden_states=hidden_states,
             mask_info=mask_info,
@@ -207,7 +274,11 @@ class ExaoneAttention(nn.Module):
 
 
 class ExaoneDecoderLayer(nn.Module):
-    """Single Exaone decoder block combining attention and gated MLP."""
+    """Single decoder layer for Exaone models.
+
+    Combines multi-head attention with partial RoPE and gated feedforward networks
+    with RMS normalization and residual connections.
+    """
 
     def __init__(
         self,
@@ -219,6 +290,16 @@ class ExaoneDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Exaone decoder layer.
+
+        Args:
+            config (ExaoneConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -275,7 +356,26 @@ class ExaoneDecoderLayer(nn.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x))
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
+        """
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
         attn_outputs = self.attn(
@@ -317,7 +417,17 @@ class ExaoneDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, ExaoneConfig, model_type="exaone")
 class ExaoneModel(EasyDeLBaseModule):
-    """Decoder-only Exaone transformer composed of embedding, stacked blocks, and final norm."""
+    """Exaone model implementation.
+
+    This implements the Exaone language model architecture, utilizing transformer blocks
+    with RMSNorm, partial rotary position embeddings, and a gated attention mechanism.
+
+    Attributes:
+        config (ExaoneConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -328,6 +438,15 @@ class ExaoneModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Exaone base model.
+
+        Args:
+            config (ExaoneConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -388,6 +507,41 @@ class ExaoneModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
+        """Forward pass through the Exaone base model.
+
+        Processes input tokens through embedding, all decoder layers with partial RoPE
+        and RMSNorm, and final normalization.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+
+        Returns:
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
+        """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -483,7 +637,17 @@ class ExaoneModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, ExaoneConfig, model_type="exaone")
 class ExaoneForCausalLM(BaseCausalLMModule[ExaoneModel, ExaoneConfig]):
-    """Exaone model with a language modeling head for causal language modeling tasks."""
+    """Exaone model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation.
+
+    Attributes:
+        config (ExaoneConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "exaone"
@@ -498,15 +662,14 @@ class ExaoneForCausalLM(BaseCausalLMModule[ExaoneModel, ExaoneConfig]):
         *,
         rngs: nn.Rngs,
     ):
-        """Initialize the ExaoneForCausalLM model.
+        """Initialize Exaone model for causal language modeling.
 
         Args:
-            config (ExaoneConfig): The model configuration.
-            dtype (jnp.dtype, optional): The data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): The data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): The precision to use for matrix multiplication.
-                Defaults to None.
-            rngs (nn.Rngs): The random number generators.
+            config (ExaoneConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -522,7 +685,17 @@ class ExaoneForCausalLM(BaseCausalLMModule[ExaoneModel, ExaoneConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=ExaoneConfig, model_type="exaone")
 class ExaoneForSequenceClassification(BaseSequenceClassificationModule[ExaoneModel, ExaoneConfig]):
-    """Exaone model with a Sequence Classification head."""
+    """Exaone model for sequence classification tasks.
+
+    This class extends the base Exaone model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+
+    Attributes:
+        config (ExaoneConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "exaone"
@@ -537,6 +710,15 @@ class ExaoneForSequenceClassification(BaseSequenceClassificationModule[ExaoneMod
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Exaone model for sequence classification.
+
+        Args:
+            config (ExaoneConfig): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=ExaoneModel,

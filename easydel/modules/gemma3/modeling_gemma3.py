@@ -127,7 +127,8 @@ class Gemma3RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization for Gemma3 models.
 
     Implements RMS normalization with Float8 support for efficient computation
-    and memory usage in Gemma3 architecture.
+    and memory usage in Gemma3 architecture. This normalization technique
+    normalizes inputs by the root mean square, providing training stability.
     """
 
     kernel_init = staticmethod(nn.initializers.ones)
@@ -139,6 +140,16 @@ class Gemma3RMSNorm(nn.Module):
         dim: int | None = None,
         epsilon: float | None = None,
     ):
+        """Initialize Gemma3 RMS normalization layer.
+
+        Args:
+            config (Gemma3TextConfig): Model configuration containing rms_norm_eps and hidden_size.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
+            dim (int | None, optional): Dimension for the normalization kernel. If None,
+                uses config.hidden_size. Defaults to None.
+            epsilon (float | None, optional): Small constant for numerical stability. If None,
+                uses config.rms_norm_eps. Defaults to None.
+        """
         self.config = config
         self.epsilon = self.config.rms_norm_eps if epsilon is None else epsilon
         self.param_dtype = param_dtype
@@ -151,9 +162,27 @@ class Gemma3RMSNorm(nn.Module):
         )
 
     def _norm(self, x: jax.Array) -> jax.Array:
+        """Apply RMS normalization without learnable scale.
+
+        Args:
+            x (jax.Array): Input tensor to normalize.
+
+        Returns:
+            jax.Array: Normalized tensor.
+        """
         return x * (1 / jnp.sqrt(jnp.power(x, 2).mean(-1, keepdims=True) + self.epsilon))
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jax.Array:
+        """Apply RMS normalization with learnable scale.
+
+        Args:
+            hidden_states (Array): Input tensor to normalize of shape
+                (batch_size, sequence_length, hidden_dim).
+
+        Returns:
+            jax.Array: Normalized and scaled hidden states. If output dtype is Float8,
+                automatically casts to bfloat16 for compatibility.
+        """
         variance = self._norm(hidden_states.astype(jnp.float32)).astype(self.param_dtype)
         out = (1 + self.kernel.value.astype(self.param_dtype)) * variance
 
@@ -163,13 +192,18 @@ class Gemma3RMSNorm(nn.Module):
 
 
 class Gemma3Attention(UnifiedAttention):
-    """Gemma3 Attention with Q/K normalization.
+    """Multi-head attention layer with Q/K normalization for Gemma3 models.
 
-    Inherits Q/K normalization from QKNormAttention.
-    Features:
-    - Custom Gemma3RMSNorm for Q/K normalization
-    - Layer-specific sliding window
-    - Custom softmax scaling (query_pre_attn_scalar)
+    Inherits from UnifiedAttention and extends it with Gemma3-specific features:
+    - Custom Gemma3RMSNorm for Q/K normalization to stabilize attention
+    - Layer-specific sliding window attention for efficient long-context processing
+    - Custom softmax scaling using query_pre_attn_scalar for improved training dynamics
+
+    Attributes:
+        is_sliding (bool): Whether this layer uses sliding window attention.
+        layer_idx (int): Index of this layer in the model stack.
+        is_cross_attention (bool): Whether this is a cross-attention layer.
+        causal (bool): Whether to apply causal masking.
     """
 
     def __init__(
@@ -184,6 +218,21 @@ class Gemma3Attention(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Gemma3 attention layer.
+
+        Args:
+            config (Gemma3TextConfig): Model configuration with attention parameters.
+            layer_idx (int): Index of this layer in the model, used to determine
+                whether to apply sliding window attention.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision for
+                matrix operations. Defaults to None.
+            causal (bool, optional): Whether to apply causal masking. Defaults to True.
+            is_cross_attention (bool, optional): Whether this is a cross-attention layer.
+                Defaults to False.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
 
         super().__init__(
@@ -248,8 +297,9 @@ class Gemma3Attention(UnifiedAttention):
 class Gemma3MLP(nn.Module):
     """Multi-Layer Perceptron module for Gemma3 models.
 
-    Implements the feedforward network with gated activation functions
-    and optional Float8 scaling for improved performance.
+    Implements the feedforward network component of the transformer architecture
+    with gated linear units and activation functions. Uses column and row parallel
+    linear layers for efficient distributed computation.
     """
 
     def __init__(
@@ -261,6 +311,17 @@ class Gemma3MLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Gemma3 MLP block.
+
+        Args:
+            config (Gemma3TextConfig): Model configuration with MLP parameters including
+                hidden_size, intermediate_size, and hidden_activation.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision for
+                matrix operations. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -297,6 +358,16 @@ class Gemma3MLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Forward pass through the MLP block.
+
+        Applies gated linear units with activation function: down_proj(act(gate_proj(x)) * up_proj(x))
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+
+        Returns:
+            Array: Output tensor of shape (batch_size, sequence_length, hidden_dim).
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -316,8 +387,15 @@ class Gemma3MLP(nn.Module):
 class Gemma3DecoderLayer(nn.Module):
     """Single decoder layer for Gemma3 models.
 
-    Combines self-attention, optional cross-attention, and feedforward networks
-    with residual connections and layer normalization.
+    Combines self-attention and feedforward networks with residual connections
+    and RMS layer normalization to form a complete transformer decoder layer.
+    Features pre-normalization and post-normalization for both attention and MLP blocks.
+
+    Attributes:
+        config (Gemma3TextConfig): Model configuration.
+        layer_idx (int): Index of this layer in the model stack.
+        is_sliding (bool): Whether this layer uses sliding window attention.
+        sliding_window (int): Size of the sliding window for local attention.
     """
 
     def __init__(
@@ -330,6 +408,17 @@ class Gemma3DecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Gemma3 decoder layer.
+
+        Args:
+            config (Gemma3TextConfig): Model configuration.
+            layer_idx (int): Index of this layer in the model, determines attention type.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision for
+                matrix operations. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -383,21 +472,29 @@ class Gemma3DecoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         default_frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """
-        Forward pass of the module block.
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture with both pre and post normalization for
+        attention and MLP blocks: x + post_norm(attn(pre_norm(x))) and x + post_norm(mlp(pre_norm(x)))
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens.
-            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            position_ids (Array): Position indices for each token, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): View into the
+                key-value cache for this layer. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies for global attention.
+                Defaults to None.
+            default_frequencies (Array | None, optional): Precomputed RoPE frequencies for sliding
+                window attention. Defaults to None.
+
         Returns:
-            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
+            DecoderLayerOutput: Contains hidden states, optional attention weights, and updated cache view.
         """
         residual = hidden_states
         frequencies = default_frequencies if self.is_sliding else frequencies
@@ -458,7 +555,20 @@ class Gemma3DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Gemma3TextConfig, model_type="gemma3_text")
 class Gemma3TextModel(EasyDeLBaseModule):
-    """Decoder-only Gemma3 text transformer with embeddings and stacked decoder layers."""
+    """Gemma3 text model implementation.
+
+    This implements the Gemma3 decoder-only language model architecture, utilizing
+    transformer blocks with RMSNorm, rotary position embeddings, Q/K normalization,
+    and alternating global/sliding window attention for efficient long-context processing.
+    Embeddings are scaled by sqrt(hidden_size) for training stability.
+
+    Attributes:
+        config (Gemma3TextConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+        hidden_size (int): Dimension of the hidden states.
+    """
 
     def __init__(
         self,
@@ -469,6 +579,16 @@ class Gemma3TextModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Gemma3 text base model.
+
+        Args:
+            config (Gemma3TextConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -507,6 +627,11 @@ class Gemma3TextModel(EasyDeLBaseModule):
 
     @cached_property
     def default_frequencies(self):
+        """Compute default RoPE frequencies for sliding window attention layers.
+
+        Returns:
+            ModuleCaches: Cached RoPE frequencies with local base frequency.
+        """
         from easydel.infra.utils import ModuleCaches
         from easydel.layers.rotary_embedding import get_frequencies
 
@@ -534,21 +659,43 @@ class Gemma3TextModel(EasyDeLBaseModule):
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> BaseModelOutput:
-        """
-        Forward pass through the Gemma2 module.
+        """Forward pass through the Gemma3 text base model.
+
+        Processes input tokens through embedding, all decoder layers, and final normalization.
+        Embeddings are scaled by sqrt(hidden_size) for training stability. Supports both
+        global and sliding window attention based on layer configuration.
 
         Args:
-            input_ids (Array): Input tensor containing token IDs.
-            attention_mask (Array): Mask for attention.
-            position_ids (Array): Positional indices.
-            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
-            output_attentions (tp.Optional[bool]): If True, output attention weights.
-            output_hidden_states (tp.Optional[bool]): If True, output hidden states.
-            init_cache (bool): If True, initialize cache for decoding.
-            deterministic (bool): If True, disable dropout.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask of shape (batch_size, sequence_length)
+                to avoid attention on padding tokens. Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token in the sequence,
+                shape (batch_size, sequence_length). Defaults to None.
+            token_type_ids (Array | None, optional): Token type IDs for distinguishing image/text
+                tokens in multimodal inputs. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Defaults to None (auto-detected).
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache containing precomputed key-value states for fast generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for managing the cache. Defaults to None.
 
         Returns:
-            BaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states,
+                optional attention weights, and updated past_key_values.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -690,7 +837,22 @@ class Gemma3TextModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=Gemma3TextConfig, model_type="gemma3_text")
 class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]):
-    """Gemma3 model with a language modeling head for causal language modeling tasks."""
+    """Gemma3 model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation. Supports both global
+    and sliding window attention with optional logit softcapping.
+
+    Attributes:
+        config (Gemma3TextConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+
+    Note:
+        Gemma3 requires bfloat16 precision. Using float16 may result in incorrect
+        predictions or degraded output quality.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "gemma3_text"
@@ -705,6 +867,17 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Gemma3 model for causal language modeling.
+
+        Args:
+            config (Gemma3TextConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+                Note: float16 is not recommended and will trigger a warning.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         if param_dtype == jnp.float16 or param_dtype == "f2":
             logger.error(
                 "Gemma-3's recommended dtype is bfloat16, but you are using float16. "
@@ -736,23 +909,35 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> CausalLMOutput:  # type:ignore
-        """
-        Forward pass through the Gemma3 model.
+        """Forward pass through the Gemma3 causal language model.
+
+        Runs the base model and optionally applies the language modeling head to produce
+        token logits for next-token prediction. Applies final_logit_softcapping if configured.
 
         Args:
-            input_ids (tp.Optional[Array]): Input tensor containing token IDs.
-            attention_mask (tp.Optional[Array]): Mask for attention.
-            position_ids (tp.Optional[Array]): Positional indices.
-            token_type_ids (tp.Optional[Array]): Token type IDs for handling different types of tokens.
-            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
-            output_attentions (tp.Optional[bool]): If True, output attention weights.
-            output_hidden_states (tp.Optional[bool]): If True, output hidden states.
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]): Cached key values for
-                faster inference.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for cache handling.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens.
+                Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention. Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            token_type_ids (Array | None, optional): Token type IDs for distinguishing image/text
+                tokens in multimodal inputs. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return all hidden states. Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode for optimizations. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cached key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache management metadata. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language modeling head. Defaults to True.
 
         Returns:
-            CausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+            CausalLMOutput: Contains logits (if apply_lm_head=True), hidden states, attentions,
+                and updated cache.
         """
         outputs = self.model(
             input_ids=input_ids,
@@ -819,7 +1004,18 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Gemma3TextConfig, model_type="gemma3_text")
 class Gemma3ForSequenceClassification(BaseSequenceClassificationModule[Gemma3TextModel, Gemma3TextConfig]):
-    """Text-only Gemma3 backbone with a classification head for sequence tasks."""
+    """Gemma3 model for sequence classification tasks.
+
+    This class extends the base Gemma3 model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+    Uses the last token's hidden state for classification (last-token pooling).
+
+    Attributes:
+        config (Gemma3TextConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "gemma3_text"
@@ -834,6 +1030,16 @@ class Gemma3ForSequenceClassification(BaseSequenceClassificationModule[Gemma3Tex
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Gemma3 model for sequence classification.
+
+        Args:
+            config (Gemma3TextConfig): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Gemma3TextModel,
@@ -859,6 +1065,33 @@ class Gemma3ForSequenceClassification(BaseSequenceClassificationModule[Gemma3Tex
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
+        """Forward pass through the Gemma3 sequence classification model.
+
+        Runs the base model and applies a classification head to the last token's hidden state
+        to produce class logits.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings. Defaults to None.
+            attention_mask (Array | None, optional): Mask to avoid attention on padding tokens.
+                Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information. Defaults to None.
+            position_ids (Array | None, optional): Position indices for tokens. Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cached states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return all hidden states. Defaults to None.
+
+        Returns:
+            SequenceClassifierOutput: Contains classification logits, hidden states, and attentions.
+
+        Raises:
+            ValueError: If batch size > 1 and no padding token is defined.
+        """
         transformer_outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -933,7 +1166,14 @@ class Gemma3MultiModalProjector(nn.Module):
     """Multi-modal projector for Gemma3 vision-language models.
 
     Projects vision features into the text embedding space, enabling
-    cross-modal understanding and generation in Gemma3.
+    cross-modal understanding and generation in Gemma3. Uses average pooling
+    to reduce spatial dimensions followed by linear projection.
+
+    Attributes:
+        config (Gemma3Config): Model configuration.
+        patches_per_image (int): Number of patches per image side from vision encoder.
+        tokens_per_side (int): Target tokens per image side after pooling.
+        kernel_size (int): Pooling kernel size for spatial reduction.
     """
 
     def __init__(
@@ -945,6 +1185,16 @@ class Gemma3MultiModalProjector(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the multi-modal projector.
+
+        Args:
+            config (Gemma3Config): Model configuration containing vision and text configs.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -979,7 +1229,20 @@ class Gemma3MultiModalProjector(nn.Module):
             padding="VALID",
         ) / (kernel_size * kernel_size)
 
-    def __call__(self, vision_outputs):
+    def __call__(self, vision_outputs: Float[Array, "batch hidden_dim num_patches"]) -> Array:
+        """Project vision features to text embedding space.
+
+        Applies average pooling to reduce spatial dimensions, normalizes with RMSNorm,
+        then projects to the text model's hidden dimension.
+
+        Args:
+            vision_outputs (Array): Vision encoder outputs of shape
+                (batch_size, hidden_dim, num_patches).
+
+        Returns:
+            Array: Projected vision features of shape (batch_size, num_tokens, text_hidden_size)
+                ready for merging with text embeddings.
+        """
         batch_size, _, seq_length = vision_outputs.shape
 
         reshaped_vision_outputs = jnp.transpose(vision_outputs, (0, 2, 1))
@@ -1005,7 +1268,21 @@ class Gemma3MultiModalProjector(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Gemma3Config, model_type="gemma3")
 class Gemma3Model(EasyDeLBaseModule):
-    """Multimodal Gemma3 stack combining a vision tower, projector, and language model."""
+    """Multimodal Gemma3 model combining a vision tower, projector, and language model.
+
+    This is the base multimodal model that processes both images and text. It consists of:
+    - A vision tower for encoding images into feature representations
+    - A multi-modal projector for mapping vision features to the text embedding space
+    - A language model for processing the combined multimodal embeddings
+
+    Attributes:
+        config (Gemma3Config): Configuration for the multimodal model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+        vocab_size (int): Size of the vocabulary from text config.
+        pad_token_id (int): ID of the padding token.
+    """
 
     def __init__(
         self,
@@ -1016,6 +1293,17 @@ class Gemma3Model(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the Gemma3 multimodal base model.
+
+        Args:
+            config (Gemma3Config): Multimodal model configuration containing vision_config
+                and text_config.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1049,6 +1337,17 @@ class Gemma3Model(EasyDeLBaseModule):
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
 
     def get_image_features(self, pixel_values: Array) -> Array:
+        """Extract image features from pixel values.
+
+        Processes images through the vision tower and projects them to the
+        text embedding space.
+
+        Args:
+            pixel_values (Array): Input images of shape (batch_size, channels, height, width).
+
+        Returns:
+            Array: Projected image features ready for merging with text embeddings.
+        """
         vision_outputs = self.vision_tower(pixel_values=pixel_values).last_hidden_state
         image_features = self.multi_modal_projector(vision_outputs)
         return image_features
@@ -1061,6 +1360,25 @@ class Gemma3Model(EasyDeLBaseModule):
         pixel_values: Array | None = None,
         **kwargs,
     ) -> Array:
+        """Compute embeddings for multimodal inputs.
+
+        Computes text embeddings from input_ids and optionally merges image features
+        at positions marked by image_token_id. Embeddings are scaled by sqrt(hidden_size).
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
+            image_features (Array | None, optional): Pre-computed image features. If None
+                and pixel_values is provided, features will be computed. Defaults to None.
+            pixel_values (Array | None, optional): Raw image pixel values. Used to compute
+                image_features if not provided directly. Defaults to None.
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            Array: Combined multimodal embeddings of shape (batch_size, sequence_length, hidden_size).
+
+        Raises:
+            ValueError: If input_ids is None.
+        """
         if input_ids is None:
             raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
 
@@ -1103,6 +1421,39 @@ class Gemma3Model(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         **lm_kwargs,
     ) -> Gemma3ModelOutputWithPast:
+        """Forward pass through the Gemma3 multimodal base model.
+
+        Processes images through the vision tower (if provided), computes embeddings,
+        and runs the language model on the combined multimodal representation.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            pixel_values (Array | None, optional): Input images of shape
+                (batch_size, channels, height, width). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens.
+                Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention. Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token. Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode for optimizations. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cached key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache management metadata. Defaults to None.
+            token_type_ids (Array | None, optional): Token type IDs for distinguishing image/text tokens.
+                Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states. Defaults to None.
+            **lm_kwargs: Additional arguments passed to the language model.
+
+        Returns:
+            Gemma3ModelOutputWithPast: Contains last_hidden_state, image_hidden_states,
+                past_key_values, optional hidden_states, and attentions.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -1157,12 +1508,25 @@ class Gemma3Model(EasyDeLBaseModule):
 
     def init_cache(
         self,
-        batch_size,
-        max_length,
-        starts=None,
-        shardings=None,
-        pad_token_id=None,
-    ):
+        batch_size: int,
+        max_length: int,
+        starts: int | None = None,
+        shardings: dict | None = None,
+        pad_token_id: int | None = None,
+    ) -> TransformerCache:
+        """Initialize the KV cache for autoregressive generation.
+
+        Args:
+            batch_size (int): Batch size for the cache.
+            max_length (int): Maximum sequence length for the cache.
+            starts (int | None, optional): Starting position for generation. Defaults to None.
+            shardings (dict | None, optional): Sharding specifications for distributed caching.
+                Defaults to None.
+            pad_token_id (int | None, optional): Padding token ID. Defaults to None.
+
+        Returns:
+            TransformerCache: Initialized cache for the language model.
+        """
         return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
 
     def prepare_inputs_for_generation(
@@ -1174,7 +1538,25 @@ class Gemma3Model(EasyDeLBaseModule):
         pixel_values: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         token_type_ids: Array | None = None,
-    ):
+    ) -> dict:
+        """Prepare inputs for autoregressive generation.
+
+        Prepares the language model inputs and adds pixel_values for multimodal generation.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
+            max_length (int): Maximum generation length.
+            pad_token_id (int): Padding token ID.
+            starts (int | None, optional): Starting position for generation. Defaults to None.
+            pixel_values (Array | None, optional): Input images for the first generation step.
+                Defaults to None.
+            attention_mask (Array | None, optional): Attention mask. Defaults to None.
+            token_type_ids (Array | None, optional): Token type IDs for multimodal inputs.
+                Defaults to None.
+
+        Returns:
+            dict: Dictionary of model inputs including pixel_values.
+        """
         model_inputs = self.language_model.prepare_inputs_for_generation(
             input_ids=input_ids,
             max_length=max_length,
@@ -1186,7 +1568,19 @@ class Gemma3Model(EasyDeLBaseModule):
         model_inputs["pixel_values"] = pixel_values
         return model_inputs
 
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+    def update_inputs_for_generation(self, model_outputs, model_kwargs: dict) -> dict:
+        """Update inputs for the next generation step.
+
+        Removes pixel_values and token_type_ids after the first generation step
+        since images are only processed once.
+
+        Args:
+            model_outputs: Outputs from the previous generation step.
+            model_kwargs (dict): Current model keyword arguments.
+
+        Returns:
+            dict: Updated model kwargs for the next generation step.
+        """
         model_kwargs = super().update_inputs_for_generation(model_outputs, model_kwargs)
         model_kwargs.pop("pixel_values", None)  # only effect first iter
         model_kwargs.pop("token_type_ids", None)  # only effect first iter
@@ -1224,11 +1618,21 @@ class Gemma3Model(EasyDeLBaseModule):
 class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma3Config]):
     """Gemma3 multimodal language model for conditional generation.
 
-    Combines a vision tower and a language model with a multi-modal projector.
-    Inherits from BaseVisionLanguageModule to leverage common VLM infrastructure.
+    Combines a vision tower, language model, and multi-modal projector for
+    vision-language tasks such as image captioning, visual question answering,
+    and multimodal dialogue. Inherits from BaseVisionLanguageModule.
 
-    Features a custom apply_lm_head with final_logit_softcapping for improved
-    training stability.
+    Features:
+    - Vision tower for encoding images into feature representations
+    - Multi-modal projector for aligning vision and text embeddings
+    - Language model with alternating global/sliding window attention
+    - Final logit softcapping for improved training stability
+
+    Attributes:
+        config (Gemma3Config): Configuration for the multimodal model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
 
     Class Attributes:
         _task_type: IMAGE_TEXT_TO_TEXT task type
@@ -1261,7 +1665,17 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Gemma3ForConditionalGeneration model."""
+        """Initialize Gemma3 for conditional generation.
+
+        Args:
+            config (Gemma3Config): Multimodal model configuration containing vision_config
+                and text_config.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for matrix operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Gemma3Model,
@@ -1297,7 +1711,20 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
         """
         return self.base_model.get_image_features(pixel_values)
 
-    def compute_embedding(self, input_ids, *args, **kwargs):
+    def compute_embedding(self, input_ids: Int[Array, "batch seq_len"], *args, **kwargs) -> Array:
+        """Compute embeddings for multimodal inputs.
+
+        Delegates to the base model's compute_embedding method to handle both
+        text and image embedding computation.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
+            *args: Additional positional arguments passed to base model.
+            **kwargs: Additional keyword arguments (e.g., image_features, pixel_values).
+
+        Returns:
+            Array: Combined multimodal embeddings.
+        """
         return self.base_model.compute_embedding(input_ids, *args, **kwargs)
 
     def __call__(
@@ -1387,8 +1814,27 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
         return lm_logits
 
-    def init_cache(self, batch_size, max_length, starts=None, shardings=None, pad_token_id=None):
-        """Initialize KV cache for generation."""
+    def init_cache(
+        self,
+        batch_size: int,
+        max_length: int,
+        starts: int | None = None,
+        shardings: dict | None = None,
+        pad_token_id: int | None = None,
+    ) -> TransformerCache:
+        """Initialize the KV cache for autoregressive generation.
+
+        Args:
+            batch_size (int): Batch size for the cache.
+            max_length (int): Maximum sequence length for the cache.
+            starts (int | None, optional): Starting position for generation. Defaults to None.
+            shardings (dict | None, optional): Sharding specifications for distributed caching.
+                Defaults to None.
+            pad_token_id (int | None, optional): Padding token ID. Defaults to None.
+
+        Returns:
+            TransformerCache: Initialized cache for the language model.
+        """
         return self.base_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
 
     def get_vision_tower(self) -> nn.Module:

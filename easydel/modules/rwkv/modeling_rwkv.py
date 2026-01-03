@@ -38,7 +38,18 @@ from .rwkv_configuration import RwkvConfig as RwkvConfig
 
 @auto_pytree
 class RwkvOutput(ModelOutput):
-    """Output type for RWKV model."""
+    """Output container for the base RWKV model with recurrent state.
+
+    Attributes:
+        last_hidden_state: Final hidden states from the model of shape
+            (batch, seq_len, hidden_size).
+        state: Recurrent state tensors for continuing generation. Contains
+            channel mix and time mix states for each layer.
+        hidden_states: Optional tuple of hidden states from all layers if
+            output_hidden_states=True.
+        attentions: Optional tuple of attention weights from all layers if
+            output_attentions=True.
+    """
 
     last_hidden_state: Array = None
     state: tuple[Array, ...] | None = None
@@ -48,7 +59,15 @@ class RwkvOutput(ModelOutput):
 
 @auto_pytree
 class RwkvCausalLMOutput(ModelOutput):
-    """Output type for RWKV causal language model."""
+    """Causal LM output including logits and state for RWKV generation.
+
+    Attributes:
+        loss: Optional language modeling loss if labels are provided.
+        logits: Prediction logits of shape (batch, seq_len, vocab_size).
+        state: Recurrent state tensors for continuing generation.
+        hidden_states: Optional tuple of hidden states from all layers.
+        attentions: Optional tuple of attention weights from all layers.
+    """
 
     loss: Array | None = None
     logits: Array = None
@@ -82,7 +101,29 @@ def rwkv_linear_attention(
     state=None,
     return_state=False,
 ):
-    """Compute RWKV linear attention update with optional recurrent state."""
+    """Compute RWKV linear attention update with optional recurrent state.
+
+    Implements the RWKV attention mechanism that achieves linear complexity
+    through a recurrent formulation. Unlike traditional attention, this
+    computes a weighted combination of values using exponential decay
+    over time steps.
+
+    Args:
+        time_decay: Time decay parameter controlling how quickly past
+            information fades, shape (hidden_size,).
+        time_first: Initial time weighting parameter for the first token,
+            shape (hidden_size,).
+        key: Key tensor of shape (batch, seq_len, hidden_size).
+        value: Value tensor of shape (batch, seq_len, hidden_size).
+        state: Optional tuple of (numerator_state, denominator_state, max_state)
+            from previous time steps for continuing recurrence.
+        return_state: Whether to return the updated recurrent state.
+
+    Returns:
+        tuple: (output, state) where output has shape (batch, seq_len, hidden_size)
+            and state is a list of [num_state, den_state, max_state] if
+            return_state is True or state was provided, else None.
+    """
     current_sequence_length = key.shape[1]
     output = jnp.zeros_like(key)
 
@@ -120,7 +161,25 @@ def rwkv_linear_attention(
 
 
 class RwkvSelfAttention(nn.Module):
-    """RWKV self-attention mechanism with linear complexity."""
+    """RWKV self-attention mechanism with linear complexity.
+
+    Implements the RWKV attention mechanism, also known as the "time mixing"
+    block. This uses a recurrent formulation with learned time decay and
+    time-first parameters to achieve linear complexity instead of quadratic
+    complexity of standard attention.
+
+    The mechanism mixes the current input with the previous hidden state
+    using learnable mixing parameters for key, value, and receptance
+    (analogous to gate in gated architectures).
+
+    Attributes:
+        config (RwkvConfig): Model configuration.
+        layer_id (int): Index of this layer in the model.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Numerical precision for operations.
+        attention_hidden_size (int): Hidden dimension for attention.
+    """
 
     def __init__(
         self,
@@ -132,6 +191,16 @@ class RwkvSelfAttention(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize RWKV self-attention layer.
+
+        Args:
+            config (RwkvConfig): Model configuration with RWKV parameters.
+            layer_id (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.layer_id = layer_id
         self.dtype = dtype
@@ -233,6 +302,22 @@ class RwkvSelfAttention(nn.Module):
         hidden: Array,
         state: tuple[Array, Array, Array, Array],
     ):
+        """Apply RWKV self-attention to input hidden states.
+
+        Performs time mixing by blending current input with previous state
+        using learned mixing parameters, then computing recurrent attention.
+
+        Args:
+            hidden (Array): Input hidden states of shape (batch, seq_len, hidden_size).
+            state (tuple[Array, Array, Array, Array]): Recurrent state tuple containing
+                (sx, aa, bb, pp) where sx is the previous hidden state and aa, bb, pp
+                are the numerator, denominator, and max state for attention.
+
+        Returns:
+            tuple[Array, tuple]: Tuple containing:
+                - Output tensor of shape (batch, seq_len, hidden_size)
+                - Updated state tuple (hidden[:, -1, :], aa, bb, pp)
+        """
         sx, aa, bb, pp = state
         # `hidden` is (batch, seq, hidden) during training/testing.
         c_x = jnp.concatenate(
@@ -277,7 +362,24 @@ class RwkvSelfAttention(nn.Module):
 
 
 class RwkvFeedForward(nn.Module):
-    """RWKV feedforward network with channel mixing."""
+    """RWKV feedforward network with channel mixing.
+
+    Implements the "channel mixing" block of RWKV which is analogous to
+    the feedforward network in transformers. It uses a gating mechanism
+    with receptance (sigmoid gate) and squared ReLU activation for the
+    key projection.
+
+    The channel mixing blends the current input with the previous state
+    using learned time mixing parameters before applying the feedforward
+    transformations.
+
+    Attributes:
+        config (RwkvConfig): Model configuration.
+        layer_id (int): Index of this layer in the model.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Numerical precision for operations.
+    """
 
     def __init__(
         self,
@@ -289,6 +391,16 @@ class RwkvFeedForward(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize RWKV feedforward (channel mixing) layer.
+
+        Args:
+            config (RwkvConfig): Model configuration with RWKV parameters.
+            layer_id (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.layer_id = layer_id
         self.dtype = dtype
@@ -350,6 +462,20 @@ class RwkvFeedForward(nn.Module):
         )
 
     def __call__(self, hidden, state):
+        """Apply channel mixing feedforward transformation.
+
+        Blends current input with previous state, then applies gated
+        feedforward with squared ReLU activation.
+
+        Args:
+            hidden (Array): Input hidden states of shape (batch, seq_len, hidden_size).
+            state (Array): Previous channel mix state of shape (batch, hidden_size).
+
+        Returns:
+            tuple[Array, Array]: Tuple containing:
+                - Output tensor of shape (batch, seq_len, hidden_size)
+                - Updated state (last hidden position for next step)
+        """
         sx = jnp.concatenate((jnp.expand_dims(state, 1), hidden[:, :-1, :]), axis=1)
         xk = hidden * self.time_mix_key.reshape(1, 1, -1) + sx * (1 - self.time_mix_key.reshape(1, 1, -1))
         xr = hidden * self.time_mix_receptance.reshape(1, 1, -1) + sx * (1 - self.time_mix_receptance.reshape(1, 1, -1))
@@ -359,7 +485,23 @@ class RwkvFeedForward(nn.Module):
 
 
 class SingleStandRwkvBlock(nn.Module):
-    """Single RWKV transformer block with attention and feedforward layers."""
+    """Single RWKV layer combining normalization, time mixing, and channel mixing.
+
+    Implements a complete RWKV block with pre-normalization architecture.
+    Each block contains:
+    - Layer normalization followed by time mixing (attention)
+    - Layer normalization followed by channel mixing (feedforward)
+    - Residual connections around both sub-layers
+
+    The first layer also includes an additional pre-normalization step.
+
+    Attributes:
+        config (RwkvConfig): Model configuration.
+        layer_id (int): Index of this layer in the model.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Numerical precision for operations.
+    """
 
     def __init__(
         self,
@@ -370,6 +512,16 @@ class SingleStandRwkvBlock(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         rngs: nn.Rngs = None,
     ) -> None:
+        """Initialize RWKV block.
+
+        Args:
+            config (RwkvConfig): Model configuration with RWKV parameters.
+            layer_id (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs, optional): Random number generator state. Defaults to None.
+        """
         self.config = config
         self.layer_id = layer_id
         self.dtype = dtype
@@ -419,6 +571,25 @@ class SingleStandRwkvBlock(nn.Module):
         )
 
     def __call__(self, hidden, state=None, use_cache: bool = False, output_attentions: bool = False):
+        """Forward pass through the RWKV block.
+
+        Applies pre-normalization followed by time mixing (attention),
+        then channel mixing (feedforward), with residual connections.
+
+        Args:
+            hidden (Array): Input tensor of shape (batch, seq_len, hidden_size).
+            state: Recurrent state, either as a tuple of (time_mix_state, channel_mix_state)
+                or as a global state list with shape [5, batch, hidden_size, num_layers].
+            use_cache (bool, optional): Whether to use and update the cache. Defaults to False.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+
+        Returns:
+            tuple: Tuple containing:
+                - Output hidden states of shape (batch, seq_len, hidden_size)
+                - Updated state (same format as input state)
+                - Attention weights if output_attentions=True, else None
+        """
         uses_global_state = isinstance(state, list)
         if state is None:
             state = init_state(self.config.hidden_size, batch_size=hidden.shape[0])
@@ -469,7 +640,24 @@ RwkvBlock = SingleStandRwkvBlock
 
 @register_module(TaskType.BASE_MODULE, config=RwkvConfig, model_type="rwkv")
 class RwkvModel(EasyDeLBaseModule):
-    """RWKV base model with embedding and transformer blocks."""
+    """RWKV (Receptance Weighted Key Value) base model implementation.
+
+    Implements the RWKV architecture, a novel RNN-based language model that
+    achieves transformer-level performance with linear complexity. Unlike
+    transformers, RWKV uses a recurrent formulation that enables:
+    - Linear time and memory complexity during training
+    - Constant memory during inference (no growing context window)
+    - Efficient parallel training like transformers
+
+    The model consists of stacked RWKV blocks, each containing time mixing
+    (analogous to attention) and channel mixing (analogous to FFN) layers.
+
+    Attributes:
+        config (RwkvConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -480,6 +668,17 @@ class RwkvModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RWKV base model.
+
+        Args:
+            config (RwkvConfig): Model configuration with RWKV parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16
+                but is overridden to jnp.float32 for numerical stability.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16
+                but is overridden to jnp.float32 for numerical stability.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         dtype = jnp.float32
         param_dtype = jnp.float32
         super().__init__(
@@ -527,6 +726,35 @@ class RwkvModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> tuple | RwkvOutput:
+        """Forward pass through the RWKV base model.
+
+        Processes input tokens through embedding, all RWKV blocks with
+        time and channel mixing, and final layer normalization.
+
+        Args:
+            input_ids (Int[Array, "batch seq_len"] | None, optional): Input token IDs.
+                Must be provided if inputs_embeds is None. Defaults to None.
+            attention_mask (Bool[Array, "batch seq_len"] | None, optional): Mask to avoid
+                processing padding tokens. Currently not used by RWKV. Defaults to None.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"] | None, optional):
+                Pre-computed input embeddings. Defaults to None.
+            state (list[Array] | None, optional): Recurrent state from previous forward
+                pass, as a list of 5 arrays with shape (batch, hidden_size, num_layers).
+                Defaults to None.
+            use_cache (bool | None, optional): Whether to maintain and return the
+                recurrent state. Defaults to None (uses config setting).
+            output_attentions (bool | None, optional): Whether to return attention
+                weights. Defaults to None (uses config setting).
+            output_hidden_states (bool | None, optional): Whether to return hidden
+                states from all layers. Defaults to None (uses config setting).
+
+        Returns:
+            RwkvOutput: Contains last_hidden_state, optional state, hidden_states,
+                and attentions.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -595,7 +823,18 @@ class RwkvModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=RwkvConfig, model_type="rwkv")
 class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):
-    """RWKV model with language modeling head for causal generation."""
+    """RWKV model with a language modeling head for causal language modeling tasks.
+
+    This model combines the RWKV recurrent backbone with a linear language
+    modeling head to perform autoregressive text generation with linear-time
+    complexity and constant memory during inference.
+
+    Attributes:
+        config (RwkvConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (overridden to jnp.float32).
+        param_dtype (jnp.dtype): Data type for parameters (overridden to jnp.float32).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "rwkv"
@@ -610,6 +849,17 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RWKV model for causal language modeling.
+
+        Args:
+            config (RwkvConfig): Model configuration with RWKV parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16
+                but is overridden to jnp.float32 for numerical stability.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16
+                but is overridden to jnp.float32 for numerical stability.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         dtype = jnp.float32
         param_dtype = jnp.float32
         super().__init__(
@@ -668,6 +918,27 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):
         inputs_embeds: Array | None = None,
         **kwargs,
     ) -> dict[str, tp.Any]:
+        """Prepare model inputs for text generation.
+
+        Initializes or retrieves the recurrent state and prepares all
+        necessary inputs for the RWKV generation loop.
+
+        Args:
+            input_ids (Int[Array, "batch seq_len"]): Input token IDs to start generation.
+            max_length (int): Maximum sequence length for generation (unused).
+            pad_token_id (int): Token ID used for padding (unused).
+            starts (int | None, optional): Starting position (unused). Defaults to None.
+            shardings (int | None, optional): Sharding configuration (unused). Defaults to None.
+            attention_mask (Array | None, optional): Attention mask. Defaults to None.
+            token_type_ids (Array | None, optional): Token type IDs (unused). Defaults to None.
+            mask_info: Mask information (unused). Defaults to None.
+            state (list[Array] | None, optional): Previous recurrent state. Defaults to None.
+            inputs_embeds (Array | None, optional): Input embeddings (unused). Defaults to None.
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            dict[str, tp.Any]: Prepared inputs including state and optional attention_mask.
+        """
         del max_length, pad_token_id, starts, shardings, token_type_ids, mask_info, kwargs
         del inputs_embeds
 
@@ -690,6 +961,20 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):
         model_outputs: RwkvCausalLMOutput,
         model_kwargs: dict[str, tp.Any],
     ) -> dict[str, tp.Any]:
+        """Update model inputs for the next generation step.
+
+        Extracts the updated recurrent state from model outputs and adds
+        it to the model kwargs for the next forward pass during
+        autoregressive generation.
+
+        Args:
+            model_outputs (RwkvCausalLMOutput): Model outputs from the current
+                generation step containing the updated state.
+            model_kwargs (dict[str, tp.Any]): Current model keyword arguments.
+
+        Returns:
+            dict[str, tp.Any]: Updated model kwargs with the new state.
+        """
         model_kwargs["state"] = model_outputs.state
         return model_kwargs
 
@@ -704,6 +989,33 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
     ) -> tuple | RwkvCausalLMOutput:
+        """Forward pass for causal language modeling.
+
+        Processes input through the RWKV backbone and applies the language
+        modeling head to produce next-token logits.
+
+        Args:
+            input_ids (Int[Array, "batch seq_len"] | None, optional): Input token IDs.
+                Must be provided if inputs_embeds is None. Defaults to None.
+            attention_mask (Bool[Array, "batch seq_len"] | None, optional): Mask to avoid
+                processing padding tokens. Defaults to None.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"] | None, optional):
+                Pre-computed input embeddings. Defaults to None.
+            state (list[Array] | None, optional): Recurrent state from previous forward
+                pass. Defaults to None.
+            use_cache (bool | None, optional): Whether to maintain and return the
+                recurrent state. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention
+                weights. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden
+                states from all layers. Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router
+                logits (unused for RWKV). Defaults to None.
+
+        Returns:
+            RwkvCausalLMOutput: Contains logits, state, and optional hidden_states
+                and attentions.
+        """
         rwkv_outputs = self.rwkv(
             input_ids,
             inputs_embeds=inputs_embeds,

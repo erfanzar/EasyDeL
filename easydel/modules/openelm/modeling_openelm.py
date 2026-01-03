@@ -48,7 +48,12 @@ from .openelm_configuration import OpenELMConfig, make_divisible
 
 
 class OpenELMMultiHeadCausalAttention(UnifiedAttention):
-    """OpenELM causal attention based on UnifiedAttention with per-layer head configuration."""
+    """Multi-head causal attention layer for OpenELM models.
+
+    Implements attention with per-layer head configuration, supporting variable
+    numbers of query and key-value heads across different layers. Uses fused
+    QKV projections and optional QK normalization for improved training stability.
+    """
 
     projection_mapping: typing.ClassVar = dict(UnifiedAttention.projection_mapping)
     projection_mapping.update(
@@ -68,6 +73,16 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize OpenELM attention layer with per-layer head configuration.
+
+        Args:
+            config (OpenELMConfig): Model configuration with per-layer attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer, used to determine head counts.
+        """
         self.layer_idx = layer_idx
         self.num_q_heads = config.num_query_heads[layer_idx]
         self.num_k_heads = config.num_kv_heads[layer_idx]
@@ -113,6 +128,18 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike,
         rngs: nn.Rngs,
     ) -> None:
+        """Define the attention network components.
+
+        Creates the fused QKV projection, output projection, optional QK normalization
+        layers, rotary embeddings, and attention performer.
+
+        Args:
+            config (OpenELMConfig): Model configuration.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Numerical precision for operations.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.qkv_proj = ColumnParallelLinear(
             config.model_dim,
             (self.num_q_heads + self.num_k_heads + self.num_v_heads) * self.head_dim,
@@ -162,6 +189,16 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         key_states: jnp.ndarray,
         value_states: jnp.ndarray,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Apply optional QK normalization to query and key states.
+
+        Args:
+            query_states (jnp.ndarray): Query tensor.
+            key_states (jnp.ndarray): Key tensor.
+            value_states (jnp.ndarray): Value tensor.
+
+        Returns:
+            tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]: Normalized query, key, and value states.
+        """
         if self.q_norm is not None:
             query_states = self.q_norm(query_states)
         if self.k_norm is not None:
@@ -169,6 +206,15 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         return query_states, key_states, value_states
 
     def _create_rotary(self, config: OpenELMConfig, dtype: jnp.dtype):
+        """Create rotary position embedding for this attention layer.
+
+        Args:
+            config (OpenELMConfig): Model configuration with RoPE parameters.
+            dtype (jnp.dtype): Data type for the rotary embeddings.
+
+        Returns:
+            Rotary embedding module for applying positional information.
+        """
         return config.get_basic_rope(
             dtype,
             head_size=config.head_dim,
@@ -188,6 +234,27 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
     ) -> AttentionLayerOutput:
+        """Forward pass through the attention layer.
+
+        Computes multi-head attention with rotary position embeddings and optional
+        KV caching for efficient autoregressive generation.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, seq_len, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, seq_len).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for KV states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+            alibi (Array | None, optional): ALiBi attention biases. Defaults to None.
+
+        Returns:
+            AttentionLayerOutput: Contains attention output, optional attention weights, and cache view.
+        """
         batch_size, sequence_length = hidden_states.shape[:2]
 
         qkv = checkpoint_name(self.query_key_value_projection(hidden_states), "attn_qkv")
@@ -362,6 +429,14 @@ class OpenELMFeedForwardNetwork(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply feedforward transformation with optional gated linear unit.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, seq_len, hidden_dim).
+
+        Returns:
+            Array: Transformed hidden states of shape (batch_size, seq_len, hidden_dim).
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -483,23 +558,24 @@ class OpenELMDecoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
-        """Forward pass of the OpenELMDecoderLayer module.
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + ffn(norm(x)).
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[Array]): Precomputed rotary frequency embeddings.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for KV states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
 
         Returns:
-            tp.Tuple[Array, tp.Optional[Array]]:
-                A tuple containing the output hidden states and optionally the attention weights.
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
         """
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
@@ -627,6 +703,11 @@ class OpenELMModel(EasyDeLBaseModule):
 
     @cached_property
     def frequencies(self):
+        """Compute and cache rotary position embedding frequencies.
+
+        Returns:
+            Array: Precomputed frequency tensor for rotary position embeddings.
+        """
         return self.config.get_basic_frequencies(
             head_size=self.config.head_dim,
             rotary_dim=self.config.head_dim,
@@ -646,32 +727,40 @@ class OpenELMModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass of the OpenELMModel.
+        """Forward pass through the OpenELM base model.
+
+        Processes input tokens through embedding, all decoder layers with RoPE and RMSNorm,
+        and final normalization.
 
         Args:
-            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, model_dim). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            BaseModelOutput: The model's output.
-                returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-                and `attentions` (optional).
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
 
         Raises:
-            ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
+            ValueError: If both input_ids and inputs_embeds are None or both are provided.
+            AssertionError: If sequence_length exceeds max_context_length.
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -771,7 +860,18 @@ class OpenELMModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=OpenELMConfig, model_type="openelm")
 class OpenELMForCausalLM(BaseCausalLMModule[OpenELMModel, OpenELMConfig]):
-    """OpenELM model with a Causal Language Modeling head."""
+    """OpenELM model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with per-layer head configuration,
+    causal attention masks, and optional input-output embedding sharing for efficient
+    autoregressive language generation.
+
+    Attributes:
+        config (OpenELMConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "openelm"
@@ -786,14 +886,14 @@ class OpenELMForCausalLM(BaseCausalLMModule[OpenELMModel, OpenELMConfig]):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the OpenELMForCausalLM model.
+        """Initialize OpenELM model for causal language modeling.
 
         Args:
-            config (OpenELMConfig): The configuration object for the OpenELM model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (OpenELMConfig): Model configuration with OpenELM-specific parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,

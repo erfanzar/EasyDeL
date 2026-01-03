@@ -72,6 +72,16 @@ class Grok1Attention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Grok-1 attention with rotary position embeddings.
+
+        Args:
+            config (Grok1Config): Model configuration with attention parameters.
+            layer_index (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(config=config)
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -157,25 +167,24 @@ class Grok1Attention(AttentionModule):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
-        """Forward pass of the Grok1Attention module.
+        """Forward pass through the Grok-1 attention layer.
+
+        Applies multi-head attention with rotary position embeddings and optional caching.
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens.
-            causal_mask (Array, optional): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional):
-                Cache view for key/value states.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional):
-                Metadata for cache handling.
-            segment_ids (tp.Optional[Array], optional): Segment IDs for segment-based attention.
-            output_attentions (bool, optional): Whether to return attention weights.
-            fcm_mask (tp.Optional[Array], optional): Forward causal mask.
-            frequencies (tp.Optional[Array], optional): Precomputed rotary frequencies.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information for masking operations.
+            position_ids (Array): Position indices for each token, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for key/value states during generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache handling. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed rotary frequencies. Defaults to None.
 
         Returns:
-            tp.Tuple[Array, tp.Optional[Array]]: A tuple containing the attention
-                output and optionally the attention weights.
+            AttentionLayerOutput: Contains attention output, optional attention weights, and cache view.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
@@ -258,6 +267,19 @@ class Grok1BLockSparseMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Grok-1 Block Sparse MLP.
+
+        Sets up the gated MLP with gate projection (linear), down projection (linear_1),
+        and up projection (linear_v) using GELU activation.
+
+        Args:
+            config (Grok1Config): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -297,13 +319,15 @@ class Grok1BLockSparseMLP(nn.Module):
         )
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
-        """Forward pass of the Grok1BLockSparseMLP module.
+        """Apply gated MLP transformation for expert processing.
+
+        Computes: linear_1(gelu(linear(x)) * linear_v(x))
 
         Args:
-            hidden_states (Array): Input hidden states.
+            hidden_states (Array): Input tensor of shape (batch_size, seq_len, hidden_dim).
 
         Returns:
-            Array: Output hidden states after processing through the block sparse MLP.
+            Array: Transformed hidden states of shape (batch_size, seq_len, hidden_dim).
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -344,6 +368,18 @@ class Grok1SparseMoeBlock(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Grok-1 Sparse MoE block.
+
+        Sets up the router gate and expert MLP networks for sparse mixture of experts.
+
+        Args:
+            config (Grok1Config): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -373,14 +409,18 @@ class Grok1SparseMoeBlock(nn.Module):
         ]
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
-        """Forward pass of the Grok1SparseMoeBlock.
+        """Forward pass through the Sparse MoE block.
+
+        Routes input tokens to top-k experts based on learned gating weights and
+        combines their outputs.
 
         Args:
-            hidden_states (Array): Input hidden states.
+            hidden_states (Array): Input hidden states of shape (batch, seq_len, hidden_dim).
 
         Returns:
-            tp.Tuple[Array, Array]: A tuple containing the output hidden states
-                and the router logits.
+            tuple[Array, Array]: A tuple containing:
+                - Output hidden states after MoE processing (batch, seq_len, hidden_dim).
+                - Router logits for auxiliary loss computation (batch, seq_len, num_experts).
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -444,6 +484,18 @@ class Grok1DecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Grok-1 decoder layer.
+
+        Sets up attention, MoE block, and normalization layers with residual connections.
+
+        Args:
+            config (Grok1Config): Model configuration.
+            layer_index (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.config = config
         self.layer_index = layer_index
@@ -516,26 +568,27 @@ class Grok1DecoderLayer(nn.Module):
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
-        """Forward pass of the Grok1DecoderLayer module.
+        """Forward pass through the decoder layer.
+
+        Applies pre/post-normalization architecture with attention and MoE:
+        x = x + post_attn_norm(attn(pre_attn_norm(x)))
+        x = x + post_moe_norm(moe(pre_moe_norm(x)))
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens.
-            causal_mask (Array, optional): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView], optional):
-                Cache view for key/value states.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata], optional):
-                Metadata for cache handling.
-            segment_ids (tp.Optional[Array], optional): Segment IDs for segment-based attention.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information for masking operations.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
             output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
-            output_router_logits (bool, optional): Whether to return router logits from the MoE layer. Defaults to False.
-            fcm_mask (tp.Optional[Array], optional): Forward causal mask. Defaults to None.
-            frequencies (tp.Optional[Array], optional): Precomputed rotary frequencies.
+            output_router_logits (bool, optional): Whether to return router logits. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
 
         Returns:
-            tp.Tuple[Array, tp.Optional[Array], tp.Optional[Array]]: A tuple containing the
-                output hidden states, optionally the attention weights, and optionally the router logits.
+            DecoderLayerOutput: Contains hidden states, attention weights, router logits, and cache view.
         """
         residual = hidden_states
         hidden_states = self.pre_attn_norm(hidden_states)
@@ -593,6 +646,15 @@ class Grok1Model(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Grok-1 base model.
+
+        Args:
+            config (Grok1Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -637,6 +699,11 @@ class Grok1Model(EasyDeLBaseModule):
 
     @cached_property
     def frequencies(self):
+        """Compute and cache rotary position embedding frequencies.
+
+        Returns:
+            Array: Precomputed RoPE frequencies for position embeddings.
+        """
         return self.config.get_basic_frequencies(
             head_size=self.config.hidden_size // self.config.num_attention_heads,
             base=self.config.rope_theta,
@@ -656,25 +723,41 @@ class Grok1Model(EasyDeLBaseModule):
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> MoeModelOutput:
-        """Forward pass through the Grok1Model.
+        """Forward pass through the Grok-1 base model.
+
+        Processes input tokens through embedding, all decoder layers with Sparse MoE,
+        and final normalization.
 
         Args:
-            input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            attention_mask (Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (Array, optional): Indices of positions of each input sequence token.
-            segment_ids (Array, optional): Segment token indices for segment embeddings.
-            output_attentions (bool, optional): Whether to return attention weights.
-            output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-            output_router_logits (bool, optional): Whether to return router logits from MoE layers.
-            past_key_values (TransformerCache | RaggedPagesCache, optional): Cache containing
-                precomputed key/value states.
-            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
-
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None (uses config.output_attentions).
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None (uses config.output_hidden_states).
+            output_router_logits (bool | None, optional): Whether to return router logits from MoE layers.
+                Defaults to None (uses config.output_router_logits).
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
 
         Returns:
-            MoeModelOutput: Model outputs (last hidden state, optional hidden states,
-                optional attentions, optional router logits)
+            MoeModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                optional router_logits, and updated past_key_values.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_router_logits = (
@@ -815,6 +898,15 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Grok-1 model for causal language modeling.
+
+        Args:
+            config (Grok1Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Grok1Model,
@@ -843,23 +935,37 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
-        """Forward pass through the Grok1ForCausalLM model.
+        """Forward pass through the Grok-1 causal language model.
 
         Args:
-            input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            attention_mask (Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (Array, optional): Indices of positions of each input sequence token.
-            output_attentions (bool, optional): Whether to return attention weights.
-            output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-            output_router_logits (bool, optional): Whether to return router logits from MoE layers.
-            past_key_values (TransformerCache | RaggedPagesCache, optional): Cache
-                containing precomputed key/value states.
-            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router logits from MoE layers.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply language model head projection.
+                Defaults to True.
 
         Returns:
-            MoeCausalLMOutput: Model outputs (logits, optional auxiliary loss, optional hidden states,
-                optional attentions, optional router logits)
+            MoeCausalLMOutput: Contains logits, optional hidden_states, optional attentions,
+                optional router_logits, auxiliary loss, and updated past_key_values.
         """
         return self.forward_moe(
             input_ids=input_ids,
@@ -878,7 +984,15 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):
         )
 
     def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary loss for load balancing."""
+        """Compute auxiliary load balancing loss from router logits.
+
+        Args:
+            outputs: Model outputs containing router_logits from MoE layers.
+            attention_mask: Attention mask to exclude padding tokens from loss computation.
+
+        Returns:
+            Optional auxiliary loss value for load balancing, or None if router_logits unavailable.
+        """
         if outputs.router_logits is None or len(outputs.router_logits) == 0:
             return None
 
@@ -891,7 +1005,17 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):
         return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
     def apply_lm_head(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
-        """Apply LM head with Grok-1's output multiplier scale."""
+        """Apply language model head with Grok-1's output multiplier scaling.
+
+        Transforms hidden states to vocabulary logits and scales by output_multiplier_scale.
+
+        Args:
+            hidden_states (Array): Hidden states from the model of shape
+                (batch_size, sequence_length, hidden_dim).
+
+        Returns:
+            Array: Scaled vocabulary logits of shape (batch_size, sequence_length, vocab_size).
+        """
         lm_logits = super().apply_lm_head(hidden_states)
         lm_logits = lm_logits * self.output_multiplier_scale
         return lm_logits

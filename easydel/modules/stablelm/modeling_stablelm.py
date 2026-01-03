@@ -47,17 +47,10 @@ from .stablelm_configuration import StableLmConfig
 
 
 class StableLmMLP(nn.Module):
-    """Multi-Layer Perceptron (MLP) block for the StableLM model.
+    """Multi-Layer Perceptron module for StableLM models.
 
-    Attributes:
-        config (StableLmConfig): Configuration object for the model.
-        gate_proj (ParallelLinear): Linear layer for the gating mechanism.
-        down_proj (ParallelLinear): Linear layer for down-projection.
-        up_proj (ParallelLinear): Linear layer for up-projection.
-        act_fn (callable): Activation function (specified in config).
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+    Implements the feedforward network with SwiGLU activation function
+    for enhanced representation learning in StableLM architecture.
     """
 
     def __init__(
@@ -70,14 +63,16 @@ class StableLmMLP(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initializes the StableLmMLP module.
+        """Initialize StableLM MLP block.
 
         Args:
-            config (StableLmConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (StableLmConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
         """
         self.config = config
         self.dtype = dtype
@@ -120,13 +115,13 @@ class StableLmMLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Forward pass of the MLP block.
+        """Apply SwiGLU feedforward transformation.
 
         Args:
-            hidden_states (jnp.ndarray): Input hidden states.
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
-            jnp.ndarray: Output hidden states after MLP transformation.
+            Transformed hidden states [batch, seq_len, hidden_dim]
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -146,10 +141,10 @@ class StableLmMLP(nn.Module):
 
 
 class StableLmLayerNormPerHead(nn.Module):
-    """Applies Layer Normalization independently to each attention head's dimension.
+    """Layer normalization applied independently to each attention head.
 
-    Attributes:
-        norms (list[nn.LayerNorm]): List of LayerNorm modules, one per head.
+    This module normalizes each attention head separately, which can improve
+    training stability and model quality in certain architectures.
     """
 
     def __init__(
@@ -163,16 +158,16 @@ class StableLmLayerNormPerHead(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the StableLmLayerNormPerHead module.
+        """Initialize per-head layer normalization.
 
         Args:
-            head_dim (int): The dimension of each attention head.
-            num_heads (int): The number of attention heads.
-            eps (float): Epsilon value for LayerNorm (default: 1e-5).
-            bias (bool): Whether to include bias in LayerNorm (default: False).
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            rngs (nn.Rngs): Random number generators.
+            head_dim (int): Dimension of each attention head.
+            num_heads (int): Number of attention heads.
+            eps (float, optional): Epsilon for numerical stability. Defaults to 1e-5.
+            bias (bool, optional): Whether to include bias in LayerNorm. Defaults to False.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            rngs (nn.Rngs): Random number generator state.
         """
         self.norms = [
             nn.LayerNorm(
@@ -187,13 +182,13 @@ class StableLmLayerNormPerHead(nn.Module):
         ]
 
     def __call__(self, hidden_states):
-        """Applies LayerNorm per head.
+        """Apply layer normalization independently to each head.
 
         Args:
-            hidden_states (Array): Input hidden states, expected shape (..., num_heads * head_dim).
+            hidden_states: Input tensor with shape (..., num_heads * head_dim)
 
         Returns:
-            Array: Hidden states after applying LayerNorm per head, same shape as input.
+            Normalized hidden states with same shape as input
         """
         # hidden_states: [batch, seq_len, num_heads * head_dim]
         states_per_heads = jnp.split(hidden_states, 1, axis=1)
@@ -205,13 +200,10 @@ class StableLmLayerNormPerHead(nn.Module):
 
 
 class StableLmAttention(UnifiedAttention):
-    """StableLM Attention with Q/K normalization.
+    """Multi-head attention layer with Q/K normalization for StableLM models.
 
-    Inherits Q/K normalization from QKNormAttention.
-    Features:
-    - Uses LayerNorm instead of RMSNorm
-    - Per-head normalization (StableLmLayerNormPerHead)
-    - Partial RoPE (partial_rotary_factor)
+    Implements attention with optional query/key normalization using per-head
+    LayerNorm and partial rotary position embeddings (RoPE).
     """
 
     norms_mapping: ClassVar = {
@@ -229,6 +221,16 @@ class StableLmAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize StableLM attention layer with optional Q/K normalization.
+
+        Args:
+            config (StableLmConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         self.qk_layernorm = config.qk_layernorm
         self.partial_rotary_factor = config.partial_rotary_factor
 
@@ -248,7 +250,17 @@ class StableLmAttention(UnifiedAttention):
         )
 
     def _create_q_norm(self, config, dtype, param_dtype, rngs):
-        """Override to use per-head LayerNorm if qk_layernorm is enabled."""
+        """Create query normalization layer using per-head LayerNorm.
+
+        Args:
+            config: Model configuration.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            rngs: Random number generator state.
+
+        Returns:
+            StableLmLayerNormPerHead if qk_layernorm enabled, None otherwise.
+        """
         if not self.qk_layernorm:
             return None
         return StableLmLayerNormPerHead(
@@ -261,7 +273,17 @@ class StableLmAttention(UnifiedAttention):
         )
 
     def _create_k_norm(self, config, dtype, param_dtype, rngs):
-        """Override to use per-head LayerNorm if qk_layernorm is enabled."""
+        """Create key normalization layer using per-head LayerNorm.
+
+        Args:
+            config: Model configuration.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            rngs: Random number generator state.
+
+        Returns:
+            StableLmLayerNormPerHead if qk_layernorm enabled, None otherwise.
+        """
         if not self.qk_layernorm:
             return None
         return StableLmLayerNormPerHead(
@@ -274,7 +296,15 @@ class StableLmAttention(UnifiedAttention):
         )
 
     def _create_rotary(self, config, dtype):
-        """Override for partial RoPE."""
+        """Create partial rotary position embeddings.
+
+        Args:
+            config: Model configuration with partial_rotary_factor.
+            dtype: Data type for computation.
+
+        Returns:
+            Rotary position embedding module with partial rotation.
+        """
         return config.get_basic_rope(
             dtype,
             head_size=int(config.partial_rotary_factor * (config.hidden_size // config.num_attention_heads)),
@@ -293,7 +323,26 @@ class StableLmAttention(UnifiedAttention):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
-        """Forward pass with per-head LayerNorm requiring transpose operations."""
+        """Forward pass through the attention layer with optional Q/K normalization.
+
+        Applies per-head LayerNorm to queries and keys when enabled, followed by
+        partial rotary position embeddings and standard attention computation.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for key-value states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            AttentionLayerOutput: Contains attention output, optional attention weights, and cache view.
+        """
         batch_size, sequence_length = hidden_states.shape[:2]
 
         # Project to Q/K/V
@@ -368,22 +417,10 @@ class StableLmAttention(UnifiedAttention):
 
 
 class StableLmDecoderLayer(nn.Module):
-    """A single decoder layer for the StableLM model.
+    """Single decoder layer for StableLM models.
 
-    This layer combines self-attention, MLP, and residual connections with layer normalization.
-    It supports parallel residual connections.
-
-    Attributes:
-        config (StableLmConfig): Configuration object for the model.
-        self_attn (StableLmAttention): Self-attention module.
-        mlp (StableLmMLP): MLP module.
-        input_layernorm (nn.LayerNorm): Layer normalization applied before self-attention.
-        post_attention_layernorm (nn.LayerNorm): Layer normalization applied after self-attention and before the MLP.
-        dropout_rng_key (str): Name of the RNG key for dropout.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+    Combines multi-head attention and feedforward networks with
+    LayerNorm and residual connections. Supports parallel residual paths.
     """
 
     def __init__(
@@ -396,14 +433,15 @@ class StableLmDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initializes the StableLmDecoderLayer module.
+        """Initialize StableLM decoder layer.
 
         Args:
-            config (StableLmConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (StableLmConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
         """
         self.config = config
         self.dtype = dtype
@@ -463,26 +501,25 @@ class StableLmDecoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
-        """Forward pass of the decoder layer.
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture with optional parallel residual paths:
+        either parallel (attn + mlp + residual) or sequential (attn → residual → mlp → residual).
 
         Args:
-            hidden_states (Array): Input hidden states (batch, seq_len, hidden_size).
-            attention_mask (Array): Attention mask (batch, 1, seq_len, kv_seq_len).
-            position_ids (Array): Position IDs (batch, seq_len).
-            causal_mask (tp.Optional[Array | bool]): Causal mask for autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]):
-                Cache view for key/value states (optional).
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]):
-                Metadata for paged attention (optional).
-            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): Whether to output attention weights (default: False).
-            fcm_mask (tp.Optional[Array]): Forward causal mask (FCM) mask (optional).
-            frequencies (tp.Optional[Array]): Precomputed rotary frequencies (optional).
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for key-value states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
 
         Returns:
-            tp.Tuple[Array, Array | None]: A tuple containing:
-                - hidden_states (Array): Output hidden states after the decoder layer.
-                - attention_outputs (Array | None): Attention weights (if `output_attentions` is True).
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
         """
         assert hidden_states.ndim == 3, f"Input hidden_states should be 3 dimensions, got {hidden_states.ndim}"
 
@@ -539,21 +576,16 @@ class StableLmDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=StableLmConfig, model_type="stablelm")
 class StableLmModel(EasyDeLBaseModule):
-    """The base StableLM transformer model.
+    """StableLM base model implementation.
 
-    This class implements the core transformer architecture, including embedding layers,
-    decoder layers, and final normalization.
+    This implements the StableLM language model architecture with transformer blocks,
+    LayerNorm, partial rotary position embeddings, and optional Q/K normalization.
 
     Attributes:
-        config (StableLmConfig): Configuration object for the model.
-        embed_tokens (nn.Embed): Embedding layer for input tokens.
-        layers (nn.List[StableLmDecoderLayer]): List of decoder layers.
-        norm (nn.LayerNorm): Final layer normalization.
-        gradient_checkpointing (str): Gradient checkpointing strategy.
+        config (StableLmConfig): Configuration for the model.
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+        precision: Precision setting for JAX operations.
     """
 
     def __init__(
@@ -565,14 +597,14 @@ class StableLmModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the StableLmModel module.
+        """Initialize StableLM base model.
 
         Args:
-            config (StableLmConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (StableLmConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -620,7 +652,11 @@ class StableLmModel(EasyDeLBaseModule):
 
     @cached_property
     def frequencies(self):
-        """Cached property for precomputed rotary frequencies."""
+        """Precomputed partial rotary position embedding frequencies.
+
+        Returns:
+            Frequency tensor for partial RoPE with dimension based on partial_rotary_factor.
+        """
         rotary_emb_dim = int(
             self.config.partial_rotary_factor * (self.config.hidden_size // self.config.num_attention_heads)
         )
@@ -642,29 +678,40 @@ class StableLmModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass of the StableLM model.
+        """Forward pass through the StableLM base model.
+
+        Processes input tokens through embedding, all decoder layers with partial RoPE
+        and LayerNorm, and final normalization.
 
         Args:
-            input_ids (tp.Optional[Array]): Input token IDs (batch, seq_len).
-                Mutually exclusive with `inputs_embeds`.
-            inputs_embeds (tp.Optional[Array]): Input embeddings (batch, seq_len, hidden_size).
-                Mutually exclusive with `input_ids`.
-            attention_mask (tp.Optional[Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
-            position_ids (tp.Optional[Array]): Position IDs (batch, seq_len). If None, automatically generated.
-            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
-            output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers
-                (default defined by config).
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for caching.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]):
-                Metadata for paged attention (optional).
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            BaseModelOutput: The model output, either as a `BaseModelOutput` object or a tuple.
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
 
         Raises:
-            ValueError: If both `input_ids` and `inputs_embeds` are provided or neither is provided.
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -767,7 +814,17 @@ class StableLmModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=StableLmConfig, model_type="stablelm")
 class StableLmForCausalLM(BaseCausalLMModule[StableLmModel, StableLmConfig]):
-    """StableLM model with a Causal Language Modeling (CLM) head."""
+    """StableLM model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation.
+
+    Attributes:
+        config (StableLmConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "stablelm"
@@ -782,6 +839,15 @@ class StableLmForCausalLM(BaseCausalLMModule[StableLmModel, StableLmConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize StableLM model for causal language modeling.
+
+        Args:
+            config (StableLmConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=StableLmModel,
@@ -807,26 +873,36 @@ class StableLmForCausalLM(BaseCausalLMModule[StableLmModel, StableLmConfig]):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> CausalLMOutput:
-        """Forward pass of the StableLM model for Causal Language Modeling.
+        """Forward pass through the StableLM model for causal language modeling.
+
+        Processes input through the base model and applies the language modeling head
+        to produce next-token predictions.
 
         Args:
-            input_ids (tp.Optional[Array]): Input token IDs (batch, seq_len).
-                Mutually exclusive with `inputs_embeds`.
-            inputs_embeds (tp.Optional[Array]): Input embeddings (batch, seq_len, hidden_size).
-                Mutually exclusive with `input_ids`.
-            attention_mask (tp.Optional[Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
-            position_ids (tp.Optional[Array]): Position IDs (batch, seq_len). If None, automatically generated.
-            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
-            output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all
-                layers (default defined by config).
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for caching.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]):
-                Metadata for paged attention (optional).
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language model head. Defaults to True.
 
         Returns:
-            CausalLMOutput: The model output, including logits, hidden states, and attentions.
+            CausalLMOutput: Contains logits, hidden states, attentions, and past_key_values.
         """
         outputs = self.model(
             input_ids=input_ids,

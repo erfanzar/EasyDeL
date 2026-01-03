@@ -67,10 +67,18 @@ logger = get_logger(__name__)
 
 
 class Xerxes2Attention(UnifiedAttention):
-    """Xerxes2 Multi-head Latent Attention.
+    """Xerxes2 Multi-head Latent Attention (MLA) layer.
 
-    Inherits MLA implementation from UnifiedAttention base class.
-    Uses a compressed KV representation with LoRA and separate nope/rope dimensions.
+    Implements Multi-head Latent Attention from DeepSeek-V2 architecture with compressed
+    key-value representations using LoRA-style low-rank projections and separate nope/rope
+    dimensions for efficient long-context processing.
+
+    Features:
+        - Compressed KV representation with low-rank LoRA projections
+        - Separate nope (non-positional) and rope (rotary) head dimensions
+        - Optional query LoRA compression for reduced memory footprint
+        - YaRN-based attention scaling for extended context lengths
+        - Grouped-query attention support via shared KV projections
     """
 
     projection_mapping: ClassVar[dict[str, str]] = {
@@ -94,6 +102,17 @@ class Xerxes2Attention(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes2 Multi-head Latent Attention layer.
+
+        Args:
+            config (Xerxes2Config): Model configuration with MLA parameters including
+                qk_nope_head_dim, qk_rope_head_dim, vhead_dim, and kv_lora_dim.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         # Set MLA-specific dimensions before calling super().__init__()
         # so they're available in define_network
         self.config = config
@@ -126,7 +145,19 @@ class Xerxes2Attention(UnifiedAttention):
         precision: jax.lax.Precision,
         rngs: nn.Rngs,
     ):
-        """Define MLA-specific network structure for Xerxes2."""
+        """Define MLA-specific network structure for Xerxes2.
+
+        Creates the projection layers for Multi-head Latent Attention, including
+        optional LoRA compression for queries and mandatory LoRA compression for
+        key-value pairs.
+
+        Args:
+            config (Xerxes2Config): Model configuration.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.Precision): Numerical precision for operations.
+            rngs (nn.Rngs): Random number generator state.
+        """
 
         if not self.use_mla_lora:
             setattr(
@@ -239,7 +270,16 @@ class Xerxes2Attention(UnifiedAttention):
         self.attention_performer = self._create_attention_performer(config, rngs)
 
     def _create_attention_performer(self, config, rngs):
-        """Create attention performer module."""
+        """Create attention performer module with YaRN scaling.
+
+        Args:
+            config: Model configuration with rope_scaling parameters.
+            rngs: Random number generator state.
+
+        Returns:
+            FlexibleAttentionModule: Configured attention performer with optional
+                YaRN-based mscale for extended context attention.
+        """
         softmax_scale = self.q_head_dim**-0.5
         if self.config.rope_scaling is not None:
             mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
@@ -256,7 +296,16 @@ class Xerxes2Attention(UnifiedAttention):
 
 
 class Xerxes2MLP(nn.Module):
-    """Feed-forward network used in dense Xerxes2 decoder layers."""
+    """Multi-Layer Perceptron module for dense Xerxes2 decoder layers.
+
+    Implements a gated feedforward network with SiLU activation using fused gate/up
+    projections for efficient computation. Used in non-MoE decoder layers.
+
+    Features:
+        - Fused gate_up projection for memory efficiency
+        - SiLU (Swish) gating activation
+        - Column/Row parallel linear layers for tensor parallelism
+    """
 
     def __init__(
         self,
@@ -267,6 +316,16 @@ class Xerxes2MLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes2 MLP block.
+
+        Args:
+            config (Xerxes2Config): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -298,6 +357,14 @@ class Xerxes2MLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply gated feedforward transformation with fused projections.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim]
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -315,7 +382,16 @@ class Xerxes2MLP(nn.Module):
 
 
 class Xerxes2MoeMLPStack(nn.Module):
-    """Xerxes2Moe MoE MLP using the new ParallelMoELinear layers."""
+    """Mixture-of-Experts MLP stack using parallel MoE linear layers.
+
+    Implements the expert feedforward networks for the MoE block with efficient
+    parallel computation across all experts simultaneously.
+
+    Features:
+        - Parallel gate/up/down projections across all experts
+        - Expert tensor mode for efficient batched computation
+        - Configurable hidden activation function
+    """
 
     def __init__(
         self,
@@ -326,6 +402,17 @@ class Xerxes2MoeMLPStack(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes2 MoE MLP stack.
+
+        Args:
+            config (Xerxes2Config): Model configuration with MoE parameters including
+                num_experts and moe_intermediate_size.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -375,7 +462,18 @@ class Xerxes2MoeMLPStack(nn.Module):
         group_sizes: Array,
         sorted_experts: Array | None = None,
     ) -> Array:
-        """Forward pass through MoE MLP."""
+        """Apply gated MoE feedforward transformation.
+
+        Processes routed tokens through the parallel expert MLPs with gated activation.
+
+        Args:
+            hidden_states: Input tensor for routed tokens.
+            group_sizes: Number of tokens assigned to each expert.
+            sorted_experts: Optional sorted expert indices for efficient routing.
+
+        Returns:
+            Transformed hidden states after expert processing.
+        """
         return checkpoint_name(
             self.down_proj(
                 self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
@@ -388,19 +486,25 @@ class Xerxes2MoeMLPStack(nn.Module):
 
 
 class Xerxes2MoeSparseBlock(BaseMoeModule):
-    """Sparse Mixture of Experts (MoE) block for Xerxes2 MoE.
+    """Sparse Mixture-of-Experts block for Xerxes2 models.
 
-    This block routes input hidden states to a selected subset of experts
-    and combines their outputs.
+    Implements a top-k routing mechanism where each token is processed by
+    a subset of expert MLPs, enabling parameter-efficient scaling. Uses
+    configurable routing and load balancing strategies.
+
+    Features:
+        - Top-k expert selection with configurable routing strategy
+        - Optional probability normalization via norm_topk_prob
+        - Standard load balancing for training stability
+        - Efficient parallel expert computation via MLP stack
 
     Attributes:
-        config (Xerxes2MoeConfig): Configuration object for the model.
-        gate (ParallelLinear): Linear layer for the gating network.
-        experts (nn.List[Xerxes2MoeMLP]): List of expert MLP modules.
+        config (Xerxes2Config): Configuration object for the model.
+        gate (ColumnParallelLinear): Linear layer for the gating/routing network.
+        experts (Xerxes2MoeMLPStack): Parallel expert MLP modules.
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
     """
 
     def __init__(
@@ -412,14 +516,16 @@ class Xerxes2MoeSparseBlock(BaseMoeModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Xerxes2MoeSparseBlock module.
+        """Initialize Xerxes2 Sparse MoE block.
 
         Args:
-            config (Xerxes2MoeConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (Xerxes2Config): Model configuration with MoE parameters including
+                num_experts and num_experts_per_tok.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -455,15 +561,18 @@ class Xerxes2MoeSparseBlock(BaseMoeModule):
         )
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
-        """Forward pass of the Sparse MoE block.
+        """Apply sparse MoE transformation with top-k expert routing.
+
+        Routes each token to a subset of experts based on gating scores,
+        processes through the selected experts, and combines outputs.
 
         Args:
-            hidden_states (Array): Input hidden states (batch_size * sequence_length, hidden_dim).
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
-            tp.Tuple[Array, Array]: A tuple containing:
-                - final_hidden_states (Array): The output hidden states after MoE processing.
-                - router_logits (Array): The logits output by the gating network.
+            tuple: A tuple containing:
+                - final_hidden_states: Transformed hidden states [batch, seq_len, hidden_dim]
+                - router_logits: Router logits for load balancing loss [batch, seq_len, num_experts]
         """
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
@@ -478,7 +587,18 @@ class Xerxes2MoeSparseBlock(BaseMoeModule):
 
 
 class Xerxes2DecoderLayer(nn.Module):
-    """Transformer decoder layer with Xerxes2 attention and optional MoE MLP."""
+    """Single decoder layer for Xerxes2 models.
+
+    Combines Multi-head Latent Attention with either dense MLP or sparse MoE
+    feedforward networks. Uses pre-norm architecture with RMS normalization
+    and residual connections.
+
+    Features:
+        - Multi-head Latent Attention (MLA) with compressed KV
+        - Layer-specific MoE vs dense MLP selection based on decoder_sparse_step
+        - Pre/post normalization for both attention and feedforward blocks
+        - Gradient checkpointing support for memory efficiency
+    """
 
     def __init__(
         self,
@@ -490,6 +610,16 @@ class Xerxes2DecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes2 decoder layer.
+
+        Args:
+            config (Xerxes2Config): Model configuration.
+            layer_idx (int): Index of this layer in the model, used to determine MoE vs dense.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -554,15 +684,27 @@ class Xerxes2DecoderLayer(nn.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         output_router_logits: bool = False,
-    ):
-        """
-        Forward pass of the module block.
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture with MLA attention followed by
+        either dense MLP or sparse MoE feedforward, with residual connections.
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            frequencies (tuple[Array, Array]): Precomputed RoPE frequencies (cos, sin).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for key-value caching during generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata for cache management. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            output_router_logits (bool, optional): Whether to return MoE router logits. Defaults to False.
+
         Returns:
-            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
+            DecoderLayerOutput: Contains hidden states, attention weights, router logits, and cache view.
         """
         residual = hidden_states
 
@@ -610,7 +752,24 @@ class Xerxes2DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Xerxes2Config, model_type="xerxes2")
 class Xerxes2Model(EasyDeLBaseModule):
-    """Xerxes2 decoder-only stack connecting embeddings, decoder layers, and final norm."""
+    """Xerxes2 base model implementation.
+
+    Implements the Xerxes2 decoder-only transformer architecture with Multi-head
+    Latent Attention (MLA), hybrid dense/MoE feedforward layers, and RMSNorm.
+    Supports efficient long-context processing via compressed KV representations.
+
+    Features:
+        - Multi-head Latent Attention with LoRA-compressed KV states
+        - Hybrid architecture with configurable dense/MoE layer patterns
+        - YaRN-based rotary position embeddings for extended contexts
+        - Gradient checkpointing for memory-efficient training
+
+    Attributes:
+        config (Xerxes2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -621,6 +780,15 @@ class Xerxes2Model(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes2 base model.
+
+        Args:
+            config (Xerxes2Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -663,7 +831,11 @@ class Xerxes2Model(EasyDeLBaseModule):
 
     @functools.cached_property
     def frequencies(self) -> jnp.ndarray:
-        """Returns frequency values from the config."""
+        """Compute and cache rotary position embedding frequencies.
+
+        Returns:
+            jnp.ndarray: Precomputed RoPE frequencies for the rope head dimension.
+        """
         return self.config.get_basic_frequencies(self.config.qk_rope_head_dim)
 
     def __call__(
@@ -679,7 +851,44 @@ class Xerxes2Model(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-    ) -> BaseModelOutput:
+    ) -> MoeModelOutput:
+        """Forward pass through the Xerxes2 base model.
+
+        Processes input tokens through embedding, all decoder layers with MLA attention
+        and hybrid dense/MoE feedforward, and final normalization.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return MoE router logits from all layers.
+                Defaults to None.
+
+        Returns:
+            MoeModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                past_key_values, and optional router_logits.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -789,12 +998,23 @@ class Xerxes2Model(EasyDeLBaseModule):
 
 
 class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):
-    """
-    Xerxes2 model with a language modeling head for causal language modeling tasks.
+    """Xerxes2 model with a language modeling head for causal language modeling tasks.
 
-    This model extends the base Xerxes2Model by adding a linear language modeling head
-    on top of the transformer model. It incorporates Mixture of Experts (MoE) architecture
-    and is designed for generative tasks and text generation.
+    Extends the base Xerxes2Model by adding a linear language modeling head for
+    autoregressive text generation. Supports hybrid dense/MoE architecture with
+    auxiliary load balancing loss for stable MoE training.
+
+    Features:
+        - Multi-head Latent Attention for efficient KV caching
+        - Hybrid dense/MoE feedforward with configurable layer patterns
+        - Auxiliary load balancing loss for MoE expert utilization
+        - YaRN-based position embeddings for extended context support
+
+    Attributes:
+        config (Xerxes2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
     """
 
     _task_type = TaskType.CAUSAL_LM
@@ -847,26 +1067,39 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
     ) -> MoeCausalLMOutput:
-        """
-        Forward pass of the causal language model.
+        """Forward pass through the Xerxes2 causal language model.
+
+        Processes input through the base model and applies the language modeling head
+        with optional MoE auxiliary loss computation.
 
         Args:
-            input_ids (Optional[Array], optional): Token IDs to process. Defaults to None.
-            inputs_embeds (Optional[Array], optional): Pre-computed input embeddings. Defaults to None.
-            attention_mask (Optional[Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
-            position_ids (Optional[Array], optional): Position IDs. Defaults to None.
-            mode (Optional[common_types.RUNTIME_MODE_TYPES], optional): Runtime mode. Defaults to None.
-            past_key_values (Optional[TransformerCache | RaggedPagesCache], optional): Cached key/values.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
                 Defaults to None.
-            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata], optional): Cache metadata.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language modeling head. Defaults to True.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
                 Defaults to None.
-            apply_lm_head (bool, optional): Whether to apply the LM head. Defaults to True.
-            output_attentions (Optional[bool], optional): Whether to output attention weights. Defaults to None.
-            output_hidden_states (Optional[bool], optional): Whether to output hidden states. Defaults to None.
-            output_router_logits (Optional[bool], optional): Whether to output router logits. Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return MoE router logits from all layers.
+                Defaults to None.
 
         Returns:
-            MoeCausalLMOutput: The model outputs with router logits and aux loss.
+            MoeCausalLMOutput: Contains logits, hidden_states, last_hidden_state, attentions,
+                past_key_values, router_logits, and auxiliary loss.
         """
         return self.forward_moe(
             input_ids=input_ids,
@@ -885,7 +1118,18 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):
         )
 
     def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary loss for load balancing."""
+        """Compute auxiliary load balancing loss for MoE layers.
+
+        Calculates the auxiliary loss that encourages balanced expert utilization
+        across all MoE layers, scaled by the router_aux_loss_coef.
+
+        Args:
+            outputs: Model outputs containing router_logits from MoE layers.
+            attention_mask: Attention mask to exclude padding tokens from loss computation.
+
+        Returns:
+            Auxiliary loss value if router_logits are available, None otherwise.
+        """
         if outputs.router_logits is None or len(outputs.router_logits) == 0:
             return None
 
@@ -899,6 +1143,20 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):
         return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
     def create_transformer_cache_config(self, batch_size: int, max_length: int):
+        """Create cache configuration for MLA-based key-value caching.
+
+        Creates a TransformerCacheConfig with dimensions appropriate for Multi-head
+        Latent Attention, using separate key and value dimensions based on the
+        nope/rope head dimensions.
+
+        Args:
+            batch_size: Number of sequences in the batch.
+            max_length: Maximum sequence length for the cache.
+
+        Returns:
+            TransformerCacheConfig: Configuration for initializing the KV cache
+                with MLA-specific key_dim (qk_rope + qk_nope) and value_dim (vhead_dim).
+        """
         head_dim = getattr(self.config, "head_dim", None)
         if head_dim is None:
             head_dim = self.config.hidden_size // self.config.num_attention_heads

@@ -64,7 +64,11 @@ from .deepseek_configuration import DeepseekV3Config
 
 
 class DeepseekV3MLP(nn.Module):
-    """Standard DeepSeek V3 feed-forward network used in dense decoder layers."""
+    """Multi-Layer Perceptron module for DeepSeek V3 dense layers.
+
+    Implements the feedforward network with SwiGLU activation function
+    for enhanced representation learning in dense (non-MoE) layers.
+    """
 
     def __init__(
         self,
@@ -77,6 +81,19 @@ class DeepseekV3MLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize DeepSeek V3 MLP block.
+
+        Args:
+            config (DeepseekV3Config): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            hidden_size (int | None, optional): Override for hidden size. Defaults to None (uses config).
+            intermediate_size (int | None, optional): Override for intermediate size.
+                Defaults to None (uses config).
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -100,6 +117,14 @@ class DeepseekV3MLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply SwiGLU feedforward transformation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim]
+        """
         if hidden_states.ndim == 3:  # if not in moe infer
             hidden_states = apply_logical_sharding(
                 hidden_states,
@@ -119,7 +144,11 @@ class DeepseekV3MLP(nn.Module):
 
 
 class MoEGate(nn.Module):
-    """Top-k routing gate that scores tokens for the mixture-of-experts blocks."""
+    """Router module that scores tokens and selects experts for DeepSeek V3 MoE.
+
+    Implements token-to-expert routing with sigmoid scoring and noaux_tc
+    top-k selection for mixture-of-experts layers in DeepSeek V3.
+    """
 
     def __init__(
         self,
@@ -130,6 +159,16 @@ class MoEGate(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize MoE gating module.
+
+        Args:
+            config (DeepseekV3Config): Model configuration with MoE routing parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -166,6 +205,17 @@ class MoEGate(nn.Module):
             )
 
     def __call__(self, hidden_states):
+        """Compute expert routing weights for input tokens.
+
+        Implements sigmoid scoring with noaux_tc group-based top-k expert selection.
+
+        Args:
+            hidden_states (Array): Input tensor of shape [batch * seq_len, hidden_dim].
+
+        Returns:
+            Array: Top-k expert weights for each token [batch * seq_len, top_k],
+                scaled by routed_scaling_factor.
+        """
         squ, _ = hidden_states.shape
         logits = jnp.dot(
             hidden_states.astype(jnp.float32),
@@ -209,7 +259,11 @@ class MoEGate(nn.Module):
 
 
 class DeepseekV3MLPMoE(nn.Module):
-    """Mixture-of-experts feed-forward module parameterized by the DeepSeek V3 config."""
+    """Mixture-of-experts feed-forward module for DeepSeek V3 MoE layers.
+
+    Implements the expert network with SwiGLU activation function for
+    mixture-of-experts routing in DeepSeek V3 architecture.
+    """
 
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
@@ -238,6 +292,19 @@ class DeepseekV3MLPMoE(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize DeepSeek V3 MoE MLP block.
+
+        Args:
+            config (DeepseekV3Config): Model configuration with MoE MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision for operations.
+                Defaults to None.
+            hidden_size (int | None, optional): Override for hidden size. Defaults to None (uses config).
+            intermediate_size (int | None, optional): Override for intermediate size.
+                Defaults to None (uses config).
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.precision = precision
 
@@ -287,6 +354,16 @@ class DeepseekV3MLPMoE(nn.Module):
         group_sizes: Array,
         sorted_experts: Array | None = None,
     ):
+        """Apply SwiGLU feedforward transformation through MoE experts.
+
+        Args:
+            hidden_states (Array): Input tensor containing routed tokens.
+            group_sizes (Array): Size of each expert group for batched computation.
+            sorted_experts (Array | None, optional): Sorted expert indices. Defaults to None.
+
+        Returns:
+            Array: Transformed hidden states after expert processing.
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -307,7 +384,11 @@ class DeepseekV3MLPMoE(nn.Module):
 
 
 class DeepseekV3MoE(BaseMoeModule):
-    """Wraps gating and expert networks to apply DeepSeek V3 MoE feed-forward processing."""
+    """Mixture-of-experts module combining gating and expert networks for DeepSeek V3.
+
+    Implements the complete MoE layer with token routing through gating network
+    and expert processing with optional shared experts for enhanced performance.
+    """
 
     def __init__(
         self,
@@ -319,6 +400,17 @@ class DeepseekV3MoE(BaseMoeModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize DeepSeek V3 MoE layer.
+
+        Args:
+            config (DeepseekV3Config): Model configuration with MoE parameters.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             n_routed_experts=config.n_routed_experts,
@@ -363,6 +455,16 @@ class DeepseekV3MoE(BaseMoeModule):
             )
 
     def __call__(self, hidden_states: Array):
+        """Process tokens through MoE experts with routing.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+
+        Returns:
+            tuple[Array, Array]: Tuple containing:
+                - Expert output tensor of shape (batch_size, sequence_length, hidden_dim)
+                - Router logits for auxiliary loss computation
+        """
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -378,9 +480,10 @@ class DeepseekV3MoE(BaseMoeModule):
 
 
 class DeepseekV3Attention(UnifiedAttention):
-    """DeepSeek V3 Multi-head Latent Attention.
+    """Multi-head Latent Attention (MLA) layer for DeepSeek V3 models.
 
-    Inherits MLA implementation from UnifiedAttention base class.
+    Implements MLA with low-rank key-value compression for efficient memory usage
+    and improved inference performance. Inherits from UnifiedAttention base class.
     """
 
     projection_mapping: ClassVar[dict[str, str]] = {
@@ -404,6 +507,17 @@ class DeepseekV3Attention(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize DeepSeek V3 MLA attention layer.
+
+        Args:
+            config (DeepseekV3Config): Model configuration with attention parameters.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         # Set MLA-specific dimensions before calling super().__init__()
         # so they're available in define_network
         self.config = config
@@ -436,7 +550,18 @@ class DeepseekV3Attention(UnifiedAttention):
         precision: jax.lax.Precision,
         rngs: nn.Rngs,
     ):
-        """Define MLA-specific network structure."""
+        """Define MLA-specific network structure.
+
+        Sets up query projection (with optional LoRA), key-value compression
+        projections with layer normalization, and output projection layers.
+
+        Args:
+            config (DeepseekV3Config): Model configuration.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.Precision): Numerical precision.
+            rngs (nn.Rngs): Random number generator state.
+        """
 
         # Query projection with optional LoRA
         if not self.use_mla_lora:
@@ -555,9 +680,17 @@ class DeepseekV3Attention(UnifiedAttention):
         self.attention_performer = self._create_attention_performer(config, rngs)
 
     def _create_attention_performer(self, config, rngs):
-        """Create attention performer module.
+        """Create attention performer module with custom softmax scale.
 
-        Override for custom attention dropout or softmax scale.
+        Configures the attention performer with MLA-specific softmax scaling,
+        including optional YARN-based scaling for extended context lengths.
+
+        Args:
+            config: Model configuration with attention settings.
+            rngs: Random number generator state for dropout.
+
+        Returns:
+            FlexibleAttentionModule: Configured attention performer.
         """
         softmax_scale = self.q_head_dim**-0.5
         if self.config.rope_scaling is not None:
@@ -575,7 +708,11 @@ class DeepseekV3Attention(UnifiedAttention):
 
 
 class DeepseekV3DecoderLayer(nn.Module):
-    """Single DeepSeek V3 transformer block with MLA attention and optional MoE MLP."""
+    """Single decoder layer for DeepSeek V3 models.
+
+    Combines Multi-head Latent Attention (MLA) and feedforward networks
+    (dense or MoE) with RMS normalization and residual connections.
+    """
 
     def __init__(
         self,
@@ -587,6 +724,17 @@ class DeepseekV3DecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize DeepSeek V3 decoder layer.
+
+        Args:
+            config (DeepseekV3Config): Model configuration.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -665,22 +813,26 @@ class DeepseekV3DecoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: tuple[Array, Array] | None = None,
     ) -> DecoderLayerOutput:
-        """
-        Forward pass of the module block.
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x))
+        where mlp may be either a dense MLP or MoE layer depending on layer configuration.
 
         Args:
-            hidden_states (Array): Input hidden states.
-            frequencies (tp.Tuple[Array, Array]): Cosine and sine components for rotary embeddings.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens.
-            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (tuple[Array, Array] | None, optional): Precomputed RoPE frequencies.
+                Defaults to None.
+
         Returns:
-            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
+            DecoderLayerOutput: Contains hidden states, attention weights, cache view, and router logits.
         """
         residual = hidden_states
 
@@ -730,7 +882,17 @@ class DeepseekV3DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, DeepseekV3Config, model_type="deepseek_v3")
 class DeepseekV3Model(EasyDeLBaseModule):
-    """Full DeepSeek V3 decoder-only transformer composed of MLA blocks and MoE feed-forward layers."""
+    """DeepSeek V3 base model implementation.
+
+    This implements the DeepSeek V3 language model architecture with Multi-head Latent
+    Attention (MLA), mixture-of-experts (MoE) layers, and RMS normalization.
+
+    Attributes:
+        config (DeepseekV3Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -741,6 +903,15 @@ class DeepseekV3Model(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize DeepSeek V3 base model.
+
+        Args:
+            config (DeepseekV3Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -785,7 +956,14 @@ class DeepseekV3Model(EasyDeLBaseModule):
 
     @functools.cached_property
     def frequencies(self):
-        """Compute RoPE frequencies using config's get_basic_frequencies method."""
+        """Compute RoPE frequencies for rotary position embeddings.
+
+        Uses YaRN scaling if configured, otherwise computes standard RoPE frequencies
+        for the rope head dimension.
+
+        Returns:
+            tuple[Array, Array]: Cosine and sine frequency components for rotary embeddings.
+        """
         return self.config.get_basic_frequencies(
             head_size=self.config.qk_rope_head_dim,
             rotary_dim=self.config.qk_rope_head_dim,
@@ -806,22 +984,42 @@ class DeepseekV3Model(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
     ) -> BaseModelOutput:
-        """
-        Forward pass through the Deepseekv3 module.
+        """Forward pass through the DeepSeek V3 base model.
+
+        Processes input tokens through embedding, all decoder layers with MLA attention
+        and MoE/dense FFN, and final normalization.
 
         Args:
-            input_ids (Array): Input tensor containing token IDs.
-            attention_mask (Array): Mask for attention.
-            position_ids (Array): Positional indices.
-            segment_ids (tp.Optional[Array]): Segment IDs for different input parts.
-            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
-            output_attentions (tp.Optional[bool]): If True, output attention weights.
-            output_hidden_states (tp.Optional[bool]): If True, output hidden states.
-            init_cache (bool): If True, initialize cache for decoding.
-            deterministic (bool): If True, disable dropout.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router logits from MoE layers.
+                Defaults to None.
 
         Returns:
-            BaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+            MoeModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                updated past_key_values, and optional router_logits.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -930,12 +1128,16 @@ class DeepseekV3Model(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, DeepseekV3Config, model_type="deepseek_v3")
 class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config]):
-    """
-    DeepseekV3 model with a language modeling head for causal language modeling tasks.
+    """DeepSeek V3 model with a language modeling head for causal language modeling tasks.
 
-    This model extends the base DeepseekV3Model by adding a linear language modeling head
-    on top of the transformer model. It incorporates Mixture of Experts (MoE) architecture
-    and is designed for generative tasks and text generation.
+    This model extends the base DeepSeek V3 model by adding a linear language modeling head
+    for autoregressive text generation with MoE routing and auxiliary loss support.
+
+    Attributes:
+        config (DeepseekV3Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
     """
 
     _task_type = TaskType.CAUSAL_LM
@@ -951,15 +1153,14 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         *,
         rngs: nn.Rngs,
     ):
-        """Initialize the DeepseekV3ForCausalLM model.
+        """Initialize DeepSeek V3 model for causal language modeling.
 
         Args:
-            config (DeepseekV3Config): The model configuration.
-            dtype (jnp.dtype, optional): The data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype, optional): The data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike, optional): The precision to use for matrix multiplication.
-                Defaults to None.
-            rngs (nn.Rngs): The random number generators.
+            config (DeepseekV3Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -988,24 +1189,40 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
     ) -> MoeCausalLMOutput:
-        """
-        Forward pass of the causal language model.
+        """Forward pass of the causal language model.
+
+        Processes input through the base model and applies the language modeling head
+        to produce next-token logits with MoE auxiliary loss support.
 
         Args:
-            input_ids (Optional[Array], optional): Token IDs to process. Defaults to None.
-            inputs_embeds (Optional[Array], optional): Pre-computed input embeddings. Defaults to None.
-            attention_mask (Optional[Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
-            position_ids (Optional[Array], optional): Position IDs. Defaults to None.
-            output_attentions (Optional[bool], optional): Whether to output attention weights. Defaults to None.
-            output_hidden_states (Optional[bool], optional): Whether to output hidden states. Defaults to None.
-            output_router_logits (Optional[bool], optional): Whether to output router logits. Defaults to None.
-            past_key_values (Optional[TransformerCache | RaggedPagesCache], optional): Cached key/values.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
                 Defaults to None.
-            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata], optional): Cache metadata.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language model head.
+                Defaults to True.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router logits from MoE layers.
                 Defaults to None.
 
         Returns:
-                MoeCausalLMOutput: The model outputs with router logits and aux loss.
+            MoeCausalLMOutput: Contains logits, optional hidden_states, optional attentions,
+                updated past_key_values, router_logits, and auxiliary loss.
         """
         return self.forward_moe(
             input_ids=input_ids,
@@ -1024,7 +1241,15 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         )
 
     def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary loss for load balancing."""
+        """Compute auxiliary loss for MoE load balancing.
+
+        Args:
+            outputs: Model outputs containing router logits.
+            attention_mask: Attention mask for valid tokens.
+
+        Returns:
+            Auxiliary loss value for load balancing, or None if no router logits.
+        """
         if outputs.router_logits is None or len(outputs.router_logits) == 0:
             return None
 
@@ -1039,19 +1264,18 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
     def create_transformer_cache_config(self, batch_size: int, max_length: int):
-        """Create cache metadata for MLA attention.
+        """Create cache configuration for MLA attention.
 
         MLA uses different dimensions for keys and values:
         - Keys: num_attention_heads x q_head_dim (qk_nope_head_dim + qk_rope_head_dim)
         - Values: num_attention_heads x v_head_dim
 
         Args:
-            batch_size: Batch size for the cache
-            max_length: Maximum sequence length
-            pad_token_id: Padding token ID (optional)
+            batch_size (int): Batch size for the cache.
+            max_length (int): Maximum sequence length.
 
         Returns:
-            TransformerCacheConfig configured for MLA
+            TransformerCacheConfig: Configuration object for MLA-compatible transformer cache.
         """
         from easydel.layers.caching import TransformerCacheConfig
 
@@ -1080,19 +1304,21 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         hbm_utilization: float = 0.9,
         dtype: jnp.dtype | None = None,
     ):
-        """Create paged cache metadata for MLA attention.
+        """Create paged cache configuration for MLA attention.
 
         MLA uses different dimensions for keys and values:
         - Keys: num_attention_heads x q_head_dim (qk_nope_head_dim + qk_rope_head_dim)
         - Values: num_attention_heads x v_head_dim
 
         Args:
-            hbm_utilization: Target HBM utilization (0.0 to 1.0)
-            page_size: Number of tokens per page
-            max_model_length: Maximum model sequence length
+            max_length (int): Maximum model sequence length.
+            page_size (int, optional): Number of tokens per page. Defaults to 128.
+            hbm_utilization (float, optional): Target HBM utilization (0.0 to 1.0).
+                Defaults to 0.9.
+            dtype (jnp.dtype | None, optional): Data type for cache. Defaults to None.
 
         Returns:
-            RaggedPagesCacheConfig configured for MLA
+            RaggedPagesCacheConfig: Configuration object for MLA-compatible paged cache.
         """
         from easydel.layers.attention import AttentionMechanisms
         from easydel.layers.caching import RaggedPagesCacheConfig

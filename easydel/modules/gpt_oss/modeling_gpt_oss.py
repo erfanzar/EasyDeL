@@ -55,11 +55,52 @@ from easydel.layers.norms import RMSNorm
 from .gpt_oss_configuration import GptOssConfig
 
 
-class GptOssRMSNorm(RMSNorm): ...
+class GptOssRMSNorm(RMSNorm):
+    """GPT-OSS RMS Normalization layer.
+
+    This is a simple extension of RMSNorm for GPT-OSS models. RMS (Root Mean Square)
+    Layer Normalization normalizes the input tensor by its RMS value, providing
+    stable training dynamics without centering the activations.
+
+    Attributes:
+        dim (int): Dimensionality of the input features.
+        eps (float): Small epsilon value for numerical stability.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+    """
+
+    ...
 
 
 class GptOssExperts(nn.Module):
-    """Grouped expert feed-forward network used inside GPT-OSS MoE layers."""
+    """Grouped expert feed-forward network used inside GPT-OSS MoE layers.
+
+    This module implements the expert network for Mixture-of-Experts (MoE) routing
+    in GPT-OSS. Each expert is a feed-forward network with a gated linear unit (GLU)
+    activation. The experts process tokens routed to them based on router decisions.
+
+    The forward pass applies a modified GLU activation with clipping for numerical
+    stability:
+        1. Compute gate projection with sigmoid activation (scaled by alpha)
+        2. Compute up projection and add 1.0
+        3. Multiply gate output with up output
+        4. Apply down projection to produce final output
+
+    Attributes:
+        config (GptOssConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        intermediate_size (int): Size of the intermediate (hidden) layer in the FFN.
+        num_experts (int): Number of expert networks.
+        hidden_size (int): Size of the hidden dimension.
+        expert_dim (int): Dimension of each expert's intermediate layer.
+        gate_proj (ColumnParallelMoELinear): Gate projection layer for GLU.
+        up_proj (ColumnParallelMoELinear): Up projection layer.
+        down_proj (RowParallelMoELinear): Down projection layer.
+        alpha (float): Scaling factor for the sigmoid in GLU activation.
+        act_fn (callable): Activation function.
+    """
 
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
@@ -99,6 +140,16 @@ class GptOssExperts(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the GptOssExperts module.
+
+        Args:
+            config (GptOssConfig): Configuration object for the model.
+            dtype (jnp.dtype): Data type for computations. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generators.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -154,7 +205,21 @@ class GptOssExperts(nn.Module):
         group_sizes: Array,
         sorted_experts: Array | None = None,
     ) -> Array:
-        """Forward pass through MoE MLP."""
+        """Forward pass through the expert MLP network.
+
+        Applies the expert feed-forward transformation with a modified GLU activation.
+        Values are clipped for numerical stability before the activation function.
+
+        Args:
+            hidden_states (Array): Input hidden states of shape (batch, seq_len, hidden_dim).
+            group_sizes (Array): Sizes of each expert group for routing.
+            sorted_experts (Array, optional): Sorted expert indices for efficient routing.
+                Defaults to None.
+
+        Returns:
+            Array: Output hidden states after expert processing with shape
+                (batch, seq_len, hidden_dim).
+        """
         w0 = self.gate_proj(hidden_states, group_sizes, sorted_experts)
         w1 = self.up_proj(hidden_states, group_sizes, sorted_experts)
 
@@ -168,7 +233,26 @@ class GptOssExperts(nn.Module):
 
 
 class GptOssMLP(BaseMoeModule):
-    """Mixture-of-experts MLP combining the router and shared experts."""
+    """Mixture-of-Experts MLP module for GPT-OSS.
+
+    This module implements the MoE layer that routes input tokens to specialized
+    expert networks. It uses a learned router to determine which experts should
+    process each token, enabling sparse computation and increased model capacity.
+
+    The routing mechanism uses top-k selection with softmax normalization,
+    allowing each token to be processed by multiple experts with weighted
+    contributions. Custom hooks handle the routing probability computation
+    and weight refinement.
+
+    Attributes:
+        config (GptOssConfig): Configuration object for the model.
+        router (ColumnParallelLinear): Router network that computes expert selection logits.
+        experts (GptOssExperts): The collection of expert networks.
+        moe_hooks: Hooks for customizing MoE routing behavior.
+        n_routed_experts (int): Total number of routed experts.
+        num_experts_per_tok (int): Number of experts selected per token.
+        hidden_size (int): Hidden dimension size.
+    """
 
     def __init__(
         self,
@@ -179,6 +263,19 @@ class GptOssMLP(BaseMoeModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the GptOssMLP module.
+
+        Sets up the router network and expert modules, along with custom routing
+        hooks for top-k probability computation and weight normalization.
+
+        Args:
+            config (GptOssConfig): Configuration object for the model.
+            dtype (jnp.dtype): Data type for computations. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generators.
+        """
         super().__init__(
             config=config,
             n_routed_experts=config.num_local_experts,
@@ -224,6 +321,26 @@ class GptOssMLP(BaseMoeModule):
         )
 
     def __call__(self, hidden_states, training=False, layer_idx=None):
+        """Forward pass through the MoE MLP.
+
+        Routes input hidden states through the expert network based on router
+        decisions. Each token is processed by the top-k experts with weighted
+        contributions.
+
+        Args:
+            hidden_states (Array): Input hidden states of shape
+                (batch, seq_len, hidden_dim).
+            training (bool): Whether in training mode. Defaults to False.
+                Currently unused.
+            layer_idx: Layer index for debugging/logging. Defaults to None.
+
+        Returns:
+            tuple: A tuple containing:
+                - output (Array): Expert-processed hidden states of shape
+                    (batch, seq_len, hidden_dim).
+                - router_logits (Array): Router logits for auxiliary loss
+                    computation.
+        """
         del training
 
         def ffn_activation(w0, w1):
@@ -250,10 +367,23 @@ class GptOssMLP(BaseMoeModule):
 
 
 class GptOssAttention(UnifiedAttention):
-    """GPT-OSS Attention with sink tokens support.
+    """GPT-OSS Attention module with sink tokens support.
 
-    Inherits from UnifiedAttention.
-    Supports layer-specific sliding windows and sink tokens for improved attention.
+    This module implements the multi-head attention mechanism for GPT-OSS with
+    support for layer-specific sliding window attention and sink tokens. The
+    attention type (global or sliding) is determined per-layer based on the
+    configuration.
+
+    Sink tokens are learnable parameters that help stabilize attention patterns
+    by providing consistent anchor points for the attention mechanism.
+
+    Attributes:
+        config (GptOssConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        layer_idx (int): Index of this layer in the model.
+        sinks (ArrayParam): Learnable sink token parameters per attention head.
     """
 
     def __init__(
@@ -266,7 +396,18 @@ class GptOssAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initialize GPT-OSS attention with sink tokens."""
+        """Initialize GPT-OSS attention with sink tokens.
+
+        Args:
+            config (GptOssConfig): Configuration object for the model.
+            dtype (jnp.dtype): Data type for computations. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generators.
+            layer_idx (int): Index of this layer in the model. Used to determine
+                whether this layer uses sliding window attention.
+        """
         is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         sliding_window = None
 
@@ -296,7 +437,30 @@ class GptOssAttention(UnifiedAttention):
 
 
 class GptOssDecoderLayer(nn.Module):
-    """Single GPT-OSS decoder block with attention and expert MLP."""
+    """GPT-OSS decoder layer with attention and Mixture-of-Experts MLP.
+
+    This module represents a single transformer decoder block in GPT-OSS,
+    consisting of a self-attention layer followed by a Mixture-of-Experts
+    MLP layer. Both sub-layers use pre-normalization (RMSNorm) and residual
+    connections.
+
+    The layer supports different attention patterns (global or sliding window)
+    based on the layer configuration, enabling efficient processing of long
+    sequences while maintaining the ability to capture both local and global
+    dependencies.
+
+    Attributes:
+        config (GptOssConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        layer_idx (int): Index of this layer in the model.
+        self_attn (GptOssAttention): Self-attention module.
+        mlp (GptOssMLP): Mixture-of-Experts MLP module.
+        input_layernorm (GptOssRMSNorm): Pre-attention layer normalization.
+        post_attention_layernorm (GptOssRMSNorm): Pre-MLP layer normalization.
+        attention_type (str): Type of attention used in this layer.
+    """
 
     def __init__(
         self,
@@ -308,6 +472,17 @@ class GptOssDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize the GPT-OSS decoder layer.
+
+        Args:
+            config (GptOssConfig): Configuration object for the model.
+            dtype (jnp.dtype): Data type for computations. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generators.
+            layer_idx (int): Index of this layer in the model.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -367,6 +542,35 @@ class GptOssDecoderLayer(nn.Module):
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
+        """Forward pass of the GPT-OSS decoder layer.
+
+        Applies self-attention with pre-normalization, followed by MoE MLP
+        with pre-normalization. Both sub-layers use residual connections.
+
+        Args:
+            hidden_states (Array): Input hidden states of shape
+                (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo): Mask information for attention computation.
+            position_ids (Array): Position indices of shape (batch, seq_len).
+            mode: Runtime mode (train, decode, infer).
+            cache_view (TransformerCacheView | RaggedPagesCacheView, optional):
+                Cache view for key/value states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata,
+                optional): Metadata for cache handling. Defaults to None.
+            output_attentions (bool): Whether to return attention weights.
+                Defaults to False.
+            output_router_logits (bool): Whether to return router logits.
+                Defaults to False.
+            frequencies (Array, optional): Rotary embedding frequencies.
+                Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Output containing:
+                - hidden_states: Processed hidden states
+                - attention_weight: Attention weights if output_attentions=True
+                - cache_view: Updated cache view
+                - router_logits: Router logits if output_router_logits=True
+        """
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
             mask_info,
@@ -490,35 +694,51 @@ class GptOssModel(EasyDeLBaseModule):
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> MoeModelOutput:
-        """Forward pass of the GptOssModel.
+        """Performs forward pass through the GPT-OSS transformer model.
+
+        Processes input tokens through token embeddings and multiple decoder layers
+        with Mixture-of-Experts MLPs. Supports both global and sliding window
+        attention patterns based on layer configuration. Uses RMSNorm for
+        pre-normalization and rotary position embeddings.
 
         Args:
-            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[Array]): Segment IDs (unused).
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            output_router_logits (tp.Optional[bool]): Whether to return router logits from the MoE layers.
-                Defaults to `config.output_router_logits`.
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+                Either this or `inputs_embeds` must be provided but not both.
+            inputs_embeds: Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Use instead of
+                `input_ids` for custom embeddings.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length)
+                indicating which tokens to attend to (True) and which to ignore
+                (False).
+            mask_info: Pre-computed mask information. If provided, overrides
+                `attention_mask`.
+            position_ids: Explicit position indices of shape
+                (batch_size, sequence_length). Auto-generated if not provided.
+            output_attentions: Whether to return attention weights from all layers.
+                Defaults to config.output_attentions.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to config.output_hidden_states.
+            output_router_logits: Whether to return router logits from MoE layers.
+                Defaults to config.output_router_logits.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER).
+                Auto-detected if None.
+            past_key_values: Cached key/value states for efficient autoregressive
+                generation.
+            cache_metadata: Metadata for paged attention mechanisms.
 
         Returns:
-            MoeModelOutput: The model's output.
-                returns a `MoeModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-                `attentions` (optional), and `router_logits` (optional).
+            MoeModelOutput containing:
+                - last_hidden_state: Final layer output of shape
+                    (batch, seq_len, hidden_size)
+                - past_key_values: Updated cache for next generation step
+                - hidden_states: Tuple of all layer outputs if
+                    output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+                - router_logits: Tuple of router logits if output_router_logits=True
 
         Raises:
-            ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
+            ValueError: If both `input_ids` and `inputs_embeds` are provided,
+                or if neither is provided.
         """
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
@@ -640,12 +860,22 @@ class GptOssModel(EasyDeLBaseModule):
 class GptOssForCausalLM(BaseCausalLMModule[GptOssModel, GptOssConfig]):
     """GPT-OSS model with a Causal Language Modeling head.
 
-    This model consists of the base GPT-OSS transformer (GptOssModel) followed by a
-    language modeling head for next token prediction. Supports MoE with auxiliary loss.
+    This model extends the base GPT-OSS transformer by adding a linear layer on top
+    to predict the next token in a sequence, making it suitable for causal language
+    modeling tasks. It leverages Mixture-of-Experts (MoE) routing for increased model
+    capacity with sparse computation.
 
-    Type Parameters:
-        GptOssModel: The base model type
-        GptOssConfig: The configuration type
+    The model supports auxiliary load balancing loss to encourage balanced routing
+    across experts, which is crucial for efficient MoE training.
+
+    Attributes:
+        config (GptOssConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        rngs (nn.Rngs): Random number generators.
+        base_model (GptOssModel): The underlying GPT-OSS transformer model.
+        lm_head: Linear layer projecting hidden states to vocabulary logits.
     """
 
     _task_type = TaskType.CAUSAL_LM
@@ -697,23 +927,49 @@ class GptOssForCausalLM(BaseCausalLMModule[GptOssModel, GptOssConfig]):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
-        """Forward pass for GPT-OSS MoE model.
+        """Forward pass for GPT-OSS Causal Language Model.
+
+        Processes input tokens through the GPT-OSS transformer with MoE layers
+        and projects the output to vocabulary logits for next-token prediction.
+        Computes auxiliary load balancing loss for MoE training when router
+        logits are available.
 
         Args:
-            input_ids: Input token IDs
-            inputs_embeds: Input embeddings (alternative to input_ids)
-            attention_mask: Mask to avoid attention on padding tokens
-            position_ids: Position indices for tokens
-            output_attentions: Whether to return attention weights
-            output_hidden_states: Whether to return hidden states
-            output_router_logits: Whether to return router logits
-            mode: Runtime mode (train, eval, etc.)
-            past_key_values: Cache containing precomputed key/value states
-            cache_metadata: Metadata for cache handling
-            apply_lm_head: Whether to apply the LM head
+            input_ids (Array, optional): Input token IDs of shape
+                (batch_size, sequence_length). Either this or `inputs_embeds`
+                must be provided.
+            inputs_embeds (Array, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Use instead of
+                `input_ids` for custom embeddings.
+            attention_mask (Array, optional): Boolean mask of shape
+                (batch_size, sequence_length) indicating which tokens to attend
+                to (True) and which to ignore (False).
+            mask_info (MaskInfo, optional): Pre-computed mask information.
+                If provided, overrides `attention_mask`.
+            position_ids (Array, optional): Position indices of shape
+                (batch_size, sequence_length). Auto-generated if not provided.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to config.output_attentions.
+            output_hidden_states (bool, optional): Whether to return hidden states
+                from all layers. Defaults to config.output_hidden_states.
+            output_router_logits (bool, optional): Whether to return router logits
+                from MoE layers. Defaults to config.output_router_logits.
+            mode: Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER).
+                Auto-detected if None.
+            past_key_values: Cached key/value states for efficient autoregressive
+                generation.
+            cache_metadata: Metadata for paged attention mechanisms.
+            apply_lm_head (bool): Whether to apply the language modeling head.
+                Set to False to get hidden states only. Defaults to True.
 
         Returns:
-            MoeCausalLMOutput with logits, aux_loss, router_logits, etc.
+            MoeCausalLMOutput containing:
+                - logits: Vocabulary logits of shape (batch, seq_len, vocab_size)
+                - aux_loss: Auxiliary load balancing loss for MoE training
+                - past_key_values: Updated cache for next generation step
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+                - router_logits: Tuple of router logits if output_router_logits=True
         """
 
         def _aux_loss_fn(outputs, attention_mask):
