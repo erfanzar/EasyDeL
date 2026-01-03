@@ -325,7 +325,7 @@ class ExecutionManager:
         if metadata is None:
             raise ValueError("ExecutionManager requires a paged cache config `metadata`.")
 
-        logger.info(f"initializing eSurge-ExecutionManager Version {metadata.version}")
+        logger.info(f"initializing eSurge-ExecutionManager {model.config.get_text_config().attn_mechanism}")
         self.model = model
         self.mesh = model.mesh
 
@@ -754,14 +754,15 @@ class ExecutionManager:
                     f"Compiling [{compilation_count + 1}/{total_compilations}]: {num_tokens:5d} tokens, "
                     f"{reqs_padd:2d} padded requests",
                 )
-                self._step_compile(
-                    num_tokens=num_tokens,
-                    num_reqs_max_model_len=num_reqs_max_model_len,
-                    max_pages_per_req=max_pages_per_req,
-                    max_num_reqs=max_num_reqs,
-                    padded_num_reqs=reqs_padd,
-                    metadata=metadata,
-                )
+                if not reqs_padd > num_tokens:
+                    self._step_compile(
+                        num_tokens=num_tokens,
+                        num_reqs_max_model_len=num_reqs_max_model_len,
+                        max_pages_per_req=max_pages_per_req,
+                        max_num_reqs=max_num_reqs,
+                        padded_num_reqs=reqs_padd,
+                        metadata=metadata,
+                    )
                 compilation_count += 1
         progress.complete(f"All {total_compilations} compilations completed")
 

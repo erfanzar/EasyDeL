@@ -128,6 +128,27 @@ class Olmo3MLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Forward pass of the Olmo3MLP module implementing a Gated Linear Unit structure.
+
+        This method applies the standard GLU-based feedforward transformation used in
+        modern transformer models:
+        1. Gate stream: hidden_states -> gate_proj -> SiLU activation
+        2. Value stream: hidden_states -> up_proj
+        3. Combine: element-wise multiply gate and value
+        4. Project down: down_proj to original hidden dimension
+
+        Args:
+            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input hidden states tensor.
+                Shape: (batch_size, sequence_length, hidden_size)
+
+        Returns:
+            Float[Array, "batch seq_len hidden_dim"]: Output hidden states after MLP transformation.
+                Shape: (batch_size, sequence_length, hidden_size)
+
+        Note:
+            The method applies logical sharding for distributed training and uses
+            checkpoint_name for gradient checkpointing at intermediate computation steps.
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -145,10 +166,21 @@ class Olmo3MLP(nn.Module):
 
 
 class Olmo3Attention(UnifiedAttention):
-    """OLMo-3 Attention with Q/K normalization and per-layer attention types.
+    """Multi-head attention layer with Q/K normalization for OLMo-3 models.
 
-    Uses RMSNorm for Q/K normalization to improve training stability.
-    Supports both sliding window and full attention based on layer configuration.
+    Extends UnifiedAttention with RMSNorm-based query and key normalization
+    for improved training stability. Supports per-layer attention type configuration
+    with both sliding window and full attention modes.
+
+    Key features:
+        - Applies RMSNorm to query and key projections before attention
+        - Uses post-normalization architecture in the decoder layer
+        - Supports configurable sliding window attention per layer
+        - No QKV clipping (relies on normalization instead)
+
+    Attributes:
+        attention_type_name (str): The type of attention for this layer
+            ("sliding_attention" or "full_attention").
     """
 
     def __init__(
@@ -164,12 +196,19 @@ class Olmo3Attention(UnifiedAttention):
         """Initialize OLMo-3 attention with Q/K normalization and per-layer attention type.
 
         Args:
-                config: Model configuration
-                layer_idx: Index of this layer (used to determine attention type)
-                dtype: Data type for computations
-                param_dtype: Data type for parameters
-                precision: JAX precision setting
-                rngs: Random number generators
+            config (Olmo3Config): Model configuration with attention parameters including
+                layer_types which determines attention type per layer.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model, used to determine attention type
+                from config.layer_types.
+
+        Note:
+            The attention type ("sliding_attention" or other) is determined by
+            config.layer_types[layer_idx]. Sliding window attention uses
+            config.sliding_window for the window size.
         """
         attention_type_name = config.layer_types[layer_idx]
         self.attention_type_name = attention_type_name
@@ -192,7 +231,18 @@ class Olmo3Attention(UnifiedAttention):
         )
 
     def _create_q_norm(self, config: Olmo3Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: nn.Rngs):
-        """Create Q normalization layer (RMSNorm)."""
+        """Create query normalization layer using RMSNorm.
+
+        Args:
+            config (Olmo3Config): Model configuration with normalization parameters.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            rngs (nn.Rngs): Random number generator state.
+
+        Returns:
+            RMSNorm: Normalization layer for query projections with dimension
+                matching num_attention_heads * head_dim.
+        """
         return RMSNorm(
             dim=config.num_attention_heads * self.head_dim,
             eps=config.rms_norm_eps,
@@ -202,7 +252,18 @@ class Olmo3Attention(UnifiedAttention):
         )
 
     def _create_k_norm(self, config: Olmo3Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: nn.Rngs):
-        """Create K normalization layer (RMSNorm)."""
+        """Create key normalization layer using RMSNorm.
+
+        Args:
+            config (Olmo3Config): Model configuration with normalization parameters.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            rngs (nn.Rngs): Random number generator state.
+
+        Returns:
+            RMSNorm: Normalization layer for key projections with dimension
+                matching num_key_value_heads * head_dim.
+        """
         return RMSNorm(
             dim=config.num_key_value_heads * self.head_dim,
             eps=config.rms_norm_eps,
@@ -212,7 +273,19 @@ class Olmo3Attention(UnifiedAttention):
         )
 
     def _preprocess_qkv(self, query_states, key_states, value_states):
-        """Apply Q/K normalization before reshaping to multi-head format."""
+        """Apply Q/K normalization before attention computation.
+
+        Normalizes query and key projections using RMSNorm to improve
+        training stability in OLMo-3 models. Value states are passed through unchanged.
+
+        Args:
+            query_states: Query projections before normalization.
+            key_states: Key projections before normalization.
+            value_states: Value projections (unchanged).
+
+        Returns:
+            Tuple of (normalized_query, normalized_key, value_states).
+        """
         query_states = self.query_normalization(query_states)
         key_states = self.key_normalization(key_states)
         return query_states, key_states, value_states
@@ -315,20 +388,49 @@ class Olmo3DecoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
-        """Forward pass of the Olmo3DecoderLayer module.
+        """Forward pass of the Olmo3DecoderLayer with post-normalization architecture.
+
+        This method implements the OLMo3 decoder layer with the following structure:
+        1. Self-attention on input hidden states
+        2. Post-attention normalization
+        3. Residual connection (input + normalized attention output)
+        4. Feed-forward network on normalized hidden states
+        5. Post-feedforward normalization
+        6. Residual connection (previous + normalized FFN output)
+
+        Note that OLMo3 uses post-normalization (normalization after the sub-layer)
+        rather than the more common pre-normalization.
 
         Args:
-                hidden_states (Array): Input hidden states.
-                mask_info (MaskInfo): Mask information for attention.
-                position_ids (Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-                mode (common_types.RUNTIME_MODE_TYPES): Runtime mode (train/eval/infer).
-                cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
-                cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-                output_attentions (bool): Whether to return attention weights. Default is False.
-                frequencies (tp.Optional[Array]): Precomputed rotary frequency embeddings.
+            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input hidden states.
+                Shape: (batch_size, sequence_length, hidden_size)
+            mask_info (MaskInfo, optional): Mask information object containing attention masks
+                and position information for causal masking.
+            position_ids (Int[Array, "batch seq_len"]): Position indices for the tokens.
+                Shape: (batch_size, sequence_length)
+            mode (common_types.RUNTIME_MODE_TYPES): Runtime mode (training, generation, etc.)
+                controlling attention behavior and caching.
+            cache_view (TransformerCacheView | RaggedPagesCacheView, optional): Cache view
+                for storing and retrieving key-value pairs during generation.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata, optional):
+                Metadata for paged attention or other cache optimizations.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+            frequencies (Float[Array, "seq_len head_dim"], optional): Precomputed RoPE
+                frequency embeddings. Shape: (max_positions, head_dim)
 
         Returns:
-                DecoderLayerOutput: Output containing hidden states and optional attention weights.
+            DecoderLayerOutput: Object containing:
+                - hidden_states (Array): Output hidden states after the decoder layer.
+                    Shape: (batch_size, sequence_length, hidden_size)
+                - attention_weight (Array, optional): Attention weights if output_attentions=True.
+                    Shape: (batch_size, num_heads, sequence_length, sequence_length)
+                - cache_view: Updated cache view with new key-value pairs
+
+        Note:
+            The post-normalization architecture (norm after sub-layer + residual) is different
+            from pre-normalization (norm before sub-layer) and may affect training dynamics.
+            OLMo3 also supports per-layer attention types (sliding window or full attention).
         """
         # Post-norm architecture: residual + norm(sublayer(x))
         residual = hidden_states
@@ -459,33 +561,56 @@ class Olmo3Model(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass of the Olmo3Model.
+        """Forward pass of the Olmo3Model base transformer.
+
+        This method processes input tokens through the entire OLMo3 transformer stack:
+        1. Embed input tokens (or accept pre-computed embeddings)
+        2. Process through all decoder layers with causal attention
+        3. Apply final layer normalization
+        4. Optionally collect hidden states and attention weights from all layers
 
         Args:
-                input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
-                inputs_embeds (tp.Optional[Array]): Input embeddings.
-                        Either `input_ids` or `inputs_embeds` must be provided.
-                attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
-                        Shape: (batch_size, sequence_length).
-                mask_info (tp.Optional[MaskInfo]): Mask information for attention.
-                position_ids (tp.Optional[Array]): Position indices for the tokens.
-                        Shape: (batch_size, sequence_length).
-                mode (tp.Optional[common_types.RUNTIME_MODE_TYPES]): Runtime mode (train/eval/infer).
-                past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                        Precomputed key/value states for attention.
-                cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-                output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                        Defaults to `config.output_attentions`.
-                output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                        Defaults to `config.output_hidden_states`.
+            input_ids (Int[Array, "batch seq_len"], optional): Input token IDs.
+                Shape: (batch_size, sequence_length). Either this or inputs_embeds must be provided.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"], optional): Pre-computed
+                input embeddings. Shape: (batch_size, sequence_length, hidden_size).
+                Either this or input_ids must be provided.
+            attention_mask (Bool[Array, "batch seq_len"], optional): Boolean mask to avoid
+                attention on padding tokens. Shape: (batch_size, sequence_length).
+                True indicates positions to mask.
+            mask_info (MaskInfo, optional): Structured mask information object. If None,
+                will be constructed from attention_mask.
+            position_ids (Int[Array, "batch seq_len"], optional): Position indices for tokens.
+                Shape: (batch_size, sequence_length). If None, uses sequential positions.
+            mode (common_types.RUNTIME_MODE_TYPES, optional): Runtime mode controlling
+                attention behavior. If None, inferred from sequence_length and past_key_values.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                Pre-computed key-value states for efficient generation. If None, initializes empty.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata, optional):
+                Metadata for paged attention or other cache optimizations.
+            output_attentions (bool, optional): Whether to return attention weights from all layers.
+                Defaults to config.output_attentions.
+            output_hidden_states (bool, optional): Whether to return hidden states from all layers.
+                Defaults to config.output_hidden_states.
 
         Returns:
-                BaseModelOutput: The model's output.
-                        returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-                        and `attentions` (optional).
+            BaseModelOutput: Object containing:
+                - last_hidden_state (Array): Final layer output after normalization.
+                    Shape: (batch_size, sequence_length, hidden_size)
+                - hidden_states (tuple, optional): Hidden states from all layers if requested.
+                    Each element shape: (batch_size, sequence_length, hidden_size)
+                - attentions (tuple, optional): Attention weights from all layers if requested.
+                    Each element shape: (batch_size, num_heads, sequence_length, sequence_length)
+                - past_key_values: Updated cache with new key-value pairs
 
         Raises:
-                ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
+            ValueError: If neither input_ids nor inputs_embeds is provided, or if both are provided.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
+
+        Note:
+            The model uses post-normalization architecture and supports various caching
+            strategies for efficient generation (TransformerCache, RaggedPagesCache, HybridCache).
+            OLMo-3 also supports per-layer attention types (sliding window or full attention).
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -587,7 +712,19 @@ class Olmo3Model(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=Olmo3Config, model_type="olmo3")
 class Olmo3ForCausalLM(BaseCausalLMModule[Olmo3Model, Olmo3Config]):
-    """OLMo-3 model with a Causal Language Modeling head."""
+    """OLMo-3 model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation. It uses Q/K normalization
+    and post-normalization architecture for improved training stability. OLMo-3 extends
+    OLMo-2 by supporting per-layer attention types (sliding window and full attention).
+
+    Attributes:
+        config (Olmo3Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "olmo3"
@@ -602,6 +739,15 @@ class Olmo3ForCausalLM(BaseCausalLMModule[Olmo3Model, Olmo3Config]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize OLMo-3 model for causal language modeling.
+
+        Args:
+            config (Olmo3Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Olmo3Model,
@@ -627,32 +773,44 @@ class Olmo3ForCausalLM(BaseCausalLMModule[Olmo3Model, Olmo3Config]):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
-        """Forward pass of the Olmo3ForCausalLM model.
+        """Forward pass of the Olmo3ForCausalLM model for next-token prediction.
+
+        This method processes input tokens through the base OLMo3 transformer and applies
+        a language modeling head to produce logits for next-token prediction.
 
         Args:
-                input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
-                inputs_embeds (tp.Optional[Array]): Input embeddings.
-                        Either `input_ids` or `inputs_embeds` must be provided.
-                attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
-                        Shape: (batch_size, sequence_length).
-                mask_info (tp.Optional[MaskInfo]): Mask information for attention.
-                position_ids (tp.Optional[Array]): Position indices for the tokens.
-                        Shape: (batch_size, sequence_length).
-                mode (tp.Optional[common_types.RUNTIME_MODE_TYPES]): Runtime mode (train/eval/infer).
-                past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                        Precomputed key/value states for attention.
-                cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-                apply_lm_head (bool): Whether to apply the language model head. Defaults to True.
-                output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                        Defaults to `config.output_attentions`.
-                output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                        Defaults to `config.output_hidden_states`.
-
+            input_ids (Int[Array, "batch seq_len"], optional): Input token IDs.
+                Shape: (batch_size, sequence_length). Either this or inputs_embeds must be provided.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"], optional): Pre-computed
+                input embeddings. Shape: (batch_size, sequence_length, hidden_size).
+            attention_mask (Bool[Array, "batch seq_len"], optional): Boolean mask for padding.
+                Shape: (batch_size, sequence_length). True indicates positions to mask.
+            mask_info (MaskInfo, optional): Structured mask information object.
+            position_ids (Int[Array, "batch seq_len"], optional): Position indices for tokens.
+                Shape: (batch_size, sequence_length).
+            mode (common_types.RUNTIME_MODE_TYPES, optional): Runtime mode for attention behavior.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                Cached key-value states for generation.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata, optional):
+                Metadata for cache optimizations.
+            apply_lm_head (bool, optional): Whether to apply the language modeling head.
+                Defaults to True. Set to False to get only hidden states.
+            output_attentions (bool, optional): Whether to return attention weights.
+            output_hidden_states (bool, optional): Whether to return all hidden states.
 
         Returns:
-                CausalLMOutput: The model's output.
-                        returns a `CausalLMOutput` object containing `logits`, `hidden_states` (optional),
-                        and `attentions` (optional).
+            CausalLMOutput: Object containing:
+                - logits (Array, optional): Next-token prediction logits if apply_lm_head=True.
+                    Shape: (batch_size, sequence_length, vocab_size)
+                - last_hidden_state (Array): Final hidden states from the base model.
+                    Shape: (batch_size, sequence_length, hidden_size)
+                - hidden_states (tuple, optional): All layer hidden states if requested.
+                - attentions (tuple, optional): All layer attention weights if requested.
+                - past_key_values: Updated cache for generation
+
+        Note:
+            For generation, typically only the last token's logits are needed:
+            `next_token_logits = outputs.logits[:, -1, :]`
         """
         outputs = self.model(
             input_ids=input_ids,
@@ -715,7 +873,19 @@ class Olmo3ForCausalLM(BaseCausalLMModule[Olmo3Model, Olmo3Config]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Olmo3Config, model_type="olmo3")
 class Olmo3ForSequenceClassification(BaseSequenceClassificationModule[Olmo3Model, Olmo3Config]):
-    """OLMo-3 model with a Sequence Classification head."""
+    """OLMo-3 model for sequence classification tasks.
+
+    This class extends the base OLMo-3 model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+    Uses Q/K normalization and post-normalization architecture for improved training stability.
+    OLMo-3 extends OLMo-2 by supporting per-layer attention types.
+
+    Attributes:
+        config (Olmo3Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "olmo3"
@@ -730,6 +900,15 @@ class Olmo3ForSequenceClassification(BaseSequenceClassificationModule[Olmo3Model
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize OLMo-3 model for sequence classification.
+
+        Args:
+            config (Olmo3Config): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Olmo3Model,
@@ -756,35 +935,46 @@ class Olmo3ForSequenceClassification(BaseSequenceClassificationModule[Olmo3Model
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> SequenceClassifierOutput:
-        """Forward pass of the Olmo3ForSequenceClassification model.
+        """Forward pass of the Olmo3ForSequenceClassification model for sequence classification.
+
+        This method processes input sequences through the base OLMo3 transformer and applies
+        a classification head to the last token's hidden state to produce class logits.
 
         Args:
-                input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
-                inputs_embeds (tp.Optional[Array]): Input embeddings.
-                        Either `input_ids` or `inputs_embeds` must be provided.
-                attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
-                        Shape: (batch_size, sequence_length).
-                mask_info (tp.Optional[MaskInfo]): Mask information for attention.
-                position_ids (tp.Optional[Array]): Position indices for the tokens.
-                        Shape: (batch_size, sequence_length).
-                mode (tp.Optional[common_types.RUNTIME_MODE_TYPES]): Runtime mode (train/eval/infer).
-                past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                        Precomputed key/value states for attention.
-                cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-                apply_lm_head (bool): Whether to apply the language model head. Defaults to True.
-                output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                        Defaults to `config.output_attentions`.
-                output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                        Defaults to `config.output_hidden_states`.
-
+            input_ids (Int[Array, "batch seq_len"], optional): Input token IDs.
+                Shape: (batch_size, sequence_length). Either this or inputs_embeds must be provided.
+            inputs_embeds (Float[Array, "batch seq_len hidden_dim"], optional): Pre-computed
+                input embeddings. Shape: (batch_size, sequence_length, hidden_size).
+            attention_mask (Bool[Array, "batch seq_len"], optional): Boolean mask for padding.
+                Shape: (batch_size, sequence_length). True indicates positions to mask.
+            mask_info (MaskInfo, optional): Structured mask information object.
+            position_ids (Int[Array, "batch seq_len"], optional): Position indices for tokens.
+                Shape: (batch_size, sequence_length).
+            mode (common_types.RUNTIME_MODE_TYPES, optional): Runtime mode for attention behavior.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                Cached key-value states (typically not used for classification).
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata, optional):
+                Metadata for cache optimizations.
+            apply_lm_head (bool, optional): Unused parameter for API compatibility.
+            output_attentions (bool, optional): Whether to return attention weights.
+            output_hidden_states (bool, optional): Whether to return all hidden states.
 
         Returns:
-                SequenceClassifierOutput: The model's output,
-                        returns a `SequenceClassifierOutput` object containing `logits`, `hidden_states` (optional),
-                        and `attentions` (optional).
+            SequenceClassifierOutput: Object containing:
+                - logits (Array): Classification logits pooled from the last token position.
+                    Shape: (batch_size, num_labels)
+                - hidden_states (tuple, optional): All layer hidden states if requested.
+                - attentions (tuple, optional): All layer attention weights if requested.
+                - past_key_values: Updated cache (typically None for classification)
 
         Raises:
-                ValueError: If `config.pad_token_id` is None and `batch_size > 1`.
+            ValueError: If config.pad_token_id is None and batch_size > 1, as the model
+                cannot determine the last non-padded token position.
+
+        Note:
+            The classification is performed on the last token's hidden state. For sequences
+            with padding, the last non-padded token is automatically selected using the
+            pad_token_id from the configuration.
         """
         transformer_outputs = self.model(
             input_ids=input_ids,

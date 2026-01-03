@@ -64,6 +64,12 @@ class GemmaRMSNorm(nn.Module):
     kernel_init = staticmethod(nn.initializers.ones)
 
     def __init__(self, config: GemmaConfig, dtype: jnp.dtype = jnp.float32):
+        """Initialize Gemma RMS normalization layer.
+
+        Args:
+            config (GemmaConfig): Model configuration containing hidden_size and rms_norm_eps.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
+        """
         self.config = config
         self.epsilon = self.config.rms_norm_eps
         self.dtype = dtype
@@ -403,7 +409,18 @@ class GemmaDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=GemmaConfig, model_type="gemma")
 class GemmaModel(EasyDeLBaseModule):
-    """Decoder-only Gemma transformer wiring embeddings, decoder blocks, and output norm."""
+    """Gemma model implementation.
+
+    This implements the Gemma language model architecture, utilizing transformer blocks
+    with RMSNorm, rotary position embeddings, and a specific attention mechanism.
+    Gemma uses embedding scaling by sqrt(hidden_size) for training stability.
+
+    Attributes:
+        config (GemmaConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -609,7 +626,17 @@ class GemmaModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=GemmaConfig, model_type="gemma")
 class GemmaForCausalLM(BaseCausalLMModule[GemmaModel, GemmaConfig]):
-    """Gemma model with a Causal Language Modeling head."""
+    """Gemma model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation.
+
+    Attributes:
+        config (GemmaConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "gemma"
@@ -749,7 +776,17 @@ class GemmaForCausalLM(BaseCausalLMModule[GemmaModel, GemmaConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=GemmaConfig, model_type="gemma")
 class GemmaForSequenceClassification(BaseSequenceClassificationModule[GemmaModel, GemmaConfig]):
-    """Gemma encoder stack with a linear classification head for sequence labels."""
+    """Gemma model for sequence classification tasks.
+
+    This class extends the base Gemma model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+
+    Attributes:
+        config (GemmaConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "gemma"

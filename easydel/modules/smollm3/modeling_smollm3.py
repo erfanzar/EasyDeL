@@ -57,11 +57,22 @@ from .smollm3_configuration import SmolLM3Config
 class SmolLM3Attention(UnifiedAttention):
     """SmolLM3 Attention module with conditional RoPE (NoPE).
 
-    This attention module supports:
-    - Conditional RoPE: Layers can use RoPE or skip it (NoPE)
-    - Optional sliding window attention
-    - Grouped Query Attention (GQA)
-    - Optional bias in projections
+    This attention module implements the multi-head attention mechanism used in SmolLM3
+    with support for conditional positional embeddings. Key features include:
+
+    - Conditional RoPE (NoPE): Layers can use RoPE or skip it entirely based on configuration
+    - Optional sliding window attention for efficient long-context processing
+    - Grouped Query Attention (GQA) for memory-efficient inference
+    - Optional bias in projection layers
+
+    Attributes:
+        config (SmolLM3Config): Configuration for the attention layer.
+        layer_idx (int): Index of this layer in the model stack.
+        use_rope (bool): Whether this layer uses RoPE embeddings.
+        is_sliding (bool): Whether this layer uses sliding window attention.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.Precision): JAX precision for matmul operations.
     """
 
     def __init__(
@@ -74,15 +85,18 @@ class SmolLM3Attention(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
-        """Initialize SmolLM3Attention.
+        """Initialize SmolLM3 attention layer with conditional RoPE support.
 
         Args:
-            config: Model configuration.
-            layer_idx: Layer index for this attention module.
-            dtype: Data type for computations.
-            param_dtype: Data type for parameters.
-            precision: JAX precision for matmul operations.
-            rngs: RNG keys for initialization.
+            config (SmolLM3Config): Model configuration containing attention parameters
+                including num_attention_heads, num_key_value_heads, and hidden_size.
+            layer_idx (int): Index of this layer in the model, used to determine
+                whether RoPE should be applied based on no_rope_layers configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
+            precision (jax.lax.Precision, optional): Numerical precision for matrix operations.
+                Defaults to jax.lax.Precision("fastest").
+            rngs (nn.Rngs): Random number generator state for initialization.
         """
         self.layer_idx = layer_idx
 
@@ -107,13 +121,19 @@ class SmolLM3Attention(UnifiedAttention):
         )
 
     def _create_rotary(self, config: SmolLM3Config, dtype: jnp.dtype):
-        """Create rotary embedding - returns dummy function for NoPE layers.
+        """Create rotary embedding function, returning a dummy for NoPE layers.
 
-        This implements the NoPE (No Position Embedding) feature: layers with
-        no_rope_layers[i] = 0 return a dummy function that skips RoPE entirely.
+        This implements the NoPE (No Position Embedding) feature where certain layers
+        skip positional embeddings entirely. Layers with no_rope_layers[i] = 0 return
+        a dummy function that passes through query/key unchanged.
+
+        Args:
+            config (SmolLM3Config): Model configuration containing RoPE parameters.
+            dtype (jnp.dtype): Data type for the rotary embedding computation.
 
         Returns:
-            Rotary function that either applies RoPE or returns inputs unchanged.
+            Callable: A function that either applies RoPE to query/key tensors or
+                returns them unchanged for NoPE layers.
         """
 
         def _dummy(query, key, positions=None, frequencies=None):
@@ -126,13 +146,27 @@ class SmolLM3Attention(UnifiedAttention):
 
 
 class SmolLM3DecoderLayer(nn.Module):
-    """SmolLM3 Decoder Layer with pre-norm architecture.
+    """Single decoder layer for SmolLM3 models with pre-norm architecture.
+
+    Implements a transformer decoder layer combining multi-head attention with
+    conditional RoPE and feedforward networks. Uses RMS normalization and
+    residual connections in a pre-norm configuration.
 
     Architecture:
         hidden = residual + attention(norm(hidden))
         hidden = residual + mlp(norm(hidden))
 
-    This is pre-norm (different from SmolLM3's post-norm).
+    Attributes:
+        config (SmolLM3Config): Configuration for this decoder layer.
+        layer_idx (int): Index of this layer in the model stack.
+        hidden_size (int): Dimension of the hidden states.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.Precision): JAX precision for matrix operations.
+        self_attn (SmolLM3Attention): Self-attention module with conditional RoPE.
+        mlp (SmolLM3MLP): Feedforward network with SwiGLU activation.
+        input_layernorm (RMSNorm): Normalization before attention.
+        post_attention_layernorm (RMSNorm): Normalization before MLP.
     """
 
     def __init__(
@@ -145,15 +179,16 @@ class SmolLM3DecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initialize SmolLM3DecoderLayer.
+        """Initialize SmolLM3 decoder layer.
 
         Args:
-            config: Model configuration.
-            layer_idx: Layer index.
-            dtype: Data type for computations.
-            param_dtype: Data type for parameters.
-            precision: JAX precision for matmul operations.
-            rngs: RNG keys for initialization.
+            config (SmolLM3Config): Model configuration containing layer parameters.
+            layer_idx (int): Index of this layer in the model stack.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
+            precision (jax.lax.Precision, optional): Numerical precision for matrix operations.
+                Defaults to jax.lax.Precision("fastest").
+            rngs (nn.Rngs): Random number generator state for initialization.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -199,7 +234,18 @@ class SmolLM3DecoderLayer(nn.Module):
         precision: jax.lax.Precision,
         rngs: nn.Rngs,
     ):
-        """Create MLP module."""
+        """Create the MLP module for this decoder layer.
+
+        Args:
+            config (SmolLM3Config): Model configuration containing MLP parameters.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.Precision): Numerical precision for matrix operations.
+            rngs (nn.Rngs): Random number generator state.
+
+        Returns:
+            SmolLM3MLP: The initialized feedforward network module.
+        """
         return SmolLM3MLP(
             config=config,
             dtype=dtype,
@@ -219,20 +265,34 @@ class SmolLM3DecoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
-        """Forward pass through decoder layer.
+        """Forward pass through the SmolLM3 decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x)).
+        Supports conditional RoPE where some layers may skip positional embeddings.
 
         Args:
-            hidden_states: Input hidden states.
-            mask_info: Mask information for attention.
-            position_ids: Position indices for RoPE.
-            mode: Runtime mode (train/eval/decode).
-            cache_view: KV cache view.
-            cache_metadata: Cache metadata.
-            output_attentions: Whether to return attention weights.
-            frequencies: Precomputed RoPE frequencies.
+            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input tensor of shape
+                (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks
+                and padding information.
+            position_ids (Int[Array, "batch seq_len"]): Position indices for tokens, shape
+                (batch_size, sequence_length). Used for RoPE in layers that support it.
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization
+                and behavior control.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): View into
+                the KV cache for efficient generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management and paged attention. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+            frequencies (Float[Array, "seq_len head_dim"] | None, optional): Precomputed RoPE
+                frequencies for position encoding. Defaults to None.
 
         Returns:
-            DecoderLayerOutput with hidden states and optional attention weights.
+            DecoderLayerOutput: Contains:
+                - hidden_states: Transformed hidden states of same shape as input
+                - attention_weight: Attention weights if output_attentions=True, else None
+                - cache_view: Updated KV cache view for generation
         """
         # Pre-norm architecture: norm -> attention -> residual
         residual = hidden_states
@@ -282,7 +342,23 @@ class SmolLM3DecoderLayer(nn.Module):
 
 
 class SmolLM3MLP(nn.Module):
-    """SmolLM3 MLP module with SwiGLU activation."""
+    """Multi-Layer Perceptron module for SmolLM3 models.
+
+    Implements the feedforward network with SwiGLU activation function
+    for enhanced representation learning. Uses gate and up projections
+    followed by element-wise multiplication and down projection.
+
+    Attributes:
+        config (SmolLM3Config): Configuration for the MLP.
+        hidden_size (int): Input/output dimension of the MLP.
+        intermediate_size (int): Hidden dimension of the intermediate layer.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.Precision): JAX precision for matrix operations.
+        gate_proj (ColumnParallelLinear): Gate projection layer.
+        up_proj (ColumnParallelLinear): Up projection layer.
+        down_proj (RowParallelLinear): Down projection layer.
+    """
 
     def __init__(
         self,
@@ -293,14 +369,16 @@ class SmolLM3MLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initialize SmolLM3MLP.
+        """Initialize SmolLM3 MLP block.
 
         Args:
-            config: Model configuration.
-            dtype: Data type for computations.
-            param_dtype: Data type for parameters.
-            precision: JAX precision for matmul operations.
-            rngs: RNG keys for initialization.
+            config (SmolLM3Config): Model configuration with MLP parameters including
+                hidden_size, intermediate_size, and mlp_bias.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
+            precision (jax.lax.Precision, optional): Numerical precision for matrix operations.
+                Defaults to jax.lax.Precision("fastest").
+            rngs (nn.Rngs): Random number generator state for initialization.
         """
         self.config = config
         self.hidden_size = config.hidden_size
@@ -344,13 +422,17 @@ class SmolLM3MLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Forward pass through MLP.
+        """Apply SwiGLU feedforward transformation.
+
+        Computes: down_proj(silu(gate_proj(x)) * up_proj(x))
 
         Args:
-            hidden_states: Input hidden states.
+            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input tensor of shape
+                (batch_size, sequence_length, hidden_dim).
 
         Returns:
-            Output hidden states.
+            Float[Array, "batch seq_len hidden_dim"]: Transformed hidden states with same
+                shape as input (batch_size, sequence_length, hidden_dim).
         """
         # SwiGLU activation: silu(gate) * up
         gate = self.gate_proj(hidden_states)
@@ -367,7 +449,23 @@ class SmolLM3MLP(nn.Module):
     embedding_layer_names=["embed_tokens"],
 )
 class SmolLM3Model(EasyDeLBaseModule):
-    """SmolLM3 base model (decoder-only transformer)."""
+    """SmolLM3 base model implementation (decoder-only transformer).
+
+    This implements the SmolLM3 language model architecture, featuring:
+    - Conditional RoPE (NoPE): Some layers skip positional embeddings
+    - Optional sliding window attention for efficient long-context processing
+    - Grouped Query Attention (GQA) for memory-efficient inference
+    - Pre-norm transformer architecture with RMSNorm
+
+    Attributes:
+        config (SmolLM3Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.Precision): Precision setting for JAX operations.
+        embed_tokens (nn.Embed): Token embedding layer.
+        layers (list[SmolLM3DecoderLayer]): List of decoder layers.
+        norm (RMSNorm): Final layer normalization.
+    """
 
     def __init__(
         self,
@@ -378,14 +476,15 @@ class SmolLM3Model(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initialize SmolLM3Model.
+        """Initialize SmolLM3 base model.
 
         Args:
-            config: Model configuration.
-            dtype: Data type for computations.
-            param_dtype: Data type for parameters.
-            precision: JAX precision for matmul operations.
-            rngs: RNG keys for initialization.
+            config (SmolLM3Config): Model configuration containing architecture parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
+            precision (jax.lax.Precision, optional): Numerical precision for matrix operations.
+                Defaults to jax.lax.Precision("fastest").
+            rngs (nn.Rngs): Random number generator state for initialization.
         """
         super().__init__(
             config=config,
@@ -464,11 +563,14 @@ class SmolLM3Model(EasyDeLBaseModule):
             output_hidden_states (bool | None): Whether to return hidden states from all layers.
 
         Returns:
-            BaseModelOutput containing:
+            BaseModelOutput: Contains:
                 - last_hidden_state: Final hidden states (batch_size, sequence_length, hidden_size)
                 - hidden_states: Tuple of hidden states from all layers if output_hidden_states=True
                 - attentions: Tuple of attention weights from all layers if output_attentions=True
                 - past_key_values: Updated KV cache if caching is enabled
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
         """
         # Validate inputs
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -549,17 +651,38 @@ class SmolLM3Model(EasyDeLBaseModule):
         )
 
     def get_embedding(self):
-        """Returns the embedding layer of the module."""
+        """Returns the embedding layer of the module.
+
+        Returns:
+            nn.Embed: The token embedding layer that maps token IDs to embeddings.
+        """
         return self.embed_tokens
 
     def get_decoder(self):
-        """Returns the decoder part of the model."""
+        """Returns the decoder part of the model.
+
+        Returns:
+            SmolLM3Model: Self, as this is a decoder-only model.
+        """
         return self
 
 
 @register_module(TaskType.CAUSAL_LM, config=SmolLM3Config, model_type="smollm3")
 class SmolLM3ForCausalLM(BaseCausalLMModule[SmolLM3Model, SmolLM3Config]):
-    """SmolLM3 model with a Causal Language Modeling head."""
+    """SmolLM3 model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation. It extends SmolLM3Model
+    with a linear projection head for next-token prediction.
+
+    Attributes:
+        config (SmolLM3Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.Precision): Precision setting for JAX operations.
+        model (SmolLM3Model): The base SmolLM3 transformer model.
+        lm_head (nn.Linear): Linear layer projecting to vocabulary size.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "smollm3"
@@ -574,14 +697,16 @@ class SmolLM3ForCausalLM(BaseCausalLMModule[SmolLM3Model, SmolLM3Config]):
         *,
         rngs: nn.Rngs,
     ):
-        """Initialize SmolLM3 for causal language modeling.
+        """Initialize SmolLM3 model for causal language modeling.
 
         Args:
-            config: Model configuration object.
-            dtype: Data type for computations.
-            param_dtype: Data type for parameters.
-            precision: JAX precision for matrix multiplications.
-            rngs: Random number generators.
+            config (SmolLM3Config): Model configuration containing vocabulary size
+                and architecture parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
+            precision (jax.lax.Precision | None, optional): Numerical precision for matrix
+                operations. Defaults to None.
+            rngs (nn.Rngs): Random number generator state for initialization.
         """
         super().__init__(
             config=config,
@@ -597,7 +722,20 @@ class SmolLM3ForCausalLM(BaseCausalLMModule[SmolLM3Model, SmolLM3Config]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=SmolLM3Config, model_type="smollm3")
 class SmolLM3ForSequenceClassification(BaseSequenceClassificationModule[SmolLM3Model, SmolLM3Config]):
-    """SmolLM3 model with a Sequence Classification head."""
+    """SmolLM3 model for sequence classification tasks.
+
+    This class extends the base SmolLM3 model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis, text
+    classification, or natural language inference.
+
+    Attributes:
+        config (SmolLM3Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.Precision): Precision setting for JAX operations.
+        model (SmolLM3Model): The base SmolLM3 transformer model.
+        score (nn.Linear): Linear layer projecting to num_labels classes.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "smollm3"
@@ -612,14 +750,16 @@ class SmolLM3ForSequenceClassification(BaseSequenceClassificationModule[SmolLM3M
         *,
         rngs: nn.Rngs,
     ):
-        """Initialize SmolLM3 for sequence classification.
+        """Initialize SmolLM3 model for sequence classification.
 
         Args:
-            config: Model configuration object.
-            dtype: Data type for computations.
-            param_dtype: Data type for parameters.
-            precision: JAX precision for matrix multiplications.
-            rngs: Random number generators.
+            config (SmolLM3Config): Model configuration with num_labels specifying
+                the number of classification classes.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
+            precision (jax.lax.Precision | None, optional): Numerical precision for matrix
+                operations. Defaults to None.
+            rngs (nn.Rngs): Random number generator state for initialization.
         """
         super().__init__(
             config=config,

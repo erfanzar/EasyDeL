@@ -97,7 +97,11 @@ class Mistral3CausalLMOutputWithPast(ModelOutput):
 
 
 class Mistral3PatchMerger(nn.Module):
-    """Spatially merges neighboring vision patches before projecting into text space."""
+    """Spatially merges neighboring vision patches before projecting into text space.
+
+    Reduces the spatial resolution of vision patch tokens by merging adjacent patches
+    together, decreasing the sequence length while preserving visual information.
+    """
 
     def __init__(
         self,
@@ -108,6 +112,16 @@ class Mistral3PatchMerger(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Mistral3 patch merger.
+
+        Args:
+            config (Mistral3Config): Model configuration with vision parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -128,6 +142,22 @@ class Mistral3PatchMerger(nn.Module):
         )
 
     def forward(self, image_features: jax.Array, image_sizes: jax.Array) -> jax.Array:
+        """Merge neighboring patches spatially.
+
+        Takes flattened patch tokens and merges them in spatial neighborhoods defined
+        by spatial_merge_size, reducing the total token count while preserving
+        semantic information.
+
+        Args:
+            image_features (jax.Array): Flattened image patch features of shape
+                (num_patches, hidden_dim).
+            image_sizes (jax.Array): Original image sizes as (height, width) pairs
+                for proper spatial reconstruction.
+
+        Returns:
+            jax.Array: Merged patch features with reduced spatial resolution,
+                shape (num_merged_patches, hidden_dim).
+        """
         image_sizes = [
             (image_size[0] // self.patch_size, image_size[1] // self.patch_size) for image_size in image_sizes
         ]
@@ -152,7 +182,12 @@ class Mistral3PatchMerger(nn.Module):
 
 
 class Mistral3MultiModalProjector(nn.Module):
-    """Projects vision tower features into the language model embedding space."""
+    """Projects vision tower features into the language model embedding space.
+
+    Transforms vision encoder outputs into a representation compatible with
+    the language model's hidden dimension through normalization, patch merging,
+    and a two-layer MLP projection.
+    """
 
     def __init__(
         self,
@@ -163,6 +198,16 @@ class Mistral3MultiModalProjector(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Mistral3 multimodal projector.
+
+        Args:
+            config (Mistral3Config): Model configuration with vision and text parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -207,6 +252,19 @@ class Mistral3MultiModalProjector(nn.Module):
         )
 
     def __call__(self, image_features: jax.Array, image_sizes: jax.Array) -> jax.Array:
+        """Project vision features into language model space.
+
+        Applies RMS normalization, patch merging, and a two-layer MLP projection
+        to transform vision tower outputs into the language model's embedding space.
+
+        Args:
+            image_features (jax.Array): Vision encoder output features of shape
+                (num_patches, vision_hidden_dim).
+            image_sizes (jax.Array): Original image sizes as (height, width) pairs.
+
+        Returns:
+            jax.Array: Projected features of shape (num_merged_patches, text_hidden_dim).
+        """
         image_features = self.norm(image_features)
         image_features = self.patch_merger(image_features, image_sizes)
         hidden_states = checkpoint_name(self.linear_1(image_features), name="projector_linear1")
@@ -217,7 +275,18 @@ class Mistral3MultiModalProjector(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Mistral3Config, model_type="mistral3")
 class Mistral3Model(EasyDeLBaseModule):
-    """Multimodal Mistral3 wrapper combining a vision tower, projector, and language model."""
+    """Multimodal Mistral3 wrapper combining a vision tower, projector, and language model.
+
+    This model implements the Mistral3 vision-language architecture, integrating a vision
+    tower for image encoding, a multimodal projector for feature alignment, and a
+    language model for text generation based on both visual and textual inputs.
+
+    Attributes:
+        config (Mistral3Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -228,6 +297,15 @@ class Mistral3Model(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Mistral3 base model.
+
+        Args:
+            config (Mistral3Config): Model configuration with vision and text parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -262,6 +340,20 @@ class Mistral3Model(EasyDeLBaseModule):
         self.vision_feature_layer = config.vision_feature_layer
 
     def get_image_features(self, pixel_values: Array, image_sizes: Array) -> Array:
+        """Extract and project image features from pixel values.
+
+        Processes images through the vision tower, selects features from the specified
+        layer, and projects them into the language model's embedding space.
+
+        Args:
+            pixel_values (Array): Input image pixel values of shape
+                (batch, channels, height, width).
+            image_sizes (Array): Original image sizes as (height, width) pairs
+                for proper patch merging.
+
+        Returns:
+            Array: Projected image features ready for merging with text embeddings.
+        """
         image_features = self.vision_tower(pixel_values, output_hidden_states=True)
         selected_image_feature = image_features.hidden_states[self.vision_feature_layer]
         image_features = self.multi_modal_projector(selected_image_feature.squeeze(0), image_sizes)
@@ -276,6 +368,29 @@ class Mistral3Model(EasyDeLBaseModule):
         image_sizes: Array | None = None,
         **kwargs,
     ) -> Array:
+        """Compute combined text and image embeddings.
+
+        Creates embeddings for text tokens and optionally merges image features at
+        positions marked by the image token ID, enabling multimodal input processing.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
+            image_features (Array | None, optional): Pre-computed image features.
+                If None and pixel_values is provided, features are computed.
+                Defaults to None.
+            pixel_values (Array | None, optional): Raw image pixel values.
+                Used to compute image_features if not provided. Defaults to None.
+            image_sizes (Array | None, optional): Original image sizes for patch merging.
+                Required when pixel_values is provided. Defaults to None.
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            Array: Combined embeddings with image features merged at image token positions,
+                shape (batch_size, sequence_length, hidden_size).
+
+        Raises:
+            ValueError: If input_ids is None or if pixel_values is provided without image_sizes.
+        """
         if input_ids is None:
             raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
 
@@ -319,6 +434,47 @@ class Mistral3Model(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         **lm_kwargs,
     ):
+        """Forward pass through the Mistral3 base model.
+
+        Processes multimodal inputs by encoding images through the vision tower,
+        merging image features with text embeddings, and forwarding through
+        the language model.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            pixel_values (Array | None, optional): Input image pixel values of shape
+                (batch, channels, height, width). Defaults to None.
+            image_sizes (Array | None, optional): Original image sizes as (height, width) pairs.
+                Required when pixel_values is provided. Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            **lm_kwargs: Additional arguments passed to the language model.
+
+        Returns:
+            Mistral3ModelOutput: Contains last_hidden_state, past_key_values, hidden_states,
+                attentions, and image_hidden_states.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None,
+                or if pixel_values is provided without input_ids.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -367,6 +523,24 @@ class Mistral3Model(EasyDeLBaseModule):
         shardings: dict | None = None,
         pad_token_id: int | None = None,
     ):
+        """Initialize KV cache for autoregressive generation.
+
+        Creates and returns an empty cache structure for the language model
+        to store key-value pairs during generation.
+
+        Args:
+            batch_size (int): Number of sequences in the batch.
+            max_length (int): Maximum sequence length for the cache.
+            starts (int | None, optional): Starting positions for each sequence.
+                Defaults to None.
+            shardings (dict | None, optional): Sharding configuration for distributed
+                cache. Defaults to None.
+            pad_token_id (int | None, optional): Token ID used for padding.
+                Defaults to None.
+
+        Returns:
+            TransformerCache: Initialized empty cache for key-value storage.
+        """
         return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
 
     def prepare_inputs_for_generation(
@@ -378,6 +552,24 @@ class Mistral3Model(EasyDeLBaseModule):
         pixel_values: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
     ):
+        """Prepare model inputs for autoregressive generation.
+
+        Sets up the input dictionary with necessary tensors for generation,
+        including optional pixel values for multimodal generation.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
+            max_length (int): Maximum generation length.
+            pad_token_id (int): Token ID used for padding.
+            starts (int | None, optional): Starting positions. Defaults to None.
+            pixel_values (Array | None, optional): Image pixel values for multimodal
+                generation. Defaults to None.
+            attention_mask (Array | None, optional): Attention mask for the inputs.
+                Defaults to None.
+
+        Returns:
+            dict: Dictionary containing prepared inputs for generation.
+        """
         model_inputs = self.language_model.prepare_inputs_for_generation(
             input_ids=input_ids,
             max_length=max_length,
@@ -389,6 +581,19 @@ class Mistral3Model(EasyDeLBaseModule):
         return model_inputs
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        """Update model inputs for the next generation step.
+
+        Updates the input arguments with new values from the model outputs,
+        and removes pixel_values after the first iteration since image features
+        are only needed once.
+
+        Args:
+            model_outputs: Outputs from the previous forward pass.
+            model_kwargs (dict): Current model input arguments.
+
+        Returns:
+            dict: Updated model input arguments for the next generation step.
+        """
         model_kwargs = self.language_model.update_inputs_for_generation(model_outputs, model_kwargs)
         model_kwargs.pop("pixel_values", None)  # only effect first iter
         return model_kwargs
@@ -465,7 +670,15 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Mistral3ForConditionalGeneration model."""
+        """Initialize Mistral3 model for conditional generation.
+
+        Args:
+            config (Mistral3Config): Model configuration with vision and text parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Mistral3Model,
@@ -505,6 +718,19 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
         return self.base_model.get_image_features(pixel_values=pixel_values, image_sizes=image_sizes)
 
     def compute_embedding(self, input_ids, *args, **kwargs):
+        """Compute combined text and image embeddings.
+
+        Delegates to the base model's compute_embedding method for multimodal
+        embedding computation.
+
+        Args:
+            input_ids: Input token IDs.
+            *args: Positional arguments passed to base model.
+            **kwargs: Keyword arguments including image_features, pixel_values, image_sizes.
+
+        Returns:
+            Array: Combined embeddings with image features merged at image token positions.
+        """
         return self.base_model.compute_embedding(input_ids, *args, **kwargs)
 
     def __call__(
@@ -600,21 +826,60 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
         shardings: dict | None = None,
         pad_token_id: int | None = None,
     ):
-        """Initialize KV cache for generation."""
+        """Initialize KV cache for autoregressive generation.
+
+        Creates and returns an empty cache structure for storing key-value pairs
+        during generation.
+
+        Args:
+            batch_size (int): Number of sequences in the batch.
+            max_length (int): Maximum sequence length for the cache.
+            starts (int | None, optional): Starting positions for each sequence.
+                Defaults to None.
+            shardings (dict | None, optional): Sharding configuration for distributed
+                cache. Defaults to None.
+            pad_token_id (int | None, optional): Token ID used for padding.
+                Defaults to None.
+
+        Returns:
+            TransformerCache: Initialized empty cache for key-value storage.
+        """
         return self.base_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
 
     def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Apply the language modeling head."""
+        """Apply the language modeling head to hidden states.
+
+        Projects the final hidden states to vocabulary logits for next token prediction.
+
+        Args:
+            hidden_states (Array): Hidden states from the model of shape
+                (batch_size, sequence_length, hidden_size).
+
+        Returns:
+            Array: Logits over vocabulary of shape (batch_size, sequence_length, vocab_size).
+        """
         return self.lm_head(hidden_states)
 
     def get_vision_tower(self) -> nn.Module:
-        """Returns the vision tower component."""
+        """Get the vision tower component.
+
+        Returns:
+            nn.Module: The vision encoder used for image feature extraction.
+        """
         return self.base_model.vision_tower
 
     def get_projector(self) -> nn.Module:
-        """Returns the multimodal projector component."""
+        """Get the multimodal projector component.
+
+        Returns:
+            nn.Module: The projector that aligns vision features with text embeddings.
+        """
         return self.base_model.multi_modal_projector
 
     def get_language_model(self) -> nn.Module:
-        """Returns the language model component."""
+        """Get the language model component.
+
+        Returns:
+            nn.Module: The underlying language model for text generation.
+        """
         return self.base_model.language_model

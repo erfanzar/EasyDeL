@@ -59,19 +59,10 @@ from .gidd_configuration import GiddConfig
 
 
 class GiddMLP(nn.Module):
-    """
-    GIDD-specific MLP (Multi-Layer Perceptron) implementation.
+    """Multi-Layer Perceptron module for GIDD models.
 
-    This MLP uses a two-layer structure with a squared ReLU activation function
-    between the layers. It's designed to be used within the GIDD transformer layers.
-
-    Attributes:
-        config (GiddConfig): Configuration object containing model parameters.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        up_proj (ParallelLinear): First linear layer projecting from hidden_size to intermediate_size.
-        down_proj (ParallelLinear): Second linear layer projecting from intermediate_size back to hidden_size.
+    Implements the feedforward network with squared ReLU activation function
+    for enhanced representation learning in GIDD diffusion architecture.
     """
 
     def __init__(
@@ -83,15 +74,15 @@ class GiddMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """
-        Initialize the GiddMLP.
+        """Initialize GIDD MLP block.
 
         Args:
-            config: Configuration object containing model parameters.
-            dtype: Data type for computations. Defaults to jnp.bfloat16.
-            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
-            precision: Precision setting for JAX operations. Defaults to None.
-            rngs: Random number generators for parameter initialization.
+            config (GiddConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -123,14 +114,13 @@ class GiddMLP(nn.Module):
         self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size)
 
     def __call__(self, h: jnp.ndarray) -> jnp.ndarray:
-        """
-        Forward pass through the MLP.
+        """Apply squared ReLU feedforward transformation.
 
         Args:
-            h: Input tensor of shape [..., hidden_size].
+            h: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
-            Output tensor of shape [..., hidden_size].
+            Transformed hidden states [batch, seq_len, hidden_dim]
         """
         h = apply_logical_sharding(
             h,
@@ -153,28 +143,9 @@ class GiddMLP(nn.Module):
 
 
 class GiddAttention(AttentionModule):
-    """
-    GIDD-specific attention mechanism with optional query-key normalization.
+    """Multi-head attention layer with RoPE embeddings and optional QK normalization for GIDD models.
 
-    This attention module implements a multi-head attention mechanism with support for
-    query-key normalization, rotary position embeddings, and flexible attention patterns.
-
-    Attributes:
-        config (GiddConfig): Configuration object containing model parameters.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        hidden_size (int): Dimensionality of the hidden states.
-        head_dim (int): Dimensionality of each attention head.
-        use_qk_norm (bool): Whether to apply normalization to query and key vectors.
-        qk_norm_eps (float): Epsilon value for numerical stability in QK normalization.
-        qk_scale (float or ArrayParam): Scaling factor for attention scores.
-        q_proj (ParallelLinear): Linear projection for queries.
-        k_proj (ParallelLinear): Linear projection for keys.
-        v_proj (ParallelLinear): Linear projection for values.
-        o_proj (ParallelLinear): Linear projection for outputs.
-        rotary: Rotary position embedding module.
-        attention_performer (FlexibleAttentionModule): Module that performs the actual attention computation.
+    Implements bidirectional attention with noise masking support for diffusion language modeling.
     """
 
     def __init__(
@@ -186,15 +157,14 @@ class GiddAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
-        """
-        Initialize the GiddAttention module.
+        """Initialize GIDD attention layer with optional query-key normalization.
 
         Args:
-            config: Configuration object containing model parameters.
-            dtype: Data type for computations. Defaults to jnp.bfloat16.
-            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
-            precision: Precision setting for JAX operations. Defaults to None.
-            rngs: Random number generators for parameter initialization.
+            config (GiddConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(config=config)
         self.dtype = dtype
@@ -289,30 +259,24 @@ class GiddAttention(AttentionModule):
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> tuple[Array, Array, Array, tp.Callable[[], Array]]:
-        """
-        Prepare and concatenate key, value, and attention mask for attention computation.
+        """Prepare and concatenate key, value, and attention mask for attention computation.
 
-        This method handles the preprocessing of attention inputs, including:
-        - Validating and reshaping attention masks
-        - Combining attention masks with noise masks
-        - Creating a function to initialize attention bias
+        Handles preprocessing of attention inputs including mask validation, reshaping,
+        combining attention masks with noise masks, and creating attention bias initialization.
 
         Args:
-            query: Query tensor of shape [batch_size, seq_len, num_heads, head_dim].
-            key: Key tensor of shape [batch_size, seq_len, num_heads, head_dim].
-            value: Value tensor of shape [batch_size, seq_len, num_heads, head_dim].
-            attention_mask: Binary mask of shape [batch_size, seq_len] or [batch_size, 1, seq_len, seq_len].
-            noise_mask: Binary mask for noise tokens of shape [batch_size, seq_len].
-            cache_view: View into the key/value cache for incremental decoding.
-            cache_metadata: Metadata for cache operations.
+            query (Array): Query tensor of shape [batch_size, seq_len, num_heads, head_dim].
+            key (Array): Key tensor of shape [batch_size, seq_len, num_heads, head_dim].
+            value (Array): Value tensor of shape [batch_size, seq_len, num_heads, head_dim].
+            mask_info (MaskInfo): Mask information including attention mask.
+            noise_mask (Array): Binary mask for noise tokens of shape [batch_size, seq_len].
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): View into
+                the key/value cache for incremental decoding. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
 
         Returns:
-            A tuple containing:
-            - key: Processed key tensor.
-            - value: Processed value tensor.
-            - attention_mask: Processed attention mask.
-            - init_attention_bias: Function to initialize attention bias.
-            - cache_view: Updated cache view.
+            tuple: Contains (key, value, mask_info, init_attention_bias, cache_view).
         """
         # Validate that query and key have matching sequence lengths
         assert query.shape[1] == key.shape[1], "Query and Key lengths must match for GIDD attention."
@@ -349,14 +313,13 @@ class GiddAttention(AttentionModule):
         return key, value, attention_mask, init_attention_bias, cache_view
 
     def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        """
-        Apply normalization to query or key vectors.
+        """Apply L2 normalization to query or key vectors.
 
         Args:
-            x: Input tensor of shape [..., num_heads, head_dim].
+            x (jnp.ndarray): Input tensor of shape [..., num_heads, head_dim].
 
         Returns:
-            Normalized tensor of the same shape.
+            jnp.ndarray: Normalized tensor of the same shape.
         """
         return x * jax.lax.rsqrt(jnp.square(x).sum(-1, keepdims=True) + self.qk_norm_eps)
 
@@ -372,26 +335,23 @@ class GiddAttention(AttentionModule):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> tuple[Array, Array]:
-        """
-        Forward pass through the attention module.
+        """Forward pass through the attention module.
 
         Args:
-            hidden_states: Input tensor of shape [batch_size, seq_len, hidden_size].
-            attention_mask: Binary mask for attention.
-            noise_mask: Binary mask for noise tokens.
-            position_ids: Position indices for rotary embeddings.
-            mode: Runtime mode (train, decode, etc.).
-            cache_view: View into the key/value cache.
-            cache_metadata: Metadata for cache operations.
-            segment_ids: Segment indices for segment embeddings.
-            output_attentions: Whether to return attention weights.
-            frequencies: Precomputed frequencies for rotary embeddings.
+            hidden_states (Array): Input tensor of shape (batch_size, seq_len, hidden_size).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            noise_mask (Array): Binary mask for noise tokens of shape (batch_size, seq_len).
+            position_ids (Array): Position indices for rotary embeddings, shape (batch_size, seq_len).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): View into
+                the key/value cache. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
 
         Returns:
-            AttentionLayerOutput containing:
-            - attention_output: Output tensor of shape [batch_size, seq_len, hidden_size].
-            - attention_weight: Attention weights if output_attentions is True.
-            - cache_view: Updated cache view.
+            AttentionLayerOutput: Contains attention_output, attention_weight, and cache_view.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
 
@@ -479,18 +439,9 @@ class GiddAttention(AttentionModule):
 
 
 class GiddRMSNorm(nn.Module):
-    """
-    Root Mean Square Layer Normalization (RMSNorm) for the GIDD model.
+    """Root Mean Square Layer Normalization for GIDD models.
 
-    RMSNorm is a simplified variant of LayerNorm that normalizes the input by
-    its root mean square value and applies a learnable scale parameter.
-
-    Attributes:
-        config (GiddConfig): Configuration object containing model parameters.
-        epsilon (float): Small constant for numerical stability.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        kernel (ArrayParam): Learnable scale parameter.
+    A simplified variant of LayerNorm that normalizes by RMS value with learnable scale.
     """
 
     kernel_init = staticmethod(nn.initializers.ones)
@@ -501,13 +452,12 @@ class GiddRMSNorm(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
     ):
-        """
-        Initialize the GiddRMSNorm.
+        """Initialize GIDD RMSNorm layer.
 
         Args:
-            config: Configuration object containing model parameters.
-            dtype: Data type for computations. Defaults to jnp.bfloat16.
-            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            config (GiddConfig): Model configuration with normalization parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
         """
         self.config = config
         self.epsilon = self.config.rms_norm_eps
@@ -523,14 +473,13 @@ class GiddRMSNorm(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """
-        Apply RMSNorm to the input tensor.
+        """Apply RMSNorm to the input tensor.
 
         Args:
-            hidden_states: Input tensor of shape [..., hidden_size].
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
 
         Returns:
-            Normalized tensor of the same shape.
+            Array: Normalized tensor of the same shape.
         """
         variance = hidden_states.astype(jnp.float32)
         variance = jnp.power(variance, 2)
@@ -542,23 +491,10 @@ class GiddRMSNorm(nn.Module):
 
 
 class GiddLayer(nn.Module):
-    """
-    A single transformer layer for the GIDD model.
+    """Single transformer layer for GIDD models.
 
-    This layer combines a self-attention mechanism with a feed-forward network (MLP),
-    using residual connections and layer normalization. It's designed to be stacked
-    to form the complete transformer model.
-
-    Attributes:
-        config (GiddConfig): Configuration object containing model parameters.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        resid_scale (float): Scaling factor for residual connections.
-        self_attn (GiddAttention): Self-attention module.
-        mlp (GiddMLP): Feed-forward network module.
-        input_layernorm (GiddRMSNorm): Layer normalization before attention.
-        post_attention_layernorm (GiddRMSNorm): Layer normalization before MLP.
+    Combines multi-head attention and feedforward networks with
+    RMS normalization, residual connections, and optional residual scaling.
     """
 
     def __init__(
@@ -571,16 +507,15 @@ class GiddLayer(nn.Module):
         rngs: nn.Rngs,
         resid_scale: float = 1.0,
     ):
-        """
-        Initialize the GiddLayer.
+        """Initialize GIDD transformer layer.
 
         Args:
-            config: Configuration object containing model parameters.
-            dtype: Data type for computations. Defaults to jnp.bfloat16.
-            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
-            precision: Precision setting for JAX operations. Defaults to None.
-            rngs: Random number generators for parameter initialization.
-            resid_scale: Scaling factor for residual connections. Defaults to 1.0.
+            config (GiddConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            resid_scale (float, optional): Scaling factor for residual connections. Defaults to 1.0.
         """
         self.config = config
         self.dtype = dtype
@@ -627,26 +562,25 @@ class GiddLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
-        """
-        Forward pass through the transformer layer.
+        """Forward pass through the transformer layer.
+
+        Applies pre-normalization architecture: x + scale*attn(norm(x)) followed by x + scale*mlp(norm(x))
 
         Args:
-            hidden_states: Input tensor of shape [batch_size, seq_len, hidden_size].
-            attention_mask: Binary mask for attention.
-            position_ids: Position indices for rotary embeddings.
-            noise_mask: Binary mask for noise tokens.
-            mode: Runtime mode (train, decode, etc.).
-            cache_view: View into the key/value cache.
-            cache_metadata: Metadata for cache operations.
-            segment_ids: Segment indices for segment embeddings.
-            output_attentions: Whether to return attention weights.
-            frequencies: Precomputed frequencies for rotary embeddings.
+            hidden_states (Array): Input tensor of shape (batch_size, seq_len, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, seq_len).
+            noise_mask (Array): Binary mask for noise tokens of shape (batch_size, seq_len).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
 
         Returns:
-            DecoderLayerOutput containing:
-            - hidden_states: Output tensor of shape [batch_size, seq_len, hidden_size].
-            - attention_weight: Attention weights if output_attentions is True.
-            - cache_view: Updated cache view.
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
         """
         # Self-attention block with residual connection
         attn_outputs = self.self_attn(
@@ -690,23 +624,16 @@ class GiddLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=GiddConfig, model_type="Gidd")
 class GiddModel(EasyDeLBaseModule):
-    """
-    Base GIDD model implementation.
+    """GIDD model implementation for diffusion language modeling.
 
-    This model implements the core transformer architecture of the GIDD model,
-    consisting of an embedding layer, multiple transformer layers, and a final
-    normalization layer. It serves as the foundation for more specialized models
-    like GiddForDiffusionLM.
+    This implements the GIDD transformer architecture, utilizing transformer blocks
+    with RMSNorm, rotary position embeddings, and bidirectional attention with noise masking.
 
     Attributes:
         config (GiddConfig): Configuration for the model.
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        resid_scale (float): Scaling factor for residual connections.
-        embed_tokens (nn.Embed): Token embedding layer.
-        layers (list[GiddLayer]): List of transformer layers.
-        norm (GiddRMSNorm): Final normalization layer.
+        precision: Precision setting for JAX operations.
     """
 
     def __init__(
@@ -718,15 +645,14 @@ class GiddModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """
-        Initialize the GiddModel.
+        """Initialize GIDD base model.
 
         Args:
-            config: Configuration for the model.
-            dtype: Data type for computations. Defaults to jnp.bfloat16.
-            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
-            precision: Precision setting for JAX operations. Defaults to None.
-            rngs: Random number generators for parameter initialization.
+            config (GiddConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -783,29 +709,42 @@ class GiddModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """
-        Forward pass through the GiddModel.
+        """Forward pass through the GIDD base model.
+
+        Processes input tokens through embedding, all transformer layers with RoPE and RMSNorm,
+        and final normalization.
 
         Args:
-            input_ids: Input token IDs of shape [batch_size, seq_len].
-            inputs_embeds: Input embeddings of shape [batch_size, seq_len, hidden_size].
-            attention_mask: Binary mask to avoid attention on padding tokens.
-            position_ids: Position indices of each input sequence token.
-            log_snr: Log signal-to-noise ratio for diffusion models.
-            noise_mask: Binary mask for noise tokens.
-            segment_ids: Segment token indices for segment embeddings.
-            mode: Runtime mode (train, decode, etc.).
-            past_key_values: Cache containing precomputed key/value states.
-            cache_metadata: Metadata for cache handling.
-            output_attentions: Whether to return attention weights.
-            output_hidden_states: Whether to return hidden states of all layers.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, seq_len).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, seq_len, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, seq_len). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, seq_len). Defaults to None.
+            log_snr (Array | None, optional): Log signal-to-noise ratio for diffusion. Defaults to None.
+            noise_mask (Array | None, optional): Binary mask for noise tokens. Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            BaseModelOutput containing:
-            - last_hidden_state: Final hidden state of shape [batch_size, seq_len, hidden_size].
-            - hidden_states: Hidden states of all layers if output_hidden_states is True.
-            - attentions: Attention weights of all layers if output_attentions is True.
-            - past_key_values: Updated cache with key/value states.
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         # Validate input
         if (input_ids is None) ^ (inputs_embeds is None):
@@ -895,11 +834,9 @@ class GiddModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
+        """Returns the encoder part of the model's graph definition.
 
-        Note:
-            This is a decoder-only model and does not have an encoder.
+        Decoder-Only models don't have an encoder.
 
         Raises:
             NotImplementedError: Always raised as this is a decoder-only model.
@@ -907,20 +844,17 @@ class GiddModel(EasyDeLBaseModule):
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
+        """Returns the decoder part of the model's graph definition.
 
         Returns:
-            The model itself, as it is a decoder-only model.
+            GiddModel: The model itself, as it is a decoder-only model.
         """
         return self
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
+        """Returns the language model head of the module.
 
-        Note:
-            The base model does not have a language model head.
+        Base Models don't have a Language Model Head.
 
         Raises:
             NotImplementedError: Always raised as the base model does not have an LM head.
@@ -928,31 +862,26 @@ class GiddModel(EasyDeLBaseModule):
         raise NotImplementedError("The base model does not have a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
+        """Returns the embedding layer of the module.
 
         Returns:
-            The token embedding layer.
+            nn.Embed: The token embedding layer.
         """
         return self.embed_tokens
 
 
 @register_module(TaskType.DIFFUSION_LM, config=GiddConfig, model_type="Gidd")
 class GiddForDiffusionLM(EasyDeLBaseModule):
-    """
-    GIDD model with a language modeling head for diffusion language modeling tasks.
+    """GIDD model with a language modeling head for diffusion language modeling tasks.
 
-    This model extends the base GiddModel with a language modeling head, making it
-    suitable for autoregressive language generation tasks, particularly in the
-    context of diffusion models.
+    This model extends the base GiddModel with a language modeling head for
+    generation tasks in the context of diffusion language modeling.
 
     Attributes:
         config (GiddConfig): Configuration for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        model (GiddModel): The base transformer model.
-        lm_head (ParallelLinear): Language modeling head.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
     """
 
     def __init__(
@@ -964,15 +893,14 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """
-        Initialize the GiddForDiffusionLM.
+        """Initialize GIDD model for diffusion language modeling.
 
         Args:
-            config: Configuration for the model.
-            dtype: Data type for computations. Defaults to jnp.bfloat16.
-            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
-            precision: Precision setting for JAX operations. Defaults to None.
-            rngs: Random number generators for parameter initialization.
+            config (GiddConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -1026,31 +954,36 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
-        """
-        Forward pass through the GiddForDiffusionLM.
+        """Forward pass through the GIDD diffusion language model.
 
         Args:
-            input_ids: Input token IDs of shape [batch_size, seq_len].
-            inputs_embeds: Input embeddings of shape [batch_size, seq_len, hidden_size].
-            attention_mask: Binary mask to avoid attention on padding tokens.
-            position_ids: Position indices of each input sequence token.
-            segment_ids: Segment token indices for segment embeddings.
-            log_snr: Log signal-to-noise ratio for diffusion models.
-            noise_mask: Binary mask for noise tokens.
-            mode: Runtime mode (train, decode, etc.).
-            past_key_values: Cache containing precomputed key/value states.
-            cache_metadata: Metadata for cache handling.
-            apply_lm_head: Whether to apply the language modeling head.
-            output_attentions: Whether to return attention weights.
-            output_hidden_states: Whether to return hidden states of all layers.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, seq_len).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, seq_len, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, seq_len). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, seq_len). Defaults to None.
+            log_snr (Array | None, optional): Log signal-to-noise ratio for diffusion. Defaults to None.
+            noise_mask (Array | None, optional): Binary mask for noise tokens. Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language modeling head. Defaults to True.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            CausalLMOutput containing:
-            - logits: Output logits of shape [batch_size, seq_len, vocab_size] if apply_lm_head is True.
-            - hidden_states: Hidden states of all layers if output_hidden_states is True.
-            - last_hidden_state: Final hidden state of shape [batch_size, seq_len, hidden_size].
-            - attentions: Attention weights of all layers if output_attentions is True.
-            - past_key_values: Updated cache with key/value states.
+            CausalLMOutput: Contains logits (if apply_lm_head), hidden_states, last_hidden_state,
+                attentions, and past_key_values.
         """
         # Get outputs from base model
         outputs = self.model(
@@ -1090,11 +1023,9 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
+        """Returns the encoder part of the model's graph definition.
 
-        Note:
-            This is a decoder-only model and does not have an encoder.
+        Decoder-Only models don't have an encoder.
 
         Raises:
             NotImplementedError: Always raised as this is a decoder-only model.
@@ -1102,28 +1033,25 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
+        """Returns the decoder part of the model's graph definition.
 
         Returns:
-            The base model, which serves as the decoder.
+            GiddModel: The base model, which serves as the decoder.
         """
         return self.model
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
+        """Returns the language model head of the module.
 
         Returns:
-            The language modeling head.
+            ColumnParallelLinear: The language modeling head.
         """
         return self.lm_head
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
+        """Returns the embedding layer of the module.
 
         Returns:
-            The token embedding layer from the base model.
+            nn.Embed: The token embedding layer from the base model.
         """
         return self.model.embed_tokens

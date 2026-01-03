@@ -89,16 +89,24 @@ class AyaVisionCausalLMOutputWithPast(ModelOutput):
 
 
 class AyaVisionMultiModalProjector(nn.Module):
-    """
-    A multi-modal projector module for AyaVision that processes image features.
-    It applies pixel shuffling, layer normalization, and linear transformations.
+    """Multi-modal projector module for AyaVision models.
+
+    Transforms vision encoder outputs to the language model's hidden dimension
+    using pixel shuffling for spatial downsampling followed by gated linear
+    projections. The architecture applies:
+    1. Pixel shuffling to reduce spatial dimensions by downsample_factor
+    2. Layer normalization on the shuffled features
+    3. Gated SiLU-activated projection (GLU-style) to intermediate size
+    4. Final linear projection to text hidden dimension
 
     Attributes:
-        config (AyaVisionConfig): Configuration object.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): JAX precision level.
-        rngs (nn.Rngs): Random number generators.
+        config (AyaVisionConfig): Configuration object containing vision/text settings.
+        dtype (jnp.dtype): Data type for computation (e.g., jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (e.g., jnp.bfloat16).
+        precision (jax.lax.PrecisionLike): JAX precision level for matrix operations.
+        rngs (nn.Rngs): Random number generators for parameter initialization.
+        downsample_factor (int): Factor by which to reduce spatial dimensions.
+        alignment_intermediate_size (int): Intermediate projection dimension.
     """
 
     def __init__(
@@ -190,13 +198,26 @@ class AyaVisionMultiModalProjector(nn.Module):
         return hidden_states
 
     def pixel_shuffle(self, image_features: jax.Array) -> jax.Array:
-        """Performs pixel shuffling on the image features based on the downsample factor.
+        """Perform pixel shuffling to downsample spatial dimensions.
+
+        Rearranges spatial patches into the channel dimension, effectively
+        reducing the spatial resolution while increasing feature dimensionality.
+        This is the inverse of the pixel shuffle operation used in super-resolution.
 
         Args:
-            image_features (jax.Array): Input image features (batch_size, seq_length, hidden_size).
+            image_features (jax.Array): Input image features from vision encoder.
+                Shape: (batch_size, seq_length, hidden_size) where seq_length = H * W
+                (number of patches from the vision encoder).
 
         Returns:
-            jax.Array: Image features after pixel shuffling.
+            jax.Array: Downsampled image features with increased channel dimension.
+                Shape: (batch_size, H/factor, W/factor, hidden_size * factor^2)
+                where factor is self.downsample_factor.
+
+        Example:
+            For downsample_factor=2 with input (1, 576, 1152):
+            - Reshapes to (1, 24, 24, 1152) spatial grid
+            - Applies pixel shuffle to get (1, 12, 12, 4608)
         """
         batch_size, seq_length, _ = image_features.shape
         height = width = int(seq_length**0.5)
@@ -226,16 +247,30 @@ class AyaVisionMultiModalProjector(nn.Module):
 
 @register_module(TaskType.BASE_VISION, config=AyaVisionConfig, model_type="aya_vision")
 class AyaVisionModel(EasyDeLBaseModule):
-    """
-    AyaVision model for conditional text generation based on image inputs.
-    Combines a vision tower and a language model with a multi-modal projector.
+    """AyaVision base model for vision-language understanding.
+
+    A multimodal model that combines a SigLIP vision encoder with a Cohere2
+    language model through a pixel-shuffle based projector. This architecture
+    enables efficient image-to-text tasks by:
+    1. Extracting visual features via the vision tower (SigLIP)
+    2. Downsampling and projecting features to text hidden dimension
+    3. Merging visual embeddings with text embeddings at image token positions
+    4. Processing the combined sequence through the language model
+
+    This is the base model without a language modeling head. For generation
+    tasks, use AyaVisionForConditionalGeneration.
 
     Attributes:
-        config (AyaVisionConfig): Configuration object.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): JAX precision level.
-        rngs (nn.Rngs): Random number generators.
+        config (AyaVisionConfig): Configuration object containing vision, text,
+            and projector settings.
+        dtype (jnp.dtype): Data type for computation (e.g., jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (e.g., jnp.bfloat16).
+        precision (jax.lax.PrecisionLike): JAX precision level for matrix operations.
+        vision_tower: SigLIP vision encoder for extracting image features.
+        multi_modal_projector: Projector module for aligning vision and text features.
+        language_model: Cohere2 language model for processing multimodal embeddings.
+        vision_feature_layer (int): Which layer of vision encoder to extract features from.
+        vision_feature_select_strategy (str): Strategy for selecting vision features.
     """
 
     def __init__(
@@ -290,13 +325,21 @@ class AyaVisionModel(EasyDeLBaseModule):
         self.vision_feature_select_strategy = getattr(config, "vision_feature_select_strategy", "default")
 
     def get_image_features(self, pixel_values: Array) -> Array:
-        """Extracts and projects image features from the vision tower.
+        """Extract and project image features from the vision tower.
+
+        Processes images through the SigLIP vision encoder, extracts features
+        from the specified layer, applies feature selection strategy, and
+        projects to the language model's hidden dimension.
 
         Args:
-            pixel_values (Array): Input pixel values for the images.
+            pixel_values (Array): Input pixel values for images.
+                Shape: (batch_size, num_channels, height, width)
+                Example: (1, 3, 384, 384) for a single 384x384 RGB image.
 
         Returns:
-            Array: Processed image features ready for the language model.
+            Array: Projected image features aligned with text hidden dimension.
+                Shape: (batch_size, num_patches, text_hidden_size)
+                Example: (1, 144, 4096) after 2x downsampling with 4096-dim text model.
         """
         image_features = self.vision_tower(pixel_values, output_hidden_states=True)
         selected_image_feature = image_features.hidden_states[self.vision_feature_layer]
@@ -316,6 +359,28 @@ class AyaVisionModel(EasyDeLBaseModule):
         pixel_values: Array | None = None,
         **kwargs,
     ) -> Array:
+        """Compute input embeddings with multimodal feature merging.
+
+        Creates text embeddings from input_ids and optionally merges image features
+        at positions marked by the image token. This enables unified processing of
+        interleaved image-text sequences.
+
+        Args:
+            input_ids (Array): Input token IDs containing image token placeholders.
+                Shape: (batch_size, sequence_length). Image tokens use config.image_token_index.
+            image_features (Array | None, optional): Pre-computed projected image features.
+                If provided, pixel_values is ignored. Shape: (batch_size, num_patches, hidden_size).
+            pixel_values (Array | None, optional): Raw image pixel values to process.
+                Only used if image_features is None. Shape: (batch_size, channels, height, width).
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            Array: Combined embeddings with image features merged at image token positions.
+                Shape: (batch_size, sequence_length, hidden_size).
+
+        Raises:
+            ValueError: If input_ids is None.
+        """
         if input_ids is None:
             raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
 
@@ -437,12 +502,31 @@ class AyaVisionModel(EasyDeLBaseModule):
 
     def init_cache(
         self,
-        batch_size,
-        max_length,
-        starts=None,
-        shardings=None,
-        pad_token_id=None,
-    ):
+        batch_size: int,
+        max_length: int,
+        starts: int | None = None,
+        shardings: tuple | None = None,
+        pad_token_id: int | None = None,
+    ) -> TransformerCache:
+        """Initialize KV cache for efficient autoregressive generation.
+
+        Creates an empty transformer cache that will store key-value pairs
+        from attention layers during generation, enabling O(1) per-token
+        computation instead of O(n) recomputation.
+
+        Args:
+            batch_size (int): Number of sequences to generate in parallel.
+            max_length (int): Maximum sequence length to allocate cache for.
+            starts (int | None, optional): Starting positions for each sequence.
+                Defaults to None (start from 0).
+            shardings (tuple | None, optional): Sharding specification for distributed
+                computation. Defaults to None.
+            pad_token_id (int | None, optional): Token ID used for padding.
+                Defaults to None.
+
+        Returns:
+            TransformerCache: Initialized empty cache ready for generation.
+        """
         return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
 
     def prepare_inputs_for_generation(
@@ -453,17 +537,29 @@ class AyaVisionModel(EasyDeLBaseModule):
         starts: int | None = None,
         pixel_values: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
-    ):
-        """Prepares inputs for text generation, including pixel values if provided.
+    ) -> dict:
+        """Prepare inputs for autoregressive text generation.
+
+        Sets up the initial model inputs including KV cache initialization
+        and optional image inputs. Called once at the start of generation
+        to prepare the first forward pass.
 
         Args:
-            input_ids (Array): Initial input token IDs.
-            max_length (int): Maximum generation length.
-            pixel_values (Optional[Array]): Pixel values for image input.
-            attention_mask (Optional[Array]): Attention mask.
+            input_ids (Array): Initial input token IDs including any image tokens.
+                Shape: (batch_size, sequence_length).
+            max_length (int): Maximum total sequence length for generation.
+                Used to allocate cache of appropriate size.
+            pad_token_id (int): Token ID used for padding sequences.
+            starts (int | None, optional): Starting position indices.
+                Defaults to None (start from 0).
+            pixel_values (Array | None, optional): Input image pixel values.
+                Shape: (batch_size, channels, height, width). Defaults to None.
+            attention_mask (Array | None, optional): Attention mask for input tokens.
+                Shape: (batch_size, sequence_length). Defaults to None.
 
         Returns:
-            dict: Model inputs ready for generation.
+            dict: Model inputs dictionary containing input_ids, attention_mask,
+                past_key_values (initialized cache), and pixel_values if provided.
         """
         model_inputs = self.language_model.prepare_inputs_for_generation(
             input_ids=input_ids,
@@ -475,66 +571,106 @@ class AyaVisionModel(EasyDeLBaseModule):
         model_inputs["pixel_values"] = pixel_values
         return model_inputs
 
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):
-        """Updates model inputs for the next step of generation, removing pixel values after the first step.
+    def update_inputs_for_generation(self, model_outputs, model_kwargs: dict) -> dict:
+        """Update model inputs for the next autoregressive generation step.
+
+        Updates the model keyword arguments after each generation step,
+        including cache updates and removing pixel_values (only needed
+        for the first step when image features are extracted and merged).
 
         Args:
-            model_outputs: Outputs from the previous generation step.
-            model_kwargs: Current keyword arguments for the model.
+            model_outputs: Outputs from the previous generation step containing
+                updated past_key_values and other state information.
+            model_kwargs (dict): Current keyword arguments for the model including
+                input_ids, attention_mask, past_key_values, and optionally pixel_values.
 
         Returns:
-            dict: Updated model keyword arguments.
+            dict: Updated model keyword arguments for the next generation step.
+                pixel_values is removed as it's only used in the first step.
         """
         model_kwargs = self.language_model.update_inputs_for_generation(model_outputs, model_kwargs)
         model_kwargs.pop("pixel_values", None)  # only effect first iter
         return model_kwargs
 
-    def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        The vision tower acts as the encoder in this multi-modal setup.
+    def get_encoder(self) -> nn.Module:
+        """Return the encoder component of the model.
+
+        In this multimodal architecture, the vision tower (SigLIP) serves as
+        the encoder, processing images into feature representations.
+
+        Returns:
+            nn.Module: The vision tower module (SigLIP vision encoder).
         """
         return self.vision_tower
 
-    def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
+    def get_decoder(self) -> nn.Module:
+        """Return the decoder component of the model.
+
+        The Cohere2 language model serves as the decoder, processing the
+        combined vision-text embeddings autoregressively.
+
+        Returns:
+            nn.Module: The language model module (Cohere2).
         """
         return self.language_model
 
-    def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        Base Models don't have a Language Model Head.
+    def get_lm_head(self) -> nn.Module:
+        """Return the language modeling head.
+
+        Delegates to the underlying language model's LM head. Note that
+        AyaVisionModel is a base model; for generation, use
+        AyaVisionForConditionalGeneration.
+
+        Returns:
+            nn.Module: The language modeling head from the underlying Cohere2 model.
         """
         return self.language_model.get_lm_head()
 
-    def get_embedding(self):
-        """
-        Returns the embedding layer of the language model (decoder).
+    def get_embedding(self) -> nn.Module:
+        """Return the token embedding layer.
+
+        Returns the embedding layer from the underlying language model
+        used to convert token IDs to dense vectors.
+
+        Returns:
+            nn.Module: The token embedding layer from the Cohere2 model.
         """
         return self.language_model.get_embedding()
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=AyaVisionConfig, model_type="aya_vision")
 class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel, AyaVisionConfig]):
-    """AyaVision model for conditional text generation based on image inputs.
+    """AyaVision model for conditional text generation from images.
 
-    Combines a vision tower and a language model with a multi-modal projector.
-    Inherits from BaseVisionLanguageModule to leverage common VLM infrastructure.
+    A vision-language model that generates text conditioned on image inputs.
+    Combines a SigLIP vision encoder with a Cohere2 language model through
+    a pixel-shuffle based multimodal projector. This class includes a language
+    modeling head for autoregressive text generation.
+
+    The architecture processes inputs as follows:
+    1. Images are encoded by the SigLIP vision tower
+    2. Visual features are downsampled via pixel shuffling
+    3. Features are projected to text hidden dimension with gated projections
+    4. Projected features are merged with text embeddings at image token positions
+    5. The combined sequence is processed by Cohere2 for next-token prediction
+
+    This model inherits from BaseVisionLanguageModule to leverage common
+    VLM infrastructure including generation utilities and caching.
 
     Attributes:
-        config (AyaVisionConfig): Configuration object.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): JAX precision level.
-        rngs (nn.Rngs): Random number generators.
+        config (AyaVisionConfig): Configuration object containing vision, text,
+            and projector settings.
+        dtype (jnp.dtype): Data type for computation (e.g., jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (e.g., jnp.bfloat16).
+        precision (jax.lax.PrecisionLike): JAX precision level for matrix operations.
+        base_model (AyaVisionModel): The underlying AyaVision base model.
+        lm_head: Language modeling head for next-token prediction.
 
     Class Attributes:
-        _task_type: IMAGE_TEXT_TO_TEXT task type
-        _model_type: "aya_vision" model identifier
-        _supports_video: False (AyaVision is image-only)
-        _uses_mrope: False (uses standard RoPE)
+        _task_type (TaskType): IMAGE_TEXT_TO_TEXT task type for VLM generation.
+        _model_type (str): "aya_vision" model identifier for registration.
+        _supports_video (bool): False (AyaVision is image-only, no video support).
+        _uses_mrope (bool): False (uses standard RoPE, not multi-resolution RoPE).
     """
 
     # Class attributes for registration and capabilities
@@ -608,7 +744,28 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
         """
         return self.base_model.get_image_features(pixel_values)
 
-    def compute_embedding(self, input_ids, *args, **kwargs):
+    def compute_embedding(
+        self,
+        input_ids: Int[Array, "batch seq_len"],
+        *args,
+        **kwargs,
+    ) -> Array:
+        """Compute embeddings with multimodal feature merging.
+
+        Delegates to the base model's compute_embedding which handles
+        text embedding creation and image feature merging at image token positions.
+
+        Args:
+            input_ids (Array): Input token IDs with image token placeholders.
+                Shape: (batch_size, sequence_length).
+            *args: Additional positional arguments passed to base model.
+            **kwargs: Additional keyword arguments including image_features
+                or pixel_values for multimodal inputs.
+
+        Returns:
+            Array: Combined embeddings ready for language model processing.
+                Shape: (batch_size, sequence_length, hidden_size).
+        """
         return self.base_model.compute_embedding(input_ids, *args, **kwargs)
 
     def __call__(
@@ -627,25 +784,53 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
         output_hidden_states: bool | None = None,
         **lm_kwargs,
     ) -> VLMCausalLMOutput:
-        """Forward pass for the AyaVision model.
+        """Forward pass for vision-language generation.
+
+        Processes images and text through the multimodal architecture to produce
+        next-token predictions. Images are encoded by the vision tower, projected,
+        merged with text embeddings, and processed by the language model.
 
         Args:
-            input_ids: Input token IDs (batch_size, sequence_length)
-            pixel_values: Input pixel values for images (batch_size, channels, height, width)
-            attention_mask: Attention mask
-            mask_info: Mask information
-            position_ids: Position IDs for text
-            mode: Runtime mode
-            past_key_values: Cached keys/values for language model
-            cache_metadata: Metadata for paged attention
-            apply_lm_head: Whether to apply the LM head
-            inputs_embeds: Input embeddings (alternative to input_ids)
-            output_attentions: Whether to output attentions
-            output_hidden_states: Whether to output hidden states
-            **lm_kwargs: Additional arguments passed to the language model
+            input_ids (Array | None): Input token IDs including image token placeholders.
+                Shape: (batch_size, sequence_length). Either this or inputs_embeds required.
+            pixel_values (Array | None, optional): Input image pixel values.
+                Shape: (batch_size, num_channels, height, width), e.g., (1, 3, 384, 384).
+                Defaults to None.
+            attention_mask (Array | None, optional): Attention mask for input tokens.
+                Shape: (batch_size, sequence_length). True/1 for valid, False/0 for padding.
+                Defaults to None.
+            mask_info (MaskInfo | None, optional): Pre-computed attention mask information
+                for efficient attention computation. Defaults to None.
+            position_ids (Array | None, optional): Position indices for tokens.
+                Shape: (batch_size, sequence_length). Auto-generated if None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode ("train", "decode", "infer").
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cached key-value states for efficient autoregressive generation.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None):
+                Metadata for paged attention and cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language modeling head
+                to produce logits. Set False to get hidden states only. Defaults to True.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings.
+                Shape: (batch_size, sequence_length, hidden_size). Alternative to input_ids.
+            output_attentions (bool | None, optional): Return attention weights from all layers.
+                Defaults to None (uses config setting).
+            output_hidden_states (bool | None, optional): Return hidden states from all layers.
+                Defaults to None (uses config setting).
+            **lm_kwargs: Additional keyword arguments passed to the language model.
 
         Returns:
-            VLMCausalLMOutput: Model outputs including logits and optional states
+            VLMCausalLMOutput: Model outputs containing:
+                - logits: Next-token prediction logits (batch, seq_len, vocab_size) if apply_lm_head
+                - past_key_values: Updated KV cache for generation
+                - hidden_states: All layer hidden states if output_hidden_states=True
+                - last_hidden_state: Final layer hidden states (batch, seq_len, hidden_size)
+                - attentions: All layer attention weights if output_attentions=True
+                - image_hidden_states: Projected image features if pixel_values provided
+
+        Raises:
+            ValueError: If neither input_ids nor inputs_embeds is provided, or if both are.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -695,27 +880,73 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
 
     def init_cache(
         self,
-        batch_size,
-        max_length,
-        starts=None,
-        shardings=None,
-        pad_token_id=None,
-    ):
-        """Initialize KV cache for generation."""
+        batch_size: int,
+        max_length: int,
+        starts: int | None = None,
+        shardings: tuple | None = None,
+        pad_token_id: int | None = None,
+    ) -> TransformerCache:
+        """Initialize KV cache for efficient autoregressive generation.
+
+        Creates an empty transformer cache for storing key-value pairs from
+        attention layers during generation, enabling O(1) per-token computation.
+
+        Args:
+            batch_size (int): Number of sequences to generate in parallel.
+            max_length (int): Maximum sequence length to allocate cache for.
+            starts (int | None, optional): Starting positions. Defaults to None.
+            shardings (tuple | None, optional): Sharding spec for distributed compute.
+                Defaults to None.
+            pad_token_id (int | None, optional): Padding token ID. Defaults to None.
+
+        Returns:
+            TransformerCache: Initialized empty cache ready for generation.
+        """
         return self.base_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
 
     def apply_lm_head(self, hidden_states: Array) -> Array:
-        """Apply the language modeling head."""
+        """Apply the language modeling head to produce logits.
+
+        Projects the final hidden states to vocabulary size for next-token prediction.
+
+        Args:
+            hidden_states (Array): Final layer hidden states from the language model.
+                Shape: (batch_size, sequence_length, hidden_size).
+
+        Returns:
+            Array: Logits over the vocabulary for each position.
+                Shape: (batch_size, sequence_length, vocab_size).
+        """
         return self.lm_head(hidden_states)
 
     def get_vision_tower(self) -> nn.Module:
-        """Returns the vision tower component."""
+        """Return the vision encoder component.
+
+        Provides access to the SigLIP vision tower for image feature extraction.
+
+        Returns:
+            nn.Module: The SigLIP vision encoder module.
+        """
         return self.base_model.vision_tower
 
     def get_projector(self) -> nn.Module:
-        """Returns the multimodal projector component."""
+        """Return the multimodal projector component.
+
+        Provides access to the pixel-shuffle based projector that aligns
+        vision features to the language model's hidden dimension.
+
+        Returns:
+            nn.Module: The AyaVisionMultiModalProjector module.
+        """
         return self.base_model.multi_modal_projector
 
     def get_language_model(self) -> nn.Module:
-        """Returns the language model component."""
+        """Return the language model component.
+
+        Provides access to the underlying Cohere2 language model for
+        text generation and hidden state computation.
+
+        Returns:
+            nn.Module: The Cohere2 language model module.
+        """
         return self.base_model.language_model

@@ -62,7 +62,23 @@ from .roberta_configuration import RobertaConfig as RobertaConfig
 
 
 class RobertaEmbeddings(nn.Module):
-    """Construct the embeddings from word, position, and token_type embeddings for RoBERTa."""
+    """Embedding layer for RoBERTa model.
+
+    This layer constructs the combined embeddings from word, position, and
+    token type embeddings used in the RoBERTa encoder. It includes layer
+    normalization and dropout for regularization.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations. Defaults to jnp.float32.
+        param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+        precision (lax.Precision): Precision setting for JAX operations.
+        word_embeddings (nn.Embed): Token embedding layer.
+        position_embeddings (nn.Embed): Position embedding layer.
+        token_type_embeddings (nn.Embed): Token type (segment) embedding layer.
+        LayerNorm (nn.LayerNorm): Layer normalization applied after embedding sum.
+        dropout (nn.Dropout): Dropout layer for regularization.
+    """
 
     def __init__(
         self,
@@ -120,6 +136,24 @@ class RobertaEmbeddings(nn.Module):
         position_ids,
         attention_mask,
     ):
+        """Forward pass of the RobertaEmbeddings layer.
+
+        Computes the combined embeddings by summing word, position, and token type
+        embeddings, then applies layer normalization and dropout.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
+            token_type_ids (Array): Token type IDs of shape (batch_size, sequence_length)
+                for distinguishing different segments (e.g., sentence A vs B).
+            position_ids (Array): Position IDs of shape (batch_size, sequence_length)
+                for positional encoding.
+            attention_mask (Array): Attention mask of shape (batch_size, sequence_length)
+                indicating which tokens to attend to.
+
+        Returns:
+            Array: Combined embeddings of shape (batch_size, sequence_length, hidden_size)
+                after layer normalization and dropout.
+        """
         inputs_embeds = self.word_embeddings(input_ids.astype("i4"))
         position_embeds = self.position_embeddings(position_ids.astype("i4"))
         token_type_embeddings = self.token_type_embeddings(token_type_ids.astype("i4"))
@@ -132,7 +166,25 @@ class RobertaEmbeddings(nn.Module):
 
 
 class RobertaSelfAttention(AttentionModule):
-    """Multi-head self-attention used throughout RoBERTa layers."""
+    """Multi-head self-attention module for RoBERTa.
+
+    This module implements the standard multi-head self-attention mechanism used
+    throughout RoBERTa encoder layers. It supports both self-attention and
+    cross-attention configurations.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        causal (bool): Whether to apply causal (unidirectional) attention masking.
+            Defaults to False for bidirectional attention.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        head_dim (int): Dimension of each attention head.
+        attention_performer (FlexibleAttentionModule): Module for computing attention.
+        query (ColumnParallelLinear): Query projection layer.
+        key (ColumnParallelLinear): Key projection layer.
+        value (ColumnParallelLinear): Value projection layer.
+    """
 
     def __init__(
         self,
@@ -188,6 +240,14 @@ class RobertaSelfAttention(AttentionModule):
         )
 
     def _split_heads(self, hidden_states):
+        """Splits the hidden states into multiple attention heads.
+
+        Args:
+            hidden_states (Array): Hidden states of shape (batch, seq_len, hidden_size).
+
+        Returns:
+            Array: Reshaped states of shape (batch, seq_len, num_heads, head_dim).
+        """
         return hidden_states.reshape((*hidden_states.shape[:2], self.config.num_attention_heads, self.head_dim))
 
     def _merge_heads(self, hidden_states):
@@ -213,6 +273,31 @@ class RobertaSelfAttention(AttentionModule):
         key_value_states: Float[Array, "batch seq_len hidden_dim"] | None = None,
         output_attentions: bool = False,
     ):
+        """Forward pass of the RobertaSelfAttention module.
+
+        Computes multi-head self-attention (or cross-attention if key_value_states
+        is provided) on the input hidden states.
+
+        Args:
+            hidden_states (Array): Input hidden states of shape (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo, optional): Pre-computed mask information for attention.
+            layer_head_mask (Array, optional): Mask for individual attention heads of shape
+                (num_heads,). Used to selectively disable specific heads.
+            mode (RUNTIME_MODE_TYPES): Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER).
+            cache_view (TransformerCacheView | RaggedPagesCacheView, optional): Cache view
+                for key/value states in autoregressive generation.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata
+                for cache handling.
+            key_value_states (Array, optional): Key/value states for cross-attention.
+                If provided, performs cross-attention instead of self-attention.
+            output_attentions (bool): Whether to return attention weights.
+
+        Returns:
+            AttentionLayerOutput: Named tuple containing:
+                - attention_output: Attention output of shape (batch, seq_len, hidden_dim)
+                - attention_weight: Attention weights if output_attentions=True, else None
+                - cache_view: Updated cache view
+        """
         is_cross_attention = key_value_states is not None
 
         query_states = checkpoint_name(self.query(hidden_states), "attn_query")
@@ -284,7 +369,20 @@ class RobertaSelfAttention(AttentionModule):
 
 
 class RobertaSelfOutput(nn.Module):
-    """Dense projection and dropout following RoBERTa self-attention."""
+    """Output projection layer following RoBERTa self-attention.
+
+    This module applies a dense projection, dropout, and residual connection
+    with layer normalization after the self-attention operation.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        dense (RowParallelLinear): Dense projection layer.
+        LayerNorm (nn.LayerNorm): Layer normalization for residual connection.
+        dropout (nn.Dropout): Dropout layer for regularization.
+    """
 
     def __init__(
         self,
@@ -318,6 +416,18 @@ class RobertaSelfOutput(nn.Module):
         self.dropout = nn.Dropout(rate=self.config.hidden_dropout_prob, rngs=rngs)
 
     def __call__(self, hidden_states, input_tensor):
+        """Forward pass of the RobertaSelfOutput layer.
+
+        Args:
+            hidden_states (Array): Output from the self-attention layer of shape
+                (batch, seq_len, hidden_dim).
+            input_tensor (Array): Original input to the attention block for residual
+                connection of shape (batch, seq_len, hidden_dim).
+
+        Returns:
+            Array: Output hidden states of shape (batch, seq_len, hidden_dim) after
+                projection, dropout, and layer normalization with residual connection.
+        """
         hidden_states = checkpoint_name(self.dense(hidden_states), "attn_dense")
         hidden_states = self.dropout(hidden_states)
         hidden_states = checkpoint_name(self.LayerNorm(hidden_states + input_tensor), "residual")
@@ -325,7 +435,20 @@ class RobertaSelfOutput(nn.Module):
 
 
 class RobertaAttention(nn.Module):
-    """Full attention module combining self-attention and its output projection."""
+    """Full attention module combining self-attention and output projection.
+
+    This module wraps the self-attention mechanism and its output projection,
+    providing the complete attention sub-layer used in each RoBERTa encoder layer.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        causal (bool): Whether to apply causal attention masking.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        self (RobertaSelfAttention): Self-attention module.
+        output (RobertaSelfOutput): Output projection module.
+    """
 
     def __init__(
         self,
@@ -369,6 +492,24 @@ class RobertaAttention(nn.Module):
         key_value_states=None,
         output_attentions: bool = False,
     ):
+        """Forward pass of the RobertaAttention module.
+
+        Args:
+            hidden_states (Array): Input hidden states of shape (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo, optional): Pre-computed mask information for attention.
+            layer_head_mask (Array): Mask for individual attention heads.
+            mode (RUNTIME_MODE_TYPES): Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER).
+            cache_view (TransformerCacheView | RaggedPagesCacheView, optional): Cache view
+                for key/value states.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata
+                for cache handling.
+            key_value_states (Array, optional): Key/value states for cross-attention.
+            output_attentions (bool): Whether to return attention weights.
+
+        Returns:
+            AttentionLayerOutput: Output containing attention results with residual connection
+                and layer normalization applied.
+        """
         attn_outputs = self.self(
             hidden_states=hidden_states,
             mask_info=mask_info,
@@ -386,7 +527,20 @@ class RobertaAttention(nn.Module):
 
 
 class RobertaIntermediate(nn.Module):
-    """First feed-forward layer of the RoBERTa transformer MLP."""
+    """Intermediate (up-projection) layer of the RoBERTa feed-forward network.
+
+    This module implements the first dense layer of the two-layer MLP used
+    in each RoBERTa encoder layer, expanding the hidden dimension to the
+    intermediate size and applying an activation function.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        dense (ColumnParallelLinear): Dense layer projecting to intermediate size.
+        activation (callable): Activation function (typically GELU).
+    """
 
     def __init__(
         self,
@@ -415,13 +569,37 @@ class RobertaIntermediate(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Forward pass of the RobertaIntermediate layer.
+
+        Args:
+            hidden_states (Array): Input hidden states of shape
+                (batch, seq_len, hidden_dim).
+
+        Returns:
+            Array: Intermediate hidden states of shape (batch, seq_len, intermediate_size)
+                after dense projection and activation.
+        """
         hidden_states = checkpoint_name(self.dense(hidden_states), "mlp_up")
         hidden_states = checkpoint_name(self.activation(hidden_states), "mlp_gate")
         return hidden_states
 
 
 class RobertaOutput(nn.Module):
-    """Output feed-forward layer with dropout and residual connection."""
+    """Output (down-projection) layer of the RoBERTa feed-forward network.
+
+    This module implements the second dense layer of the two-layer MLP,
+    projecting back from intermediate size to hidden size. Includes dropout
+    for regularization and layer normalization with residual connection.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        dense (RowParallelLinear): Dense layer projecting back to hidden size.
+        dropout (nn.Dropout): Dropout layer for regularization.
+        LayerNorm (nn.LayerNorm): Layer normalization for residual connection.
+    """
 
     def __init__(
         self,
@@ -458,6 +636,18 @@ class RobertaOutput(nn.Module):
         )
 
     def __call__(self, hidden_states, attention_output):
+        """Forward pass of the RobertaOutput layer.
+
+        Args:
+            hidden_states (Array): Intermediate hidden states from RobertaIntermediate
+                of shape (batch, seq_len, intermediate_size).
+            attention_output (Array): Output from the attention sub-layer for residual
+                connection of shape (batch, seq_len, hidden_dim).
+
+        Returns:
+            Array: Output hidden states of shape (batch, seq_len, hidden_dim) after
+                down-projection, dropout, and layer normalization with residual.
+        """
         hidden_states = checkpoint_name(self.dense(hidden_states), "mlp_down")
         hidden_states = self.dropout(hidden_states)
         hidden_states = checkpoint_name(self.LayerNorm(hidden_states + attention_output), "layer_output")
@@ -465,7 +655,23 @@ class RobertaOutput(nn.Module):
 
 
 class RobertaLayer(nn.Module):
-    """Single RoBERTa transformer encoder layer."""
+    """Single RoBERTa transformer encoder layer.
+
+    This module represents a complete encoder layer in the RoBERTa model,
+    containing self-attention, optional cross-attention, and feed-forward
+    sub-layers with residual connections and layer normalization.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        attention (RobertaAttention): Self-attention sub-layer.
+        intermediate (RobertaIntermediate): MLP up-projection sub-layer.
+        output (RobertaOutput): MLP down-projection sub-layer.
+        crossattention (RobertaAttention, optional): Cross-attention sub-layer
+            for encoder-decoder configurations.
+    """
 
     def __init__(
         self,
@@ -524,6 +730,32 @@ class RobertaLayer(nn.Module):
         encoder_mask_info: MaskInfo | None = None,
         output_attentions: bool = False,
     ):
+        """Forward pass of a single RobertaLayer.
+
+        Processes input through self-attention, optional cross-attention (if
+        encoder_hidden_states provided), and feed-forward sub-layers.
+
+        Args:
+            hidden_states (Array): Input hidden states of shape (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo, optional): Pre-computed mask information for self-attention.
+            layer_head_mask (Array): Mask for individual attention heads.
+            mode (RUNTIME_MODE_TYPES): Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER).
+            cache_view (TransformerCacheView | RaggedPagesCacheView, optional): Cache view
+                for key/value states.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata
+                for cache handling.
+            encoder_hidden_states (Array, optional): Hidden states from encoder for
+                cross-attention in encoder-decoder configurations.
+            encoder_mask_info (MaskInfo, optional): Mask information for encoder states.
+            output_attentions (bool): Whether to return attention weights.
+
+        Returns:
+            DecoderLayerOutput: Named tuple containing:
+                - hidden_states: Output hidden states of shape (batch, seq_len, hidden_dim)
+                - attention_weight: Self-attention weights if output_attentions=True
+                - cross_attention: Cross-attention output if encoder_hidden_states provided
+                - cache_view: Updated cache view
+        """
         # Self Attention
         attention_outputs = self.attention(
             hidden_states=hidden_states,
@@ -563,7 +795,19 @@ class RobertaLayer(nn.Module):
 
 
 class RobertaEncoder(nn.Module):
-    """Stack of RoBERTa encoder layers with optional gradient checkpointing."""
+    """Stack of RoBERTa encoder layers.
+
+    This module contains the stack of transformer encoder layers that form
+    the core of the RoBERTa model. Supports gradient checkpointing for
+    memory-efficient training of deep models.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        layer (list[RobertaLayer]): List of encoder layers.
+    """
 
     def __init__(
         self,
@@ -609,6 +853,38 @@ class RobertaEncoder(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
+        """Forward pass through all RoBERTa encoder layers.
+
+        Processes input through the full stack of encoder layers, optionally
+        collecting intermediate hidden states and attention weights.
+
+        Args:
+            hidden_states (Array): Input hidden states from embeddings of shape
+                (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo, optional): Pre-computed mask information for attention.
+            head_mask (Array): Mask for attention heads with shape (num_layers, num_heads).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (MODE_TRAIN, MODE_DECODE, MODE_INFER).
+            encoder_hidden_states (Array, optional): Hidden states from encoder for
+                cross-attention in encoder-decoder configurations.
+            encoder_mask_info (MaskInfo, optional): Mask information for encoder states.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                Cached key/value states for efficient autoregressive generation.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata
+                for cache handling.
+            output_attentions (bool): Whether to return attention weights from all layers.
+            output_hidden_states (bool): Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutputWithPastAndCrossAttentions: Named tuple containing:
+                - last_hidden_state: Final layer output of shape (batch, seq_len, hidden_dim)
+                - past_key_values: Updated cache for next generation step
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+                - cross_attentions: Tuple of cross-attention outputs if applicable
+
+        Raises:
+            ValueError: If head_mask has incorrect number of layers specified.
+        """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
         all_cross_attentions = () if encoder_hidden_states is not None else None
@@ -661,7 +937,19 @@ class RobertaEncoder(nn.Module):
 
 
 class RobertaPooler(nn.Module):
-    """Pooling layer that projects the first token representation."""
+    """Pooling layer for sequence-level representations.
+
+    This module extracts the representation of the first token ([CLS] token)
+    and projects it through a dense layer with tanh activation, producing
+    a fixed-size vector for sequence classification tasks.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        dense (RowParallelLinear): Dense projection layer for pooled output.
+    """
 
     def __init__(
         self,
@@ -689,13 +977,41 @@ class RobertaPooler(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Forward pass of the RobertaPooler layer.
+
+        Extracts the first token representation and applies dense projection
+        with tanh activation.
+
+        Args:
+            hidden_states (Array): Hidden states from encoder of shape
+                (batch, seq_len, hidden_dim).
+
+        Returns:
+            Array: Pooled output of shape (batch, hidden_dim) representing
+                the sequence-level encoding.
+        """
         cls_hidden_state = hidden_states[:, 0]
         cls_hidden_state = self.dense(cls_hidden_state)
         return nn.tanh(cls_hidden_state)
 
 
 class RobertaLMHead(nn.Module):
-    """Language modeling head for masked language modeling on top of RoBERTa."""
+    """Language modeling head for masked language modeling.
+
+    This module implements the prediction head for masked language modeling (MLM)
+    tasks on top of RoBERTa. It consists of a dense layer, GELU activation,
+    layer normalization, and a decoder layer projecting to vocabulary size.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        dense (RowParallelLinear): Dense transformation layer.
+        layer_norm (nn.LayerNorm): Layer normalization.
+        decoder (RowParallelLinear): Projection layer to vocabulary size.
+        bias (ArrayParam): Output bias for vocabulary predictions.
+    """
 
     def __init__(
         self,
@@ -744,6 +1060,20 @@ class RobertaLMHead(nn.Module):
         )
 
     def __call__(self, hidden_states, shared_embedding=None):
+        """Forward pass of the RobertaLMHead.
+
+        Transforms hidden states through dense layer, GELU activation,
+        layer normalization, and decoder projection to produce vocabulary logits.
+
+        Args:
+            hidden_states (Array): Hidden states from encoder of shape
+                (batch, seq_len, hidden_dim).
+            shared_embedding (Array, optional): Shared embedding weights for
+                weight tying. If provided, uses transposed embeddings as decoder weights.
+
+        Returns:
+            Array: Vocabulary logits of shape (batch, seq_len, vocab_size).
+        """
         hidden_states = self.dense(hidden_states)
         hidden_states = ACT2FN["gelu"](hidden_states)
         hidden_states = self.layer_norm(hidden_states)
@@ -758,7 +1088,22 @@ class RobertaLMHead(nn.Module):
 
 
 class RobertaClassificationHead(nn.Module):
-    """Classifier head used for sequence-level classification tasks."""
+    """Classification head for sequence-level classification tasks.
+
+    This module implements the classification head used for sequence
+    classification tasks like sentiment analysis. It takes the [CLS] token
+    representation and applies dropout, dense layer, tanh activation,
+    another dropout, and final projection to class logits.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        dense (RowParallelLinear): Hidden layer projection.
+        dropout (nn.Dropout): Dropout for regularization.
+        out_proj (RowParallelLinear): Output projection to number of labels.
+    """
 
     def __init__(
         self,
@@ -804,6 +1149,17 @@ class RobertaClassificationHead(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Forward pass of the RobertaClassificationHead.
+
+        Extracts [CLS] token, applies transformations, and projects to class logits.
+
+        Args:
+            hidden_states (Array): Hidden states from encoder of shape
+                (batch, seq_len, hidden_dim).
+
+        Returns:
+            Array: Classification logits of shape (batch, num_labels).
+        """
         hidden_states = hidden_states[:, 0, :]
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.dense(hidden_states)
@@ -815,7 +1171,23 @@ class RobertaClassificationHead(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=RobertaConfig, model_type="roberta")
 class RobertaModel(EasyDeLBaseModule):
-    """RoBERTa encoder composed of embeddings, stacked layers, and pooling."""
+    """RoBERTa base model implementation.
+
+    This class implements the main RoBERTa encoder architecture, consisting of
+    embedding layers (word, position, and token type), multiple encoder layers,
+    and an optional pooling layer. RoBERTa uses dynamic masking and removes the
+    next sentence prediction objective compared to BERT.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        embeddings (RobertaEmbeddings): Embedding layer for input processing.
+        encoder (RobertaEncoder): Stack of transformer encoder layers.
+        pooler (RobertaPooler, optional): Pooling layer for sequence-level representations.
+        add_pooling_layer (bool): Whether to include the pooling layer.
+    """
 
     def __init__(
         self,
@@ -874,6 +1246,37 @@ class RobertaModel(EasyDeLBaseModule):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
+        """Forward pass through the RoBERTa model.
+
+        Processes input tokens through embeddings, encoder layers, and optional
+        pooling layer. Supports bidirectional encoding and optional cross-attention
+        for encoder-decoder configurations.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
+            attention_mask (Array, optional): Boolean mask of shape (batch_size, sequence_length)
+                indicating which tokens to attend to (True) and which to ignore (False).
+                Auto-generated as all ones if not provided.
+            token_type_ids (Array, optional): Token type IDs of shape (batch_size, sequence_length)
+                for distinguishing segments. Defaults to zeros if not provided.
+            position_ids (Array, optional): Position indices of shape (batch_size, sequence_length).
+                Auto-generated following RoBERTa's scheme if not provided.
+            head_mask (Array, optional): Mask for attention heads with shape (num_layers, num_heads).
+            encoder_hidden_states (Array, optional): Hidden states from encoder for cross-attention.
+            encoder_attention_mask (Array, optional): Mask for encoder hidden states.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                Cached key/value states for efficient generation.
+            output_attentions (bool): Whether to return attention weights from all layers.
+            output_hidden_states (bool): Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutputWithPoolingAndCrossAttentions: Named tuple containing:
+                - last_hidden_state: Final layer output of shape (batch, seq_len, hidden_size)
+                - pooler_output: Pooled [CLS] representation if add_pooling_layer=True
+                - hidden_states: Tuple of all layer outputs if output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+                - cross_attentions: Tuple of cross-attention weights if applicable
+        """
         # make sure `token_type_ids` is correctly initialized when not passed
         if token_type_ids is None:
             token_type_ids = jnp.zeros_like(input_ids)
@@ -985,7 +1388,20 @@ class RobertaModel(EasyDeLBaseModule):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=RobertaConfig, model_type="roberta")
 class RobertaForSequenceClassification(BaseSequenceClassificationModule[RobertaModel, RobertaConfig]):
-    """RoBERTa backbone with a classification head for sequence-level labels."""
+    """RoBERTa model with a classification head for sequence classification.
+
+    This model extends the base RoBERTa model by adding a classification head
+    on top for sequence-level classification tasks such as sentiment analysis,
+    natural language inference, or text categorization.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        roberta (RobertaModel): Base RoBERTa encoder model.
+        classifier (RobertaClassificationHead): Classification head for sequence labels.
+    """
 
     def __init__(
         self,
@@ -1033,6 +1449,23 @@ class RobertaForSequenceClassification(BaseSequenceClassificationModule[RobertaM
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
+        """Forward pass for sequence classification.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
+            attention_mask (Array, optional): Attention mask of shape (batch_size, sequence_length).
+            token_type_ids (Array, optional): Token type IDs for segment distinction.
+            position_ids (Array, optional): Position indices for positional encoding.
+            head_mask (Array, optional): Mask for attention heads.
+            output_attentions (bool): Whether to return attention weights.
+            output_hidden_states (bool): Whether to return all hidden states.
+
+        Returns:
+            SequenceClassifierOutput: Named tuple containing:
+                - logits: Classification logits of shape (batch, num_labels)
+                - hidden_states: Tuple of hidden states if output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+        """
         # Model
         outputs = self.roberta(
             input_ids=input_ids,
@@ -1054,29 +1487,27 @@ class RobertaForSequenceClassification(BaseSequenceClassificationModule[RobertaM
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        """
+        """Returns the encoder part of the model."""
         return self.roberta
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        RoBERTa is an encoder-only model.
+        """Returns the decoder part of the model.
+
+        Raises:
+            NotImplementedError: RoBERTa is an encoder-only model.
         """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        This model has a sequence classification head, not an LM Head.
+        """Returns the language model head.
+
+        Raises:
+            NotImplementedError: This model has a classification head, not an LM head.
         """
         raise NotImplementedError("This model has a sequence classification head, not a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
+        """Returns the embedding layer of the model."""
         return self.roberta.get_embedding()
 
     def get_task_head(self):
@@ -1085,7 +1516,21 @@ class RobertaForSequenceClassification(BaseSequenceClassificationModule[RobertaM
 
 
 class RobertaForMultipleChoice(EasyDeLBaseModule):
-    """RoBERTa encoder adapted for multiple-choice tasks with per-option scoring."""
+    """RoBERTa model for multiple-choice classification tasks.
+
+    This model extends RoBERTa for multiple-choice tasks where each example
+    has several possible answers. The input is reshaped to process all choices
+    in parallel, and the model outputs a score for each choice.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        roberta (RobertaModel): Base RoBERTa encoder model with pooling.
+        dropout (nn.Dropout): Dropout layer for regularization.
+        classifier (ColumnParallelLinear): Linear layer projecting to single score per choice.
+    """
 
     def __init__(
         self,
@@ -1133,6 +1578,26 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
+        """Forward pass for multiple-choice classification.
+
+        Reshapes inputs from (batch, num_choices, seq_len) to (batch*num_choices, seq_len),
+        processes through RoBERTa, and produces scores for each choice.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch, num_choices, seq_len).
+            attention_mask (Array): Attention mask of shape (batch, num_choices, seq_len).
+            token_type_ids (Array): Token type IDs of shape (batch, num_choices, seq_len).
+            position_ids (Array): Position IDs of shape (batch, num_choices, seq_len).
+            head_mask (Array): Mask for attention heads.
+            output_attentions (bool): Whether to return attention weights.
+            output_hidden_states (bool): Whether to return all hidden states.
+
+        Returns:
+            MultipleChoiceModelOutput: Named tuple containing:
+                - logits: Choice scores of shape (batch, num_choices)
+                - hidden_states: Tuple of hidden states if output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+        """
         num_choices = input_ids.shape[1]
         input_ids = input_ids.reshape(-1, input_ids.shape[-1]) if input_ids is not None else None
         attention_mask = attention_mask.reshape(-1, attention_mask.shape[-1]) if attention_mask is not None else None
@@ -1163,34 +1628,46 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        """
+        """Returns the encoder part of the model."""
         return self.roberta
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        RoBERTa is an encoder-only model.
+        """Returns the decoder part of the model.
+
+        Raises:
+            NotImplementedError: RoBERTa is an encoder-only model.
         """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        This model has a multiple choice classification head, not an LM Head.
+        """Returns the language model head.
+
+        Raises:
+            NotImplementedError: This model has a multiple choice head, not an LM head.
         """
         raise NotImplementedError("This model has a multiple choice classification head, not a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
+        """Returns the embedding layer of the model."""
         return self.roberta.get_embedding()
 
 
 class RobertaForTokenClassification(BaseTokenClassificationModule[RobertaModel, RobertaConfig]):
-    """RoBERTa encoder with token classification head for per-token labels."""
+    """RoBERTa model with a token classification head.
+
+    This model extends RoBERTa for token-level classification tasks such as
+    Named Entity Recognition (NER) or Part-of-Speech (POS) tagging, where
+    each token in the sequence receives a label.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        roberta (RobertaModel): Base RoBERTa encoder model without pooling.
+        dropout (nn.Dropout): Dropout layer for regularization.
+        classifier (nn.Linear): Linear layer projecting to number of labels per token.
+    """
 
     def __init__(
         self,
@@ -1234,6 +1711,23 @@ class RobertaForTokenClassification(BaseTokenClassificationModule[RobertaModel, 
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
+        """Forward pass for token classification.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
+            attention_mask (Array): Attention mask of shape (batch_size, sequence_length).
+            token_type_ids (Array): Token type IDs for segment distinction.
+            position_ids (Array): Position indices for positional encoding.
+            head_mask (Array): Mask for attention heads.
+            output_attentions (bool): Whether to return attention weights.
+            output_hidden_states (bool): Whether to return all hidden states.
+
+        Returns:
+            TokenClassifierOutput: Named tuple containing:
+                - logits: Token classification logits of shape (batch, seq_len, num_labels)
+                - hidden_states: Tuple of hidden states if output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+        """
         # Model
         outputs = self.roberta(
             input_ids=input_ids,
@@ -1263,29 +1757,27 @@ class RobertaForTokenClassification(BaseTokenClassificationModule[RobertaModel, 
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        """
+        """Returns the encoder part of the model."""
         return self.roberta
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        RoBERTa is an encoder-only model.
+        """Returns the decoder part of the model.
+
+        Raises:
+            NotImplementedError: RoBERTa is an encoder-only model.
         """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        This model has a token classification head, not an LM Head.
+        """Returns the language model head.
+
+        Raises:
+            NotImplementedError: This model has a token classification head, not an LM head.
         """
         raise NotImplementedError("This model has a token classification head, not a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
+        """Returns the embedding layer of the model."""
         return self.roberta.get_embedding()
 
     def get_task_head(self):
@@ -1294,7 +1786,20 @@ class RobertaForTokenClassification(BaseTokenClassificationModule[RobertaModel, 
 
 
 class RobertaForQuestionAnswering(BaseQuestionAnsweringModule[RobertaModel, RobertaConfig]):
-    """RoBERTa encoder with start/end span heads for extractive QA."""
+    """RoBERTa model for extractive question answering.
+
+    This model extends RoBERTa for extractive QA tasks where the answer is
+    a span within the input context. It predicts start and end positions
+    of the answer span.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        roberta (RobertaModel): Base RoBERTa encoder model without pooling.
+        qa_outputs (nn.Linear): Linear layer for start/end position predictions.
+    """
 
     def __init__(
         self,
@@ -1333,6 +1838,24 @@ class RobertaForQuestionAnswering(BaseQuestionAnsweringModule[RobertaModel, Robe
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
+        """Forward pass for question answering.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
+            attention_mask (Array): Attention mask of shape (batch_size, sequence_length).
+            token_type_ids (Array): Token type IDs for segment distinction.
+            position_ids (Array): Position indices for positional encoding.
+            head_mask (Array): Mask for attention heads.
+            output_attentions (bool): Whether to return attention weights.
+            output_hidden_states (bool): Whether to return all hidden states.
+
+        Returns:
+            QuestionAnsweringModelOutput: Named tuple containing:
+                - start_logits: Start position logits of shape (batch, seq_len)
+                - end_logits: End position logits of shape (batch, seq_len)
+                - hidden_states: Tuple of hidden states if output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+        """
         # Model
         outputs = self.roberta(
             input_ids=input_ids,
@@ -1365,29 +1888,27 @@ class RobertaForQuestionAnswering(BaseQuestionAnsweringModule[RobertaModel, Robe
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        """
+        """Returns the encoder part of the model."""
         return self.roberta
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        RoBERTa is an encoder-only model.
+        """Returns the decoder part of the model.
+
+        Raises:
+            NotImplementedError: RoBERTa is an encoder-only model.
         """
         raise NotImplementedError("This is an encoder-only model and does not have a decoder.")
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        This model has a question answering head, not an LM Head.
+        """Returns the language model head.
+
+        Raises:
+            NotImplementedError: This model has a QA head, not an LM head.
         """
         raise NotImplementedError("This model has a question answering head, not a language model head.")
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
+        """Returns the embedding layer of the model."""
         return self.roberta.get_embedding()
 
     def get_task_head(self):
@@ -1397,7 +1918,20 @@ class RobertaForQuestionAnswering(BaseQuestionAnsweringModule[RobertaModel, Robe
 
 @register_module(TaskType.CAUSAL_LM, config=RobertaConfig, model_type="roberta")
 class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):
-    """RoBERTa repurposed for causal language modeling with an LM head."""
+    """RoBERTa model with a causal language modeling head.
+
+    This model adapts RoBERTa for causal (autoregressive) language modeling,
+    predicting the next token in a sequence. It uses a language modeling head
+    with dense projection, GELU activation, and output vocabulary projection.
+
+    Attributes:
+        config (RobertaConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (lax.Precision): Precision setting for JAX operations.
+        roberta (RobertaModel): Base RoBERTa encoder model without pooling.
+        lm_head (RobertaLMHead): Language modeling head for next token prediction.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "roberta"
@@ -1447,6 +1981,15 @@ class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):
         )
 
     def apply_lm_head(self, hidden_states: Array) -> Array:
+        """Apply the language modeling head to hidden states.
+
+        Args:
+            hidden_states (Array): Hidden states from encoder of shape
+                (batch, seq_len, hidden_dim).
+
+        Returns:
+            Array: Vocabulary logits of shape (batch, seq_len, vocab_size).
+        """
         shared_embedding = (
             self.roberta.embeddings.word_embeddings.embedding.value if self.config.tie_word_embeddings else None
         )
@@ -1466,6 +2009,29 @@ class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
+        """Forward pass for causal language modeling.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch_size, sequence_length).
+            attention_mask (Array, optional): Attention mask of shape (batch_size, sequence_length).
+            mask_info (MaskInfo, optional): Pre-computed mask information.
+            position_ids (Array, optional): Position indices for positional encoding.
+            token_type_ids (Array, optional): Token type IDs for segment distinction.
+            head_mask (Array, optional): Mask for attention heads.
+            encoder_hidden_states (Array, optional): Hidden states from encoder for cross-attention.
+            encoder_attention_mask (Array, optional): Mask for encoder hidden states.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                Cached key/value states for efficient autoregressive generation.
+            output_attentions (bool): Whether to return attention weights.
+            output_hidden_states (bool): Whether to return all hidden states.
+
+        Returns:
+            CausalLMOutputWithCrossAttentions: Named tuple containing:
+                - logits: Vocabulary logits of shape (batch, seq_len, vocab_size)
+                - hidden_states: Tuple of hidden states if output_hidden_states=True
+                - attentions: Tuple of attention weights if output_attentions=True
+                - cross_attentions: Tuple of cross-attention weights if applicable
+        """
         # Model
         outputs = self.roberta(
             input_ids=input_ids,
@@ -1498,26 +2064,21 @@ class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):
         )
 
     def get_encoder(self):
-        """
-        Returns the encoder part of the model's graph definition.
-        This model is adapted as a decoder, so it has no separate encoder.
+        """Returns the encoder part of the model.
+
+        Raises:
+            NotImplementedError: This causal LM model does not have a separate encoder.
         """
         raise NotImplementedError("This CausalLM model does not have a separate encoder.")
 
     def get_decoder(self):
-        """
-        Returns the decoder part of the model's graph definition.
-        """
+        """Returns the decoder part of the model."""
         return self.roberta.get_decoder()
 
     def get_lm_head(self):
-        """
-        Returns the language model head of the module.
-        """
+        """Returns the language model head."""
         return self.lm_head
 
     def get_embedding(self):
-        """
-        Returns the embedding layer of the module.
-        """
+        """Returns the embedding layer of the model."""
         return self.roberta.get_embedding()

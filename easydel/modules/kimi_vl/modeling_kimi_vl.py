@@ -14,13 +14,26 @@
 
 """EasyDeL implementation of MoonshotAI Kimi-VL.
 
-Implements the vision tower (MoonViT) and the multimodal wrapper around
-DeepSeek-V3 (MoE) language model, matching the HuggingFace trust_remote_code
-structure and parameter naming:
+This module implements the Kimi-VL vision-language model, which combines:
+- MoonViT: A vision transformer encoder for processing images
+- Multi-modal projector: Projects vision features to language model space
+- DeepSeek-V3: A Mixture of Experts language model backbone
 
-- `vision_tower.*`
-- `multi_modal_projector.*`
-- `language_model.*` (DeepseekV3ForCausalLM)
+The architecture follows the HuggingFace trust_remote_code structure
+and parameter naming conventions:
+- `vision_tower.*`: MoonViT vision encoder components
+- `multi_modal_projector.*`: Vision-to-language projection layers
+- `language_model.*`: DeepseekV3ForCausalLM backbone
+
+Key features:
+- 2D rotary position embeddings for vision transformers
+- Learnable 2D position embeddings with interpolation
+- Block-diagonal attention for multi-image processing
+- Patch merging for efficient feature compression
+- Seamless integration with DeepSeek-V3 MoE language model
+
+References:
+    - Kimi-VL: https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct
 """
 
 from __future__ import annotations
@@ -46,8 +59,20 @@ from .kimi_vl_configuration import KimiVLConfig, MoonViTConfig
 def _create_block_diagonal_bias(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
     """Create block-diagonal attention bias from cumulative sequence lengths.
 
+    This function creates a block-diagonal attention mask where each block
+    corresponds to one image/segment. Positions within the same segment
+    can attend to each other (bias=0), while cross-segment attention
+    is blocked (bias=-inf).
+
+    Args:
+        cu_seqlens (Array): Cumulative sequence lengths array of shape (num_segments + 1,).
+            For example, [0, 196, 392] for two 14x14 images.
+        seq_length (int): Total sequence length (sum of all segment lengths).
+        dtype (jnp.dtype): Data type for the output bias tensor.
+
     Returns:
-        Array[1, seq_length, seq_length] with 0 for allowed positions and -inf for disallowed.
+        Array: Attention bias of shape (1, seq_length, seq_length) with 0 for
+            allowed positions and -inf for disallowed cross-segment positions.
     """
     positions = jnp.arange(seq_length)
     starts = cu_seqlens[:-1]
@@ -65,11 +90,21 @@ def _apply_rope(
     xk: Array,
     freqs_cis: Array,
 ) -> tuple[Array, Array]:
-    """Apply complex RoPE to q/k.
+    """Apply complex-valued rotary position embeddings to queries and keys.
+
+    Uses complex number multiplication for efficient RoPE application.
+    The input tensors are converted to complex form, multiplied with
+    frequency components, and converted back to real representation.
 
     Args:
-        xq, xk: (..., num_heads, head_dim)
-        freqs_cis: (..., head_dim/2) complex
+        xq (Array): Query tensor of shape (..., num_heads, head_dim).
+        xk (Array): Key tensor of shape (..., num_heads, head_dim).
+        freqs_cis (Array): Complex frequency tensor of shape (..., head_dim/2).
+            Contains precomputed cos + i*sin values for each position.
+
+    Returns:
+        tuple[Array, Array]: Tuple of (rotated_queries, rotated_keys), each with
+            the same shape as the input tensors.
     """
     freqs_cis = freqs_cis[..., None, :]  # (..., 1, head_dim/2)
 
@@ -89,7 +124,18 @@ def _apply_rope(
 
 
 class Learnable2DInterpPosEmb(nn.Module):
-    """Learnable 2D positional embeddings with cubic interpolation."""
+    """Learnable 2D positional embeddings with resolution interpolation.
+
+    This module provides learnable position embeddings that can be interpolated
+    to different spatial resolutions. Uses cubic interpolation by default for
+    smooth scaling to arbitrary image sizes.
+
+    Attributes:
+        height (int): Base height for learned position embeddings.
+        width (int): Base width for learned position embeddings.
+        dim (int): Embedding dimension for each position.
+        interpolation_mode: Interpolation method for resizing (default: CUBIC).
+    """
 
     def __init__(
         self,
@@ -102,6 +148,20 @@ class Learnable2DInterpPosEmb(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize learnable 2D position embeddings.
+
+        Args:
+            height (int): Base height for the position embedding grid.
+            width (int): Base width for the position embedding grid.
+            dim (int): Embedding dimension for each spatial position.
+            interpolation_mode (jax.image.ResizeMethod, optional): Method for
+                interpolating to different resolutions. Defaults to CUBIC.
+            dtype (jnp.dtype, optional): Data type for computation.
+                Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters.
+                Defaults to jnp.bfloat16.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.height = height
         self.width = width
         self.dim = dim
@@ -112,6 +172,20 @@ class Learnable2DInterpPosEmb(nn.Module):
         self.dtype = dtype
 
     def __call__(self, x: Array, grid_hws: Array) -> Array:
+        """Add interpolated position embeddings to input features.
+
+        For each image in the batch (specified by grid_hws), interpolates
+        the learned position embeddings to match the image's patch grid
+        size and adds them to the corresponding features.
+
+        Args:
+            x (Array): Input feature tensor of shape (total_patches, dim).
+            grid_hws (Array): Array of (height, width) pairs for each image,
+                shape (num_images, 2).
+
+        Returns:
+            Array: Features with position embeddings added, same shape as input.
+        """
         pos_embs = []
         kernel = self.kernel.value.astype(jnp.float32).transpose(2, 1, 0)
         for h, w in grid_hws:
@@ -131,7 +205,17 @@ class Learnable2DInterpPosEmb(nn.Module):
 
 
 class MoonVisionPatchEmbed(nn.Module):
-    """Patch embedding for MoonViT (expects patchified inputs)."""
+    """Patch embedding layer for MoonViT vision transformer.
+
+    Converts image patches into embeddings using a convolution operation,
+    then adds learnable 2D position embeddings. Supports variable resolution
+    images through position embedding interpolation.
+
+    Attributes:
+        patch_size (int): Size of each image patch.
+        in_dim (int): Number of input channels (typically 3 for RGB).
+        out_dim (int): Output embedding dimension.
+    """
 
     def __init__(
         self,
@@ -146,6 +230,24 @@ class MoonVisionPatchEmbed(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize MoonViT patch embedding layer.
+
+        Args:
+            out_dim (int): Output embedding dimension for each patch.
+            in_dim (int, optional): Number of input channels. Defaults to 3.
+            patch_size (int, optional): Size of each square patch. Defaults to 14.
+            pos_emb_height (int, optional): Base height for position embeddings.
+                Defaults to 64.
+            pos_emb_width (int, optional): Base width for position embeddings.
+                Defaults to 64.
+            dtype (jnp.dtype, optional): Data type for computation.
+                Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters.
+                Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike | None, optional): Numerical precision.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.patch_size = patch_size
         self.in_dim = in_dim
         self.out_dim = out_dim
@@ -174,6 +276,22 @@ class MoonVisionPatchEmbed(nn.Module):
         )
 
     def __call__(self, pixel_values: Array, grid_hws: Array) -> Array:
+        """Embed image patches with position information.
+
+        Applies convolution to extract patch features and adds interpolated
+        2D position embeddings based on each image's grid dimensions.
+
+        Args:
+            pixel_values (Array): Input images of shape (num_patches, H, W, C)
+                or (num_patches, C, H, W). Automatically handles NCHW to NHWC
+                conversion.
+            grid_hws (Array): Array of (height, width) pairs for each image's
+                patch grid, shape (num_images, 2).
+
+        Returns:
+            Array: Embedded patches with position information added,
+                shape (total_patches, out_dim).
+        """
         if pixel_values.ndim == 4:
             # Convert from NCHW -> NHWC for JAX conv.
             pixel_values = jnp.transpose(pixel_values, (0, 2, 3, 1))
@@ -183,9 +301,36 @@ class MoonVisionPatchEmbed(nn.Module):
 
 
 class Rope2DPosEmb(nn.Module):
-    """2D rotary position embedding (complex cis) with multi-resolution support."""
+    """2D rotary position embedding for vision transformers.
+
+    Implements rotary position embeddings extended to 2D spatial grids
+    using complex number representation. Supports variable resolution
+    images by computing position embeddings on a fixed grid that can
+    be sliced for different image sizes.
+
+    The embedding uses separate frequency components for x and y positions,
+    concatenated along the last dimension to form the full 2D RoPE.
+
+    Attributes:
+        dim (int): Embedding dimension (must be divisible by 4).
+        max_height (int): Maximum supported grid height.
+        max_width (int): Maximum supported grid width.
+        theta_base (float): Base for frequency computation.
+    """
 
     def __init__(self, dim: int, max_height: int, max_width: int, theta_base: float = 10000.0):
+        """Initialize 2D rotary position embedding.
+
+        Args:
+            dim (int): Embedding dimension (must be divisible by 4 for x/y split).
+            max_height (int): Maximum grid height to precompute embeddings for.
+            max_width (int): Maximum grid width to precompute embeddings for.
+            theta_base (float, optional): Base for computing frequency bands.
+                Defaults to 10000.0.
+
+        Raises:
+            ValueError: If dim is not divisible by 4.
+        """
         self.dim = dim
         if dim % 4 != 0:
             raise ValueError("dim must be divisible by 4")
@@ -195,6 +340,14 @@ class Rope2DPosEmb(nn.Module):
 
     @cached_property
     def freqs_cis(self) -> Array:
+        """Precomputed complex frequency tensor for the full grid.
+
+        Computes e^(i * pos * freq) for all positions in the maximum grid,
+        combining x and y position frequencies.
+
+        Returns:
+            Array: Complex frequency tensor of shape (max_height, max_width, dim/2).
+        """
         n = self.max_height * self.max_width
         flat_pos = jnp.arange(n, dtype=jnp.float32)
         x_pos = flat_pos % self.max_width
@@ -209,6 +362,21 @@ class Rope2DPosEmb(nn.Module):
         return freqs_cis.reshape(self.max_height, self.max_width, -1)
 
     def get_freqs_cis(self, grid_hws: Array) -> Array:
+        """Get concatenated frequency tensors for multiple images.
+
+        Slices the precomputed frequency tensor for each image's grid
+        dimensions and concatenates them along the sequence dimension.
+
+        Args:
+            grid_hws (Array): Array of (height, width) pairs for each image,
+                shape (num_images, 2).
+
+        Returns:
+            Array: Concatenated frequency tensor of shape (total_patches, dim/2).
+
+        Raises:
+            ValueError: If any grid dimension exceeds the maximum supported size.
+        """
         shapes = [(int(h), int(w)) for h, w in grid_hws]
         if not all(1 <= h <= self.max_height and 1 <= w <= self.max_width for h, w in shapes):
             raise ValueError(f"grid_hws out of range: {shapes} vs {(self.max_height, self.max_width)}")
@@ -217,7 +385,16 @@ class Rope2DPosEmb(nn.Module):
 
 
 class MLP2(nn.Module):
-    """Two-layer MLP used in MoonViT blocks (matches HF naming `fc0`/`fc1`)."""
+    """Two-layer feedforward network for MoonViT transformer blocks.
+
+    Standard MLP with configurable activation function. Uses HuggingFace-compatible
+    naming (`fc0`, `fc1`) for weight loading compatibility.
+
+    Attributes:
+        fc0: First linear layer (input -> hidden).
+        fc1: Second linear layer (hidden -> output).
+        activation: Activation function applied after first layer.
+    """
 
     def __init__(
         self,
@@ -229,6 +406,19 @@ class MLP2(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize two-layer MLP.
+
+        Args:
+            dims (tuple[int, int, int]): Tuple of (input_dim, hidden_dim, output_dim).
+            activation (Callable): Activation function to apply after first layer.
+            dtype (jnp.dtype, optional): Data type for computation.
+                Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters.
+                Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike | None, optional): Numerical precision.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         in_dim, hidden_dim, out_dim = dims
         self.fc0 = nn.Linear(
             in_dim,
@@ -251,11 +441,31 @@ class MLP2(nn.Module):
         self.activation = activation
 
     def __call__(self, x: Array) -> Array:
+        """Apply two-layer MLP transformation.
+
+        Args:
+            x (Array): Input tensor of shape (..., input_dim).
+
+        Returns:
+            Array: Output tensor of shape (..., output_dim).
+        """
         return self.fc1(self.activation(self.fc0(x)))
 
 
 class MoonVitEncoderLayer(nn.Module):
-    """Transformer encoder layer for MoonViT."""
+    """Transformer encoder layer for MoonViT vision transformer.
+
+    Implements a standard vision transformer encoder layer with:
+    - Pre-normalization architecture (LayerNorm before attention and MLP)
+    - Multi-head self-attention with 2D RoPE
+    - Block-diagonal attention for multi-image processing
+    - Two-layer MLP with configurable activation
+
+    Attributes:
+        num_heads (int): Number of attention heads.
+        hidden_dim (int): Hidden dimension size.
+        head_dim (int): Dimension per attention head.
+    """
 
     def __init__(
         self,
@@ -271,6 +481,24 @@ class MoonVitEncoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize MoonViT encoder layer.
+
+        Args:
+            base_config (MoonViTConfig): Configuration for the vision transformer.
+            num_heads (int): Number of attention heads.
+            hidden_dim (int): Hidden dimension size.
+            mlp_dim (int): MLP intermediate dimension.
+            activation (Callable): Activation function for MLP.
+            attn_bias (bool, optional): Whether to use bias in attention layers.
+                Defaults to True.
+            dtype (jnp.dtype, optional): Data type for computation.
+                Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters.
+                Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike | None, optional): Numerical precision.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
         self.head_dim = hidden_dim // num_heads
@@ -326,6 +554,16 @@ class MoonVitEncoderLayer(nn.Module):
         )
 
     def _attention(self, x: Array, cu_seqlens: Array, rope_freqs_cis: Array) -> Array:
+        """Apply multi-head self-attention with 2D RoPE and block-diagonal masking.
+
+        Args:
+            x (Array): Input tensor of shape (seq_len, hidden_dim).
+            cu_seqlens (Array): Cumulative sequence lengths for block-diagonal attention.
+            rope_freqs_cis (Array): 2D rotary position embedding frequencies.
+
+        Returns:
+            Array: Attention output of shape (seq_len, hidden_dim).
+        """
         seq_length = x.shape[0]
         qkv = self.wqkv(x)
         qkv = qkv.reshape(seq_length, 3, self.num_heads, self.head_dim)
@@ -355,6 +593,20 @@ class MoonVitEncoderLayer(nn.Module):
         return self.wo(attn_out)
 
     def __call__(self, hidden_states: Array, cu_seqlens: Array, rope_freqs_cis: Array) -> Array:
+        """Forward pass through the encoder layer.
+
+        Applies pre-norm self-attention and MLP with residual connections:
+        x = x + attention(norm(x))
+        x = x + mlp(norm(x))
+
+        Args:
+            hidden_states (Array): Input tensor of shape (seq_len, hidden_dim).
+            cu_seqlens (Array): Cumulative sequence lengths for multi-image attention.
+            rope_freqs_cis (Array): 2D rotary position embedding frequencies.
+
+        Returns:
+            Array: Output tensor of shape (seq_len, hidden_dim).
+        """
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
         hidden_states = residual + self._attention(hidden_states, cu_seqlens, rope_freqs_cis)
@@ -366,7 +618,17 @@ class MoonVitEncoderLayer(nn.Module):
 
 
 class MoonVitEncoder(nn.Module):
-    """Vision transformer encoder for MoonViT (packed sequences)."""
+    """Vision transformer encoder for MoonViT with packed sequence support.
+
+    Processes packed sequences of image patches from multiple images
+    using block-diagonal attention. Uses 2D rotary position embeddings
+    for spatial awareness.
+
+    Attributes:
+        rope_2d (Rope2DPosEmb): 2D rotary position embedding module.
+        blocks (list): Stack of transformer encoder layers.
+        final_layernorm: Final layer normalization.
+    """
 
     def __init__(
         self,
@@ -381,6 +643,22 @@ class MoonVitEncoder(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize MoonViT encoder.
+
+        Args:
+            base_config (MoonViTConfig): Configuration for the vision transformer.
+            hidden_dim (int): Hidden dimension size.
+            num_layers (int): Number of transformer layers.
+            num_heads (int): Number of attention heads.
+            mlp_dim (int): MLP intermediate dimension.
+            dtype (jnp.dtype, optional): Data type for computation.
+                Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters.
+                Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike | None, optional): Numerical precision.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.rope_2d = Rope2DPosEmb(hidden_dim // num_heads, 512, 512)
 
         def activation(x):
@@ -410,6 +688,20 @@ class MoonVitEncoder(nn.Module):
         )
 
     def __call__(self, hidden_states: Array, grid_hws: Array) -> Array:
+        """Forward pass through the MoonViT encoder.
+
+        Processes packed image patches through transformer layers with
+        block-diagonal attention and 2D rotary position embeddings.
+
+        Args:
+            hidden_states (Array): Packed patch embeddings of shape
+                (total_patches, hidden_dim).
+            grid_hws (Array): Array of (height, width) pairs for each image,
+                shape (num_images, 2).
+
+        Returns:
+            Array: Encoded features of shape (total_patches, hidden_dim).
+        """
         rope_freqs_cis = self.rope_2d.get_freqs_cis(grid_hws)
 
         grid_lens = (grid_hws[:, 0] * grid_hws[:, 1]).astype(jnp.int32)
@@ -427,7 +719,27 @@ def patch_merger(
     grid_hws: Array,
     merge_kernel_size: tuple[int, int],
 ) -> list[Array]:
-    """Merge patches into spatial groups (matches HF `patch_merger`)."""
+    """Merge adjacent patches into spatial groups for feature compression.
+
+    Groups patches according to the merge kernel size, reducing the number
+    of tokens while preserving spatial locality. This is used to reduce
+    the sequence length before projecting to the language model.
+
+    For example, with merge_kernel_size=(2, 2), a 14x14 grid becomes
+    7x7 groups, each containing 4 patches.
+
+    Args:
+        hidden_states (Array): Packed patch features of shape
+            (total_patches, hidden_dim).
+        grid_hws (Array): Array of (height, width) pairs for each image,
+            shape (num_images, 2).
+        merge_kernel_size (tuple[int, int]): Kernel size for merging patches
+            as (kernel_h, kernel_w).
+
+    Returns:
+        list[Array]: List of merged features for each image, where each
+            element has shape (num_groups, kernel_h * kernel_w, hidden_dim).
+    """
     d_model = hidden_states.shape[-1]
     kernel_h, kernel_w = merge_kernel_size
     outputs = []
@@ -445,7 +757,21 @@ def patch_merger(
 
 
 class MoonVitPretrainedModel(nn.Module):
-    """MoonViT vision tower used by Kimi-VL (matches HF `MoonVitPretrainedModel`)."""
+    """MoonViT vision tower for Kimi-VL multimodal model.
+
+    Complete vision encoder that processes images through:
+    1. Patch embedding with learnable 2D position embeddings
+    2. Vision transformer encoder with 2D RoPE
+    3. Patch merging for sequence compression
+
+    Matches HuggingFace `MoonVitPretrainedModel` naming for weight compatibility.
+
+    Attributes:
+        merge_kernel_size (tuple): Kernel size for patch merging.
+        patch_size (int): Size of image patches.
+        patch_embed: Patch embedding layer.
+        encoder: Vision transformer encoder.
+    """
 
     def __init__(
         self,
@@ -456,6 +782,18 @@ class MoonVitPretrainedModel(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize MoonViT vision tower.
+
+        Args:
+            config (MoonViTConfig): Configuration for the vision model.
+            dtype (jnp.dtype, optional): Data type for computation.
+                Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters.
+                Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike | None, optional): Numerical precision.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.merge_kernel_size = tuple(config.merge_kernel_size)
         self.patch_size = config.patch_size
         self.patch_embed = MoonVisionPatchEmbed(
@@ -481,13 +819,45 @@ class MoonVitPretrainedModel(nn.Module):
         )
 
     def __call__(self, pixel_values: Array, grid_hws: Array) -> list[Array]:
+        """Process images through the vision tower.
+
+        Embeds image patches, processes them through the transformer encoder,
+        and merges adjacent patches for sequence compression.
+
+        Args:
+            pixel_values (Array): Input images of shape (num_patches, C, H, W)
+                or (num_patches, H, W, C).
+            grid_hws (Array): Array of (height, width) pairs for each image's
+                patch grid, shape (num_images, 2).
+
+        Returns:
+            list[Array]: List of merged features for each image, where each
+                element has shape (num_groups, kernel_h * kernel_w, hidden_dim).
+        """
         hidden_states = self.patch_embed(pixel_values, grid_hws)
         hidden_states = self.encoder(hidden_states, grid_hws)
         return patch_merger(hidden_states, grid_hws, merge_kernel_size=self.merge_kernel_size)
 
 
 class KimiVLMultiModalProjector(nn.Module):
-    """Project MoonViT patch groups into DeepSeek-V3 hidden size."""
+    """Multi-modal projector for bridging vision and language models.
+
+    Projects merged patch features from MoonViT into the DeepSeek-V3
+    language model's hidden dimension. Uses a two-layer MLP with
+    LayerNorm and GELU activation.
+
+    Architecture:
+        1. Pre-normalization on input features
+        2. Flatten merged patches
+        3. Linear projection with GELU activation
+        4. Final linear projection to language model dimension
+
+    Attributes:
+        hidden_size (int): Flattened feature dimension after patch merging.
+        pre_norm: Layer normalization before projection.
+        linear_1: First linear layer with GELU activation.
+        linear_2: Second linear layer projecting to LM hidden size.
+    """
 
     def __init__(
         self,
@@ -498,6 +868,18 @@ class KimiVLMultiModalProjector(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize multi-modal projector.
+
+        Args:
+            config (KimiVLConfig): Configuration for the VLM model.
+            dtype (jnp.dtype, optional): Data type for computation.
+                Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters.
+                Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike | None, optional): Numerical precision.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         merge_kernel = tuple(config.vision_config.merge_kernel_size)
         hidden_size = config.vision_config.hidden_size * merge_kernel[0] * merge_kernel[1]
 
@@ -529,6 +911,18 @@ class KimiVLMultiModalProjector(nn.Module):
         )
 
     def __call__(self, image_features: list[Array]) -> Array:
+        """Project merged image features to language model dimension.
+
+        Concatenates features from all images, normalizes, flattens the
+        merged patch groups, and projects to the language model hidden size.
+
+        Args:
+            image_features (list[Array]): List of merged features from
+                MoonViT, each of shape (num_groups, kernel_h * kernel_w, hidden_dim).
+
+        Returns:
+            Array: Projected features of shape (total_tokens, lm_hidden_size).
+        """
         image_features = jnp.concatenate(image_features, axis=0)
         hidden_states = self.pre_norm(image_features).reshape(-1, self.hidden_size)
         hidden_states = self.linear_1(hidden_states)
@@ -539,7 +933,30 @@ class KimiVLMultiModalProjector(nn.Module):
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=KimiVLConfig, model_type="kimi_vl")
 class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausalLM, KimiVLConfig]):
-    """Kimi-VL model for image-text to text generation."""
+    """Kimi-VL vision-language model for conditional text generation.
+
+    Combines MoonViT vision encoder with DeepSeek-V3 MoE language model
+    for multimodal understanding and generation. Processes images through
+    the vision tower and projects them into the language model's embedding
+    space.
+
+    Architecture:
+        1. Vision tower (MoonViT): Encodes images into patch features
+        2. Multi-modal projector: Projects vision features to LM dimension
+        3. Language model (DeepSeek-V3): Generates text conditioned on
+           combined image and text embeddings
+
+    This model supports:
+        - Single and multi-image inputs
+        - Variable resolution images
+        - Interleaved image-text generation
+        - Efficient MoE-based language modeling
+
+    Attributes:
+        vision_tower (MoonVitPretrainedModel): Vision encoder component.
+        multi_modal_projector (KimiVLMultiModalProjector): Vision-to-LM projector.
+        language_model (DeepseekV3ForCausalLM): Language model backbone.
+    """
 
     _task_type = TaskType.IMAGE_TEXT_TO_TEXT
     _model_type = "kimi_vl"
@@ -557,6 +974,18 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Kimi-VL model for conditional generation.
+
+        Args:
+            config (KimiVLConfig): Configuration for the VLM model.
+            dtype (jnp.dtype, optional): Data type for computation.
+                Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters.
+                Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike | None, optional): Numerical precision.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         language_model = DeepseekV3ForCausalLM(
             config=config.text_config,
             dtype=dtype,
@@ -597,6 +1026,19 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         input_ids: Array,
         image_features: Array,
     ) -> Array:
+        """Merge text embeddings with image features at placeholder positions.
+
+        Replaces the placeholder token embeddings with the corresponding
+        image feature embeddings.
+
+        Args:
+            inputs_embeds (Array): Text embeddings of shape (batch, seq_len, hidden_dim).
+            input_ids (Array): Token IDs of shape (batch, seq_len).
+            image_features (Array): Projected image features.
+
+        Returns:
+            Array: Combined embeddings with image features replacing placeholders.
+        """
         placeholder = int(self.config.media_placeholder_token_id)
         multimodal_embeddings = image_features.reshape(-1, image_features.shape[-1])
         return BaseVisionLanguageModule.merge_multimodal_embeddings(
@@ -607,6 +1049,18 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         )
 
     def _extract_image_features(self, pixel_values: Array, image_grid_hws: Array) -> Array:
+        """Extract and project image features from pixel values.
+
+        Processes images through the vision tower and multi-modal projector
+        to produce features compatible with the language model.
+
+        Args:
+            pixel_values (Array): Input images.
+            image_grid_hws (Array): Grid dimensions for each image.
+
+        Returns:
+            Array: Projected image features ready for merging with text.
+        """
         image_features = self.vision_tower(pixel_values, image_grid_hws)
         return self.multi_modal_projector(image_features)
 
@@ -616,6 +1070,23 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         image_grid_hws: Int[Array, "num_images 2"] | None = None,
         **kwargs,
     ) -> Float[Array, "num_patches hidden_dim"]:
+        """Get projected image features from pixel values.
+
+        Public interface for extracting image features. Useful for pre-computing
+        image features for efficient multi-turn conversation.
+
+        Args:
+            pixel_values (Array): Input images of shape (num_patches, C, H, W).
+            image_grid_hws (Array | None): Grid dimensions for each image,
+                shape (num_images, 2). Required when pixel_values is provided.
+            **kwargs: Additional arguments (ignored for compatibility).
+
+        Returns:
+            Array: Projected image features of shape (num_patches, hidden_dim).
+
+        Raises:
+            ValueError: If image_grid_hws is None.
+        """
         if image_grid_hws is None:
             raise ValueError("`image_grid_hws` must be provided when `pixel_values` is not None.")
         return self._extract_image_features(pixel_values.astype(self.dtype), image_grid_hws)
@@ -629,6 +1100,29 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         image_grid_hws: Int[Array, "num_images 2"] | None = None,
         **kwargs,
     ) -> Array:
+        """Compute combined text and image embeddings.
+
+        Embeds input tokens and optionally merges with image features at
+        placeholder positions. Handles placeholder token ID replacement
+        for out-of-vocabulary image tokens.
+
+        Args:
+            input_ids (Array): Token IDs of shape (batch, seq_len).
+            image_features (Array | None, optional): Pre-computed image features.
+                Defaults to None.
+            pixel_values (Array | None, optional): Raw pixel values for images.
+                Used if image_features is None. Defaults to None.
+            image_grid_hws (Array | None, optional): Grid dimensions for images.
+                Required if pixel_values is provided. Defaults to None.
+            **kwargs: Additional arguments (ignored for compatibility).
+
+        Returns:
+            Array: Combined embeddings of shape (batch, seq_len, hidden_dim).
+
+        Raises:
+            ValueError: If input_ids is None or if pixel_values is provided
+                without image_grid_hws.
+        """
         if input_ids is None:
             raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
 
@@ -672,6 +1166,49 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         pixel_values: Float[Array, "num_patches channels patch_h patch_w"] | None = None,
         image_grid_hws: Int[Array, "num_images 2"] | None = None,
     ) -> VLMCausalLMOutput:
+        """Forward pass for multimodal generation.
+
+        Processes both image and text inputs through their respective encoders,
+        merges the embeddings, and generates output through the language model.
+
+        Args:
+            input_ids (Array | None, optional): Token IDs of shape (batch, seq_len).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed embeddings.
+                Defaults to None.
+            attention_mask (Array | None, optional): Attention mask for padding.
+                Defaults to None.
+            mask_info (object | None, optional): Advanced mask information.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for tokens.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode).
+                Defaults to None.
+            past_key_values (object | None, optional): Cache for generation.
+                Defaults to None.
+            cache_metadata (object | None, optional): Cache metadata.
+                Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply LM head projection.
+                Defaults to True.
+            output_attentions (bool | None, optional): Return attention weights.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Return hidden states.
+                Defaults to None.
+            output_router_logits (bool | None, optional): Return MoE router logits.
+                Defaults to None.
+            pixel_values (Array | None, optional): Input images.
+                Defaults to None.
+            image_grid_hws (Array | None, optional): Grid dimensions for images.
+                Defaults to None.
+
+        Returns:
+            VLMCausalLMOutput: Contains logits, hidden states, attentions,
+                image features, router logits, and auxiliary loss.
+
+        Raises:
+            ValueError: If both or neither of input_ids and inputs_embeds are provided,
+                or if pixel_values is provided without input_ids or image_grid_hws.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -721,6 +1258,20 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         )
 
     def init_cache(self, batch_size, max_length, starts=None, shardings=None, pad_token_id=None):
+        """Initialize KV cache for generation.
+
+        Delegates to the language model's cache initialization.
+
+        Args:
+            batch_size: Batch size for the cache.
+            max_length: Maximum sequence length.
+            starts: Starting positions (optional).
+            shardings: Sharding specifications (optional).
+            pad_token_id: Padding token ID (optional).
+
+        Returns:
+            Initialized cache for autoregressive generation.
+        """
         return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
 
     def prepare_inputs_for_generation(
@@ -733,6 +1284,24 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         attention_mask: Array | None = None,
         image_grid_hws: Array | None = None,
     ):
+        """Prepare inputs for autoregressive generation.
+
+        Extends the language model's input preparation with image-related
+        inputs for multimodal generation.
+
+        Args:
+            input_ids (Array): Input token IDs.
+            max_length (int): Maximum generation length.
+            pad_token_id (int): Padding token ID.
+            starts (int | None, optional): Starting positions. Defaults to None.
+            pixel_values (Array | None, optional): Input images. Defaults to None.
+            attention_mask (Array | None, optional): Attention mask. Defaults to None.
+            image_grid_hws (Array | None, optional): Image grid dimensions.
+                Defaults to None.
+
+        Returns:
+            dict: Model inputs including text and image components.
+        """
         model_inputs = self.language_model.prepare_inputs_for_generation(
             input_ids=input_ids,
             max_length=max_length,
@@ -745,30 +1314,77 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         return model_inputs
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        """Update inputs for the next generation step.
+
+        Updates model kwargs and removes image inputs after the first
+        forward pass (images are only needed once).
+
+        Args:
+            model_outputs: Outputs from the previous generation step.
+            model_kwargs: Current model keyword arguments.
+
+        Returns:
+            dict: Updated model kwargs for the next step.
+        """
         model_kwargs = self.language_model.update_inputs_for_generation(model_outputs, model_kwargs)
         model_kwargs.pop("pixel_values", None)
         model_kwargs.pop("image_grid_hws", None)
         return model_kwargs
 
     def get_encoder(self):
+        """Get the vision encoder (vision tower).
+
+        Returns:
+            MoonVitPretrainedModel: The vision tower component.
+        """
         return self.vision_tower
 
     def get_decoder(self):
+        """Get the language model decoder.
+
+        Returns:
+            The decoder component of the language model.
+        """
         return self.language_model.get_decoder()
 
     def get_lm_head(self):
+        """Get the language model head.
+
+        Returns:
+            The language model output projection.
+        """
         return self.language_model.get_lm_head()
 
     def get_embedding(self):
+        """Get the token embedding layer.
+
+        Returns:
+            nn.Embed: The language model's token embeddings.
+        """
         return self.language_model.get_embedding()
 
     def get_vision_tower(self) -> nn.Module:
+        """Get the vision tower module.
+
+        Returns:
+            MoonVitPretrainedModel: The MoonViT vision encoder.
+        """
         return self.vision_tower
 
     def get_projector(self) -> nn.Module:
+        """Get the multi-modal projector.
+
+        Returns:
+            KimiVLMultiModalProjector: The vision-to-language projector.
+        """
         return self.multi_modal_projector
 
     def get_language_model(self) -> nn.Module:
+        """Get the language model backbone.
+
+        Returns:
+            DeepseekV3ForCausalLM: The DeepSeek-V3 language model.
+        """
         return self.language_model
 
 

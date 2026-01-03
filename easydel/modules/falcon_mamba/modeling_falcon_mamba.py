@@ -51,7 +51,20 @@ from .falcon_mamba_configuration import FalconMambaConfig
 
 
 def rms_forward(hidden_states: Array, *, variance_epsilon: float = 1e-6) -> Array:
-    """RMS normalize without learnable weights (HF parity helper)."""
+    """Apply RMS normalization without learnable weights.
+
+    This is a helper function for HuggingFace parity, applying root mean square
+    normalization to the input hidden states without any learnable scale parameters.
+
+    Args:
+        hidden_states: Input tensor to normalize with shape (..., features).
+        variance_epsilon: Small constant added to variance for numerical stability.
+            Defaults to 1e-6.
+
+    Returns:
+        Normalized tensor with the same shape as the input, cast back to the
+        original input dtype.
+    """
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.astype(jnp.float32)
     variance = jnp.mean(jnp.square(hidden_states), axis=-1, keepdims=True)
@@ -61,7 +74,20 @@ def rms_forward(hidden_states: Array, *, variance_epsilon: float = 1e-6) -> Arra
 
 @auto_pytree
 class FalconMambaOutput(BaseModelOutput):
-    """Output type for `FalconMambaModel`."""
+    """Output container for the base FalconMamba model with cached state.
+
+    This class encapsulates the outputs from the FalconMamba backbone model,
+    including the final hidden states and optional intermediate layer outputs.
+
+    Attributes:
+        last_hidden_state: The final hidden state tensor of shape
+            (batch_size, sequence_length, hidden_size) after the last layer
+            and final normalization.
+        cache_params: Recurrent cache containing the SSM states and convolution
+            states for each layer, used during autoregressive generation.
+        hidden_states: Optional tuple of hidden states at each layer when
+            output_hidden_states=True, including the final normalized output.
+    """
 
     last_hidden_state: Array = None
     cache_params: RecurrentCache | None = None
@@ -70,7 +96,19 @@ class FalconMambaOutput(BaseModelOutput):
 
 @auto_pytree
 class FalconMambaCausalLMOutput(BaseModelOutput):
-    """Output type for `FalconMambaForCausalLM`."""
+    """Causal LM output including logits and cache for FalconMamba decoding.
+
+    This class encapsulates the outputs from the FalconMamba causal language model,
+    including vocabulary logits for next token prediction.
+
+    Attributes:
+        logits: The language model logits of shape (batch_size, sequence_length,
+            vocab_size) for next token prediction. None if apply_lm_head=False.
+        cache_params: Recurrent cache containing the SSM states and convolution
+            states for each layer, used during autoregressive generation.
+        hidden_states: Optional tuple of hidden states at each layer when
+            output_hidden_states=True, including the final normalized output.
+    """
 
     logits: Array = None
     cache_params: RecurrentCache | None = None
@@ -78,10 +116,27 @@ class FalconMambaCausalLMOutput(BaseModelOutput):
 
 
 class Conv1D(nn.Module):
-    """Depthwise causal 1D convolution used by the mixer.
+    """Depthwise causal 1D convolution used by the FalconMamba mixer.
 
-    Parameter layout matches HF after conversion:
-        - `kernel`: [kernel_size, 1, channels]
+    This module implements a 1D convolution layer with depthwise separable
+    convolution support. The parameter layout matches HuggingFace after
+    conversion for model compatibility.
+
+    Parameter layout:
+        - kernel: Shape [kernel_size, 1, channels] for depthwise convolution.
+
+    Attributes:
+        features: Number of output channels.
+        kernel_size: Size of the convolutional kernel.
+        stride: Stride of the convolution.
+        padding: Padding applied to both sides of the input.
+        dilation: Spacing between kernel elements.
+        groups: Number of blocked connections from input to output channels.
+        use_bias: Whether to add a learnable bias.
+        num_spatial_dims: Number of spatial dimensions (always 1 for 1D conv).
+        dtype: Data type for computation.
+        param_dtype: Data type for parameters.
+        precision: Numerical precision for convolution operations.
     """
 
     def __init__(
@@ -100,6 +155,23 @@ class Conv1D(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the 1D convolution layer.
+
+        Args:
+            features: Number of output channels (features).
+            kernel_size: Size of the convolutional kernel. Defaults to 1.
+            stride: Stride of the convolution. Defaults to 1.
+            padding: Padding applied to both sides of the input. Defaults to 0.
+            dilation: Spacing between kernel elements. Defaults to 1.
+            groups: Number of blocked connections from input channels to output
+                channels. For depthwise convolution, set groups=features. Defaults to 1.
+            use_bias: Whether to add a learnable bias to the output. Defaults to True.
+            num_spatial_dims: Number of spatial dimensions. Defaults to 1.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: Numerical precision for convolution operations. Defaults to None.
+            rngs: Random number generator state for parameter initialization.
+        """
         kernel_shape = (kernel_size, 1, features)
         self.kernel = ArrayParam.bound(
             shape=kernel_shape,
@@ -128,7 +200,20 @@ class Conv1D(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-    def __call__(self, x):
+    def __call__(self, x: Array) -> Array:
+        """Apply 1D convolution to the input tensor.
+
+        Args:
+            x: Input tensor of shape (batch_size, channels, sequence_length).
+                Must have rank equal to num_spatial_dims + 2.
+
+        Returns:
+            Convolved output tensor of shape (batch_size, features, output_length),
+            where output_length depends on the kernel size, stride, padding, and dilation.
+
+        Raises:
+            ValueError: If input tensor does not have the expected rank.
+        """
         unbatched_rank = self.num_spatial_dims + 2
         if x.ndim != unbatched_rank:
             raise ValueError(
@@ -154,15 +239,40 @@ class Conv1D(nn.Module):
 
 
 class FalconMambaMixer(nn.Module):
-    """Selective SSM mixer used by FalconMamba blocks.
+    """Selective state space model (SSM) mixer used by FalconMamba blocks.
 
-    This is a faithful, naive implementation of the reference algorithm:
-    - Causal depthwise conv over the expanded stream.
-    - Input-dependent (dt, B, C) from projections.
+    This module implements the core Mamba selective SSM mechanism adapted for
+    the FalconMamba architecture. The implementation follows the reference
+    algorithm:
+    - Causal depthwise convolution over the expanded hidden stream.
+    - Input-dependent discretization parameters (dt, B, C) from projections.
     - Recurrent scan over sequence to update the SSM state.
+    - RMS normalization on the SSM parameters for stability.
 
     The "fast path" (CUDA kernels / mamba-ssm) is not implemented here; this
-    version is intended for correctness and portability.
+    version is intended for correctness and portability across JAX backends.
+
+    Attributes:
+        config: FalconMamba model configuration.
+        layer_idx: Index of this mixer layer in the model.
+        dtype: Data type for computation.
+        param_dtype: Data type for parameters.
+        precision: Numerical precision for matrix operations.
+        conv1d: Depthwise causal 1D convolution layer.
+        activation: Name of the activation function.
+        act: Activation function callable.
+        rms_eps: Epsilon for RMS normalization of SSM parameters.
+        in_proj: Input projection to expand hidden size.
+        x_proj: Projection to compute time step and SSM parameters.
+        dt_proj: Time step projection layer.
+        out_proj: Output projection to contract back to hidden size.
+        A_log: Learnable log of the state transition matrix A.
+        D: Learnable skip connection parameter.
+        ssm_state_size: Size of the SSM state dimension.
+        intermediate_size: Size of the expanded hidden dimension.
+        conv_kernel_size: Kernel size for the causal convolution.
+        time_step_rank: Rank of the time step projection.
+        ssm_op: SSM operation module for efficient state space computation.
     """
 
     def __init__(
@@ -175,6 +285,16 @@ class FalconMambaMixer(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize the FalconMamba selective SSM mixer.
+
+        Args:
+            config: FalconMamba model configuration containing SSM parameters.
+            layer_idx: Index of this layer in the model stack.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: Numerical precision for matrix operations. Defaults to None.
+            rngs: Random number generator state for parameter initialization.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -305,7 +425,31 @@ class FalconMambaMixer(nn.Module):
         cache_params: RecurrentCacheView | None = None,
         cache_position: Array | None = None,
         attention_mask: Array | None = None,
-    ):
+    ) -> tuple[Array, RecurrentCacheView | None]:
+        """Apply selective SSM transformation to input hidden states.
+
+        This method performs the complete Mamba SSM forward pass:
+        1. Project input to expanded dimension and split into hidden/gate streams.
+        2. Apply causal convolution to the hidden stream.
+        3. Compute input-dependent SSM parameters (dt, B, C) with RMS normalization.
+        4. Run the selective scan SSM operation.
+        5. Apply gating and project back to original hidden dimension.
+
+        Args:
+            input_states: Input hidden states of shape
+                (batch_size, sequence_length, hidden_size).
+            cache_params: Optional cache view containing SSM state and convolution
+                state from previous steps for autoregressive generation.
+            cache_position: Optional position indices for cache update (unused).
+            attention_mask: Optional attention mask of shape (batch_size, sequence_length)
+                to mask padded positions.
+
+        Returns:
+            A tuple containing:
+                - contextualized_states: Output hidden states of shape
+                    (batch_size, sequence_length, hidden_size).
+                - cache_params: Updated cache view with new SSM and convolution states.
+        """
         batch_size, seq_len, _ = input_states.shape
         dtype = input_states.dtype
 
@@ -386,6 +530,24 @@ class FalconMambaMixer(nn.Module):
 
 
 class FalconMambaBlock(nn.Module):
+    """Single FalconMamba layer applying normalization, mixer, and residual connection.
+
+    This block constitutes one layer of the FalconMamba model, combining:
+    - Pre-normalization with RMSNorm.
+    - Selective SSM mixer for sequence modeling.
+    - Residual connection for gradient flow.
+
+    Attributes:
+        config: FalconMamba model configuration.
+        layer_idx: Index of this layer in the model stack.
+        dtype: Data type for computation.
+        param_dtype: Data type for parameters.
+        precision: Numerical precision for operations.
+        residual_in_fp32: Whether to compute residual in float32 for stability.
+        norm: RMSNorm layer for pre-normalization.
+        mixer: FalconMamba selective SSM mixer module.
+    """
+
     def __init__(
         self,
         config: FalconMambaConfig,
@@ -396,6 +558,16 @@ class FalconMambaBlock(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize a FalconMamba block.
+
+        Args:
+            config: FalconMamba model configuration.
+            layer_idx: Index of this layer in the model stack.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: Numerical precision for operations. Defaults to None.
+            rngs: Random number generator state for parameter initialization.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -429,7 +601,26 @@ class FalconMambaBlock(nn.Module):
         cache_params: RecurrentCacheView | None = None,
         cache_position: Array | None = None,
         attention_mask: Array | None = None,
-    ) -> Array:
+    ) -> tuple[Array, RecurrentCacheView | None]:
+        """Process hidden states through the FalconMamba block.
+
+        Applies pre-normalization, selective SSM mixing, and residual connection.
+
+        Args:
+            hidden_states: Input hidden states of shape
+                (batch_size, sequence_length, hidden_size).
+            cache_params: Optional cache view containing SSM state and convolution
+                state from previous steps for autoregressive generation.
+            cache_position: Optional position indices for cache update.
+            attention_mask: Optional attention mask of shape (batch_size, sequence_length)
+                to mask padded positions.
+
+        Returns:
+            A tuple containing:
+                - hidden_states: Output hidden states of shape
+                    (batch_size, sequence_length, hidden_size) with residual added.
+                - cache_params: Updated cache view with new SSM and convolution states.
+        """
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
         if self.residual_in_fp32:
@@ -446,7 +637,36 @@ class FalconMambaBlock(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=FalconMambaConfig, model_type="falcon_mamba")
 class FalconMambaModel(EasyDeLBaseModule):
-    """FalconMamba backbone (token embeddings + stacked mixer blocks)."""
+    """FalconMamba backbone model with token embeddings and stacked mixer blocks.
+
+    This is the base FalconMamba model that outputs raw hidden states without
+    a language modeling head. It combines the Falcon architecture with the
+    Mamba selective state space model for efficient sequence modeling.
+
+    The model consists of:
+    - Token embedding layer.
+    - Stack of FalconMamba blocks with selective SSM mixers.
+    - Final RMSNorm layer.
+
+    Attributes:
+        config: FalconMamba model configuration.
+        embeddings: Token embedding layer.
+        layers: List of FalconMamba blocks.
+        norm_f: Final RMSNorm layer applied to the output.
+
+    Example:
+        ```python
+        from easydel.modules.falcon_mamba import FalconMambaConfig, FalconMambaModel
+        from flax import nnx as nn
+
+        config = FalconMambaConfig(
+            vocab_size=32000,
+            hidden_size=2560,
+            num_hidden_layers=64,
+        )
+        model = FalconMambaModel(config, rngs=nn.Rngs(0))
+        ```
+    """
 
     def __init__(
         self,
@@ -457,6 +677,15 @@ class FalconMambaModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize the FalconMamba base model.
+
+        Args:
+            config: FalconMamba model configuration specifying architecture parameters.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: Numerical precision for matrix operations. Defaults to None.
+            rngs: Random number generator state for parameter initialization.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -499,6 +728,32 @@ class FalconMambaModel(EasyDeLBaseModule):
         attention_mask: Array | None = None,
         **kwargs,
     ) -> tuple | FalconMambaOutput:
+        """Process input through the FalconMamba backbone.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+                Mutually exclusive with inputs_embeds.
+            inputs_embeds: Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Mutually exclusive
+                with input_ids.
+            cache_params: Optional recurrent cache containing SSM and convolution
+                states from previous generation steps.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to config.output_hidden_states.
+            cache_position: Optional position indices for cache update (unused).
+            attention_mask: Optional attention mask of shape (batch_size, sequence_length).
+                If not provided, will be inferred from pad_token_id in input_ids.
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            FalconMambaOutput containing:
+                - last_hidden_state: Final hidden states after all layers and normalization.
+                - cache_params: Updated recurrent cache for autoregressive generation.
+                - hidden_states: Optional tuple of per-layer hidden states.
+
+        Raises:
+            ValueError: If both or neither of input_ids and inputs_embeds are provided.
+        """
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -554,21 +809,70 @@ class FalconMambaModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
+        """Returns the encoder part of the model.
+
+        Raises:
+            NotImplementedError: FalconMamba is a decoder-only model without an encoder.
+        """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
+        """Returns the decoder part of the model.
+
+        Returns:
+            The model itself, as FalconMamba is a decoder-only architecture.
+        """
         return self
 
     def get_lm_head(self):
+        """Returns the language model head.
+
+        Raises:
+            NotImplementedError: The base model does not have a language model head.
+        """
         raise NotImplementedError("The base model does not have a language model head.")
 
     def get_embedding(self):
+        """Returns the token embedding layer.
+
+        Returns:
+            The token embedding module used by this model.
+        """
         return self.embeddings
 
 
 @register_module(TaskType.CAUSAL_LM, config=FalconMambaConfig, model_type="falcon_mamba")
 class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaConfig]):
-    """FalconMamba causal language model (backbone + LM head)."""
+    """FalconMamba model with a causal language modeling head.
+
+    This model combines the FalconMamba backbone with a language modeling head
+    for next token prediction. It is suitable for text generation tasks and
+    can be used with autoregressive decoding.
+
+    The model uses the Mamba selective state space architecture for efficient
+    sequence modeling with linear complexity in sequence length.
+
+    Attributes:
+        backbone: The FalconMamba base model.
+        lm_head: Linear layer projecting hidden states to vocabulary logits.
+
+    Example:
+        ```python
+        from easydel.modules.falcon_mamba import FalconMambaConfig, FalconMambaForCausalLM
+        from flax import nnx as nn
+
+        config = FalconMambaConfig(
+            vocab_size=32000,
+            hidden_size=2560,
+            num_hidden_layers=64,
+        )
+        model = FalconMambaForCausalLM(config, rngs=nn.Rngs(0))
+
+        # Generate text
+        output = model(input_ids)
+        logits = output.logits
+        ```
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "falcon_mamba"
@@ -583,6 +887,15 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize the FalconMamba causal language model.
+
+        Args:
+            config: FalconMamba model configuration specifying architecture parameters.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: Numerical precision for matrix operations. Defaults to None.
+            rngs: Random number generator state for parameter initialization.
+        """
         super().__init__(
             config=config,
             base_model_class=FalconMambaModel,
@@ -605,6 +918,32 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
         attention_mask: Array | None = None,
         **kwargs,
     ) -> tuple | FalconMambaCausalLMOutput:
+        """Process input and compute language modeling logits.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+                Mutually exclusive with inputs_embeds.
+            inputs_embeds: Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Mutually exclusive
+                with input_ids.
+            cache_params: Optional recurrent cache containing SSM and convolution
+                states from previous generation steps.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to config.output_hidden_states.
+            apply_lm_head: Whether to apply the language model head to compute
+                vocabulary logits. Set to False to get only hidden states.
+                Defaults to True.
+            cache_position: Optional position indices for cache update (unused).
+            attention_mask: Optional attention mask of shape (batch_size, sequence_length).
+            **kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            FalconMambaCausalLMOutput containing:
+                - logits: Vocabulary logits for next token prediction, or None if
+                    apply_lm_head=False.
+                - cache_params: Updated recurrent cache for autoregressive generation.
+                - hidden_states: Optional tuple of per-layer hidden states.
+        """
         outputs = self.backbone(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -625,6 +964,18 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
         )
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        """Update model kwargs for the next generation step.
+
+        Extracts and updates the cache from model outputs for autoregressive
+        generation.
+
+        Args:
+            model_outputs: Output from the previous generation step.
+            model_kwargs: Current model keyword arguments.
+
+        Returns:
+            Updated model_kwargs with the new cache_params.
+        """
         model_kwargs["cache_params"] = model_outputs.cache_params
         return model_kwargs
 
@@ -636,6 +987,22 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
         starts: int | None = None,
         **kwargs,
     ):
+        """Prepare inputs for autoregressive text generation.
+
+        Initializes the recurrent cache if not provided and prepares all
+        required inputs for the generation loop.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+            max_length: Maximum length of the generated sequence.
+            pad_token_id: Token ID used for padding.
+            starts: Optional starting position for generation.
+            **kwargs: Additional arguments including cache_params, attention_mask,
+                and cache_position.
+
+        Returns:
+            Dictionary of prepared inputs for the model call.
+        """
         from eformer.escale import PartitionAxis
 
         cache_params = kwargs.get("cache_params", None)
@@ -660,13 +1027,33 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
         )
 
     def get_encoder(self):
+        """Returns the encoder part of the model.
+
+        Raises:
+            NotImplementedError: FalconMamba is a decoder-only model without an encoder.
+        """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
+        """Returns the decoder part of the model.
+
+        Returns:
+            The backbone decoder module.
+        """
         return self.backbone.get_decoder()
 
     def get_lm_head(self):
+        """Returns the language model head.
+
+        Returns:
+            The linear layer used to project hidden states to vocabulary logits.
+        """
         return self.lm_head
 
     def get_embedding(self):
+        """Returns the token embedding layer.
+
+        Returns:
+            The token embedding module from the backbone model.
+        """
         return self.backbone.get_embedding()

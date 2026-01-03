@@ -106,7 +106,11 @@ def dropout_add(
 
 
 class FalconAttention(UnifiedAttention):
-    """Falcon attention built on top of the unified attention backend."""
+    """Multi-head attention layer for Falcon models.
+
+    Implements the attention mechanism with support for ALiBi positional encodings
+    and multi-query attention, built on top of the unified attention backend.
+    """
 
     projection_mapping: typing.ClassVar = dict(UnifiedAttention.projection_mapping)
     projection_mapping.update(
@@ -126,6 +130,16 @@ class FalconAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Falcon attention layer with ALiBi or RoPE support.
+
+        Args:
+            config (FalconConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         use_gqa = config.multi_query or (
             config.num_attention_heads != getattr(config, "num_kv_heads", config.num_attention_heads)
         )
@@ -150,6 +164,18 @@ class FalconAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike,
         rngs: nn.Rngs,
     ) -> ColumnParallelLinear:
+        """Create the fused query-key-value projection layer.
+
+        Args:
+            config (FalconConfig): Model configuration.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Numerical precision.
+            rngs (nn.Rngs): Random number generator state.
+
+        Returns:
+            ColumnParallelLinear: Fused QKV projection layer.
+        """
         return ColumnParallelLinear(
             config.hidden_size,
             (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim,
@@ -169,6 +195,18 @@ class FalconAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike,
         rngs: nn.Rngs,
     ) -> RowParallelLinear:
+        """Create the output projection layer.
+
+        Args:
+            config (FalconConfig): Model configuration.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Numerical precision.
+            rngs (nn.Rngs): Random number generator state.
+
+        Returns:
+            RowParallelLinear: Output projection layer.
+        """
         return RowParallelLinear(
             self.num_heads * self.head_dim,
             config.hidden_size,
@@ -182,7 +220,11 @@ class FalconAttention(UnifiedAttention):
 
 
 class FalconMlp(nn.Module):
-    """Gated feed-forward network for Falcon decoder blocks."""
+    """Multi-Layer Perceptron module for Falcon models.
+
+    Implements the feedforward network with GELU activation function
+    for enhanced representation learning in Falcon architecture.
+    """
 
     def __init__(
         self,
@@ -194,6 +236,17 @@ class FalconMlp(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Falcon MLP block.
+
+        Args:
+            config (FalconConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -219,6 +272,15 @@ class FalconMlp(nn.Module):
         )
 
     def __call__(self, x: Array, deterministic: bool = True):
+        """Apply GELU feedforward transformation.
+
+        Args:
+            x (Array): Input tensor of shape [batch, seq_len, hidden_dim].
+            deterministic (bool, optional): Whether to use deterministic mode. Defaults to True.
+
+        Returns:
+            Array: Transformed hidden states of shape [batch, seq_len, hidden_dim].
+        """
         x = apply_logical_sharding(
             x,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -237,7 +299,12 @@ class FalconMlp(nn.Module):
 
 
 class FalconBlock(nn.Module):
-    """Single Falcon transformer block with attention and MLP."""
+    """Single decoder layer for Falcon models.
+
+    Combines multi-head attention and feedforward networks with
+    LayerNorm normalization and residual connections. Supports both
+    parallel and sequential attention/MLP computation modes.
+    """
 
     def __init__(
         self,
@@ -249,6 +316,16 @@ class FalconBlock(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Falcon decoder layer.
+
+        Args:
+            config (FalconConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -339,22 +416,26 @@ class FalconBlock(nn.Module):
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Array | None = None,
     ) -> DecoderLayerOutput:
-        """
-        Forward pass of the FalconBlock module.
+        """Forward pass through the decoder layer.
+
+        Applies layer normalization, attention, and MLP with residual connections.
+        Supports parallel or sequential attention/MLP computation based on config.
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens.
-            causal_mask (Array, optional): Causal mask for ensuring autoregressive behavior.
-            alibi (tp.Optional[Array], optional): Alibi tensor for adding positional bias.
-            init_cache (bool, optional): If True, initializes cache for caching keys and values.
-            output_attentions (bool, optional): If True, outputs attention weights alongside the hidden states.
-            deterministic (bool, optional): If True, disables dropout for deterministic behavior.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+            alibi (Array | None, optional): Precomputed ALiBi positional biases. Defaults to None.
 
         Returns:
-            tp.Union[Array, tp.Tuple[Array, Array]]: The output tensor and optionally
-                the attention weights.
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
         """
         residual = hidden_states
 
@@ -414,7 +495,18 @@ class FalconBlock(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=FalconConfig, model_type="falcon")
 class FalconModel(EasyDeLBaseModule):
-    """Falcon decoder-only transformer with embeddings, blocks, and final norm."""
+    """Falcon model implementation.
+
+    This implements the Falcon language model architecture, utilizing transformer blocks
+    with LayerNorm, optional ALiBi or rotary position embeddings, and support for
+    parallel or sequential attention/MLP computation.
+
+    Attributes:
+        config (FalconConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -425,6 +517,15 @@ class FalconModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Falcon base model.
+
+        Args:
+            config (FalconConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -602,7 +703,17 @@ class FalconModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=FalconConfig, model_type="falcon")
 class FalconForCausalLM(BaseCausalLMModule[FalconModel, FalconConfig]):
-    """Falcon model with a language modeling head for causal language modeling tasks."""
+    """Falcon model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation.
+
+    Attributes:
+        config (FalconConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "falcon"
@@ -617,14 +728,14 @@ class FalconForCausalLM(BaseCausalLMModule[FalconModel, FalconConfig]):
         *,
         rngs: nn.Rngs,
     ):
-        """Initialize a FalconForCausalLM model.
+        """Initialize Falcon model for causal language modeling.
 
         Args:
-            config (FalconConfig): Configuration object for the model.
-            dtype (jnp.dtype, optional): Data type for activations and weights. Defaults to jnp.bfloat16.
+            config (FalconConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike, optional): Numerical precision for computations. Defaults to None.
-            rngs (nn.Rngs): Random number generator keys for initialization.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,

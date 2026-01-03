@@ -68,8 +68,31 @@ def shift_tokens_right(
     pad_token_id: int,
     decoder_start_token_id: int,
 ):
-    """
-    Shift input ids one token to the right using JAX.
+    """Shift input ids one token to the right for decoder teacher forcing.
+
+    This function prepares decoder inputs by shifting the target sequence one position
+    to the right and prepending the decoder start token. This is a standard technique
+    for sequence-to-sequence models during training, where the decoder predicts the
+    next token given the previous tokens.
+
+    Args:
+        input_ids (Int[Array, "batch seq_len"]): Target token IDs to be shifted.
+            Shape: (batch_size, sequence_length). Tokens with value -100 are treated
+            as labels to be ignored and are replaced with pad_token_id.
+        pad_token_id (int): The ID of the padding token to use for filling positions
+            and replacing -100 values.
+        decoder_start_token_id (int): The ID of the token to insert at the start of
+            each sequence (typically <|startoftranscript|> for Whisper).
+
+    Returns:
+        Int[Array, "batch seq_len"]: Shifted input IDs where:
+            - Position 0 contains decoder_start_token_id
+            - Position i contains the original token from position i-1
+            - -100 values are replaced with pad_token_id
+
+    Example:
+        >>> # Original: [tok1, tok2, tok3, -100]
+        >>> # Shifted:  [start_tok, tok1, tok2, tok3]
     """
     batch_size, seq_length = input_ids.shape
     shifted_input_ids = jnp.full(
@@ -1454,6 +1477,44 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ):
+        """Runs the decoder with pre-computed encoder outputs.
+
+        This method performs only the decoding step, using encoder hidden states that were
+        computed separately. This is useful for autoregressive generation where the encoder
+        outputs can be computed once and reused for each decoding step.
+
+        Args:
+            decoder_input_ids (jnp.ndarray): Input token IDs for the decoder.
+                Shape: (batch_size, target_sequence_length).
+            encoder_outputs (BaseModelOutput | tuple): Pre-computed encoder outputs containing
+                at least the last hidden state. The first element should be encoder hidden states
+                with shape (batch_size, encoder_sequence_length, d_model).
+            encoder_attention_mask (Bool[Array, "batch seq_len"], optional): Mask for encoder
+                hidden states indicating valid positions. Shape: (batch_size, encoder_seq_len).
+            decoder_mask_info (MaskInfo, optional): Mask information for decoder self-attention.
+                If None, creates default causal mask.
+            decoder_position_ids (Int[Array, "batch seq_len"], optional): Position indices for
+                decoder inputs. Auto-generated as sequential positions if None.
+            mode (RUNTIME_MODE_TYPES, optional): Execution mode (train/decode/prefill).
+                Auto-detected based on sequence length and cache state if None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache, optional):
+                Cached key/value states for fast autoregressive generation.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata, optional):
+                Metadata for paged attention cache management.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to config.output_attentions.
+            output_hidden_states (bool, optional): Whether to return hidden states from all layers.
+                Defaults to config.output_hidden_states.
+
+        Returns:
+            Seq2SeqLMOutput: Decoder output containing:
+                - logits (jnp.ndarray): Next-token prediction logits.
+                  Shape: (batch_size, target_sequence_length, vocab_size).
+                - decoder_hidden_states (tuple, optional): Hidden states from each decoder layer.
+                - decoder_attentions (tuple, optional): Self-attention weights from each layer.
+                - cross_attentions (tuple, optional): Cross-attention weights from each layer.
+                - past_key_values: Updated cache with new key/value states.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1506,6 +1567,33 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         output_hidden_states: bool | None = None,
         **kwargs,
     ):
+        """Runs the encoder to produce audio representations.
+
+        This method encodes log-Mel spectrogram features into contextualized representations
+        that can be used by the decoder for transcription or translation. The encoder output
+        can be cached and reused for multiple decoding steps during generation.
+
+        Args:
+            input_features (jnp.ndarray): Log-Mel spectrogram features from audio input.
+                Shape: (batch_size, num_mel_bins, sequence_length) where num_mel_bins is
+                typically 80 and sequence_length is max_source_positions * 2 (usually 3000).
+            attention_mask (Bool[Array, "batch seq_len"], optional): Mask indicating valid
+                audio positions. Currently unused as Whisper processes fixed-length spectrograms.
+            output_attentions (bool, optional): Whether to return attention weights from all
+                encoder layers. Defaults to config.output_attentions.
+            output_hidden_states (bool, optional): Whether to return hidden states from all
+                encoder layers. Defaults to config.output_hidden_states.
+            **kwargs: Additional keyword arguments (unused, for API compatibility).
+
+        Returns:
+            Seq2SeqModelOutput: Encoder output containing:
+                - encoder_last_hidden_state (jnp.ndarray): Final encoder hidden states.
+                  Shape: (batch_size, encoder_sequence_length, d_model).
+                - encoder_hidden_states (tuple, optional): Hidden states from each encoder layer
+                  if output_hidden_states=True.
+                - encoder_attentions (tuple, optional): Attention weights from each encoder layer
+                  if output_attentions=True.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1528,6 +1616,43 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         is_multilingual=None,
         **kwargs,
     ):
+        """Generates text transcriptions or translations from audio features.
+
+        This method performs autoregressive text generation from audio input, supporting
+        multilingual transcription, English translation, and timestamp prediction. It handles
+        Whisper-specific generation features including forced decoder tokens for language
+        and task conditioning.
+
+        Args:
+            input_features (jnp.ndarray): Log-Mel spectrogram features from audio input.
+                Shape: (batch_size, num_mel_bins, sequence_length).
+            generation_config (GenerationConfig, optional): Configuration object controlling
+                generation parameters (max_length, temperature, top_k, etc.). If None, uses
+                the model's default generation_config.
+            logits_processor (LogitsProcessorList, optional): Custom logits processors for
+                modifying the probability distribution during generation.
+            return_timestamps (bool, optional): Whether to predict timestamps along with text.
+                When True, uses WhisperTimeStampLogitsProcessor for timestamp token generation.
+            task (str, optional): Task to perform - either "transcribe" (speech-to-text in
+                original language) or "translate" (speech-to-English translation).
+            language (str, optional): Language code for transcription (e.g., "en", "fr", "de").
+                Used to condition the model for a specific language.
+            is_multilingual (bool, optional): Whether to use multilingual tokens. When True,
+                prepends language and task tokens to guide generation.
+            **kwargs: Additional keyword arguments passed to the base generate method,
+                including decoder_input_ids, max_length, num_beams, etc.
+
+        Returns:
+            jnp.ndarray: Generated token IDs. Shape: (batch_size, generated_sequence_length).
+                The output includes special tokens like language tags, task tokens, and
+                optionally timestamp tokens depending on the configuration.
+
+        Note:
+            - For multilingual models, language and task tokens are automatically prepended
+            - Timestamp tokens are interleaved with text tokens when return_timestamps=True
+            - The no_timestamps_token is forced when return_timestamps=False to suppress
+              timestamp generation
+        """
         if generation_config is None:
             generation_config = self.generation_config
 
@@ -1588,6 +1713,32 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         generation_config: tp.Optional["transformers.GenerationConfig"] = None,  # type:ignore
         **kwargs,
     ):
+        """Generates text with explicitly forced decoder token IDs.
+
+        This internal method provides fine-grained control over generation by forcing
+        specific tokens at specific positions in the output sequence. It's useful for
+        scenarios where you want to guarantee certain tokens appear in the output,
+        such as language tags or task identifiers.
+
+        Args:
+            input_features (jax.Array): Log-Mel spectrogram features from audio input.
+                Shape: (batch_size, num_mel_bins, sequence_length).
+            forced_decoder_ids (jax.Array): Array of (position, token_id) pairs specifying
+                which tokens to force at which positions. Shape: (num_forced, 2).
+                For example, [(1, lang_id), (2, task_id)] forces language token at position 1
+                and task token at position 2.
+            return_timestamps (bool): Whether to predict timestamps along with text.
+                When True, applies WhisperTimeStampLogitsProcessor for timestamp generation.
+                Default: False.
+            generation_config (GenerationConfig, optional): Configuration for generation
+                parameters. If None, uses the model's default generation_config.
+                Note: forced_decoder_ids in generation_config is overridden and set to None.
+            **kwargs: Additional keyword arguments passed to the base generate method.
+
+        Returns:
+            jnp.ndarray: Generated token IDs including forced tokens.
+                Shape: (batch_size, generated_sequence_length).
+        """
         if generation_config is None:
             generation_config = self.generation_config
         generation_config.forced_decoder_ids = None
@@ -1614,6 +1765,39 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         encoder_outputs=None,
         **kwargs,
     ):
+        """Prepares model inputs for the first generation step.
+
+        This method initializes the KV cache and prepares all necessary inputs for
+        the autoregressive generation loop. It sets up attention masks, position IDs,
+        and the initial cache state.
+
+        Args:
+            decoder_input_ids (jnp.ndarray): Initial decoder token IDs to start generation.
+                Shape: (batch_size, initial_sequence_length). Typically contains the
+                decoder_start_token_id and any prompt tokens.
+            max_length (int): Maximum sequence length for generation. Used to pre-allocate
+                the KV cache and attention mask.
+            pad_token_id (int): Token ID used for padding. Used to compute prefill length
+                and pad the attention mask.
+            starts (int, optional): Starting position indices for each sequence in the batch.
+                If None, computed automatically from decoder_input_ids.
+            shardings: Sharding specifications for distributed computation.
+            attention_mask (jax.Array, optional): Encoder attention mask.
+                Shape: (batch_size, encoder_sequence_length).
+            decoder_attention_mask (jax.Array, optional): Decoder attention mask for the
+                initial input sequence. Shape: (batch_size, initial_sequence_length).
+            encoder_outputs (tuple, optional): Pre-computed encoder outputs to use for
+                cross-attention during decoding.
+            **kwargs: Additional keyword arguments for API compatibility.
+
+        Returns:
+            dict: Prepared inputs dictionary containing:
+                - past_key_values: Initialized KV cache for all decoder layers.
+                - encoder_outputs: Pre-computed encoder hidden states.
+                - encoder_attention_mask: Mask for encoder outputs.
+                - decoder_mask_info: MaskInfo for decoder self-attention.
+                - decoder_position_ids: Position indices for decoder inputs.
+        """
         # initializing the cache
         batch_size, seq_length = decoder_input_ids.shape
 
@@ -1646,6 +1830,23 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         )
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        """Updates model inputs for the next autoregressive generation step.
+
+        This method updates the model kwargs after each generation step, preparing
+        them for the next forward pass. It updates the KV cache with the new key/value
+        states and increments position IDs.
+
+        Args:
+            model_outputs (Seq2SeqLMOutput): Outputs from the previous generation step,
+                containing updated past_key_values with cached key/value states.
+            model_kwargs (dict): Dictionary of model inputs from the current step,
+                including decoder_position_ids and other generation state.
+
+        Returns:
+            dict: Updated model kwargs for the next generation step with:
+                - past_key_values: Updated KV cache from model_outputs.
+                - decoder_position_ids: Incremented position IDs for the next token.
+        """
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["decoder_position_ids"] = model_kwargs["decoder_position_ids"][:, -1:] + 1
         return model_kwargs
@@ -1658,6 +1859,39 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         loss_kwargs: dict | None = None,
         **batch,
     ) -> tuple[tp.Any, LossMetrics]:
+        """Computes the cross-entropy loss for speech-to-text training.
+
+        This method handles the loss computation for Whisper training, including
+        automatic preparation of decoder inputs through right-shifting of labels.
+        It uses mean reduction and disables token shifting in the base loss function
+        since shifting is handled here.
+
+        Args:
+            labels (Array, optional): Target token IDs for computing the loss.
+                Shape: (batch_size, sequence_length). Tokens with value -100 are
+                ignored in the loss computation.
+            loss_config (LossConfig, optional): Configuration for loss computation
+                including reduction method and other parameters. If None, creates
+                a default LossConfig with mean reduction.
+            loss_kwargs (dict, optional): Additional keyword arguments passed to
+                the loss computation function.
+            **batch: Additional batch inputs including input_features and optionally
+                decoder_input_ids. If decoder_input_ids is not provided but labels
+                is provided, decoder_input_ids will be created by right-shifting
+                the labels.
+
+        Returns:
+            tuple[Array, LossMetrics]: A tuple containing:
+                - loss (Array): Scalar loss value (mean cross-entropy over valid tokens).
+                - metrics (LossMetrics): Additional loss metrics including per-token
+                  losses and auxiliary information.
+
+        Note:
+            - If decoder_input_ids is not provided, it's automatically created by
+              shifting labels right with decoder_start_token_id prepended.
+            - Tokens with label -100 are replaced with pad_token_id in decoder inputs.
+            - Uses mean reduction by default rather than sum.
+        """
         if loss_config is None:
             loss_config = LossConfig()
         loss_config.reduction = "mean"

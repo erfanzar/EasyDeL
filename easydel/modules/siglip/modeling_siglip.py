@@ -83,7 +83,11 @@ class SiglipOutput(ModelOutput):
 
 
 class SiglipVisionEmbeddings(nn.Module):
-    """Patch projection and positional encoding for the SigLIP vision encoder."""
+    """Vision embeddings module for SigLIP models.
+
+    Converts image pixel values into patch embeddings with position encodings
+    for vision transformer processing. Unlike CLIP, SigLIP does not use a class token.
+    """
 
     def __init__(
         self,
@@ -94,6 +98,16 @@ class SiglipVisionEmbeddings(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize SigLIP vision embeddings.
+
+        Args:
+            config (SiglipVisionConfig): Vision model configuration with embedding parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.embed_dim = config.hidden_size
         self.image_size = config.image_size
@@ -120,6 +134,16 @@ class SiglipVisionEmbeddings(nn.Module):
         )
 
     def interpolate(self, embeddings: Array, height: int, width: int):
+        """Interpolate position embeddings for different image sizes.
+
+        Args:
+            embeddings: Patch embeddings of shape (batch_size, num_patches, embed_dim).
+            height: Original image height in pixels.
+            width: Original image width in pixels.
+
+        Returns:
+            Interpolated position embeddings matching the number of patches.
+        """
         num_patches = embeddings.shape[1]
         num_positions = self.position_embedding.weight.shape[0]
         if num_patches == num_positions and height == width:
@@ -149,6 +173,17 @@ class SiglipVisionEmbeddings(nn.Module):
         return jnp.reshape(jnp.transpose(patch_pos_embed, (0, 2, 3, 1)), (1, -1, dim))
 
     def __call__(self, pixel_values: Array, interpolate_pos_encoding=False):
+        """Create vision embeddings from pixel values.
+
+        Args:
+            pixel_values: Input pixel values of shape (batch_size, channels, height, width).
+            interpolate_pos_encoding: Whether to interpolate position embeddings for
+                different image resolutions. Defaults to False.
+
+        Returns:
+            Patch embeddings with position encodings of shape
+            (batch_size, num_patches, hidden_size).
+        """
         _, _, height, width = pixel_values.shape
         target_dtype = self.patch_embedding.kernel.dtype
 
@@ -165,7 +200,11 @@ class SiglipVisionEmbeddings(nn.Module):
 
 
 class SiglipTextEmbeddings(nn.Module):
-    """Token and position embeddings for the SigLIP text encoder."""
+    """Text embeddings module for SigLIP models.
+
+    Combines token embeddings and position embeddings for text
+    transformer processing in the SigLIP architecture.
+    """
 
     def __init__(
         self,
@@ -176,6 +215,16 @@ class SiglipTextEmbeddings(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize SigLIP text embeddings.
+
+        Args:
+            config (SiglipTextConfig): Text model configuration with embedding parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         embed_dim = config.hidden_size
 
         self.token_embedding = nn.Embed(
@@ -201,6 +250,21 @@ class SiglipTextEmbeddings(nn.Module):
         position_ids: Int[Array, "batch seq_len"] | None = None,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
     ) -> Array:
+        """Create text embeddings from token IDs.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+            position_ids: Position indices of shape (batch_size, sequence_length).
+                Auto-generated if not provided.
+            inputs_embeds: Pre-computed token embeddings. If provided, input_ids is ignored.
+
+        Returns:
+            Combined token and position embeddings of shape
+            (batch_size, sequence_length, hidden_size).
+
+        Raises:
+            ValueError: If sequence length exceeds max_position_embeddings.
+        """
         seq_length = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[-2]
         max_position_embedding = self.position_embedding.embedding.shape[0]
 
@@ -223,7 +287,11 @@ class SiglipTextEmbeddings(nn.Module):
 
 
 class SiglipAttention(AttentionModule):
-    """Multi-head self-attention module used across SigLIP encoders."""
+    """Multi-head attention module for SigLIP models.
+
+    Implements bidirectional self-attention for both text and vision
+    encoders in the SigLIP architecture.
+    """
 
     def __init__(
         self,
@@ -234,6 +302,17 @@ class SiglipAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize SigLIP attention layer.
+
+        Args:
+            config: Model configuration with attention parameters (hidden_size,
+                num_attention_heads, attention_dropout).
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(config=config)
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -272,9 +351,25 @@ class SiglipAttention(AttentionModule):
         )
 
     def _split_heads(self, hidden_states):
+        """Split hidden states into multiple attention heads.
+
+        Args:
+            hidden_states: Input tensor of shape (batch, seq_len, embed_dim).
+
+        Returns:
+            Reshaped tensor of shape (batch, seq_len, num_heads, head_dim).
+        """
         return hidden_states.reshape((*hidden_states.shape[:2], self.num_heads, self.head_dim))
 
     def _merge_heads(self, hidden_states):
+        """Merge attention heads back into hidden states.
+
+        Args:
+            hidden_states: Input tensor of shape (batch, seq_len, num_heads, head_dim).
+
+        Returns:
+            Merged tensor of shape (batch, seq_len, embed_dim).
+        """
         return hidden_states.reshape((*hidden_states.shape[:2], self.embed_dim))
 
     def __call__(
@@ -283,6 +378,16 @@ class SiglipAttention(AttentionModule):
         mask_info: MaskInfo | None = None,
         output_attentions: bool = False,
     ):
+        """Apply multi-head self-attention.
+
+        Args:
+            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim).
+            mask_info: Attention mask information for masking padded positions.
+            output_attentions: Whether to return attention weights. Defaults to False.
+
+        Returns:
+            AttentionLayerOutput containing attention output and optional attention weights.
+        """
         query = checkpoint_name(self.q_proj(hidden_states), "attn_query")
         key = checkpoint_name(self.k_proj(hidden_states), "attn_key")
         value = checkpoint_name(self.v_proj(hidden_states), "attn_value")
@@ -310,7 +415,11 @@ class SiglipAttention(AttentionModule):
 
 
 class SiglipMLP(nn.Module):
-    """Two-layer feed-forward network for SigLIP transformer blocks."""
+    """Multi-Layer Perceptron module for SigLIP models.
+
+    Implements the feedforward network with configurable activation function
+    for both text and vision encoders in the SigLIP architecture.
+    """
 
     def __init__(
         self,
@@ -321,6 +430,17 @@ class SiglipMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize SigLIP MLP block.
+
+        Args:
+            config (SiglipTextConfig): Model configuration with MLP parameters
+                (hidden_size, intermediate_size, hidden_act).
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -342,6 +462,14 @@ class SiglipMLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply feedforward transformation.
+
+        Args:
+            hidden_states: Input tensor of shape (batch, seq_len, hidden_dim).
+
+        Returns:
+            Transformed hidden states of shape (batch, seq_len, hidden_dim).
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -357,7 +485,11 @@ class SiglipMLP(nn.Module):
 
 
 class SiglipEncoderLayer(nn.Module):
-    """Transformer encoder block with pre-norm attention and MLP."""
+    """Single encoder layer for SigLIP models.
+
+    Combines multi-head self-attention and feedforward networks with
+    layer normalization and residual connections using pre-norm architecture.
+    """
 
     def __init__(
         self,
@@ -368,6 +500,15 @@ class SiglipEncoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize SigLIP encoder layer.
+
+        Args:
+            config (SiglipTextConfig): Model configuration with layer parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -408,6 +549,18 @@ class SiglipEncoderLayer(nn.Module):
         mask_info: MaskInfo | None = None,
         output_attentions: bool = False,
     ):
+        """Forward pass through the encoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x)).
+
+        Args:
+            hidden_states: Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info: Attention mask information for masking positions.
+            output_attentions: Whether to return attention weights. Defaults to False.
+
+        Returns:
+            EncoderLayerOutput containing hidden states and optional attention weights.
+        """
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
         attn_outputs = self.self_attn(
@@ -430,7 +583,11 @@ class SiglipEncoderLayer(nn.Module):
 
 
 class SiglipEncoder(nn.Module):
-    """Stack of SigLIP encoder layers with optional attention and hidden state capture."""
+    """Transformer encoder for SigLIP models.
+
+    Stacks multiple SiglipEncoderLayer instances to form the complete
+    encoder for either text or vision processing.
+    """
 
     def __init__(
         self,
@@ -441,6 +598,15 @@ class SiglipEncoder(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize SigLIP encoder.
+
+        Args:
+            config (SiglipTextConfig): Model configuration with encoder parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -464,6 +630,20 @@ class SiglipEncoder(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
+        """Forward pass through all encoder layers.
+
+        Args:
+            inputs_embeds: Input embeddings of shape (batch_size, sequence_length, hidden_dim).
+            mask_info: Attention mask information. Defaults to None.
+            output_attentions: Whether to return attention weights from all layers.
+                Defaults to False.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to False.
+
+        Returns:
+            BaseModelOutput containing last hidden state, optional all hidden states,
+            and optional attention weights.
+        """
         hidden_states = inputs_embeds
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -493,7 +673,12 @@ class SiglipEncoder(nn.Module):
 
 
 class SiglipTextTransformer(EasyDeLBaseModule):
-    """Text-side transformer backbone providing embeddings, encoder, and projection head."""
+    """Text transformer encoder for SigLIP models.
+
+    Processes text tokens through embeddings, multiple encoder layers,
+    and final layer normalization with a projection head to produce
+    text representations for contrastive learning.
+    """
 
     def __init__(
         self,
@@ -504,6 +689,15 @@ class SiglipTextTransformer(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize SigLIP text transformer.
+
+        Args:
+            config (SiglipTextConfig): Text model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -551,6 +745,23 @@ class SiglipTextTransformer(EasyDeLBaseModule):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ):
+        """Forward pass through the text transformer.
+
+        Processes text tokens through embeddings, encoder layers, and produces
+        pooled output from the last token position with a projection head.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+            mask_info: Attention mask information for masking padded tokens.
+            position_ids: Position indices of shape (batch_size, sequence_length).
+            output_attentions: Whether to return attention weights. Defaults to False.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to False.
+
+        Returns:
+            BaseModelOutputWithPooling containing last hidden state, pooled output,
+            optional hidden states, and optional attention weights.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -610,7 +821,11 @@ class SiglipTextTransformer(EasyDeLBaseModule):
 
 @register_module(TaskType.BASE_MODULE, config=SiglipTextConfig, model_type="siglip_text_model")
 class SiglipTextModel(EasyDeLBaseModule):
-    """Public text-only SigLIP model wrapper exposing the transformer backbone."""
+    """SigLIP text model outputting raw hidden states.
+
+    A bare transformer encoder for text that produces embeddings without
+    any task-specific head, suitable for use in contrastive learning.
+    """
 
     def __init__(
         self,
@@ -621,6 +836,15 @@ class SiglipTextModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize SigLIP text model.
+
+        Args:
+            config (SiglipTextConfig): Text model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -645,6 +869,26 @@ class SiglipTextModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> tuple | BaseModelOutputWithPooling:
+        """Forward pass through the SigLIP text model.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) indicating
+                which tokens to attend to. Auto-generated if not provided.
+            mask_info: Pre-computed attention mask information. Overrides attention_mask if provided.
+            position_ids: Position indices of shape (batch_size, sequence_length).
+                Auto-generated if not provided.
+            output_attentions: Whether to return attention weights. Defaults to config value.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to config value.
+
+        Returns:
+            BaseModelOutputWithPooling containing last hidden state, pooled output,
+            optional hidden states, and optional attention weights.
+
+        Raises:
+            ValueError: If input_ids is not provided.
+        """
         if input_ids is None:
             raise ValueError("`input_ids` must be provided.")
 
@@ -692,7 +936,12 @@ class SiglipTextModel(EasyDeLBaseModule):
 
 
 class SiglipVisionTransformer(EasyDeLBaseModule):
-    """Vision-side transformer encoder used by SigLIP for patch representations."""
+    """Vision transformer encoder for SigLIP models.
+
+    Processes images through patch embeddings, multiple encoder layers with
+    bidirectional attention, and layer normalization with an optional
+    multi-head attention pooling head to produce vision representations.
+    """
 
     def __init__(
         self,
@@ -703,6 +952,15 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize SigLIP vision transformer.
+
+        Args:
+            config (SiglipVisionConfig): Vision model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -750,6 +1008,23 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         interpolate_pos_encoding: bool | None = False,
     ) -> tuple | BaseModelOutputWithPooling:
+        """Forward pass through the vision transformer.
+
+        Processes images through patch embeddings, encoder layers, post-layer norm,
+        and produces pooled output using multi-head attention pooling.
+
+        Args:
+            pixel_values: Input pixel values of shape (batch_size, channels, height, width).
+            output_attentions: Whether to return attention weights. Defaults to config value.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to config value.
+            interpolate_pos_encoding: Whether to interpolate position embeddings for
+                different image resolutions. Defaults to False.
+
+        Returns:
+            BaseModelOutputWithPooling containing last hidden state, pooled output
+            from attention pooling, optional hidden states, and optional attention weights.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -805,7 +1080,11 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
 
 
 class MultiheadAttention(nn.Module):
-    """Simple multi-head attention used by the vision pooling head."""
+    """Multi-head attention module for SigLIP vision pooling.
+
+    Implements standard multi-head attention without causal masking,
+    used by the attention pooling head for aggregating patch representations.
+    """
 
     def __init__(
         self,
@@ -818,6 +1097,21 @@ class MultiheadAttention(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize multi-head attention module.
+
+        Args:
+            embed_dim: Embedding dimension for the attention layer.
+            num_heads: Number of attention heads.
+            bias: Whether to include bias in projection layers. Defaults to True.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+
+        Raises:
+            ValueError: If embed_dim or num_heads is non-positive.
+            AssertionError: If embed_dim is not divisible by num_heads.
+        """
         if embed_dim <= 0 or num_heads <= 0:
             raise ValueError(
                 f"embed_dim and num_heads must be greater than 0,"
@@ -857,6 +1151,16 @@ class MultiheadAttention(nn.Module):
         key: Array,
         value: Array,
     ):
+        """Apply multi-head attention.
+
+        Args:
+            query: Query tensor of shape (batch_size, query_len, embed_dim).
+            key: Key tensor of shape (batch_size, key_len, embed_dim).
+            value: Value tensor of shape (batch_size, key_len, embed_dim).
+
+        Returns:
+            Attention output of shape (batch_size, query_len, embed_dim).
+        """
         qbs, qss, qds = query.shape
         b, s, _d = value.shape
 
@@ -883,7 +1187,13 @@ class MultiheadAttention(nn.Module):
 
 
 class SiglipMultiheadAttentionPoolingHead(nn.Module):
-    """Pools vision tokens with a learned probe followed by MLP refinement."""
+    """Multi-head attention pooling head for SigLIP vision model.
+
+    Uses a learned probe token to attend over all patch representations,
+    producing a single pooled representation followed by MLP refinement.
+    This is SigLIP's approach to aggregating patch-level features into
+    image-level representations.
+    """
 
     def __init__(
         self,
@@ -894,6 +1204,15 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize attention pooling head.
+
+        Args:
+            config (SiglipVisionConfig): Vision model configuration with pooling parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.probe = ArrayParam.bound(
             shape=(1, 1, config.hidden_size),
             dtype=param_dtype,
@@ -925,6 +1244,14 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
         )
 
     def __call__(self, hidden_state):
+        """Apply attention pooling over patch representations.
+
+        Args:
+            hidden_state: Patch representations of shape (batch_size, num_patches, hidden_size).
+
+        Returns:
+            Pooled representation of shape (batch_size, hidden_size).
+        """
         batch_size = hidden_state.shape[0]
         probe = self.probe.value.repeat(batch_size, 0)
         hidden_state = self.attention(probe, hidden_state, hidden_state)
@@ -936,7 +1263,11 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
 
 @register_module(TaskType.BASE_VISION, config=SiglipVisionConfig, model_type="siglip_vision_model")
 class SiglipVisionModel(EasyDeLBaseModule):
-    """Convenience wrapper around the SigLIP vision transformer backbone."""
+    """SigLIP vision model outputting raw hidden states.
+
+    A bare vision transformer that processes images and produces embeddings
+    without any task-specific head, suitable for use in contrastive learning.
+    """
 
     def __init__(
         self,
@@ -947,6 +1278,15 @@ class SiglipVisionModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize SigLIP vision model.
+
+        Args:
+            config (SiglipVisionConfig): Vision model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -969,6 +1309,20 @@ class SiglipVisionModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         interpolate_pos_encoding: bool = False,
     ) -> tuple | BaseModelOutputWithPooling:
+        """Forward pass through the SigLIP vision model.
+
+        Args:
+            pixel_values: Input pixel values of shape (batch_size, channels, height, width).
+            output_attentions: Whether to return attention weights. Defaults to config value.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to config value.
+            interpolate_pos_encoding: Whether to interpolate position embeddings for
+                different image resolutions. Defaults to False.
+
+        Returns:
+            BaseModelOutputWithPooling containing last hidden state, pooled output,
+            optional hidden states, and optional attention weights.
+        """
         return self.vision_model(
             pixel_values=pixel_values,
             output_attentions=output_attentions,
@@ -1005,7 +1359,12 @@ class SiglipVisionModel(EasyDeLBaseModule):
 
 @register_module(TaskType.BASE_MODULE, config=SiglipConfig, model_type="siglip")
 class SiglipModel(EasyDeLBaseModule):
-    """Full SigLIP contrastive model combining text and vision towers."""
+    """Sigmoid Language-Image Pre-training (SigLIP) model.
+
+    Combines text and vision encoders with sigmoid loss for contrastive
+    learning. Unlike CLIP, SigLIP uses a sigmoid loss function instead
+    of softmax, enabling more efficient batch-level contrastive learning.
+    """
 
     def __init__(
         self,
@@ -1016,6 +1375,19 @@ class SiglipModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize SigLIP model.
+
+        Args:
+            config (SiglipConfig): Combined text and vision configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+
+        Raises:
+            TypeError: If config.get_text_config() is not SiglipTextConfig or
+                config.vision_config is not SiglipVisionConfig.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1078,6 +1450,22 @@ class SiglipModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> Array:
+        """Extract text features from input tokens.
+
+        Processes text through the text encoder and returns the pooled output
+        from the projection head.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+            attention_mask: Boolean mask indicating tokens to attend to.
+            mask_info: Pre-computed mask information.
+            position_ids: Position indices for tokens.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            Pooled text features of shape (batch_size, projection_size).
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1105,6 +1493,20 @@ class SiglipModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         interpolate_pos_encoding: bool = False,
     ) -> Array:
+        """Extract image features from pixel values.
+
+        Processes images through the vision encoder and returns the pooled output
+        from the attention pooling head.
+
+        Args:
+            pixel_values: Input pixel values of shape (batch_size, channels, height, width).
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            interpolate_pos_encoding: Whether to interpolate position embeddings.
+
+        Returns:
+            Pooled image features of shape (batch_size, hidden_size).
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1133,6 +1535,39 @@ class SiglipModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         interpolate_pos_encoding: bool = False,
     ) -> tuple | SiglipOutput:
+        """Performs forward pass through SigLIP's dual-encoder architecture.
+
+        Processes images through the vision transformer and text through the text transformer,
+        normalizes both embeddings, and computes sigmoid-based contrastive similarity logits
+        between all image-text pairs in the batch.
+
+        Args:
+            input_ids: Text token IDs of shape (batch_size, sequence_length). Tokenized text
+                inputs for the text encoder.
+            pixel_values: Image pixel values of shape (batch_size, channels, height, width).
+                Preprocessed images for the vision encoder.
+            attention_mask: Boolean mask of shape (batch_size, sequence_length) for text,
+                indicating which tokens to attend to.
+            mask_info: Pre-computed mask information for text. If provided, overrides
+                `attention_mask`.
+            position_ids: Explicit position indices of shape (batch_size, sequence_length)
+                for text. Auto-generated if not provided.
+            return_loss: Whether to compute and return the contrastive loss.
+            output_attentions: Whether to return attention weights from vision and text encoders.
+            output_hidden_states: Whether to return hidden states from all layers of both encoders.
+            interpolate_pos_encoding: Whether to interpolate position embeddings for
+                different image resolutions.
+
+        Returns:
+            SiglipOutput containing:
+                - loss: Sigmoid contrastive loss if return_loss is True
+                - logits_per_image: Similarity scores of shape (batch, batch)
+                - logits_per_text: Similarity scores of shape (batch, batch)
+                - text_embeds: L2-normalized text embeddings
+                - image_embeds: L2-normalized image embeddings
+                - text_model_output: Full output from text encoder
+                - vision_model_output: Full output from vision encoder
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1227,7 +1662,11 @@ class SiglipModel(EasyDeLBaseModule):
 
 @register_module(TaskType.IMAGE_CLASSIFICATION, config=SiglipConfig, model_type="siglip")
 class SiglipForImageClassification(BaseImageClassificationModule[SiglipVisionModel, SiglipConfig]):
-    """Image-classification head on top of the SigLIP vision encoder."""
+    """SigLIP vision model with image classification head.
+
+    Extends the SigLIP vision transformer with a linear classification layer
+    on top of the mean-pooled patch embeddings for image classification tasks.
+    """
 
     def __init__(
         self,
@@ -1238,6 +1677,15 @@ class SiglipForImageClassification(BaseImageClassificationModule[SiglipVisionMod
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize SigLIP for image classification.
+
+        Args:
+            config (SiglipConfig): Model configuration with vision_config and num_labels.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         vision_model = SiglipVisionModel(
             config.vision_config,
             dtype=dtype,
@@ -1267,6 +1715,21 @@ class SiglipForImageClassification(BaseImageClassificationModule[SiglipVisionMod
         output_hidden_states: bool | None = None,
         interpolate_pos_encoding: bool = False,
     ) -> tuple | ImageClassifierOutput:
+        """Forward pass for image classification.
+
+        Args:
+            pixel_values: Input pixel values of shape (batch_size, channels, height, width).
+            labels: Ground truth labels for computing loss (unused in this implementation).
+            output_attentions: Whether to return attention weights. Defaults to config value.
+            output_hidden_states: Whether to return hidden states from all layers.
+                Defaults to config value.
+            interpolate_pos_encoding: Whether to interpolate position embeddings for
+                different image resolutions.
+
+        Returns:
+            ImageClassifierOutput containing classification logits, optional hidden states,
+            and optional attention weights.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

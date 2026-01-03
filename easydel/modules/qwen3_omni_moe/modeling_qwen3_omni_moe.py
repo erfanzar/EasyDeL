@@ -86,7 +86,22 @@ from .qwen3_omni_moe_configuration import (
 
 @auto_pytree
 class Qwen3OmniMoeCausalLMOutputWithPast(ModelOutput):
-    """Output class for Qwen3OmniMoe causal language model."""
+    """Output class for Qwen3OmniMoe causal language model.
+
+    Contains model outputs including logits, hidden states, attention weights,
+    and multimodal embeddings from audio and image encoders.
+
+    Attributes:
+        loss (Array | None): Language modeling loss if labels provided.
+        logits (Array): Prediction scores from language model head.
+        past_key_values (list[Array] | None): Cached key-value states for generation.
+        hidden_states (tuple[Array] | None): Hidden states from all layers if requested.
+        attentions (tuple[Array] | None): Attention weights from all layers if requested.
+        rope_deltas (Array | None): RoPE position deltas for multimodal inputs.
+        image_hidden_states (Array | None): Encoded image features [batch, seq_len, hidden_dim].
+        audio_hidden_states (Array | None): Encoded audio features [batch, seq_len, hidden_dim].
+        router_logits (tuple[Array] | None): Router logits from MoE layers if requested.
+    """
 
     loss: Array | None = None
     logits: Array = None
@@ -100,7 +115,11 @@ class Qwen3OmniMoeCausalLMOutputWithPast(ModelOutput):
 
 
 class Qwen3OmniMoeAudioMLP(nn.Module):
-    """Feed-forward network for audio encoder."""
+    """Feed-forward network for audio encoder.
+
+    Implements a two-layer feedforward network with configurable activation
+    function for processing audio features in the audio encoder.
+    """
 
     def __init__(
         self,
@@ -111,6 +130,16 @@ class Qwen3OmniMoeAudioMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize audio encoder MLP.
+
+        Args:
+            config (Qwen3OmniMoeAudioConfig): Audio encoder configuration with
+                d_model and encoder_ffn_dim parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.fc1 = ColumnParallelLinear(
             config.d_model,
             config.encoder_ffn_dim,
@@ -132,11 +161,24 @@ class Qwen3OmniMoeAudioMLP(nn.Module):
         self.act = ACT2FN[config.activation_function]
 
     def __call__(self, hidden_states: Array) -> Array:
+        """Apply feedforward transformation to audio features.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, d_model].
+
+        Returns:
+            Transformed hidden states [batch, seq_len, d_model].
+        """
         return self.fc2(self.act(self.fc1(hidden_states)))
 
 
 class Qwen3OmniMoeAudioAttention(nn.Module):
-    """Self-attention for audio encoder."""
+    """Self-attention module for audio encoder.
+
+    Implements multi-head self-attention for processing audio features
+    without causal masking. Uses FlexibleAttentionModule for efficient
+    attention computation.
+    """
 
     def __init__(
         self,
@@ -148,6 +190,16 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize audio encoder attention layer.
+
+        Args:
+            config (Qwen3OmniMoeAudioConfig): Audio encoder configuration.
+            layer_idx (int): Index of this layer in the encoder stack.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.d_model = config.d_model
@@ -203,6 +255,15 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         hidden_states: Array,
         attention_mask: Array | None = None,
     ) -> Array:
+        """Apply self-attention to audio features.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, d_model].
+            attention_mask: Optional attention mask [batch, seq_len].
+
+        Returns:
+            Attention output tensor [batch, seq_len, d_model].
+        """
         batch_size, seq_len, _ = hidden_states.shape
 
         q = self.q_proj(hidden_states)
@@ -229,6 +290,8 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
     """Transformer layer for audio encoder.
 
+    Implements a single transformer layer with pre-normalization architecture,
+    self-attention, and feedforward network for processing audio features.
     Matches HuggingFace structure with fc1/fc2 directly on the layer.
     """
 
@@ -242,6 +305,16 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize audio encoder layer.
+
+        Args:
+            config (Qwen3OmniMoeAudioConfig): Audio encoder configuration.
+            layer_idx (int): Index of this layer in the encoder stack.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.self_attn = Qwen3OmniMoeAudioAttention(
             config=config,
             layer_idx=layer_idx,
@@ -289,6 +362,15 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         hidden_states: Array,
         attention_mask: Array | None = None,
     ) -> Array:
+        """Forward pass through audio encoder layer.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, d_model].
+            attention_mask: Optional attention mask.
+
+        Returns:
+            Output tensor [batch, seq_len, d_model] after attention and FFN.
+        """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(hidden_states, attention_mask)
@@ -343,6 +425,16 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize audio encoder.
+
+        Args:
+            config (Qwen3OmniMoeAudioConfig): Audio encoder configuration with
+                conv and transformer parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -535,7 +627,11 @@ def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) 
 
 
 class Qwen3OmniMoeVisionPatchEmbed(nn.Module):
-    """3D patch embedding for vision encoder."""
+    """3D patch embedding for vision encoder.
+
+    Converts image/video patches into embedding vectors using 3D convolution
+    that processes temporal, height, and width dimensions simultaneously.
+    """
 
     def __init__(
         self,
@@ -546,6 +642,15 @@ class Qwen3OmniMoeVisionPatchEmbed(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize vision patch embedding layer.
+
+        Args:
+            config (Qwen3OmniMoeVisionConfig): Vision encoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.dtype = dtype
         self.patch_size = config.patch_size
         self.temporal_patch_size = config.temporal_patch_size
@@ -566,6 +671,14 @@ class Qwen3OmniMoeVisionPatchEmbed(nn.Module):
         )
 
     def __call__(self, hidden_states: Array) -> Array:
+        """Convert image/video patches to embeddings.
+
+        Args:
+            hidden_states: Input patches flattened into [num_patches, patch_elements].
+
+        Returns:
+            Patch embeddings [num_patches, hidden_size].
+        """
         hidden_states = jnp.transpose(
             hidden_states.reshape(
                 -1,
@@ -583,6 +696,8 @@ class Qwen3OmniMoeVisionPatchEmbed(nn.Module):
 class Qwen3OmniMoeVisionPatchMerger(nn.Module):
     """Spatial patch merger for vision encoder.
 
+    Merges spatially adjacent patches to reduce sequence length while
+    preserving information. Uses layer normalization and MLP for processing.
     Matches HuggingFace structure with ln_q and mlp list.
     """
 
@@ -596,6 +711,17 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize vision patch merger.
+
+        Args:
+            config (Qwen3OmniMoeVisionConfig): Vision encoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            use_postshuffle_norm (bool, optional): Whether to apply norm after shuffling.
+                Defaults to False.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.dtype = dtype
         self.spatial_merge_size = config.spatial_merge_size
         self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
@@ -631,6 +757,14 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         ]
 
     def __call__(self, x: Array) -> Array:
+        """Merge adjacent patches and project to output dimension.
+
+        Args:
+            x: Input patch embeddings.
+
+        Returns:
+            Merged and projected embeddings.
+        """
         x = self.ln_q(x.reshape(-1, self.hidden_size) if self.use_postshuffle_norm else x).reshape(-1, self.hidden_size)
         x = self.mlp[0](x)
         x = nn.gelu(x, approximate=False)
@@ -639,7 +773,11 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
 
 
 class Qwen3OmniMoeVisionMLP(nn.Module):
-    """Feed-forward network for vision encoder."""
+    """Feed-forward network for vision encoder.
+
+    Implements a two-layer feedforward network with GELU activation
+    for processing vision features in the vision encoder.
+    """
 
     def __init__(
         self,
@@ -650,6 +788,15 @@ class Qwen3OmniMoeVisionMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize vision encoder MLP.
+
+        Args:
+            config (Qwen3OmniMoeVisionConfig): Vision encoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.linear_fc1 = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
@@ -671,11 +818,24 @@ class Qwen3OmniMoeVisionMLP(nn.Module):
         )
 
     def __call__(self, x: Array) -> Array:
+        """Apply feedforward transformation to vision features.
+
+        Args:
+            x: Input tensor [seq_len, hidden_size].
+
+        Returns:
+            Transformed hidden states [seq_len, hidden_size].
+        """
         return self.linear_fc2(self.act(self.linear_fc1(x)))
 
 
 class Qwen3OmniMoeVisionAttention(nn.Module):
-    """Self-attention for vision encoder."""
+    """Self-attention module for vision encoder.
+
+    Implements multi-head self-attention with rotary position embeddings
+    for processing vision features. Uses FlexibleAttentionModule for
+    efficient attention computation.
+    """
 
     def __init__(
         self,
@@ -687,6 +847,16 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize vision encoder attention layer.
+
+        Args:
+            config (Qwen3OmniMoeVisionConfig): Vision encoder configuration.
+            layer_idx (int): Index of this layer in the encoder stack.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_heads
         self.head_dim = config.hidden_size // config.num_heads
@@ -722,6 +892,16 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
         cu_seqlens: Array,
         rotary_pos_emb: Array,
     ) -> Array:
+        """Apply self-attention with RoPE to vision features.
+
+        Args:
+            hidden_states: Input tensor [seq_len, hidden_size].
+            cu_seqlens: Cumulative sequence lengths for attention masking.
+            rotary_pos_emb: Rotary position embeddings.
+
+        Returns:
+            Attention output tensor [seq_len, hidden_size].
+        """
         seq_length = hidden_states.shape[0]
         qkv = self.qkv(hidden_states)
         q, k, v = map(
@@ -747,7 +927,11 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
 
 
 class Qwen3OmniMoeVisionBlock(nn.Module):
-    """Transformer block for vision encoder."""
+    """Transformer block for vision encoder.
+
+    Implements a single transformer layer with pre-normalization architecture,
+    self-attention with RoPE, and feedforward network for processing vision features.
+    """
 
     def __init__(
         self,
@@ -759,6 +943,16 @@ class Qwen3OmniMoeVisionBlock(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize vision encoder block.
+
+        Args:
+            config (Qwen3OmniMoeVisionConfig): Vision encoder configuration.
+            layer_idx (int): Index of this layer in the encoder stack.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.norm1 = nn.LayerNorm(config.hidden_size, epsilon=1e-6, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
         self.norm2 = nn.LayerNorm(config.hidden_size, epsilon=1e-6, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
         self.attn = Qwen3OmniMoeVisionAttention(
@@ -783,6 +977,16 @@ class Qwen3OmniMoeVisionBlock(nn.Module):
         cu_seqlens: Array,
         rotary_pos_emb: Array,
     ) -> Array:
+        """Forward pass through vision encoder block.
+
+        Args:
+            hidden_states: Input tensor [seq_len, hidden_size].
+            cu_seqlens: Cumulative sequence lengths for attention masking.
+            rotary_pos_emb: Rotary position embeddings.
+
+        Returns:
+            Output tensor [seq_len, hidden_size] after attention and FFN.
+        """
         hidden_states = hidden_states + self.attn(self.norm1(hidden_states), cu_seqlens, rotary_pos_emb)
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
@@ -808,6 +1012,12 @@ def create_vision_rotary_embedding(dim: int, theta: float = 10000.0, max_seqlen:
 class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
     """Vision encoder for Qwen3OmniMoe.
 
+    Processes images and videos through:
+    1. 3D patch embedding for temporal and spatial patches
+    2. Position embeddings for spatial locations
+    3. Transformer encoder layers with RoPE
+    4. Patch merging to reduce sequence length
+
     Matches HuggingFace structure with merger_list, rotary_pos_emb.
     """
 
@@ -822,6 +1032,15 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize vision encoder.
+
+        Args:
+            config (Qwen3OmniMoeVisionConfig): Vision encoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -932,6 +1151,16 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
         grid_thw: Array,
         max_grid_size: int,
     ) -> Array:
+        """Forward pass through vision encoder.
+
+        Args:
+            hidden_states: Input pixel values [num_patches, channels * t * h * w].
+            grid_thw: Grid dimensions (temporal, height, width) for each image/video.
+            max_grid_size: Maximum grid size for rotary embedding computation.
+
+        Returns:
+            Encoded vision features [num_merged_patches, out_hidden_size].
+        """
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw, max_grid_size)
 
@@ -959,7 +1188,11 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
 
 
 class Qwen3OmniMoeTextMLP(nn.Module):
-    """Dense MLP for non-MoE layers."""
+    """Dense MLP for non-MoE layers in Qwen3OmniMoe text decoder.
+
+    Implements the feedforward network with SwiGLU activation function
+    for enhanced representation learning. Used for non-MoE layers.
+    """
 
     def __init__(
         self,
@@ -970,6 +1203,15 @@ class Qwen3OmniMoeTextMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize text decoder MLP.
+
+        Args:
+            config (Qwen3OmniMoeTextConfig): Text decoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         column_linear = partial(
             ColumnParallelLinear,
@@ -996,6 +1238,14 @@ class Qwen3OmniMoeTextMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def __call__(self, hidden_states: Array) -> Array:
+        """Apply SwiGLU feedforward transformation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim].
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim].
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -1008,7 +1258,11 @@ class Qwen3OmniMoeTextMLP(nn.Module):
 
 
 class Qwen3OmniMoeMLPStack(nn.Module):
-    """MoE MLP stack."""
+    """Stacked MoE MLP module using ParallelMoELinear layers.
+
+    Implements the expert MLP stack with SwiGLU activation function using
+    column and row parallel MoE linear layers for efficient expert computation.
+    """
 
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
@@ -1035,6 +1289,15 @@ class Qwen3OmniMoeMLPStack(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize MoE MLP stack.
+
+        Args:
+            config (Qwen3OmniMoeTextConfig): Text decoder configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.gate_proj = ColumnParallelMoELinear(
             num_experts=config.num_experts,
@@ -1080,6 +1343,16 @@ class Qwen3OmniMoeMLPStack(nn.Module):
         group_sizes: Array,
         sorted_experts: Array | None = None,
     ) -> Array:
+        """Apply SwiGLU feedforward transformation through MoE experts.
+
+        Args:
+            hidden_states: Input tensor after expert routing.
+            group_sizes: Array specifying the number of tokens routed to each expert.
+            sorted_experts: Optional array of sorted expert indices.
+
+        Returns:
+            Transformed hidden states after MoE MLP processing.
+        """
         return self.down_proj(
             self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
             * self.up_proj(hidden_states, group_sizes, sorted_experts),
@@ -1089,7 +1362,11 @@ class Qwen3OmniMoeMLPStack(nn.Module):
 
 
 class Qwen3OmniMoeTextSparseBlock(BaseMoeModule):
-    """Sparse MoE block for text decoder."""
+    """Sparse Mixture of Experts (MoE) block for Qwen3OmniMoe text decoder.
+
+    Implements token-level expert routing with top-k selection, combining
+    outputs from multiple experts based on learned routing weights.
+    """
 
     def __init__(
         self,
@@ -1100,6 +1377,15 @@ class Qwen3OmniMoeTextSparseBlock(BaseMoeModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize text decoder MoE sparse block.
+
+        Args:
+            config (Qwen3OmniMoeTextConfig): Text decoder configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             n_routed_experts=config.num_experts,
@@ -1130,6 +1416,16 @@ class Qwen3OmniMoeTextSparseBlock(BaseMoeModule):
         )
 
     def __call__(self, hidden_states: Array) -> tuple[Array, Array]:
+        """Route tokens through experts and combine outputs.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim].
+
+        Returns:
+            Tuple containing:
+                - Output hidden states [batch, seq_len, hidden_dim] after expert processing
+                - Router logits [batch * seq_len, num_experts] for auxiliary loss computation
+        """
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -1143,7 +1439,11 @@ class Qwen3OmniMoeTextSparseBlock(BaseMoeModule):
 
 
 class Qwen3OmniMoeTextAttention(UnifiedAttention):
-    """Causal self-attention for text decoder."""
+    """Causal self-attention for Qwen3OmniMoe text decoder.
+
+    Multi-head attention layer with RoPE embeddings and Q/K normalization.
+    Features layer-specific sliding window attention support.
+    """
 
     def __init__(
         self,
@@ -1155,6 +1455,16 @@ class Qwen3OmniMoeTextAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize text decoder attention layer.
+
+        Args:
+            config (Qwen3OmniMoeTextConfig): Text decoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer for sliding window configuration.
+        """
         sliding_window = None
         if config.use_sliding_window and config.sliding_window is not None and layer_idx >= config.max_window_layers:
             sliding_window = config.sliding_window
@@ -1173,11 +1483,25 @@ class Qwen3OmniMoeTextAttention(UnifiedAttention):
         )
 
     def _postprocess_qkv(self, query_states, key_states, value_states):
+        """Apply Q/K normalization after computing query, key, and value projections.
+
+        Args:
+            query_states: Query tensor from projection layer.
+            key_states: Key tensor from projection layer.
+            value_states: Value tensor from projection layer.
+
+        Returns:
+            Tuple of normalized query, normalized key, and value tensors.
+        """
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
 class Qwen3OmniMoeTextDecoderLayer(nn.Module):
-    """Decoder layer for text model."""
+    """Single decoder layer for Qwen3OmniMoe text model.
+
+    Combines multi-head attention with Q/K normalization and feedforward networks
+    (either standard MLP or MoE) with RMS normalization and residual connections.
+    """
 
     def __init__(
         self,
@@ -1189,6 +1513,16 @@ class Qwen3OmniMoeTextDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize text decoder layer.
+
+        Args:
+            config (Qwen3OmniMoeTextConfig): Text decoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer, used to determine MoE vs MLP.
+        """
         self.config = config
         self.layer_idx = layer_idx
 
@@ -1262,6 +1596,22 @@ class Qwen3OmniMoeTextDecoderLayer(nn.Module):
         output_router_logits: bool = False,
         frequencies: Array | None = None,
     ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens.
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.).
+            cache_view: Cache view for key-value states. Defaults to None.
+            cache_metadata: Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            output_router_logits (bool, optional): Whether to return router logits. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, router logits, and cache view.
+        """
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
             mask_info,
@@ -1306,6 +1656,15 @@ class Qwen3OmniMoeTalkerResizeMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize talker resize MLP.
+
+        Args:
+            config (Qwen3OmniMoeTalkerConfig): Talker configuration with input/output dimensions.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         text_config = config.text_config
 
@@ -1330,11 +1689,23 @@ class Qwen3OmniMoeTalkerResizeMLP(nn.Module):
         self.act_fn = ACT2FN[text_config.hidden_act]
 
     def __call__(self, hidden_states: Array) -> Array:
+        """Project hidden states from thinker to talker dimension.
+
+        Args:
+            hidden_states: Input tensor from thinker [batch, seq_len, thinker_hidden_dim].
+
+        Returns:
+            Resized hidden states [batch, seq_len, talker_hidden_dim].
+        """
         return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_states)))
 
 
 class Qwen3OmniMoeTalkerTextMLP(nn.Module):
-    """Dense MLP for Talker (used as shared expert)."""
+    """Dense MLP for Talker text model.
+
+    Implements the feedforward network with SwiGLU activation function
+    for enhanced representation learning. Used as shared expert in MoE layers.
+    """
 
     def __init__(
         self,
@@ -1346,6 +1717,17 @@ class Qwen3OmniMoeTalkerTextMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize talker text MLP.
+
+        Args:
+            config (Qwen3OmniMoeTalkerTextConfig): Talker text configuration.
+            intermediate_size (int | None, optional): Override for intermediate layer size.
+                Defaults to config.intermediate_size if None.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         imz = intermediate_size or config.intermediate_size
         column_linear = partial(
@@ -1373,6 +1755,14 @@ class Qwen3OmniMoeTalkerTextMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def __call__(self, hidden_states: Array) -> Array:
+        """Apply SwiGLU feedforward transformation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim].
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim].
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -1385,7 +1775,11 @@ class Qwen3OmniMoeTalkerTextMLP(nn.Module):
 
 
 class Qwen3OmniMoeTalkerMLPStack(nn.Module):
-    """MoE MLP stack for Talker."""
+    """Stacked MoE MLP module for Talker using ParallelMoELinear layers.
+
+    Implements the expert MLP stack with SwiGLU activation function for
+    the Talker's MoE layers.
+    """
 
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
@@ -1412,6 +1806,15 @@ class Qwen3OmniMoeTalkerMLPStack(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Talker MoE MLP stack.
+
+        Args:
+            config (Qwen3OmniMoeTalkerTextConfig): Talker text configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.gate_proj = ColumnParallelMoELinear(
             num_experts=config.num_experts,
@@ -1457,6 +1860,16 @@ class Qwen3OmniMoeTalkerMLPStack(nn.Module):
         group_sizes: Array,
         sorted_experts: Array | None = None,
     ) -> Array:
+        """Apply SwiGLU feedforward transformation through MoE experts.
+
+        Args:
+            hidden_states: Input tensor after expert routing.
+            group_sizes: Array specifying the number of tokens routed to each expert.
+            sorted_experts: Optional array of sorted expert indices.
+
+        Returns:
+            Transformed hidden states after MoE MLP processing.
+        """
         return self.down_proj(
             self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
             * self.up_proj(hidden_states, group_sizes, sorted_experts),
@@ -1472,6 +1885,9 @@ class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
     - Has a shared_expert (dense MLP) that processes ALL tokens
     - Has a shared_expert_gate (sigmoid gate) to weight the shared expert output
     - Output = routed_expert_output + sigmoid(gate(x)) * shared_expert(x)
+
+    This architecture allows for better knowledge sharing across all tokens
+    while still maintaining the benefits of sparse expert routing.
     """
 
     def __init__(
@@ -1483,6 +1899,15 @@ class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Talker MoE sparse block with shared expert.
+
+        Args:
+            config (Qwen3OmniMoeTalkerTextConfig): Talker text configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             n_routed_experts=config.num_experts,
@@ -1535,6 +1960,16 @@ class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
         )
 
     def __call__(self, hidden_states: Array) -> tuple[Array, Array]:
+        """Route tokens through experts and shared expert, then combine outputs.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim].
+
+        Returns:
+            Tuple containing:
+                - Output hidden states after MoE and shared expert processing
+                - Router logits for auxiliary loss computation
+        """
         routed_output, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -1554,7 +1989,11 @@ class Qwen3OmniMoeTalkerTextSparseMoeBlock(BaseMoeModule):
 
 
 class Qwen3OmniMoeTalkerTextAttention(UnifiedAttention):
-    """Causal self-attention for Talker text model."""
+    """Causal self-attention for Talker text model.
+
+    Multi-head attention layer with RoPE embeddings and Q/K normalization.
+    Features sliding window attention support.
+    """
 
     def __init__(
         self,
@@ -1566,6 +2005,16 @@ class Qwen3OmniMoeTalkerTextAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Talker text attention layer.
+
+        Args:
+            config (Qwen3OmniMoeTalkerTextConfig): Talker text configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the decoder stack.
+        """
         super().__init__(
             config,
             dtype,
@@ -1580,11 +2029,25 @@ class Qwen3OmniMoeTalkerTextAttention(UnifiedAttention):
         )
 
     def _postprocess_qkv(self, query_states, key_states, value_states):
+        """Apply Q/K normalization after computing query, key, and value projections.
+
+        Args:
+            query_states: Query tensor from projection layer.
+            key_states: Key tensor from projection layer.
+            value_states: Value tensor from projection layer.
+
+        Returns:
+            Tuple of normalized query, normalized key, and value tensors.
+        """
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
 class Qwen3OmniMoeTalkerTextDecoderLayer(nn.Module):
-    """Decoder layer for Talker text model with shared expert MoE."""
+    """Decoder layer for Talker text model with shared expert MoE.
+
+    Combines multi-head attention with Q/K normalization and MoE feedforward
+    network with shared expert using RMS normalization and residual connections.
+    """
 
     def __init__(
         self,
@@ -1596,6 +2059,16 @@ class Qwen3OmniMoeTalkerTextDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Talker text decoder layer.
+
+        Args:
+            config (Qwen3OmniMoeTalkerTextConfig): Talker text configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer, used to determine MoE vs MLP.
+        """
         self.config = config
         self.layer_idx = layer_idx
 
@@ -1669,6 +2142,22 @@ class Qwen3OmniMoeTalkerTextDecoderLayer(nn.Module):
         output_router_logits: bool = False,
         frequencies: Array | None = None,
     ) -> DecoderLayerOutput:
+        """Forward pass through the Talker decoder layer.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens.
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.).
+            cache_view: Cache view for key-value states. Defaults to None.
+            cache_metadata: Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            output_router_logits (bool, optional): Whether to return router logits. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, router logits, and cache view.
+        """
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
             mask_info,
@@ -1699,7 +2188,11 @@ class Qwen3OmniMoeTalkerTextDecoderLayer(nn.Module):
 
 
 class Qwen3OmniMoeTalkerCodePredictorMLP(nn.Module):
-    """Dense MLP for Talker code predictor (non-MoE)."""
+    """Dense MLP for Talker code predictor.
+
+    Implements the feedforward network with SwiGLU activation function
+    for the code predictor (non-MoE) layers.
+    """
 
     def __init__(
         self,
@@ -1710,6 +2203,15 @@ class Qwen3OmniMoeTalkerCodePredictorMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize code predictor MLP.
+
+        Args:
+            config (Qwen3OmniMoeTalkerCodePredictorConfig): Code predictor configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         column_linear = partial(
             ColumnParallelLinear,
@@ -1736,6 +2238,14 @@ class Qwen3OmniMoeTalkerCodePredictorMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def __call__(self, hidden_states: Array) -> Array:
+        """Apply SwiGLU feedforward transformation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim].
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim].
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -1748,7 +2258,11 @@ class Qwen3OmniMoeTalkerCodePredictorMLP(nn.Module):
 
 
 class Qwen3OmniMoeTalkerCodePredictorAttention(UnifiedAttention):
-    """Causal self-attention for Talker code predictor."""
+    """Causal self-attention for Talker code predictor.
+
+    Multi-head attention layer with RoPE embeddings and Q/K normalization
+    for processing codec token sequences.
+    """
 
     def __init__(
         self,
@@ -2763,7 +3277,8 @@ def merge_multimodal_embeddings(
 class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
     """Text decoder model for Qwen3OmniMoe Thinker.
 
-    Contains only the text processing components (embed_tokens, layers, norm).
+    A transformer decoder with MoE layers for text generation. Contains
+    only the text processing components (embed_tokens, layers, norm).
     This matches HuggingFace's Qwen3OmniMoeThinkerTextModel structure where
     audio_tower and visual are at the top level of ForConditionalGeneration.
     """
@@ -2777,6 +3292,15 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Thinker text model.
+
+        Args:
+            config (Qwen3OmniMoeTextConfig): Text decoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -2835,7 +3359,25 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> VLMCausalLMOutput:
-        """Forward pass through text decoder only."""
+        """Forward pass through text decoder.
+
+        Args:
+            input_ids: Input token IDs [batch, seq_len].
+            inputs_embeds: Input embeddings if provided instead of input_ids.
+            attention_mask: Attention mask for padding.
+            mask_info: Mask information for efficient attention.
+            position_ids: Position IDs for tokens.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return all hidden states.
+            output_router_logits: Whether to return MoE router logits.
+            mode: Runtime mode (train, decode, etc.).
+            past_key_values: Cached key-value states for generation.
+            cache_metadata: Cache metadata for efficient caching.
+
+        Returns:
+            VLMCausalLMOutput: Model outputs including hidden states, attentions,
+                and router logits if requested.
+        """
         config = self.config
         output_router_logits = output_router_logits if output_router_logits is not None else config.output_router_logits
         output_hidden_states = output_hidden_states if output_hidden_states is not None else config.output_hidden_states
@@ -2906,6 +3448,11 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
 class Qwen3OmniMoeModel(EasyDeLBaseModule):
     """Base Qwen3OmniMoe Thinker model combining audio, vision, and text.
 
+    A multimodal encoder-decoder model that processes:
+    - Audio inputs via mel-spectrogram encoding
+    - Visual inputs (images/videos) via patch embedding and transformer
+    - Text inputs via token embedding
+
     Note: This class is kept for backward compatibility. The audio and visual
     components are nested under this model, while in HuggingFace they're at
     the ForConditionalGeneration level.
@@ -2920,6 +3467,16 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize base Qwen3OmniMoe model.
+
+        Args:
+            config (Qwen3OmniMoeThinkerConfig): Thinker configuration with audio,
+                vision, and text configurations.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -3230,6 +3787,16 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Qwen3OmniMoe Thinker for conditional generation.
+
+        Args:
+            config (Qwen3OmniMoeThinkerConfig): Thinker configuration with
+                audio, vision, and text configurations.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         text_model = Qwen3OmniMoeThinkerTextModel(
             config=config.text_config,
             dtype=dtype,
@@ -3558,6 +4125,16 @@ class Qwen3OmniMoeForConditionalGeneration(
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize full Qwen3OmniMoe model with Thinker, Talker, and Code2Wav.
+
+        Args:
+            config (Qwen3OmniMoeConfig): Full configuration including thinker,
+                talker, and code2wav configurations.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         thinker = Qwen3OmniMoeThinkerForConditionalGeneration(
             config=config.thinker_config,
             dtype=dtype,

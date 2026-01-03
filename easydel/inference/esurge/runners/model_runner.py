@@ -546,17 +546,37 @@ class eSurgeRunner:
 
         logger.info("Helper kernel precompilation finished")
 
-    def compile(self):
-        """Compile the model for all token padding sizes."""
+    def compile(self, *, max_num_batched_tokens: int | None = None) -> None:
+        """Compile the model for token/request bucket sizes.
+
+        Notes:
+            - `max_model_len` controls the *sequence length* (context window).
+            - `max_num_batched_tokens` controls the *per-step* token budget that the
+              scheduler will emit in a single forward pass.
+
+            When `max_num_batched_tokens` is provided, compilation is capped to the
+            smallest token bucket >= that value (dramatically reducing startup time
+            for long-context models).
+        """
         logger.info("Starting eSurgeRunner compilation")
+        num_tokens_paddings = list(self.num_tokens_paddings)
+        if max_num_batched_tokens is not None:
+            target = int(max_num_batched_tokens)
+            if target <= 0:
+                raise ValueError(f"max_num_batched_tokens must be positive, got {max_num_batched_tokens}")
+
+            # Pick the smallest bucket >= target (keeps runtime bucket selection valid).
+            cap = next((b for b in num_tokens_paddings if b >= target), num_tokens_paddings[-1])
+            num_tokens_paddings = [b for b in num_tokens_paddings if b <= cap]
+
         logger.debug(
-            f"Compiling for {len(self.num_tokens_paddings)} token padding sizes: {self.num_tokens_paddings[:5]}..."
-            if len(self.num_tokens_paddings) > 5
-            else f"Compiling for token padding sizes: {self.num_tokens_paddings}"
+            f"Compiling for {len(num_tokens_paddings)} token padding sizes: {num_tokens_paddings[:5]}..."
+            if len(num_tokens_paddings) > 5
+            else f"Compiling for token padding sizes: {num_tokens_paddings}"
         )
 
         self.executor_manager.compile(
-            num_tokens_paddings=self.num_tokens_paddings,
+            num_tokens_paddings=num_tokens_paddings,
             num_reqs_max_model_len=self.num_reqs_max_model_len,
             max_pages_per_req=self.max_pages_per_req,
             max_num_reqs=self.max_num_reqs,
@@ -566,7 +586,7 @@ class eSurgeRunner:
 
         self._precompile_jitted_helpers(
             reqs_padds=self.max_num_seq_buckets,
-            prompt_len_buckets=[min(n, self.max_model_len) for n in self.num_tokens_paddings],
+            prompt_len_buckets=[min(n, self.max_model_len) for n in num_tokens_paddings],
             precompile_allowed_mask=False,
             allowed_max=4096,
         )

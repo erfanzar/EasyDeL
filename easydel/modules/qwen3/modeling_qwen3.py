@@ -47,30 +47,11 @@ from .qwen3_configuration import Qwen3Config
 
 
 class Qwen3MLP(nn.Module):
-    """Qwen3 MLP module.
+    """Multi-Layer Perceptron module for Qwen3 models.
 
-    This module implements the feed-forward network (MLP) used in the Qwen3 model.
-    It uses a Gated Linear Unit (GLU) structure with SiLU activation.
-
-    Attributes:
-        config (Qwen3Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        gate_proj (ParallelLinear): Linear layer for the GLU gate.
-        down_proj (ParallelLinear): Linear layer for the down projection.
-        up_proj (ParallelLinear): Linear layer for the GLU value.
-        act_fn (callable): Activation function (SiLU).
+    Implements the feedforward network with SwiGLU activation function
+    for enhanced representation learning in Qwen3 architecture.
     """
-
-    config: Qwen3Config
-    dtype: jnp.dtype
-    param_dtype: jnp.dtype
-    precision: jax.lax.PrecisionLike | None
-    gate_proj: ColumnParallelLinear
-    down_proj: RowParallelLinear
-    up_proj: ColumnParallelLinear
-    act_fn: callable
 
     def __init__(
         self,
@@ -81,14 +62,15 @@ class Qwen3MLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen3MLP module.
+        """Initialize Qwen3 MLP block.
 
         Args:
-            config (Qwen3Config): The configuration object for the Qwen3 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen3Config): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -132,13 +114,13 @@ class Qwen3MLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Forward pass of the Qwen3MLP module.
+        """Apply SwiGLU feedforward transformation.
 
         Args:
-            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input hidden states.
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
-            Float[Array, "batch seq_len hidden_dim"]: Output hidden states after MLP transformation.
+            Transformed hidden states [batch, seq_len, hidden_dim]
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -159,11 +141,10 @@ class Qwen3MLP(nn.Module):
 
 
 class Qwen3Attention(UnifiedAttention):
-    """Qwen3 Attention with Q/K normalization.
+    """Multi-head attention layer with RoPE embeddings and Q/K normalization for Qwen3 models.
 
-    Inherits Q/K normalization (RMSNorm) from QKNormAttention.
-    Features:
-    - Layer-specific sliding window
+    This attention module features layer-specific sliding window attention
+    and applies RMSNorm to query and key states before attention computation.
     """
 
     def __init__(
@@ -176,6 +157,16 @@ class Qwen3Attention(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Qwen3 attention layer with grouped-query attention support.
+
+        Args:
+            config (Qwen3Config): Model configuration with attention parameters.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config,
             dtype,
@@ -190,37 +181,25 @@ class Qwen3Attention(UnifiedAttention):
         )
 
     def _postprocess_qkv(self, query_states, key_states, value_states):
+        """Apply Q/K normalization after computing query, key, and value projections.
+
+        Args:
+            query_states: Query tensor from projection layer.
+            key_states: Key tensor from projection layer.
+            value_states: Value tensor from projection layer.
+
+        Returns:
+            Tuple of normalized query, normalized key, and value tensors.
+        """
         return self.query_normalization(query_states), self.key_normalization(key_states), value_states
 
 
 class Qwen3DecoderLayer(nn.Module):
-    """Qwen3 Transformer Decoder Layer.
+    """Single decoder layer for Qwen3 models.
 
-    This module represents a single decoder layer in the Qwen3 model,
-    combining self-attention and MLP sub-layers with residual connections
-    and RMS normalization.
-
-    Attributes:
-        config (Qwen3Config): Configuration object for the model.
-                    layer_idx (int): The index of the layer in the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        input_layernorm (RMSNorm): RMS normalization applied before the attention layer.
-        self_attn (Qwen3Attention): The self-attention module.
-        mlp (Qwen3MLP): The feed-forward (MLP) module.
-        post_attention_layernorm (RMSNorm): RMS normalization applied after the attention layer and before the MLP layer.
+    Combines multi-head attention with Q/K normalization and feedforward networks
+    with RMS normalization and residual connections.
     """
-
-    config: Qwen3Config
-    dtype: jnp.dtype
-    param_dtype: jnp.dtype
-    precision: jax.lax.PrecisionLike | None
-    self_attn: Qwen3Attention
-    mlp: Qwen3MLP
-    input_layernorm: RMSNorm
-    post_attention_layernorm: RMSNorm
 
     def __init__(
         self,
@@ -232,15 +211,15 @@ class Qwen3DecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen3DecoderLayer.
+        """Initialize Qwen3 decoder layer.
 
         Args:
-            config (Qwen3Config): The configuration object for the Qwen3 model.
-                        layer_idx (int): The index of the layer in the model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen3Config): Model configuration.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -298,22 +277,24 @@ class Qwen3DecoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim//2 2"] | None = None,
     ) -> DecoderLayerOutput:
-        """Forward pass of the Qwen3DecoderLayer module.
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x))
 
         Args:
-            hidden_states (Float[Array, "batch seq_len hidden_dim"]): Input hidden states.
-            attention_mask (Bool[Array, "batch seq_len"]): Mask to apply on the attention scores.
-            position_ids (Int[Array, "batch seq_len"]): Position indices for the tokens.
-            causal_mask (Union[Bool[Array, "batch 1 seq_len seq_len"], bool, None]): Causal mask for ensuring autoregressive behavior.
-            cache_view (Optional[Union[TransformerCacheView, RaggedPagesCacheView]]): Cache view for attention KVs.
-            cache_metadata (Optional[Union[TransformerMetadata, RaggedPagesMetadata]]): Metadata for paged attention.
-            segment_ids (Optional[Int[Array, "batch seq_len"]]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (Optional[Bool[Array, "batch seq_len seq_len"]]): Flash Chunking Mask (FCM) for attention.
-            frequencies (Optional[Float[Array, "seq_len head_dim//2 2"]]): Precomputed rotary frequency embeddings.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
 
         Returns:
-            DecoderLayerOutput: A tuple containing the output hidden states, optionally the attention weights, and cache view.
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
         """
 
         attn_outputs = self.self_attn(
@@ -358,27 +339,18 @@ class Qwen3DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Qwen3Config, model_type="qwen3")
 class Qwen3Model(EasyDeLBaseModule):
-    """The base Qwen3 model transformer.
+    """Qwen3 model implementation.
 
-    This class represents the core transformer architecture of the Qwen3 model,
-    consisting of an embedding layer, multiple Qwen3DecoderLayer layers,
-    and a final RMS normalization layer.
+    This implements the Qwen3 language model architecture, utilizing transformer blocks
+    with RMSNorm, Q/K normalization, rotary position embeddings, and layer-specific
+    sliding window attention.
 
     Attributes:
-        config (Qwen3Config): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        embed_tokens (nn.Embed): Embedding layer for input tokens.
-        layers (tp.List[Qwen3DecoderLayer]): List of decoder layers.
-        norm (RMSNorm): Final layer normalization.
-        gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
+            config (Qwen3Config): Configuration for the model.
+            dtype (jnp.dtype): Data type for computations.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision: Precision setting for JAX operations.
     """
-
-    embed_tokens: nn.Embed
-    layers: list[Qwen3DecoderLayer]
-    norm: RMSNorm
 
     def __init__(
         self,
@@ -389,14 +361,14 @@ class Qwen3Model(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen3Model.
+        """Initialize Qwen3 base model.
 
         Args:
-            config (Qwen3Config): The configuration object for the Qwen3 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen3Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -452,30 +424,40 @@ class Qwen3Model(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass of the Qwen3Model.
+        """Forward pass through the Qwen3 base model.
+
+        Processes input tokens through embedding, all decoder layers with RoPE, Q/K normalization,
+        and RMSNorm, and final normalization.
 
         Args:
-            input_ids (Optional[Int[Array, "batch seq_len"]]): Input token IDs.
-            inputs_embeds (Optional[Float[Array, "batch seq_len hidden_dim"]]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (Optional[Bool[Array, "batch seq_len"]]): Mask to avoid performing attention on padding token indices.
-            position_ids (Optional[Int[Array, "batch seq_len"]]): Position indices for the tokens.
-            segment_ids (Optional[Int[Array, "batch seq_len"]]): Segment IDs (unused).
-            output_attentions (Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
-            past_key_values (Optional[Union[TransformerCache, RaggedPagesCache]]):
-                Precomputed key/value states for attention.
-            cache_metadata (Optional[Union[TransformerMetadata, RaggedPagesMetadata]]): Metadata for paged attention.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            BaseModelOutput: The model's output.
-                returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-                and `attentions` (optional).
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
 
         Raises:
-            ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -583,7 +565,17 @@ class Qwen3Model(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=Qwen3Config, model_type="qwen3")
 class Qwen3ForCausalLM(BaseCausalLMModule[Qwen3Model, Qwen3Config]):
-    """Qwen3 model with a Causal Language Modeling head."""
+    """Qwen3 model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation.
+
+    Attributes:
+            config (Qwen3Config): Configuration for the model.
+            dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+            param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+            precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "qwen3"
@@ -598,14 +590,14 @@ class Qwen3ForCausalLM(BaseCausalLMModule[Qwen3Model, Qwen3Config]):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen3ForCausalLM model.
+        """Initialize Qwen3 model for causal language modeling.
 
         Args:
-            config (Qwen3Config): The configuration object for the Qwen3 model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen3Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -621,7 +613,17 @@ class Qwen3ForCausalLM(BaseCausalLMModule[Qwen3Model, Qwen3Config]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Qwen3Config, model_type="qwen3")
 class Qwen3ForSequenceClassification(BaseSequenceClassificationModule[Qwen3Model, Qwen3Config]):
-    """Qwen3 model with a Sequence Classification head."""
+    """Qwen3 model for sequence classification tasks.
+
+    This class extends the base Qwen3 model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+
+    Attributes:
+            config (Qwen3Config): Configuration for the model.
+            dtype (jnp.dtype): Data type for computations.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "qwen3"
@@ -636,15 +638,14 @@ class Qwen3ForSequenceClassification(BaseSequenceClassificationModule[Qwen3Model
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen3ForSequenceClassification model.
+        """Initialize Qwen3 model for sequence classification.
 
         Args:
-            config (Qwen3Config): The configuration object for the Qwen3 model.
-                Must include `num_labels`.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen3Config): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
