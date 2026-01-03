@@ -79,7 +79,7 @@ from typing import Any
 import flax
 import flax.nnx
 import jax
-from eformer.common_types import NOT_GIVEN
+from eformer.common_types import NOT_GIVEN, _Empty
 from eformer.loggings import get_logger
 from jax import numpy as jnp
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
@@ -260,7 +260,7 @@ class eSurge:
         min_token_pad: int | None = None,
         max_num_seqs: int = 256,
         max_num_seq_buckets: list[int] | None = None,
-        max_num_batched_tokens: int | None | NOT_GIVEN = NOT_GIVEN,
+        max_num_batched_tokens: int | None | _Empty = NOT_GIVEN,
         hbm_utilization: float = 0.85,
         page_size: int = 128,
         use_aot_forward: bool = True,
@@ -565,7 +565,7 @@ class eSurge:
                 "(falls back to `max_model_len`)."
             )
         elif max_num_batched_tokens is NOT_GIVEN and jax.default_backend() == "tpu":
-            max_num_batched_tokens = min(max(4096, max_num_seqs), max_model_len)
+            max_num_batched_tokens = min(max(8192, max_num_seqs), max_model_len)
             logger.info(
                 f"TPU backend detected and `max_num_batched_tokens` was not provided; defaulting to {max_num_batched_tokens} tokens/step. "
                 "Pass an explicit int to override, or pass `None` to disable this auto-default "
