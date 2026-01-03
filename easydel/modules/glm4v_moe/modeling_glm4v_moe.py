@@ -53,7 +53,21 @@ from .glm4v_moe_configuration import Glm4vMoeConfig, Glm4vMoeTextConfig, Glm4vMo
 
 @auto_pytree
 class Glm4vMoeModelOutputWithPast(ModelOutput):
-    """Base model output for GLM4V-MoE multimodal model."""
+    """Base model output for GLM4V-MoE multimodal model.
+
+    Contains outputs from the GLM4V-MoE multimodal model including hidden states,
+    cached key-values for generation, position information for multimodal
+    rotary position embeddings, and MoE-specific routing information.
+
+    Attributes:
+        last_hidden_state (Array | None): Hidden states from the final layer.
+        past_key_values (TransformerCache | None): Cached key-value states for generation.
+        hidden_states (tuple[Array] | None): Hidden states from all layers if requested.
+        attentions (tuple[Array] | None): Attention weights from all layers if requested.
+        rope_deltas (Array | None): Position deltas for multimodal rotary embeddings.
+        router_logits (tuple[Array] | None): Router logits from MoE layers for load balancing.
+        all_router_losses (tuple[Array] | None): Auxiliary routing losses from MoE layers.
+    """
 
     last_hidden_state: Array | None = None
     past_key_values: TransformerCache | None = None
@@ -65,7 +79,12 @@ class Glm4vMoeModelOutputWithPast(ModelOutput):
 
 
 class Glm4vMoeTextAttention(UnifiedAttention):
-    """GLM4V-MoE attention with bias-free output projection (HF-compatible)."""
+    """GLM4V-MoE attention with bias-free output projection.
+
+    Implements multi-head self-attention with GPT-J style rotary position
+    embeddings and grouped-query attention support for the text decoder.
+    Uses bias-free output projection for HuggingFace compatibility.
+    """
 
     def __init__(
         self,
@@ -77,6 +96,16 @@ class Glm4vMoeTextAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize text decoder attention layer.
+
+        Args:
+            config (Glm4vMoeTextConfig): Text decoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the decoder.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -97,6 +126,18 @@ class Glm4vMoeTextAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike,
         rngs: nn.Rngs,
     ) -> RowParallelLinear:
+        """Create the output projection layer without bias.
+
+        Args:
+            config (Glm4vMoeTextConfig): Text decoder configuration.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Numerical precision for operations.
+            rngs (nn.Rngs): Random number generator state.
+
+        Returns:
+            RowParallelLinear: Output projection layer.
+        """
         return RowParallelLinear(
             self.num_heads * self.head_dim,
             config.hidden_size,
@@ -110,7 +151,13 @@ class Glm4vMoeTextAttention(UnifiedAttention):
 
 
 class Glm4vMoeTextDecoderLayer(nn.Module):
-    """Single decoder block for GLM4V-MoE with attention and (dense/MoE) MLP."""
+    """Single decoder block for GLM4V-MoE with attention and MoE MLP.
+
+    Implements a transformer decoder layer with pre-normalization,
+    self-attention, and either a dense MLP or Mixture-of-Experts MLP
+    depending on the layer index. The first `first_k_dense_replace` layers
+    use dense MLPs, while remaining layers use MoE.
+    """
 
     def __init__(
         self,
@@ -122,6 +169,17 @@ class Glm4vMoeTextDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize text decoder layer.
+
+        Args:
+            config (Glm4vMoeTextConfig): Text decoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the decoder. Determines whether
+                to use dense MLP or MoE based on first_k_dense_replace config.
+        """
         self.config = config
         self.layer_idx = layer_idx
 
@@ -171,6 +229,28 @@ class Glm4vMoeTextDecoderLayer(nn.Module):
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
+        """Forward pass through the text decoder layer.
+
+        Applies pre-normalization architecture with attention and MoE/dense MLP:
+        x + attn(norm(x)) followed by x + mlp(norm(x))
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            output_router_logits (bool, optional): Whether to return MoE router logits. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, cache view,
+                and router logits from MoE layers.
+        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -207,14 +287,37 @@ class Glm4vMoeTextDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_VISION, config=Glm4vMoeConfig, model_type="glm4v_moe")
 class Glm4vMoeVisionModel(Glm4vVisionModel):
-    """Vision encoder for GLM4V-MoE (same architecture as GLM4V)."""
+    """Vision transformer encoder for GLM4V-MoE.
+
+    Processes images and videos through patch embedding, transformer blocks with
+    2D rotary position embeddings, spatial downsampling, and patch merging to
+    produce vision features for the multimodal language model.
+
+    Inherits all functionality from Glm4vVisionModel as the vision architecture
+    is shared between GLM4V and GLM4V-MoE variants.
+
+    Attributes:
+        config_class: The configuration class for this model (Glm4vMoeVisionConfig).
+    """
 
     config_class = Glm4vMoeVisionConfig
 
 
 @register_module(TaskType.BASE_MODULE, config=Glm4vMoeTextConfig, model_type="glm4v_moe")
 class Glm4vMoeTextModel(EasyDeLBaseModule):
-    """GLM4V-MoE text decoder model."""
+    """GLM4V-MoE text decoder model with Mixture-of-Experts.
+
+    Implements the text decoder component of GLM4V-MoE, utilizing transformer
+    blocks with RMSNorm, rotary position embeddings, and a hybrid architecture
+    where the first `first_k_dense_replace` layers use dense MLPs and the
+    remaining layers use Mixture-of-Experts for improved capacity.
+
+    Attributes:
+        config_class: The configuration class for this model.
+        embed_tokens: Token embedding layer.
+        layers: List of decoder layers (dense and MoE).
+        norm: Final layer normalization.
+    """
 
     config_class = Glm4vMoeTextConfig
 
@@ -227,6 +330,16 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM4V-MoE text decoder.
+
+        Args:
+            config (Glm4vMoeTextConfig): Text decoder configuration including
+                MoE parameters like first_k_dense_replace and num_experts.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -269,6 +382,42 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
     ) -> MoeModelOutput:
+        """Forward pass through the GLM4V-MoE text decoder.
+
+        Processes input tokens through embedding, all decoder layers with RoPE,
+        RMSNorm, and Mixture-of-Experts, then final normalization.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router logits from MoE layers.
+                Defaults to None.
+
+        Returns:
+            MoeModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                updated past_key_values, router_logits, and auxiliary router losses.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -352,15 +501,38 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
         )
 
     def get_decoder(self):
+        """Return the decoder (text model itself).
+
+        Returns:
+            Glm4vMoeTextModel: This text decoder model.
+        """
         return self
 
     def get_embedding(self):
+        """Return the token embedding layer.
+
+        Returns:
+            nn.Embed: The token embedding layer.
+        """
         return self.embed_tokens
 
 
 @register_module(TaskType.VISION_LM, config=Glm4vMoeConfig, model_type="glm4v_moe")
 class Glm4vMoeModel(Glm4vModel):
-    """GLM4V-MoE multimodal model (shares GLM4V multimodal glue)."""
+    """GLM4V-MoE multimodal model integrating vision encoder and MoE text decoder.
+
+    Combines a vision transformer encoder with a MoE-enhanced text decoder to process
+    both image/video and text inputs, supporting multimodal understanding
+    and generation with 3D rotary position embeddings for spatial-temporal reasoning.
+
+    Inherits multimodal glue logic from Glm4vModel including position encoding
+    computation, embedding merging, and vision feature extraction. The key difference
+    is the use of Glm4vMoeTextModel as the language model component.
+
+    Attributes:
+        visual (Glm4vMoeVisionModel): Vision encoder for processing images/videos.
+        language_model (Glm4vMoeTextModel): MoE-enhanced text decoder for language understanding.
+    """
 
     def __init__(
         self,
@@ -371,6 +543,16 @@ class Glm4vMoeModel(Glm4vModel):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM4V-MoE multimodal model.
+
+        Args:
+            config (Glm4vMoeConfig): Full model configuration including vision, text,
+                and MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         EasyDeLBaseModule.__init__(
             self,
             config=config,
@@ -415,6 +597,38 @@ class Glm4vMoeModel(Glm4vModel):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         **kwargs,
     ) -> Glm4vMoeModelOutputWithPast:
+        """Forward pass through the GLM4V-MoE multimodal model.
+
+        Processes text and image/video inputs through the vision encoder and
+        MoE text decoder to produce hidden representations with router information.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
+            attention_mask (Array | None, optional): Attention mask of shape (batch, seq_len).
+            position_ids (Array | None, optional): Position IDs for M-RoPE,
+                shape (3, batch, seq_len) or (batch, seq_len).
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cached key-value states for generation.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings.
+            output_attentions (bool | None, optional): Whether to return attention weights.
+            output_hidden_states (bool | None, optional): Whether to return all hidden states.
+            output_router_logits (bool | None, optional): Whether to return MoE router logits.
+            pixel_values (Array | None, optional): Image pixel values.
+            pixel_values_videos (Array | None, optional): Video pixel values.
+            image_grid_thw (Array | None, optional): Grid dimensions for images.
+            video_grid_thw (Array | None, optional): Grid dimensions for videos.
+            rope_deltas (Array | None, optional): Pre-computed rope position deltas.
+            cache_position (Array | None, optional): Cache position (unused).
+            mask_info (MaskInfo | None, optional): Attention mask information.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode for optimization.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata for efficient caching.
+            **kwargs: Additional unused arguments.
+
+        Returns:
+            Glm4vMoeModelOutputWithPast: Model outputs including hidden states, cache,
+                rope deltas, router logits, and auxiliary router losses.
+        """
         del cache_position
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -474,7 +688,23 @@ class Glm4vMoeModel(Glm4vModel):
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Glm4vMoeConfig, model_type="glm4v_moe")
 class Glm4vMoeForConditionalGeneration(BaseVisionLanguageModule[Glm4vMoeModel, Glm4vMoeConfig]):
-    """GLM4V-MoE model for conditional generation."""
+    """GLM4V-MoE model for conditional generation.
+
+    Vision-language model that combines a vision encoder with a MoE-enhanced text decoder
+    and language modeling head for generating text conditioned on images,
+    videos, and/or text prompts.
+
+    Supports both image and video understanding with 3D rotary position
+    embeddings for spatial-temporal reasoning and Mixture-of-Experts for
+    improved model capacity.
+
+    Attributes:
+        _task_type: The task type for this model (IMAGE_TEXT_TO_TEXT).
+        _model_type: Model type identifier ("glm4v_moe").
+        _supports_video: Whether this model supports video inputs (True).
+        _uses_mrope: Whether this model uses multimodal RoPE (True).
+        vocab_size: Vocabulary size from the text configuration.
+    """
 
     _task_type = TaskType.IMAGE_TEXT_TO_TEXT
     _model_type = "glm4v_moe"
@@ -498,6 +728,16 @@ class Glm4vMoeForConditionalGeneration(BaseVisionLanguageModule[Glm4vMoeModel, G
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM4V-MoE for conditional generation.
+
+        Args:
+            config (Glm4vMoeConfig): Full model configuration including vision, text,
+                MoE parameters, and generation settings.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Glm4vMoeModel,
@@ -519,19 +759,61 @@ class Glm4vMoeForConditionalGeneration(BaseVisionLanguageModule[Glm4vMoeModel, G
 
     @property
     def visual(self):
+        """Return the vision encoder.
+
+        Returns:
+            Glm4vMoeVisionModel: The vision encoder from the base model.
+        """
         return self.base_model.visual
 
     @property
     def language_model(self):
+        """Return the language model decoder.
+
+        Returns:
+            Glm4vMoeTextModel: The MoE language model from the base model.
+        """
         return self.base_model.language_model
 
     def get_video_features(self, pixel_values_videos: Array, video_grid_thw: Array | None = None, **kwargs):
+        """Extract video features using the vision encoder.
+
+        Args:
+            pixel_values_videos (Array): Video pixel values.
+            video_grid_thw (Array | None, optional): Grid dimensions for videos.
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            tuple[Array, ...]: Video embeddings split by video.
+        """
         return self.base_model.get_video_features(pixel_values_videos, video_grid_thw)
 
     def get_image_features(self, pixel_values: Array, image_grid_thw: Array | None = None, **kwargs):
+        """Extract image features using the vision encoder.
+
+        Args:
+            pixel_values (Array): Image pixel values.
+            image_grid_thw (Array | None, optional): Grid dimensions for images.
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            tuple[Array, ...]: Image embeddings split by image.
+        """
         return self.base_model.get_image_features(pixel_values, image_grid_thw)
 
     def compute_embedding(self, input_ids, *args, **kwargs):
+        """Compute multimodal embeddings.
+
+        Delegates to the base model's compute_embedding method.
+
+        Args:
+            input_ids: Input token IDs.
+            *args: Positional arguments passed to base model.
+            **kwargs: Keyword arguments passed to base model.
+
+        Returns:
+            Array: Merged multimodal embeddings.
+        """
         return self.base_model.compute_embedding(input_ids, *args, **kwargs)
 
     def __call__(
@@ -556,6 +838,38 @@ class Glm4vMoeForConditionalGeneration(BaseVisionLanguageModule[Glm4vMoeModel, G
         cache_position: Array | None = None,
         **kwargs,
     ) -> VLMCausalLMOutput:
+        """Forward pass for conditional generation.
+
+        Processes multimodal inputs through the vision encoder and MoE text decoder,
+        then applies the language modeling head to produce logits for generation.
+
+        Args:
+            input_ids (Array, optional): Input token IDs of shape (batch, seq_len).
+            attention_mask (Array | None, optional): Attention mask of shape (batch, seq_len).
+            mask_info (MaskInfo | None, optional): Attention mask information.
+            position_ids (Array | None, optional): Position IDs for M-RoPE.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode for optimization.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cached key-value states for generation.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata for efficient caching.
+            apply_lm_head (bool, optional): Whether to apply the LM head. Defaults to True.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings.
+            output_attentions (bool | None, optional): Whether to return attention weights.
+            output_hidden_states (bool | None, optional): Whether to return all hidden states.
+            output_router_logits (bool | None, optional): Whether to return MoE router logits.
+            pixel_values (Array | None, optional): Image pixel values.
+            pixel_values_videos (Array | None, optional): Video pixel values.
+            image_grid_thw (Array | None, optional): Grid dimensions for images.
+            video_grid_thw (Array | None, optional): Grid dimensions for videos.
+            rope_deltas (Array | None, optional): Pre-computed rope position deltas.
+            cache_position (Array | None, optional): Cache position (unused).
+            **kwargs: Additional unused arguments.
+
+        Returns:
+            VLMCausalLMOutput: Model outputs including logits, hidden states, cache,
+                rope deltas, and router logits from MoE layers.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

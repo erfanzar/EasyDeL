@@ -63,7 +63,12 @@ from .qwen2_moe_configuration import Qwen2MoeConfig
 
 
 class Qwen2MoeMLPStack(nn.Module):
-    """Qwen2Moe MoE MLP using the new ParallelMoELinear layers."""
+    """Mixture of Experts MLP stack module for Qwen2 MoE models.
+
+    Implements the feedforward network used by each expert in the Sparse MoE block.
+    Uses SwiGLU activation with gated projections (gate_proj, up_proj) and a down projection.
+    This class uses ParallelMoELinear layers for efficient expert parallelism.
+    """
 
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
@@ -91,6 +96,17 @@ class Qwen2MoeMLPStack(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int | None = None,
     ):
+        """Initialize Qwen2 MoE MLP stack block.
+
+        Args:
+            config (Qwen2MoeConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int | None, optional): Index of this layer in the model. Defaults to None.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -154,17 +170,11 @@ class Qwen2MoeMLPStack(nn.Module):
 
 
 class Qwen2MoeMLP(nn.Module):
-    """Multi-Layer Perceptron (MLP) block for the Qwen2 MoE model.
+    """Multi-Layer Perceptron module for Qwen2 MoE models.
 
-    Attributes:
-        config (Qwen2MoeConfig): Configuration object for the model.
-        gate_proj (ParallelLinear): Linear layer for the gating mechanism.
-        down_proj (ParallelLinear): Linear layer for down-projection.
-        up_proj (ParallelLinear): Linear layer for up-projection.
-        act_fn (callable): Activation function (SiLU).
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+    Implements the feedforward network with SwiGLU activation function for enhanced
+    representation learning. This MLP is used as the shared expert in the Sparse MoE
+    block, using standard ColumnParallel and RowParallel linear layers.
     """
 
     def __init__(
@@ -177,15 +187,16 @@ class Qwen2MoeMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2MoeMLP module.
+        """Initialize Qwen2 MoE MLP block.
 
         Args:
-            config (Qwen2MoeConfig): The configuration object for the model.
-            intermediate_size (int): The size of the intermediate layer.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen2MoeConfig): Model configuration with MLP parameters.
+            intermediate_size (int): Size of the intermediate layer (hidden dimension of MLP).
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
@@ -217,13 +228,13 @@ class Qwen2MoeMLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Forward pass of the MLP block.
+        """Apply SwiGLU feedforward transformation.
 
         Args:
-            hidden_states (jnp.ndarray): Input hidden states.
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
 
         Returns:
-            jnp.ndarray: Output hidden states after MLP transformation.
+            Array: Transformed hidden states of shape (batch, seq_len, hidden_dim).
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -242,12 +253,11 @@ class Qwen2MoeMLP(nn.Module):
 
 
 class Qwen2MoeAttention(UnifiedAttention):
-    """Qwen2 MoE Attention module with sliding window support.
+    """Multi-head attention layer with RoPE embeddings and sliding window support for Qwen2 MoE models.
 
-    Inherits from UnifiedAttention with Qwen2Moe-specific customizations:
-    - Sliding window attention
-    - Custom bias configuration (Q/K/V use qkv_bias, O doesn't)
-    - Attention dropout
+    Inherits from UnifiedAttention with Qwen2 MoE-specific customizations including
+    optional sliding window attention and custom bias configuration where Q/K/V projections
+    use configurable bias (qkv_bias) while output projection does not use bias.
     """
 
     def __init__(
@@ -260,14 +270,16 @@ class Qwen2MoeAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initializes the Qwen2MoeAttention module.
+        """Initialize Qwen2 MoE attention layer with grouped-query attention and sliding window support.
 
         Args:
-            config (Qwen2MoeConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen2MoeConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model, used for determining
+                sliding window attention configuration.
         """
 
         super().__init__(
@@ -356,19 +368,11 @@ class Qwen2MoeAttention(UnifiedAttention):
 
 
 class Qwen2MoeSparseBlock(BaseMoeModule):
-    """Sparse Mixture of Experts (MoE) block for Qwen2 MoE.
+    """Sparse Mixture of Experts block for Qwen2 MoE models.
 
-    This block routes input hidden states to a selected subset of experts
-    and combines their outputs.
-
-    Attributes:
-        config (Qwen2MoeConfig): Configuration object for the model.
-        gate (ParallelLinear): Linear layer for the gating network.
-        experts (nn.List[Qwen2MoeMLP]): List of expert MLP modules.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+    Implements the sparse MoE layer that routes tokens to a subset of expert MLPs.
+    Uses top-k routing to distribute tokens across experts efficiently. This block
+    also includes a shared expert that processes all tokens alongside the routed experts.
     """
 
     def __init__(
@@ -380,14 +384,15 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2MoeSparseBlock module.
+        """Initialize Qwen2 MoE Sparse MoE block.
 
         Args:
-            config (Qwen2MoeConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen2MoeConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -478,24 +483,11 @@ class Qwen2MoeSparseBlock(BaseMoeModule):
 
 
 class Qwen2MoeDecoderLayer(nn.Module):
-    """A single decoder layer for the Qwen2 MoE model.
+    """Single decoder layer for Qwen2 MoE models.
 
-    This layer combines self-attention, a sparse MoE block (or a standard MLP),
-    and residual connections with layer normalization.
-
-    Attributes:
-        config (Qwen2MoeConfig): Configuration object for the model.
-        layer_idx (int): Index of the current layer.
-        self_attn (Qwen2MoeAttention): Self-attention module.
-        mlp (Qwen2MoeSparseBlock | Qwen2MoeMLP): MoE block or standard MLP.
-        input_layernorm (RMSNorm): Layer normalization applied before self-attention.
-        post_attention_layernorm (RMSNorm): Layer normalization applied after self-attention and
-            before the MLP/MoE block.
-        dropout_rng_key (str): Name of the RNG key for dropout.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+    Combines multi-head attention with optional sliding window and Sparse MoE feedforward
+    networks (or standard MLP for certain layers), using RMS normalization and residual
+    connections.
     """
 
     def __init__(
@@ -508,15 +500,15 @@ class Qwen2MoeDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initializes the Qwen2MoeDecoderLayer module.
+        """Initialize Qwen2 MoE decoder layer.
 
         Args:
-            config (Qwen2MoeConfig): The configuration object for the model.
-            layer_idx (int): The index of the current layer.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen2MoeConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
         """
         self.config = config
         self.layer_idx = layer_idx
@@ -643,21 +635,18 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Qwen2MoeConfig, model_type="qwen2_moe")
 class Qwen2MoeModel(EasyDeLBaseModule):
-    """The base Qwen2 MoE transformer model.
+    """The base Qwen2 MoE model transformer.
 
-    This class implements the core transformer architecture, including embedding layers,
-    decoder layers, and final normalization.
+    This class represents the core transformer architecture of the Qwen2 MoE model,
+    consisting of an embedding layer, multiple Qwen2MoeDecoderLayer layers (with sparse MoE),
+    and a final layer normalization. It features optional sliding window attention,
+    shared experts, and configurable decoder sparse steps.
 
     Attributes:
         config (Qwen2MoeConfig): Configuration object for the model.
-        embed_tokens (nn.Embed): Embedding layer for input tokens.
-        layers (nn.List[Qwen2MoeDecoderLayer]): List of decoder layers.
-        norm (RMSNorm): Final layer normalization.
-        gradient_checkpointing (str): Gradient checkpointing strategy.
-        dtype (jnp.dtype): Data type for computations.
+        dtype (jnp.dtype): Data type for computation.
         param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
     """
 
     def __init__(
@@ -669,14 +658,14 @@ class Qwen2MoeModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2MoeModel module.
+        """Initialize Qwen2 MoE base model.
 
         Args:
-            config (Qwen2MoeConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen2MoeConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -887,7 +876,18 @@ class Qwen2MoeModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=Qwen2MoeConfig, model_type="qwen2_moe")
 class Qwen2MoeForCausalLM(BaseCausalLMModule[Qwen2MoeModel, Qwen2MoeConfig]):
-    """Qwen2 MoE model with a Causal Language Modeling head."""
+    """Qwen2 MoE model with a language modeling head for causal language modeling tasks.
+
+    This model is a sparse MoE transformer-based language model with causal attention masks
+    and optional sliding window attention applied to perform autoregressive language generation.
+    It includes both routed experts and shared experts for improved model capacity.
+
+    Attributes:
+        config (Qwen2MoeConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "qwen2_moe"
@@ -902,6 +902,15 @@ class Qwen2MoeForCausalLM(BaseCausalLMModule[Qwen2MoeModel, Qwen2MoeConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Qwen2 MoE model for causal language modeling.
+
+        Args:
+            config (Qwen2MoeConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Qwen2MoeModel,
@@ -976,7 +985,15 @@ class Qwen2MoeForCausalLM(BaseCausalLMModule[Qwen2MoeModel, Qwen2MoeConfig]):
         )
 
     def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary loss from router logits."""
+        """Compute auxiliary load balancing loss from router logits.
+
+        Args:
+            outputs: Model outputs containing router_logits from MoE layers.
+            attention_mask: Attention mask to exclude padding tokens from loss computation.
+
+        Returns:
+            Optional auxiliary loss value for load balancing, or None if router_logits unavailable.
+        """
         if outputs.router_logits is None or len(outputs.router_logits) == 0:
             return None
         aux_loss = auxiliary_load_balancing_loss_func(
@@ -990,19 +1007,16 @@ class Qwen2MoeForCausalLM(BaseCausalLMModule[Qwen2MoeModel, Qwen2MoeConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Qwen2MoeConfig, model_type="qwen2_moe")
 class Qwen2MoeForSequenceClassification(BaseSequenceClassificationModule[Qwen2MoeModel, Qwen2MoeConfig]):
-    """Qwen2 MoE model with a sequence classification head.
+    """Qwen2 MoE model for sequence classification tasks.
 
-    This class wraps the base `Qwen2MoeModel` and adds a linear layer on top
-    to perform sequence classification tasks.
+    This class extends the base Qwen2 MoE model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
 
     Attributes:
-        config (Qwen2MoeConfig): Configuration object for the model.
-        model (Qwen2MoeModel): The base Qwen2 MoE model.
-        score (ParallelLinear): The sequence classification head (linear layer).
+        config (Qwen2MoeConfig): Configuration for the model.
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
-        rngs (nn.Rngs): Random number generators.
+        precision: Precision setting for JAX operations.
     """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
@@ -1018,14 +1032,14 @@ class Qwen2MoeForSequenceClassification(BaseSequenceClassificationModule[Qwen2Mo
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2MoeForSequenceClassification module.
+        """Initialize Qwen2 MoE model for sequence classification.
 
         Args:
-            config (Qwen2MoeConfig): The configuration object for the model.
-            dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-            param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
-            rngs (nn.Rngs): Random number generators.
+            config (Qwen2MoeConfig): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,

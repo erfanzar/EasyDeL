@@ -45,7 +45,12 @@ from .glm4_configuration import Glm4Config
 
 
 class Glm4MLP(nn.Module):
-    """Feed-forward network used inside GLM-4 decoder layers."""
+    """Multi-Layer Perceptron module for GLM-4 models.
+
+    Implements the feedforward network with gated activation function
+    using fused gate-up projections for enhanced representation learning
+    in the GLM-4 architecture.
+    """
 
     def __init__(
         self,
@@ -56,6 +61,16 @@ class Glm4MLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM-4 MLP block.
+
+        Args:
+            config (Glm4Config): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -82,7 +97,17 @@ class Glm4MLP(nn.Module):
         self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
-    def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
+    def __call__(
+        self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
+    ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply gated feedforward transformation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim]
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -100,7 +125,7 @@ class Glm4MLP(nn.Module):
 
 
 class Glm4Attention(UnifiedAttention):
-    """Multi-head attention block configured for GLM-4."""
+    """Multi-head attention layer with RoPE embeddings for GLM-4 models."""
 
     def __init__(
         self,
@@ -112,6 +137,16 @@ class Glm4Attention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize GLM-4 attention layer with grouped-query attention support.
+
+        Args:
+            config (Glm4Config): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         self.layer_idx = layer_idx
         super().__init__(
             config=config,
@@ -124,7 +159,12 @@ class Glm4Attention(UnifiedAttention):
 
 
 class Glm4DecoderLayer(nn.Module):
-    """Single GLM-4 decoder block combining attention and MLP."""
+    """Single decoder layer for GLM-4 models.
+
+    Combines multi-head attention and feedforward networks with
+    RMS normalization and residual connections. Includes additional
+    post-attention and post-MLP layer normalization for improved stability.
+    """
 
     def __init__(
         self,
@@ -136,6 +176,16 @@ class Glm4DecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize GLM-4 decoder layer.
+
+        Args:
+            config (Glm4Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -204,7 +254,27 @@ class Glm4DecoderLayer(nn.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture with post-attention and post-MLP normalization:
+        x + norm(attn(norm(x))) followed by x + norm(mlp(norm(x)))
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
+        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
@@ -247,7 +317,18 @@ class Glm4DecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Glm4Config, model_type="glm4")
 class Glm4Model(EasyDeLBaseModule):
-    """GLM4 model implementation."""
+    """GLM-4 model implementation.
+
+    This implements the GLM-4 (General Language Model 4) architecture, utilizing transformer
+    blocks with RMSNorm, rotary position embeddings, and an enhanced attention mechanism
+    with additional post-layer normalization for improved training stability.
+
+    Attributes:
+        config (Glm4Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -258,6 +339,15 @@ class Glm4Model(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM-4 base model.
+
+        Args:
+            config (Glm4Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -314,6 +404,41 @@ class Glm4Model(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
+        """Forward pass through the GLM-4 base model.
+
+        Processes input tokens through embedding, all decoder layers with RoPE and RMSNorm,
+        and final normalization.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+
+        Returns:
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -377,21 +502,45 @@ class Glm4Model(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
+        """
+        Returns the encoder part of the model's graph definition.
+        Decoder-Only models don't have an encoder.
+        """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
 
     def get_decoder(self):
+        """
+        Returns the decoder part of the model's graph definition.
+        """
         return self
 
     def get_lm_head(self):
+        """
+        Returns the language model head of the module.
+        Base Models don't have a Language Model Head.
+        """
         raise NotImplementedError("The base model does not have a language model head.")
 
     def get_embedding(self):
+        """
+        Returns the embedding layer of the module.
+        """
         return self.embed_tokens
 
 
 @register_module(TaskType.CAUSAL_LM, config=Glm4Config, model_type="glm4")
 class Glm4ForCausalLM(BaseCausalLMModule[Glm4Model, Glm4Config]):
-    """GLM4 model with a language modeling head for causal language modeling tasks."""
+    """GLM-4 model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation.
+
+    Attributes:
+        config (Glm4Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "glm4"
@@ -406,6 +555,15 @@ class Glm4ForCausalLM(BaseCausalLMModule[Glm4Model, Glm4Config]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM-4 model for causal language modeling.
+
+        Args:
+            config (Glm4Config): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Glm4Model,
@@ -420,7 +578,17 @@ class Glm4ForCausalLM(BaseCausalLMModule[Glm4Model, Glm4Config]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Glm4Config, model_type="glm4")
 class Glm4ForSequenceClassification(BaseSequenceClassificationModule[Glm4Model, Glm4Config]):
-    """GLM4 model for sequence classification tasks."""
+    """GLM-4 model for sequence classification tasks.
+
+    This class extends the base GLM-4 model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+
+    Attributes:
+        config (Glm4Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "glm4"
@@ -435,6 +603,15 @@ class Glm4ForSequenceClassification(BaseSequenceClassificationModule[Glm4Model, 
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize GLM-4 model for sequence classification.
+
+        Args:
+            config (Glm4Config): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Glm4Model,

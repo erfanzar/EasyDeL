@@ -69,6 +69,16 @@ class MistralMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Mistral MLP block.
+
+        Args:
+            config (MistralConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -153,7 +163,16 @@ class MistralAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initialize Mistral attention with sliding window configuration."""
+        """Initialize Mistral attention layer with sliding window and grouped-query attention support.
+
+        Args:
+            config (MistralConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         # Set sliding window before super().__init__ so it's available during network definition
 
         super().__init__(
@@ -190,6 +209,16 @@ class MistralDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Mistral decoder layer.
+
+        Args:
+            config (MistralConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -245,6 +274,25 @@ class MistralDecoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x))
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
+        """
         residual = hidden_states
         attention_output = self.self_attn(
             self.input_layernorm(hidden_states),
@@ -296,6 +344,15 @@ class MistralModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Mistral base model.
+
+        Args:
+            config (MistralConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -351,23 +408,40 @@ class MistralModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass through the Mistral model.
+        """Forward pass through the Mistral base model.
+
+        Processes input tokens through embedding, all decoder layers with RoPE, sliding window
+        attention, and RMSNorm, followed by final normalization.
 
         Args:
-            input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            attention_mask (Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (Array, optional): Indices of positions of each input sequence token.
-            past_key_values (TransformerCache | RaggedPagesCache, optional):
-                Cache containing precomputed key/value states.
-            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
-            output_attentions (bool, optional): Whether to return attention weights.
-            output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            Union[BaseModelOutput, Tuple]: Model outputs
-                (last hidden state, optional hidden states, optional attentions)
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -473,7 +547,17 @@ class MistralModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=MistralConfig, model_type="mistral")
 class MistralForCausalLM(BaseCausalLMModule[MistralModel, MistralConfig]):
-    """Mistral model with a language modeling head for causal language modeling tasks."""
+    """Mistral model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    and sliding window attention applied to perform autoregressive language generation.
+
+    Attributes:
+            config (MistralConfig): Configuration for the model.
+            dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+            param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+            precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "mistral"
@@ -488,6 +572,15 @@ class MistralForCausalLM(BaseCausalLMModule[MistralModel, MistralConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Mistral model for causal language modeling.
+
+        Args:
+            config (MistralConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=MistralModel,
@@ -516,19 +609,32 @@ class MistralForCausalLM(BaseCausalLMModule[MistralModel, MistralConfig]):
         """Forward pass through the Mistral model for causal language modeling.
 
         Args:
-                input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
-                inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-                attention_mask (Array, optional): Mask to avoid attention on padding tokens.
-                position_ids (Array, optional): Indices of positions of each input sequence token.
-                past_key_values (TransformerCache | RaggedPagesCache, optional):
-                    Cache containing precomputed key/value states.
-                cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
-                output_attentions (bool, optional): Whether to return attention weights.
-                output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language model head projection.
+                Defaults to True.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-                Union[CausalLMOutput, Tuple]: Model outputs (logits, optional hidden states, optional attentions)
+            CausalLMOutput: Contains logits, hidden_states, last_hidden_state, attentions,
+                and past_key_values.
         """
         outputs = self.model(
             input_ids=input_ids,
@@ -591,7 +697,17 @@ class MistralForCausalLM(BaseCausalLMModule[MistralModel, MistralConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=MistralConfig, model_type="mistral")
 class MistralForSequenceClassification(BaseSequenceClassificationModule[MistralModel, MistralConfig]):
-    """Mistral model for sequence classification tasks."""
+    """Mistral model for sequence classification tasks.
+
+    This class extends the base Mistral model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+
+    Attributes:
+            config (MistralConfig): Configuration for the model.
+            dtype (jnp.dtype): Data type for computations.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "mistral"
@@ -606,6 +722,15 @@ class MistralForSequenceClassification(BaseSequenceClassificationModule[MistralM
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Mistral model for sequence classification.
+
+        Args:
+            config (MistralConfig): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=MistralModel,
@@ -637,19 +762,29 @@ class MistralForSequenceClassification(BaseSequenceClassificationModule[MistralM
         a classification head to the output.
 
         Args:
-            input_ids (Array, optional): Input token IDs, shape (batch_size, sequence_length).
-            inputs_embeds (Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
-            attention_mask (Array, optional): Mask to avoid attention on padding tokens.
-            position_ids (Array, optional): Indices of positions of each input sequence token.
-            past_key_values (TransformerCache | RaggedPagesCache, optional):
-                Cache containing precomputed key/value states.
-            cache_metadata (TransformerMetadata | RaggedPagesMetadata, optional): Metadata for cache handling.
-            output_attentions (bool, optional): Whether to return attention weights.
-            output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            Union[SequenceClassifierOutput, Tuple]: Classification outputs including logits and optional model outputs
+            SequenceClassifierOutput: Contains logits, past_key_values, hidden_states, and attentions.
         """
         transformer_outputs = self.model(
             input_ids=input_ids,

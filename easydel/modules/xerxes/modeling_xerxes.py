@@ -49,23 +49,53 @@ logger = get_logger(__name__)
 
 
 class Identity(nn.Module):
-    """No-op module used as a placeholder when optional layers are disabled."""
+    """No-op module used as a placeholder when optional layers are disabled.
+
+    This module returns its input unchanged, serving as a pass-through
+    when certain normalization or processing layers are conditionally disabled.
+    """
 
     def __init__(self): ...
+
     def __call__(self, x):
+        """Pass through input unchanged.
+
+        Args:
+            x: Input tensor of any shape.
+
+        Returns:
+            The input tensor unchanged.
+        """
         return x
 
 
 class PostCross(nn.Module):
-    """Applies a bounded tanh transform after cross attention."""
+    """Applies a bounded tanh transform after cross attention.
+
+    Implements a soft clipping function that bounds outputs to approximately [-30, 30]
+    while preserving gradient flow for most values.
+    """
 
     def __init__(self): ...
+
     def __call__(self, x):
+        """Apply bounded tanh transformation.
+
+        Args:
+            x: Input tensor of any shape.
+
+        Returns:
+            Transformed tensor with values bounded to approximately [-30, 30].
+        """
         return jax.nn.tanh(x / 30.0) * 30.0
 
 
 class XerxesMLP(nn.Module):
-    """Feed-forward network for Xerxes decoder blocks."""
+    """Multi-Layer Perceptron module for Xerxes models.
+
+    Implements the feedforward network with SwiGLU or GELU activation function
+    for enhanced representation learning in Xerxes architecture.
+    """
 
     def __init__(
         self,
@@ -76,6 +106,16 @@ class XerxesMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes MLP block.
+
+        Args:
+            config (XerxesConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -121,6 +161,14 @@ class XerxesMLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply gated feedforward transformation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim]
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -138,12 +186,15 @@ class XerxesMLP(nn.Module):
 
 
 class XerxesAttention(UnifiedAttention):
-    """Xerxes Attention with conditional Q/K normalization.
+    """Multi-head attention layer with conditional Q/K normalization for Xerxes models.
 
-    Inherits Q/K normalization from QKNormAttention.
+    Implements attention with optional Q/K normalization and layer-specific sliding window
+    patterns for efficient long-context processing.
+
     Features:
-    - Conditional Q/K normalization via xe_kvnorm flag
-    - Layer-specific sliding window (different patterns based on layer_idx or window_pattern)
+        - Conditional Q/K normalization via xe_kvnorm flag
+        - Layer-specific sliding window (different patterns based on layer_idx or window_pattern)
+        - Grouped-query attention support
     """
 
     def __init__(
@@ -158,6 +209,18 @@ class XerxesAttention(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes attention layer with conditional Q/K normalization.
+
+        Args:
+            config (XerxesConfig): Model configuration with attention parameters.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            causal (bool, optional): Whether to use causal attention. Defaults to True.
+            is_cross_attention (bool, optional): Whether this is cross-attention. Defaults to False.
+            rngs (nn.Rngs): Random number generator state.
+        """
         # Set sliding window BEFORE super().__init__()
         self.is_local_attn = False
         sliding_window = None
@@ -227,7 +290,11 @@ class XerxesAttention(UnifiedAttention):
 
 
 class XerxesSparseMoeBlock(nn.Module):
-    """Sparse mixture-of-experts feed-forward block used in selected layers."""
+    """Sparse Mixture-of-Experts block for Xerxes models.
+
+    Implements a top-k routing mechanism where each token is processed by
+    a subset of expert MLPs, enabling parameter-efficient scaling.
+    """
 
     def __init__(
         self,
@@ -238,6 +305,20 @@ class XerxesSparseMoeBlock(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes Sparse MoE block.
+
+        Args:
+            config (XerxesConfig): Model configuration with MoE parameters including
+                num_local_experts and num_experts_per_tok.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.Precision | None, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+
+        Raises:
+            AssertionError: If config.swish_run is True (incompatible with MoE).
+        """
         assert config.swish_run is False
 
         self.config = config
@@ -267,6 +348,16 @@ class XerxesSparseMoeBlock(nn.Module):
         ]
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+        """Apply sparse MoE transformation with top-k expert routing.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            tuple: A tuple containing:
+                - final_hidden_state: Transformed hidden states [batch, seq_len, hidden_dim]
+                - router_logits: Router logits for load balancing loss [batch, seq_len, num_experts]
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -296,7 +387,12 @@ class XerxesSparseMoeBlock(nn.Module):
 
 
 class XerxesDecoderLayer(nn.Module):
-    """Transformer decoder block with optional cross-attention and MoE."""
+    """Single decoder layer for Xerxes models.
+
+    Combines multi-head attention and feedforward networks (or MoE) with
+    RMS normalization and residual connections. Supports optional cross-attention
+    and conditional normalization patterns.
+    """
 
     def __init__(
         self,
@@ -308,6 +404,16 @@ class XerxesDecoderLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes decoder layer.
+
+        Args:
+            config (XerxesConfig): Model configuration.
+            layer_idx (int): Index of this layer in the model.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.dtype = dtype
@@ -367,24 +473,29 @@ class XerxesDecoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         default_frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """
-        Forward pass of the module block.
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture with optional identity bypass for certain
+        configurations. Supports both standard MLP and MoE feedforward.
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens.
-            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
-        Returns:
-            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
-        """
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for key-value caching during generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesCacheView | None, optional):
+                Cache metadata for cache management. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+            default_frequencies (Array | None, optional): Default RoPE frequencies for local attention.
+                Defaults to None.
 
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, router logits, and cache view.
+        """
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
             mask_info,
@@ -436,7 +547,18 @@ class XerxesDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=XerxesConfig, model_type="xerxes")
 class XerxesModel(EasyDeLBaseModule):
-    """Xerxes decoder stack wiring embeddings, decoder layers, and final norm."""
+    """Xerxes model implementation.
+
+    This implements the Xerxes language model architecture, utilizing transformer blocks
+    with RMSNorm, rotary position embeddings, conditional Q/K normalization, and optional
+    mixture-of-experts layers.
+
+    Attributes:
+        config (XerxesConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -447,6 +569,15 @@ class XerxesModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes base model.
+
+        Args:
+            config (XerxesConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -517,22 +648,40 @@ class XerxesModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """
-        Forward pass through the Xerxes module.
+        """Forward pass through the Xerxes base model.
+
+        Processes input tokens through embedding, all decoder layers with RoPE and RMSNorm,
+        and final normalization. Supports conditional Q/K normalization and MoE layers.
 
         Args:
-            input_ids (Array): Input tensor containing token IDs.
-            attention_mask (Array): Mask for attention.
-            position_ids (Array): Positional indices.
-            segment_ids (tp.Optional[Array]): Segment IDs for different input parts.
-            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
-            output_attentions (tp.Optional[bool]): If True, output attention weights.
-            output_hidden_states (tp.Optional[bool]): If True, output hidden states.
-            init_cache (bool): If True, initialize cache for decoding.
-            deterministic (bool): If True, disable dropout.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesCacheView | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            BaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -644,7 +793,18 @@ class XerxesModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=XerxesConfig, model_type="xerxes")
 class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):
-    """Xerxes language model with LM head for causal generation."""
+    """Xerxes model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation. Supports conditional
+    Q/K normalization, mixture-of-experts, and bounded output transformation.
+
+    Attributes:
+        config (XerxesConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "xerxes"
@@ -659,6 +819,15 @@ class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Xerxes model for causal language modeling.
+
+        Args:
+            config (XerxesConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (str | jax.lax.Precision | None, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=XerxesModel,
@@ -686,24 +855,38 @@ class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
-        """
-        Forward pass through the Xerxes module.
+        """Forward pass through the Xerxes causal language model.
+
+        Processes input through the base model and applies the language modeling head
+        with optional bounded tanh transformation.
 
         Args:
-            input_ids (tp.Optional[Array]): Input tensor containing token IDs.
-            attention_mask (tp.Optional[Array]): Mask for attention.
-            position_ids (tp.Optional[Array]): Positional indices.
-            segment_ids (tp.Optional[Array]): Segment IDs for different input parts.
-            inputs_embeds (tp.Optional[Array]): Embedded input tensor.
-            output_attentions (tp.Optional[bool]): If True, output attention weights.
-            output_hidden_states (tp.Optional[bool]): If True, output hidden states.
-            init_cache (bool): If True, initialize cache for decoding.
-            deterministic (bool): If True, disable dropout.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesCacheView | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language modeling head. Defaults to True.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            CausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+            CausalLMOutput: Contains logits, hidden_states, last_hidden_state, attentions,
+                and past_key_values.
         """
-
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

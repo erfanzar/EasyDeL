@@ -46,20 +46,10 @@ from .olmo_configuration import OlmoConfig
 
 
 class OlmoMLP(nn.Module):
-    """OLMo MLP module.
+    """Multi-Layer Perceptron module for OLMo models.
 
-    This module implements the feed-forward network (MLP) used in the OLMo model.
-    It consists of gate, up, and down projections with a SiLU activation.
-
-    Attributes:
-        config (OlmoConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        gate_proj (ParallelLinear): Linear layer for the gate projection.
-        down_proj (ParallelLinear): Linear layer for the down projection.
-        up_proj (ParallelLinear): Linear layer for the up projection.
-        act_fn (callable): Activation function (SiLU).
+    Implements the feedforward network with SwiGLU activation function
+    for enhanced representation learning in OLMo architecture.
     """
 
     def __init__(
@@ -72,14 +62,16 @@ class OlmoMLP(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initializes the OlmoMLP module.
+        """Initialize OLMo MLP block.
 
         Args:
-            config (OlmoConfig): The configuration object for the OLMo model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (OlmoConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
         """
         self.config = config
         self.dtype = dtype
@@ -123,13 +115,13 @@ class OlmoMLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Forward pass of the OlmoMLP module.
+        """Apply SwiGLU feedforward transformation.
 
         Args:
-            hidden_states (jnp.ndarray): Input hidden states.
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
-            jnp.ndarray: Output hidden states after MLP transformation.
+            Transformed hidden states [batch, seq_len, hidden_dim]
         """
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -148,7 +140,10 @@ class OlmoMLP(nn.Module):
 
 
 class OlmoAttention(UnifiedAttention):
-    """OLMo attention built on UnifiedAttention with optional QKV clipping."""
+    """Multi-head attention layer with RoPE embeddings for OLMo models.
+
+    Extends UnifiedAttention with optional QKV clipping for improved training stability.
+    """
 
     def __init__(
         self,
@@ -160,6 +155,16 @@ class OlmoAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize OLMo attention layer with grouped-query attention support.
+
+        Args:
+            config (OlmoConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         self.clip_qkv = getattr(config, "clip_qkv", None)
         super().__init__(
             config=config,
@@ -178,7 +183,19 @@ class OlmoAttention(UnifiedAttention):
         key_states: jnp.ndarray,
         value_states: jnp.ndarray,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """Apply optional clipping before reshaping QKV tensors."""
+        """Apply optional clipping before reshaping QKV tensors.
+
+        Clips query, key, and value states to [-clip_qkv, clip_qkv] if configured.
+        This helps with training stability in OLMo models.
+
+        Args:
+            query_states: Query projections before reshaping.
+            key_states: Key projections before reshaping.
+            value_states: Value projections before reshaping.
+
+        Returns:
+            Tuple of (query_states, key_states, value_states) with optional clipping applied.
+        """
         query_states, key_states, value_states = super()._preprocess_qkv(query_states, key_states, value_states)
         if self.clip_qkv is not None:
             clip_val = self.clip_qkv
@@ -189,21 +206,10 @@ class OlmoAttention(UnifiedAttention):
 
 
 class OlmoDecoderLayer(nn.Module):
-    """OLMo Transformer Decoder Layer.
+    """Single decoder layer for OLMo models.
 
-    This module represents a single decoder layer in the OLMo model,
-    combining self-attention and MLP sub-layers with residual connections.
-    Unlike typical transformer blocks, OLMo applies the layer normalization *after*
-    the residual connection.
-
-    Attributes:
-        config (OlmoConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computations.
-        param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        self_attn (OlmoAttention): The self-attention module.
-        mlp (OlmoMLP): The feed-forward (MLP) module.
+    Combines multi-head attention and feedforward networks with
+    LayerNorm normalization and residual connections.
     """
 
     def __init__(
@@ -216,14 +222,15 @@ class OlmoDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
-        """Initializes the OlmoDecoderLayer.
+        """Initialize OLMo decoder layer.
 
         Args:
-            config (OlmoConfig): The configuration object for the OLMo model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (OlmoConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
         """
         self.config = config
         self.dtype = dtype
@@ -280,24 +287,25 @@ class OlmoDecoderLayer(nn.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """Forward pass of the OlmoDecoderLayer module.
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x))
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
-            causal_mask (tp.Optional[Array | bool]): Causal mask for ensuring autoregressive behavior.
-            cache_view (tp.Optional[TransformerCacheView | RaggedPagesCacheView]): Cache view for attention KVs.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
-            output_attentions (bool): Whether to return attention weights. Default is False.
-            fcm_mask (tp.Optional[Array]): Flash Chunking Mask (FCM) for attention.
-            frequencies (tp.Optional[Array]): Precomputed rotary frequency embeddings.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
 
         Returns:
-            tp.Tuple[Array, tp.Optional[Array]]:
-                A tuple containing the output hidden states and optionally the attention weights.
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
         """
         residual = hidden_states
         attention_output = self.self_attn(
@@ -328,21 +336,16 @@ class OlmoDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=OlmoConfig, model_type="olmo")
 class OlmoModel(EasyDeLBaseModule):
-    """The base OLMo model transformer.
+    """OLMo model implementation.
 
-    This class represents the core transformer architecture of the OLMo model,
-    consisting of an embedding layer and multiple OlmoDecoderLayer layers.
-    Note that OLMo does not have a final layer normalization.
+    This implements the OLMo (Open Language Model) architecture, utilizing transformer blocks
+    with LayerNorm, rotary position embeddings, and grouped-query attention.
 
     Attributes:
-        config (OlmoConfig): Configuration object for the model.
-        dtype (jnp.dtype): Data type for computation.
+        config (OlmoConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
-        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        rngs (nn.Rngs): Random number generators.
-        embed_tokens (nn.Embed): Embedding layer for input tokens.
-        layers (tp.List[OlmoDecoderLayer]): List of decoder layers.
-        gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
+        precision: Precision setting for JAX operations.
     """
 
     def __init__(
@@ -354,14 +357,14 @@ class OlmoModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the OlmoModel.
+        """Initialize OLMo base model.
 
         Args:
-            config (OlmoConfig): The configuration object for the OLMo model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (OlmoConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -418,32 +421,40 @@ class OlmoModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        """Forward pass of the OlmoModel.
+        """Forward pass through the OLMo base model.
+
+        Processes input tokens through embedding, all decoder layers with RoPE and LayerNorm,
+        and final normalization.
 
         Args:
-            input_ids (tp.Optional[Array]): Input token IDs. Shape: (batch_size, sequence_length).
-            inputs_embeds (tp.Optional[Array]): Input embeddings.
-                Either `input_ids` or `inputs_embeds` must be provided.
-            attention_mask (tp.Optional[Array]): Mask to avoid performing attention on padding token indices.
-                Shape: (batch_size, sequence_length).
-            position_ids (tp.Optional[Array]): Position indices for the tokens.
-                Shape: (batch_size, sequence_length).
-            segment_ids (tp.Optional[Array]): Segment IDs (unused).
-            past_key_values (tp.Optional[TransformerCache | RaggedPagesCache]):
-                Precomputed key/value states for attention.
-            cache_metadata (tp.Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
-            output_attentions (tp.Optional[bool]): Whether to return attention weights.
-                Defaults to `config.output_attentions`.
-            output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
-                Defaults to `config.output_hidden_states`.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            BaseModelOutput: The model's output.
-                returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-                and `attentions` (optional).
+            BaseModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                and updated past_key_values.
 
         Raises:
-            ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence_length exceeds max_position_embeddings.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -545,7 +556,17 @@ class OlmoModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=OlmoConfig, model_type="olmo")
 class OlmoForCausalLM(BaseCausalLMModule[OlmoModel, OlmoConfig]):
-    """OLMo model with a Causal Language Modeling head."""
+    """OLMo model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation.
+
+    Attributes:
+        config (OlmoConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "olmo"
@@ -560,14 +581,14 @@ class OlmoForCausalLM(BaseCausalLMModule[OlmoModel, OlmoConfig]):
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the OlmoForCausalLM model.
+        """Initialize OLMo model for causal language modeling.
 
         Args:
-            config (OlmoConfig): The configuration object for the OLMo model.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (OlmoConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -583,7 +604,17 @@ class OlmoForCausalLM(BaseCausalLMModule[OlmoModel, OlmoConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=OlmoConfig, model_type="olmo")
 class OlmoForSequenceClassification(BaseSequenceClassificationModule[OlmoModel, OlmoConfig]):
-    """OLMo model with a Sequence Classification head."""
+    """OLMo model for sequence classification tasks.
+
+    This class extends the base OLMo model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+
+    Attributes:
+        config (OlmoConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "olmo"
@@ -598,15 +629,14 @@ class OlmoForSequenceClassification(BaseSequenceClassificationModule[OlmoModel, 
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the OlmoForSequenceClassification model.
+        """Initialize OLMo model for sequence classification.
 
         Args:
-            config (OlmoConfig): The configuration object for the OLMo model.
-                Must include `num_labels`.
-            dtype (jnp.dtype): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.bfloat16.
-            precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
-            rngs (nn.Rngs): Random number generators.
+            config (OlmoConfig): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,

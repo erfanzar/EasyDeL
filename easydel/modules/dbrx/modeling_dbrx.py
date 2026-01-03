@@ -201,7 +201,27 @@ class DbrxAttention(UnifiedAttention):
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
     ):
-        """Override to handle fused QKV projection efficiently with optional clipping."""
+        """Forward pass for DBRX attention with fused QKV projection.
+
+        Handles the fused QKV projection efficiently with optional clipping,
+        applies rotary position embeddings, and computes attention outputs.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information for the attention computation.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for key-value caching. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+            alibi (Array | None, optional): ALiBi position bias (not used in DBRX). Defaults to None.
+
+        Returns:
+            AttentionLayerOutput: Contains attention output, optional attention weights, and cache view.
+        """
         batch_size, sequence_length = hidden_states.shape[:2]
         qkv_states = checkpoint_name(self.Wqkv(hidden_states), "attn_qkv")
         if self.config.attn_config.clip_qkv is not None:
@@ -276,6 +296,18 @@ class DbrxNormAttentionNorm(nn.Module):
 
     Implements a unique architecture pattern with normalization layers
     surrounding the attention mechanism for improved gradient flow.
+    This module applies layer normalization before and after attention,
+    with residual connections for stable training.
+
+    Attributes:
+        config (DbrxConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        norm_1 (nn.LayerNorm): Pre-attention layer normalization.
+        attn (DbrxAttention): DBRX attention module.
+        norm_2 (nn.LayerNorm): Post-attention layer normalization.
+        dropout (nn.Dropout): Dropout layer for regularization.
     """
 
     kernel_init = staticmethod(nn.initializers.ones)
@@ -290,6 +322,16 @@ class DbrxNormAttentionNorm(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize the DbrxNormAttentionNorm module.
+
+        Args:
+            config (DbrxConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -335,21 +377,26 @@ class DbrxNormAttentionNorm(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
-        """
-        Forward pass of the attentionNrom module.
+        """Forward pass through the normalization-attention-normalization module.
+
+        Applies pre-attention normalization, attention mechanism with residual connection,
+        and post-attention normalization.
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens.
-            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information for attention computation.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for key-value caching. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
         Returns:
-            DecoderLayerOutput: A tuple containing the residual_states, hidden states, and the attention weights.
+            DecoderLayerOutput: Contains normalized hidden states, residual states,
+                optional attention weights, and cache view.
         """
         residual_states = hidden_states
         hidden_states = self.norm_1(hidden_states)
@@ -385,7 +432,19 @@ class DbrxExpertGLU(nn.Module):
     """Gated Linear Unit expert module for DBRX mixture of experts.
 
     Implements a single expert network with gated activation for
-    specialized processing in the MoE architecture.
+    specialized processing in the MoE architecture. Uses a SwiGLU-style
+    gating mechanism with two parallel projections (w1, v1) and an output
+    projection (w2).
+
+    Attributes:
+        config (DbrxConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        w1 (ArrayParam): Gate projection weights for all experts.
+        v1 (ArrayParam): Up projection weights for all experts.
+        w2 (ArrayParam): Down projection weights for all experts.
+        activation_fn: Activation function for the gating mechanism.
     """
 
     def __init__(
@@ -398,6 +457,16 @@ class DbrxExpertGLU(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int | None = None,
     ):
+        """Initialize the DbrxExpertGLU module.
+
+        Args:
+            config (DbrxConfig): Model configuration with FFN parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int | None, optional): Index of this layer. Defaults to None.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -414,6 +483,18 @@ class DbrxExpertGLU(nn.Module):
         self.activation_fn = ACT2FN[self.config.ffn_config.ffn_act_fn["name"]]
 
     def __call__(self, x: Array, expert_idx: int) -> Array:
+        """Apply the gated linear unit transformation for a specific expert.
+
+        Computes SwiGLU-style transformation: (act(x @ w1) * (x @ v1)) @ w2
+        for the specified expert.
+
+        Args:
+            x (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            expert_idx (int): Index of the expert to use for computation.
+
+        Returns:
+            Array: Transformed tensor of shape (batch_size, sequence_length, hidden_dim).
+        """
         expert_shape = (
             self.config.ffn_config.moe_num_experts,
             self.config.ffn_config.ffn_hidden_size,
@@ -447,7 +528,15 @@ class DbrxExperts(nn.Module):
     """Collection of expert networks for DBRX mixture of experts.
 
     Manages multiple expert networks that can be selected and combined
-    based on routing decisions for conditional computation.
+    based on routing decisions for conditional computation. Iterates through
+    all experts and aggregates their weighted outputs.
+
+    Attributes:
+        config (DbrxConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        mlp (DbrxExpertGLU): Shared expert MLP containing all expert weights.
     """
 
     def __init__(
@@ -459,6 +548,15 @@ class DbrxExperts(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the DbrxExperts module.
+
+        Args:
+            config (DbrxConfig): Model configuration with MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -480,6 +578,20 @@ class DbrxExperts(nn.Module):
         top_weights: Array,
         top_experts: Array,
     ):
+        """Forward pass through all experts with weighted aggregation.
+
+        Iterates through all experts, applies each to the input, and aggregates
+        the outputs based on the routing weights assigned by the router.
+
+        Args:
+            x (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            weights (Array): Full routing weights for all experts.
+            top_weights (Array): Top-k routing weights for selected experts.
+            top_experts (Array): Indices of top-k selected experts.
+
+        Returns:
+            Array: Aggregated expert outputs of shape (batch_size, sequence_length, hidden_dim).
+        """
         final_hidden_state = jnp.zeros_like(x)
         for index in range(self.config.ffn_config.moe_num_experts):
             output_moe_layer = self.mlp(x, index)
@@ -493,7 +605,21 @@ class DbrxRouter(nn.Module):
     """Router module for DBRX mixture of experts.
 
     Determines which experts to activate for each input token,
-    implementing sparse routing for efficient computation.
+    implementing sparse routing for efficient computation. Uses top-k
+    routing with optional jittering and weight normalization.
+
+    Attributes:
+        config (DbrxConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        hidden_size (int): Dimension of input hidden states.
+        moe_num_experts (int): Total number of experts.
+        moe_top_k (int): Number of experts to select for each token.
+        moe_jitter_eps (float | None): Jitter epsilon for training regularization.
+        moe_normalize_expert_weights (int | None): Normalization order for weights.
+        uniform_expert_assignment (bool): Whether to use uniform expert assignment.
+        layer (ColumnParallelLinear): Router projection layer.
     """
 
     def __init__(
@@ -505,6 +631,15 @@ class DbrxRouter(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the DbrxRouter module.
+
+        Args:
+            config (DbrxConfig): Model configuration with router parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -529,6 +664,20 @@ class DbrxRouter(nn.Module):
         )
 
     def jitter(self, x: Array) -> Array:
+        """Apply multiplicative jitter noise for training regularization.
+
+        Adds random noise to the input to improve router training stability
+        and encourage exploration of different expert assignments.
+
+        Args:
+            x (Array): Input tensor to apply jitter to.
+
+        Returns:
+            Array: Jittered input tensor with same shape as input.
+
+        Raises:
+            RuntimeError: If moe_jitter_eps is not set in config.
+        """
         if self.moe_jitter_eps is None:
             raise RuntimeError("The router does not have moe_jitter_eps set.")
         low = 1.0 - self.moe_jitter_eps
@@ -537,6 +686,21 @@ class DbrxRouter(nn.Module):
         return low + noise * (high - low)
 
     def __call__(self, x: Array, deterministic: bool = True) -> tuple[Array, Array, Array]:
+        """Route tokens to experts using top-k selection.
+
+        Computes routing scores for all experts, selects top-k experts for each token,
+        and optionally normalizes the routing weights.
+
+        Args:
+            x (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            deterministic (bool, optional): If False, applies jitter noise. Defaults to True.
+
+        Returns:
+            tuple[Array, Array, Array]: A tuple containing:
+                - weights: Full routing weights for all experts (batch, seq_len, num_experts).
+                - top_weights: Weights for selected experts (batch, seq_len, top_k).
+                - top_experts: Indices of selected experts (batch, seq_len, top_k).
+        """
         if not deterministic and self.moe_jitter_eps is not None:
             x = x * self.jitter(x)
 
@@ -576,7 +740,17 @@ class DbrxFFN(nn.Module):
     """Feedforward network with mixture of experts for DBRX models.
 
     Combines router and expert networks to implement sparse MoE
-    feedforward layers with conditional computation.
+    feedforward layers with conditional computation. The router determines
+    which experts process each token, and the experts' outputs are combined
+    based on routing weights.
+
+    Attributes:
+        config (DbrxConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        router (DbrxRouter): Router module for expert selection.
+        experts (DbrxExperts): Collection of expert MLP networks.
     """
 
     def __init__(
@@ -588,6 +762,15 @@ class DbrxFFN(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the DbrxFFN module.
+
+        Args:
+            config (DbrxConfig): Model configuration with FFN and MoE parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -611,6 +794,18 @@ class DbrxFFN(nn.Module):
         )
 
     def __call__(self, x: Array) -> tuple[Array, Array]:
+        """Forward pass through the MoE feedforward network.
+
+        Routes input tokens to selected experts and combines their outputs.
+
+        Args:
+            x (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+
+        Returns:
+            tuple[Array, Array]: A tuple containing:
+                - Output hidden states after MoE processing (batch, seq_len, hidden_dim).
+                - Router logits for auxiliary loss computation (batch, seq_len, num_experts).
+        """
         x = apply_logical_sharding(
             x,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -631,7 +826,18 @@ class DbrxBlock(nn.Module):
     """Single transformer block for DBRX models.
 
     Integrates attention mechanisms with mixture of experts feedforward
-    networks, using residual connections and normalization.
+    networks, using residual connections and normalization. Each block
+    contains a norm-attention-norm module followed by a MoE FFN.
+
+    Attributes:
+        config (DbrxConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        hidden_size (int): Dimension of hidden states.
+        resid_pdrop (float): Residual dropout probability.
+        norm_attn_norm (DbrxNormAttentionNorm): Attention module with normalization.
+        ffn (DbrxFFN): Mixture of experts feedforward network.
     """
 
     def __init__(
@@ -644,6 +850,16 @@ class DbrxBlock(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize a DBRX decoder block.
+
+        Args:
+            config (DbrxConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -689,22 +905,26 @@ class DbrxBlock(nn.Module):
         output_router_logits: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> DecoderLayerOutput:
-        """
-        Forward pass of the attentionNrom module.
+        """Forward pass through the DBRX decoder block.
+
+        Applies attention with normalization followed by MoE feedforward network
+        with residual connections.
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens.
-            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights.
-            output_router_logits (bool): If True, outputs router logits.
-            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo): Attention mask information for attention computation.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES | None): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view
+                for key-value caching. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            output_router_logits (bool, optional): Whether to return router logits. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
         Returns:
-            DecoderLayerOutput: A tuple containing the residual_states, hidden states, and the attention weights.
+            DecoderLayerOutput: Contains hidden states, attention weights, router logits, and cache view.
         """
 
         decoder_output = self.norm_attn_norm(
@@ -729,13 +949,29 @@ class DbrxBlock(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=DbrxConfig, model_type="dbrx")
 class DbrxModel(EasyDeLBaseModule):
-    """
-    Base DBRX Model outputting raw hidden-states.
+    """The base DBRX model transformer.
 
-    This model is a Transformer-based model with a mixture of experts (MoE) architecture,
-    implementing the DBRX architecture as described in the original paper.
+    This class represents the core transformer architecture of the DBRX model,
+    consisting of an embedding layer, multiple DbrxBlock layers (with sparse MoE),
+    and a final layer normalization.
 
-    The model uses specialized attention modules and a router-based MoE FFN layer.
+    The DBRX architecture features:
+    - Fused QKV attention with optional clipping
+    - Mixture of Experts (MoE) feedforward networks
+    - Rotary Position Embeddings (RoPE)
+    - Pre-normalization architecture
+
+    Attributes:
+        config (DbrxConfig): Configuration object for the model.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+        padding_idx (int | None): Token ID used for padding.
+        vocab_size (int): Size of the vocabulary.
+        emb_pdrop (float): Embedding dropout probability.
+        wte (nn.Embed): Token embedding layer.
+        blocks (list[DbrxBlock]): List of decoder blocks.
+        norm_f (nn.LayerNorm): Final layer normalization.
     """
 
     def __init__(
@@ -747,15 +983,14 @@ class DbrxModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        """Initialize the DbrxModel.
+        """Initialize the DBRX base model.
 
         Args:
-                config (DbrxConfig): The model configuration.
-                dtype (jnp.dtype, optional): The data type for computation. Defaults to jnp.float32.
-                param_dtype (jnp.dtype, optional): The data type for parameters. Defaults to jnp.float32.
-                precision (jax.lax.PrecisionLike, optional): The precision to use for matrix multiplication.
-                    Defaults to None.
-                rngs (nn.Rngs): The random number generators.
+            config (DbrxConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
         """
         super().__init__(
             config=config,
@@ -796,6 +1031,11 @@ class DbrxModel(EasyDeLBaseModule):
 
     @cached_property
     def frequencies(self):
+        """Compute and cache the rotary position embedding frequencies.
+
+        Returns:
+            Array: Precomputed RoPE frequencies for position embeddings.
+        """
         return self.config.get_basic_frequencies(
             rotary_dim=self.config.hidden_size // self.config.num_attention_heads,
             head_size=self.config.hidden_size // self.config.num_attention_heads,
@@ -816,27 +1056,41 @@ class DbrxModel(EasyDeLBaseModule):
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> MoeModelOutput:
-        """
-        Forward pass of the model.
+        """Forward pass through the DBRX base model.
+
+        Processes input tokens through embedding, all decoder blocks with MoE,
+        and final normalization.
 
         Args:
-                input_ids (Array): Token IDs to process.
-                attention_mask (Optional[Array], optional): Mask to avoid attention on padding tokens.
-                    Defaults to None.
-                position_ids (Optional[Array], optional): Position IDs. Defaults to None.
-                segment_ids (Optional[Array], optional): Segment IDs for segment-based attention. Defaults to None.
-                inputs_embeds (Optional[Array], optional): Pre-computed input embeddings. Defaults to None.
-                output_attentions (Optional[bool], optional): Whether to output attention weights. Defaults to None.
-                output_hidden_states (Optional[bool], optional): Whether to output hidden states. Defaults to None.
-                output_router_logits (Optional[bool], optional): Whether to output router logits. Defaults to None.
-                past_key_values (Optional[TransformerCache | RaggedPagesCache], optional): Cached key/values.
-                    Defaults to None.
-                cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata], optional): Cache metadata.
-                    Defaults to None.
-
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None (uses config.output_attentions).
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None (uses config.output_hidden_states).
+            output_router_logits (bool | None, optional): Whether to return router logits from MoE layers.
+                Defaults to None (uses config.output_router_logits).
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
 
         Returns:
-                MoeModelOutput: The model outputs, either as a named tuple or a standard tuple.
+            MoeModelOutput: Contains last_hidden_state, optional all hidden_states, optional attentions,
+                optional router_logits, and updated past_key_values.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
         """
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
@@ -946,7 +1200,17 @@ class DbrxModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=DbrxConfig, model_type="dbrx")
 class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):
-    """DBRX model with a Causal Language Modeling head."""
+    """DBRX model with a language modeling head for causal language modeling tasks.
+
+    This model is a sparse MoE transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation.
+
+    Attributes:
+        config (DbrxConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "dbrx"
@@ -961,6 +1225,15 @@ class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize DBRX model for causal language modeling.
+
+        Args:
+            config (DbrxConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=DbrxModel,
@@ -988,7 +1261,38 @@ class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
-        """Forward pass of the DbrxForCausalLM model."""
+        """Forward pass through the DBRX causal language model.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router logits from MoE layers.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply language model head projection.
+                Defaults to True.
+
+        Returns:
+            MoeCausalLMOutput: Contains logits, optional hidden_states, optional attentions,
+                optional router_logits, auxiliary loss, and updated past_key_values.
+        """
         return self.forward_moe(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -1006,7 +1310,15 @@ class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):
         )
 
     def _compute_aux_loss(self, outputs, attention_mask):
-        """Compute auxiliary loss from router logits."""
+        """Compute auxiliary load balancing loss from router logits.
+
+        Args:
+            outputs: Model outputs containing router_logits from MoE layers.
+            attention_mask: Attention mask to exclude padding tokens from loss computation.
+
+        Returns:
+            Optional auxiliary loss value for load balancing, or None if router_logits unavailable.
+        """
         if outputs.router_logits is None or len(outputs.router_logits) == 0:
             return None
         aux_loss = auxiliary_load_balancing_loss_func(
@@ -1020,7 +1332,17 @@ class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=DbrxConfig, model_type="dbrx")
 class DbrxForSequenceClassification(BaseSequenceClassificationModule[DbrxModel, DbrxConfig]):
-    """DBRX model with a Sequence Classification head."""
+    """DBRX model for sequence classification tasks.
+
+    This class extends the base DBRX model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+
+    Attributes:
+        config (DbrxConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "dbrx"
@@ -1035,6 +1357,15 @@ class DbrxForSequenceClassification(BaseSequenceClassificationModule[DbrxModel, 
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize DBRX model for sequence classification.
+
+        Args:
+            config (DbrxConfig): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=DbrxModel,
@@ -1062,6 +1393,36 @@ class DbrxForSequenceClassification(BaseSequenceClassificationModule[DbrxModel, 
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> SequenceClassifierOutput:
+        """Forward pass through the DBRX sequence classification model.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            output_router_logits (bool | None, optional): Whether to return router logits from MoE layers.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+
+        Returns:
+            SequenceClassifierOutput: Contains classification logits, optional hidden_states,
+                optional attentions, auxiliary loss, and updated past_key_values.
+        """
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
 

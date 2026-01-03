@@ -276,7 +276,30 @@ class MambaRMSNormGated(nn.Module):
 
 
 class Mamba2Mixer(nn.Module):
-    """Selective state space mixer powering the Mamba2 token mixing step."""
+    """Core selective state space mixer for Mamba2 blocks.
+
+    Implements the improved selective state space model (SSM) from Mamba2,
+    featuring enhanced hardware efficiency through chunked computations and
+    multi-head structure. This mixer processes sequences with input-dependent
+    state transitions, enabling content-aware modeling with linear complexity.
+
+    The Mamba2 architecture introduces several improvements over the original:
+    - Multi-head SSM structure for better parallelization
+    - Grouped convolutions for efficiency
+    - Improved numerical stability through chunked state updates
+
+    Attributes:
+        config (Mamba2Config): Model configuration.
+        layer_idx (int): Index of this layer in the model.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Numerical precision for operations.
+        num_heads (int): Number of SSM heads.
+        hidden_size (int): Dimensionality of hidden states.
+        ssm_state_size (int): Size of the SSM state.
+        conv_kernel_size (int): Size of the convolution kernel.
+        intermediate_size (int): Expanded intermediate dimension.
+    """
 
     def __init__(
         self,
@@ -550,7 +573,21 @@ class Mamba2Mixer(nn.Module):
 
 
 class Mamba2Block(nn.Module):
-    """Single Mamba2 layer combining normalization, mixer, and residual path."""
+    """Single Mamba2 layer combining normalization, SSM mixer, and residual connections.
+
+    Implements a complete Mamba2 block with pre-normalization architecture,
+    applying RMS normalization followed by the selective state space mixer
+    and a residual connection. Each block maintains separate convolution
+    and SSM states for efficient autoregressive generation.
+
+    Attributes:
+        config (Mamba2Config): Model configuration.
+        layer_idx (int): Index of this layer in the model.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Numerical precision for operations.
+        residual_in_fp32 (bool): Whether to compute residuals in float32.
+    """
 
     def __init__(
         self,
@@ -637,7 +674,24 @@ class Mamba2Block(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Mamba2Config, model_type="mamba2")
 class Mamba2Model(EasyDeLBaseModule):
-    """Stacked Mamba2 mixer blocks with token embeddings and final norm."""
+    """Mamba2 selective state space model implementation.
+
+    Implements the Mamba2 architecture, an improved state space model that
+    achieves linear-time sequence modeling through selective state spaces
+    with multi-head structure. Mamba2 introduces hardware-efficient chunked
+    computations and improved parallelization compared to the original Mamba.
+
+    The model processes input tokens through:
+    1. Token embedding layer
+    2. Stack of Mamba2 blocks with SSM mixers
+    3. Final RMS normalization
+
+    Attributes:
+        config (Mamba2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -794,7 +848,19 @@ class Mamba2Model(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=Mamba2Config, model_type="mamba2")
 class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):
-    """Mamba2 language model with tied backbone and projection head."""
+    """Mamba2 model with a language modeling head for causal language modeling tasks.
+
+    This model combines the Mamba2 selective state space backbone with a
+    linear language modeling head to perform autoregressive text generation
+    with linear-time complexity. The improved multi-head SSM structure
+    enables better hardware utilization compared to the original Mamba.
+
+    Attributes:
+        config (Mamba2Config): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "mamba2"
@@ -892,6 +958,25 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):
         starts: int | None = None,
         **kwargs,
     ):
+        """Prepare model inputs for text generation.
+
+        Initializes or retrieves the recurrent cache and prepares all
+        necessary inputs for the generation loop. Creates a Mamba2-specific
+        cache configuration with multi-head SSM states.
+
+        Args:
+            input_ids: Input token IDs to start generation from.
+            max_length (int): Maximum sequence length for generation.
+            pad_token_id (int): Token ID used for padding.
+            starts (int | None, optional): Starting position for generation.
+                Defaults to None.
+            **kwargs: Additional keyword arguments including cache_params,
+                cache_position, and attention_mask.
+
+        Returns:
+            dict: Prepared inputs including cache_params, attention_mask,
+                and cache_position for the generation loop.
+        """
         from eformer.escale import PartitionAxis
 
         from easydel.layers.caching import RecurrentCache, RecurrentCacheConfig
@@ -925,6 +1010,21 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):
         )
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        """Update model inputs for the next generation step.
+
+        Extracts the updated cache from model outputs and adds it to the
+        model kwargs for the next forward pass during autoregressive generation.
+        Also updates the sequence position in the cache.
+
+        Args:
+            model_outputs (Mamba2CausalLMOutput): Model outputs from the current
+                generation step containing the updated cache_params.
+            model_kwargs (dict): Current model keyword arguments to be updated.
+
+        Returns:
+            dict: Updated model kwargs with the new cache state for the next
+                generation step.
+        """
         model_outputs.cache_params.update_seq(1)
         model_kwargs["cache_params"] = model_outputs.cache_params
         return model_kwargs

@@ -81,6 +81,16 @@ class RMSNorm(nn.Module):
         do_t: bool = False,
         rngs: nn.Rngs = None,
     ):
+        """Initialize RMSNorm layer.
+
+        Args:
+            dim (int | tuple): Dimension(s) of the normalization layer.
+            eps (float, optional): Small constant for numerical stability. Defaults to 1e-6.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            do_t (bool, optional): Whether to transpose the kernel weight. Defaults to False.
+            rngs (nn.Rngs, optional): Random number generator state. Defaults to None.
+        """
         super().__init__()
 
         if rngs is None:
@@ -98,9 +108,25 @@ class RMSNorm(nn.Module):
         )
 
     def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Compute RMS normalization.
+
+        Args:
+            x (jnp.ndarray): Input tensor to normalize.
+
+        Returns:
+            jnp.ndarray: RMS-normalized tensor.
+        """
         return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Apply RMS normalization with learnable scale.
+
+        Args:
+            x (jnp.ndarray): Input tensor to normalize.
+
+        Returns:
+            jnp.ndarray: Normalized and scaled tensor.
+        """
         if self.dtype in [
             jnp.float8_e4m3b11fnuz,
             jnp.float8_e4m3fn,
@@ -136,7 +162,16 @@ class CohereAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ) -> None:
-        """Initialize Cohere attention with optional Q/K normalization."""
+        """Initialize Cohere attention with optional Q/K normalization.
+
+        Args:
+            config (CohereConfig): Model configuration with attention parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         super().__init__(
             config,
             dtype,
@@ -168,11 +203,28 @@ class CohereAttention(UnifiedAttention):
             )
 
     def _create_rotary(self, config: CohereConfig, dtype: jnp.dtype):
-        """Create Cohere-specific rotary embedding layer."""
+        """Create Cohere-specific rotary embedding layer.
+
+        Args:
+            config (CohereConfig): Model configuration.
+            dtype (jnp.dtype): Data type for the rotary embeddings.
+
+        Returns:
+            Rotary embedding module configured for Cohere architecture.
+        """
         return config.get_basic_rope(dtype, self.head_dim, self.head_dim, True)
 
     def _postprocess_qkv(self, query_states, key_states, value_states):
-        """Apply Q/K normalization if configured."""
+        """Apply Q/K normalization if configured.
+
+        Args:
+            query_states: Query tensor from attention projection.
+            key_states: Key tensor from attention projection.
+            value_states: Value tensor from attention projection.
+
+        Returns:
+            Tuple of (query_states, key_states, value_states), optionally normalized.
+        """
         if self.config.use_qk_norm:
             query_states = self.q_norm(query_states)
             key_states = self.k_norm(key_states)
@@ -196,6 +248,17 @@ class CohereMLP(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Cohere MLP block.
+
+        Args:
+            config (CohereConfig): Model configuration with MLP parameters.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
+                Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -225,6 +288,14 @@ class CohereMLP(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
+        """Apply SwiGLU feedforward transformation.
+
+        Args:
+            hidden_states: Input tensor [batch, seq_len, hidden_dim]
+
+        Returns:
+            Transformed hidden states [batch, seq_len, hidden_dim]
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -242,10 +313,12 @@ class CohereMLP(nn.Module):
 
 
 class CohereBlock(nn.Module):
-    """Single transformer block for Cohere models.
+    """Single decoder layer for Cohere models.
 
-    Combines self-attention, feedforward networks, and layer normalization
-    with residual connections to form a complete transformer layer.
+    Combines multi-head attention and feedforward networks with
+    RMS normalization and residual connections. Uses a parallel
+    attention-feedforward architecture where both are applied
+    to the same normalized input.
     """
 
     def __init__(
@@ -258,6 +331,16 @@ class CohereBlock(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ) -> None:
+        """Initialize Cohere decoder block.
+
+        Args:
+            config (CohereConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the model.
+        """
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -309,22 +392,25 @@ class CohereBlock(nn.Module):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
-    ):
-        """
-        Forward pass of the module block.
+    ) -> DecoderLayerOutput:
+        """Forward pass through the decoder block.
+
+        Applies parallel attention-feedforward architecture: x + attn(norm(x)) + mlp(norm(x))
 
         Args:
-            hidden_states (Array): Input hidden states.
-            attention_mask (Array): Mask to apply on the attention scores.
-            position_ids (Array): Position indices for the tokens.
-            causal_mask (Array): Causal mask for ensuring autoregressive behavior.
-            segment_ids (tp.Optional[Array]): Segment IDs for segment-based attention (optional).
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-            fcm_mask (tp.Optional[Array]): fcm mask to be combined with attn mask and causal mask.
+            hidden_states (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for tokens, shape (batch_size, sequence_length).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.) for optimization.
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional): Cache view.
+                Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies. Defaults to None.
+
         Returns:
-            tp.Tuple[Array, Array]: A tuple containing the attention output and the attention weights.
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
         """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -372,7 +458,18 @@ class CohereBlock(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=CohereConfig, model_type="cohere")
 class CohereModel(EasyDeLBaseModule):
-    """Decoder-only Cohere transformer assembling embeddings, blocks, and final norm."""
+    """Cohere model implementation.
+
+    This implements the Cohere language model architecture, utilizing transformer blocks
+    with RMSNorm, rotary position embeddings, optional Q/K normalization, and a
+    parallel attention-feedforward architecture.
+
+    Attributes:
+        config (CohereConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -383,6 +480,15 @@ class CohereModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Cohere base model.
+
+        Args:
+            config (CohereConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -569,7 +675,18 @@ class CohereModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=CohereConfig, model_type="cohere")
 class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
-    """Cohere model with a Causal Language Modeling head."""
+    """Cohere model with a language modeling head for causal language modeling tasks.
+
+    This model is a transformer-based language model with causal attention masks
+    applied to perform autoregressive language generation. Includes logit scaling
+    as configured in CohereConfig.
+
+    Attributes:
+        config (CohereConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "cohere"
@@ -584,6 +701,15 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Cohere model for causal language modeling.
+
+        Args:
+            config (CohereConfig): Model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=CohereModel,
@@ -610,22 +736,38 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:  # type:ignore
-        """
-        Forward pass through the Cohere model for Causal Language Modeling.
+        """Forward pass through the Cohere model for causal language modeling.
+
+        Processes input through the Cohere transformer and applies the language
+        modeling head to produce next-token predictions with logit scaling.
 
         Args:
-            input_ids (Optional[Array]): Input tensor containing token IDs.
-            inputs_embeds (Optional[Array]): Embedded input tensor (alternative to input_ids).
-            attention_mask (Optional[Array]): Mask for attention.
-            position_ids (Optional[Array]): Positional indices.
-            segment_ids (Optional[Array]): Segment IDs for different input parts.
-            output_attentions (Optional[bool]): If True, output attention weights.
-            output_hidden_states (Optional[bool]): If True, output hidden states.
-            past_key_values (Optional[TransformerCache | RaggedPagesCache]): KV cache for faster generation.
-            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]): Metadata for paged attention.
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
+            apply_lm_head (bool, optional): Whether to apply the language modeling head.
+                Defaults to True.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
 
         Returns:
-            Union[CausalLMOutput, Tuple]: Model output, including logits.
+            CausalLMOutput: Contains logits (scaled by logit_scale), last_hidden_state,
+                optional all hidden_states, optional attentions, and updated past_key_values.
         """
         outputs = self.model(
             input_ids=input_ids,
@@ -692,7 +834,17 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=CohereConfig, model_type="cohere")
 class CohereForSequenceClassification(BaseSequenceClassificationModule[CohereModel, CohereConfig]):
-    """Cohere model for sequence classification."""
+    """Cohere model for sequence classification tasks.
+
+    This class extends the base Cohere model by adding a linear classification head
+    to perform sequence classification tasks such as sentiment analysis or text classification.
+
+    Attributes:
+        config (CohereConfig): Configuration for the model.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     _task_type = TaskType.SEQUENCE_CLASSIFICATION
     _model_type = "cohere"
@@ -707,6 +859,15 @@ class CohereForSequenceClassification(BaseSequenceClassificationModule[CohereMod
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Cohere model for sequence classification.
+
+        Args:
+            config (CohereConfig): Model configuration with num_labels for classification.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=CohereModel,
@@ -732,23 +893,39 @@ class CohereForSequenceClassification(BaseSequenceClassificationModule[CohereMod
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> SequenceClassifierOutput:
-        """
-        Forward pass for sequence classification.
+        """Forward pass for sequence classification.
+
+        Processes input through the Cohere transformer and applies the classification
+        head to produce class predictions using pooled representations.
 
         Args:
-            input_ids (Optional[Array]): Input token IDs.
-            inputs_embeds (Optional[Array]): Input embeddings (alternative to input_ids).
-            attention_mask (Optional[Array]): Attention mask.
-            position_ids (Optional[Array]): Position IDs.
-            segment_ids (Optional[Array]): Segment IDs.
-            output_attentions (Optional[bool]): Whether to output attentions.
-            output_hidden_states (Optional[bool]): Whether to output hidden states.
-            past_key_values (Optional[TransformerCache | RaggedPagesCache]): KV cache.
-            cache_metadata (Optional[TransformerMetadata | RaggedPagesMetadata]): Cache metadata.
-
+            input_ids (Array | None, optional): Input token IDs of shape (batch_size, sequence_length).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed input embeddings of shape
+                (batch_size, sequence_length, hidden_size). Defaults to None.
+            attention_mask (Array | None, optional): Boolean mask to avoid attention on padding tokens,
+                shape (batch_size, sequence_length). Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information for attention operations.
+                Defaults to None.
+            position_ids (Array | None, optional): Position indices for each token, shape
+                (batch_size, sequence_length). Defaults to None.
+            output_attentions (bool | None, optional): Whether to return attention weights from all layers.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return hidden states from all layers.
+                Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode (train/decode) for optimizations.
+                Auto-detected if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cache with precomputed key-value states. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache management. Defaults to None.
 
         Returns:
-            Union[SequenceClassifierOutput, Tuple]: Classification output (logits and optional hidden states/attentions).
+            SequenceClassifierOutput: Contains pooled logits of shape (batch_size, num_labels),
+                optional past_key_values, optional all hidden_states, and optional attentions.
+
+        Raises:
+            ValueError: If batch_size > 1 and no padding token is defined in config.
         """
         transformer_outputs = self.model(
             input_ids=input_ids,

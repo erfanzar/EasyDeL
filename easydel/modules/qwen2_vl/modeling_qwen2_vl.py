@@ -221,8 +221,23 @@ def get_rope_index(
 
 @auto_pytree
 class Qwen2VLCausalLMOutputWithPast(ModelOutput):
-    """
-    Base class for Qwen2VL causal language model (or autoregressive) outputs.
+    """Output class for Qwen2VL causal language model with past key-values.
+
+    Extends ModelOutput to include rope_deltas for multi-dimensional rotary
+    position embeddings used in vision-language models.
+
+    Attributes:
+        loss (Array | None): Language modeling loss when labels are provided.
+        logits (Array): Prediction scores from the language modeling head,
+            shape (batch_size, sequence_length, vocab_size).
+        past_key_values (list[Array] | None): Cached key-value states for
+            efficient autoregressive generation.
+        hidden_states (tuple[Array] | None): Hidden states from all layers
+            if output_hidden_states=True.
+        attentions (tuple[Array] | None): Attention weights from all layers
+            if output_attentions=True.
+        rope_deltas (Array | None): Position deltas for multi-dimensional RoPE,
+            shape (batch_size, 1), accounting for variable vision token lengths.
     """
 
     loss: Array | None = None
@@ -236,7 +251,20 @@ class Qwen2VLCausalLMOutputWithPast(ModelOutput):
 def create_attention_mask(cu_seqlens: Array, seq_length: int, dtype: jnp.dtype) -> Array:
     """Create block-diagonal attention mask from cumulative sequence lengths.
 
-    Vectorized implementation that works correctly with JAX tracing.
+    Creates a mask that allows attention only within segments defined by
+    cumulative sequence lengths, used for processing multiple images/videos
+    as separate sequences within a batch.
+
+    Args:
+        cu_seqlens (Array): Cumulative sequence lengths of shape (num_segments + 1,).
+            For example, [0, 100, 256] indicates two segments: positions 0-99 and 100-255.
+        seq_length (int): Total sequence length for the output mask.
+        dtype (jnp.dtype): Data type for the output mask (typically float32 or bfloat16).
+
+    Returns:
+        Array: Block-diagonal attention mask of shape (1, seq_length, seq_length).
+            Positions within the same segment have value 0.0, positions across
+            different segments have value -inf (dtype minimum).
     """
     positions = jnp.arange(seq_length)
     starts = cu_seqlens[:-1]
@@ -288,7 +316,22 @@ def merge_multimodal_embeddings(
     multimodal_embeddings: jax.Array,
     placeholder_token_id: int | list[int],
 ) -> jax.Array:
-    """Overwrite `inputs_embeds` wherever `input_ids` matches placeholder tokens."""
+    """Merge multimodal embeddings into text embeddings at placeholder token positions.
+
+    Replaces embeddings at positions where input_ids match the placeholder token(s)
+    with the corresponding multimodal (image/video) embeddings.
+
+    Args:
+        input_ids (jax.Array): Input token IDs of shape (batch_size, seq_length).
+        inputs_embeds (jax.Array): Text embeddings of shape (batch_size, seq_length, hidden_dim).
+        multimodal_embeddings (jax.Array): Flattened vision embeddings of shape (total_tokens, hidden_dim).
+        placeholder_token_id (int | list[int]): Token ID(s) indicating where to insert vision embeddings.
+            Can be a single int or list of ints for multiple placeholder types.
+
+    Returns:
+        jax.Array: Merged embeddings of shape (batch_size, seq_length, hidden_dim) with vision
+            embeddings inserted at placeholder positions.
+    """
     if isinstance(placeholder_token_id, list):
         placeholder_token_id = jnp.array(placeholder_token_id)
         is_multimodal = jnp.isin(input_ids, placeholder_token_id)
@@ -298,14 +341,38 @@ def merge_multimodal_embeddings(
 
 
 def precompute_vl_rotary(dim, theta, max_position):
-    """Precompute rotary angle matrix for the vision-language attention stack."""
+    """Precompute rotary position embedding frequencies for vision-language attention.
+
+    Computes the inverse frequency matrix used for rotary position embeddings
+    in the vision-language attention stack.
+
+    Args:
+        dim (int): Dimension of the rotary embedding (typically head_dim).
+        theta (float): Base value for computing inverse frequencies (typically 10000.0).
+        max_position (int): Maximum sequence position to precompute embeddings for.
+
+    Returns:
+        jnp.ndarray: Rotary angle matrix of shape (max_position, dim // 2) containing
+            the outer product of position indices and inverse frequencies.
+    """
     inv = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype="f4") / dim))
     seq = jnp.arange(0, max_position, "f4")
     return jnp.outer(seq, inv)
 
 
 def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
+    """Rotate half the hidden dimensions of the input for rotary embeddings.
+
+    Splits the input tensor along the last dimension and swaps the two halves
+    with negation, which is the core operation for applying rotary position embeddings.
+
+    Args:
+        x (Array): Input tensor of shape (..., head_dim) where head_dim is even.
+
+    Returns:
+        Array: Rotated tensor of the same shape, where the first half of the last
+            dimension is negated and swapped with the second half.
+    """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return jnp.concatenate([-x2, x1], axis=-1)
@@ -345,7 +412,11 @@ def apply_rotary_pos_emb_vision(
 
 
 class Qwen2VLPatchEmbed(nn.Module):
-    """Convert images or video frames into patch embeddings for Qwen2-VL."""
+    """Patch embedding layer for converting images/video frames into embeddings.
+
+    Uses 3D convolution to convert image or video patches into embeddings,
+    handling both spatial (height, width) and temporal dimensions for video input.
+    """
 
     def __init__(
         self,
@@ -359,6 +430,18 @@ class Qwen2VLPatchEmbed(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize the patch embedding layer.
+
+        Args:
+            patch_size (int, optional): Spatial patch size (height and width). Defaults to 14.
+            temporal_patch_size (int, optional): Temporal patch size for video frames. Defaults to 2.
+            in_channels (int, optional): Number of input channels (RGB=3). Defaults to 3.
+            embed_dim (int, optional): Output embedding dimension. Defaults to 1152.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.dtype = dtype
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
@@ -379,6 +462,15 @@ class Qwen2VLPatchEmbed(nn.Module):
         )
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
+        """Apply patch embedding to input pixels.
+
+        Args:
+            hidden_states (Array): Input pixel values of shape
+                (num_patches * temporal * channels, patch_size, patch_size) flattened.
+
+        Returns:
+            Array: Patch embeddings of shape (num_patches, embed_dim).
+        """
         hidden_states = jnp.transpose(
             hidden_states.reshape(
                 -1,
@@ -395,7 +487,11 @@ class Qwen2VLPatchEmbed(nn.Module):
 
 
 class Qwen2VLPatchMerger(nn.Module):
-    """Merge neighboring spatial patches to downsample visual tokens."""
+    """Patch merger module to downsample visual tokens by merging spatial neighbors.
+
+    Reduces the number of visual tokens by merging adjacent patches spatially,
+    projecting them through an MLP to match the language model's hidden dimension.
+    """
 
     def __init__(
         self,
@@ -408,6 +504,18 @@ class Qwen2VLPatchMerger(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize the patch merger.
+
+        Args:
+            dim (int): Output dimension (language model hidden size).
+            context_dim (int): Input context dimension from vision encoder.
+            spatial_merge_size (int, optional): Number of patches to merge spatially.
+                Defaults to 2 (merges 2x2=4 patches into 1).
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.dtype = dtype
         self.hidden_size = context_dim * (spatial_merge_size**2)
@@ -441,6 +549,14 @@ class Qwen2VLPatchMerger(nn.Module):
         ]
 
     def __call__(self, x: Array) -> Array:
+        """Merge and project patches.
+
+        Args:
+            x (Array): Input patches of shape (num_patches, context_dim).
+
+        Returns:
+            Array: Merged and projected patches of shape (num_merged_patches, dim).
+        """
         x = self.ln_q(x).reshape(-1, self.hidden_size)
         for mlp in self.mlp:
             x = mlp(x)
@@ -448,7 +564,11 @@ class Qwen2VLPatchMerger(nn.Module):
 
 
 class Qwen2VLVisionMLP(nn.Module):
-    """Feed-forward module for the Qwen2-VL vision encoder."""
+    """Multi-Layer Perceptron module for the Qwen2-VL vision encoder.
+
+    Implements a two-layer feedforward network with configurable activation function
+    for use in vision transformer blocks.
+    """
 
     def __init__(
         self,
@@ -461,6 +581,17 @@ class Qwen2VLVisionMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize the vision MLP.
+
+        Args:
+            dim (int): Input and output dimension.
+            hidden_dim (int): Hidden layer dimension.
+            hidden_act (str): Activation function name (e.g., 'gelu', 'silu').
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.fc1 = ColumnParallelLinear(
             dim,
@@ -483,11 +614,23 @@ class Qwen2VLVisionMLP(nn.Module):
         )
 
     def __call__(self, x: Array) -> Array:
+        """Apply feedforward transformation.
+
+        Args:
+            x (Array): Input tensor of shape (seq_len, dim).
+
+        Returns:
+            Array: Transformed tensor of shape (seq_len, dim).
+        """
         return self.fc2(self.act(self.fc1(x)))
 
 
 class Qwen2VLVisionAttention(UnifiedAttention):
-    """Self-attention layer for vision patches with rotary position encoding."""
+    """Self-attention layer for vision patches with 2D rotary position encoding.
+
+    Implements multi-head self-attention for the vision encoder with spatial
+    rotary embeddings that encode 2D patch positions (height, width).
+    """
 
     def __init__(
         self,
@@ -501,6 +644,18 @@ class Qwen2VLVisionAttention(UnifiedAttention):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize vision attention layer.
+
+        Args:
+            config: Vision configuration object.
+            layer_idx (int): Index of this layer in the encoder stack.
+            dim (int): Hidden dimension for attention.
+            num_heads (int, optional): Number of attention heads. Defaults to 16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.embed_dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -542,6 +697,18 @@ class Qwen2VLVisionAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike,
         rngs: nn.Rngs,
     ) -> None:
+        """Define network layers for vision attention.
+
+        Creates fused QKV projection and output projection layers for
+        efficient vision attention computation.
+
+        Args:
+            config: Configuration object with model parameters.
+            dtype (jnp.dtype): Data type for computation.
+            param_dtype (jnp.dtype): Data type for parameters.
+            precision (jax.lax.PrecisionLike): Numerical precision.
+            rngs (nn.Rngs): Random number generator state.
+        """
         self.qkv = ColumnParallelLinear(
             self.embed_dim,
             self.embed_dim * 3,
@@ -562,6 +729,16 @@ class Qwen2VLVisionAttention(UnifiedAttention):
         )
 
     def _create_attention_performer(self, config, rngs: nn.Rngs):
+        """Create attention performer for vision attention.
+
+        Args:
+            config: Configuration object.
+            rngs (nn.Rngs): Random number generator state.
+
+        Returns:
+            FlexibleAttentionModule: Configured attention module with vanilla attention
+                and no KV caching (not needed for vision encoder).
+        """
         return FlexibleAttentionModule(
             rngs=rngs,
             base_config=config,
@@ -577,6 +754,20 @@ class Qwen2VLVisionAttention(UnifiedAttention):
         cu_seqlens: Array,
         position_embeddings: tuple[Array, Array] | None = None,
     ) -> Array:
+        """Apply vision self-attention with rotary embeddings.
+
+        Computes multi-head self-attention over vision patches with 2D rotary
+        position embeddings. Processes each image/video segment separately.
+
+        Args:
+            hidden_states (Array): Input patches of shape (seq_len, hidden_dim).
+            cu_seqlens (Array): Cumulative sequence lengths for segment boundaries.
+            position_embeddings (tuple[Array, Array] | None, optional): Precomputed
+                (cos, sin) rotary embeddings. Defaults to None.
+
+        Returns:
+            Array: Attention output of shape (seq_len, hidden_dim).
+        """
         seq_length = hidden_states.shape[0]
         qkv = self.qkv(hidden_states)
         q, k, v = map(
@@ -613,7 +804,11 @@ class Qwen2VLVisionAttention(UnifiedAttention):
 
 
 class Qwen2VLVisionBlock(nn.Module):
-    """Vision transformer block combining attention and MLP with pre-normalization."""
+    """Vision transformer block combining self-attention and MLP with pre-normalization.
+
+    Implements a standard ViT block architecture with pre-layer normalization,
+    multi-head self-attention with 2D rotary embeddings, and an MLP feedforward network.
+    """
 
     def __init__(
         self,
@@ -625,6 +820,16 @@ class Qwen2VLVisionBlock(nn.Module):
         *,
         rngs: nn.Rngs,
     ) -> None:
+        """Initialize vision transformer block.
+
+        Args:
+            config (Qwen2VLVisionConfig): Vision encoder configuration.
+            layer_idx (int): Index of this block in the encoder stack.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__()
         self.norm1 = nn.LayerNorm(
             config.embed_dim,
@@ -662,6 +867,18 @@ class Qwen2VLVisionBlock(nn.Module):
         )
 
     def __call__(self, hidden_states, cu_seqlens, position_embeddings) -> Array:
+        """Forward pass through the vision block.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x)).
+
+        Args:
+            hidden_states (Array): Input patches of shape (seq_len, hidden_dim).
+            cu_seqlens (Array): Cumulative sequence lengths for segment boundaries.
+            position_embeddings (tuple[Array, Array]): Precomputed (cos, sin) rotary embeddings.
+
+        Returns:
+            Array: Output patches of shape (seq_len, hidden_dim).
+        """
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
@@ -672,7 +889,11 @@ class Qwen2VLVisionBlock(nn.Module):
 
 
 class Qwen2VLMLP(nn.Module):
-    """Feed-forward network used in the Qwen2-VL language decoder."""
+    """Multi-Layer Perceptron module for Qwen2-VL language decoder.
+
+    Implements a SwiGLU feedforward network for the language model decoder layers,
+    with gate, up, and down projections for enhanced representation learning.
+    """
 
     def __init__(
         self,
@@ -684,6 +905,16 @@ class Qwen2VLMLP(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Qwen2-VL language decoder MLP.
+
+        Args:
+            config (Qwen2VLTextConfig): Text model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the decoder stack.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -724,6 +955,14 @@ class Qwen2VLMLP(nn.Module):
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
+        """Apply SwiGLU feedforward transformation.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+
+        Returns:
+            jnp.ndarray: Transformed tensor of shape (batch, seq_len, hidden_dim).
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -742,7 +981,12 @@ class Qwen2VLMLP(nn.Module):
 
 
 class Qwen2VLAttention(UnifiedAttention):
-    """Causal self-attention used in the Qwen2-VL language decoder."""
+    """Causal self-attention layer for Qwen2-VL language decoder.
+
+    Implements multi-head causal attention with multi-dimensional RoPE (M-RoPE)
+    that encodes 3D positions (temporal, height, width) for vision-language alignment.
+    Supports sliding window attention when configured.
+    """
 
     def __init__(
         self,
@@ -754,6 +998,16 @@ class Qwen2VLAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Qwen2-VL language decoder attention.
+
+        Args:
+            config (Qwen2VLTextConfig): Text model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the decoder stack.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -777,6 +1031,27 @@ class Qwen2VLAttention(UnifiedAttention):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ) -> AttentionLayerOutput:
+        """Apply causal attention with M-RoPE position embeddings.
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information.
+            position_ids (Array): Position IDs, either 2D (batch, seq_len) or 3D
+                (3, batch, seq_len) for M-RoPE temporal/height/width encoding.
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.).
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional):
+                Cache view for KV caching. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies.
+                Defaults to None.
+
+        Returns:
+            AttentionLayerOutput: Contains attention output, optional attention weights,
+                and updated cache view.
+        """
         return super().__call__(
             hidden_states=hidden_states,
             mask_info=mask_info,
@@ -790,7 +1065,11 @@ class Qwen2VLAttention(UnifiedAttention):
 
 
 class Qwen2VLDecoderLayer(nn.Module):
-    """Transformer decoder layer coupling Qwen2-VL attention and feed-forward modules."""
+    """Single decoder layer for Qwen2-VL language model.
+
+    Combines causal self-attention with M-RoPE position encoding and SwiGLU
+    feedforward networks, using RMS normalization and residual connections.
+    """
 
     def __init__(
         self,
@@ -802,6 +1081,16 @@ class Qwen2VLDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize Qwen2-VL decoder layer.
+
+        Args:
+            config (Qwen2VLTextConfig): Text model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+            layer_idx (int): Index of this layer in the decoder stack.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -859,6 +1148,28 @@ class Qwen2VLDecoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
     ):
+        """Forward pass through the decoder layer.
+
+        Applies pre-normalization architecture: x + attn(norm(x)) followed by x + mlp(norm(x)).
+
+        Args:
+            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_dim).
+            mask_info (MaskInfo | None): Attention mask information including causal masks.
+            position_ids (Array): Position indices for M-RoPE encoding, shape (3, batch, seq_len)
+                or (batch, seq_len).
+            mode (RUNTIME_MODE_TYPES): Runtime mode (train, decode, etc.).
+            cache_view (TransformerCacheView | RaggedPagesCacheView | None, optional):
+                Cache view for KV caching. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Metadata for cache operations. Defaults to None.
+            output_attentions (bool, optional): Whether to return attention weights.
+                Defaults to False.
+            frequencies (Array | None, optional): Precomputed RoPE frequencies.
+                Defaults to None.
+
+        Returns:
+            DecoderLayerOutput: Contains hidden states, attention weights, and cache view.
+        """
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
             mask_info,
@@ -897,7 +1208,17 @@ class Qwen2VLDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_VISION, config=Qwen2VLVisionConfig, model_type="qwen2_vl")
 class Qwen2VLVisionTransformer(EasyDeLBaseModule):
-    """Vision transformer encoder used to extract image features for Qwen2-VL."""
+    """Vision transformer encoder for extracting image and video features.
+
+    Implements a vision transformer architecture with 2D rotary position embeddings
+    and patch merging for efficient visual feature extraction in Qwen2-VL.
+
+    Attributes:
+        config (Qwen2VLVisionConfig): Vision encoder configuration.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     config_class = Qwen2VLVisionConfig
 
@@ -910,6 +1231,18 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the vision transformer.
+
+        Args:
+            config (Qwen2VLVisionConfig): Vision encoder configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+
+        Raises:
+            AssertionError: If config is not a Qwen2VLVisionConfig instance.
+        """
         assert isinstance(config, Qwen2VLVisionConfig), (
             "Qwen2VLVisionTransformer requires a Qwen2VLVisionConfig instance"
         )
@@ -959,9 +1292,27 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         )
 
     def get_dtype(self) -> jnp.dtype:
+        """Get the data type of the model parameters.
+
+        Returns:
+            jnp.dtype: The data type of the MLP kernel parameters.
+        """
         return self.blocks[0].mlp.fc2.kernel.value.dtype
 
     def rot_pos_emb(self, grid_thw, max_grid_size):
+        """Compute 2D rotary position embeddings for vision patches.
+
+        Creates position embeddings that encode spatial (height, width) positions
+        for each patch, accounting for spatial merge operations.
+
+        Args:
+            grid_thw (Array): Grid dimensions of shape (num_images/videos, 3) where
+                each row contains (temporal, height, width) in patches.
+            max_grid_size (int): Maximum grid size for computing rotary frequencies.
+
+        Returns:
+            jnp.ndarray: Rotary position embeddings of shape (total_patches, head_dim).
+        """
         pos_ids = []
 
         for t, h, w in grid_thw:
@@ -1014,6 +1365,21 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         grid_thw: Array,
         max_grid_size,
     ) -> Array:
+        """Forward pass through the vision transformer.
+
+        Encodes image or video pixel values into visual features suitable for
+        fusion with the language model.
+
+        Args:
+            hidden_states (Array): Flattened pixel values ready for patch embedding.
+            grid_thw (Array): Grid dimensions of shape (num_images/videos, 3) where
+                each row contains (temporal, height, width) in patches.
+            max_grid_size: Maximum grid size for computing rotary position embeddings.
+
+        Returns:
+            Array: Visual features of shape (num_merged_patches, hidden_size) after
+                patch merging, ready for language model fusion.
+        """
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw, max_grid_size)
 
@@ -1064,7 +1430,18 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
 
 @register_module(TaskType.BASE_MODULE, config=Qwen2VLTextConfig, model_type="qwen2_vl")
 class Qwen2VLTextModel(EasyDeLBaseModule):
-    """Language decoder stack for Qwen2-VL that consumes projected vision tokens."""
+    """Language decoder stack for Qwen2-VL that processes text and projected vision tokens.
+
+    Implements the transformer decoder backbone for the Qwen2-VL model, processing
+    interleaved text and vision embeddings using M-RoPE position encoding for
+    multimodal understanding.
+
+    Attributes:
+        config (Qwen2VLTextConfig): Text model configuration.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+    """
 
     def __init__(
         self,
@@ -1075,6 +1452,18 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the Qwen2-VL text model.
+
+        Args:
+            config (Qwen2VLTextConfig): Text model configuration.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+
+        Raises:
+            AssertionError: If config is not a Qwen2VLTextConfig instance.
+        """
         assert isinstance(config, Qwen2VLTextConfig), "Qwen2VLTextModel requires a Qwen2VLTextConfig instance"
         super().__init__(
             config=config,
@@ -1132,6 +1521,41 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
+        """Forward pass through the Qwen2-VL text model.
+
+        Processes input tokens (or embeddings) through all decoder layers with
+        M-RoPE position encoding and RMS normalization.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
+                Must be provided if inputs_embeds is None.
+            inputs_embeds (Array | None, optional): Pre-computed embeddings of shape
+                (batch, seq_len, hidden_size). Typically includes fused vision tokens.
+            attention_mask (Array | None, optional): Attention mask of shape (batch, seq_len).
+                Defaults to None.
+            mask_info (MaskInfo | None, optional): Advanced mask information. Defaults to None.
+            position_ids (Array | None, optional): 3D position IDs for M-RoPE of shape
+                (3, batch, seq_len). Auto-computed if None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode. Auto-detected if None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cached KV states for generation. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            apply_lm_head (bool, optional): Unused parameter for API compatibility.
+                Defaults to True.
+            output_attentions (bool | None, optional): Whether to return attention weights.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Whether to return all hidden states.
+                Defaults to None.
+
+        Returns:
+            BaseModelOutput: Contains last_hidden_state, optional hidden_states,
+                optional attentions, and past_key_values.
+
+        Raises:
+            ValueError: If both input_ids and inputs_embeds are provided or both are None.
+            AssertionError: If sequence length exceeds max_position_embeddings.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -1240,8 +1664,19 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
 
 @register_module(TaskType.BASE_MODULE, config=Qwen2VLConfig, model_type="qwen2_vl")
 class Qwen2VLModel(EasyDeLBaseModule):
-    """
-    The Qwen2-VL model which consists of a vision encoder and a language model.
+    """Qwen2-VL base model combining vision encoder and language decoder.
+
+    This model integrates a vision transformer encoder for processing images and videos
+    with a language model decoder, enabling multimodal understanding through M-RoPE
+    position encoding and vision-text embedding fusion.
+
+    Attributes:
+        config (Qwen2VLConfig): Combined model configuration.
+        dtype (jnp.dtype): Data type for computations.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Precision setting for JAX operations.
+        visual (Qwen2VLVisionTransformer): Vision encoder component.
+        language_model (Qwen2VLTextModel): Language decoder component.
     """
 
     def __init__(
@@ -1253,6 +1688,16 @@ class Qwen2VLModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the Qwen2-VL base model.
+
+        Args:
+            config (Qwen2VLConfig): Combined model configuration containing
+                vision_config and text_config.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1277,9 +1722,27 @@ class Qwen2VLModel(EasyDeLBaseModule):
         self.rope_deltas = None
 
     def set_embeddings(self, value):
+        """Set the token embedding layer.
+
+        Args:
+            value: New embedding layer to set.
+        """
         self.language_model.set_embeddings(value)
 
     def get_video_features(self, pixel_values_videos: Array, video_grid_thw: Array | None = None):
+        """Extract visual features from video input.
+
+        Args:
+            pixel_values_videos (Array): Video pixel values of shape
+                (num_videos, channels, num_frames, height, width).
+            video_grid_thw (Array | None, optional): Video grid dimensions of shape
+                (num_videos, 3) where each row is (temporal, height, width).
+                Defaults to None.
+
+        Returns:
+            list[Array] | Array: Video embeddings, either as a list of per-video
+                embeddings or concatenated if video_grid_thw is None.
+        """
         pixel_values_videos = pixel_values_videos.astype(self.visual.dtype)
         max_grid_size = int(video_grid_thw[:, 1:].max()) if video_grid_thw is not None else 1
         video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw, max_grid_size=max_grid_size)
@@ -1290,6 +1753,19 @@ class Qwen2VLModel(EasyDeLBaseModule):
         return video_embeds
 
     def get_image_features(self, pixel_values: Array, image_grid_thw: Array | None = None):
+        """Extract visual features from image input.
+
+        Args:
+            pixel_values (Array): Image pixel values of shape
+                (num_images, channels, height, width).
+            image_grid_thw (Array | None, optional): Image grid dimensions of shape
+                (num_images, 3) where each row is (1, height, width).
+                Defaults to None.
+
+        Returns:
+            list[Array] | Array: Image embeddings, either as a list of per-image
+                embeddings or concatenated if image_grid_thw is None.
+        """
         pixel_values = pixel_values.astype(self.visual.dtype)
         max_grid_size = int(image_grid_thw[:, 1:].max()) if image_grid_thw is not None else 1
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw, max_grid_size=max_grid_size)
@@ -1306,6 +1782,24 @@ class Qwen2VLModel(EasyDeLBaseModule):
         video_grid_thw: Array = None,
         attention_mask: Array = None,
     ):
+        """Compute 3D M-RoPE position indices for multimodal inputs.
+
+        Calculates position indices that encode temporal, height, and width
+        dimensions for vision tokens, enabling proper position encoding
+        for images and videos in the language model.
+
+        Args:
+            input_ids (Array, optional): Input token IDs of shape (batch, seq_len).
+            image_grid_thw (Array, optional): Image grid dimensions of shape
+                (num_images, 3) where each row is (1, height, width).
+            video_grid_thw (Array, optional): Video grid dimensions of shape
+                (num_videos, 3) where each row is (temporal, height, width).
+            attention_mask (Array, optional): Attention mask of shape (batch, seq_len).
+
+        Returns:
+            tuple[Array, Array]: Position IDs of shape (3, batch, seq_len) and
+                rope_deltas of shape (batch, 1).
+        """
         return get_rope_index(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
@@ -1329,6 +1823,30 @@ class Qwen2VLModel(EasyDeLBaseModule):
         video_embeds: Array | None = None,
         **kwargs,
     ) -> Array:
+        """Compute input embeddings with vision tokens merged in.
+
+        Creates input embeddings by combining text token embeddings with
+        vision embeddings at placeholder token positions.
+
+        Args:
+            input_ids (Array): Input token IDs of shape (batch, seq_len).
+            pixel_values (Array | None, optional): Image pixel values. Defaults to None.
+            pixel_values_videos (Array | None, optional): Video pixel values. Defaults to None.
+            image_grid_thw (Array | None, optional): Image grid dimensions. Defaults to None.
+            video_grid_thw (Array | None, optional): Video grid dimensions. Defaults to None.
+            image_embeds (Array | None, optional): Pre-computed image embeddings.
+                Defaults to None.
+            video_embeds (Array | None, optional): Pre-computed video embeddings.
+                Defaults to None.
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            Array: Combined embeddings of shape (batch, seq_len, hidden_size) with
+                vision embeddings inserted at placeholder token positions.
+
+        Raises:
+            ValueError: If input_ids is None.
+        """
         if input_ids is None:
             raise ValueError("`input_ids` must be provided when calling `compute_embedding`.")
 
@@ -1384,6 +1902,43 @@ class Qwen2VLModel(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         **kwargs,
     ):
+        """Forward pass through the Qwen2-VL base model.
+
+        Processes multimodal inputs by encoding vision features and fusing them
+        with text embeddings, then passing through the language model.
+
+        Args:
+            input_ids (Array | None, optional): Input token IDs of shape (batch, seq_len).
+                Defaults to None.
+            attention_mask (Array | None, optional): Attention mask. Defaults to None.
+            position_ids (Array | None, optional): 3D position IDs for M-RoPE.
+                Auto-computed if None. Defaults to None.
+            past_key_values (TransformerCache | RaggedPagesCache | HybridCache | None, optional):
+                Cached KV states. Defaults to None.
+            inputs_embeds (Array | None, optional): Pre-computed embeddings.
+                Defaults to None.
+            use_cache (bool | None, optional): Whether to return cache. Defaults to None.
+            output_attentions (bool | None, optional): Return attention weights.
+                Defaults to None.
+            output_hidden_states (bool | None, optional): Return hidden states.
+                Defaults to None.
+            return_dict (bool | None, optional): Return dict vs tuple. Defaults to None.
+            pixel_values (Array | None, optional): Image pixels. Defaults to None.
+            pixel_values_videos (Array | None, optional): Video pixels. Defaults to None.
+            image_grid_thw (Array | None, optional): Image grid dimensions. Defaults to None.
+            video_grid_thw (Array | None, optional): Video grid dimensions. Defaults to None.
+            rope_deltas (Array | None, optional): Position deltas. Defaults to None.
+            cache_position (Array | None, optional): Cache positions. Defaults to None.
+            mask_info (MaskInfo | None, optional): Mask information. Defaults to None.
+            mode (RUNTIME_MODE_TYPES | None, optional): Runtime mode. Defaults to None.
+            cache_metadata (TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None, optional):
+                Cache metadata. Defaults to None.
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            BaseModelOutput: Contains last_hidden_state, past_key_values,
+                hidden_states, and attentions.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1481,7 +2036,16 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         *,
         rngs: nn.Rngs,
     ):
-        """Initializes the Qwen2VLForConditionalGeneration model."""
+        """Initialize the Qwen2-VL model for conditional generation.
+
+        Args:
+            config (Qwen2VLConfig): Combined model configuration containing
+                vision_config and text_config.
+            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
+            precision (jax.lax.PrecisionLike, optional): Numerical precision. Defaults to None.
+            rngs (nn.Rngs): Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Qwen2VLModel,
@@ -1502,13 +2066,27 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
 
     @property
     def visual(self):
-        """Property to access the vision transformer for backward compatibility."""
+        """Access the vision transformer component.
+
+        Returns:
+            Qwen2VLVisionTransformer: The vision encoder component for backward compatibility.
+        """
         return self.base_model.visual
 
     def get_embedding(self):
+        """Get the token embedding layer.
+
+        Returns:
+            nn.Embed: The token embedding layer from the language model.
+        """
         return self.base_model.get_embedding()
 
     def set_embeddings(self, value):
+        """Set the token embedding layer.
+
+        Args:
+            value: New embedding layer to set.
+        """
         self.base_model.set_embeddings(value)
 
     def get_video_features(
@@ -1548,6 +2126,18 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         return self.base_model.get_image_features(pixel_values, image_grid_thw)
 
     def compute_embedding(self, input_ids, *args, **kwargs):
+        """Compute input embeddings with vision tokens merged in.
+
+        Delegates to the base model's compute_embedding method.
+
+        Args:
+            input_ids: Input token IDs.
+            *args: Additional positional arguments.
+            **kwargs: Additional keyword arguments including pixel_values.
+
+        Returns:
+            Array: Combined embeddings with vision tokens inserted.
+        """
         return self.base_model.compute_embedding(input_ids, *args, **kwargs)
 
     def __call__(
@@ -1692,6 +2282,31 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         rope_deltas=None,
         **kwargs,
     ):
+        """Prepare model inputs for autoregressive generation.
+
+        Sets up the cache, attention mask, position IDs, and other inputs
+        needed for efficient autoregressive generation.
+
+        Args:
+            input_ids: Input token IDs.
+            max_length (int): Maximum sequence length for generation.
+            pad_token_id (int): Padding token ID.
+            starts (int | None, optional): Prefill length. Defaults to None.
+            past_key_values: Cached KV states. Defaults to None.
+            attention_mask: Attention mask. Defaults to None.
+            mask_info: Mask information. Defaults to None.
+            inputs_embeds: Pre-computed embeddings. Defaults to None.
+            position_ids: Position IDs. Defaults to None.
+            pixel_values: Image pixel values. Defaults to None.
+            pixel_values_videos: Video pixel values. Defaults to None.
+            image_grid_thw: Image grid dimensions. Defaults to None.
+            video_grid_thw: Video grid dimensions. Defaults to None.
+            rope_deltas: Position deltas for M-RoPE. Defaults to None.
+            **kwargs: Additional arguments.
+
+        Returns:
+            dict: Model inputs dictionary for generation.
+        """
         batch_size, _seq_length = input_ids.shape
 
         if past_key_values is None:
@@ -1774,6 +2389,17 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         self,
         model_kwargs: dict[str, Array],
     ) -> tp.Mapping[str, dict[str, tp.Any]] | None:
+        """Create required properties from model kwargs for generation.
+
+        Extracts grid dimensions that need to be preserved across generation steps.
+
+        Args:
+            model_kwargs (dict[str, Array]): Model keyword arguments.
+
+        Returns:
+            tp.Mapping[str, dict[str, tp.Any]] | None: Dictionary of properties
+                to preserve, or None if no relevant properties found.
+        """
         basics = {}
         if "image_grid_thw" in model_kwargs.keys():
             basics.update({"image_grid_thw": {"value": jnp.array(model_kwargs["image_grid_thw"])}})
@@ -1782,6 +2408,18 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         return basics
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
+        """Update model inputs for the next generation step.
+
+        Updates cached KV states, position IDs, and removes vision inputs
+        that only need to be processed once.
+
+        Args:
+            model_outputs: Outputs from the previous generation step.
+            model_kwargs: Current model keyword arguments.
+
+        Returns:
+            dict: Updated model keyword arguments for the next step.
+        """
         model_kwargs["past_key_values"] = model_outputs.past_key_values
 
         if hasattr(model_outputs, "rope_deltas") and model_outputs.rope_deltas is not None:
@@ -1818,7 +2456,24 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         drop_ids: bool = True,
         **others,
     ):
-        """Prepare inputs with mRoPE position IDs computed from grid shapes."""
+        """Prepare inputs with M-RoPE position IDs computed from grid shapes.
+
+        Computes 3D position IDs for multi-dimensional RoPE based on the
+        provided image and video grid dimensions.
+
+        Args:
+            image_grid_thw (Array | None, optional): Image grid dimensions.
+                Defaults to None.
+            video_grid_thw (Array | None, optional): Video grid dimensions.
+                Defaults to None.
+            drop_ids (bool, optional): Whether to drop input_ids from result.
+                Defaults to True.
+            **others: Additional arguments to include in the result.
+
+        Returns:
+            dict: Prepared inputs including computed position_ids, rope_deltas,
+                and mask_info.
+        """
         attention_mask = others.get("attention_mask", None)
         mask_info = others.get("mask_info", None)
         mask_info = MaskInfo.dynamic_init(
@@ -1888,15 +2543,9 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         return others
 
     def get_static_arguments(self):
-        return ("image_grid_thw", "video_grid_thw")
+        """Get arguments that should be treated as static for JIT compilation.
 
-    def _create_required_props_from_kwargs(
-        self,
-        model_kwargs: dict[str, Array],
-    ) -> tp.Mapping[str, dict[str, tp.Any]] | None:
-        basics = {}
-        if "image_grid_thw" in model_kwargs.keys():
-            basics.update({"image_grid_thw": {"value": jnp.array(model_kwargs["image_grid_thw"])}})
-        if "video_grid_thw" in model_kwargs.keys():
-            basics.update({"video_grid_thw": {"value": jnp.array(model_kwargs["video_grid_thw"])}})
-        return basics
+        Returns:
+            tuple[str, ...]: Names of arguments that are static (grid dimensions).
+        """
+        return ("image_grid_thw", "video_grid_thw")
