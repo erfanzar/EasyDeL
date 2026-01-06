@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
       args:
         HARDWARE_TYPE: tpu
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.13}
     image: easydel:tpu
     container_name: easydel-tpu
     stdin_open: true

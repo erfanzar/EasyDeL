@@ -15,7 +15,7 @@
 # pyright:reportUnusedImport=none
 # pyright:reportImportCycles=none
 
-__version__ = "0.2.0.2"
+__version__ = "0.2.0.3"
 
 import os as _os
 import sys as _sys
