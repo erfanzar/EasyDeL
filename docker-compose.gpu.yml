@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
       args:
         HARDWARE_TYPE: gpu
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.13}
     image: easydel:gpu-cuda12.8
     container_name: easydel-gpu
     stdin_open: true

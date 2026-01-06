@@ -7,7 +7,7 @@ set -e
 HARDWARE_TYPE=${1:-cpu}
 TARGET=${2:-production}
 VERSION=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo "latest")}
-PYTHON_VERSION=${PYTHON_VERSION:-3.11}
+PYTHON_VERSION=${PYTHON_VERSION:-3.13}
 REGISTRY=${REGISTRY:-ghcr.io/erfanzar}
 IMAGE_NAME=${IMAGE_NAME:-easydel}
 
@@ -54,7 +54,7 @@ print_usage() {
     echo ""
     echo "Environment variables:"
     echo "  VERSION             Version tag (default: git describe or 'latest')"
-    echo "  PYTHON_VERSION      Python version (default: 3.11)"
+    echo "  PYTHON_VERSION      Python version (default: 3.13)"
     echo "  REGISTRY            Docker registry (default: ghcr.io/erfanzar)"
     echo "  IMAGE_NAME          Image name (default: easydel)"
 }

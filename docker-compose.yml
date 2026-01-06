@@ -5,7 +5,7 @@ x-common-variables: &common-variables
   PYTHONDONTWRITEBYTECODE: 1
 
 x-build-args: &build-args
-  PYTHON_VERSION: ${PYTHON_VERSION:-3.11}
+  PYTHON_VERSION: ${PYTHON_VERSION:-3.13}
   GIT_USER_EMAIL: ${GIT_USER_EMAIL}
   GIT_USER_NAME: ${GIT_USER_NAME}
 

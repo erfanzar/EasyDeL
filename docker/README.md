@@ -271,6 +271,6 @@ docker run -it --rm \
 
 - The GPU image requires CUDA 12.8 compatible hardware
 - TPU support requires Google Cloud credentials and TPU access
-- All images are based on Python 3.11
-- Dependencies are managed with `uv` package manager for fast installation
-- The `--no-strict` flag is used for dependency resolution to handle JAX/PyTorch compatibility
+- Images default to Python 3.13 (override with `PYTHON_VERSION`, e.g. `PYTHON_VERSION=3.12 ./docker/build.sh cpu`)
+- Ray is pinned to 2.53.0 (`ray[default,gcp]` installed in Docker images)
+- Dependencies are installed with `uv` (`JAX_PLATFORMS=cpu` is set during GPU/TPU builds to avoid backend detection at build time)

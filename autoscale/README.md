@@ -13,20 +13,28 @@ The autoscaling system automatically discovers available TPU resources across GC
 To launch a Ray cluster with TPUs in a specific zone:
 
 ```bash
-ray up autoscale/easydel-europe-west4-a.yaml --no-config-cache
+# Recommended: run the repo-pinned Ray to avoid local/cluster version mismatches.
+uv run --python 3.13 ray up autoscale/easydel-europe-west4-a.yaml --no-config-cache
+
+# Or, if you manage Ray globally on your machine:
+# ray up autoscale/easydel-europe-west4-a.yaml --no-config-cache
 ```
 
 To connect to the cluster:
 
 ```bash
-ray attach autoscale/easydel-europe-west4-a.yaml
+uv run --python 3.13 ray attach autoscale/easydel-europe-west4-a.yaml
 ```
 
 To shut down the cluster:
 
 ```bash
-ray down autoscale/easydel-europe-west4-a.yaml
+uv run --python 3.13 ray down autoscale/easydel-europe-west4-a.yaml
 ```
+
+Notes:
+- Ray >=2.53 supports `.rayignore` for controlling cluster uploads (this repo includes one).
+- If you run via `uv run` and want the pre-2.47 behavior where only the driver uses the uv environment, set `RAY_ENABLE_UV_RUN_RUNTIME_ENV=0`.
 
 ## TPU Generations and Configurations
 
@@ -52,7 +60,7 @@ ray down autoscale/easydel-europe-west4-a.yaml
 1. Forward the dashboard port when attaching to the cluster:
 
 ```bash
-ray attach autoscale/easydel-us-central1-a.yaml --port-forward 8265
+uv run --python 3.13 ray attach autoscale/easydel-us-central1-a.yaml --port-forward 8265
 ```
 
 1. Access the dashboard at `http://localhost:8265`
@@ -90,6 +98,7 @@ from eformer.executor.ray import TpuAcceleratorConfig, autoscale_execute_resumab
 BUCKET_PATH = "gs://your-bucket/easydel-checkpoints"
 
 execution_env = {
+    "working_dir": ".",
     "env_vars": {
         "EASYDEL_AUTO": "1",
         "HF_TOKEN": "YOUR_HF_TOKEN",
@@ -135,13 +144,13 @@ python autoscale/update-cluster.py \
 
 ```bash
 # Check cluster status
-ray status
+uv run --python 3.13 ray status
 
 # View cluster resources
-ray cluster-resources
+uv run --python 3.13 ray cluster-resources
 
 # Monitor running jobs
-ray job list
+uv run --python 3.13 ray job list
 ```
 
 ### Cost Optimization Tips
@@ -176,12 +185,16 @@ Key environment variables for EasyDeL/eFormer:
    - Verify firewall rules allow Ray ports (6379, 8265, 10001)
    - Check VPC network configuration
 
-3. **Out of Memory**
+3. **Ray Version / SSH Key Issues**
+   - Run `ray up/attach/down` via `uv run --python 3.13 ray ...` to keep local CLI and cluster Ray versions in sync
+   - If you set `auth.ssh_private_key`, note Ray 2.51+ changed the default GCP SSH key naming/path (private key no longer uses `.pem`)
+
+4. **Out of Memory**
    - Reduce batch size
    - Enable gradient checkpointing
    - Use model parallelism with EasyScaler
 
-4. **Preemption Handling**
+5. **Preemption Handling**
    - Use `autoscale_execute_resumable` decorator
    - Configure checkpoint saving frequency
    - Implement automatic restart logic
@@ -214,9 +227,9 @@ For fault tolerance and better availability:
 
 ```bash
 # Launch clusters in multiple regions
-ray up autoscale/easydel-us-central1-a.yaml --no-config-cache &
-ray up autoscale/easydel-europe-west4-a.yaml --no-config-cache &
-ray up autoscale/easydel-asia-northeast1-a.yaml --no-config-cache &
+uv run --python 3.13 ray up autoscale/easydel-us-central1-a.yaml --no-config-cache &
+uv run --python 3.13 ray up autoscale/easydel-europe-west4-a.yaml --no-config-cache &
+uv run --python 3.13 ray up autoscale/easydel-asia-northeast1-a.yaml --no-config-cache &
 ```
 
 ## Resources

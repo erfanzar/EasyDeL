@@ -50,6 +50,26 @@ eopod run pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releas
 
 EasyDeL supports distributed execution with Ray, particularly for multi-host and multi-slice TPU environments. For GPUs, manual configuration is required, but TPUs can leverage `eformer`, an EasyDeL utility for cluster management.
 
+### Ray Version Compatibility (2.42 → 2.53)
+
+EasyDeL pins Ray to a known-good version to avoid cluster/CLI mismatches:
+
+- Project dependency: `ray[default]==2.53.0` (see `pyproject.toml`).
+- Docker images also install `ray[default,gcp]==2.53.0` (see `Dockerfile`).
+
+If you use Ray autoscaler (`ray up/attach/down`), run the CLI with the same pinned version:
+
+```shell
+uv run --python 3.13 ray up autoscale/easydel-us-central1-a.yaml --no-config-cache
+uv run --python 3.13 ray attach autoscale/easydel-us-central1-a.yaml
+```
+
+Notes:
+
+- Ray 2.47+ enables `uv run` runtime environment support by default; set `RAY_ENABLE_UV_RUN_RUNTIME_ENV=0` to restore the older behavior.
+- Ray 2.53 adds `.rayignore` support for controlling cluster uploads (this repo includes `.rayignore`). For `runtime_env` uploads, prefer `runtime_env={"excludes":[...]}`
+  to avoid sending `.git/` and other large folders.
+
 ### Setting Up Ray with TPU Clusters
 
 For a 2x v4-64 TPU setup, run:
@@ -62,6 +82,14 @@ For a v4-256 TPU:
 
 ```shell
 eopod run "python -m eformer.executor.tpu_patch_ray --tpu-version v4 --tpu-slice 256 --num-slices 1 --internal-ips <comma-separated-TPU-IPs> --self-job"
+```
+
+### Automated TPU VM Setup (Optional)
+
+This repo also ships a helper script to install EasyDeL + Ray on TPU VMs and run `eopod auto-config-ray`:
+
+```shell
+./tpu_setup.sh
 ```
 
 ## Usage Example

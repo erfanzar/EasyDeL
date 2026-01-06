@@ -2,20 +2,22 @@
 
 # Bases
 ARG HARDWARE_TYPE=cpu
+ARG PYTHON_VERSION=3.13
 FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu22.04 AS gpu-base
 FROM ubuntu:22.04 AS tpu-base
-FROM python:3.13-slim AS cpu-base
+FROM python:${PYTHON_VERSION}-slim AS cpu-base
 FROM ghcr.io/astral-sh/uv:latest AS uv
 
 # Final image chosen by HARDWARE_TYPE
 FROM ${HARDWARE_TYPE}-base AS final
+ARG PYTHON_VERSION=3.13
 SHELL ["/bin/bash", "-lc"]
 
 ARG HARDWARE_TYPE=cpu
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
-# OS deps + Python 3.11 for Ubuntu-based images (GPU/TPU)
+# OS deps + Python for Ubuntu-based images (GPU/TPU)
 RUN set -eux; \
     if [[ "$HARDWARE_TYPE" != "cpu" ]]; then \
         apt-get update && \
@@ -25,9 +27,9 @@ RUN set -eux; \
         add-apt-repository -y ppa:deadsnakes/ppa && \
         apt-get update && \
         apt-get install -y --no-install-recommends \
-            python3.11 python3.11-venv python3.11-dev python3.11-distutils python3-pip && \
-        update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 && \
-        update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1; \
+            python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-dev && \
+        update-alternatives --install /usr/bin/python python /usr/bin/python${PYTHON_VERSION} 1 && \
+        update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1; \
     fi; \
     apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -64,16 +66,11 @@ RUN set -eux; \
     fi
 
 # Ray with GCP extras
-RUN uv pip install 'ray[default,gcp]==2.51.0'
+RUN uv pip install 'ray[default,gcp]==2.53.0'
 
-# TPU-only: patch Ray TPU runner and install gcloud
+# TPU-only: install gcloud
 RUN set -eux; \
     if [[ "$HARDWARE_TYPE" == "tpu" ]]; then \
-        git clone https://github.com/dlwh/ray.git /tmp/ray --branch tpu_docker_2.34 --depth 1; \
-        py_site=$(python -c 'import site; print(next(p for p in site.getsitepackages() if "site-packages" in p))'); \
-        cp /tmp/ray/python/ray/autoscaler/_private/gcp/tpu_command_runner.py \
-           "$py_site/ray/autoscaler/_private/gcp/tpu_command_runner.py"; \
-        rm -rf /tmp/ray; \
         curl -fsSL https://dl.google.com/dl/cloudsdk/release/google-cloud-sdk.tar.gz -o /tmp/google-cloud-sdk.tar.gz; \
         mkdir -p /usr/local/gcloud; \
         tar -C /usr/local/gcloud -xzf /tmp/google-cloud-sdk.tar.gz; \

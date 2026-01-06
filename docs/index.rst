@@ -97,6 +97,7 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
 
    getting_started
    install.md
+   ray_upgrade.md
    contributing
 
 .. toctree::

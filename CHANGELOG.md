@@ -57,6 +57,11 @@ All notable changes to this project will be documented in this file.
   - Fixed TPU setup script to use explicit Python path for UV installation
   - Improved base module `to_state` method with partition rules and sharding support
 
+- **Docker / Ray Tooling**: Updated defaults for modern runtimes
+  - Docker now defaults to Python 3.13 via `PYTHON_VERSION` build arg
+  - Ray pinned to 2.53.0 across project + container tooling
+  - Added `.rayignore` and expanded docs for Ray autoscaler/TPU workflows
+
 ### Removed
 
 - **Deprecated Components**: Cleaned up old inference implementations
