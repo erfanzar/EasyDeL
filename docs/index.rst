@@ -106,6 +106,7 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
 
    infra/index
    infra/overview.md
+   environment_variables.md
    infra/base_config.md
    infra/base_module.md
    infra/customization.md

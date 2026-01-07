@@ -1529,6 +1529,7 @@ For comprehensive documentation, tutorials, and API reference:
 - Installation Guide
 - Training Tutorials (SFT, DPO, GRPO, etc.)
 - eSurge Deployment Guide
+- Environment Flags: [`docs/environment_variables.md`](docs/environment_variables.md)
 - Model Architecture Details
 - API Reference
 - Advanced Topics (Sharding, MoE, Quantization)

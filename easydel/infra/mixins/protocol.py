@@ -81,7 +81,7 @@ from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import Mesh
-from jaxtyping import Array
+from jaxtyping import Array, Bool, Float, Int, Shaped
 
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.quantization import EasyDeLQuantizationConfig
@@ -89,19 +89,56 @@ from easydel.layers.quantization import EasyDeLQuantizationConfig
 from ..base_config import EasyDeLBaseConfig
 from ..loss_utils import LossConfig, LossMetrics
 from ..modeling_outputs import (
+    BaseModelOutput,
+    BaseModelOutputWithPastAndCrossAttentions,
+    BaseModelOutputWithPooling,
+    BaseModelOutputWithPoolingAndCrossAttentions,
     CausalLMOutput,
     CLIPOutput,
     CLIPTextModelOutput,
     ImageClassifierOutput,
+    ModelOutput,
     MoeCausalLMOutput,
     MoeModelOutput,
+    MultipleChoiceModelOutput,
+    QuestionAnsweringModelOutput,
+    Seq2SeqLMOutput,
+    Seq2SeqModelOutput,
     SequenceClassifierOutput,
+    TokenClassifierOutput,
+    VLMCausalLMOutput,
 )
 
 PartitionLike = tp.Optional[tp.Mapping[str, tp.Callable] | tp.Mapping[tuple, tp.Callable]]  # noqa
 _CP = type[EasyDeLBaseConfig]
 _T = tp.TypeVar("_T")
 Self = tp.TypeVar("Self")
+
+AnyArray = Shaped[Array, "..."]
+Tokens = Int[Array, "batch seq_len"]
+TokenEmbeds = Float[Array, "batch seq_len hidden_dim"]
+AttentionMask = Bool[Array, "batch ..."]
+PositionIds = Int[Array, "batch ..."]
+SegmentIds = Int[Array, "batch ..."]
+TokenTypeIds = Int[Array, "batch ..."]
+HeadMask = Bool[Array, "..."]
+EncoderHiddenStates = Float[Array, "batch ..."]
+EncoderAttentionMask = Bool[Array, "batch ..."]
+DecoderInputIds = Int[Array, "batch dec_seq_len"]
+DecoderAttentionMask = Bool[Array, "batch dec_seq_len"]
+DecoderPositionIds = Int[Array, "batch dec_seq_len"]
+PixelValues = Float[Array, "batch ..."]
+VideoPixelValues = Float[Array, "batch ..."]
+ImageSizes = Int[Array, "batch ..."]
+VisualPosMasks = Bool[Array, "batch ..."]
+DeepstackVisualEmbeds = list[Float[Array, "..."]]
+RopeDeltas = Int[Array, "..."]
+CachePosition = Int[Array, "..."]
+LogSnr = Float[Array, "..."]
+NoiseMask = Bool[Array, "..."]
+AudioFeatures = Float[Array, "batch n_mels frames"]
+Labels = AnyArray
+RecurrentState = list[Float[Array, "..."]]
 
 if tp.TYPE_CHECKING:
     from transformers import PreTrainedModel
@@ -112,6 +149,7 @@ if tp.TYPE_CHECKING:
         OperationsMetadata,
         RaggedPagesCache,
         RaggedPagesMetadata,
+        RecurrentCache,
         TransformerCache,
         TransformerMetadata,
     )
@@ -282,12 +320,159 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @tp.overload
     def __call__(
         self,
-        input_ids: Array | None = None,
-        inputs_embeds: Array | None = None,
-        attention_mask: Array | None = None,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: Array | None = None,
-        segment_ids: Array | None = None,
+        position_ids: PositionIds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> BaseModelOutput:
+        """Forward pass for decoder-only backbones without a task head.
+
+        Accepts token IDs or input embeddings, mask_info/attention_mask, and
+        optional KV cache arguments. Returns BaseModelOutput with last_hidden_state,
+        optional hidden_states/attentions, and updated cache state.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutput: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        encoder_hidden_states: EncoderHiddenStates | None = None,
+        encoder_attention_mask: EncoderAttentionMask | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> BaseModelOutput:
+        """Forward pass for decoder-only backbones with optional cross-attention.
+
+        Provide encoder_hidden_states/encoder_attention_mask to enable cross-attention
+        (e.g., GPT-2 conditional setups). Returns BaseModelOutput with cache updates.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            encoder_hidden_states: Encoder hidden states for cross-attention.
+            encoder_attention_mask: Encoder attention mask for cross-attention.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutput: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        extra_embedding: TokenEmbeds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> BaseModelOutput:
+        """Forward pass for models that accept extra embeddings.
+
+        `extra_embedding` is merged with token embeddings (model-specific) before
+        attention layers. Returns BaseModelOutput with hidden states/attentions
+        and updated cache.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            extra_embedding: Additional embedding injected into the model.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutput: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        log_snr: LogSnr | None = None,
+        noise_mask: NoiseMask | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> BaseModelOutput:
+        """Forward pass for diffusion language models.
+
+        `log_snr` and `noise_mask` condition the diffusion timestep/noise schedule.
+        Returns BaseModelOutput with hidden states and optional attentions.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            log_snr: Log signal-to-noise ratio for diffusion conditioning.
+            noise_mask: Mask for diffusion/noise conditioning.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutput: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
@@ -295,105 +480,111 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> CausalLMOutput:
-        """Forward pass for Causal Language Models (e.g., GPT, Llama).
+        """Causal LM forward pass with optional LM head.
+
+        Use apply_lm_head=False to return backbone states only. Returns CausalLMOutput
+        with logits, cache state, and optional hidden states/attentions.
 
         Args:
-            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
-            inputs_embeds (Array | None): Optional array of input embeddings. Use this if you've
-                pre-computed embeddings and want to bypass the embedding layer.
-            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
-            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
-                Preferred over attention_mask for document-level boundaries.
-            position_ids (Array | None): Optional array specifying token positions.
-            segment_ids (Array | None): Optional array indicating segment IDs.
-            mode (RUNTIME_MODE_TYPES | None): Runtime mode ("prefill", "decode", or None for auto).
-            past_key_values (Cache | None): Optional cache containing key and value tensors
-                from previous model passes. Useful for faster inference.
-            cache_metadata (Metadata | None): Optional metadata for cache operations.
-            apply_lm_head (bool): Whether to apply the language model head. Defaults to True.
-            output_attentions (bool | None): Optional flag to return attention weights.
-            output_hidden_states (bool | None): Optional flag to return hidden states.
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            apply_lm_head: Whether to apply the LM head and return logits.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
 
         Returns:
-            CausalLMOutput: Model output containing logits and optionally hidden states/attentions.
-        """
+            CausalLMOutput: Causal LM output with logits plus optional hidden_states/attentions and cache."""
 
     @tp.overload
     def __call__(
         self,
-        input_ids: Array | None = None,
-        inputs_embeds: Array | None = None,
-        attention_mask: Array | None = None,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: Array | None = None,
-        segment_ids: Array | None = None,
+        position_ids: PositionIds | None = None,
+        log_snr: LogSnr | None = None,
+        noise_mask: NoiseMask | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-    ) -> SequenceClassifierOutput:
-        """Forward pass for Sequence Classification Models (e.g., BERT for sentiment).
+    ) -> CausalLMOutput:
+        """Diffusion LM forward pass with optional LM head.
+
+        Uses log_snr/noise_mask for diffusion conditioning and returns CausalLMOutput
+        with logits plus optional hidden states/attentions.
 
         Args:
-            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
-            inputs_embeds (Array | None): Optional array of input embeddings.
-            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
-            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
-            position_ids (Array | None): Optional array specifying token positions.
-            segment_ids (Array | None): Optional array indicating segment IDs.
-            output_attentions (bool | None): Optional flag to return attention weights.
-            output_hidden_states (bool | None): Optional flag to return hidden states.
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            log_snr: Log signal-to-noise ratio for diffusion conditioning.
+            noise_mask: Mask for diffusion/noise conditioning.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            apply_lm_head: Whether to apply the LM head and return logits.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
 
         Returns:
-            SequenceClassifierOutput: Model output containing logits for classification.
-        """
+            CausalLMOutput: Causal LM output with logits plus optional hidden_states/attentions and cache."""
 
     @tp.overload
     def __call__(
         self,
-        input_ids: Array | None = None,
-        inputs_embeds: Array | None = None,
-        attention_mask: Array | None = None,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: Array | None = None,
-        segment_ids: Array | None = None,
+        position_ids: PositionIds | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
-        apply_lm_head: bool = True,
     ) -> MoeModelOutput:
-        """Forward pass for Mixture-of-Experts (MoE) Models.
+        """MoE backbone forward pass.
+
+        Set output_router_logits=True to return router/gating diagnostics.
+        Returns MoeModelOutput with hidden states, attentions, and cache updates.
 
         Args:
-            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
-            inputs_embeds (Array | None): Optional array of input embeddings.
-            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
-            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
-            position_ids (Array | None): Optional array specifying token positions.
-            segment_ids (Array | None): Optional array indicating segment IDs.
-            output_attentions (bool | None): Optional flag to return attention weights.
-            output_hidden_states (bool | None): Optional flag to return hidden states.
-            output_router_logits (bool | None): Optional flag to return router logits
-                that determine expert selection.
-            mode (RUNTIME_MODE_TYPES | None): Runtime mode ("prefill", "decode", or None).
-            past_key_values (Cache | None): Optional cache from previous model passes.
-            cache_metadata (Metadata | None): Optional metadata for cache operations.
-            apply_lm_head (bool): Whether to apply the language model head. Defaults to True.
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            output_router_logits: Whether to return router/gating logits.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
 
         Returns:
-            MoeModelOutput: Model output with logits, router logits, and optional states.
-        """
+            MoeModelOutput: MoE backbone output with optional router logits and cache."""
 
     @tp.overload
     def __call__(
         self,
-        input_ids: Array | None = None,
-        inputs_embeds: Array | None = None,
-        attention_mask: Array | None = None,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: Array | None = None,
-        segment_ids: Array | None = None,
+        position_ids: PositionIds | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
@@ -402,271 +593,2226 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
-        """Forward pass for Mixture-of-Experts (MoE) Causal Language Models.
+        """MoE causal LM forward pass.
+
+        Returns MoeCausalLMOutput with logits plus optional router logits, hidden
+        states, attentions, and cache updates.
 
         Args:
-            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
-            inputs_embeds (Array | None): Optional array of input embeddings.
-            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
-            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
-            position_ids (Array | None): Optional array specifying token positions.
-            segment_ids (Array | None): Optional array indicating segment IDs.
-            output_attentions (bool | None): Optional flag to return attention weights.
-            output_hidden_states (bool | None): Optional flag to return hidden states.
-            output_router_logits (bool | None): Optional flag to return router logits
-                that determine expert selection.
-            mode (RUNTIME_MODE_TYPES | None): Runtime mode ("prefill", "decode", or None).
-            past_key_values (Cache | None): Optional cache from previous model passes.
-            cache_metadata (Metadata | None): Optional metadata for cache operations.
-            apply_lm_head (bool): Whether to apply the language model head. Defaults to True.
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            output_router_logits: Whether to return router/gating logits.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            apply_lm_head: Whether to apply the LM head and return logits.
 
         Returns:
-            MoeCausalLMOutput: Model output with logits, router logits, and optional states.
-        """
+            MoeCausalLMOutput: Causal LM output with logits plus optional hidden_states/attentions and cache."""
 
     @tp.overload
     def __call__(
         self,
-        pixel_values: Array | None = None,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-    ) -> ImageClassifierOutput:
-        """Process image inputs through the CLIP vision encoder.
+    ) -> SequenceClassifierOutput:
+        """Sequence classification forward pass for decoder-style backbones.
+
+        Runs the backbone and task head, returning SequenceClassifierOutput with
+        logits plus optional hidden states/attentions.
 
         Args:
-            pixel_values: Optional array of shape (batch_size, num_channels, height, width)
-                containing the pixel values of the images to encode.
-            output_attentions: Optional bool indicating whether to return attention weights.
-            output_hidden_states: Optional bool indicating whether to return all hidden states.
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
 
         Returns:
-            ImageClassifierOutput containing the model outputs.
-        """
-        ...
+            SequenceClassifierOutput: Classification logits plus optional hidden_states/attentions."""
 
     @tp.overload
     def __call__(
         self,
-        input_ids: Array,
-        attention_mask: Array,
-        position_ids: Array,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        segment_ids: SegmentIds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> SequenceClassifierOutput:
+        """Sequence classification with optional LM head and segment IDs.
+
+        `segment_ids` is model-specific (often unused). apply_lm_head toggles the
+        classification head. Returns SequenceClassifierOutput with logits and states.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            segment_ids: Segment ids for packed/segmented inputs (model-specific).
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            apply_lm_head: Whether to apply the LM head and return logits.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            SequenceClassifierOutput: Classification logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> TokenClassifierOutput:
+        """Token-level classification forward pass.
+
+        Applies a per-token classifier and returns TokenClassifierOutput with logits
+        plus optional hidden states/attentions.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            TokenClassifierOutput: Per-token logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> QuestionAnsweringModelOutput:
+        """Extractive QA forward pass.
+
+        Applies a span head to produce start/end logits and returns
+        QuestionAnsweringModelOutput with optional hidden states/attentions.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            QuestionAnsweringModelOutput: Start/end span logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        attention_mask: AttentionMask | None = None,
+        token_type_ids: TokenTypeIds | None = None,
+        position_ids: PositionIds | None = None,
+        head_mask: HeadMask | None = None,
+        encoder_hidden_states: EncoderHiddenStates | None = None,
+        encoder_attention_mask: EncoderAttentionMask | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> BaseModelOutputWithPoolingAndCrossAttentions:
+        """Encoder-only forward pass with pooling and optional cross-attention.
+
+        Supports token_type_ids/head_mask and optional encoder_hidden_states for
+        cross-attention. Returns BaseModelOutputWithPoolingAndCrossAttentions.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            token_type_ids: Token type ids for segment embeddings (encoder-style models).
+            position_ids: Position indices for tokens.
+            head_mask: Head mask for attention heads.
+            encoder_hidden_states: Encoder hidden states for cross-attention.
+            encoder_attention_mask: Encoder attention mask for cross-attention.
+            past_key_values: KV cache for autoregressive decoding.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutputWithPoolingAndCrossAttentions: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        attention_mask: AttentionMask | None = None,
+        token_type_ids: TokenTypeIds | None = None,
+        position_ids: PositionIds | None = None,
+        head_mask: HeadMask | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> SequenceClassifierOutput:
+        """Encoder-only sequence classification.
+
+        Returns SequenceClassifierOutput with logits plus optional hidden states/attentions.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            token_type_ids: Token type ids for segment embeddings (encoder-style models).
+            position_ids: Position indices for tokens.
+            head_mask: Head mask for attention heads.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            SequenceClassifierOutput: Classification logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        attention_mask: AttentionMask | None = None,
+        token_type_ids: TokenTypeIds | None = None,
+        position_ids: PositionIds | None = None,
+        head_mask: HeadMask | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> TokenClassifierOutput:
+        """Encoder-only token classification.
+
+        Returns TokenClassifierOutput with per-token logits and optional states.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            token_type_ids: Token type ids for segment embeddings (encoder-style models).
+            position_ids: Position indices for tokens.
+            head_mask: Head mask for attention heads.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            TokenClassifierOutput: Per-token logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        attention_mask: AttentionMask | None = None,
+        token_type_ids: TokenTypeIds | None = None,
+        position_ids: PositionIds | None = None,
+        head_mask: HeadMask | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> QuestionAnsweringModelOutput:
+        """Encoder-only extractive QA.
+
+        Returns QuestionAnsweringModelOutput with span logits and optional states.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            token_type_ids: Token type ids for segment embeddings (encoder-style models).
+            position_ids: Position indices for tokens.
+            head_mask: Head mask for attention heads.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            QuestionAnsweringModelOutput: Start/end span logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        attention_mask: AttentionMask | None = None,
+        token_type_ids: TokenTypeIds | None = None,
+        position_ids: PositionIds | None = None,
+        head_mask: HeadMask | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> MultipleChoiceModelOutput:
+        """Multiple-choice classification over encoder outputs.
+
+        Inputs are shaped (batch, num_choices, seq_len) and flattened internally by
+        model implementations. Returns MultipleChoiceModelOutput with choice logits.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            token_type_ids: Token type ids for segment embeddings (encoder-style models).
+            position_ids: Position indices for tokens.
+            head_mask: Head mask for attention heads.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            MultipleChoiceModelOutput: Choice logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens,
+        mask_info: MaskInfo | None = None,
+        attention_mask: AttentionMask | None = None,
+        position_ids: PositionIds | None = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ) -> BaseModelOutputWithPooling:
+        """Text encoder forward pass for CLIP/SigLIP-style models.
+
+        Returns BaseModelOutputWithPooling with pooled text representation and
+        optional hidden states/attentions.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            mask_info: Optional MaskInfo for attention masking.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            position_ids: Position indices for tokens.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutputWithPooling: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens,
+        mask_info: MaskInfo | None = None,
+        attention_mask: AttentionMask | None = None,
+        position_ids: PositionIds | None = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ) -> CLIPTextModelOutput:
-        """Process text inputs through the CLIP text encoder.
+        """Text encoder forward pass with projection into multimodal space.
+
+        Returns CLIPTextModelOutput with projected text embeddings plus optional
+        hidden states/attentions.
 
         Args:
-            input_ids: Array of shape (batch_size, sequence_length) containing the input
-                token ids.
-            attention_mask: Array of shape (batch_size, sequence_length) containing the
-                attention mask for padding tokens.
-            position_ids: Array of shape (batch_size, sequence_length) containing position
-                indices for tokens.
-            output_attentions: Whether to return attention weights. Defaults to False.
-            output_hidden_states: Whether to return all hidden states. Defaults to False.
+            input_ids: Token ids for text inputs.
+            mask_info: Optional MaskInfo for attention masking.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            position_ids: Position indices for tokens.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
 
         Returns:
-            CLIPTextModelOutput containing the model outputs.
-        """
-        ...
+            CLIPTextModelOutput: Projected text embeddings plus optional hidden_states/attentions."""
 
     @tp.overload
     def __call__(
         self,
-        input_ids: Array | None = None,
-        pixel_values: Array | None = None,
-        attention_mask: Array | None = None,
-        mask_info: MaskInfo | None = None,
-        position_ids: Array | None = None,
-        output_attentions=None,
-        output_hidden_states=None,
-    ) -> CLIPOutput:
-        """Process both text and image inputs through the full CLIP model.
+        pixel_values: PixelValues | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        interpolate_pos_encoding: bool | None = None,
+    ) -> BaseModelOutputWithPooling:
+        """Vision encoder forward pass for CLIP/SigLIP/Vision Transformers.
 
-        This method handles the full CLIP model forward pass, encoding both text and image
-        inputs and computing their similarity.
+        Supports interpolate_pos_encoding for resized inputs. Returns
+        BaseModelOutputWithPooling with pooled image features and optional states.
 
         Args:
-            input_ids: Optional array of shape (batch_size, sequence_length) containing the
-                input token ids for text.
-            pixel_values: Optional array of shape (batch_size, num_channels, height, width)
-                containing the pixel values of the images.
-            attention_mask: Optional array of shape (batch_size, sequence_length) containing
-                the attention mask for text padding tokens.
-            position_ids: Optional array of shape (batch_size, sequence_length) containing
-                position indices for text tokens.
+            pixel_values: Image pixel values (preprocessed).
             output_attentions: Whether to return attention weights.
-            output_hidden_states: Whether to return all hidden states.
-
+            output_hidden_states: Whether to return hidden states from all layers.
+            interpolate_pos_encoding: Model-specific argument.
 
         Returns:
-            CLIPOutput containing the model outputs (including text embeddings,
-            image embeddings, and their similarity).
-        """
-        ...
+            BaseModelOutputWithPooling: Backbone output with last_hidden_state and optional hidden_states/attentions."""
 
     @tp.overload
-    def compute_loss(
+    def __call__(
         self,
-        input_ids: Array | None = None,
-        labels: Array | None = None,
-        inputs_embeds: Array | None = None,
-        attention_mask: Array | None = None,
+        pixel_values: PixelValues | None = None,
+        labels: Labels | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        interpolate_pos_encoding: bool | None = None,
+    ) -> ImageClassifierOutput:
+        """Image classification forward pass.
+
+        If labels are provided, models may compute loss. Returns ImageClassifierOutput
+        with logits plus optional hidden states/attentions.
+
+        Args:
+            pixel_values: Image pixel values (preprocessed).
+            labels: Target labels for loss computation.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            interpolate_pos_encoding: Model-specific argument.
+
+        Returns:
+            ImageClassifierOutput: Image logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        pixel_values: PixelValues | None = None,
+        attention_mask: AttentionMask | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: Array | None = None,
-        segment_ids: Array | None = None,
+        position_ids: PositionIds | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> CLIPOutput:
+        """Full CLIP dual-encoder forward pass.
+
+        Encodes text and images, projects them into a shared embedding space,
+        and returns similarity logits along with text/image embeddings.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            pixel_values: Image pixel values (preprocessed).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            CLIPOutput: Text/image embeddings and similarity logits."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        decoder_input_ids: DecoderInputIds | None = None,
+        decoder_attention_mask: DecoderAttentionMask | None = None,
+        pixel_values: PixelValues | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        loss_config: LossConfig | None = None,
-        loss_kwargs: dict | None = None,
-    ) -> tuple[CausalLMOutput, LossMetrics]:
-        """Computes the loss for Causal Language Models.
+        **kwargs,
+    ) -> Seq2SeqLMOutput:
+        """Conditional generation forward pass for encoder-decoder models.
+
+        Supports encoder text inputs, optional decoder_input_ids, and optional
+        pixel_values for multimodal variants. Returns Seq2SeqLMOutput with logits,
+        cache state, and encoder/decoder hidden states.
 
         Args:
-            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
-            labels (Array | None): Optional array of target token IDs for computing loss.
-            inputs_embeds (Array | None): Optional array of input embeddings.
-            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
-            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
-            position_ids (Array | None): Optional array specifying token positions.
-            segment_ids (Array | None): Optional array indicating segment IDs.
-            past_key_values (Cache | None): Optional cache from previous model passes.
-            cache_metadata (Metadata | None): Optional metadata for cache operations.
-            output_attentions (bool | None): Optional flag to return attention weights.
-            output_hidden_states (bool | None): Optional flag to return hidden states.
-            loss_config (LossConfig | None): Optional configuration for loss computation.
-            loss_kwargs (dict | None): Optional additional keyword arguments for loss computation.
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            decoder_input_ids: Decoder token ids.
+            decoder_attention_mask: Decoder attention mask.
+            pixel_values: Image pixel values (preprocessed).
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            apply_lm_head: Whether to apply the LM head and return logits.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            **kwargs: Additional keyword arguments forwarded to the model.
 
         Returns:
-            tuple[CausalLMOutput, LossMetrics]: Model output and loss metrics.
-        """
+            Seq2SeqLMOutput: Seq2Seq LM output with logits, cache, and encoder/decoder states."""
 
     @tp.overload
-    def compute_loss(
+    def __call__(
         self,
-        input_ids: Array | None = None,
-        labels: Array | None = None,
-        inputs_embeds: Array | None = None,
-        attention_mask: Array | None = None,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: Array | None = None,
-        segment_ids: Array | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-        loss_config: LossConfig | None = None,
-        loss_kwargs: dict | None = None,
-    ) -> tuple[SequenceClassifierOutput, LossMetrics]:
-        """Computes the loss for Sequence Classification Models.
-
-        Args:
-            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
-            labels (Array | None): Optional array of target classification labels.
-            inputs_embeds (Array | None): Optional array of input embeddings.
-            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
-            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
-            position_ids (Array | None): Optional array specifying token positions.
-            segment_ids (Array | None): Optional array indicating segment IDs.
-            output_attentions (bool | None): Optional flag to return attention weights.
-            output_hidden_states (bool | None): Optional flag to return hidden states.
-            loss_config (LossConfig | None): Optional configuration for loss computation.
-            loss_kwargs (dict | None): Optional additional keyword arguments for loss computation.
-
-        Returns:
-            tuple[SequenceClassifierOutput, LossMetrics]: Model output and loss metrics.
-        """
-
-    @tp.overload
-    def compute_loss(
-        self,
-        input_ids: Array | None = None,
-        labels: Array | None = None,
-        inputs_embeds: Array | None = None,
-        attention_mask: Array | None = None,
-        mask_info: MaskInfo | None = None,
-        position_ids: Array | None = None,
-        segment_ids: Array | None = None,
+        position_ids: PositionIds | None = None,
+        token_type_ids: TokenTypeIds | None = None,
+        pixel_values: PixelValues | None = None,
+        pixel_values_videos: VideoPixelValues | None = None,
+        image_grid_thw: tuple | None = None,
+        video_grid_thw: tuple | None = None,
+        image_grid_hws: tuple | None = None,
+        image_sizes: ImageSizes | None = None,
+        image_max_grid_size: tuple | None = None,
+        video_max_grid_size: tuple | None = None,
+        visual_pos_masks: VisualPosMasks | None = None,
+        deepstack_visual_embeds: DeepstackVisualEmbeds | None = None,
+        rope_deltas: RopeDeltas | None = None,
+        cache_position: CachePosition | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
-        loss_config: LossConfig | None = None,
-        loss_kwargs: dict | None = None,
-    ) -> tuple[MoeModelOutput, LossMetrics]:
-        """Computes the loss for Mixture-of-Experts (MoE) Models.
+        **kwargs,
+    ) -> VLMCausalLMOutput:
+        """Vision-language causal LM forward pass.
+
+        Combines text tokens with visual/video features (grid metadata, masks,
+        mRoPE deltas, cache_position, etc.) and returns VLMCausalLMOutput with
+        logits plus optional router diagnostics, hidden states, and attentions.
 
         Args:
-            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
-            labels (Array | None): Optional array of target token IDs for computing loss.
-            inputs_embeds (Array | None): Optional array of input embeddings.
-            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
-            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
-            position_ids (Array | None): Optional array specifying token positions.
-            segment_ids (Array | None): Optional array indicating segment IDs.
-            output_attentions (bool | None): Optional flag to return attention weights.
-            output_hidden_states (bool | None): Optional flag to return hidden states.
-            output_router_logits (bool | None): Optional flag to return router logits.
-            past_key_values (Cache | None): Optional cache from previous model passes.
-            cache_metadata (Metadata | None): Optional metadata for cache operations.
-            loss_config (LossConfig | None): Optional configuration for loss computation.
-            loss_kwargs (dict | None): Optional additional keyword arguments for loss.
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            token_type_ids: Token type ids for segment embeddings (encoder-style models).
+            pixel_values: Image pixel values (preprocessed).
+            pixel_values_videos: Video pixel values (preprocessed).
+            image_grid_thw: Image grid layout metadata (T, H, W).
+            video_grid_thw: Video grid layout metadata (T, H, W).
+            image_grid_hws: Image grid metadata (H, W) for some models.
+            image_sizes: Original image sizes for dynamic resizing/positioning.
+            image_max_grid_size: Max image grid size for visual encoders.
+            video_max_grid_size: Max video grid size for visual encoders.
+            visual_pos_masks: Visual position masks for multimodal alignment.
+            deepstack_visual_embeds: Precomputed DeepStack visual embeddings.
+            rope_deltas: RoPE delta offsets for multimodal positions.
+            cache_position: Cache position indices for streaming decoding.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            apply_lm_head: Whether to apply the LM head and return logits.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            output_router_logits: Whether to return router/gating logits.
+            **kwargs: Additional keyword arguments forwarded to the model.
 
         Returns:
-            tuple[MoeModelOutput, LossMetrics]: Model output and loss metrics.
-        """
+            VLMCausalLMOutput: Causal LM output with logits plus optional hidden_states/attentions and cache."""
 
     @tp.overload
-    def compute_loss(
+    def __call__(
         self,
-        input_ids: Array | None = None,
-        labels: Array | None = None,
-        inputs_embeds: Array | None = None,
-        attention_mask: Array | None = None,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
         mask_info: MaskInfo | None = None,
-        position_ids: Array | None = None,
-        segment_ids: Array | None = None,
+        position_ids: PositionIds | None = None,
+        token_type_ids: TokenTypeIds | None = None,
+        pixel_values: PixelValues | None = None,
+        pixel_values_videos: VideoPixelValues | None = None,
+        image_grid_thw: tuple | None = None,
+        video_grid_thw: tuple | None = None,
+        image_grid_hws: tuple | None = None,
+        image_sizes: ImageSizes | None = None,
+        image_max_grid_size: tuple | None = None,
+        video_max_grid_size: tuple | None = None,
+        visual_pos_masks: VisualPosMasks | None = None,
+        deepstack_visual_embeds: DeepstackVisualEmbeds | None = None,
+        rope_deltas: RopeDeltas | None = None,
+        cache_position: CachePosition | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
-        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
-        loss_config: LossConfig | None = None,
-        loss_kwargs: dict | None = None,
-    ) -> tuple[MoeCausalLMOutput, LossMetrics]:
-        """Computes the loss for Mixture-of-Experts (MoE) Causal Language Models.
+        **kwargs,
+    ) -> ModelOutput:
+        """Vision-language backbone forward pass without an LM head.
+
+        Accepts the same multimodal inputs as the LM variant but returns
+        backbone ModelOutput (hidden states, attentions, cache) without logits.
 
         Args:
-            input_ids (Array | None): Optional array of token IDs. Shape (batch_size, seq_length).
-            labels (Array | None): Optional array of target token IDs for computing loss.
-            inputs_embeds (Array | None): Optional array of input embeddings.
-            attention_mask (Array | None): Optional array indicating which tokens should be attended to.
-            mask_info (MaskInfo | None): Optional MaskInfo object for segment-aware masking.
-            position_ids (Array | None): Optional array specifying token positions.
-            segment_ids (Array | None): Optional array indicating segment IDs.
-            output_attentions (bool | None): Optional flag to return attention weights.
-            output_hidden_states (bool | None): Optional flag to return hidden states.
-            output_router_logits (bool | None): Optional flag to return router logits.
-            past_key_values (Cache | None): Optional cache from previous model passes.
-            cache_metadata (Metadata | None): Optional metadata for cache operations.
-            loss_config (LossConfig | None): Optional configuration for loss computation.
-            loss_kwargs (dict | None): Optional additional keyword arguments for loss.
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            token_type_ids: Token type ids for segment embeddings (encoder-style models).
+            pixel_values: Image pixel values (preprocessed).
+            pixel_values_videos: Video pixel values (preprocessed).
+            image_grid_thw: Image grid layout metadata (T, H, W).
+            video_grid_thw: Video grid layout metadata (T, H, W).
+            image_grid_hws: Image grid metadata (H, W) for some models.
+            image_sizes: Original image sizes for dynamic resizing/positioning.
+            image_max_grid_size: Max image grid size for visual encoders.
+            video_max_grid_size: Max video grid size for visual encoders.
+            visual_pos_masks: Visual position masks for multimodal alignment.
+            deepstack_visual_embeds: Precomputed DeepStack visual embeddings.
+            rope_deltas: RoPE delta offsets for multimodal positions.
+            cache_position: Cache position indices for streaming decoding.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            output_router_logits: Whether to return router/gating logits.
+            **kwargs: Additional keyword arguments forwarded to the model.
 
         Returns:
-            tuple[MoeCausalLMOutput, LossMetrics]: Model output and loss metrics.
+            ModelOutput: Backbone output with last_hidden_state, optional hidden_states/attentions, and multimodal metadata."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_features: AudioFeatures,
+        mask_info: MaskInfo | None = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ) -> BaseModelOutput:
+        """Audio encoder forward pass for log-Mel features.
+
+        Args:
+            input_features: Log-Mel spectrogram features (batch, n_mels, frames).
+            mask_info: Optional attention mask information for padding/timestamps.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return per-layer hidden states.
+
+        Returns:
+            BaseModelOutput with last_hidden_state and optional hidden_states/attentions.
         """
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        encoder_hidden_states: EncoderHiddenStates | None = None,
+        encoder_mask_info: MaskInfo | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ) -> BaseModelOutputWithPastAndCrossAttentions:
+        """Decoder forward pass with optional cross-attention.
+
+        Uses decoder token ids with optional encoder_hidden_states/encoder_mask_info
+        for cross-attention and returns BaseModelOutputWithPastAndCrossAttentions.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            encoder_hidden_states: Encoder hidden states for cross-attention.
+            encoder_mask_info: MaskInfo for encoder cross-attention.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutputWithPastAndCrossAttentions: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_features: AudioFeatures,
+        decoder_input_ids: DecoderInputIds,
+        decoder_mask_info: MaskInfo | None = None,
+        decoder_position_ids: DecoderPositionIds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ) -> Seq2SeqModelOutput:
+        """Encoder-decoder audio forward pass (Whisper base model).
+
+        Runs the audio encoder then the text decoder and returns Seq2SeqModelOutput
+        with decoder states plus optional encoder/decoder attentions.
+
+        Args:
+            input_features: Audio log-Mel features.
+            decoder_input_ids: Decoder token ids.
+            decoder_mask_info: MaskInfo for decoder self-attention.
+            decoder_position_ids: Decoder position indices.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            Seq2SeqModelOutput: Seq2Seq base output with decoder states and optional encoder states."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_features: AudioFeatures,
+        decoder_input_ids: DecoderInputIds,
+        decoder_mask_info: MaskInfo | None = None,
+        decoder_position_ids: DecoderPositionIds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> Seq2SeqLMOutput:
+        """Whisper conditional generation forward pass with LM head.
+
+        Returns Seq2SeqLMOutput with decoder logits, cache state, and optional
+        encoder/decoder hidden states and attentions.
+
+        Args:
+            input_features: Audio log-Mel features.
+            decoder_input_ids: Decoder token ids.
+            decoder_mask_info: MaskInfo for decoder self-attention.
+            decoder_position_ids: Decoder position indices.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            apply_lm_head: Whether to apply the LM head and return logits.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            Seq2SeqLMOutput: Seq2Seq LM output with logits, cache, and encoder/decoder states."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_features: AudioFeatures,
+        encoder_outputs: BaseModelOutput | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> SequenceClassifierOutput:
+        """Audio classification forward pass over encoder outputs.
+
+        Args:
+            input_features: Log-Mel spectrogram features (batch, n_mels, frames).
+            encoder_outputs: Optional precomputed encoder outputs to reuse. If provided,
+                it should include last_hidden_state and (when needed) hidden_states.
+            output_attentions: Whether to return encoder attention weights.
+            output_hidden_states: Whether to return per-layer hidden states.
+
+        Returns:
+            SequenceClassifierOutput with logits (batch, num_labels) and optional
+            hidden_states/attentions from the encoder.
+        """
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        cache: RecurrentCache | None = None,
+        position_ids: PositionIds | None = None,
+        attention_mask: AttentionMask | None = None,
+        output_hidden_states: bool | None = None,
+        **kwargs,
+    ) -> ModelOutput:
+        """SSM/recurrent backbone forward pass (Mamba-style).
+
+        Uses `cache` for recurrent state and returns ModelOutput with
+        last_hidden_state, optional hidden_states, and updated cache.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            cache: Recurrent cache state (SSM/Mamba).
+            position_ids: Position indices for tokens.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            output_hidden_states: Whether to return hidden states from all layers.
+            **kwargs: Additional keyword arguments forwarded to the model.
+
+        Returns:
+            ModelOutput: last_hidden_state plus optional hidden_states and updated cache."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        cache: RecurrentCache | None = None,
+        position_ids: PositionIds | None = None,
+        attention_mask: AttentionMask | None = None,
+        apply_lm_head: bool = True,
+        output_hidden_states: bool | None = None,
+        **kwargs,
+    ) -> ModelOutput:
+        """SSM/recurrent causal LM forward pass (Mamba-style).
+
+        Applies the LM head when apply_lm_head=True and returns ModelOutput
+        containing logits plus optional states and cache.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            cache: Recurrent cache state (SSM/Mamba).
+            position_ids: Position indices for tokens.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            apply_lm_head: Whether to apply the LM head and return logits.
+            output_hidden_states: Whether to return hidden states from all layers.
+            **kwargs: Additional keyword arguments forwarded to the model.
+
+        Returns:
+            ModelOutput: logits plus optional hidden_states and updated cache."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        cache_params: RecurrentCache | None = None,
+        output_hidden_states: bool | None = None,
+        cache_position: CachePosition | None = None,
+        attention_mask: AttentionMask | None = None,
+        **kwargs,
+    ) -> ModelOutput:
+        """Mamba2/Falcon-Mamba backbone forward pass.
+
+        Uses cache_params and cache_position for streaming/incremental updates and
+        returns ModelOutput with last_hidden_state plus updated cache_params.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            cache_params: Recurrent cache parameters (Mamba2/Falcon-Mamba).
+            output_hidden_states: Whether to return hidden states from all layers.
+            cache_position: Cache position indices for streaming decoding.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            **kwargs: Additional keyword arguments forwarded to the model.
+
+        Returns:
+            ModelOutput: last_hidden_state plus optional hidden_states and updated cache_params."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        cache_params: RecurrentCache | None = None,
+        output_hidden_states: bool | None = None,
+        cache_position: CachePosition | None = None,
+        attention_mask: AttentionMask | None = None,
+        apply_lm_head: bool = True,
+        **kwargs,
+    ) -> ModelOutput:
+        """Mamba2/Falcon-Mamba causal LM forward pass.
+
+        Applies the LM head when apply_lm_head=True and returns ModelOutput with
+        logits plus optional hidden states and cache_params.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            cache_params: Recurrent cache parameters (Mamba2/Falcon-Mamba).
+            output_hidden_states: Whether to return hidden states from all layers.
+            cache_position: Cache position indices for streaming decoding.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            apply_lm_head: Whether to apply the LM head and return logits.
+            **kwargs: Additional keyword arguments forwarded to the model.
+
+        Returns:
+            ModelOutput: logits plus optional hidden_states and updated cache_params."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        attention_mask: AttentionMask | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        state: RecurrentState | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> ModelOutput:
+        """RWKV backbone forward pass with recurrent state.
+
+        Uses `state` for recurrence and returns ModelOutput with last_hidden_state,
+        optional hidden_states/attentions, and updated state when caching is enabled.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            state: Recurrent state for RWKV.
+            use_cache: Whether to use/return recurrent state.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            ModelOutput: last_hidden_state plus optional hidden_states and updated state when use_cache=True."""
+
+    @tp.overload
+    def __call__(
+        self,
+        input_ids: Tokens | None = None,
+        attention_mask: AttentionMask | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        state: RecurrentState | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+    ) -> ModelOutput:
+        """RWKV causal LM forward pass.
+
+        Returns ModelOutput with logits and recurrent state; output_router_logits is
+        accepted for API consistency but unused by RWKV.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            state: Recurrent state for RWKV.
+            use_cache: Whether to use/return recurrent state.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            output_router_logits: Whether to return router/gating logits.
+
+        Returns:
+            ModelOutput: logits plus optional hidden_states and updated state when use_cache=True."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> BaseModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutput: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        encoder_hidden_states: EncoderHiddenStates | None = None,
+        encoder_attention_mask: EncoderAttentionMask | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> BaseModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            encoder_hidden_states: Encoder hidden states for cross-attention.
+            encoder_attention_mask: Encoder attention mask for cross-attention.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutput: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        extra_embedding: TokenEmbeds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> BaseModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            extra_embedding: Additional embedding injected into the model.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutput: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        log_snr: LogSnr | None = None,
+        noise_mask: NoiseMask | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> BaseModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            log_snr: Log signal-to-noise ratio for diffusion conditioning.
+            noise_mask: Mask for diffusion/noise conditioning.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutput: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> CausalLMOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            apply_lm_head: Whether to apply the LM head and return logits.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            CausalLMOutput: Causal LM output with logits plus optional hidden_states/attentions and cache."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        log_snr: LogSnr | None = None,
+        noise_mask: NoiseMask | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> CausalLMOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            log_snr: Log signal-to-noise ratio for diffusion conditioning.
+            noise_mask: Mask for diffusion/noise conditioning.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            apply_lm_head: Whether to apply the LM head and return logits.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            CausalLMOutput: Causal LM output with logits plus optional hidden_states/attentions and cache."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+    ) -> MoeModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            output_router_logits: Whether to return router/gating logits.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+
+        Returns:
+            MoeModelOutput: MoE backbone output with optional router logits and cache."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+    ) -> MoeCausalLMOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            output_router_logits: Whether to return router/gating logits.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            apply_lm_head: Whether to apply the LM head and return logits.
+
+        Returns:
+            MoeCausalLMOutput: Causal LM output with logits plus optional hidden_states/attentions and cache."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> SequenceClassifierOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            SequenceClassifierOutput: Classification logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        segment_ids: SegmentIds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> SequenceClassifierOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            segment_ids: Segment ids for packed/segmented inputs (model-specific).
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            apply_lm_head: Whether to apply the LM head and return logits.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            SequenceClassifierOutput: Classification logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> TokenClassifierOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            TokenClassifierOutput: Per-token logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> QuestionAnsweringModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            QuestionAnsweringModelOutput: Start/end span logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        attention_mask: AttentionMask | None = None,
+        token_type_ids: TokenTypeIds | None = None,
+        position_ids: PositionIds | None = None,
+        head_mask: HeadMask | None = None,
+        encoder_hidden_states: EncoderHiddenStates | None = None,
+        encoder_attention_mask: EncoderAttentionMask | None = None,
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> BaseModelOutputWithPoolingAndCrossAttentions:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            token_type_ids: Token type ids for segment embeddings (encoder-style models).
+            position_ids: Position indices for tokens.
+            head_mask: Head mask for attention heads.
+            encoder_hidden_states: Encoder hidden states for cross-attention.
+            encoder_attention_mask: Encoder attention mask for cross-attention.
+            past_key_values: KV cache for autoregressive decoding.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutputWithPoolingAndCrossAttentions: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        attention_mask: AttentionMask | None = None,
+        token_type_ids: TokenTypeIds | None = None,
+        position_ids: PositionIds | None = None,
+        head_mask: HeadMask | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> SequenceClassifierOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            token_type_ids: Token type ids for segment embeddings (encoder-style models).
+            position_ids: Position indices for tokens.
+            head_mask: Head mask for attention heads.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            SequenceClassifierOutput: Classification logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        attention_mask: AttentionMask | None = None,
+        token_type_ids: TokenTypeIds | None = None,
+        position_ids: PositionIds | None = None,
+        head_mask: HeadMask | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> TokenClassifierOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            token_type_ids: Token type ids for segment embeddings (encoder-style models).
+            position_ids: Position indices for tokens.
+            head_mask: Head mask for attention heads.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            TokenClassifierOutput: Per-token logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        attention_mask: AttentionMask | None = None,
+        token_type_ids: TokenTypeIds | None = None,
+        position_ids: PositionIds | None = None,
+        head_mask: HeadMask | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> QuestionAnsweringModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            token_type_ids: Token type ids for segment embeddings (encoder-style models).
+            position_ids: Position indices for tokens.
+            head_mask: Head mask for attention heads.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            QuestionAnsweringModelOutput: Start/end span logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        attention_mask: AttentionMask | None = None,
+        token_type_ids: TokenTypeIds | None = None,
+        position_ids: PositionIds | None = None,
+        head_mask: HeadMask | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> MultipleChoiceModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            token_type_ids: Token type ids for segment embeddings (encoder-style models).
+            position_ids: Position indices for tokens.
+            head_mask: Head mask for attention heads.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            MultipleChoiceModelOutput: Choice logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens,
+        mask_info: MaskInfo | None = None,
+        attention_mask: AttentionMask | None = None,
+        position_ids: PositionIds | None = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ) -> BaseModelOutputWithPooling:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            mask_info: Optional MaskInfo for attention masking.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            position_ids: Position indices for tokens.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutputWithPooling: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens,
+        mask_info: MaskInfo | None = None,
+        attention_mask: AttentionMask | None = None,
+        position_ids: PositionIds | None = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ) -> CLIPTextModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            mask_info: Optional MaskInfo for attention masking.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            position_ids: Position indices for tokens.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            CLIPTextModelOutput: Projected text embeddings plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        pixel_values: PixelValues | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        interpolate_pos_encoding: bool | None = None,
+    ) -> BaseModelOutputWithPooling:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            pixel_values: Image pixel values (preprocessed).
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            interpolate_pos_encoding: Model-specific argument.
+
+        Returns:
+            BaseModelOutputWithPooling: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        pixel_values: PixelValues | None = None,
+        labels: Labels | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        interpolate_pos_encoding: bool | None = None,
+    ) -> ImageClassifierOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            pixel_values: Image pixel values (preprocessed).
+            labels: Target labels for loss computation.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            interpolate_pos_encoding: Model-specific argument.
+
+        Returns:
+            ImageClassifierOutput: Image logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        pixel_values: PixelValues | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> CLIPOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            pixel_values: Image pixel values (preprocessed).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            CLIPOutput: Text/image embeddings and similarity logits."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        decoder_input_ids: DecoderInputIds | None = None,
+        decoder_attention_mask: DecoderAttentionMask | None = None,
+        pixel_values: PixelValues | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        **kwargs,
+    ) -> Seq2SeqLMOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            decoder_input_ids: Decoder token ids.
+            decoder_attention_mask: Decoder attention mask.
+            pixel_values: Image pixel values (preprocessed).
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            apply_lm_head: Whether to apply the LM head and return logits.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            **kwargs: Additional keyword arguments forwarded to the model.
+
+        Returns:
+            Seq2SeqLMOutput: Seq2Seq LM output with logits, cache, and encoder/decoder states."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        token_type_ids: TokenTypeIds | None = None,
+        pixel_values: PixelValues | None = None,
+        pixel_values_videos: VideoPixelValues | None = None,
+        image_grid_thw: tuple | None = None,
+        video_grid_thw: tuple | None = None,
+        image_grid_hws: tuple | None = None,
+        image_sizes: ImageSizes | None = None,
+        image_max_grid_size: tuple | None = None,
+        video_max_grid_size: tuple | None = None,
+        visual_pos_masks: VisualPosMasks | None = None,
+        deepstack_visual_embeds: DeepstackVisualEmbeds | None = None,
+        rope_deltas: RopeDeltas | None = None,
+        cache_position: CachePosition | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+        **kwargs,
+    ) -> VLMCausalLMOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            token_type_ids: Token type ids for segment embeddings (encoder-style models).
+            pixel_values: Image pixel values (preprocessed).
+            pixel_values_videos: Video pixel values (preprocessed).
+            image_grid_thw: Image grid layout metadata (T, H, W).
+            video_grid_thw: Video grid layout metadata (T, H, W).
+            image_grid_hws: Image grid metadata (H, W) for some models.
+            image_sizes: Original image sizes for dynamic resizing/positioning.
+            image_max_grid_size: Max image grid size for visual encoders.
+            video_max_grid_size: Max video grid size for visual encoders.
+            visual_pos_masks: Visual position masks for multimodal alignment.
+            deepstack_visual_embeds: Precomputed DeepStack visual embeddings.
+            rope_deltas: RoPE delta offsets for multimodal positions.
+            cache_position: Cache position indices for streaming decoding.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            apply_lm_head: Whether to apply the LM head and return logits.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            output_router_logits: Whether to return router/gating logits.
+            **kwargs: Additional keyword arguments forwarded to the model.
+
+        Returns:
+            VLMCausalLMOutput: Causal LM output with logits plus optional hidden_states/attentions and cache."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        attention_mask: AttentionMask | None = None,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        token_type_ids: TokenTypeIds | None = None,
+        pixel_values: PixelValues | None = None,
+        pixel_values_videos: VideoPixelValues | None = None,
+        image_grid_thw: tuple | None = None,
+        video_grid_thw: tuple | None = None,
+        image_grid_hws: tuple | None = None,
+        image_sizes: ImageSizes | None = None,
+        image_max_grid_size: tuple | None = None,
+        video_max_grid_size: tuple | None = None,
+        visual_pos_masks: VisualPosMasks | None = None,
+        deepstack_visual_embeds: DeepstackVisualEmbeds | None = None,
+        rope_deltas: RopeDeltas | None = None,
+        cache_position: CachePosition | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+        **kwargs,
+    ) -> ModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            token_type_ids: Token type ids for segment embeddings (encoder-style models).
+            pixel_values: Image pixel values (preprocessed).
+            pixel_values_videos: Video pixel values (preprocessed).
+            image_grid_thw: Image grid layout metadata (T, H, W).
+            video_grid_thw: Video grid layout metadata (T, H, W).
+            image_grid_hws: Image grid metadata (H, W) for some models.
+            image_sizes: Original image sizes for dynamic resizing/positioning.
+            image_max_grid_size: Max image grid size for visual encoders.
+            video_max_grid_size: Max video grid size for visual encoders.
+            visual_pos_masks: Visual position masks for multimodal alignment.
+            deepstack_visual_embeds: Precomputed DeepStack visual embeddings.
+            rope_deltas: RoPE delta offsets for multimodal positions.
+            cache_position: Cache position indices for streaming decoding.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            output_router_logits: Whether to return router/gating logits.
+            **kwargs: Additional keyword arguments forwarded to the model.
+
+        Returns:
+            ModelOutput: Backbone output with last_hidden_state, optional hidden_states/attentions, and multimodal metadata."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_features: AudioFeatures,
+        mask_info: MaskInfo | None = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ) -> BaseModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_features: Audio log-Mel features.
+            mask_info: Optional MaskInfo for attention masking.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutput: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens,
+        mask_info: MaskInfo | None = None,
+        position_ids: PositionIds | None = None,
+        encoder_hidden_states: EncoderHiddenStates | None = None,
+        encoder_mask_info: MaskInfo | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ) -> BaseModelOutputWithPastAndCrossAttentions:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            mask_info: Optional MaskInfo for attention masking.
+            position_ids: Position indices for tokens.
+            encoder_hidden_states: Encoder hidden states for cross-attention.
+            encoder_mask_info: MaskInfo for encoder cross-attention.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            BaseModelOutputWithPastAndCrossAttentions: Backbone output with last_hidden_state and optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_features: AudioFeatures,
+        decoder_input_ids: DecoderInputIds,
+        decoder_mask_info: MaskInfo | None = None,
+        decoder_position_ids: DecoderPositionIds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ) -> Seq2SeqModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_features: Audio log-Mel features.
+            decoder_input_ids: Decoder token ids.
+            decoder_mask_info: MaskInfo for decoder self-attention.
+            decoder_position_ids: Decoder position indices.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            Seq2SeqModelOutput: Seq2Seq base output with decoder states and optional encoder states."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_features: AudioFeatures,
+        decoder_input_ids: DecoderInputIds,
+        decoder_mask_info: MaskInfo | None = None,
+        decoder_position_ids: DecoderPositionIds | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
+        past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
+        cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
+        apply_lm_head: bool = True,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> Seq2SeqLMOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_features: Audio log-Mel features.
+            decoder_input_ids: Decoder token ids.
+            decoder_mask_info: MaskInfo for decoder self-attention.
+            decoder_position_ids: Decoder position indices.
+            mode: Runtime mode (prefill/decode/auto).
+            past_key_values: KV cache for autoregressive decoding.
+            cache_metadata: Metadata for cache operations/paged attention.
+            apply_lm_head: Whether to apply the LM head and return logits.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            Seq2SeqLMOutput: Seq2Seq LM output with logits, cache, and encoder/decoder states."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_features: AudioFeatures,
+        encoder_outputs: BaseModelOutput | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> SequenceClassifierOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_features: Audio log-Mel features.
+            encoder_outputs: Precomputed encoder outputs to reuse.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            SequenceClassifierOutput: Classification logits plus optional hidden_states/attentions."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        cache: RecurrentCache | None = None,
+        position_ids: PositionIds | None = None,
+        attention_mask: AttentionMask | None = None,
+        output_hidden_states: bool | None = None,
+        **kwargs,
+    ) -> ModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            cache: Recurrent cache state (SSM/Mamba).
+            position_ids: Position indices for tokens.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            output_hidden_states: Whether to return hidden states from all layers.
+            **kwargs: Additional keyword arguments forwarded to the model.
+
+        Returns:
+            ModelOutput: last_hidden_state plus optional hidden_states and updated cache."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        cache: RecurrentCache | None = None,
+        position_ids: PositionIds | None = None,
+        attention_mask: AttentionMask | None = None,
+        apply_lm_head: bool = True,
+        output_hidden_states: bool | None = None,
+        **kwargs,
+    ) -> ModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            cache: Recurrent cache state (SSM/Mamba).
+            position_ids: Position indices for tokens.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            apply_lm_head: Whether to apply the LM head and return logits.
+            output_hidden_states: Whether to return hidden states from all layers.
+            **kwargs: Additional keyword arguments forwarded to the model.
+
+        Returns:
+            ModelOutput: logits plus optional hidden_states and updated cache."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        cache_params: RecurrentCache | None = None,
+        output_hidden_states: bool | None = None,
+        cache_position: CachePosition | None = None,
+        attention_mask: AttentionMask | None = None,
+        **kwargs,
+    ) -> ModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            cache_params: Recurrent cache parameters (Mamba2/Falcon-Mamba).
+            output_hidden_states: Whether to return hidden states from all layers.
+            cache_position: Cache position indices for streaming decoding.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            **kwargs: Additional keyword arguments forwarded to the model.
+
+        Returns:
+            ModelOutput: last_hidden_state plus optional hidden_states and updated cache_params."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        cache_params: RecurrentCache | None = None,
+        output_hidden_states: bool | None = None,
+        cache_position: CachePosition | None = None,
+        attention_mask: AttentionMask | None = None,
+        apply_lm_head: bool = True,
+        **kwargs,
+    ) -> ModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            cache_params: Recurrent cache parameters (Mamba2/Falcon-Mamba).
+            output_hidden_states: Whether to return hidden states from all layers.
+            cache_position: Cache position indices for streaming decoding.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            apply_lm_head: Whether to apply the LM head and return logits.
+            **kwargs: Additional keyword arguments forwarded to the model.
+
+        Returns:
+            ModelOutput: logits plus optional hidden_states and updated cache_params."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        attention_mask: AttentionMask | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        state: RecurrentState | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+    ) -> ModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            state: Recurrent state for RWKV.
+            use_cache: Whether to use/return recurrent state.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+
+        Returns:
+            ModelOutput: last_hidden_state plus optional hidden_states and updated state when use_cache=True."""
+
+    @tp.overload
+    def mesh_call(
+        self,
+        input_ids: Tokens | None = None,
+        attention_mask: AttentionMask | None = None,
+        inputs_embeds: TokenEmbeds | None = None,
+        state: RecurrentState | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
+    ) -> ModelOutput:
+        """Run the forward pass inside `self.mesh` (auto/normal mesh).
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses the
+        same arguments and return type as the matching `__call__` overload. It does
+        not switch to `explicit_mesh` or `manual_mesh`; enter those meshes explicitly
+        if needed.
+
+        Args:
+            input_ids: Token ids for text inputs.
+            attention_mask: Attention mask (True/1 for tokens to attend).
+            inputs_embeds: Precomputed token embeddings (use instead of input_ids).
+            state: Recurrent state for RWKV.
+            use_cache: Whether to use/return recurrent state.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return hidden states from all layers.
+            output_router_logits: Whether to return router/gating logits.
+
+        Returns:
+            ModelOutput: logits plus optional hidden_states and updated state when use_cache=True."""
 
     @tp.overload
     def compute_loss(
         self,
         *,
-        labels: Array | None = None,
+        labels: Labels | None = None,
         loss_config: LossConfig | None = None,
         loss_kwargs: dict | None = None,
         **batch,
     ) -> tuple[tp.Any, LossMetrics]:
-        """basic `compute_loss` call"""
+        """Compute loss for a forward pass.
+
+        Runs `self(**batch)` and applies the configured loss function. For causal
+        LM losses, labels can be inferred from input_ids when omitted. loss_kwargs
+        are forwarded to the loss function.
+
+        Args:
+            labels: Target labels (optional for causal LM).
+            loss_config: Optional loss configuration override.
+            loss_kwargs: Extra kwargs forwarded to the loss function.
+            **batch: Forward-pass inputs (input_ids, attention_mask, etc.).
+
+        Returns:
+            Tuple of (model_output, loss_metrics). model_output includes `loss`
+            populated from the computed metrics.
+        """
 
     @property
     @abstractmethod
@@ -998,9 +3144,9 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @abstractmethod
     def generate(
         self,
-        input_ids: Array,
+        input_ids: Tokens,
         generation_config: tp.Any | None = None,
-        prng_key: Array | None = None,
+        prng_key: AnyArray | None = None,
         trace: bool = True,
         logits_processor: tp.Any | None = None,
         **kwargs,
@@ -1076,13 +3222,13 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @abstractmethod
     def prepare_inputs_for_generation(
         self,
-        input_ids: Array,
+        input_ids: Tokens,
         max_length: int,
         pad_token_id: int,
         starts: int | None = None,
         shardings: int | None = None,
-        attention_mask: Array | None = None,
-        token_type_ids: Array | None = None,
+        attention_mask: AttentionMask | None = None,
+        token_type_ids: TokenTypeIds | None = None,
         mask_info: tp.Any | None = None,
     ) -> dict[str, tp.Any]:
         """Sets up the initial inputs required for starting autoregressive generation.

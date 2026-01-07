@@ -62,6 +62,7 @@ from eformer.paths import ePath, ePathLike
 from eformer.pytree import auto_pytree
 from huggingface_hub.file_download import REGEX_COMMIT_HASH
 from jax import numpy as jnp
+from jax.sharding import AxisType
 from jax.sharding import NamedSharding as Ns
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array
@@ -429,6 +430,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     _show_private_attrs: bool = False
     _hidden_mesh: common_types.Mesh | None = None
+    _hidden_explicit_mesh: common_types.Mesh | None = None
+    _hidden_manual_mesh: common_types.Mesh | None = None
 
     def __init__(
         self,
@@ -566,6 +569,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
         should_sort_granules_by_key: bool = True,
         allow_split_physical_axes: bool = True,
         backend: str | None = None,
+        eformer_craft_mesh: bool | None = None,
+        axis_types: tp.Sequence[AxisType | str]
+        | AxisType
+        | str
+        | None
+        | tp.Literal["auto", "explicit", "manual"] = None,
     ):
         """Creates a JAX device mesh for distributed model execution.
 
@@ -594,6 +603,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 when mapping to logical mesh axes. Default: True.
             backend: Backend platform to create mesh for ('gpu', 'tpu', etc.).
                 If None or empty string, uses default backend.
+            eformer_craft_mesh: If True, use eformer's mesh creation path
+                (mesh_utils-based, supports multi-slice/multi-process). If False, use
+                JAX's `make_mesh` path when possible. Default: reads
+                `EFORMER_CREATE_MESH` (True).
+            axis_types: Optional axis type(s) for mesh axes. Accepts `AxisType` values
+                or "auto", "explicit", "manual" strings. A single value applies to all
+                axes; a sequence must match `sharding_axis_names`. Default: "auto".
 
         Returns:
             A JAX Mesh object configured for distributed execution with the specified
@@ -611,7 +627,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         if backend == "":
             backend = None
-
+        if axis_types is None:
+            axis_types = "auto"
+        if eformer_craft_mesh is None:
+            eformer_craft_mesh = check_bool_flag("EFORMER_CREATE_MESH", default=True)
         mesh = create_mesh(
             axis_dims=sharding_axis_dims,
             axis_names=sharding_axis_names,
@@ -619,9 +638,54 @@ class EasyDeLBaseConfig(PretrainedConfig):
             should_sort_granules_by_key=should_sort_granules_by_key,
             allow_split_physical_axes=allow_split_physical_axes,
             backend=backend,
-            use_jax=not check_bool_flag("ED_CREATE_MESH", default=False),
+            use_jax=not eformer_craft_mesh,
+            axis_types=axis_types,
         )
         return mesh
+
+    def _build_mesh(
+        self,
+        axis_types: tp.Sequence[AxisType | str]
+        | AxisType
+        | str
+        | None
+        | tp.Literal["auto", "explicit", "manual"] = None,
+    ) -> common_types.Mesh:
+        """Create a JAX mesh using the config sharding settings."""
+        sharding_axis_dims = (
+            [v for k, v in self.sharding_axis_dims.items()]
+            if isinstance(self.sharding_axis_dims, dict)
+            else self.sharding_axis_dims
+        )
+        sharding_axis_names = (
+            [v for k, v in self.sharding_axis_names.items()]
+            if isinstance(self.sharding_axis_names, dict)
+            else self.sharding_axis_names
+        )
+        sharding_dcn_axis_dims = (
+            [v for k, v in self.sharding_dcn_axis_dims.items()]
+            if isinstance(self.sharding_dcn_axis_dims, dict)
+            else self.sharding_dcn_axis_dims
+        )
+        return self.create_mesh(
+            sharding_axis_dims=tuple(sharding_axis_dims) if sharding_axis_dims is not None else sharding_axis_dims,
+            sharding_axis_names=tuple(sharding_axis_names) if sharding_axis_names is not None else sharding_axis_names,
+            sharding_dcn_axis_dims=tuple(sharding_dcn_axis_dims)
+            if sharding_dcn_axis_dims is not None
+            else sharding_dcn_axis_dims,
+            should_sort_granules_by_key=(
+                (self.should_sort_granules_by_key if self.should_sort_granules_by_key is not None else True)
+                if hasattr(self, "should_sort_granules_by_key")
+                else True
+            ),
+            allow_split_physical_axes=(
+                (self.allow_split_physical_axes if self.allow_split_physical_axes is not None else True)
+                if hasattr(self, "allow_split_physical_axes")
+                else True
+            ),
+            backend=((self.backend if self.backend is not None else "") if hasattr(self, "backend") else ""),
+            axis_types=axis_types,
+        )
 
     @property
     def mesh(self):
@@ -656,41 +720,37 @@ class EasyDeLBaseConfig(PretrainedConfig):
         if self._hidden_mesh is not None:
             return self._hidden_mesh
 
-        sharding_axis_dims = (
-            [v for k, v in self.sharding_axis_dims.items()]
-            if isinstance(self.sharding_axis_dims, dict)
-            else self.sharding_axis_dims
-        )
-        sharding_axis_names = (
-            [v for k, v in self.sharding_axis_names.items()]
-            if isinstance(self.sharding_axis_names, dict)
-            else self.sharding_axis_names
-        )
-        sharding_dcn_axis_dims = (
-            [v for k, v in self.sharding_dcn_axis_dims.items()]
-            if isinstance(self.sharding_dcn_axis_dims, dict)
-            else self.sharding_dcn_axis_dims
-        )
-        mesh = self.create_mesh(
-            sharding_axis_dims=tuple(sharding_axis_dims) if sharding_axis_dims is not None else sharding_axis_dims,
-            sharding_axis_names=tuple(sharding_axis_names) if sharding_axis_names is not None else sharding_axis_names,
-            sharding_dcn_axis_dims=tuple(sharding_dcn_axis_dims)
-            if sharding_dcn_axis_dims is not None
-            else sharding_dcn_axis_dims,
-            should_sort_granules_by_key=(
-                (self.should_sort_granules_by_key if self.should_sort_granules_by_key is not None else True)
-                if hasattr(self, "should_sort_granules_by_key")
-                else True
-            ),
-            allow_split_physical_axes=(
-                (self.allow_split_physical_axes if self.allow_split_physical_axes is not None else True)
-                if hasattr(self, "allow_split_physical_axes")
-                else True
-            ),
-            backend=((self.backend if self.backend is not None else "") if hasattr(self, "backend") else ""),
-        )
+        mesh = self._build_mesh()
         self.set_model_mesh(mesh)
         return self._hidden_mesh
+
+    @property
+    def explicit_mesh(self):
+        """Gets or creates the JAX device mesh with explicit axis types.
+
+        This property mirrors `mesh`, but requests AxisType.Explicit for all axes.
+        The mesh can be overridden with `set_explicit_mesh()`.
+        """
+        if self._hidden_explicit_mesh is not None:
+            return self._hidden_explicit_mesh
+
+        mesh = self._build_mesh(axis_types="explicit")
+        self.set_explicit_mesh(mesh)
+        return self._hidden_explicit_mesh
+
+    @property
+    def manual_mesh(self):
+        """Gets or creates the JAX device mesh with manual axis types.
+
+        This property mirrors `mesh`, but requests AxisType.Manual for all axes.
+        The mesh can be overridden with `set_manual_mesh()`.
+        """
+        if self._hidden_manual_mesh is not None:
+            return self._hidden_manual_mesh
+
+        mesh = self._build_mesh(axis_types="manual")
+        self.set_manual_mesh(mesh)
+        return self._hidden_manual_mesh
 
     @property
     def expert_mesh(self) -> jax.sharding.Mesh:
@@ -788,6 +848,60 @@ class EasyDeLBaseConfig(PretrainedConfig):
             except Exception:
                 try:
                     sub_cfg._hidden_mesh = mesh
+                except Exception:
+                    pass
+
+    def set_explicit_mesh(self, mesh: common_types.Mesh):
+        """Sets a custom explicit-axis mesh for the model.
+
+        Args:
+            mesh: JAX device mesh to use for this model.
+        """
+        self._hidden_explicit_mesh = mesh
+
+        sub_configs = getattr(self, "sub_configs", None)
+        if not isinstance(sub_configs, dict):
+            return
+
+        for attr_name in sub_configs.keys():
+            sub_cfg = getattr(self, attr_name, None)
+            if sub_cfg is None:
+                continue
+            try:
+                if hasattr(sub_cfg, "set_explicit_mesh"):
+                    sub_cfg.set_explicit_mesh(mesh)
+                else:
+                    sub_cfg._hidden_explicit_mesh = mesh
+            except Exception:
+                try:
+                    sub_cfg._hidden_explicit_mesh = mesh
+                except Exception:
+                    pass
+
+    def set_manual_mesh(self, mesh: common_types.Mesh):
+        """Sets a custom manual-axis mesh for the model.
+
+        Args:
+            mesh: JAX device mesh to use for this model.
+        """
+        self._hidden_manual_mesh = mesh
+
+        sub_configs = getattr(self, "sub_configs", None)
+        if not isinstance(sub_configs, dict):
+            return
+
+        for attr_name in sub_configs.keys():
+            sub_cfg = getattr(self, attr_name, None)
+            if sub_cfg is None:
+                continue
+            try:
+                if hasattr(sub_cfg, "set_manual_mesh"):
+                    sub_cfg.set_manual_mesh(mesh)
+                else:
+                    sub_cfg._hidden_manual_mesh = mesh
+            except Exception:
+                try:
+                    sub_cfg._hidden_manual_mesh = mesh
                 except Exception:
                     pass
 
@@ -1278,9 +1392,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """Serialize config to a dictionary while temporarily hiding forbidden types.
 
         Notes:
-            EasyDeL caches the active JAX mesh on the config (``_hidden_mesh``) for runtime use.
-            That object contains non-picklable JAX devices, so we must exclude it from any deep
-            copies performed during serialization.
+            EasyDeL caches the active JAX meshes on the config (``_hidden_mesh``,
+            ``_hidden_explicit_mesh``, ``_hidden_manual_mesh``) for runtime use.
+            Those objects contain non-picklable JAX devices, so we must exclude them
+            from any deep copies performed during serialization.
         """
         sd = self.__dict__
         forbidden_types = {"_ScalarMeta"}
@@ -1288,7 +1403,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         for key in list(sd.keys()):
             value = sd.get(key)
-            if key == "_hidden_mesh" or value.__class__.__name__ in forbidden_types:
+            if key in {"_hidden_mesh", "_hidden_explicit_mesh", "_hidden_manual_mesh"} or value.__class__.__name__ in (
+                forbidden_types
+            ):
                 extracted_values[key] = sd.pop(key)
 
         try:
@@ -1313,13 +1430,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 sd[key] = value
 
     def __deepcopy__(self, memo):
-        """Deep copy the config while keeping the cached runtime mesh by reference."""
+        """Deep copy the config while keeping the cached runtime meshes by reference."""
         cls = self.__class__
         result = cls.__new__(cls)
         memo[id(self)] = result
 
         for key, value in self.__dict__.items():
-            if key == "_hidden_mesh":
+            if key in {"_hidden_mesh", "_hidden_explicit_mesh", "_hidden_manual_mesh"}:
                 setattr(result, key, value)
             else:
                 setattr(result, key, copy.deepcopy(value, memo))
