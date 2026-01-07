@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "easydel"
-version = "0.2.0.3"
+version = "0.2.0.4"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
 readme = "README.md"
@@ -32,7 +32,7 @@ dependencies = [
 	"jax>=0.8.2",
 	"jaxlib>=0.8.2",
 	"ray[default]==2.53.0",
-	"eformer==0.0.85",
+	"eformer==0.0.90",
 	"ejkernel==0.0.50",
 	"einops~=0.8.0",
 	"transformers~=4.57.3",

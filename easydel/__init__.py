@@ -15,7 +15,7 @@
 # pyright:reportUnusedImport=none
 # pyright:reportImportCycles=none
 
-__version__ = "0.2.0.3"
+__version__ = "0.2.0.4"
 
 import os as _os
 import sys as _sys
@@ -57,15 +57,18 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _getlogger("absl").setLevel(30)
 
     _os.environ["NUMEXPR_NUM_THREADS"] = "8"
-    _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
     _os.environ["KMP_AFFINITY"] = "noverbose"
     _os.environ["GRPC_VERBOSITY"] = "3"
     _os.environ["GLOG_minloglevel"] = "3"
 
     _os.environ["CACHE_TRITON_KERNELS"] = "1"
-    _os.environ["TPU_MIN_LOG_LEVEL"] = "2"
-    _os.environ["TPU_STDERR_LOG_LEVEL"] = "2"
+    _os.environ["TPU_MIN_LOG_LEVEL"] = "3"
+    _os.environ["TPU_STDERR_LOG_LEVEL"] = "3"
+
+    _os.environ["TPU_LOG_DIR"] = "disabled"
+    _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
     _os.environ["JAX_ENABLE_PGLE"] = "true"
 
     _os.environ["JAX_PGLE_PROFILING_RUNS"] = "3"
@@ -1023,7 +1026,7 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_eformer_versions = ["0.0.85"]
+    _targeted_eformer_versions = ["0.0.90"]
     _targeted_ejkernel_versions = ["0.0.50"]
 
     from eformer import __version__ as _eform_version
