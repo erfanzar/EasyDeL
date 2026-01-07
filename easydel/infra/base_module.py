@@ -333,6 +333,37 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         return self.config.mesh
 
     @property
+    def explicit_mesh(self: Self) -> jax.sharding.Mesh:
+        """
+        Retrieves the explicit-axis JAX device mesh from the module's configuration.
+
+        Returns:
+            jax.sharding.Mesh: The device mesh defined in `self.config.explicit_mesh`.
+        """
+        return self.config.explicit_mesh
+
+    @property
+    def manual_mesh(self: Self) -> jax.sharding.Mesh:
+        """
+        Retrieves the manual-axis JAX device mesh from the module's configuration.
+
+        Returns:
+            jax.sharding.Mesh: The device mesh defined in `self.config.manual_mesh`.
+        """
+        return self.config.manual_mesh
+
+    def mesh_call(self: Self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+        """
+        Calls the module under the configured JAX mesh.
+
+        This is equivalent to `with self.mesh: self(*args, **kwargs)` and uses
+        the same arguments/return types as `__call__`. It does not use
+        `explicit_mesh` or `manual_mesh`; enter those contexts explicitly when needed.
+        """
+        with self.mesh:
+            return self(*args, **kwargs)
+
+    @property
     def model_task(self: Self) -> str | None:
         """
         Returns the specific task associated with this model instance (e.g., 'causal-language-model').
