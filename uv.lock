@@ -615,7 +615,7 @@ wheels = [
 
 [[package]]
 name = "easydel"
-version = "0.2.0.3"
+version = "0.2.0.4"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -678,7 +678,7 @@ tpu = [
 requires-dist = [
     { name = "cryptography", specifier = ">=45.0.6" },
     { name = "datasets", specifier = ">=3.6.0" },
-    { name = "eformer", specifier = "==0.0.85" },
+    { name = "eformer", specifier = "==0.0.90" },
     { name = "einops", specifier = "~=0.8.0" },
     { name = "ejkernel", specifier = "==0.0.50" },
     { name = "ejkernel", extras = ["gpu", "triton"], marker = "extra == 'gpu'", specifier = "==0.0.50" },
@@ -722,7 +722,7 @@ provides-extras = ["torch", "gpu", "tpu", "tensorflow", "lm-eval", "profile"]
 
 [[package]]
 name = "eformer"
-version = "0.0.85"
+version = "0.0.90"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "braceexpand" },
@@ -744,9 +744,9 @@ dependencies = [
     { name = "tensorstore" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d5/ee/7a0acbe85853185c9946da51e0aeccd7e963f4f1911b2046ccb8337431d7/eformer-0.0.85.tar.gz", hash = "sha256:651de5bb7611d1a22d5a55f4e17c4085ff52bb1b775cc7829786ef572ba1efdd", size = 215730, upload-time = "2025-11-26T17:47:22.198Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/64/02/d01c4240103207fb1efafffc2b7a6265085930a8d2595d0a1906e3f0728c/eformer-0.0.90.tar.gz", hash = "sha256:e2083478fbd7e3d7ac72696a0ae57ab3abe3707fd87414cb74fd1671ff55ad91", size = 271449, upload-time = "2026-01-07T12:26:37.408Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ae/df/8c842c02c1cc007a1fdacb8eba95a525dc3a35558cb2791b5ad20a17aab2/eformer-0.0.85-py3-none-any.whl", hash = "sha256:aacf06aa24f4169dc3001cd8840393b5c4d44da27c56d5d5b983945cccc2a1f0", size = 270762, upload-time = "2025-11-26T17:47:21.223Z" },
+    { url = "https://files.pythonhosted.org/packages/a2/4c/3c0290824f01a11e52ef82de62f45f07ac8b26206ceccb74c2afefc08273/eformer-0.0.90-py3-none-any.whl", hash = "sha256:3b57717a9ebc763844fd09927c00997926fbea84dba07c3a74f499e46b140cd0", size = 332869, upload-time = "2026-01-07T12:26:38.449Z" },
 ]
 
 [[package]]
