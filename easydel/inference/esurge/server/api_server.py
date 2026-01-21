@@ -1627,9 +1627,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                 tool_parser = self.get_tool_parser_for_model(request.model)
                 previous_text = ""
                 previous_token_ids: list[int] = []
-                queue = self._start_stream_task(
-                    lambda: esurge.stream(content, sampling_params, request_id=request_id)
-                )
+                queue = self._start_stream_task(lambda: esurge.stream(content, sampling_params, request_id=request_id))
                 total_generated = 0
                 generation_time = 0.0
                 tokens_per_second = 0.0
@@ -1911,9 +1909,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             async with self._acquire_generation_slot():
                 prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
                 previous_text = ""
-                queue = self._start_stream_task(
-                    lambda: esurge.stream(prompt, sampling_params, request_id=request_id)
-                )
+                queue = self._start_stream_task(lambda: esurge.stream(prompt, sampling_params, request_id=request_id))
                 total_generated = 0
                 generation_time = 0.0
                 tokens_per_second = 0.0

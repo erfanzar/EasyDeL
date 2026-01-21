@@ -58,8 +58,8 @@ from enum import Enum
 from functools import lru_cache, partial
 
 import jax
-import jax.numpy as jnp
 import jax.extend
+import jax.numpy as jnp
 import jax.tree_util
 import numpy as np
 from eformer.escale import with_sharding_constraint
