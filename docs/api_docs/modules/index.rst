@@ -26,6 +26,7 @@ easydel.modules package
    glm4/index
    glm46v/index
    glm4_moe/index
+   glm4_moe_lite/index
    glm4v/index
    glm4v_moe/index
    gpt2/index

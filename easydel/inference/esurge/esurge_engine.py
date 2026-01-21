@@ -496,7 +496,9 @@ class eSurge:
                 attn_value = (
                     requested_attn.value
                     if isinstance(requested_attn, AttentionMechanisms)
-                    else str(requested_attn) if requested_attn is not None else None
+                    else str(requested_attn)
+                    if requested_attn is not None
+                    else None
                 )
                 if backend == "gpu" and attn_value in (
                     AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2.value,
