@@ -10,6 +10,7 @@ easydel.layers.caching package
    ragged_page/index
    recurrent/index
    transformer/index
+   unified_attention/index
    _abstracts
    _metadatabuilder
    _specs

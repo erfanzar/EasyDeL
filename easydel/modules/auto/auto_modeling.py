@@ -29,7 +29,7 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
 from easydel.infra.factory import TaskType, registry
 from easydel.infra.mixins.bridge import TENSORSTORE_INDEX_NAME
-from easydel.layers.quantization import EasyDeLQuantizationConfig
+from easydel.layers.components import QuantizationConfig
 
 SAFETENSOR_INDEX_NAME = "tensorstore_index.json"
 MODEL_INDEX_NAME = "model_structure.json"
@@ -97,8 +97,9 @@ class BaseAutoEasyModel:
         config_kwargs: EasyDeLBaseConfigDict | None = None,
         auto_shard_model: bool = True,
         partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
-        quantize_tensors: bool = True,
+        quantization_config: QuantizationConfig | None = None,
+        quantize_tensors: bool = False,
+        quantize_modules: bool = False,
         verbose: bool = True,
         from_torch: bool | None = None,
         **kwargs,
@@ -123,6 +124,7 @@ class BaseAutoEasyModel:
             partition_rules: Custom partition rules for parameter sharding.
             quantization_config: Quantization configuration. Pass None to disable.
             quantize_tensors: Whether to quantize tensors during loading.
+            quantize_modules: Whether to quantize model linear or modules.
             from_torch: Whether to load the model from transformers-pytorch.
             **kwargs: Additional keyword arguments.
 
@@ -159,6 +161,7 @@ class BaseAutoEasyModel:
                 partition_rules=partition_rules,
                 quantization_config=quantization_config,
                 quantize_tensors=quantize_tensors,
+                quantize_modules=quantize_modules,
                 verbose=verbose,
                 **kwargs,
             )
@@ -182,6 +185,7 @@ class BaseAutoEasyModel:
                 partition_rules=partition_rules,
                 quantization_config=quantization_config,
                 quantize_tensors=quantize_tensors,
+                quantize_modules=quantize_modules,
                 verbose=verbose,
                 **kwargs,
             )
@@ -204,8 +208,9 @@ class BaseAutoEasyModel:
         config_kwargs: EasyDeLBaseConfigDict | None = None,
         auto_shard_model: bool = True,
         partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
-        quantize_tensors: bool = True,
+        quantization_config: QuantizationConfig | None = None,
+        quantize_tensors: bool = False,
+        quantize_modules: bool = False,
         verbose: bool = True,
         **kwargs,
     ):
@@ -236,7 +241,8 @@ class BaseAutoEasyModel:
             partition_rules (tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]], optional): Custom partition rules.
                 Defaults to None.
             quantization_config: Quantization configuration. Pass None to disable.
-            quantize_tensors (bool): Whether to quantize tensors. Defaults to True.
+            quantize_tensors (bool): Whether to quantize tensors. Defaults to False.
+            quantize_modules (bool): Whether to quantize model linears or modules. Defaults to False.
             verbose (bool): Enable verbose logging. Defaults to True.
             **kwargs: Additional keyword arguments passed to the underlying `EasyDeLBaseModule.from_pretrained`.
 
@@ -265,6 +271,7 @@ class BaseAutoEasyModel:
             partition_rules=partition_rules,
             quantization_config=quantization_config,
             quantize_tensors=quantize_tensors,
+            quantize_modules=quantize_modules,
             verbose=verbose,
             **kwargs,
         )
@@ -287,8 +294,9 @@ class BaseAutoEasyModel:
         config_kwargs: EasyDeLBaseConfigDict | None = None,
         auto_shard_model: bool = True,
         partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
-        quantize_tensors: bool = True,
+        quantization_config: QuantizationConfig | None = None,
+        quantize_tensors: bool = False,
+        quantize_modules: bool = False,
         verbose: bool = True,
         **kwargs,
     ):
@@ -319,7 +327,8 @@ class BaseAutoEasyModel:
             partition_rules (tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]], optional): Custom partition rules.
                 Defaults to None.
             quantization_config: Quantization configuration. Pass None to disable.
-            quantize_tensors (bool): Whether to quantize tensors. Defaults to True.
+            quantize_tensors (bool): Whether to quantize tensors. Defaults to False.
+            quantize_modules (bool): Whether to quantize model linears or modules. Defaults to False.
             verbose (bool): Enable verbose logging. Defaults to True.
             **kwargs: Additional keyword arguments passed to the underlying `EasyDeLBaseModule._from_torch_pretrained`.
 
@@ -348,6 +357,7 @@ class BaseAutoEasyModel:
             partition_rules=partition_rules,
             quantization_config=quantization_config,
             quantize_tensors=quantize_tensors,
+            quantize_modules=quantize_modules,
             verbose=verbose,
             **kwargs,
         )
@@ -498,7 +508,7 @@ class BaseAutoEasyState:
         config_kwargs: EasyDeLBaseConfigDict | None = None,
         auto_shard_model: bool = True,
         partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
+        quantization_config: QuantizationConfig | None = None,
         from_torch: bool | None = None,
         **kwargs,
     ) -> EasyDeLState:

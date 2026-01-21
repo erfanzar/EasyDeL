@@ -59,7 +59,7 @@ from jaxtyping import Array, Bool, Float, Int
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, BaseRunTimeMetadata
 
 if tp.TYPE_CHECKING:
-    from easydel.layers.quantization.quantizers import EasyQuantizer
+    from easydel.layers.components.quants._quants import EasyQuantizer
 else:
     EasyQuantizer = object
 

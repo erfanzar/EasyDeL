@@ -51,15 +51,17 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.moe import (
+from easydel.layers.components import (
     BaseMoeModule,
+    ColumnParallelLinear,
     ColumnParallelMoELinear,
+    Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    RowParallelLinear,
     RowParallelMoELinear,
 )
-from easydel.layers.norms import RMSNorm as Llama4TextRMSNorm
+from easydel.layers.components import RMSNorm as Llama4TextRMSNorm
 from easydel.utils.compiling_utils import ejit
 
 from .llama4_configuration import Llama4Config, Llama4TextConfig, Llama4VisionConfig
@@ -811,13 +813,7 @@ class Llama4TextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=self.config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
             dtype=dtype,

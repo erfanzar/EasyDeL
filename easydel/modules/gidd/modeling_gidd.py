@@ -53,7 +53,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
 
 from .gidd_configuration import GiddConfig
 
@@ -665,13 +665,7 @@ class GiddModel(EasyDeLBaseModule):
         # Calculate residual scale factor
         self.resid_scale = config.resid_scale / config.num_hidden_layers
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
             dtype=dtype,
@@ -865,7 +859,7 @@ class GiddModel(EasyDeLBaseModule):
         """Returns the embedding layer of the module.
 
         Returns:
-            nn.Embed: The token embedding layer.
+            Embed: The token embedding layer.
         """
         return self.embed_tokens
 
@@ -1052,6 +1046,6 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         """Returns the embedding layer of the module.
 
         Returns:
-            nn.Embed: The token embedding layer from the base model.
+            Embed: The token embedding layer from the base model.
         """
         return self.model.embed_tokens

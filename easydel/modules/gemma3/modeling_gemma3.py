@@ -50,8 +50,8 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import float8s
+from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.components.norms._norms import lowfloats
 from easydel.modules.auto.auto_modeling import AutoEasyDeLVisionModel
 
 from .gemma3_configuration import Gemma3Config, Gemma3TextConfig
@@ -186,7 +186,7 @@ class Gemma3RMSNorm(nn.Module):
         variance = self._norm(hidden_states.astype(jnp.float32)).astype(self.param_dtype)
         out = (1 + self.kernel.value.astype(self.param_dtype)) * variance
 
-        if out.dtype in float8s:
+        if out.dtype in lowfloats:
             out = out.astype(jnp.bfloat16)
         return out
 
@@ -598,13 +598,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
         )
         self.hidden_size = self.config.hidden_size
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=self.config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             self.config.vocab_size,
             self.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -633,7 +627,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
             ModuleCaches: Cached RoPE frequencies with local base frequency.
         """
         from easydel.infra.utils import ModuleCaches
-        from easydel.layers.rotary_embedding import get_frequencies
+        from easydel.layers.components import get_frequencies
 
         frequencies = get_frequencies(
             head_size=self.config.head_dim,

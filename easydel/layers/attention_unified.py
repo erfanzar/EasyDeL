@@ -52,8 +52,8 @@ from .caching import (
     TransformerMetadata,
     UnifiedAttentionCacheView,
 )
-from .linear import ColumnParallelLinear, RowParallelLinear
-from .norms import RMSNorm
+from .components import ColumnParallelLinear, RowParallelLinear
+from .components.norms._norms import RMSNorm
 
 if TYPE_CHECKING:
     from easydel.infra.base_config import EasyDeLBaseConfig

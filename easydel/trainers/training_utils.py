@@ -99,6 +99,7 @@ def make_default_tensor_straight_through(
         if quantization_mode == "int8":
             qdq = _quantize_dequantize_int8
         elif quantization_mode == "nf4":
+
             def qdq(y):
                 return _quantize_dequantize_nf4(y, block_size=tp.cast(int, nf4_block_size))
         elif quantization_mode == "fp8":

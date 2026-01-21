@@ -66,7 +66,7 @@ Default Configuration (Xerxes2 Base):
 Usage Example:
     ```python
     from easydel import Xerxes2Config, Xerxes2ForCausalLM
-    from easydel.layers.rotary_embedding import RopeConfig
+    from easydel.layers.components import RopeConfig
     import jax.numpy as jnp
     from flax import nnx as nn
 

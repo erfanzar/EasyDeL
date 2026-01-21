@@ -36,7 +36,7 @@ from easydel.layers.caching import (
     TransformerCache,
     TransformerMetadata,
 )
-from easydel.layers.linear import RowParallelLinear
+from easydel.layers.components import RowParallelLinear
 from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 
 from .aya_vision_configuration import AyaVisionConfig

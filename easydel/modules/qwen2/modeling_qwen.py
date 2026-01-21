@@ -45,8 +45,8 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm as RMSNorm
+from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.components import RMSNorm as RMSNorm
 
 from .qwen_configuration import Qwen2Config
 
@@ -228,7 +228,7 @@ class Qwen2Attention(UnifiedAttention):
 
     def _create_o_proj(self, config, dtype, param_dtype, precision, rngs):
         """Override to use bias=False for output projection (Qwen2-specific)."""
-        from easydel.layers.linear import RowParallelLinear
+        from easydel.layers.components import RowParallelLinear
 
         return RowParallelLinear(
             config.num_attention_heads * self.head_dim,
@@ -443,13 +443,7 @@ class Qwen2Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             config.vocab_size,
             config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),

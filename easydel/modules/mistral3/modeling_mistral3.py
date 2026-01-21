@@ -37,8 +37,7 @@ from easydel.layers.caching import (
     TransformerCache,
     TransformerMetadata,
 )
-from easydel.layers.linear import RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.layers.components import RMSNorm, RowParallelLinear
 from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 
 from .mistral3_configuration import Mistral3Config

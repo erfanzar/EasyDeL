@@ -29,77 +29,92 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
+from collections import OrderedDict
+from collections.abc import Iterable
 
 import zmq
 from transformers import AutoTokenizer
 
 
-class SimpleDecoder:
-    """Simple incremental decoder with UTF-8 error handling.
+class FastIncrementalDecoder:
+    """
+    Incrementally decode token streams while handling malformed UTF‑8
+    (the “�” replacement character).
 
-    This decoder handles incremental token decoding and buffers tokens that
-    may result in malformed UTF-8 sequences until they can be properly decoded.
+    Public API matches the original `SimpleDecoder.decode` method:
 
-    Args:
-        tokenizer: The tokenizer instance to use for decoding.
+        delta, new_buffered_tokens, has_buffer = decoder.decode(
+            tokens,
+            previous_text="",
+            buffered=decoder.buffered,   # mutable list that the decoder updates
+            skip_special_tokens=True,
+        )
     """
 
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
 
-    def _decode_tokens(self, tokens, *, skip_special_tokens: bool) -> str:
+    def _decode(self, token_ids: Iterable[int], *, skip_special_tokens: bool) -> str:
+        """Wrapper around `tokenizer.decode` that works with all HF versions."""
         try:
             return self.tokenizer.decode(
-                tokens,
+                list(token_ids),
                 skip_special_tokens=skip_special_tokens,
                 clean_up_tokenization_spaces=False,
             )
         except TypeError:
-            return self.tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
-        except Exception:
-            return ""
+            return self.tokenizer.decode(
+                list(token_ids),
+                skip_special_tokens=skip_special_tokens,
+            )
 
-    def decode(self, tokens, previous_text, buffered_tokens, *, skip_special_tokens: bool):
-        """Decode tokens incrementally, handling UTF-8 boundary issues.
+    def decode(
+        self,
+        new_tokens: Iterable[int],
+        previous_text: str,
+        buffered_tokens: list,
+        *,
+        skip_special_tokens: bool,
+    ) -> tuple[str, list[int], bool]:
+        """
+        Incrementally decode `new_tokens`.
 
-        Args:
-            tokens: New tokens to decode.
-            previous_text: Previously decoded text.
-            buffered_tokens: Tokens buffered from previous decode attempts.
+        * If the new tokens alone produce a clean string → return that delta.
+          The buffer is cleared.
+
+        * If they contain “�” we prepend the existing `self.buffer` and try
+          again.  If that still contains “�” we keep the whole sequence in
+          `self.buffer` and return an empty delta.
+
+        * If ``finished=True`` (handled by the caller) we always decode
+          everything in `self.buffer + new_tokens` and then drop it.
 
         Returns:
-            A tuple of (delta_text, new_buffered_tokens, has_buffer).
+            delta_text, buffered (the same list that was passed in), has_buffer
         """
-        merged = list(buffered_tokens) + list(tokens)
-        if not merged:
-            return "", [], False
+        decoded_new = self._decode(new_tokens, skip_special_tokens=skip_special_tokens)
 
-        decoded = self._decode_tokens(merged, skip_special_tokens=skip_special_tokens)
-
-        if "�" not in decoded:
-            delta = decoded[len(previous_text) :] if previous_text and decoded.startswith(previous_text) else decoded
+        if "�" not in decoded_new:
+            delta = (
+                decoded_new[len(previous_text) :]
+                if previous_text and decoded_new.startswith(previous_text)
+                else decoded_new
+            )
             return delta, [], False
 
-        # Backtrack by trimming tokens until no malformed chars.
-        remaining = list(merged)
-        new_buffer = []
-        decoded_text = previous_text
+        candidate = list(buffered_tokens) + list(new_tokens)
+        decoded_candidate = self._decode(candidate, skip_special_tokens=skip_special_tokens)
 
-        while remaining:
-            new_buffer.insert(0, remaining.pop())
-            candidate = self._decode_tokens(remaining, skip_special_tokens=skip_special_tokens)
-            if not candidate:
-                continue
-            if "�" not in candidate:
-                decoded_text = candidate
-                break
+        if "�" not in decoded_candidate:
+            delta = (
+                decoded_candidate[len(previous_text) :]
+                if previous_text and decoded_candidate.startswith(previous_text)
+                else decoded_candidate
+            )
+            return delta, [], False
 
-        delta = (
-            decoded_text[len(previous_text) :]
-            if previous_text and decoded_text.startswith(previous_text)
-            else decoded_text
-        )
-        return delta, new_buffer, True
+        return "", candidate, True
 
 
 def _tokenizer_worker(endpoint: str, tokenizer_path: str, tokenizer_kwargs: dict) -> None:
@@ -161,25 +176,16 @@ def _detokenizer_worker(
     if "trust_remote_code" not in tokenizer_kwargs.keys():
         tokenizer_kwargs["trust_remote_code"] = os.getenv("ESURGE_WORKER_TRUST_REMOTE_CODE", "1") in ["1", "on", "yes"]
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_kwargs)
-    decoder = SimpleDecoder(tokenizer)
-    eos_token_id = tokenizer.eos_token_id
-    eos_ids = eos_token_id if isinstance(eos_token_id, (list, tuple, set)) else [eos_token_id]
-    eos_set = {int(tid) for tid in eos_ids if tid is not None}
-
-    def _strip_eos(tokens: list[int]) -> list[int]:
-        if not eos_set:
-            return list(tokens)
-        return [tok for tok in tokens if tok not in eos_set]
+    decoder = FastIncrementalDecoder(tokenizer)
 
     ctx = zmq.Context()
     socket = ctx.socket(zmq.REP)
     socket.bind(endpoint)
-    states: dict[str, dict] = {}
+    states: OrderedDict[str, dict] = OrderedDict()
 
-    def _evict():
+    def evict():
         while len(states) > max_states:
-            rid = next(iter(states))
-            states.pop(rid, None)
+            states.popitem(last=False)
 
     try:
         while True:
@@ -190,12 +196,11 @@ def _detokenizer_worker(
                 generated_tokens = message["tokens"]
                 finished = message["finished"]
                 skip_special = message["skip_special_tokens"]
-                generated_tokens = _strip_eos(generated_tokens)
 
                 state = states.setdefault(rid, {"last_index": 0, "previous_text": "", "buffered": []})
                 last_idx = min(state["last_index"], len(generated_tokens))
                 new_tokens = generated_tokens[last_idx:]
-
+                detokstart = time.time()
                 if new_tokens or finished:
                     delta, new_buffered, _ = decoder.decode(
                         new_tokens,
@@ -237,8 +242,9 @@ def _detokenizer_worker(
                         "last_decoded_index": state["last_index"],
                         "finished": finished,
                     }
-
-                _evict()
+                detoktook = time.time() - detokstart
+                result["detoktook"] = detoktook
+                evict()
                 socket.send_pyobj({"status": "ok", "result": result})
             elif cmd == "drain":
                 states.clear()

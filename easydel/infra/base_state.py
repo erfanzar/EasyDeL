@@ -82,7 +82,7 @@ if tp.TYPE_CHECKING:
 
     from easydel.infra.base_config import EasyDeLBaseConfigDict
     from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
-    from easydel.layers.quantization import EasyDeLQuantizationConfig
+    from easydel.layers.components import QuantizationConfig
 
     from .base_module import EasyDeLBaseModule, PartitionLike
 
@@ -608,8 +608,9 @@ class EasyDeLState(struct.PyTreeNode):
         model_task: TaskType = TaskType.AUTO_BIND,
         auto_shard_model: bool = True,
         partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_config: "EasyDeLQuantizationConfig | None" = None,
-        quantize_tensors: bool = True,
+        quantization_config: "QuantizationConfig | None" = None,
+        quantize_tensors: bool = False,
+        quantize_modules: bool = False,
         verbose: bool = True,
         tx_template: optax.GradientTransformation | None = None,
         **kwargs,
@@ -662,7 +663,9 @@ class EasyDeLState(struct.PyTreeNode):
             quantization_config:
                 Quantization configuration. Pass None to disable quantization.
             quantize_tensors:
-                If True, applies quantization to the loaded tensors. Defaults to True.
+                If True, applies quantization to the loaded tensors. Defaults to False.
+            quantize_modules:
+                If True, applies quantization to the model linear Models. Defaults to False.
             verbose:
                 If True, logs detailed information during loading. Defaults to True.
             **kwargs:
@@ -717,6 +720,7 @@ class EasyDeLState(struct.PyTreeNode):
             partition_rules=partition_rules,
             quantization_config=quantization_config,
             quantize_tensors=quantize_tensors,
+            quantize_modules=quantize_modules,
             verbose=verbose,
             **kwargs,
         )

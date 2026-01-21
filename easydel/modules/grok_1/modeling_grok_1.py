@@ -41,8 +41,8 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm as FlaxGrok1RMSNorm
+from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.components import RMSNorm as FlaxGrok1RMSNorm
 
 from .grok_1_configuration import Grok1Config
 
@@ -663,13 +663,7 @@ class Grok1Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             self.config.vocab_size,
             self.config.hidden_size,
             dtype=dtype,

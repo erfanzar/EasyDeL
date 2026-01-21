@@ -14,4 +14,5 @@ easydel.layers.operations.modules package
    scaled_dot_product_attention
    ssm1
    ssm2
+   unified_attention
    vanilla_attention

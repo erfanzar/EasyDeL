@@ -38,7 +38,7 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, ArrayParam
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.base_modules import BaseImageClassificationModule
-from easydel.layers.linear import ColumnParallelLinear
+from easydel.layers.components import ColumnParallelLinear
 
 from .clip_configuration import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
 
@@ -127,7 +127,7 @@ class CLIPVisionEmbeddings(nn.Module):
 
         self.num_patches = (image_size // patch_size) ** 2
         num_positions = self.num_patches + 1
-        self.position_embedding = nn.Embed(
+        self.position_embedding = Embed(
             num_positions,
             embed_dim,
             embedding_init=jax.nn.initializers.normal(),
@@ -191,7 +191,7 @@ class CLIPTextEmbeddings(nn.Module):
         """
         embed_dim = config.hidden_size
 
-        self.token_embedding = nn.Embed(
+        self.token_embedding = Embed(
             config.vocab_size,
             embed_dim,
             embedding_init=jax.nn.initializers.normal(),
@@ -199,7 +199,7 @@ class CLIPTextEmbeddings(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.position_embedding = nn.Embed(
+        self.position_embedding = Embed(
             config.max_position_embeddings,
             embed_dim,
             embedding_init=jax.nn.initializers.normal(),

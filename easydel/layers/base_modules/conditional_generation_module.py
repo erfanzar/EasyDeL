@@ -39,7 +39,7 @@ from easydel.layers.caching import (
     TransformerCache,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear
+from easydel.layers.components import ColumnParallelLinear
 
 from ._base_task_module import BaseTaskModule, ConfigT, ModelT
 

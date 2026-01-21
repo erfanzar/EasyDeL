@@ -27,7 +27,7 @@ from jaxtyping import Array, Float
 
 from easydel.infra.modeling_outputs import ImageClassifierOutput
 from easydel.infra.utils import auto_remat
-from easydel.layers.linear import ColumnParallelLinear
+from easydel.layers.components import ColumnParallelLinear
 
 from ._base_task_module import BaseTaskModule, ConfigT, ModelT
 

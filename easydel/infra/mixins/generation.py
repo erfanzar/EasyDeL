@@ -1184,7 +1184,7 @@ class EasyGenerationMixin:
         Returns:
             type: The EasyQuantizer class.
         """
-        from easydel.layers.quantization.quantizers import EasyQuantizer
+        from easydel.layers.components.quants._quants import EasyQuantizer
 
         return EasyQuantizer
 

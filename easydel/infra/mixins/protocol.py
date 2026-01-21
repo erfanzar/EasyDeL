@@ -83,8 +83,7 @@ from jax import numpy as jnp
 from jax.sharding import Mesh
 from jaxtyping import Array, Bool, Float, Int, Shaped
 
-from easydel.layers.linear import ParallelLinear
-from easydel.layers.quantization import EasyDeLQuantizationConfig
+from easydel.layers.components import ParallelLinear, QuantizationConfig
 
 from ..base_config import EasyDeLBaseConfig
 from ..loss_utils import LossConfig, LossMetrics
@@ -2926,7 +2925,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @abstractmethod
     def quantize(
         self: Self,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
+        quantization_config: QuantizationConfig | None = None,
         quantize_tensors: bool = True,
         verbose: bool | None = None,
     ):

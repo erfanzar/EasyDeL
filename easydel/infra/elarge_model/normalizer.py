@@ -27,7 +27,7 @@ from typing import Any, cast
 
 from easydel.infra.base_config import EasyDeLBaseConfigDict
 from easydel.infra.factory import TaskType
-from easydel.layers.quantization.quantizers import EasyDeLQuantizationConfig
+from easydel.layers.components.quants._quants import QuantizationConfig
 
 from .defaults import DEFAULTS
 from .types import ELMConfig
@@ -164,7 +164,7 @@ def materialize_base_config(cfg: ELMConfig, prefer: tp.Literal["base", "sections
 
     kv_quant = quant.get("kv_cache")
     if kv_quant is not None:
-        kv_quant = EasyDeLQuantizationConfig(**kv_quant)
+        kv_quant = QuantizationConfig(**kv_quant)
 
     # KV cache quantization config
     set_maybe("kv_cache_quantization_config", kv_quant)

@@ -56,7 +56,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
 
 from .roberta_configuration import RobertaConfig as RobertaConfig
 
@@ -73,9 +73,9 @@ class RobertaEmbeddings(nn.Module):
         dtype (jnp.dtype): Data type for computations. Defaults to jnp.float32.
         param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
         precision (lax.Precision): Precision setting for JAX operations.
-        word_embeddings (nn.Embed): Token embedding layer.
-        position_embeddings (nn.Embed): Position embedding layer.
-        token_type_embeddings (nn.Embed): Token type (segment) embedding layer.
+        word_embeddings (Embed): Token embedding layer.
+        position_embeddings (Embed): Position embedding layer.
+        token_type_embeddings (Embed): Token type (segment) embedding layer.
         LayerNorm (nn.LayerNorm): Layer normalization applied after embedding sum.
         dropout (nn.Dropout): Dropout layer for regularization.
     """
@@ -93,7 +93,7 @@ class RobertaEmbeddings(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.word_embeddings = nn.Embed(
+        self.word_embeddings = Embed(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -101,7 +101,7 @@ class RobertaEmbeddings(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.position_embeddings = nn.Embed(
+        self.position_embeddings = Embed(
             num_embeddings=self.config.max_position_embeddings,
             features=self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -109,7 +109,7 @@ class RobertaEmbeddings(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.token_type_embeddings = nn.Embed(
+        self.token_type_embeddings = Embed(
             num_embeddings=self.config.type_vocab_size,
             features=self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),

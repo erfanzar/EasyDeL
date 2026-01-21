@@ -47,6 +47,7 @@ class DetokenizerResult:
     delta_text: str
     last_decoded_index: int
     finished: bool
+    detoktook: float
 
 
 class _BaseWorkerClient:

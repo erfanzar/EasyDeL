@@ -49,7 +49,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
 
 from .dbrx_configuration import DbrxConfig
 
@@ -969,7 +969,7 @@ class DbrxModel(EasyDeLBaseModule):
         padding_idx (int | None): Token ID used for padding.
         vocab_size (int): Size of the vocabulary.
         emb_pdrop (float): Embedding dropout probability.
-        wte (nn.Embed): Token embedding layer.
+        wte (Embed): Token embedding layer.
         blocks (list[DbrxBlock]): List of decoder blocks.
         norm_f (nn.LayerNorm): Final layer normalization.
     """
@@ -1003,7 +1003,7 @@ class DbrxModel(EasyDeLBaseModule):
         self.vocab_size = self.config.vocab_size
         self.emb_pdrop = self.config.emb_pdrop
 
-        self.wte = nn.Embed(
+        self.wte = Embed(
             self.config.vocab_size,
             self.config.d_model,
             dtype=dtype,

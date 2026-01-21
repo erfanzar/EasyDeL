@@ -43,7 +43,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
 
 from .mosaic_configuration import MptConfig as MptConfig
 
@@ -595,7 +595,7 @@ class MptModel(EasyDeLBaseModule):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
-        wte (nn.Embed): Token embedding layer.
+        wte (Embed): Token embedding layer.
         emb_drop (nn.Dropout): Dropout layer applied after embeddings.
         blocks (tp.List[MptBlock]): List of transformer blocks.
         norm_f (nn.LayerNorm): Final layer normalization.
@@ -627,7 +627,7 @@ class MptModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.wte = nn.Embed(
+        self.wte = Embed(
             num_embeddings=config.vocab_size,
             features=config.d_model,
             rngs=rngs,

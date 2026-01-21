@@ -47,7 +47,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
 
 from .gemma2_configuration import Gemma2Config
 
@@ -473,13 +473,7 @@ class Gemma2Model(EasyDeLBaseModule):
         )
         self.hidden_size = self.config.hidden_size
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             self.config.vocab_size,
             self.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),

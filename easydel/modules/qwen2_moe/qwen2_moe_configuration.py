@@ -29,7 +29,7 @@ from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
-from easydel.layers.moe.utils import get_moe_partition_spec
+from easydel.layers.components import get_moe_partition_spec
 
 
 class ExpertTensorParallel(DynamicShardingAxes):
@@ -214,9 +214,11 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [
-                "sliding_attention"
-                if self.sliding_window is not None and i >= self.max_window_layers
-                else "full_attention"
+                (
+                    "sliding_attention"
+                    if self.sliding_window is not None and i >= self.max_window_layers
+                    else "full_attention"
+                )
                 for i in range(self.num_hidden_layers)
             ]
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)

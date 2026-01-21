@@ -69,8 +69,7 @@ from flax import nnx as nn
 from jaxtyping import Array, DTypeLike, PRNGKeyArray
 from tqdm.auto import tqdm
 
-from easydel.layers.linear import ParallelLinear
-from easydel.layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer
+from easydel.layers.components import EasyQuantizer, ParallelLinear, QuantizationConfig
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
@@ -384,7 +383,7 @@ def quantize_linear_layers(
     model: nn.Module,
     /,
     *,
-    quantization_config: EasyDeLQuantizationConfig | None = None,
+    quantization_config: QuantizationConfig | None = None,
     verbose: bool = True,
 ) -> nn.Module:
     """
@@ -402,7 +401,7 @@ def quantize_linear_layers(
         return model
 
     quantizer = EasyQuantizer(quantization_config=quantization_config)
-    return quantizer.quantize_linears(model, verbose=verbose)
+    return quantizer.quantize_modules(model, verbose=verbose)
 
 
 def apply_lora_to_layers(

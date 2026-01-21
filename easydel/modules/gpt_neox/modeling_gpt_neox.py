@@ -42,7 +42,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
 
 from .gpt_neox_configuration import GPTNeoXConfig as GPTNeoXConfig
 
@@ -421,7 +421,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        embed_in (nn.Embed): Token embedding layer.
+        embed_in (Embed): Token embedding layer.
         emb_dropout (nn.Dropout): Dropout applied after embeddings.
         layers (list[GPTNeoXBlock]): List of transformer blocks.
         final_layer_norm (nn.LayerNorm): Final layer normalization.
@@ -452,7 +452,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embed_in = nn.Embed(
+        self.embed_in = Embed(
             self.config.vocab_size,
             self.config.hidden_size,
             dtype=dtype,

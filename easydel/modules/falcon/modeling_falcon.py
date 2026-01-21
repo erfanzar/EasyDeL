@@ -42,7 +42,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
 
 from .falcon_configuration import FalconConfig
 
@@ -533,7 +533,7 @@ class FalconModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.word_embeddings = nn.Embed(
+        self.word_embeddings = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,

@@ -45,7 +45,7 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
+from easydel.infra.utils import ACT2FN, ArrayParam
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import (
@@ -58,7 +58,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
 
 from .opt_configuration import OPTConfig
 
@@ -512,7 +512,7 @@ class OPTLearnedPositionalEmbedding(nn.Module):
         """
         # Add offset to inputs and lookup embeddings
         indices = inputs + self.offset
-        # Use take for embedding lookup, matching nn.Embed behavior
+        # Use take for embedding lookup, matching Embed behavior
         embedded = jnp.take(self.kernel.value, indices, axis=0)
         # Cast to output dtype if needed
         if self.dtype != self.param_dtype:
@@ -535,7 +535,7 @@ class OPTDecoder(EasyDeLBaseModule):
         padding_idx (int): Index of the padding token.
         max_target_positions (int): Maximum sequence length the model can handle.
         embed_scale (float): Scaling factor for embeddings (usually 1.0).
-        embed_tokens (nn.Embed): Token embedding layer.
+        embed_tokens (Embed): Token embedding layer.
         embed_positions (OPTLearnedPositionalEmbedding): Positional embedding layer.
         project_out (ColumnParallelLinear, optional): Optional linear projection layer after embeddings.
         project_in (ColumnParallelLinear, optional): Optional linear projection layer before embeddings.
@@ -581,13 +581,7 @@ class OPTDecoder(EasyDeLBaseModule):
         self.padding_idx = self.config.pad_token_id
         self.max_target_positions = self.config.max_position_embeddings
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             config.vocab_size,
             config.word_embed_proj_dim,
             embedding_init=nn.initializers.normal(config.init_std),
@@ -597,9 +591,9 @@ class OPTDecoder(EasyDeLBaseModule):
         )
 
         self.position_offset = offset
-        # Use `nn.Embed` directly so HF -> EasyDeL conversion treats this as an embedding
+        # Use `Embed` directly so HF -> EasyDeL conversion treats this as an embedding
         # (no weight transpose) and maps `*.weight` -> `*.embedding`.
-        self.embed_positions = nn.Embed(
+        self.embed_positions = Embed(
             self.config.max_position_embeddings + offset,
             embed_dim,
             embedding_init=nn.initializers.normal(config.init_std),
@@ -913,7 +907,7 @@ class OPTModel(EasyDeLBaseModule):
         """Gets the input embeddings from the model.
 
         Returns:
-            nn.Embed: The token embedding layer used by the decoder.
+            Embed: The token embedding layer used by the decoder.
         """
         return self.decoder.embed_tokens
 

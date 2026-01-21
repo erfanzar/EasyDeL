@@ -363,6 +363,11 @@ _import_structure = {
         "Glm4MoeForSequenceClassification",
         "Glm4MoeModel",
     ],
+    "modules.glm4_moe_lite": [
+        "Glm4MoeLiteConfig",
+        "Glm4MoeLiteForCausalLM",
+        "Glm4MoeLiteModel",
+    ],
     "modules.glm4v": [
         "Glm4vConfig",
         "Glm4vForConditionalGeneration",
@@ -833,6 +838,7 @@ if _tp.TYPE_CHECKING:
     from .modules.glm import GlmConfig, GlmForCausalLM, GlmForSequenceClassification, GlmModel
     from .modules.glm4 import Glm4Config, Glm4ForCausalLM, Glm4ForSequenceClassification, Glm4Model
     from .modules.glm4_moe import Glm4MoeConfig, Glm4MoeForCausalLM, Glm4MoeForSequenceClassification, Glm4MoeModel
+    from .modules.glm4_moe_lite import Glm4MoeLiteConfig, Glm4MoeLiteForCausalLM, Glm4MoeLiteModel
     from .modules.glm4v import (
         Glm4vConfig,
         Glm4vForConditionalGeneration,

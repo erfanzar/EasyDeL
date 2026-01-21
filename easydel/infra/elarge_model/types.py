@@ -33,7 +33,7 @@ from jax import numpy as jnp
 from easydel.infra.base_config import EasyDeLBaseConfigDict
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
 from easydel.infra.factory import TaskType
-from easydel.layers.quantization import EasyDeLQuantizationConfig
+from easydel.layers.components import QuantizationConfig
 
 from .trainer_types import TrainerConfig
 
@@ -42,8 +42,37 @@ if tp.TYPE_CHECKING:
 
     from easydel.inference.sampling_params import SamplingParams
 
-DTypeLike = tp.Union[str, jnp.dtype, type, tp.Literal["fp8", "bf16", "fp16", "fp32"]]  # noqa
-PrecisionLike = tp.Union[str, jax.lax.Precision, None, tp.Literal["HIGH", "DEFAULT", "HIGHEST"]]  # noqa
+DTypeLike = tp.Union[  # noqa
+    str,
+    jnp.dtype,
+    type,
+    tp.Literal[
+        "fp8",
+        "bf16",
+        "fp16",
+        "fp32",
+        "mxfp4",
+        "mxfp8",
+        "nvfp8",
+    ],
+]
+PrecisionLike = tp.Union[  # noqa
+    str,
+    jax.lax.Precision,
+    None,
+    tp.Literal[
+        "HIGH",
+        "DEFAULT",
+        "HIGHEST",
+        "highest",
+        "float32",
+        "high",
+        "bfloat16_3x",
+        "tensorfloat32",
+        "default",
+        "fastest",
+    ],
+]
 PartitionRules = tuple[tuple[str, Any], ...]
 DatasetTypeLike = tp.Literal[
     "json",
@@ -213,6 +242,7 @@ class EasyDeLQuantizationCfg(TypedDict, total=False):
 
     Attributes:
         dtype: The quantization type (NF4, INT8, TERNARY, BINARY).
+        runtime_dtype: The quantization type for runtime (NF4, INT8, TERNARY, BINARY).
         block_size: Block size for block-wise quantization.
         simulate: If True, uses STE without actual bit packing (QAT mode).
         use_kernel: If True, uses optimized TPU/GPU kernels when available.
@@ -221,7 +251,8 @@ class EasyDeLQuantizationCfg(TypedDict, total=False):
 
     """
 
-    dtype: NotRequired[tp.Literal["nf4", "int8", "ternary", "binary"]]
+    dtype: NotRequired[tp.Literal["nf4", "int8", "ternary", "binary", "mxfp8", "nvfp8", "mxfp4"]]
+    runtime_dtype: NotRequired[tp.Literal["nf4", "int8", "ternary", "binary", "mxfp8", "nvfp8", "mxfp4"]]
     block_size: NotRequired[int]
     simulate: NotRequired[bool]
     use_kernel: NotRequired[bool]
@@ -232,19 +263,21 @@ class QuantizationCfg(TypedDict, total=False):
     """Quantization configuration for model compression.
 
     Supports both KV cache quantization and model layer quantization
-    using EasyDeLQuantizationConfig.
+    using QuantizationConfig.
 
     Attributes:
         platform: Target platform for quantization
         kv_cache: KV cache quantization config
         model: model layer quantization config
         quantize_tensors: Whether to quantize tensors during loading
+        quantize_modules: Whether to quantize model linears or modules.
     """
 
     platform: NotRequired[EasyDeLPlatforms | None]
-    kv_cache: NotRequired[EasyDeLQuantizationConfig | EasyDeLQuantizationCfg | None]
-    model: NotRequired[EasyDeLQuantizationConfig | EasyDeLQuantizationCfg | None]
+    kv_cache: NotRequired[QuantizationConfig | EasyDeLQuantizationCfg | None]
+    model: NotRequired[QuantizationConfig | EasyDeLQuantizationCfg | None]
     quantize_tensors: NotRequired[bool]
+    quantize_modules: NotRequired[bool]
 
 
 class BaseCfg(TypedDict, total=False):

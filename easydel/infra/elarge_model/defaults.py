@@ -38,6 +38,7 @@ DEFAULTS: ELMConfig = {
     "quantization": {
         "block_size": 128,
         "quantize_tensors": False,
+        "quantize_modules": False,
         "linear_pattern": ".*",
         "linear_block_size": 64,
     },

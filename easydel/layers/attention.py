@@ -74,8 +74,8 @@ from .caching import (
     TransformerMetadata,
     UnifiedAttentionCacheView,
 )
+from .components.quants._quants import EasyQuantizer
 from .operations import AttentionOutput, OperationMetadata, OperationRegistry
-from .quantization.quantizers import EasyQuantizer
 
 logger = get_logger(__name__)
 

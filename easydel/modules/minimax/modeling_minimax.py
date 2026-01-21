@@ -40,15 +40,17 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.moe import (
+from easydel.layers.components import (
     BaseMoeModule,
+    ColumnParallelLinear,
     ColumnParallelMoELinear,
+    Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    RMSNorm,
+    RowParallelLinear,
     RowParallelMoELinear,
 )
-from easydel.layers.norms import RMSNorm
 
 from .minimax_configuration import MiniMaxConfig
 
@@ -798,13 +800,7 @@ class MiniMaxModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
@@ -1155,7 +1151,7 @@ class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):
 
         layer_types = self.config.get_text_config().layer_types
         return {
-            idx: (RecurrentCacheView if layer_type == "linear_attention" else TransformerCacheView)
+            idx: RecurrentCacheView if layer_type == "linear_attention" else TransformerCacheView
             for idx, layer_type in enumerate(layer_types)
         }
 

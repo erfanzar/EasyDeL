@@ -73,7 +73,7 @@ from transformers.modeling_gguf_pytorch_utils import load_gguf_checkpoint
 from transformers.utils import CONFIG_NAME, cached_file, download_url, is_remote_url
 from transformers.utils.generic import is_timm_config_dict
 
-from easydel.layers.quantization import EasyDeLQuantizationConfig
+from easydel.layers.components import QuantizationConfig
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.helpers import check_bool_flag, get_logger
 
@@ -91,7 +91,7 @@ from .etils import (
 if tp.TYPE_CHECKING:
     from ejkernel.modules.operations.configs import BaseOperationConfig
 
-    from easydel.layers.rotary_embedding import RopeConfig
+    from easydel.layers.components import RopeConfig
 
     from .utils import AttnMaskDetail, ModuleCaches
 
@@ -337,7 +337,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     sequence_axis_name: NotRequired[str]
     gradient_checkpointing: NotRequired[EasyDeLGradientCheckPointers | str | AVAILABLE_GRADIENT_CHECKPOINTS]
     gradient_checkpointing_targets: NotRequired[list[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS] | None]
-    kv_cache_quantization_config: NotRequired[EasyDeLQuantizationConfig | None]
+    kv_cache_quantization_config: NotRequired[QuantizationConfig | None]
     kv_cache_sharding_sequence_axis_name: NotRequired[str | tuple[str, ...]]
     flash_attention_backward_pass_impl: NotRequired[tp.Literal["triton", "xla"]]
     attn_dtype: NotRequired[jnp.dtype]
@@ -355,7 +355,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     use_ring_of_experts: NotRequired[bool]
     fsdp_is_ep_bound: NotRequired[bool]
     sp_is_ep_bound: NotRequired[bool]
-    quantization_config: NotRequired[EasyDeLQuantizationConfig | None]
+    quantization_config: NotRequired[QuantizationConfig | None]
     operation_configs: NotRequired[dict[str, BaseOperationConfig] | None]
     mask_max_position_embeddings: NotRequired[int]
     freq_max_position_embeddings: NotRequired[int]
@@ -461,8 +461,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         gradient_checkpointing_targets: list[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS] | None = None,
         precompute_masks: bool = True,
-        kv_cache_quantization_config: EasyDeLQuantizationConfig | None = None,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
+        kv_cache_quantization_config: QuantizationConfig | None = None,
+        quantization_config: QuantizationConfig | None = None,
         kv_cache_sharding_sequence_axis_name: str | tuple[str, ...] = "sp",
         flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = "triton",
         attn_dtype: jnp.dtype = jnp.bfloat16,
@@ -570,11 +570,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         allow_split_physical_axes: bool = True,
         backend: str | None = None,
         eformer_craft_mesh: bool | None = None,
-        axis_types: tp.Sequence[AxisType | str]
-        | AxisType
-        | str
-        | None
-        | tp.Literal["auto", "explicit", "manual"] = None,
+        axis_types: (
+            tp.Sequence[AxisType | str] | AxisType | str | None | tp.Literal["auto", "explicit", "manual"]
+        ) = None,
     ):
         """Creates a JAX device mesh for distributed model execution.
 
@@ -627,10 +625,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         if backend == "":
             backend = None
-        if axis_types is None:
-            axis_types = "auto"
         if eformer_craft_mesh is None:
-            eformer_craft_mesh = check_bool_flag("EFORMER_CREATE_MESH", default=True)
+            eformer_craft_mesh = check_bool_flag("EFORMER_CREATE_MESH", True)
+
         mesh = create_mesh(
             axis_dims=sharding_axis_dims,
             axis_names=sharding_axis_names,
@@ -645,11 +642,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     def _build_mesh(
         self,
-        axis_types: tp.Sequence[AxisType | str]
-        | AxisType
-        | str
-        | None
-        | tp.Literal["auto", "explicit", "manual"] = None,
+        axis_types: (
+            tp.Sequence[AxisType | str] | AxisType | str | None | tp.Literal["auto", "explicit", "manual"]
+        ) = None,
     ) -> common_types.Mesh:
         """Create a JAX mesh using the config sharding settings."""
         sharding_axis_dims = (
@@ -670,9 +665,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return self.create_mesh(
             sharding_axis_dims=tuple(sharding_axis_dims) if sharding_axis_dims is not None else sharding_axis_dims,
             sharding_axis_names=tuple(sharding_axis_names) if sharding_axis_names is not None else sharding_axis_names,
-            sharding_dcn_axis_dims=tuple(sharding_dcn_axis_dims)
-            if sharding_dcn_axis_dims is not None
-            else sharding_dcn_axis_dims,
+            sharding_dcn_axis_dims=(
+                tuple(sharding_dcn_axis_dims) if sharding_dcn_axis_dims is not None else sharding_dcn_axis_dims
+            ),
             should_sort_granules_by_key=(
                 (self.should_sort_granules_by_key if self.should_sort_granules_by_key is not None else True)
                 if hasattr(self, "should_sort_granules_by_key")
@@ -1086,8 +1081,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         gradient_checkpointing: EasyDeLGradientCheckPointers = NOT_GIVEN,
         gradient_checkpointing_targets: list[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS] | None = NOT_GIVEN,
         precompute_masks: bool = NOT_GIVEN,
-        kv_cache_quantization_config: EasyDeLQuantizationConfig | None = NOT_GIVEN,
-        quantization_config: EasyDeLQuantizationConfig | None = NOT_GIVEN,
+        kv_cache_quantization_config: QuantizationConfig | None = NOT_GIVEN,
+        quantization_config: QuantizationConfig | None = NOT_GIVEN,
         kv_cache_sharding_sequence_axis_name: str | tuple[str, ...] = NOT_GIVEN,
         flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = NOT_GIVEN,
         attn_dtype: jnp.dtype = NOT_GIVEN,
@@ -1392,10 +1387,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """Serialize config to a dictionary while temporarily hiding forbidden types.
 
         Notes:
-            EasyDeL caches the active JAX meshes on the config (``_hidden_mesh``,
-            ``_hidden_explicit_mesh``, ``_hidden_manual_mesh``) for runtime use.
-            Those objects contain non-picklable JAX devices, so we must exclude them
-            from any deep copies performed during serialization.
+            EasyDeL caches the active JAX mesh on the config (``_hidden_mesh``) for runtime use.
+            That object contains non-picklable JAX devices, so we must exclude it from any deep
+            copies performed during serialization.
         """
         sd = self.__dict__
         forbidden_types = {"_ScalarMeta"}
@@ -1403,8 +1397,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         for key in list(sd.keys()):
             value = sd.get(key)
-            if key in {"_hidden_mesh", "_hidden_explicit_mesh", "_hidden_manual_mesh"} or value.__class__.__name__ in (
-                forbidden_types
+            if (
+                key in {"_hidden_mesh", "_hidden_explicit_mesh", "_hidden_manual_mesh"}
+                or value.__class__.__name__ in forbidden_types
             ):
                 extracted_values[key] = sd.pop(key)
 
@@ -1430,7 +1425,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 sd[key] = value
 
     def __deepcopy__(self, memo):
-        """Deep copy the config while keeping the cached runtime meshes by reference."""
+        """Deep copy the config while keeping the cached runtime mesh by reference."""
         cls = self.__class__
         result = cls.__new__(cls)
         memo[id(self)] = result
@@ -1751,7 +1746,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         missing ``original_max_position_embeddings`` values are filled from the
         base config. Otherwise a default `RopeConfig` instance is returned.
         """
-        from easydel.layers.rotary_embedding import RopeConfig
+        from easydel.layers.components import RopeConfig
 
         if not hasattr(self, "rope_scaling") or self.rope_scaling is None:
             config = RopeConfig()
@@ -1786,7 +1781,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         Returns:
             Callable from `get_rope` ready to be applied to query/key tensors.
         """
-        from easydel.layers.rotary_embedding import get_rope
+        from easydel.layers.components import get_rope
 
         partial_rotary_factor = getattr(self, "partial_rotary_factor", 1.0)
         rotary_dim = rotary_dim or head_size
@@ -1820,7 +1815,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         Returns:
             `ModuleCaches` wrapping the computed frequency tensor.
         """
-        from easydel.layers.rotary_embedding import get_inv_frequencies
+        from easydel.layers.components import get_inv_frequencies
 
         from .utils import ModuleCaches
 
@@ -1856,7 +1851,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         Returns:
             `ModuleCaches` containing the frequencies sharded with `NamedSharding`.
         """
-        from easydel.layers.rotary_embedding import get_frequencies
+        from easydel.layers.components import get_frequencies
 
         from .utils import ModuleCaches
 

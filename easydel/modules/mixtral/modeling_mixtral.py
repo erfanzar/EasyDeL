@@ -46,15 +46,16 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear
-from easydel.layers.moe import (
+from easydel.layers.components import (
     BaseMoeModule,
+    ColumnParallelLinear,
     ColumnParallelMoELinear,
+    Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    RMSNorm,
     RowParallelMoELinear,
 )
-from easydel.layers.norms import RMSNorm
 
 from .mixtral_configuration import MixtralConfig as MixtralConfig
 
@@ -457,7 +458,7 @@ class MixtralModel(EasyDeLBaseModule):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
-        embed_tokens (nn.Embed): Embedding layer for input tokens.
+        embed_tokens (Embed): Embedding layer for input tokens.
         layers (tp.List[MixtralDecoderLayer]): List of decoder layers.
         norm (RMSNorm): Final layer normalization.
         gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
@@ -489,13 +490,7 @@ class MixtralModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             config.vocab_size,
             config.hidden_size,
             dtype=dtype,

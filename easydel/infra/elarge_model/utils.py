@@ -144,6 +144,9 @@ def coerce_dtype(x: DTypeLike | None) -> jnp.dtype:
     except Exception:
         s = str(x).lower()
         fp8 = {
+            "nvfp8": jnp.float8_e4m3,
+            "mxfp8": jnp.float8_e5m2,
+            "mxfp4": jnp.float4_e2m1fn,
             "fp8": jnp.float8_e5m2,
             "float8": jnp.float8_e5m2,
             "fp8_e4m3": jnp.float8_e4m3,
