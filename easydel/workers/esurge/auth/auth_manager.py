@@ -489,7 +489,7 @@ class EnhancedApiKeyManager:
             raise PermissionDenied(f"Access denied to model: {model}")
 
         # Check rate limits
-        self._check_rate_limits(metadata)
+        self._check_rate_limits(metadata, requested_tokens)
 
         # Check quotas
         self._check_quotas(metadata, requested_tokens)
@@ -551,7 +551,7 @@ class EnhancedApiKeyManager:
 
         return model in permissions.allowed_models
 
-    def _check_rate_limits(self, metadata: ApiKeyMetadata) -> None:
+    def _check_rate_limits(self, metadata: ApiKeyMetadata, requested_tokens: int = 0) -> None:
         """Check if rate limits are exceeded.
 
         Raises:
@@ -560,6 +560,7 @@ class EnhancedApiKeyManager:
         rate_limits = metadata.rate_limits
         current_time = time.time()
         key_id = metadata.key_id
+        requested_tokens = max(requested_tokens, 0)
 
         # Check requests per minute
         if rate_limits.requests_per_minute:
@@ -584,6 +585,28 @@ class EnhancedApiKeyManager:
             if len(window) >= rate_limits.requests_per_day:
                 raise RateLimitExceeded(f"Rate limit exceeded: {rate_limits.requests_per_day} requests/day")
             window.append(current_time)
+
+        # Check token rate limits (pre-check using requested_tokens)
+        if rate_limits.tokens_per_minute:
+            window = self._token_usage_windows[key_id]["tokens_minute"]
+            self._clean_window(window, current_time, 60)
+            used = sum(tokens for _, tokens in window)
+            if used + requested_tokens > rate_limits.tokens_per_minute:
+                raise RateLimitExceeded(f"Rate limit exceeded: {rate_limits.tokens_per_minute} tokens/minute")
+
+        if rate_limits.tokens_per_hour:
+            window = self._token_usage_windows[key_id]["tokens_hour"]
+            self._clean_window(window, current_time, 3600)
+            used = sum(tokens for _, tokens in window)
+            if used + requested_tokens > rate_limits.tokens_per_hour:
+                raise RateLimitExceeded(f"Rate limit exceeded: {rate_limits.tokens_per_hour} tokens/hour")
+
+        if rate_limits.tokens_per_day:
+            window = self._token_usage_windows[key_id]["tokens_day"]
+            self._clean_window(window, current_time, 86400)
+            used = sum(tokens for _, tokens in window)
+            if used + requested_tokens > rate_limits.tokens_per_day:
+                raise RateLimitExceeded(f"Rate limit exceeded: {rate_limits.tokens_per_day} tokens/day")
 
     def _check_quotas(self, metadata: ApiKeyMetadata, requested_tokens: int) -> None:
         """Check if quotas are exceeded.
@@ -620,8 +643,13 @@ class EnhancedApiKeyManager:
     def _clean_window(self, window: deque, current_time: float, window_size: int) -> None:
         """Remove expired entries from a time window."""
         cutoff = current_time - window_size
-        while window and window[0] < cutoff:
-            window.popleft()
+        while window:
+            head = window[0]
+            timestamp = head[0] if isinstance(head, (tuple, list)) else head
+            if timestamp < cutoff:
+                window.popleft()
+            else:
+                break
 
     def record_usage(
         self,
@@ -654,8 +682,7 @@ class EnhancedApiKeyManager:
         self._record_token_rate_limit(metadata, prompt_tokens + completion_tokens)
 
         # Mark storage as dirty for next auto-save
-        if self.storage:
-            self.storage.mark_dirty()
+        self._mark_dirty_and_save()
 
     def _record_token_rate_limit(self, metadata: ApiKeyMetadata, tokens: int) -> None:
         """Record token usage for rate limiting."""
