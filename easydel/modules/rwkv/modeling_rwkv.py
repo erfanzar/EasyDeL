@@ -29,7 +29,7 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
 from easydel.infra.utils import ArrayParam
 from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
 
 from .rwkv_configuration import RwkvConfig as RwkvConfig
 
@@ -688,7 +688,7 @@ class RwkvModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embeddings = nn.Embed(
+        self.embeddings = Embed(
             config.vocab_size,
             config.hidden_size,
             dtype=dtype,
@@ -876,11 +876,11 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):
 
     @property
     def transform_fn(self):
-        from easydel.layers.moe import BaseMoeModule, ParallelMoELinear
+        from easydel.layers.components import BaseMoeModule, ParallelMoELinear
         from easydel.utils import traversals
         from easydel.utils.parameters_transformation import StateDictConverter
 
-        embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.Embed)]
+        embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, Embed)]
         layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.LayerNorm)]
         moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
         moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]

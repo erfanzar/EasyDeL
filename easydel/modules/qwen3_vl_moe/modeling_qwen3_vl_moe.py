@@ -51,15 +51,17 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.moe import (
+from easydel.layers.components import (
     BaseMoeModule,
+    ColumnParallelLinear,
     ColumnParallelMoELinear,
+    Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    RMSNorm,
+    RowParallelLinear,
     RowParallelMoELinear,
 )
-from easydel.layers.norms import RMSNorm
 
 from .qwen3_vl_moe_configuration import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig, Qwen3VLMoeVisionConfig
 
@@ -842,7 +844,7 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.pos_embed = nn.Embed(
+        self.pos_embed = Embed(
             num_embeddings=config.num_position_embeddings,
             features=config.hidden_size,
             dtype=dtype,
@@ -1633,13 +1635,7 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
@@ -1897,7 +1893,7 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         """Get the embedding layer.
 
         Returns:
-            nn.Embed: The token embedding layer.
+            Embed: The token embedding layer.
         """
         return self.embed_tokens
 
@@ -1965,7 +1961,7 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         """Get the input embeddings layer.
 
         Returns:
-            nn.Embed: Token embedding layer from the language model.
+            Embed: Token embedding layer from the language model.
         """
         return self.language_model.get_embedding()
 
@@ -2570,7 +2566,7 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
         """Get the embedding layer.
 
         Returns:
-            nn.Embed: The token embedding layer from the language model.
+            Embed: The token embedding layer from the language model.
         """
         return self.language_model.embed_tokens
 
@@ -2646,7 +2642,7 @@ class Qwen3VLMoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3VLMoeMode
         """Get the input embeddings layer.
 
         Returns:
-            nn.Embed: Token embedding layer.
+            Embed: Token embedding layer.
         """
         return self.model.get_input_embeddings()
 

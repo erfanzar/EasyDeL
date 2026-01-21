@@ -43,7 +43,7 @@ from easydel.infra.modeling_outputs import (
     Seq2SeqModelOutput,
     SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.infra.utils import ACT2FN
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.base_modules import BaseConditionalGenerationModule
 from easydel.layers.caching import (
@@ -56,7 +56,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
 
 from .whisper_configuration import WhisperConfig as WhisperConfig
 
@@ -649,7 +649,7 @@ class WhisperEncoder(EasyDeLBaseModule):
         config (WhisperConfig): Configuration object for the model.
         conv1 (nn.Conv): First convolutional layer.
         conv2 (nn.Conv): Second convolutional layer.
-        embed_positions (nn.Embed): Positional embedding layer.
+        embed_positions (Embed): Positional embedding layer.
         layers (nn.List[WhisperEncoderLayer]): List of encoder layers.
         layer_norm (nn.LayerNorm): Final layer normalization.
         embed_dim (int): Dimensionality of the model.
@@ -730,7 +730,7 @@ class WhisperEncoder(EasyDeLBaseModule):
             for i in range(self.config.encoder_layers)
         ]
 
-        self.embed_positions = nn.Embed(
+        self.embed_positions = Embed(
             self.config.max_source_positions,
             self.config.d_model,
             dtype=self.dtype,
@@ -830,8 +830,8 @@ class WhisperDecoder(EasyDeLBaseModule):
 
     Attributes:
         config (WhisperConfig): Configuration object for the model.
-        embed_tokens (nn.Embed): Embedding layer for target tokens.
-        embed_positions (nn.Embed): Positional embedding layer.
+        embed_tokens (Embed): Embedding layer for target tokens.
+        embed_positions (Embed): Positional embedding layer.
         layers (nn.List[WhisperDecoderLayer]): List of decoder layers.
         layer_norm (nn.LayerNorm): Final layer normalization (applied to pre-final outputs).
         dropout (nn.Dropout): Dropout layer.
@@ -870,20 +870,14 @@ class WhisperDecoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             self.config.vocab_size,
             self.config.d_model,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.embed_positions = nn.Embed(
+        self.embed_positions = Embed(
             self.config.max_target_positions,
             self.config.d_model,
             dtype=dtype,
@@ -1543,9 +1537,11 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
 
         lm_logits = self.proj_out(
             hidden_states,
-            self.model.decoder.embed_tokens.embedding.value.T.astype(self.param_dtype)
-            if self.config.tie_word_embeddings
-            else None,
+            (
+                self.model.decoder.embed_tokens.embedding.value.T.astype(self.param_dtype)
+                if self.config.tie_word_embeddings
+                else None
+            ),
         )
 
         return Seq2SeqLMOutput(

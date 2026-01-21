@@ -47,8 +47,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.layers.components import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
 
 from .internlm2_configuration import InternLM2Config
 
@@ -394,7 +393,7 @@ class InternLM2Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.tok_embeddings = nn.Embed(
+        self.tok_embeddings = Embed(
             config.vocab_size,
             config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),

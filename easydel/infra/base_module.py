@@ -100,8 +100,7 @@ from .modeling_outputs import EmbeddingInfo
 
 if tp.TYPE_CHECKING:
     from easydel.infra.base_state import EasyDeLState
-    from easydel.layers.linear import ParallelLinear
-    from easydel.layers.quantization import EasyDeLQuantizationConfig
+    from easydel.layers.components import Embed, ParallelLinear, QuantizationConfig
 
 
 PartitionLike = tp.Mapping[str, tp.Callable] | tp.Mapping[tuple, tp.Callable] | None
@@ -770,7 +769,11 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         def _map(path, val: nn.VariableState):
             if val.value is not None and path in _shard_keys:
                 fn = sharding_fns[path]
-                val.value = fn(val.value)
+                if callable(fn):
+                    val.value = fn(val.value)
+                else:
+                    # NOTE: It should smt like NF4 or 8bit array if it's not callable and that mean it's already pre-sharded.
+                    ...
             return val
 
         state.update(state.map(_map))
@@ -962,9 +965,11 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
     def quantize(
         self: Self,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
-        quantize_tensors: bool = True,
+        quantization_config: QuantizationConfig | None = None,
+        quantize_tensors: bool = False,
+        quantize_modules: bool | None = None,
         verbose: bool | None = None,
+        raise_error: bool = True,
     ) -> Self:
         """
         Applies quantization to the module's linear layers or tensors.
@@ -973,31 +978,41 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             quantization_config: The quantization configuration specifying dtype,
                 block_size, and pattern. If None, uses default INT8 quantization.
             quantize_tensors: If True, quantizes the tensor values directly.
-                If False, replaces Linear layers with their quantized equivalents.
+            quantize_modules: If True, replaces Linear layers with their quantized equivalents.
+                Defaults to True when `quantize_tensors` is False.
             verbose: If True, logs information during the quantization process.
                 Defaults to True only on process index 0.
+            raise_error: If True, raises error when you pass both as False and we have nothing todo.
 
         Returns:
             Self: The quantized model instance.
 
         Example:
-            >>> from easydel.layers.quantization import EasyDeLQuantizationConfig, QuantizationType
-            >>> config = EasyDeLQuantizationConfig(dtype=QuantizationType.NF4, block_size=64)
+            >>> from easydel.layers.quantization import QuantizationConfig, QuantizationType
+            >>> config = QuantizationConfig(dtype=QuantizationType.NF4, block_size=64)
             >>> quantized_model = model.quantize(quantization_config=config)
         """
-        from easydel.layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer, QuantizationType
+        from easydel.layers.components import EasyQuantizer, QuantizationConfig, QuantizationType
 
         if quantization_config is None:
-            quantization_config = EasyDeLQuantizationConfig(dtype=QuantizationType.INT8)
+            quantization_config = QuantizationConfig(dtype=QuantizationType.INT8)
 
         quantizer = EasyQuantizer(quantization_config=quantization_config)
+        if quantize_modules is None:
+            quantize_modules = not quantize_tensors
+        if quantize_modules and quantize_tensors:
+            raise ValueError("`quantize_tensors` and `quantize_modules` both can't be True.")
 
         if verbose is None:
             verbose = jax.process_index() == 0
         if quantize_tensors:
-            ...
-        else:
-            self = quantizer.quantize_linears(self, verbose=verbose)
+            self = quantizer.quantize_model_tensors(self)
+        elif quantize_modules:
+            self = quantizer.quantize_modules(self, verbose=verbose)
+        elif raise_error:
+            raise ValueError(
+                "both `quantize_modules` and `quantize_tensors` can't be False at a time u can pass `raise_error=False` to skip this error."
+            )
         return self
 
     def to_state(self, state_class: type[EasyDeLState] | None = None) -> EasyDeLState:
@@ -1124,14 +1139,14 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         """
         raise NotImplementedError()
 
-    def get_embedding(self: Self) -> nn.Module | nn.Embed:
+    def get_embedding(self: Self) -> nn.Module | Embed:
         """Return the input embedding layer of the model.
 
         This method should be overridden by models to return their token
         embedding layer. Useful for weight tying or accessing embeddings directly.
 
         Returns:
-            nn.Module | nn.Embed: The embedding layer.
+            nn.Module | Embed: The embedding layer.
 
         Raises:
             NotImplementedError: If the model does not have an embedding layer.
@@ -1351,13 +1366,35 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         Returns:
             bool: True if the model contains any quantized components, False otherwise.
         """
-        from easydel.layers.quantization import Array8B, ArrayNF4, Linear8bit, LinearNF4
+        from eformer.ops.quantization import Array1B, Array8B, ArrayNF4
+
+        from easydel.layers.components import (
+            ColumnParallelLinearQuantized,
+            ParallelLinearQuantized,
+            RowParallelLinearQuantized,
+        )
 
         for _, tensor in nn.iter_graph(self):
-            if isinstance(tensor, (Linear8bit, LinearNF4)):
+            if isinstance(
+                tensor,
+                (
+                    RowParallelLinearQuantized,
+                    ColumnParallelLinearQuantized,
+                    ParallelLinearQuantized,
+                ),
+            ):
                 return True
 
-            if isinstance(getattr(tensor, "value", getattr(tensor, "raw_value", tensor)), (Array8B, ArrayNF4)):
+            possible_tensor = getattr(tensor, "value", getattr(tensor, "raw_value", tensor))
+
+            if isinstance(possible_tensor, (Array8B, ArrayNF4, Array1B)):
+                return True
+
+            if getattr(possible_tensor, "dtype", None) in [
+                jnp.float8_e4m3,
+                jnp.float8_e5m2,
+                jnp.float4_e2m1fn,
+            ]:
                 return True
         return False
 
@@ -1452,11 +1489,12 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         Returns:
             Partial function for state dict conversion with layer information and sharding.
         """
-        from easydel.layers.moe import BaseMoeModule, ParallelMoELinear
+        from easydel.layers.components import BaseMoeModule, Embed, ParallelMoELinear
         from easydel.utils import traversals
         from easydel.utils.parameters_transformation import StateDictConverter
 
         embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.Embed)]
+        embedding_path.extend([".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, Embed)])
         layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.LayerNorm)]
         moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
         moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
@@ -1716,11 +1754,12 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         Returns:
             tp.Callable: A partial function for converting a PyTorch state dict without applying sharding.
         """
-        from easydel.layers.moe import BaseMoeModule, ParallelMoELinear
+        from easydel.layers.components import BaseMoeModule, Embed, ParallelMoELinear
         from easydel.utils import traversals
         from easydel.utils.parameters_transformation import StateDictConverter
 
         embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.Embed)]
+        embedding_path.extend([".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, Embed)])
         layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.LayerNorm)]
         moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
         moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]

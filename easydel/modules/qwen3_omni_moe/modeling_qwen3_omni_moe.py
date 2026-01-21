@@ -59,15 +59,17 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.moe import (
+from easydel.layers.components import (
     BaseMoeModule,
+    ColumnParallelLinear,
     ColumnParallelMoELinear,
+    Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    RMSNorm,
+    RowParallelLinear,
     RowParallelMoELinear,
 )
-from easydel.layers.norms import RMSNorm
 
 from .qwen3_omni_moe_configuration import (
     Qwen3OmniMoeAudioConfig,
@@ -1073,7 +1075,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.pos_embed = nn.Embed(
+        self.pos_embed = Embed(
             num_embeddings=config.num_position_embeddings,
             features=config.hidden_size,
             dtype=dtype,
@@ -2408,7 +2410,7 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
         )
 
         self.codec_embedding = [
-            nn.Embed(
+            Embed(
                 config.vocab_size,
                 config.hidden_size,
                 embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
@@ -2622,7 +2624,7 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.codec_embedding = nn.Embed(
+        self.codec_embedding = Embed(
             config.vocab_size,
             config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
@@ -3197,7 +3199,7 @@ class Qwen3OmniMoeCode2Wav(EasyDeLBaseModule):
         )
 
         # Single embedding for all quantizers with offset-based indexing
-        self.code_embedding = nn.Embed(
+        self.code_embedding = Embed(
             config.codebook_size * config.num_quantizers,
             config.hidden_size,
             dtype=dtype,
@@ -3309,14 +3311,7 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             config.vocab_size,
             config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
@@ -3502,14 +3497,8 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         )
 
         text_config = config.text_config
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=text_config.gradient_checkpointing,
-            save_names=text_config.gradient_checkpointing_targets,
-            exclude_names=text_config.gradient_checkpointing_targets,
-        )
 
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             text_config.vocab_size,
             text_config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=text_config.initializer_range),

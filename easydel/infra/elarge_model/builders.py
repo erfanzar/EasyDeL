@@ -37,7 +37,7 @@ from eformer.common_types import NOT_GIVEN
 from easydel.inference.esurge.esurge_engine import DEFAULT_DETOKENIZER_MAX_STATES
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType
-from easydel.layers.quantization.quantizers import EasyDeLQuantizationConfig
+from easydel.layers.components.quants._quants import QuantizationConfig
 from easydel.modules.auto import (
     AutoEasyDeLAnyToAnyModel,
     AutoEasyDeLModel,
@@ -90,7 +90,7 @@ def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[s
     config_kwargs.pop("platform", None)
     quant_model = quant.get("model")
     if quant_model is not None:
-        quant_model = EasyDeLQuantizationConfig(**quant_model)
+        quant_model = QuantizationConfig(**quant_model)
     return dict(
         pretrained_model_name_or_path=model["name_or_path"],
         device=loader.get("device"),
@@ -109,6 +109,7 @@ def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[s
         partition_rules=sharding.get("partition_rules"),
         quantization_config=quant_model,
         quantize_tensors=bool(quant.get("quantize_tensors", False)),
+        quantize_modules=bool(quant.get("quantize_modules", False)),
         verbose=bool(loader.get("verbose", True)),
         from_torch=loader.get("from_torch"),
         trust_remote_code=loader.get("trust_remote_code", False),

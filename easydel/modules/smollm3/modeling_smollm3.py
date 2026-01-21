@@ -48,8 +48,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.layers.components import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
 
 from .smollm3_configuration import SmolLM3Config
 
@@ -462,7 +461,7 @@ class SmolLM3Model(EasyDeLBaseModule):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.Precision): Precision setting for JAX operations.
-        embed_tokens (nn.Embed): Token embedding layer.
+        embed_tokens (Embed): Token embedding layer.
         layers (list[SmolLM3DecoderLayer]): List of decoder layers.
         norm (RMSNorm): Final layer normalization.
     """
@@ -494,7 +493,7 @@ class SmolLM3Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = nn.Embed(
+        self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
@@ -654,7 +653,7 @@ class SmolLM3Model(EasyDeLBaseModule):
         """Returns the embedding layer of the module.
 
         Returns:
-            nn.Embed: The token embedding layer that maps token IDs to embeddings.
+            Embed: The token embedding layer that maps token IDs to embeddings.
         """
         return self.embed_tokens
 

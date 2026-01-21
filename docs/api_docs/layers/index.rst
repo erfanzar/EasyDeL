@@ -6,12 +6,8 @@ easydel.layers package
 
    base_modules/index
    caching/index
-   moe/index
+   components/index
    operations/index
-   quantization/index
    attention
    attention_unified
    decoder_base
-   linear
-   norms
-   rotary_embedding

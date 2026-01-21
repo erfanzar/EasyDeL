@@ -1464,9 +1464,7 @@ class eLargeModel:
 
             resolved_reward = reward_funcs if reward_funcs is not None else reward_model
             if resolved_reward is None:
-                raise ValueError(
-                    "ppo training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
-                )
+                raise ValueError("ppo training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg).")
 
             trainer_kwargs["arguments"] = training_args
             trainer_kwargs["model"] = model

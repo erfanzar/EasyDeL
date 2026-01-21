@@ -43,7 +43,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
 
 from .gpt_j_configuration import GPTJConfig as GPTJConfig
 
@@ -616,7 +616,7 @@ class GPTJModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.embed_dim = config.hidden_size
-        self.wte = nn.Embed(
+        self.wte = Embed(
             self.config.vocab_size,
             self.embed_dim,
             embedding_init=nn.initializers.normal(stddev=config.initializer_range),

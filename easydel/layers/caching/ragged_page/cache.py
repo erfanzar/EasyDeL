@@ -36,7 +36,7 @@ from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, OperationsMe
 from .utils import kv_cache_update, kv_cache_update_jax
 
 if tp.TYPE_CHECKING:
-    from easydel.layers.quantization.quantizers import EasyQuantizer
+    from easydel.layers.components.quants._quants import EasyQuantizer
 else:
     EasyQuantizer = object
 
@@ -348,7 +348,7 @@ class RaggedPagesCacheView(BaseCacheView):
         Returns:
             RaggedPagesCacheView: Initialized cache view.
         """
-        from easydel.layers.quantization.quantizers import EasyQuantizer as EQ
+        from easydel.layers.components.quants._quants import EasyQuantizer as EQ
 
         if quantizer is None:
             quantizer = EQ(quantization_config=None)

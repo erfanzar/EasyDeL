@@ -48,15 +48,15 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear
-from easydel.layers.moe import (
+from easydel.layers.components import (
     BaseMoeModule,
+    ColumnParallelLinear,
     ColumnParallelMoELinear,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    RMSNorm,
     RowParallelMoELinear,
 )
-from easydel.layers.norms import RMSNorm
 
 from .arctic_configuration import ArcticConfig
 
@@ -186,7 +186,7 @@ class ArcticAttention(UnifiedAttention):
         Returns:
             RowParallelLinear: Output projection layer.
         """
-        from easydel.layers.linear import RowParallelLinear
+        from easydel.layers.components import RowParallelLinear
 
         return RowParallelLinear(
             config.num_attention_heads * self.head_dim,
@@ -760,13 +760,7 @@ class ArcticModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             self.config.vocab_size,
             self.config.hidden_size,
             dtype=dtype,
@@ -962,7 +956,7 @@ class ArcticModel(EasyDeLBaseModule):
         """Returns the embedding layer.
 
         Returns:
-            nn.Embed: The token embedding layer.
+            Embed: The token embedding layer.
         """
         return self.embed_tokens
 

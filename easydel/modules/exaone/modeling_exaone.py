@@ -42,8 +42,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.layers.components import ColumnParallelLinear, RMSNorm
 
 from .exaone_configuration import ExaoneConfig
 
@@ -454,7 +453,7 @@ class ExaoneModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.wte = nn.Embed(
+        self.wte = Embed(
             self.config.vocab_size,
             self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),

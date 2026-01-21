@@ -28,8 +28,7 @@ from eformer.common_types import (
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
-from easydel.layers.moe.utils import get_moe_partition_spec
-from easydel.layers.rotary_embedding import RopeConfig
+from easydel.layers.components import RopeConfig, get_moe_partition_spec
 
 
 class ExpertTensorParallel(DynamicShardingAxes):

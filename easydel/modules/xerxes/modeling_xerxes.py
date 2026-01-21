@@ -40,8 +40,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.layers.components import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
 
 from .xerxes_configuration import XerxesConfig as XerxesConfig
 
@@ -587,13 +586,7 @@ class XerxesModel(EasyDeLBaseModule):
         )
         self.hidden_size = self.config.hidden_size
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             self.config.vocab_size,
             self.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -623,7 +616,7 @@ class XerxesModel(EasyDeLBaseModule):
     @functools.cached_property
     def default_frequencies(self):
         from easydel.infra.utils import ModuleCaches
-        from easydel.layers.rotary_embedding import get_frequencies
+        from easydel.layers.components import get_frequencies
 
         frequencies = get_frequencies(
             head_size=self.config.head_dim,

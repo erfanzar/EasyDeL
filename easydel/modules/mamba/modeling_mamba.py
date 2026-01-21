@@ -33,8 +33,8 @@ from easydel.infra.modeling_outputs import BaseModelOutput
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import RecurrentCache, RecurrentCacheConfig, RecurrentCacheView
-from easydel.layers.linear import ColumnParallelLinear
-from easydel.layers.norms import RMSNorm as MambaRMSNorm
+from easydel.layers.components import ColumnParallelLinear
+from easydel.layers.components import RMSNorm as MambaRMSNorm
 from easydel.layers.operations import OperationMetadata
 from easydel.layers.operations.modules import SSM1Op
 
@@ -597,7 +597,7 @@ class MambaModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embeddings = nn.Embed(
+        self.embeddings = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,

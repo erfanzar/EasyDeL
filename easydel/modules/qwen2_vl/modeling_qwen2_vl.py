@@ -49,8 +49,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.layers.components import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
 
 from .qwen2_vl_configuration import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
 
@@ -1473,13 +1472,7 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
             dtype=dtype,
@@ -2077,7 +2070,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         """Get the token embedding layer.
 
         Returns:
-            nn.Embed: The token embedding layer from the language model.
+            Embed: The token embedding layer from the language model.
         """
         return self.base_model.get_embedding()
 

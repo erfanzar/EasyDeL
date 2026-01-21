@@ -66,6 +66,9 @@ class DtypeHandler:
                 "fp64": jnp.float64,
                 "float64": jnp.float64,
                 "fp8": jnp.float8_e5m2,
+                "nvfp8": jnp.float8_e4m3,
+                "mxfp8": jnp.float8_e5m2,
+                "mxfp4": jnp.float4_e2m1fn,
                 "fp8_e4m3fn": jnp.float8_e4m3fn,
                 "fp8_e4m3fnuz": jnp.float8_e4m3fnuz,
                 "fp8_e4m3b11fnuz": jnp.float8_e4m3b11fnuz,
@@ -553,7 +556,7 @@ class StateDictConverter:
         graphtree = unflatten_dict(module.parameters)
         model_parameters = flatten_dict(graphtree, sep=".")
 
-        from easydel.layers.moe import BaseMoeModule, ParallelMoELinear
+        from easydel.layers.components import BaseMoeModule, ParallelMoELinear
         from easydel.utils import traversals
 
         md = ParallelMoELinear

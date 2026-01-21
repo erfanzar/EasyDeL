@@ -37,8 +37,7 @@ from easydel.layers.attention import MaskInfo
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import HybridCache, HybridCacheView, OperationsMetadata
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.layers.components import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
 from easydel.layers.operations import OperationMetadata
 from easydel.layers.operations.modules import SSM2Op
 
@@ -1010,7 +1009,7 @@ class FalconH1Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = nn.Embed(
+        self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
@@ -1196,7 +1195,7 @@ class FalconH1Model(EasyDeLBaseModule):
         """Return the token embedding layer of the model.
 
         Returns:
-            nn.Embed: Token embedding layer.
+            Embed: Token embedding layer.
         """
         return self.embed_tokens
 
@@ -1457,6 +1456,6 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):
         """Return the token embedding layer of the underlying model.
 
         Returns:
-            nn.Embed: Token embedding layer from the base FalconH1Model.
+            Embed: Token embedding layer from the base FalconH1Model.
         """
         return self.model.get_embedding()

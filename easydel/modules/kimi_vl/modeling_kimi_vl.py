@@ -1359,7 +1359,7 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         """Get the token embedding layer.
 
         Returns:
-            nn.Embed: The language model's token embeddings.
+            Embed: The language model's token embeddings.
         """
         return self.language_model.get_embedding()
 

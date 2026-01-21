@@ -29,8 +29,7 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.layers.components import ColumnParallelLinear, RMSNorm, RowParallelLinear
 
 from .pixtral_configuration import PixtralVisionConfig
 

@@ -49,8 +49,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.layers.components import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
 
 from .glm4v_configuration import Glm4vConfig, Glm4vTextConfig, Glm4vVisionConfig
 
@@ -647,7 +646,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         )
 
         num_positions = int((config.image_size // config.patch_size) ** 2)
-        self.pos_embed = nn.Embed(
+        self.pos_embed = Embed(
             num_embeddings=num_positions,
             features=config.hidden_size,
             dtype=dtype,
@@ -1241,7 +1240,7 @@ class Glm4vTextModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embed_tokens = nn.Embed(
+        self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
@@ -1408,7 +1407,7 @@ class Glm4vTextModel(EasyDeLBaseModule):
         """Return the token embedding layer.
 
         Returns:
-            nn.Embed: The token embedding layer.
+            Embed: The token embedding layer.
         """
         return self.embed_tokens
 
@@ -1470,7 +1469,7 @@ class Glm4vModel(EasyDeLBaseModule):
         """Return the input token embedding layer.
 
         Returns:
-            nn.Embed: The token embedding layer from the language model.
+            Embed: The token embedding layer from the language model.
         """
         return self.language_model.get_embedding()
 
@@ -1927,7 +1926,7 @@ class Glm4vModel(EasyDeLBaseModule):
         """Return the token embedding layer.
 
         Returns:
-            nn.Embed: The token embedding layer from the language model.
+            Embed: The token embedding layer from the language model.
         """
         return self.language_model.embed_tokens
 

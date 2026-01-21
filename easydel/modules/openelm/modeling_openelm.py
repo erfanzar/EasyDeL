@@ -41,8 +41,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.layers.components import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
 
 from .openelm_configuration import OpenELMConfig, make_divisible
 
@@ -630,7 +629,7 @@ class OpenELMModel(EasyDeLBaseModule):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
-        token_embeddings (nn.Embed): Embedding layer for input tokens.
+        token_embeddings (Embed): Embedding layer for input tokens.
         layers (tp.List[OpenELMDecoderLayer]): List of decoder layers.
         norm (RMSNorm): Final layer normalization.
         gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
@@ -661,7 +660,7 @@ class OpenELMModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.token_embeddings = nn.Embed(
+        self.token_embeddings = Embed(
             config.vocab_size,
             config.model_dim,
             dtype=dtype,

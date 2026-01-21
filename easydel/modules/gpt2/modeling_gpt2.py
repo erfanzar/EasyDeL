@@ -641,13 +641,7 @@ class GPT2Model(EasyDeLBaseModule):
         )
         self.embed_dim = self.config.hidden_size
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=self.config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.wte = embed_block(
+        self.wte = Embed(
             self.config.vocab_size,
             self.embed_dim,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -655,7 +649,7 @@ class GPT2Model(EasyDeLBaseModule):
             rngs=rngs,
             param_dtype=param_dtype,
         )
-        pos_embed_block = nn.Embed
+        pos_embed_block = Embed
         pos_embed_block = auto_remat(
             pos_embed_block,
             policy=self.config.gradient_checkpointing,

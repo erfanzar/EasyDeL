@@ -104,11 +104,11 @@ logger = get_logger("eSurgeEngine")
 # Configuration constants
 DEFAULT_DETOKENIZER_MAX_STATES = 1 << 16  # 65536 states for streaming decode
 DEFAULT_PAGE_SIZE_GPU_MIN = 256  # Minimum efficient page size for GPU
-DEFAULT_DECODE_INTERVAL_TOKENS = 4  # Decode every N tokens
-DEFAULT_DECODE_INTERVAL_SECS = 0.02  # Or decode every N seconds (20ms)
+DEFAULT_DECODE_INTERVAL_TOKENS = 16  # Decode every N tokens
+DEFAULT_DECODE_INTERVAL_SECS = 0.04  # Or decode every N seconds (20ms)
 # Default to fail-fast (1) so benchmark runs don't spin for hours on fatal errors.
 # Set `EASURGE_MAX_SCHEDULER_ERRORS=10` (or higher) to restore retry behavior.
-MAX_CONSECUTIVE_SCHEDULER_ERRORS = int(os.environ.get("EASURGE_MAX_SCHEDULER_ERRORS", "1"))
+MAX_CONSECUTIVE_SCHEDULER_ERRORS = int(os.environ.get("EASURGE_MAX_SCHEDULER_ERRORS", "5"))
 WORKER_DRAIN_MAX_RETRIES = 3  # Maximum retry attempts for worker drain
 WORKER_DRAIN_INITIAL_DELAY = 0.1  # Initial retry delay in seconds
 
@@ -619,6 +619,10 @@ class eSurge:
         self._scheduler_running = False
         self._scheduler_exception: BaseException | None = None
         self._scheduler_exception_tb: str | None = None
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+
+        self.__eos_ids = eos_token_id if isinstance(eos_token_id, (list, tuple, set)) else [eos_token_id]
+        self.__eos_set = {int(tid) for tid in self.__eos_ids if tid is not None}
 
         self.initiate()
 
@@ -950,11 +954,8 @@ class eSurge:
 
     def _filter_eos_tokens(self, tokens: list[int]) -> list[int]:
         """Remove eos tokens from a token list before decoding."""
-        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
-        if eos_token_id is None:
-            return tokens
-        eos_ids = eos_token_id if isinstance(eos_token_id, (list, tuple, set)) else [eos_token_id]
-        eos_set = {int(tid) for tid in eos_ids if tid is not None}
+
+        eos_set = self.__eos_set
         if not eos_set:
             return tokens
         return [tok for tok in tokens if tok not in eos_set]
@@ -2358,7 +2359,7 @@ class eSurge:
                                 ro.delta_seq += 1
                                 text_changed = True
 
-                        ro.num_generated_tokens = len(rd["generated_tokens"])
+                        ro.num_generated_tokens = num_generated
 
                         elapsed = now - rd["start_time"]
                         ro.processing_time = elapsed

@@ -36,7 +36,7 @@ from easydel.layers.caching import (
     TransformerCache,
     TransformerMetadata,
 )
-from easydel.layers.linear import RowParallelLinear
+from easydel.layers.components import RowParallelLinear
 
 from ..auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 from .llava_configuration import LlavaConfig
@@ -513,7 +513,7 @@ class LlavaModel(EasyDeLBaseModule):
         """Return the embedding layer of the model.
 
         Returns:
-            nn.Embed: The text embedding layer from the language model.
+            Embed: The text embedding layer from the language model.
         """
         return self.language_model.get_embedding()
 

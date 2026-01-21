@@ -44,8 +44,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.layers.components import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
 
 from .exaone4_configuration import Exaone4Config
 
@@ -491,7 +490,7 @@ class Exaone4Model(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embed_tokens = nn.Embed(
+        self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
@@ -644,7 +643,7 @@ class Exaone4Model(EasyDeLBaseModule):
         """Returns the embedding layer of the module.
 
         Returns:
-            nn.Embed: The token embedding layer.
+            Embed: The token embedding layer.
         """
         return self.embed_tokens
 

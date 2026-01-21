@@ -15,6 +15,8 @@
 from dataclasses import dataclass
 from typing import Literal
 
+LONG_PREFILL_TRS: int = 2048
+
 
 @dataclass
 class SchedulerConfig:
@@ -51,8 +53,8 @@ class SchedulerConfig:
     policy: Literal["priority", "fcfs"] = "fcfs"
     """The scheduling policy to use, such as 'priority' or 'fcfs'."""
 
-    long_prefill_token_threshold: int = 256
-    """A token threshold for handling long prefill requests."""
+    long_prefill_token_threshold: int | None = None
+    """A token threshold for handling long prefill requests (this can overwrite the max_num_batched_tokens)."""
 
     chunked_prefill_enabled: bool = False
     """A flag to enable or disable chunked prefilling."""
@@ -82,7 +84,11 @@ class SchedulerConfig:
                 f"max_num_batched_tokens ({self.max_num_batched_tokens}) cannot exceed "
                 f"max_model_len ({self.max_model_len})"
             )
-
+        if self.long_prefill_token_threshold is None:
+            if self.max_num_batched_tokens is not None:
+                self.long_prefill_token_threshold = self.max_num_batched_tokens
+            else:
+                self.long_prefill_token_threshold = LONG_PREFILL_TRS
         if self.long_prefill_token_threshold < 0:
             raise ValueError(
                 f"long_prefill_token_threshold must be non-negative, got {self.long_prefill_token_threshold}"

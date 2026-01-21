@@ -80,7 +80,7 @@ from jax.sharding import PartitionSpec
 from transformers.utils.generic import working_or_temp_dir
 from transformers.utils.hub import PushToHubMixin
 
-from easydel.layers.quantization import EasyDeLQuantizationConfig
+from easydel.layers.components import QuantizationConfig
 from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
 from easydel.utils.traversals import flatten_dict, is_flatten, merge_model_and_tree, string_key_to_int, unflatten_dict
 
@@ -496,10 +496,11 @@ class EasyBridgeMixin(PushToHubMixin):
         param_dtype: jnp.dtype,
         mesh: jax.sharding.Mesh,
         shard_fns: dict[tp.Callable] | None,
-        quantization_config: EasyDeLQuantizationConfig | None,
+        quantization_config: QuantizationConfig | None,
         quantize_tensors: bool,
-        vebose: bool,
-    ) -> EasyDeLBaseModule:
+        quantize_modules: bool,
+        verbose: bool,
+    ) -> tuple[EasyDeLBaseModule, bool]:
         """Loads model weights from a checkpoint file.
 
         Args:
@@ -510,17 +511,17 @@ class EasyBridgeMixin(PushToHubMixin):
             mesh (jax.sharding.Mesh): The JAX mesh for distributed sharding.
             shard_fns (dict[Callable] | None): Custom shard functions for loading checkpoint.
                 Defaults to None.
-            quantization_config (EasyDeLQuantizationConfig | None): Quantization configuration
+            quantization_config (QuantizationConfig | None): Quantization configuration
                 for loading. Pass None to disable quantization.
             quantize_tensors (bool): Whether to quantize tensors during loading.
-            vebose (bool): Whether to print verbose messages during loading.
+            verbose (bool): Whether to print verbose messages during loading.
 
         Returns:
             EasyDeLBaseModule: The model with loaded parameters.
         """
         callback = None
         if quantize_tensors and quantization_config is not None:
-            from easydel.layers.quantization.quantizers import EasyQuantizer
+            from easydel.layers.components.quants._quants import EasyQuantizer
 
             quantizer = EasyQuantizer(quantization_config=quantization_config)
             if quantize_tensors:
@@ -548,9 +549,11 @@ class EasyBridgeMixin(PushToHubMixin):
                 return x
 
         extraargs = {}
+        itwas_tensorstore = False
         if resolved_archive_file:
             if str(resolved_archive_file).endswith(TENSORSTORE_INDEX_NAME):
                 resolved_archive_file = str(resolved_archive_file)[: -len(TENSORSTORE_INDEX_NAME)]
+                itwas_tensorstore = True
             else:
                 extraargs["callback"] = callback
             state, _ = Checkpointer(
@@ -578,7 +581,12 @@ class EasyBridgeMixin(PushToHubMixin):
             required_params = set(flatten_dict(model.graphtree_params_shape))
             unexpected_keys = set(state.keys()) - required_params
             if any([k[-1].startswith("quant_") for k in state.keys()]):
-                model = model.quantize(quantization_config=quantization_config, verbose=vebose)
+                model = model.quantize(
+                    quantization_config=quantization_config,
+                    quantize_tensors=False,
+                    quantize_modules=True,
+                    verbose=verbose,
+                )
             for unexpected_key in unexpected_keys:
                 del state[unexpected_key]
 
@@ -603,10 +611,10 @@ class EasyBridgeMixin(PushToHubMixin):
             else:
                 state = jax.tree_util.tree_map(_convert, state)
 
-            return merge_model_and_tree(model=model, tree=unflatten_dict(state))
+            return merge_model_and_tree(model=model, tree=unflatten_dict(state)), itwas_tensorstore
 
         else:
-            return model
+            return model, itwas_tensorstore
 
     @classmethod
     def from_pretrained(
@@ -634,9 +642,9 @@ class EasyBridgeMixin(PushToHubMixin):
         local_files_only: bool = False,
         token: str | bool | None = None,
         revision: str = "main",
-        vebose: bool = True,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
-        quantize_tensors: bool = True,
+        quantization_config: QuantizationConfig | None = None,
+        quantize_tensors: bool = False,
+        quantize_modules: bool = False,
         **kwargs,
     ):
         """Loads an EasyDeL model from a pretrained model or path.
@@ -679,10 +687,11 @@ class EasyBridgeMixin(PushToHubMixin):
             token (str | bool | None): HuggingFace Hub authentication token. Defaults to None.
             revision (str): The specific model version to use (branch, tag, or commit).
                 Defaults to "main".
-            vebose (bool): Legacy parameter for verbose output. Defaults to True.
-            quantization_config (EasyDeLQuantizationConfig | None): Quantization configuration
+            verbose (bool): Legacy parameter for verbose output. Defaults to True.
+            quantization_config (QuantizationConfig | None): Quantization configuration
                 for loading. Pass None to disable. Defaults to None.
-            quantize_tensors (bool): Whether to quantize tensors during loading. Defaults to True.
+            quantize_tensors (bool): Whether to quantize tensors during loading. Defaults to False.
+            quantize_modules (bool): Whether to quantize model linear or module classes. Defaults to False.
             **kwargs: Additional keyword arguments (e.g., proxies, trust_remote_code, subfolder).
 
         Returns:
@@ -874,7 +883,7 @@ class EasyBridgeMixin(PushToHubMixin):
             precision=precision,
             rngs=nn.Rngs(0),
         )
-        model = cls._load_model_weights(
+        model, itwas_tensorstore = cls._load_model_weights(
             resolved_archive_file,
             model,
             param_dtype,
@@ -882,15 +891,17 @@ class EasyBridgeMixin(PushToHubMixin):
             shard_fns,
             quantization_config,
             quantize_tensors,
-            vebose,
+            quantize_modules,
+            verbose,
         )
-
-        if not quantize_tensors and quantization_config is not None:
-            model = model.quantize(
-                quantization_config=quantization_config,
-                quantize_tensors=quantize_tensors,
-                verbose=vebose,
-            )
+        quantize_tensors = quantize_tensors and itwas_tensorstore and quantization_config is not None
+        model = model.quantize(
+            quantization_config=quantization_config,
+            quantize_tensors=quantize_tensors,
+            quantize_modules=quantize_modules,
+            verbose=verbose,
+            raise_error=False,
+        )
         if model.can_generate():
             try:
                 model.generation_config = GenerationConfig.from_pretrained(
@@ -931,8 +942,9 @@ class EasyBridgeMixin(PushToHubMixin):
         config_kwargs: EasyDeLBaseConfigDict | None = None,
         auto_shard_model: bool = True,
         partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
-        quantize_tensors: bool = True,
+        quantization_config: QuantizationConfig | None = None,
+        quantize_tensors: bool = False,
+        quantize_modules: bool = False,
         verbose: bool = True,
         **kwargs,
     ):
@@ -968,9 +980,10 @@ class EasyBridgeMixin(PushToHubMixin):
             auto_shard_model (bool): Whether to automatically shard the model. Defaults to True.
             partition_rules (tuple[tuple[str, PartitionSpec], ...] | None): Custom partitioning
                 rules for sharding. Defaults to None.
-            quantization_config (EasyDeLQuantizationConfig | None): Quantization configuration.
+            quantization_config (QuantizationConfig | None): Quantization configuration.
                 Pass None to disable. Defaults to None.
-            quantize_tensors (bool): Whether to quantize tensors during loading. Defaults to True.
+            quantize_tensors (bool): Whether to quantize tensors during loading. Defaults to False.
+            quantize_modules (bool): Whether to quantize model linear or module classes. Defaults to False.
             verbose (bool): Whether to print verbose messages. Defaults to True.
             **kwargs: Additional keyword arguments including:
                 - torch_load_mode (str): "full" or "streaming". Defaults to "streaming".
@@ -987,7 +1000,7 @@ class EasyBridgeMixin(PushToHubMixin):
         """
         from transformers import AutoConfig
 
-        from easydel.layers.quantization.quantizers import EasyQuantizer
+        from easydel.layers.components.quants._quants import EasyQuantizer
         from easydel.modules.auto.auto_configuration import AutoShardAndGatherFunctions, get_modules_by_type
 
         try:
@@ -1143,12 +1156,14 @@ class EasyBridgeMixin(PushToHubMixin):
         logger.debug("merging model and parameters pytree.")
         model = merge_model_and_tree(model=model, tree=params)
         logger.debug("model and parameters pytree merged.")
-        if quantization_config is not None and not quantize_tensors:
-            logger.debug("quantizing model.")
-            model = model.quantize(
-                quantization_config=quantization_config,
-                verbose=verbose,
-            )
+
+        model = model.quantize(
+            quantization_config=quantization_config,
+            quantize_tensors=quantize_tensors,
+            quantize_modules=quantize_modules,
+            raise_error=False,
+        )
+
         logger.debug("returning model.")
         return model
 

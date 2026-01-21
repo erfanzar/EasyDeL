@@ -33,7 +33,7 @@ from easydel.layers.caching.ragged_page.utils import kv_cache_update_jax
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, unwrap_metadata
 
 if tp.TYPE_CHECKING:
-    from easydel.layers.quantization.quantizers import EasyQuantizer
+    from easydel.layers.components.quants._quants import EasyQuantizer
 else:
     EasyQuantizer = object
 

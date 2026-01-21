@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import itertools
+import time
 import typing
 from collections import defaultdict
 from collections.abc import Iterable
@@ -182,8 +183,6 @@ class Scheduler(SchedulerInterface):
         return desired_running <= bucket
 
     def schedule(self) -> SchedulerOutput:
-        import time
-
         schedule_start_time = time.time()
         scheduled_new_reqs: list[EngineRequest] = []
         scheduled_resumed_reqs: list[EngineRequest] = []
@@ -276,9 +275,7 @@ class Scheduler(SchedulerInterface):
                 if num_scheduled_spec_tokens > 0:
                     del request.spec_token_ids[num_scheduled_spec_tokens:]
                     scheduled_spec_decode_tokens[request.request_id] = request.spec_token_ids
-
         skipped_waiting_requests = create_request_queue(self.policy)
-
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if not self._ensure_capacity(len(self.running) + 1):
@@ -340,7 +337,6 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
-
                 new_pages = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens + num_external_computed_tokens,
@@ -396,6 +392,7 @@ class Scheduler(SchedulerInterface):
 
         num_common_prefix_pages = [0] * len(self.kv_cache_config.kv_cache_groups)
         scheduled_req_count = len(num_scheduled_tokens)
+
         if scheduled_req_count > 0:
             if scheduled_running_reqs:
                 representative_req = scheduled_running_reqs[0]
@@ -410,9 +407,11 @@ class Scheduler(SchedulerInterface):
                 num_common_prefix_pages = self.kv_cache_manager.get_num_common_prefix_pages(
                     representative_req, scheduled_req_count
                 )
+
         new_reqs_data = [
             NewRequestData.from_request(req, req_to_new_page_ids[req.request_id]) for req in scheduled_new_reqs
         ]
+
         cached_reqs_data = self._make_cached_request_data(
             scheduled_running_reqs,
             scheduled_resumed_reqs,
@@ -420,6 +419,7 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens,
             req_to_new_page_ids,
         )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -431,9 +431,7 @@ class Scheduler(SchedulerInterface):
             suggested_bucket=self._current_seq_bucket,  # Hint for runner's buffer selection
             async_scheduling=self.scheduler_config.async_scheduling,  # Pass async config to runner
         )
-
         self._update_after_schedule(scheduler_output)
-
         # Log scheduler metrics
         schedule_time = time.time() - schedule_start_time
         metrics_collector = get_metrics_collector()

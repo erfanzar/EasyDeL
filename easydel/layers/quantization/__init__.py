@@ -12,22 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Re-export eformer quantization types for convenience
-from eformer.ops.quantization import Array8B, ArrayNF4, QuantizationConfig, QuantizationType, quantize, straight_through
+"""Compatibility exports for quantization utilities."""
 
-from .linear_8bit import Linear8bit
-from .linear_nf4 import LinearNF4
-from .quantizers import EasyDeLQuantizationConfig, EasyQuantizer
+from ..components.quants import (
+    EasyQuantizer,
+    QuantizationConfig,
+    QuantizationType,
+    quantize,
+    straight_through,
+    straight_through_1bit,
+    straight_through_8bit,
+    straight_through_mxfp4,
+    straight_through_mxfp8,
+    straight_through_nf4,
+    straight_through_nvfp8,
+)
+
+# Backward-compatible alias for older API surface.
+EasyDeLQuantizationConfig = QuantizationConfig
 
 __all__ = (
-    "Array8B",
-    "ArrayNF4",
     "EasyDeLQuantizationConfig",
     "EasyQuantizer",
-    "Linear8bit",
-    "LinearNF4",
     "QuantizationConfig",
     "QuantizationType",
     "quantize",
     "straight_through",
+    "straight_through_1bit",
+    "straight_through_8bit",
+    "straight_through_mxfp4",
+    "straight_through_mxfp8",
+    "straight_through_nf4",
+    "straight_through_nvfp8",
 )
