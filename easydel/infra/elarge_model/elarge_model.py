@@ -152,7 +152,7 @@ class eLargeModel:
         """
         if config is None:
             self._config = normalize({"model": {"name_or_path": ""}})
-        elif isinstance(config, str | os.PathLike) or hasattr(config, "__fspath__"):
+        elif isinstance(config, (str, os.PathLike)) or hasattr(config, "__fspath__"):
             self._config = load_elm_config(config)
         else:
             self._config = normalize(config)
@@ -802,11 +802,11 @@ class eLargeModel:
             raise ImportError("PyYAML is required for YAML configs. Install with: pip install pyyaml") from e
 
         def to_yamlable(obj: Any) -> Any:
-            if obj is None or isinstance(obj, str | int | float | bool):
+            if obj is None or isinstance(obj, (str, int, float, bool)):
                 return obj
             if isinstance(obj, dict):
                 return {str(k): to_yamlable(v) for k, v in obj.items()}
-            if isinstance(obj, list | tuple | set):
+            if isinstance(obj, (list, tuple, set)):
                 return [to_yamlable(v) for v in obj]
             if hasattr(obj, "to_dict") and callable(obj.to_dict):
                 return to_yamlable(obj.to_dict())
@@ -1738,7 +1738,7 @@ class eLargeModel:
             for task, metrics in results.get("results", {}).items():
                 logger.info(f"{task}:")
                 for metric, value in metrics.items():
-                    if isinstance(value, int | float):
+                    if isinstance(value, (int, float)):
                         logger.info(f"  {metric}: {value:.4f}" if isinstance(value, float) else f"  {metric}: {value}")
 
             return results

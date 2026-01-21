@@ -30,16 +30,16 @@ def straight_through_mxfp8(weights: jax.Array):
     Straight-through mxfp8 emulator.
     """
 
-    return weights.astype(jnp.float8_e4m3).astype(weights.dtype)
+    return weights.astype(jnp.float8_e5m2).astype(weights.dtype)
 
 
 @ste
 def straight_through_nvfp8(weights: jax.Array):
     """
-    Straight-through mxfp8 emulator.
+    Straight-through nvfp8 emulator.
     """
 
-    return weights.astype(jnp.float8_e5m2).astype(weights.dtype)
+    return weights.astype(jnp.float8_e4m3).astype(weights.dtype)
 
 
 @ste

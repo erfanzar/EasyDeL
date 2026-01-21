@@ -969,9 +969,17 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
                 total_generated = 0
                 last_output: RequestOutput | None = None
+                disconnected = False
 
                 try:
                     while True:
+                        if await raw_request.is_disconnected():
+                            try:
+                                esurge.abort_request(request_id)
+                            except Exception:
+                                logger.debug("Failed to abort request %s after disconnect", request_id, exc_info=True)
+                            disconnected = True
+                            break
                         kind, payload = await queue.get()
                         if kind == _STREAM_END:
                             break
@@ -1045,6 +1053,9 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
                         total_generated = current_completion_tokens
 
+                    if disconnected:
+                        return
+
                     usage = UsageInfo(
                         prompt_tokens=prompt_tokens,
                         completion_tokens=total_generated,
@@ -1094,7 +1105,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         if isinstance(prompt_ids, list) and prompt_ids:
             first = prompt_ids[0]
             if isinstance(first, list):
-                return len(first)
+                return sum(len(seg) for seg in prompt_ids)
         if isinstance(prompt_ids, list):
             return len(prompt_ids)
         return 0
@@ -1289,6 +1300,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                     completion_tokens = 0
                     tool_calls_payload: list[tp.Any] | None = None
                     last_output: RequestOutput | None = None
+                    disconnected = False
 
                     yield self._sse_event(
                         "response.created",
@@ -1343,6 +1355,15 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
                     try:
                         while True:
+                            if await raw_request.is_disconnected():
+                                try:
+                                    esurge.abort_request(response_id)
+                                except Exception:
+                                    logger.debug(
+                                        "Failed to abort response %s after disconnect", response_id, exc_info=True
+                                    )
+                                disconnected = True
+                                break
                             kind, stream_payload = await queue.get()
                             if kind == _STREAM_END:
                                 break
@@ -1372,6 +1393,9 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                                     "delta": delta_text,
                                 },
                             )
+
+                        if disconnected:
+                            return
 
                         full_text = last_output.accumulated_text if last_output is not None else previous_text
                         if tool_request is not None and full_text:
@@ -1603,14 +1627,24 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                 tool_parser = self.get_tool_parser_for_model(request.model)
                 previous_text = ""
                 previous_token_ids: list[int] = []
-                queue = self._start_stream_task(lambda: esurge.stream(content, sampling_params))
+                queue = self._start_stream_task(
+                    lambda: esurge.stream(content, sampling_params, request_id=request_id)
+                )
                 total_generated = 0
                 generation_time = 0.0
                 tokens_per_second = 0.0
                 last_output: RequestOutput | None = None
+                disconnected = False
 
                 try:
                     while True:
+                        if await raw_request.is_disconnected():
+                            try:
+                                esurge.abort_request(request_id)
+                            except Exception:
+                                logger.debug("Failed to abort request %s after disconnect", request_id, exc_info=True)
+                            disconnected = True
+                            break
                         kind, payload = await queue.get()
                         if kind == _STREAM_END:
                             break
@@ -1624,7 +1658,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                         elapsed_time = output.processing_time
 
                         current_text = output.accumulated_text or ""
-                        delta_text = output.delta_text
+                        delta_text = self._compute_delta_text(current_text, previous_text, output.delta_text or "")
 
                         if tool_parser:
                             current_token_ids = output.outputs[0].token_ids if output.outputs else []
@@ -1680,6 +1714,9 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                         total_generated = output.num_generated_tokens
                         generation_time = output.processing_time
                         tokens_per_second = output.tokens_per_second
+
+                    if disconnected:
+                        return
 
                     if last_output is None:
                         raise RuntimeError("Streaming finished without any output")
@@ -1874,14 +1911,24 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             async with self._acquire_generation_slot():
                 prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
                 previous_text = ""
-                queue = self._start_stream_task(lambda: esurge.stream(prompt, sampling_params))
+                queue = self._start_stream_task(
+                    lambda: esurge.stream(prompt, sampling_params, request_id=request_id)
+                )
                 total_generated = 0
                 generation_time = 0.0
                 tokens_per_second = 0.0
                 last_output: RequestOutput | None = None
+                disconnected = False
 
                 try:
                     while True:
+                        if await raw_request.is_disconnected():
+                            try:
+                                esurge.abort_request(request_id)
+                            except Exception:
+                                logger.debug("Failed to abort request %s after disconnect", request_id, exc_info=True)
+                            disconnected = True
+                            break
                         kind, payload = await queue.get()
                         if kind == _STREAM_END:
                             break
@@ -1920,6 +1967,9 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                         total_generated = output.num_generated_tokens
                         generation_time = output.processing_time
                         tokens_per_second = output.tokens_per_second
+
+                    if disconnected:
+                        return
 
                     if last_output is None:
                         raise RuntimeError("Streaming finished without any output")

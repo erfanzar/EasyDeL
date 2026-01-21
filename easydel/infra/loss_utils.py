@@ -159,7 +159,7 @@ class LossConfig:
     label_smoothing: float = 0.0
     z_loss: float = 0.0
     loss_normalizing_factor: FACTOR_TYPE = "NUM_REAL_TARGET_TOKENS"
-    num_labels: str | None = None
+    num_labels: int | None = None
     problem_type: str | None = None
     divide_weight_sum: bool = False
     shift_tokens: bool = True
@@ -1028,7 +1028,7 @@ def get_factor_and_weight(
         A tuple containing the loss normalizing factor and loss weights.
     """
     loss_weights = batch.get("decoder_loss_weights", None)
-    if loss_normalizing_factor is None or not isinstance(loss_normalizing_factor, str | SLNF):
+    if loss_normalizing_factor is None or not isinstance(loss_normalizing_factor, (str, SLNF)):
         return loss_normalizing_factor, loss_weights
 
     if isinstance(loss_normalizing_factor, str):
@@ -1099,7 +1099,7 @@ def auxiliary_load_balancing_loss_func(
 
     # If gate_logits is a tuple or list, concatenate them.
     # Assumes individual layer logits are already on the correct device.
-    if isinstance(gate_logits, tuple | list):
+    if isinstance(gate_logits, (tuple, list)):
         # Ensure all logits are JAX arrays before concatenation
         gate_logits_list = [jnp.asarray(layer_gate.reshape(-1, num_experts)) for layer_gate in gate_logits]
         concatenated_gate_logits = jnp.concatenate(gate_logits_list, axis=0)
@@ -1407,9 +1407,19 @@ def ForSequenceClassificationLoss(
 
     if logits is None or labels is None:
         raise ValueError("Logits and labels cannot be None")
+    if config is None:
+        config = LossConfig()
 
-    num_labels = config.num_labels
-
+    num_labels = config.num_labels if config.num_labels is not None else config.num_classification_labels
+    if isinstance(num_labels, str):
+        try:
+            num_labels = int(num_labels)
+        except ValueError as exc:
+            raise ValueError(f"num_labels must be an int, got {num_labels!r}") from exc
+    if num_labels is None:
+        raise ValueError("num_labels must be set for sequence classification loss")
+    if config.problem_type is None and config.classification_problem_type is not None:
+        config.problem_type = config.classification_problem_type
     if config.problem_type is None:
         if num_labels == 1:
             config.problem_type = "regression"
@@ -1443,7 +1453,7 @@ def ForSequenceClassificationLoss(
         )
     else:
         raise ValueError(f"Invalid problem_type: {config.problem_type}")
-    return LossMetrics(total_loss=loss, loss=loss)
+    return LossMetrics(loss=loss)
 
 
 def ForQuestionAnsweringLoss(
