@@ -53,7 +53,7 @@ def prune_nones(obj: Any) -> Any:
     """
     if isinstance(obj, dict):
         return {k: prune_nones(v) for k, v in obj.items() if v is not None}
-    if isinstance(obj, list | tuple):
+    if isinstance(obj, (list, tuple)):
         t = type(obj)
         return t(prune_nones(v) for v in obj)
     return obj

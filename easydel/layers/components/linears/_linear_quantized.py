@@ -129,7 +129,7 @@ class ParallelLinearQuantized(nn.Module):
         if self._direction == "row":
             linear_class = RowParallelLinear
         elif self._direction == "column":
-            linear_class = RowParallelLinear
+            linear_class = ColumnParallelLinear
         else:
             raise ValueError(
                 "unknown direction detected Try To use module with Known "
@@ -150,7 +150,9 @@ class ParallelLinearQuantized(nn.Module):
             rngs,
         )
 
-        dequantized_kernel = self._dequantize_array(self.quant_kernel, self.quant_scales)
+        kernel_value = getattr(self.quant_kernel, "value", self.quant_kernel)
+        scale_value = getattr(self.quant_scales, "value", self.quant_scales)
+        dequantized_kernel = self._dequantize_array(kernel_value, scale_value)
         linear.kernel = nn.Param(dequantized_kernel)
 
         if self.use_bias:
@@ -159,11 +161,13 @@ class ParallelLinearQuantized(nn.Module):
         return linear
 
     def restage(self, kernel: jax.Array, bias: jax.Array | None):
-        wq, scale = self._quantize_array(kernel)
+        kernel_value = getattr(kernel, "value", kernel)
+        bias_value = getattr(bias, "value", bias)
+        wq, scale = self._quantize_array(kernel_value)
         self.quant_kernel.value = wq
         self.quant_scales.value = scale
-        if bias is not None:
-            self.bias.copy_from = bias
+        if bias_value is not None and self.use_bias:
+            self.bias.value = bias_value
         return self
 
     @jax.named_scope("easydel-linear-int8-call")
@@ -178,7 +182,9 @@ class ParallelLinearQuantized(nn.Module):
             subscript = "...k,...kj->...j"
 
         def normal_flow(inputs):
-            kernel = self._dequantize_array(self.quant_kernel, self.quant_scales)
+            kernel_value = getattr(self.quant_kernel, "value", self.quant_kernel)
+            scale_value = getattr(self.quant_scales, "value", self.quant_scales)
+            kernel = self._dequantize_array(kernel_value, scale_value)
 
             if self.dtype is not None:
                 inputs = inputs.astype(self.dtype)
@@ -194,7 +200,9 @@ class ParallelLinearQuantized(nn.Module):
 
             out = jnp.einsum(subscript, inputs, kernel, **kws)
         elif self.config.dtype == QuantizationType.NF4:
-            out = nf4_qmm_jax(inputs, self.quant_kernel, self.quant_scales)
+            kernel_value = getattr(self.quant_kernel, "value", self.quant_kernel)
+            scale_value = getattr(self.quant_scales, "value", self.quant_scales)
+            out = nf4_qmm_jax(inputs, kernel_value, scale_value)
         elif self.config.dtype in {QuantizationType.MXFP4, QuantizationType.MXFP8, QuantizationType.NVFP8}:
             kernel = self.quant_kernel.value
 

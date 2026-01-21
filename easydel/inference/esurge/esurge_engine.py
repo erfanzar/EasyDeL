@@ -71,6 +71,7 @@ import time
 import traceback
 import typing
 import uuid
+from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import cached_property
@@ -283,8 +284,10 @@ class eSurge:
         detokenizer_max_states: int = DEFAULT_DETOKENIZER_MAX_STATES,
         tokenizer_endpoint: str | None = None,
         detokenizer_endpoint: str | None = None,
-        sampling_params_callback: typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None]
-        | None = None,
+        max_request_outputs: int | None = 1000,
+        sampling_params_callback: (
+            typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None] | None
+        ) = None,
         extra_eos_token_ids: list[int] | None = None,
         silent_mode: bool = False,
         # Vision-language model support
@@ -344,6 +347,9 @@ class eSurge:
                 pause() to free memory, and lazily reinitializing it on resume().
             tokenizer_endpoint: ZMQ endpoint of the external tokenizer worker.
             detokenizer_endpoint: ZMQ endpoint of the external detokenizer worker.
+            max_request_outputs: Maximum number of completed RequestOutput objects
+                to retain in memory for post-hoc access. Set to None for unlimited
+                retention or <=0 to disable retention entirely.
             sampling_params_callback: Optional callable that can inspect/modify
                 the SamplingParams for each submitted request. Receives a cloned
                 SamplingParams instance and request metadata dict containing
@@ -490,9 +496,7 @@ class eSurge:
                 attn_value = (
                     requested_attn.value
                     if isinstance(requested_attn, AttentionMechanisms)
-                    else str(requested_attn)
-                    if requested_attn is not None
-                    else None
+                    else str(requested_attn) if requested_attn is not None else None
                 )
                 if backend == "gpu" and attn_value in (
                     AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2.value,
@@ -596,6 +600,8 @@ class eSurge:
         self._request_counter = 0
         self._active_requests: dict[str, dict] = {}
         self._request_outputs: dict[str, RequestOutput] = {}
+        self._max_request_outputs = None if max_request_outputs is None else int(max_request_outputs)
+        self._finished_request_ids: deque[str] = deque()
 
         # Per-request events to support many concurrent streams
         self._request_events: dict[str, threading.Event] = {}
@@ -681,6 +687,23 @@ class eSurge:
         if tb:
             raise RuntimeError(f"eSurge scheduler crashed: {exc}\n{tb}") from exc
         raise RuntimeError(f"eSurge scheduler crashed: {exc}") from exc
+
+    def _track_finished_output(self, request_id: str) -> None:
+        """Track and evict completed RequestOutput objects to cap memory usage."""
+        max_outputs = self._max_request_outputs
+        if max_outputs is None:
+            return
+        if max_outputs <= 0:
+            self._request_outputs.pop(request_id, None)
+            return
+        if request_id in self._finished_request_ids:
+            return
+        self._finished_request_ids.append(request_id)
+        while len(self._finished_request_ids) > max_outputs:
+            old_id = self._finished_request_ids.popleft()
+            if old_id == request_id:
+                continue
+            self._request_outputs.pop(old_id, None)
 
     def initiate(self) -> None:
         """Start the background scheduler thread.
@@ -1148,17 +1171,23 @@ class eSurge:
         """
         if isinstance(prompts, str):
             prompts = [prompts]
+        elif len(prompts) == 0:
+            raise ValueError("Empty prompt list provided")
 
         if request_id is None:
             request_ids = [self._generate_request_id() for _ in prompts]
         elif isinstance(request_id, str):
+            if len(prompts) != 1:
+                raise ValueError("request_id must be a list when providing multiple prompts.")
             request_ids = [request_id]
         else:
-            request_ids = request_id
+            request_ids = list(request_id)
+            if len(request_ids) != len(prompts):
+                raise ValueError("Length of request_id list must match number of prompts.")
 
         base_sampling_params = sampling_params or SamplingParams(max_tokens=128)
 
-        for prompt, req_id in zip(prompts, request_ids, strict=False):
+        for prompt, req_id in zip(prompts, request_ids, strict=True):
             prompt_tokens = self._tokenize_prompt(req_id, prompt)
             effective_params = self._prepare_sampling_params_for_request(
                 base_sampling_params,
@@ -1197,7 +1226,7 @@ class eSurge:
         if pbar:
             pbar.close()
 
-        # Cleanup per-request events (outputs are preserved for post-hoc access)
+        # Cleanup per-request events (outputs retained per max_request_outputs).
         with self._request_lock:
             for output in outputs:
                 rid = output.request_id
@@ -1206,6 +1235,10 @@ class eSurge:
                 if n_samples > 1:
                     for sample_idx in range(n_samples):
                         self._request_events.pop(f"{rid}-{sample_idx}", None)
+        if self._max_request_outputs is not None:
+            with self._output_lock:
+                for output in outputs:
+                    self._track_finished_output(output.request_id)
         return outputs
 
     def stream(
@@ -1345,6 +1378,9 @@ class eSurge:
                     if n_samples > 1:
                         for sample_idx in range(n_samples):
                             self._request_events.pop(f"{request_id}-{sample_idx}", None)
+                if self._max_request_outputs is not None:
+                    with self._output_lock:
+                        self._track_finished_output(request_id)
 
     def chat(
         self,
@@ -1633,7 +1669,7 @@ class eSurge:
                 if output is not None and output.finished:
                     break
 
-        # Request is finished; cleanup per-request events (output is preserved)
+        # Request is finished; cleanup per-request events (retention honors max_request_outputs).
         n_samples = len(output.outputs) if output is not None else 0
         with self._request_lock:
             self._request_events.pop(request_id, None)
@@ -1642,6 +1678,9 @@ class eSurge:
                     self._request_events.pop(f"{request_id}-{sample_idx}", None)
 
         assert output is not None
+        if self._max_request_outputs is not None:
+            with self._output_lock:
+                self._track_finished_output(request_id)
         return output
 
     def update_model_weights(
@@ -1705,6 +1744,7 @@ class eSurge:
         with self._request_lock, self._output_lock:
             self._active_requests.clear()
             self._request_outputs.clear()
+            self._finished_request_ids.clear()
         self._request_events.clear()
 
         self.scheduler = Scheduler.from_runner(
@@ -1898,6 +1938,7 @@ class eSurge:
                 "prompt": prompt_for_engine,
                 "prompt_token_ids": token_ids,
                 "generated_tokens": [],
+                "reported_generated_count": 0,
                 "last_decoded_index": 0,
                 "start_time": start_ts,
                 "first_token_time": None,
@@ -1997,6 +2038,7 @@ class eSurge:
                         "prompt": prompt_for_engine,
                         "prompt_token_ids": token_ids,
                         "generated_tokens": [],  # Fresh list for each sample
+                        "reported_generated_count": 0,
                         "last_decoded_index": 0,
                         "start_time": start_ts,
                         "first_token_time": None,
@@ -2087,13 +2129,17 @@ class eSurge:
                 self.scheduler.finish_requests(abort_ids, EngineRequestStatus.FINISHED_ABORTED)
                 detokenizer_reset_ids |= abort_ids
 
-            # Clean up active request tracking (outputs are preserved)
+            # Clean up active request tracking (output retention honors max_request_outputs).
             for rid in abort_ids:
                 self._active_requests.pop(rid, None)
             self._active_requests.pop(parent_request_id, None)
+            for rid in abort_ids:
+                if rid != parent_request_id:
+                    self._request_events.pop(rid, None)
 
             # Update output state
             ro = self._request_outputs.get(parent_request_id)
+            n_samples = len(ro.outputs) if ro is not None else 0
             if ro is not None:
                 if request_id == parent_request_id:
                     ro.finished = True
@@ -2135,6 +2181,15 @@ class eSurge:
             ev.set()
         self._output_event.set()
         log_metrics_summary()
+        if ro is not None and ro.finished:
+            with self._request_lock:
+                self._request_events.pop(parent_request_id, None)
+                if n_samples > 1:
+                    for sample_idx in range(n_samples):
+                        self._request_events.pop(f"{parent_request_id}-{sample_idx}", None)
+            if self._max_request_outputs is not None:
+                with self._output_lock:
+                    self._track_finished_output(parent_request_id)
 
     def _cleanup_detokenizer_state(self) -> None:
         """Attempt to clean up failed detokenizer states.
@@ -2325,8 +2380,13 @@ class eSurge:
 
                         if rd["first_token_time"] is None and num_generated > 0:
                             rd["first_token_time"] = now - rd["start_time"]
-                            if metrics_collector and ro.first_token_time is None:
-                                metrics_collector.record_first_token(parent_request_id)
+                        if rd["first_token_time"] is not None:
+                            if ro.first_token_time is None:
+                                ro.first_token_time = rd["first_token_time"]
+                                if metrics_collector:
+                                    metrics_collector.record_first_token(parent_request_id)
+                            else:
+                                ro.first_token_time = min(ro.first_token_time, rd["first_token_time"])
 
                         if metrics_collector:
                             metrics_collector.add_generated_tokens(parent_request_id, len(new_tokens))
@@ -2359,20 +2419,24 @@ class eSurge:
                                 ro.delta_seq += 1
                                 text_changed = True
 
-                        ro.num_generated_tokens = num_generated
-
                         elapsed = now - rd["start_time"]
                         ro.processing_time = elapsed
                         ro.time_spent_generating = elapsed
-                        ro.first_token_time = rd["first_token_time"]
 
-                        if rd["first_token_time"] is not None and num_generated > 0:
-                            generation_time = elapsed - rd["first_token_time"]
-                            ro.tokens_per_second = num_generated / generation_time if generation_time > 0 else 0.0
+                        prev_reported = rd.get("reported_generated_count", 0)
+                        if num_generated >= prev_reported:
+                            ro.num_generated_tokens += num_generated - prev_reported
+                            rd["reported_generated_count"] = num_generated
+                        else:
+                            rd["reported_generated_count"] = num_generated
+
+                        if ro.first_token_time is not None and ro.num_generated_tokens > 0:
+                            generation_time = elapsed - ro.first_token_time
+                            ro.tokens_per_second = (
+                                ro.num_generated_tokens / generation_time if generation_time > 0 else 0.0
+                            )
                         else:
                             ro.tokens_per_second = 0.0
-
-                        ro.num_generated_tokens = num_generated
 
                     if engine_output.finished:
                         comp = ro.outputs[sample_index]
@@ -2419,23 +2483,22 @@ class eSurge:
                             if "prompt_token_ids" in rd
                             else sum(len(seg) for seg in ro.prompt_token_ids)
                         )
-                        num_generated_tokens = len(rd["generated_tokens"])
 
                         ro.processing_time = elapsed
                         ro.time_spent_generating = elapsed
-                        ro.num_generated_tokens = num_generated_tokens
-                        ro.first_token_time = rd.get("first_token_time")
 
-                        if ro.first_token_time is not None and num_generated_tokens > 0:
+                        if ro.first_token_time is not None and ro.num_generated_tokens > 0:
                             generation_time = elapsed - ro.first_token_time
-                            ro.tokens_per_second = num_generated_tokens / generation_time if generation_time > 0 else 0.0
+                            ro.tokens_per_second = (
+                                ro.num_generated_tokens / generation_time if generation_time > 0 else 0.0
+                            )
                         else:
                             ro.tokens_per_second = 0.0
 
                         ro.metrics = {
                             "prompt_tokens": num_prompt_tokens,
-                            "generated_tokens": num_generated_tokens,
-                            "total_tokens": num_prompt_tokens + num_generated_tokens,
+                            "generated_tokens": ro.num_generated_tokens,
+                            "total_tokens": num_prompt_tokens + ro.num_generated_tokens,
                             "processing_time": elapsed,
                             "first_token_time": ro.first_token_time,
                             "tokens_per_second": ro.tokens_per_second,

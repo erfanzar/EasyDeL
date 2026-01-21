@@ -181,7 +181,7 @@ class FlashAttn(OperationImpl):
         query_dim: int = query.shape[-1]
         key_dim: int = key.shape[-1]
         value_dim: int = value.shape[-1]
-        dims_incompatible: bool = query_dim != value_dim != key_dim
+        dims_incompatible: bool = not (query_dim == key_dim == value_dim)
 
         if dims_incompatible:
             vanilla_attn: VanillaAttn = VanillaAttn(self.metadata)

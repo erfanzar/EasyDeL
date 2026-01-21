@@ -131,7 +131,7 @@ class ModelOutput(tp.OrderedDict):
                     first_field_iterator = False
             if first_field_iterator:
                 for idx, element in enumerate(iterator):
-                    if not isinstance(element, list | tuple) or not len(element) == 2 or not isinstance(element[0], str):
+                    if not isinstance(element, (list, tuple)) or not len(element) == 2 or not isinstance(element[0], str):
                         if idx == 0:
                             self[class_fields[0].name] = first_field
                         else:

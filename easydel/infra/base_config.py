@@ -199,7 +199,7 @@ def _resolve_eformer_axis(axis: str | list[str], manager: PartitionManager):
         >>> _resolve_eformer_axis("tp", partition_manager)
         >>> _resolve_eformer_axis(["tp", "ep"], partition_manager)
     """
-    was_list = isinstance(axis, list | tuple)
+    was_list = isinstance(axis, (list, tuple))
     if not was_list:
         axis = [axis]
     out = manager.paxis.resolve_axis(axes=axis, mode=MODE_TRAIN)
