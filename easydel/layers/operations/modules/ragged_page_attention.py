@@ -12,6 +12,69 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ragged Paged Attention implementations for continuous batching.
+
+This module provides paged attention implementations optimized for serving
+scenarios with continuous batching, where requests of varying lengths are
+processed together efficiently using paged KV-cache management.
+
+Key features:
+- Non-contiguous paged KV-cache for memory-efficient serving
+- Support for variable-length sequences in the same batch
+- TPU-optimized Pallas kernels with GPU/CPU fallbacks
+- Ragged tensor format for handling batches without padding waste
+- Integration with vLLM-style paged memory management
+
+Two versions are provided:
+
+RaggedPageAttnV2:
+    Uses slot mapping for cache updates. Each token is mapped to a specific
+    slot in the paged cache via a precomputed slot_mapping tensor.
+
+    Required metadata:
+    - SEQ_LENS, CONTEXT_LENS, POSITIONS
+    - QUERY_START_LOC, PAGES_TABLES, SLOT_MAPPING
+
+RaggedPageAttnV3:
+    Uses request distribution for more efficient batch processing. Instead
+    of per-token slot mapping, uses request-level distribution information
+    for cache updates.
+
+    Required metadata:
+    - SEQ_LENS, CONTEXT_LENS, POSITIONS
+    - QUERY_START_LOC, PAGES_TABLES, REQUEST_DISTRIBUTION
+
+Implementation details:
+- Queries are expected in ragged format: [total_tokens, num_heads, head_dim]
+- Page tables map logical positions to physical pages in the KV cache
+- Context lengths track the total KV cache length per sequence
+- Query start locations mark sequence boundaries in the ragged tensor
+
+Example:
+    >>> from easydel.layers.operations import OperationMetadata
+    >>> from easydel.layers.operations.modules import RaggedPageAttnV3
+    >>>
+    >>> metadata = OperationMetadata(runtime_dtype=jnp.bfloat16)
+    >>> attn = RaggedPageAttnV3(metadata)
+    >>>
+    >>> # Queries in ragged format (no padding)
+    >>> output = attn(
+    ...     query=query,  # [total_tokens, num_heads, head_dim]
+    ...     key=key,
+    ...     value=value,
+    ...     cache_view=paged_cache,
+    ...     cache_metadata=ragged_metadata,
+    ... )
+
+Note:
+    These implementations are designed for inference serving with continuous
+    batching. For training or single-request inference, consider using
+    FlashAttn or VanillaAttn instead.
+
+References:
+    - vLLM PagedAttention: https://arxiv.org/abs/2309.06180
+    - EasyDeL serving documentation
+"""
 
 import jax
 from eformer import common_types as ct

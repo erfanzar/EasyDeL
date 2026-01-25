@@ -18,48 +18,75 @@ This package provides a modular, type-safe system for creating task-specific
 model wrappers (ForCausalLM, ForSequenceClassification, etc.) with minimal
 boilerplate and maximum flexibility.
 
+The module implements a hierarchical class structure where:
+    - BaseTaskModule: Abstract foundation for all task modules
+    - Task-specific modules: Inherit from BaseTaskModule for specific tasks
+    - Feature classes: Provide reusable functionality (logit cap, pooling, etc.)
+    - Protocol classes: Define structural interfaces for type safety
+    - Factory functions: Enable dynamic class generation
+
 Features:
-- Generic typing with Protocol-based interfaces
-- Automatic model registration
-- Modular features (logit cap, tie embeddings, router aux loss, etc.)
-- Factory functions for dynamic class generation
+    - Generic typing with Protocol-based interfaces for type safety
+    - Automatic model registration with the EasyDeL factory system
+    - Modular features (logit cap, tie embeddings, router aux loss, etc.)
+    - Factory functions for dynamic class generation
+    - Support for various task types: causal LM, classification, QA, VLM, etc.
+
+Module Structure:
+    - _base_task_module.py: Core BaseTaskModule abstract class
+    - _protocols.py: Protocol definitions for model interfaces
+    - _features.py: Reusable feature implementations
+    - _vlm_features.py: Vision-Language Model specific features
+    - _auto_mapper.py: Factory functions for dynamic class creation
+    - causal_lm_module.py: BaseCausalLMModule for language modeling
+    - sequence_classification_module.py: BaseSequenceClassificationModule
+    - token_classification_module.py: BaseTokenClassificationModule
+    - question_answering_module.py: BaseQuestionAnsweringModule
+    - conditional_generation_module.py: BaseConditionalGenerationModule
+    - image_classification_module.py: BaseImageClassificationModule
+    - vision_language_module.py: BaseVisionLanguageModule
 
 Example Usage:
 
-Explicit Subclassing (Recommended):
-    ```python
-    from easydel.layers.base_modules import BaseCausalLMModule
-    from easydel.modules.arctic import ArcticModel, ArcticConfig
+    Explicit Subclassing (Recommended):
+        ```python
+        from easydel.layers.base_modules import BaseCausalLMModule
+        from easydel.modules.arctic import ArcticModel, ArcticConfig
 
-    class ArcticForCausalLM(BaseCausalLMModule[ArcticModel, ArcticConfig]):
-        _task_type = TaskType.CAUSAL_LM
-        _model_type = "arctic"
-        _config_class = ArcticConfig
+        class ArcticForCausalLM(BaseCausalLMModule[ArcticModel, ArcticConfig]):
+            _task_type = TaskType.CAUSAL_LM
+            _model_type = "arctic"
+            _config_class = ArcticConfig
 
-        def __init__(self, config, dtype=jnp.bfloat16, *, rngs):
-            super().__init__(
-                config=config,
-                base_model_class=ArcticModel,
-                base_model_name="model",
-                dtype=dtype,
-                rngs=rngs,
-                router_aux_loss_coef=0.001,
-            )
-    ```
+            def __init__(self, config, dtype=jnp.bfloat16, *, rngs):
+                super().__init__(
+                    config=config,
+                    base_model_class=ArcticModel,
+                    base_model_name="model",
+                    dtype=dtype,
+                    rngs=rngs,
+                    router_aux_loss_coef=0.001,
+                )
+        ```
 
-Factory Function Approach:
-    ```python
-    from easydel.layers.base_modules import create_causal_lm_class
-    from easydel.modules.arctic import ArcticModel, ArcticConfig
+    Factory Function Approach:
+        ```python
+        from easydel.layers.base_modules import create_causal_lm_class
+        from easydel.modules.arctic import ArcticModel, ArcticConfig
 
-    ArcticForCausalLM = create_causal_lm_class(
-        "Arctic",
-        ArcticModel,
-        ArcticConfig,
-        model_type="arctic",
-        router_aux_loss_coef=0.001,
-    )
-    ```
+        ArcticForCausalLM = create_causal_lm_class(
+            "Arctic",
+            ArcticModel,
+            ArcticConfig,
+            model_type="arctic",
+            router_aux_loss_coef=0.001,
+        )
+        ```
+
+See Also:
+    - easydel.infra.factory: Model registration and TaskType definitions
+    - easydel.infra.base_module: EasyDeLBaseModule parent class
+    - easydel.infra.base_config: EasyDeLBaseConfig for configurations
 """
 
 # Protocol definitions

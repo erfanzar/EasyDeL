@@ -180,6 +180,34 @@ class eLargeModel:
         a `config`/`elarge_model`/`elm` key. If the YAML file also contains a
         top-level `actions` key (e.g. used by `easydel.scripts.elarge`), that key
         is ignored when loading the ELM configuration.
+
+        Args:
+            yaml_path: Path to the YAML configuration file. Can be a string path,
+                os.PathLike, or ePathLike object.
+
+        Returns:
+            eLargeModel instance configured from the YAML file.
+
+        Raises:
+            ImportError: If PyYAML is not installed.
+            FileNotFoundError: If the YAML file does not exist.
+            TypeError: If the YAML root or config is not a dict/mapping.
+
+        Example:
+            >>> # YAML file with direct config:
+            >>> # model:
+            >>> #   name_or_path: meta-llama/Llama-2-7b
+            >>> # loader:
+            >>> #   dtype: bf16
+            >>> elm = eLargeModel.from_yaml("config.yaml")
+            >>>
+            >>> # YAML file with wrapped config:
+            >>> # config:
+            >>> #   model:
+            >>> #     name_or_path: meta-llama/Llama-2-7b
+            >>> # actions:
+            >>> #   - train
+            >>> elm = eLargeModel.from_yaml("pipeline.yaml")
         """
         try:
             import yaml  # type: ignore
@@ -795,13 +823,46 @@ class eLargeModel:
         save_elm_config(self._config, json_path)
 
     def to_yaml(self, yaml_path: str | os.PathLike | ePathLike) -> None:
-        """Save configuration to a YAML file."""
+        """Save configuration to a YAML file.
+
+        Exports the current configuration to a YAML file that can be loaded
+        later with from_yaml() or shared with others. The YAML format is often
+        more human-readable than JSON for complex configurations.
+
+        Args:
+            yaml_path: Path where the YAML configuration file will be saved.
+                Will create parent directories if they don't exist.
+
+        Raises:
+            ImportError: If PyYAML is not installed.
+            TypeError: If any configuration value is not YAML serializable.
+
+        Example:
+            >>> elm.to_yaml("config.yaml")
+            >>> # Later or on another machine:
+            >>> elm2 = eLargeModel.from_yaml("config.yaml")
+        """
         try:
             import yaml  # type: ignore
         except ImportError as e:
             raise ImportError("PyYAML is required for YAML configs. Install with: pip install pyyaml") from e
 
         def to_yamlable(obj: Any) -> Any:
+            """Convert an object to a YAML-serializable form.
+
+            Recursively processes the object, converting dicts, lists, enums,
+            PathLike objects, and objects with to_dict() methods into basic
+            Python types that can be serialized to YAML.
+
+            Args:
+                obj: Any Python object to convert.
+
+            Returns:
+                A YAML-serializable representation of the object.
+
+            Raises:
+                TypeError: If the object cannot be converted to a YAML-serializable form.
+            """
             if obj is None or isinstance(obj, (str, int, float, bool)):
                 return obj
             if isinstance(obj, dict):
@@ -1777,7 +1838,14 @@ class eLargeModel:
         w = 53  # inner width (content area)
 
         def _fmt(val: Any) -> str:
-            """Format a value for display, handling enums and special types."""
+            """Format a value for display, handling enums and special types.
+
+            Args:
+                val: Any value to format for display.
+
+            Returns:
+                A string representation suitable for the configuration display.
+            """
             if val is None:
                 return "none"
             if hasattr(val, "value"):
@@ -1787,11 +1855,22 @@ class eLargeModel:
             return str(val)
 
         def _line(content: str) -> str:
-            """Create a padded line within the box."""
+            """Create a padded line within the box.
+
+            Args:
+                content: The text content to display in the line.
+
+            Returns:
+                A formatted line string with box-drawing characters.
+            """
             return f"║ {content:<{w}}║"
 
         def _sep() -> str:
-            """Create a separator line."""
+            """Create a separator line within the box.
+
+            Returns:
+                A horizontal separator line using box-drawing characters.
+            """
             return f"╟{'─' * (w + 1)}╢"
 
         lines = []

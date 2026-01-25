@@ -12,20 +12,97 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unified Attention Module.
+"""Unified Attention Module for EasyDeL.
 
-Single base class supporting multiple attention mechanisms:
-- Standard RoPE-based attention (Llama, Mistral, most models)
-- Multi-head Latent Attention (DeepSeek V2/V3)
-- ALiBi positional bias (Falcon, MPT)
+This module provides a single base class (UnifiedAttention) that supports multiple
+attention mechanisms through method-based routing. It enables building attention
+layers for various model architectures without code duplication.
 
-Features:
-- Multiple forward paths (forward, forward_mla, forward_alibi)
-- Post-processing hooks for Q/K normalization
-- Automatic routing based on config
-- Support for fused and separate QKV projections
-- Sliding window attention
-- KV caching
+Supported Attention Types:
+    Standard RoPE:
+        Rotary Position Embedding-based attention used by most modern models
+        including Llama, Mistral, Gemma, Qwen, and others.
+
+    Multi-head Latent Attention (MLA):
+        DeepSeek V2/V3 style attention with LoRA-compressed queries and
+        compressed key-value projections for memory efficiency.
+
+    ALiBi (Attention with Linear Biases):
+        Position-independent attention with learned linear biases,
+        used by models like Falcon and MPT.
+
+Key Features:
+    Multiple Forward Paths:
+        - forward(): Standard RoPE-based attention
+        - forward_mla(): Multi-head Latent Attention
+        - forward_alibi(): ALiBi positional bias attention
+
+    Post-processing Hooks:
+        - _preprocess_qkv(): Transform Q/K/V before reshape
+        - _postprocess_qkv(): Apply Q/K normalization after reshape
+
+    Projection Customization:
+        - Fused or separate Q/K/V projections
+        - Customizable projection names via projection_mapping
+        - Support for MLA-specific projections
+
+    Memory Optimization:
+        - Sliding window attention for local context
+        - KV caching for autoregressive generation
+        - Grouped Query Attention (GQA) support
+
+Classes:
+    UnifiedAttention:
+        Base attention module supporting standard, MLA, and ALiBi attention.
+
+Functions:
+    apply_rotary_pos_emb:
+        Apply rotary position embeddings to query and key tensors.
+
+    yarn_get_mscale:
+        Calculate YaRN (Yet another RoPE extensioN) mscale factor.
+
+Example:
+    Creating a standard attention layer::
+
+        >>> from easydel.layers.attention_unified import UnifiedAttention
+        >>>
+        >>> class LlamaAttention(UnifiedAttention):
+        ...     '''Llama-style attention with Q/K normalization.'''
+        ...
+        ...     def _postprocess_qkv(self, q, k, v):
+        ...         q = self.q_norm(q)
+        ...         k = self.k_norm(k)
+        ...         return q, k, v
+
+    Creating MLA attention (DeepSeek)::
+
+        >>> class DeepseekAttention(UnifiedAttention):
+        ...     def __init__(self, config, rngs, layer_idx, ...):
+        ...         super().__init__(
+        ...             config, rngs=rngs, layer_idx=layer_idx,
+        ...             attention_type='mla',
+        ...             use_mla_lora=True
+        ...         )
+
+    Creating ALiBi attention (Falcon)::
+
+        >>> class FalconAttention(UnifiedAttention):
+        ...     def __init__(self, config, rngs, layer_idx, ...):
+        ...         super().__init__(
+        ...             config, rngs=rngs, layer_idx=layer_idx,
+        ...             attention_type='alibi'
+        ...         )
+
+Note:
+    The UnifiedAttention class is designed to be subclassed for specific model
+    architectures. Override methods like _postprocess_qkv(), _create_rotary(),
+    or the projection creation methods to customize behavior.
+
+See Also:
+    - easydel.layers.attention: FlexibleAttentionModule for attention computation
+    - easydel.layers.components.rotary_embedding: RoPE implementations
+    - easydel.layers.caching: KV cache implementations
 """
 
 from __future__ import annotations
@@ -76,15 +153,36 @@ def apply_rotary_pos_emb(
 ]:
     """Apply rotary position embeddings to query and key tensors.
 
+    Implements the RoPE (Rotary Position Embedding) algorithm that encodes
+    position information by rotating query and key vectors based on their
+    absolute positions in the sequence.
+
+    The rotation is performed using the formula:
+        rotated = x * cos + rotate_half(x) * sin
+
+    where rotate_half splits the last dimension and swaps halves with negation.
+
     Args:
-            q: Query tensor [batch_size, num_heads, seq_len, head_dim]
-            k: Key tensor [batch_size, num_kv_heads, seq_len, head_dim]
-            cos: Cosine component of RoPE [max_seq_len, head_dim]
-            sin: Sine component of RoPE [max_seq_len, head_dim]
-            position_ids: Position indices [batch_size, seq_len]
+        q: Query tensor with shape [batch_size, num_heads, seq_len, head_dim].
+        k: Key tensor with shape [batch_size, num_kv_heads, seq_len, head_dim].
+        cos: Precomputed cosine values with shape [max_seq_len, head_dim].
+        sin: Precomputed sine values with shape [max_seq_len, head_dim].
+        position_ids: Position indices with shape [batch_size, seq_len] used
+            to gather the appropriate cos/sin values for each position.
 
     Returns:
-            Tuple of (rotated_query, rotated_key)
+        Tuple containing:
+            - q_embed: Rotated query tensor with same shape as input q.
+            - k_embed: Rotated key tensor with same shape as input k.
+
+    Note:
+        The rotation preserves the inner product structure such that
+        q_i^T * k_j depends on the relative position (i - j), enabling
+        the model to learn position-aware attention patterns.
+
+    Example:
+        >>> cos, sin = compute_rope_frequencies(max_len=4096, dim=64)
+        >>> q_rotated, k_rotated = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
     """
     cos_gathered: Float[Array, "batch_size seq_len head_dim"] = cos[position_ids]
     sin_gathered: Float[Array, "batch_size seq_len head_dim"] = sin[position_ids]
@@ -110,14 +208,28 @@ def apply_rotary_pos_emb(
 
 
 def yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
-    """Calculate YaRN mscale factor.
+    """Calculate YaRN (Yet another RoPE extensioN) mscale factor.
+
+    Computes the magnitude scaling factor used in YaRN to maintain
+    attention score magnitudes when extending context length beyond
+    the original training length.
+
+    The formula is: mscale = 0.1 * mscale * log(scale) + 1.0
 
     Args:
-            scale: Scaling factor
-            mscale: Base mscale value
+        scale: Context length scaling factor (extended_length / original_length).
+            When scale <= 1, returns 1.0 (no scaling needed).
+        mscale: Base magnitude scale coefficient. Higher values increase
+            the scaling effect. Defaults to 1.0.
 
     Returns:
-            Computed mscale factor
+        Computed mscale factor to multiply attention scores by.
+        Returns 1.0 when scale <= 1 (no extension needed).
+
+    Example:
+        >>> # Extending from 4K to 32K context
+        >>> mscale = yarn_get_mscale(scale=8.0, mscale=1.0)
+        >>> # Use mscale to adjust attention: attn_scores * mscale
     """
     if scale <= 1:
         return 1.0
@@ -338,7 +450,25 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         precision: jax.lax.Precision,
         rngs: PRNGKeyArray,
     ) -> ColumnParallelLinear:
-        """Create query projection layer."""
+        """Create query projection layer.
+
+        Creates a column-parallel linear layer for projecting input hidden
+        states to query representations.
+
+        Args:
+            config: Model configuration containing hidden_size and attention settings.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            precision: JAX precision setting for matrix operations.
+            rngs: Random number generators for parameter initialization.
+
+        Returns:
+            ColumnParallelLinear layer mapping hidden_size to num_heads * head_dim.
+
+        Note:
+            Override this method to customize query projection (e.g., different
+            initialization, bias settings, or quantization).
+        """
         return ColumnParallelLinear(
             config.hidden_size,
             self.num_heads * self.head_dim,
@@ -358,7 +488,26 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         precision: jax.lax.Precision,
         rngs: PRNGKeyArray,
     ) -> ColumnParallelLinear:
-        """Create key projection layer."""
+        """Create key projection layer.
+
+        Creates a column-parallel linear layer for projecting input hidden
+        states to key representations.
+
+        Args:
+            config: Model configuration containing hidden_size and attention settings.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            precision: JAX precision setting for matrix operations.
+            rngs: Random number generators for parameter initialization.
+
+        Returns:
+            ColumnParallelLinear layer mapping hidden_size to
+            num_key_value_heads * head_dim.
+
+        Note:
+            For GQA (Grouped Query Attention), num_key_value_heads may be
+            smaller than num_heads.
+        """
         return ColumnParallelLinear(
             config.hidden_size,
             self.num_key_value_heads * self.head_dim,
@@ -378,7 +527,26 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         precision: jax.lax.Precision,
         rngs: PRNGKeyArray,
     ) -> ColumnParallelLinear:
-        """Create value projection layer."""
+        """Create value projection layer.
+
+        Creates a column-parallel linear layer for projecting input hidden
+        states to value representations.
+
+        Args:
+            config: Model configuration containing hidden_size and attention settings.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            precision: JAX precision setting for matrix operations.
+            rngs: Random number generators for parameter initialization.
+
+        Returns:
+            ColumnParallelLinear layer mapping hidden_size to
+            num_key_value_heads * head_dim.
+
+        Note:
+            For GQA (Grouped Query Attention), num_key_value_heads may be
+            smaller than num_heads, matching the key projection.
+        """
         return ColumnParallelLinear(
             config.hidden_size,
             self.num_key_value_heads * self.head_dim,
@@ -398,7 +566,25 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         precision: jax.lax.Precision,
         rngs: PRNGKeyArray,
     ) -> RowParallelLinear:
-        """Create output projection layer."""
+        """Create output projection layer.
+
+        Creates a row-parallel linear layer for projecting attention output
+        back to the hidden dimension.
+
+        Args:
+            config: Model configuration containing hidden_size.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            precision: JAX precision setting for matrix operations.
+            rngs: Random number generators for parameter initialization.
+
+        Returns:
+            RowParallelLinear layer mapping num_heads * head_dim to hidden_size.
+
+        Note:
+            Row-parallel is used for the output projection as it follows
+            column-parallel attention computation, enabling efficient all-reduce.
+        """
         return RowParallelLinear(
             self.num_heads * self.head_dim,
             config.hidden_size,
@@ -459,7 +645,26 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         Float[Array, "batch_size seq_len num_heads head_dim"],
         Float[Array, "batch_size seq_len num_kv_heads head_dim"],
     ]:
-        """Apply rotary position embeddings to Q and K."""
+        """Apply rotary position embeddings to query and key tensors.
+
+        Uses the rotary embedding module to encode positional information
+        into the query and key representations.
+
+        Args:
+            query_states: Query tensor [batch_size, seq_len, num_heads, head_dim].
+            key_states: Key tensor [batch_size, seq_len, num_kv_heads, head_dim].
+            position_ids: Position indices [batch_size, seq_len].
+            frequencies: Optional precomputed frequencies. If None, uses
+                the rotary module's internal frequency computation.
+
+        Returns:
+            Tuple of (rotated_query, rotated_key) with positional information
+            encoded via rotation.
+
+        Note:
+            If self.rotary is None (e.g., for ALiBi attention), returns the
+            input tensors unchanged.
+        """
         if self.rotary is None:
             return query_states, key_states
         q_rotated: Float[Array, "batch_size seq_len num_heads head_dim"]
@@ -581,82 +786,191 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
 
     @property
     def query_projection(self) -> ColumnParallelLinear:
-        """Get query projection (for fused QKV support)."""
+        """Get query projection layer.
+
+        Returns:
+            The query projection layer, accessed via projection_mapping
+            to support custom attribute names.
+        """
         return getattr(self, self.projection_mapping["query_projection"])
 
     @property
     def key_projection(self) -> ColumnParallelLinear:
-        """Get key projection (for fused QKV support)."""
+        """Get key projection layer.
+
+        Returns:
+            The key projection layer, accessed via projection_mapping
+            to support custom attribute names.
+        """
         return getattr(self, self.projection_mapping["key_projection"])
 
     @property
     def value_projection(self) -> ColumnParallelLinear:
-        """Get value projection (for fused QKV support)."""
+        """Get value projection layer.
+
+        Returns:
+            The value projection layer, accessed via projection_mapping
+            to support custom attribute names.
+        """
         return getattr(self, self.projection_mapping["value_projection"])
 
     @property
     def output_projection(self) -> RowParallelLinear:
-        """Get output projection."""
+        """Get output projection layer.
+
+        Returns:
+            The output projection layer that maps attention output
+            back to hidden dimension.
+        """
         return getattr(self, self.projection_mapping["output_projection"])
 
     @property
     def query_key_value_projection(self) -> ColumnParallelLinear:
-        """Get fused QKV projection."""
+        """Get fused QKV projection layer.
+
+        Returns:
+            The fused query-key-value projection layer used when
+            use_fused_qkv=True. Projects to (num_heads + 2*num_kv_heads) * head_dim.
+
+        Raises:
+            AttributeError: If use_fused_qkv was False during initialization.
+        """
         return getattr(self, self.projection_mapping["query_key_value_projection"])
 
     @property
     def query_normalization(self) -> RMSNorm:
-        """Get query normalization layer."""
+        """Get query normalization layer.
+
+        Returns:
+            The RMSNorm layer for normalizing query representations.
+
+        Raises:
+            AttributeError: If use_qk_norm was False during initialization.
+        """
         return getattr(self, self.norms_mapping["query_normalization"])
 
     @property
     def key_normalization(self) -> RMSNorm:
-        """Get key normalization layer."""
+        """Get key normalization layer.
+
+        Returns:
+            The RMSNorm layer for normalizing key representations.
+
+        Raises:
+            AttributeError: If use_qk_norm was False during initialization.
+        """
         return getattr(self, self.norms_mapping["key_normalization"])
 
     @property
     def value_normalization(self) -> RMSNorm:
-        """Get value normalization layer."""
+        """Get value normalization layer.
+
+        Returns:
+            The RMSNorm layer for normalizing value representations.
+
+        Raises:
+            AttributeError: If value normalization was not configured.
+        """
         return getattr(self, self.norms_mapping["value_normalization"])
 
     @property
     def output_normalization(self) -> RMSNorm:
-        """Get output normalization layer."""
+        """Get output normalization layer.
+
+        Returns:
+            The RMSNorm layer for normalizing output representations.
+
+        Raises:
+            AttributeError: If output normalization was not configured.
+        """
         return getattr(self, self.norms_mapping["output_normalization"])
 
     @property
     def mla_q_proj(self) -> ColumnParallelLinear:
-        """Get MLA query projection (non-LoRA)."""
+        """Get MLA query projection (non-LoRA variant).
+
+        Returns:
+            Direct query projection used when use_mla_lora=False.
+
+        Raises:
+            AttributeError: If MLA projections were not configured.
+        """
         return getattr(self, self.projection_mapping["mla_q_proj"])
 
     @property
     def mla_q_a_proj(self) -> ColumnParallelLinear:
-        """Get MLA query A projection (LoRA)."""
+        """Get MLA query A projection (LoRA down-projection).
+
+        Returns:
+            First projection in the LoRA-style query compression
+            (hidden_size -> lora_rank).
+
+        Raises:
+            AttributeError: If use_mla_lora was False during initialization.
+        """
         return getattr(self, self.projection_mapping["mla_q_a_proj"])
 
     @property
     def mla_q_a_layernorm(self) -> RMSNorm:
-        """Get MLA query A layer normalization."""
+        """Get MLA query A layer normalization.
+
+        Returns:
+            Normalization layer applied after q_a_proj and before q_b_proj.
+
+        Raises:
+            AttributeError: If use_mla_lora was False during initialization.
+        """
         return getattr(self, self.projection_mapping["mla_q_a_layernorm"])
 
     @property
     def mla_q_b_proj(self) -> ColumnParallelLinear:
-        """Get MLA query B projection (LoRA)."""
+        """Get MLA query B projection (LoRA up-projection).
+
+        Returns:
+            Second projection in the LoRA-style query compression
+            (lora_rank -> num_heads * q_head_dim).
+
+        Raises:
+            AttributeError: If use_mla_lora was False during initialization.
+        """
         return getattr(self, self.projection_mapping["mla_q_b_proj"])
 
     @property
     def mla_kv_a_proj_with_mqa(self) -> ColumnParallelLinear:
-        """Get MLA KV A projection with MQA."""
+        """Get MLA KV A projection with multi-query attention.
+
+        Returns:
+            Compressed KV projection that outputs both latent KV
+            and positional key component (kv_lora_rank + qk_rope_head_dim).
+
+        Raises:
+            AttributeError: If MLA projections were not configured.
+        """
         return getattr(self, self.projection_mapping["mla_kv_a_proj_with_mqa"])
 
     @property
     def mla_kv_a_layernorm(self) -> RMSNorm:
-        """Get MLA KV A layer normalization."""
+        """Get MLA KV A layer normalization.
+
+        Returns:
+            Normalization layer applied to compressed KV before kv_b_proj.
+
+        Raises:
+            AttributeError: If MLA projections were not configured.
+        """
         return getattr(self, self.projection_mapping["mla_kv_a_layernorm"])
 
     @property
     def mla_kv_b_proj(self) -> ColumnParallelLinear:
-        """Get MLA KV B projection."""
+        """Get MLA KV B projection.
+
+        Returns:
+            Decompression projection for KV (kv_lora_rank ->
+            num_heads * (qk_nope_head_dim + v_head_dim)).
+
+        Raises:
+            AttributeError: If MLA projections were not configured.
+        """
         return getattr(self, self.projection_mapping["mla_kv_b_proj"])
 
     def _preprocess_qkv(
@@ -1125,24 +1439,52 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         frequencies: Float[Array, "seq_len head_dim"] | None = None,
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
     ) -> AttentionLayerOutput:
-        """Main entry point - routes to appropriate forward method.
+        """Main entry point that routes to the appropriate forward method.
 
-        Automatically selects the correct attention mechanism based on config.attention_type.
-        Models usually don't need to override this unless they have special routing logic.
+        Automatically selects the correct attention mechanism based on the
+        attention_type set during initialization. Routes to:
+        - forward(): Standard RoPE-based attention
+        - forward_mla(): Multi-head Latent Attention
+        - forward_alibi(): ALiBi positional bias attention
 
         Args:
-            hidden_states: Input tensor
-            mask_info: Mask information
-            position_ids: Position indices
-            mode: Runtime mode
-            cache_view: Optional cache view
-            cache_metadata: Optional cache metadata
-            output_attentions: Whether to return attention weights
-            frequencies: Optional precomputed frequencies
-            alibi: Optional external ALiBi positional bias
+            hidden_states: Input tensor with shape [batch, seq_len, hidden_dim].
+            mask_info: Container for attention masks and segment information.
+                May include attention_mask, segment_ids, and position information.
+            position_ids: Position indices with shape [batch, seq_len].
+            mode: Runtime mode (MODE_TRAIN, MODE_PREFILL, or MODE_DECODE).
+            cache_view: Optional view into the KV cache for autoregressive
+                generation. Can be TransformerCacheView, RaggedPagesCacheView,
+                or UnifiedAttentionCacheView.
+            cache_metadata: Optional metadata about cache state including
+                start indices and current positions.
+            output_attentions: If True, include attention weights in output.
+                May increase memory usage significantly.
+            frequencies: Optional precomputed RoPE frequencies. If None, uses
+                the module's internal rotary embedding computation.
+            alibi: Optional precomputed ALiBi positional bias. If None and
+                attention_type='alibi', computed internally.
 
         Returns:
-            AttentionLayerOutput
+            AttentionLayerOutput containing:
+                - attention_output: Output tensor [batch, seq_len, hidden_dim]
+                - attention_weight: Attention weights if output_attentions=True
+                - cache_view: Updated cache view for next generation step
+
+        Note:
+            Models usually don't need to override this method unless they have
+            special routing logic. Instead, override the specific forward_*
+            methods or the helper methods like _postprocess_qkv().
+
+        Example:
+            >>> # Standard usage
+            >>> output = attention(
+            ...     hidden_states,
+            ...     mask_info=mask_info,
+            ...     position_ids=position_ids,
+            ...     mode=common_types.MODE_PREFILL
+            ... )
+            >>> next_hidden = output.attention_output
         """
         if self.attention_type == "mla":
             return self.forward_mla(
@@ -1183,10 +1525,14 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
     # Operation access properties for dynamic discovery
     @property
     def operation_executor(self):
-        """Get the OperationExecutor from attention_performer.
+        """Get the OperationExecutor from the underlying attention performer.
+
+        Provides access to the operation executor for dynamic operation
+        discovery and mode-specific execution.
 
         Returns:
-            OperationExecutor if attention_performer exists, None otherwise.
+            OperationExecutor wrapping prefill and decode operations if
+            attention_performer exists, None otherwise.
         """
         if hasattr(self, "attention_performer") and self.attention_performer is not None:
             return self.attention_performer.operation_executor
@@ -1194,17 +1540,26 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
 
     @property
     def operation(self):
-        """Get the primary operation from attention_performer."""
+        """Get the primary operation from the attention performer.
+
+        Returns:
+            The prefill operation instance if attention_performer exists,
+            None otherwise.
+        """
         if hasattr(self, "attention_performer") and self.attention_performer is not None:
             return self.attention_performer.operation
         return None
 
     @property
     def operation_requirements(self):
-        """Get requirements from the attention performer.
+        """Get combined requirements from the attention performer.
+
+        Retrieves metadata and cache requirements from both prefill and
+        decode operations.
 
         Returns:
-            OperationRequirements if attention_performer exists, default otherwise.
+            OperationRequirements with combined metadata/cache requirements
+            if attention_performer exists, default requirements otherwise.
         """
         from easydel.layers.operations.requirements import OperationRequirements
 
@@ -1214,7 +1569,13 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
 
     @property
     def requires_cache(self) -> bool:
-        """Whether this attention layer requires cache."""
+        """Check whether this attention layer requires a KV cache.
+
+        Returns:
+            True if the attention mechanism requires cache for proper
+            operation, False otherwise. Defaults to True if attention_performer
+            is not available.
+        """
         if hasattr(self, "attention_performer") and self.attention_performer is not None:
             return self.attention_performer.requires_cache
         return True

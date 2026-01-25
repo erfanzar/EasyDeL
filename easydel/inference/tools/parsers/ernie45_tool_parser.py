@@ -12,6 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Tool parser implementation for ERNIE 4.5 models.
+
+This module provides a tool parser specifically designed for ERNIE 4.5 (Baidu) model outputs.
+ERNIE 4.5 is a thinking model that uses a specific format with </think> tags followed by
+<tool_call> tags containing JSON function call data.
+
+The parser handles the complex token structure including thinking sections, response tags,
+and tool call delimiters, with special handling for newline tokens and streaming state.
+
+Example format:
+    reasoning content</think>
+
+    <tool_call>
+    {"name": "function_name", "arguments": {"param": "value"}}
+    </tool_call>
+"""
+
 from __future__ import annotations
 
 import json
@@ -37,9 +54,70 @@ logger = get_logger(__name__)
 
 @ToolParserManager.register_module("ernie45")
 class Ernie45ToolParser(ToolParser):
+    """Tool parser for ERNIE 4.5 (Baidu) model outputs.
+
+    This parser handles the extraction of function/tool calls from ERNIE 4.5 model
+    outputs. ERNIE 4.5 is a thinking model that outputs reasoning in a thinking
+    section followed by tool calls in XML-style tags.
+
+    The parser handles several special tokens and structures:
+    - </think> tag marking the end of the thinking section
+    - <response>...</response> tags for regular responses
+    - <tool_call>...</tool_call> tags for function calls
+    - Special newline token handling (<0x0A>)
+
+    Attributes:
+        current_tool_name_sent: Flag indicating if the current tool name has been sent.
+        prev_tool_call_arr: List of previously parsed tool call dictionaries.
+        current_tool_id: Index of the current tool being processed (-1 means none).
+        streamed_args_for_tool: List of argument strings streamed for each tool.
+        think_end_token: Token marking end of thinking section.
+        response_start_token: Token marking start of response.
+        response_end_token: Token marking end of response.
+        tool_call_start_token: Token marking start of tool call.
+        tool_call_end_token: Token marking end of tool call.
+        tool_calls_start_token: Alias for tool_call_start_token.
+        newline_token: Special newline token representation.
+        tool_call_regex: Compiled regex for extracting tool call JSON.
+        think_end_token_id: Token ID for think_end_token.
+        response_start_token_id: Token ID for response_start_token.
+        response_end_token_id: Token ID for response_end_token.
+        tool_call_start_token_id: Token ID for tool_call_start_token.
+        tool_call_end_token_id: Token ID for tool_call_end_token.
+        newline_token_id: Token ID for newline_token.
+        parser_token_ids: List of special parser token IDs.
+
+    Raises:
+        ValueError: If the tokenizer is not provided during initialization.
+
+    Example:
+        >>> parser = Ernie45ToolParser(tokenizer)
+        >>> result = parser.extract_tool_calls(model_output, request)
+        >>> if result.tools_called:
+        ...     for tool_call in result.tool_calls:
+        ...         print(f"Function: {tool_call.function.name}")
+    """
+
     def __init__(self, tokenizer: AnyTokenizer):
-        """Ernie thinking model format:
-        abc\\n</think>\\n\\n\\n<tool_call>\\n{...}\\n</tool_call>\\n
+        """Initialize the ERNIE 4.5 tool parser.
+
+        Sets up token mappings and regex patterns for parsing ERNIE 4.5 format
+        tool calls. Validates that a tokenizer is provided and maps special
+        tokens to their IDs.
+
+        Args:
+            tokenizer: A HuggingFace tokenizer instance used for token processing.
+                This tokenizer should be compatible with the ERNIE 4.5 model and
+                must contain the special tokens used by this parser.
+
+        Raises:
+            ValueError: If the tokenizer is not provided (is None or falsy).
+
+        Note:
+            The parser expects the tokenizer vocabulary to contain special tokens
+            like </think>, <response>, </response>, <tool_call>, </tool_call>,
+            and <0x0A> (newline). Missing tokens will result in None values for
+            the corresponding token IDs.
         """
         super().__init__(tokenizer)
 
@@ -80,6 +158,26 @@ class Ernie45ToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
+        """Extract tool calls from a complete model output.
+
+        Parses the model output to find and extract function calls in ERNIE 4.5 format.
+        Searches for <tool_call>...</tool_call> tags containing JSON function data.
+
+        Args:
+            model_output: The complete text output from the model to parse.
+            request: The chat completion request that triggered this response.
+
+        Returns:
+            ExtractedToolCallInformation: An object containing:
+                - tools_called: True if valid tool calls were found, False otherwise.
+                - tool_calls: List of ToolCall objects representing parsed function calls.
+                - content: Any text content before the tool call section, or the full
+                    output if no valid tool calls were found.
+
+        Note:
+            If no <tool_call> start token is found, returns immediately with
+            tools_called=False and the full output as content.
+        """
         if self.tool_calls_start_token not in model_output:
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
@@ -118,6 +216,37 @@ class Ernie45ToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        """Extract tool calls incrementally during streaming generation.
+
+        Processes tokens as they are generated to progressively extract and emit
+        tool call information. Handles the complex ERNIE 4.5 format including
+        thinking sections, response tags, and tool call delimiters.
+
+        This method buffers content between tool call start and end tokens,
+        then extracts and emits the complete tool call when the end token is found.
+
+        Args:
+            previous_text: The accumulated text from all previous tokens.
+            current_text: The complete text including the current delta.
+            delta_text: The new text added in this streaming step.
+            previous_token_ids: Token IDs from all previous generation steps.
+            current_token_ids: All token IDs including the current step.
+            delta_token_ids: The new token IDs added in this step.
+            request: The chat completion request for context.
+
+        Returns:
+            DeltaMessage or None: A delta message containing either:
+                - Content text if outside tool call section.
+                - Tool call information when a complete tool call is parsed.
+                - None if buffering content within a tool call.
+
+        Note:
+            The method handles several special cases:
+            - Strips leading newlines after </think> or response tokens
+            - Handles <response>...</response> tags for non-tool responses
+            - Buffers content between <tool_call> and </tool_call> tags
+            - Supports multiple sequential tool calls
+        """
         self._buffer += delta_text
         cur_text = self._buffer
 

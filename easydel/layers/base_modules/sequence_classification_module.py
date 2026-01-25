@@ -15,7 +15,44 @@
 """Generic base class for Sequence Classification tasks.
 
 This module provides BaseSequenceClassificationModule, a generic, type-safe base
-class for creating ForSequenceClassification model wrappers.
+class for creating ForSequenceClassification model wrappers with minimal boilerplate.
+
+Sequence classification models predict a single label for an entire input sequence,
+making them suitable for tasks like sentiment analysis, topic classification,
+natural language inference, and text similarity scoring.
+
+Key Features:
+    - Generic typing with ModelT and ConfigT type parameters
+    - Configurable pooling strategies (last, first, mean, max)
+    - Optional MoE router auxiliary loss computation
+    - Gradient checkpointing support for memory efficiency
+    - Customizable classification head configuration
+
+Example:
+    Creating a sequence classification model::
+
+        from easydel.layers.base_modules import BaseSequenceClassificationModule
+
+        class MyModelForSequenceClassification(
+            BaseSequenceClassificationModule[MyModel, MyConfig]
+        ):
+            _task_type = TaskType.SEQUENCE_CLASSIFICATION
+            _model_type = "my_model"
+            _config_class = MyConfig
+
+            def __init__(self, config, dtype=jnp.bfloat16, *, rngs):
+                super().__init__(
+                    config=config,
+                    base_model_class=MyModel,
+                    dtype=dtype,
+                    rngs=rngs,
+                    pooling_strategy="last",
+                )
+
+See Also:
+    - BaseTaskModule: Parent class with common task functionality
+    - BaseCausalLMModule: For causal language modeling tasks
+    - BaseTokenClassificationModule: For token-level classification tasks
 """
 
 from collections.abc import Callable
@@ -47,39 +84,60 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
 
     This class provides a fully-featured, type-safe base for creating
     ForSequenceClassification model wrappers with support for:
-    - Generic typing (ModelT, ConfigT)
-    - Automatic registration
+
+    - Generic typing (ModelT, ConfigT) for type safety
+    - Automatic model registration via class attributes
     - Modular features (pooling strategies, router aux loss)
-    - Gradient checkpointing
-    - Configurable classification head
+    - Gradient checkpointing for memory-efficient training
+    - Configurable classification head with customizable name and parameters
+
+    The sequence classification task involves predicting a single label for
+    an entire input sequence. This is achieved by pooling the hidden states
+    (using configurable strategies like "last", "first", "mean", or "max")
+    and passing the pooled representation through a classification head.
 
     Example:
-        ```python
-        class ArcticForSequenceClassification(
-            BaseSequenceClassificationModule[ArcticModel, ArcticConfig]
-        ):
-            _task_type = TaskType.SEQUENCE_CLASSIFICATION
-            _model_type = "arctic"
-            _config_class = ArcticConfig
+        Basic usage with a custom model::
 
-            def __init__(self, config, dtype=jnp.bfloat16, *, rngs):
-                super().__init__(
-                    config=config,
-                    base_model_class=ArcticModel,
-                    base_model_name="model",
-                    dtype=dtype,
-                    rngs=rngs,
-                    pooling_strategy="last",
-                    router_aux_loss_coef=0.001,
-                )
-        ```
+            class ArcticForSequenceClassification(
+                BaseSequenceClassificationModule[ArcticModel, ArcticConfig]
+            ):
+                _task_type = TaskType.SEQUENCE_CLASSIFICATION
+                _model_type = "arctic"
+                _config_class = ArcticConfig
+
+                def __init__(self, config, dtype=jnp.bfloat16, *, rngs):
+                    super().__init__(
+                        config=config,
+                        base_model_class=ArcticModel,
+                        base_model_name="model",
+                        dtype=dtype,
+                        rngs=rngs,
+                        pooling_strategy="last",
+                        router_aux_loss_coef=0.001,
+                    )
+
+        Using the model for inference::
+
+            model = ArcticForSequenceClassification(config, rngs=rngs)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits  # Shape: (batch_size, num_labels)
 
     Type Parameters:
-        ModelT: The base model type (must implement BaseModelProtocol)
-        ConfigT: The configuration type
+        ModelT: The base model type (must implement BaseModelProtocol).
+            This is the underlying transformer model that produces hidden states.
+        ConfigT: The configuration type containing model hyperparameters.
+            Must have `num_labels` and `hidden_size` attributes.
 
     Attributes:
-        score: The classification head (linear projection to num_labels)
+        score: The classification head (linear projection from hidden_size to num_labels).
+            The actual attribute name can be customized via `score_head_name` parameter.
+        _score_head_name (str): The name of the classification head attribute.
+        base_model: The underlying transformer model that produces hidden states.
+
+    Note:
+        The configuration must have a `num_labels` attribute specifying the number
+        of output classes. This is validated during initialization.
     """
 
     def __init__(
@@ -103,23 +161,57 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
     ):
         """Initialize the Sequence Classification module.
 
+        Creates a sequence classification model by wrapping a base transformer model
+        and adding a classification head. The model uses pooling to reduce the
+        sequence of hidden states to a single vector before classification.
+
         Args:
-            config: Model configuration (must have num_labels attribute)
-            base_model: Pre-instantiated base model (optional)
-            base_model_class: Base model class to instantiate (optional)
-            base_model_name: Attribute name for the base model (e.g., "model", "transformer")
-            dtype: Data type for computations
-            param_dtype: Data type for parameters
-            precision: Precision setting for JAX operations
-            rngs: Random number generators
-            pooling_strategy: Strategy for pooling sequences ("last", "first", "mean", "max")
-            router_aux_loss_coef: Coefficient for MoE router auxiliary loss
-            score_head_name: Attribute name for the classification head (e.g., "score", "classifier")
-            score_head_bias: Whether to use bias in the classification head
-            score_head_kernel_init: Custom kernel initializer for classification head
+            config: Model configuration object. Must have the following attributes:
+                - num_labels (int): Number of output classes
+                - hidden_size (int): Dimension of hidden states
+                - pad_token_id (int, optional): ID of padding token
+                - gradient_checkpointing (str, optional): Checkpointing policy
+            base_model: Pre-instantiated base model instance. If provided,
+                base_model_class is ignored. Useful for sharing weights.
+            base_model_class: Base model class to instantiate. Required if
+                base_model is not provided.
+            base_model_name: Attribute name for storing the base model.
+                Common values are "model", "transformer", "encoder".
+                Defaults to "model".
+            dtype: Data type for computations (activations). Defaults to bfloat16.
+            param_dtype: Data type for parameters (weights). Defaults to bfloat16.
+            precision: JAX precision setting for matrix multiplications.
+                Can be None, "high", "highest", or a Precision enum value.
+            rngs: Flax random number generators for initialization.
+            pooling_strategy: Strategy for pooling sequence representations.
+                - "last": Use the last non-padding token (default)
+                - "first": Use the first token (CLS token style)
+                - "mean": Average all non-padding tokens
+                - "max": Max-pool over all non-padding tokens
+            router_aux_loss_coef: Coefficient for MoE router auxiliary loss.
+                Only used for Mixture-of-Experts models. None disables aux loss.
+            score_head_name: Attribute name for the classification head.
+                Defaults to "score". Common alternatives: "classifier", "output".
+            score_head_bias: Whether to include bias in the classification head.
+                Defaults to False for better stability.
+            score_head_kernel_init: Custom initializer for classification head weights.
+                If None, uses the default Flax initializer.
 
         Raises:
-            AssertionError: If config does not have num_labels attribute
+            AssertionError: If config does not have a `num_labels` attribute.
+                This is required for creating the classification head.
+
+        Example:
+            Creating a classification model with mean pooling::
+
+                model = BaseSequenceClassificationModule(
+                    config=my_config,
+                    base_model_class=MyTransformerModel,
+                    dtype=jnp.float32,
+                    rngs=nn.Rngs(0),
+                    pooling_strategy="mean",
+                    score_head_bias=True,
+                )
         """
         # Validate config has num_labels
         assert hasattr(config, "num_labels"), (
@@ -183,23 +275,64 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
     ) -> SequenceClassifierOutput:
         """Forward pass through the Sequence Classification model.
 
+        Processes input through the base transformer model, pools the sequence
+        representations according to the configured strategy, and applies the
+        classification head to produce logits for each class.
+
         Args:
-            input_ids: Input token IDs, shape (batch_size, sequence_length)
-            inputs_embeds: Input embeddings (alternative to input_ids)
-            attention_mask: Mask to avoid attention on padding tokens
-            position_ids: Position IDs for positional embeddings
-            mode: Runtime mode (train, eval, etc.)
-            past_key_values: Cache containing precomputed key/value states
-            cache_metadata: Metadata for cache handling
-            output_attentions: Whether to return attention weights
-            output_hidden_states: Whether to return hidden states of all layers
+            input_ids: Input token IDs with shape (batch_size, sequence_length).
+                Each value should be a valid token ID from the vocabulary.
+                Either input_ids or inputs_embeds must be provided.
+            inputs_embeds: Pre-computed input embeddings with shape
+                (batch_size, sequence_length, hidden_dim). Alternative to input_ids
+                for passing custom embeddings directly.
+            attention_mask: Binary mask with shape (batch_size, sequence_length).
+                1 for tokens to attend to, 0 for padding tokens. Used for both
+                attention computation and pooling.
+            mask_info: Structured mask information for advanced attention patterns.
+                Alternative to attention_mask for complex masking scenarios.
+            position_ids: Position indices with shape (batch_size, sequence_length).
+                If None, positions are inferred from input_ids.
+            mode: Runtime mode controlling model behavior. Options include
+                training mode, evaluation mode, and various inference modes.
+            past_key_values: Cached key/value states from previous forward passes.
+                Used for efficient autoregressive generation.
+            cache_metadata: Metadata for cache management including sequence
+                lengths and cache indices.
+            output_attentions: If True, include attention weights in the output.
+                Defaults to model config setting if None.
+            output_hidden_states: If True, include hidden states from all layers
+                in the output. Defaults to model config setting if None.
 
         Returns:
-            SequenceClassifierOutput containing classification logits, hidden states,
-            attentions, and auxiliary loss if applicable
+            SequenceClassifierOutput: A dataclass containing:
+                - logits: Classification logits with shape (batch_size, num_labels)
+                - past_key_values: Updated KV cache (if caching is enabled)
+                - hidden_states: Tuple of hidden states from all layers (if requested)
+                - attentions: Tuple of attention weights from all layers (if requested)
+                - aux_loss: Router auxiliary loss for MoE models (if applicable)
 
         Raises:
-            ValueError: If batch size > 1 and no padding token is defined
+            ValueError: If batch size > 1 and no padding token is defined in config,
+                and no attention_mask is provided. This is required to correctly
+                identify the last token position for pooling.
+
+        Example:
+            Basic inference::
+
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+                predictions = jnp.argmax(outputs.logits, axis=-1)
+
+            Getting all hidden states::
+
+                outputs = model(
+                    input_ids=input_ids,
+                    output_hidden_states=True,
+                )
+                # outputs.hidden_states is a tuple of arrays
         """
         # Forward through base model
         outputs = self.base_model(
@@ -246,18 +379,37 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
         )
 
     def get_task_head(self):
-        """Returns the classification head.
+        """Returns the classification head module.
+
+        Retrieves the linear layer used for sequence classification. The head
+        projects from hidden_size to num_labels dimensions.
 
         Returns:
-            The score module
+            nn.Module: The classification head module (typically ColumnParallelLinear).
+                The actual attribute name depends on the score_head_name parameter
+                used during initialization.
+
+        Example:
+            Accessing the classification head weights::
+
+                head = model.get_task_head()
+                weights = head.kernel.value  # Shape: (hidden_size, num_labels)
         """
         return getattr(self, self._score_head_name)
 
     def get_lm_head(self):
         """Raises NotImplementedError since this model uses a classification head.
 
+        Sequence classification models do not have a language modeling head.
+        They use a classification head instead, which can be accessed via
+        get_task_head().
+
         Raises:
             NotImplementedError: Always raised for sequence classification models
+                with a message indicating the correct method to use.
+
+        See Also:
+            get_task_head: Use this method to access the classification head.
         """
         raise NotImplementedError(
             f"SequenceClassification models use a classification head ({self._score_head_name}), not an lm_head."

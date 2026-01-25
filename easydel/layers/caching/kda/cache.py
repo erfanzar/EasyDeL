@@ -15,10 +15,36 @@
 """KDA (Key-Driven Attention) Cache implementation.
 
 This module provides caching for KDA-style linear attention which uses
-separate convolution states for Q, K, V projections (used in Kimi Linear).
+separate convolution states for Q, K, V projections. KDA is a linear
+attention variant used in models like Kimi Linear that combines:
 
-The KDACache is designed to be composable - HybridCache uses KDACacheView
-directly for its kda_linear_attention layers.
+- Separate convolutional states for Q, K, V projections
+- A recurrent state for linear attention computation
+- Position tracking for autoregressive generation
+
+Key Features:
+    - Separate Q/K/V convolution states for short-range dependencies
+    - Recurrent state for long-range linear attention
+    - Composable design for use within HybridCache
+    - Full serialization support via to_pure/from_pure
+
+Key Components:
+    - KDACacheConfig: Configuration for cache dimensions
+    - KDACacheView: Per-layer view with conv and recurrent states
+    - KDACache: Multi-layer cache container
+    - KDAMetadata: Runtime metadata placeholder
+
+Example:
+    >>> config = KDACacheConfig.create(
+    ...     num_hidden_layers=32,
+    ...     partition_axis=PartitionAxis(),
+    ...     batch_size=4,
+    ...     key_dim=256,
+    ...     value_dim=256,
+    ...     d_conv=4,
+    ...     recurrent_state_shape=(64, 64)
+    ... )
+    >>> cache = KDACache.init_cache(config)
 """
 
 from __future__ import annotations
@@ -37,16 +63,37 @@ from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, BaseRunTimeM
 
 @auto_pytree
 class KDACacheConfig(BaseCacheConfig):
-    """Metadata for KDA cache configuration.
+    """Configuration for KDA (Key-Driven Attention) cache.
+
+    Defines the dimensions and partitioning for KDA-style linear attention
+    caching, which stores separate convolution states for Q, K, V projections
+    plus a recurrent state for linear attention.
 
     Attributes:
-        num_hidden_layers: Number of layers in the model.
-        partition_axis: Configuration for tensor partitioning.
-        batch_size: Number of sequences in batch.
-        key_dim: Dimension of key (and query) projections.
-        value_dim: Dimension of value projections.
-        d_conv: Size of the convolution kernel.
-        recurrent_state_shape: Shape of recurrent state (excluding batch).
+        num_hidden_layers (int): Number of transformer layers in the model.
+        partition_axis (PartitionAxis): Configuration for tensor partitioning
+            across devices.
+        batch_size (int): Number of sequences in a batch.
+        key_dim (int): Dimension of key (and query) projections. Used for
+            Q and K convolution state sizes.
+        value_dim (int): Dimension of value projections. Used for V
+            convolution state size.
+        d_conv (int): Size of the convolution kernel (context window for
+            short-range dependencies).
+        recurrent_state_shape (tuple): Shape of the recurrent state tensor
+            excluding the batch dimension. Typically (num_heads, head_dim)
+            or similar.
+
+    Example:
+        >>> config = KDACacheConfig.create(
+        ...     num_hidden_layers=32,
+        ...     partition_axis=PartitionAxis(),
+        ...     batch_size=4,
+        ...     key_dim=256,
+        ...     value_dim=256,
+        ...     d_conv=4,
+        ...     recurrent_state_shape=(8, 64)
+        ... )
     """
 
     num_hidden_layers: int = field(pytree_node=False)
@@ -68,7 +115,25 @@ class KDACacheConfig(BaseCacheConfig):
         d_conv: int,
         recurrent_state_shape: tuple[int, ...],
     ) -> KDACacheConfig:
-        """Create and validate KDACacheConfig."""
+        """Create and validate a KDACacheConfig.
+
+        Factory method that validates all parameters before construction.
+
+        Args:
+            num_hidden_layers: Number of transformer layers.
+            partition_axis: Tensor partitioning configuration.
+            batch_size: Batch size for cache allocation.
+            key_dim: Key/query projection dimension.
+            value_dim: Value projection dimension.
+            d_conv: Convolution kernel size.
+            recurrent_state_shape: Shape of recurrent state (excluding batch).
+
+        Returns:
+            KDACacheConfig: Validated configuration instance.
+
+        Raises:
+            ValueError: If any dimension is non-positive.
+        """
         if num_hidden_layers <= 0:
             raise ValueError("num_hidden_layers must be positive")
         if batch_size <= 0:
@@ -177,7 +242,21 @@ class KDACacheView(BaseCacheView):
         v_conv_state: Float[Array, "batch value_dim d_conv"] | None = None,
         recurrent_state: Float[Array, "batch ..."] | None = None,
     ) -> tuple[None, None, KDACacheView]:
-        """Update cache with new Q/K/V conv states and/or recurrent state."""
+        """Update cache with new Q/K/V conv states and/or recurrent state.
+
+        Unlike transformer KV caches that return (key, value, view), KDA cache
+        returns (None, None, view) since the attention is computed differently.
+
+        Args:
+            q_conv_state: New Q convolution state. If None, keeps existing.
+            k_conv_state: New K convolution state. If None, keeps existing.
+            v_conv_state: New V convolution state. If None, keeps existing.
+            recurrent_state: New recurrent state. If None, keeps existing.
+
+        Returns:
+            tuple: (None, None, updated_view) - None values for compatibility
+                with the base interface; the updated KDACacheView.
+        """
         new_q = q_conv_state if q_conv_state is not None else self.q_conv_state
         new_k = k_conv_state if k_conv_state is not None else self.k_conv_state
         new_v = v_conv_state if v_conv_state is not None else self.v_conv_state
@@ -202,7 +281,20 @@ class KDACacheView(BaseCacheView):
         new_v_conv_state: Float[Array, "batch value_dim d_conv"] | None = None,
         new_recurrent_state: Float[Array, "batch ..."] | None = None,
     ) -> KDACacheView:
-        """Update KDA states."""
+        """Update KDA states with new values.
+
+        Convenience method that wraps concatenate_to_cache and returns
+        just the updated view.
+
+        Args:
+            new_q_conv_state: New Q convolution state. If None, keeps existing.
+            new_k_conv_state: New K convolution state. If None, keeps existing.
+            new_v_conv_state: New V convolution state. If None, keeps existing.
+            new_recurrent_state: New recurrent state. If None, keeps existing.
+
+        Returns:
+            KDACacheView: Updated cache view with new states.
+        """
         _, _, new_view = self.concatenate_to_cache(
             q_conv_state=new_q_conv_state,
             k_conv_state=new_k_conv_state,
@@ -212,7 +304,14 @@ class KDACacheView(BaseCacheView):
         return new_view
 
     def reset(self) -> KDACacheView:
-        """Reset cache to zeros."""
+        """Reset cache to zeros.
+
+        Creates a new cache view with all states zeroed out while
+        preserving metadata and layer index.
+
+        Returns:
+            KDACacheView: Fresh cache view with zeroed states.
+        """
         return KDACacheView(
             q_conv_state=jnp.zeros_like(self.q_conv_state),
             k_conv_state=jnp.zeros_like(self.k_conv_state),
@@ -237,8 +336,17 @@ class KDACacheView(BaseCacheView):
 class KDACache(BaseCache):
     """Multi-layer KDA cache container.
 
+    Holds a list of KDACacheView instances, one per transformer layer.
+    Provides methods for initialization, serialization, and batch manipulation.
+
     Attributes:
-        views: List of KDACacheView, one per layer.
+        views (list): List of KDACacheView instances, one per layer.
+            May contain None for uninitialized layers.
+
+    Example:
+        >>> config = KDACacheConfig.create(...)
+        >>> cache = KDACache.init_cache(config)
+        >>> layer_view = cache.views[layer_idx]
     """
 
     views: list[KDACacheView | None]
@@ -250,7 +358,18 @@ class KDACache(BaseCache):
         dtype: jnp.dtype | None = None,
         partition_specs: PartitionSpec | None = None,
     ) -> KDACache:
-        """Initialize a complete KDA cache."""
+        """Initialize a complete KDA cache for all layers.
+
+        Creates KDACacheView instances for each layer specified in the config.
+
+        Args:
+            config: KDACacheConfig with cache dimensions.
+            dtype: Data type for cache tensors. Default: jnp.bfloat16.
+            partition_specs: Sharding specification (unused, uses config).
+
+        Returns:
+            KDACache: Initialized cache with views for all layers.
+        """
         if dtype is None:
             dtype = jnp.bfloat16
 
@@ -268,11 +387,26 @@ class KDACache(BaseCache):
 
     @classmethod
     def init_empty(cls, num_hidden_layers: int) -> KDACache:
-        """Initialize an empty KDA cache."""
+        """Initialize an empty KDA cache with None views.
+
+        Creates a cache with placeholder None views for lazy initialization.
+
+        Args:
+            num_hidden_layers: Number of layers to allocate slots for.
+
+        Returns:
+            KDACache: Cache with None views for each layer.
+        """
         return cls(views=[None for _ in range(num_hidden_layers)])
 
     def reset(self) -> KDACache:
-        """Reset all layers."""
+        """Reset all layer caches to zeros.
+
+        Creates a new cache where each view has zeroed states.
+
+        Returns:
+            KDACache: New cache with all states reset.
+        """
         new_views = [view.reset() if view is not None else None for view in self.views]
         return KDACache(views=new_views)
 
@@ -387,6 +521,14 @@ class KDACache(BaseCache):
 
 
 class KDAMetadata(BaseRunTimeMetadata):
-    """Runtime metadata for KDA cache operations."""
+    """Runtime metadata for KDA cache operations.
+
+    Placeholder class for KDA-specific runtime metadata. Currently empty
+    as KDA attention does not require additional runtime metadata beyond
+    the cache state itself.
+
+    This class exists for interface consistency with other cache types
+    and may be extended in the future for KDA-specific optimizations.
+    """
 
     ...

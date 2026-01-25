@@ -20,31 +20,31 @@ using chunking strategies, custom VJP for gradient computation, and support for
 various normalization and regularization techniques.
 
 Classes:
-    SpecialLossNormalizingFactor: Enum for dynamic loss normalization strategies
-    LossConfig: Configuration class for customizing loss computation behavior
-    LossMetrics: Container for loss metrics and auxiliary training information
+    SpecialLossNormalizingFactor: Enum for dynamic loss normalization strategies.
+    LossConfig: Configuration class for customizing loss computation behavior.
+    LossMetrics: Container for loss metrics and auxiliary training information.
 
 Loss Functions:
-    ForCausalLMLoss: Causal language modeling with token shifting
-    ForSequenceClassificationLoss: Single/multi-label classification and regression
-    ForQuestionAnsweringLoss: Span-based question answering (SQuAD-style)
-    ForTokenClassification: Token-level classification (NER, POS tagging)
+    ForCausalLMLoss: Causal language modeling with token shifting.
+    ForSequenceClassificationLoss: Single/multi-label classification and regression.
+    ForQuestionAnsweringLoss: Span-based question answering (SQuAD-style).
+    ForTokenClassification: Token-level classification (NER, POS tagging).
 
 Utility Functions:
-    cross_entropy_blockwise_logits: Memory-efficient CE for large vocabularies
-    sparse_cross_entropy_chunked_vocab: Chunked vocabulary processing
-    sparse_cross_entropy_chunked_tokens: Chunked token processing
-    compute_weighted_cross_entropy: Standard weighted CE with z-loss
-    auxiliary_load_balancing_loss_func: MoE load balancing loss
+    cross_entropy_blockwise_logits: Memory-efficient CE for large vocabularies.
+    sparse_cross_entropy_chunked_vocab: Chunked vocabulary processing.
+    sparse_cross_entropy_chunked_tokens: Chunked token processing.
+    compute_weighted_cross_entropy: Standard weighted CE with z-loss.
+    auxiliary_load_balancing_loss_func: MoE load balancing loss.
 
 Key Features:
-    - Memory-efficient chunking for large vocabulary/sequence lengths
-    - Flexible loss normalization (per-token, per-sequence, weighted)
-    - Label smoothing and z-loss regularization
-    - Custom VJP for efficient gradient computation
-    - Support for packed sequences and attention masking
-    - Mixed precision computation support
-    - MoE auxiliary loss for expert load balancing
+    - Memory-efficient chunking for large vocabulary/sequence lengths.
+    - Flexible loss normalization (per-token, per-sequence, weighted).
+    - Label smoothing and z-loss regularization.
+    - Custom VJP for efficient gradient computation.
+    - Support for packed sequences and attention masking.
+    - Mixed precision computation support.
+    - MoE auxiliary loss for expert load balancing.
 
 Example:
     >>> from easydel.infra import LossConfig, ForCausalLMLoss
@@ -90,20 +90,34 @@ from easydel.utils.compiling_utils import hash_fn
 
 @enum.unique
 class SpecialLossNormalizingFactor(enum.Enum):
-    """
-    Specifies special, dynamically calculated loss normalizing factors.
+    """Enumeration for dynamic loss normalization strategies.
 
-    These enums are used in loss functions to indicate how the loss should be
-    normalized based on properties of the input batch, rather than using a fixed
-    constant.
+    This enum specifies how the loss should be normalized based on properties
+    of the input batch, rather than using a fixed constant. These strategies
+    are particularly useful for handling variable-length sequences and packed
+    batches where padding tokens should not contribute to the loss.
 
     Attributes:
-        NO_WEIGHT_NUM_REAL_TARGET_TOKENS: Divides the loss by the number of non-padding target tokens,
-            ignoring any provided loss weights.
-        NUM_REAL_TARGET_TOKENS: Divides the loss by the number of non-padding target tokens,
-            considering provided loss weights.
-        NUM_TOTAL_TARGET_TOKENS: Divides the loss by the total number of target tokens, including padding.
-        AVERAGE_PER_SEQUENCE: Computes the average loss per sequence in the batch.
+        NO_WEIGHT_NUM_REAL_TARGET_TOKENS: Divides the loss by the number of
+            non-padding target tokens, ignoring any provided loss weights.
+            Useful when you want to normalize purely by token count without
+            considering importance weights.
+        NUM_REAL_TARGET_TOKENS: Divides the loss by the number of non-padding
+            target tokens, considering provided loss weights. This is the
+            default and most commonly used normalization strategy.
+        NUM_TOTAL_TARGET_TOKENS: Divides the loss by the total number of target
+            tokens, including padding. Use this when you want consistent
+            normalization regardless of padding.
+        AVERAGE_PER_SEQUENCE: Computes the average loss per sequence in the
+            batch. This normalizes each sequence independently before averaging,
+            which can be useful for variable-length sequences to prevent longer
+            sequences from dominating the gradient.
+
+    Example:
+        >>> from easydel.infra.loss_utils import SpecialLossNormalizingFactor as SLNF
+        >>> config = LossConfig(loss_normalizing_factor=SLNF.NUM_REAL_TARGET_TOKENS)
+        >>> # Or using string representation
+        >>> config = LossConfig(loss_normalizing_factor="NUM_REAL_TARGET_TOKENS")
     """
 
     NO_WEIGHT_NUM_REAL_TARGET_TOKENS = 0
@@ -114,45 +128,68 @@ class SpecialLossNormalizingFactor(enum.Enum):
 
 SLNF = SpecialLossNormalizingFactor
 
-
+# Type alias for loss normalizing factor that can be a float, int, string, or enum.
 FACTOR_TYPE = tp.Optional[float | int | str | SLNF]  # noqa
 
 
 @auto_pytree
 class LossConfig:
-    """
-    Configuration class for customizing loss computation behavior.
+    """Configuration class for customizing loss computation behavior.
+
+    This class encapsulates all configurable parameters for loss computation,
+    including regularization techniques (label smoothing, z-loss), normalization
+    strategies, and memory optimization options (chunking).
 
     Attributes:
-        ignore_index (int): Specifies a target value that is ignored and does not contribute to the loss.
-            Defaults to -100.
-        label_smoothing (float): Amount of label smoothing to apply. 0.0 means no smoothing.
-            Defaults to 0.0.
-        z_loss (float): Coefficient for the z-loss regularization term, which encourages logits
-            for non-target classes to be small. Defaults to 0.0.
-        loss_normalizing_factor (FACTOR_TYPE): How to normalize the loss. Can be a constant float/int,
-            a string representation of a `SpecialLossNormalizingFactor` enum, or the enum itself.
-            Defaults to "NUM_REAL_TARGET_TOKENS".
-        num_labels (tp.Optional[int]): The number of labels for classification tasks. Used in
-            `ForSequenceClassificationLoss`. Defaults to None.
-        problem_type (tp.Optional[str]): Specifies the problem type for sequence classification
-            (e.g., "single_label_classification", "multi_label_classification").
-            Defaults to None.
-        divide_weight_sum (bool): If True, divides the loss by the sum of weights, in addition to
-            the `loss_normalizing_factor`. Defaults to False.
-        shift_tokens (bool): If True (typically for Causal LM), shifts the logits and labels
-            so that the model predicts the next token. Defaults to True.
-        break_on_nan (bool): If True, raises an `EasyDeLBreakRequest` if a NaN is encountered
-            during loss computation. Defaults to True.
-        reduction (tp.Optional[tp.Literal["none", "mean", "sum"]]): Specifies the reduction to apply
-            to the loss. If None, the default reduction of the specific loss function is used.
-            Defaults to None.
-        num_classification_labels (tp.Optional[int]): Number of labels specifically for sequence
-            classification. Alias for `num_labels`. Defaults to None.
-        classification_problem_type (tp.Optional[tp.Literal["regression", "single_label_classification",
-                "multi_label_classification"]]):
-            Problem type specifically for sequence classification. Alias for `problem_type`.
-            Defaults to None.
+        ignore_index: Target value that is ignored and does not contribute to
+            the loss or gradient. Commonly set to -100 for padding tokens.
+        label_smoothing: Smoothing factor in [0, 1). When > 0, replaces hard
+            one-hot targets with soft targets where the true class has
+            probability (1 - label_smoothing) and other classes share the
+            remaining probability. Helps prevent overconfidence.
+        z_loss: Coefficient for z-loss regularization term, which penalizes
+            large logits and encourages the log-partition function (logsumexp)
+            to remain small. Helps stabilize training for large models.
+        loss_normalizing_factor: Strategy for normalizing the loss. Can be:
+            - A float/int constant
+            - A string matching a SpecialLossNormalizingFactor name
+            - A SpecialLossNormalizingFactor enum value
+        num_labels: Number of labels for classification tasks. Required for
+            sequence classification.
+        problem_type: Type of classification problem. One of "regression",
+            "single_label_classification", or "multi_label_classification".
+        divide_weight_sum: If True, additionally divides loss by sum of weights
+            after applying loss_normalizing_factor.
+        shift_tokens: If True (default for causal LM), shifts logits and labels
+            so the model predicts the next token. Set to False for non-autoregressive
+            tasks.
+        break_on_nan: If True, raises EasyDeLBreakRequest when NaN is encountered.
+        reduction: Reduction method for the loss. One of "none", "mean", or "sum".
+            If None, uses the default for the specific loss function.
+        num_classification_labels: Alias for num_labels for sequence classification.
+        classification_problem_type: Alias for problem_type.
+        chunk_vocab_size: If set, enables vocabulary-dimension chunking with this
+            chunk size. Reduces memory for large vocabularies.
+        chunk_token_size: If set, enables token-dimension chunking with this
+            chunk size. Reduces memory for long sequences.
+        chunk_block_size: If set, enables blockwise processing with this block
+            size. Alternative memory optimization strategy.
+        compute_dtype: Data type for computation. One of "fp32" or "bf16".
+            If None, uses the input dtype.
+
+    Example:
+        >>> # Standard configuration with label smoothing
+        >>> config = LossConfig(
+        ...     label_smoothing=0.1,
+        ...     z_loss=1e-4,
+        ...     loss_normalizing_factor="NUM_REAL_TARGET_TOKENS"
+        ... )
+        >>>
+        >>> # Memory-efficient configuration for large vocabulary
+        >>> config = LossConfig(
+        ...     chunk_vocab_size=8192,
+        ...     compute_dtype="bf16"
+        ... )
     """
 
     ignore_index: int = -100
@@ -175,6 +212,11 @@ class LossConfig:
     compute_dtype: tp.Literal["fp32", "bf16"] | None = None
 
     def __repr__(self):
+        """Return a detailed string representation of the configuration.
+
+        Returns:
+            str: Multi-line string showing all configuration fields and values.
+        """
         cls_name = self.__class__.__name__
         field_lines = [f"    {f.name}: {getattr(self, f.name)!r}".replace("\n", "\n    ") for f in fields(self)]
         return f"{cls_name}(\n" + "\n".join(field_lines) + "\n)"
@@ -185,22 +227,43 @@ class LossConfig:
 
 @auto_pytree
 class LossMetrics:
-    """
-    Container for various metrics related to loss computation and model training.
+    """Container for loss metrics and auxiliary training information.
+
+    This class aggregates various metrics computed during loss calculation,
+    providing a unified interface for accessing loss values, regularization
+    terms, and diagnostic information useful for monitoring training.
 
     Attributes:
-        loss (tp.Optional[tp.Union[float, Array]]): The primary computed loss value.
-        z_loss (tp.Optional[tp.Union[float, Array]]): The computed z-loss regularization term.
-        weight_sum (tp.Optional[tp.Union[float, Array]]): The sum of weights used in the loss calculation.
-        accuracy (tp.Optional[tp.Union[float, Array]]): Computed accuracy, if applicable.
-        learning_rate (tp.Optional[tp.Union[float, Array]]): The learning rate used for the current step.
-        max_grad_norm (tp.Optional[flax.struct.PyTreeNode]): The maximum gradient norm observed.
-        mean_grad_norm (tp.Optional[flax.struct.PyTreeNode]): The mean gradient norm observed.
-        grad_norms (tp.Optional[flax.struct.PyTreeNode]): A pytree containing the norms of gradients for each parameter.
-        chosen_rewards (tp.Optional[jax.Array]): Rewards for the chosen sequence in preference-based tasks.
-        rejected_rewards (tp.Optional[jax.Array]): Rewards for the rejected sequence in preference-based tasks.
-        other_metrics (tp.Optional[tp.Mapping[str, jax.Array]]): A dictionary for any additional custom metrics.
-        execution_time (tp.Optional[float]): Time taken for the computation step.
+        loss: The primary computed loss value. This is the value that should
+            be used for backpropagation.
+        z_loss: The computed z-loss regularization term. Included in the total
+            loss but tracked separately for monitoring.
+        weight_sum: Sum of weights used in loss calculation. Useful for
+            verifying normalization and debugging.
+        accuracy: Computed accuracy as fraction of correct predictions,
+            weighted by the loss weights if applicable.
+        learning_rate: Learning rate used for the current step. Populated
+            during training for logging purposes.
+        max_grad_norm: Maximum gradient norm observed across all parameters.
+            Useful for detecting exploding gradients.
+        mean_grad_norm: Mean gradient norm across all parameters.
+        grad_norms: PyTree containing gradient norms for each parameter.
+            Useful for detailed gradient analysis.
+        chosen_rewards: Rewards for chosen sequences in preference-based
+            training (e.g., DPO, RLHF).
+        rejected_rewards: Rewards for rejected sequences in preference-based
+            training.
+        other_metrics: Dictionary for storing additional custom metrics
+            specific to certain training scenarios.
+        execution_time: Wall-clock time taken for the computation step
+            in seconds.
+
+    Example:
+        >>> metrics = ForCausalLMLoss(logits, labels, config=config)
+        >>> print(f"Loss: {metrics.loss:.4f}")
+        >>> print(f"Accuracy: {metrics.accuracy:.2%}")
+        >>> if metrics.z_loss is not None:
+        ...     print(f"Z-Loss: {metrics.z_loss:.6f}")
     """
 
     loss: float | Array | None = None
@@ -220,15 +283,33 @@ class LossMetrics:
 def _logsumexp_chunked(x: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
     """Compute logsumexp over the last dimension in chunks for memory efficiency.
 
-    This function computes log(sum(exp(x))) over the last dimension using a chunked
-    approach to reduce memory usage for large vocabulary sizes.
+    This function computes log(sum(exp(x))) over the last dimension using a
+    two-pass chunked approach to reduce peak memory usage. The first pass
+    computes the maximum value across chunks, and the second pass computes
+    the sum of shifted exponentials.
+
+    This is particularly useful for large vocabulary sizes where materializing
+    the full softmax distribution would exceed memory limits.
 
     Args:
-        x: Input array with shape [..., V] where V is vocabulary size.
-        chunk_size: Size of chunks to process at a time.
+        x: Input array with shape [..., V] where V is the vocabulary size or
+            the dimension over which to compute logsumexp.
+        chunk_size: Size of chunks to process at a time. Smaller values reduce
+            memory usage but may increase computation time.
 
     Returns:
-        Array with shape [...] containing logsumexp values.
+        Array with shape [...] containing the logsumexp values for each position
+        in the leading dimensions.
+
+    Note:
+        The chunked computation is mathematically equivalent to the standard
+        logsumexp but uses O(chunk_size) memory instead of O(V) for the
+        intermediate computations.
+
+    Example:
+        >>> logits = jnp.randn(32, 1024, 50000)  # Large vocabulary
+        >>> lse = _logsumexp_chunked(logits, chunk_size=8192)
+        >>> assert lse.shape == (32, 1024)
     """
     # x: [..., V]
     V: int = x.shape[-1]  # static python int
@@ -237,6 +318,7 @@ def _logsumexp_chunked(x: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
 
     # Pass 1: max
     def max_body(i, m):
+        """Compute running maximum across chunks."""
         start = i * chunk_size
         chunk = lax.dynamic_slice_in_dim(x, start, chunk_size, axis=-1)
         return jnp.maximum(m, jnp.max(chunk, axis=-1))
@@ -250,6 +332,7 @@ def _logsumexp_chunked(x: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
 
     # Pass 2: sum of exp(x - m)
     def sum_body(i, s):
+        """Compute running sum of shifted exponentials."""
         start = i * chunk_size
         chunk = lax.dynamic_slice_in_dim(x, start, chunk_size, axis=-1)
         return s + jnp.sum(jnp.exp(chunk - m[..., None]), axis=-1)
@@ -275,9 +358,54 @@ def cross_entropy_blockwise_logits(
     block_size: int = 8192,
     dtype: jnp.dtype | None = jnp.float32,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """
-    Blockwise sparse cross-entropy from logits without materializing softmax or one-hot.
-    Returns (total_loss, total_z_loss, weight_sum, accuracy).
+    """Compute blockwise sparse cross-entropy without materializing full softmax.
+
+    This function implements a memory-efficient cross-entropy computation that
+    processes the vocabulary dimension in blocks. It avoids materializing the
+    full softmax distribution or one-hot encoded targets, making it suitable
+    for large vocabulary sizes.
+
+    The implementation uses a streaming approach to compute:
+    1. Running logsumexp for normalization
+    2. Target logits via sparse indexing
+    3. Sum of logits for label smoothing
+    4. Running argmax for accuracy computation
+
+    Args:
+        logits: Model output logits with shape [B, T, V] (batch, sequence, vocab)
+            or [N, V] (flattened tokens, vocab).
+        targets: Target token indices with shape [B, T] or [N]. Values should be
+            in [0, V) or equal to ignore_index for masked positions.
+        weights: Optional per-token weights with shape [B, T] or [N]. If None,
+            uses binary weights based on ignore_index masking.
+        ignore_index: Index value to ignore in loss computation. Typically -100
+            for padding tokens.
+        label_smoothing: Label smoothing factor in [0, 1). When > 0, distributes
+            some probability mass to non-target classes.
+        z_loss: Coefficient for z-loss regularization. Adds z_loss * logsumexp^2
+            to the loss to encourage smaller logits.
+        block_size: Size of vocabulary blocks to process at a time. Must be > 0.
+            Smaller values reduce memory but may increase computation.
+        dtype: Data type for computation. If None, uses input dtype. Float32
+            recommended for numerical stability.
+
+    Returns:
+        Tuple of four arrays:
+            - total_loss: Sum of weighted per-token losses (scalar).
+            - total_z_loss: Sum of weighted z-loss terms (scalar).
+            - weight_sum: Sum of weights for normalization (scalar).
+            - accuracy: Weighted accuracy as fraction in [0, 1] (scalar).
+
+    Raises:
+        ValueError: If logits has invalid shape (not 2D or 3D) or block_size <= 0.
+
+    Example:
+        >>> logits = jnp.randn(4, 512, 50000)  # Large vocabulary
+        >>> targets = jnp.randint(0, 50000, (4, 512))
+        >>> loss, z_loss, w_sum, acc = cross_entropy_blockwise_logits(
+        ...     logits, targets, block_size=8192
+        ... )
+        >>> normalized_loss = loss / w_sum
     """
     # Flatten tokens
     if logits.ndim == 3:
@@ -318,6 +446,7 @@ def cross_entropy_blockwise_logits(
     tail = V - n_full * block_size
 
     def process_block(start: int, size: int, m, log_z, o, sum_logits, best_logit, best_id):
+        """Process a single vocabulary block and update accumulators."""
         # Static slice sizes: size is either block_size (in a fori_loop) or tail (once)
         chunk = lax.dynamic_slice_in_dim(logits2d, start, size, axis=1)  # [L, size]
 
@@ -346,6 +475,7 @@ def cross_entropy_blockwise_logits(
         return m, log_z, o, sum_logits, best_logit, best_id
 
     def full_body(i, carry):
+        """Process a full block in the fori_loop."""
         start = i * block_size
         return process_block(start, block_size, *carry)
 
@@ -392,24 +522,45 @@ def sparse_cross_entropy_chunked_vocab(
     chunk_size: int = 8192,
     compute_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Compute sparse cross-entropy loss with vocabulary chunking for memory efficiency.
+    """Compute sparse cross-entropy loss with vocabulary chunking.
 
     This function chunks along the vocabulary dimension to reduce memory usage
-    when computing cross-entropy for large vocabularies.
+    when computing cross-entropy for large vocabularies. It uses the chunked
+    logsumexp implementation for numerical stability.
+
+    Unlike `cross_entropy_blockwise_logits`, this function uses a simpler
+    approach that first computes the full logsumexp, then gathers the target
+    logit. This is more efficient when the vocabulary fits in memory after
+    chunking but the full softmax distribution would not.
 
     Args:
         logits: Model logits with shape [..., V] where V is vocabulary size.
-        targets: Target token indices with shape [...].
-        weights: Optional per-token weights with shape [...].
-        ignore_index: Index to ignore in loss computation (default: -100).
-        label_smoothing: Label smoothing factor in [0, 1] (default: 0.0).
-        z_loss: Coefficient for z-loss regularization (default: 0.0).
-        reduction: Reduction type, "mean" or "sum" (default: "mean").
-        chunk_size: Vocabulary chunk size for memory efficiency (default: 8192).
-        compute_dtype: Dtype for computation (default: jnp.float32).
+            Can be any number of leading dimensions.
+        targets: Target token indices with shape [...] matching logits' leading
+            dimensions.
+        weights: Optional per-token weights with shape [...]. If None, uses
+            binary weights based on ignore_index.
+        ignore_index: Index value to ignore in loss computation.
+        label_smoothing: Label smoothing factor in [0, 1).
+        z_loss: Coefficient for z-loss regularization.
+        reduction: Reduction type. "mean" divides by weight sum, "sum" returns
+            raw sum.
+        chunk_size: Vocabulary chunk size for memory efficiency.
+        compute_dtype: Data type for computation.
 
     Returns:
-        Tuple of (total_loss, total_z_loss, weight_sum, accuracy).
+        Tuple of four arrays:
+            - total_loss: Reduced loss value.
+            - total_z_loss: Sum of weighted z-loss terms.
+            - weight_sum: Sum of weights.
+            - accuracy: Weighted accuracy.
+
+    Example:
+        >>> logits = jnp.randn(8, 256, 100000)  # Very large vocabulary
+        >>> targets = jnp.randint(0, 100000, (8, 256))
+        >>> loss, z_loss, w_sum, acc = sparse_cross_entropy_chunked_vocab(
+        ...     logits, targets, chunk_size=16384
+        ... )
     """
     logits = logits.astype(compute_dtype)
     valid = targets != ignore_index
@@ -453,24 +604,43 @@ def sparse_cross_entropy_chunked_tokens(
     token_chunk_size: int = 8192,
     compute_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Compute sparse cross-entropy loss with token sequence chunking for memory efficiency.
+    """Compute sparse cross-entropy loss with token sequence chunking.
 
     This function chunks along the token/batch dimension to reduce memory usage
-    when computing cross-entropy for long sequences or large batches.
+    when computing cross-entropy for long sequences or large batches. This is
+    complementary to vocabulary chunking and can be used when the sequence
+    length is the memory bottleneck.
+
+    The function processes tokens in chunks using a fori_loop for the full
+    chunks and handles any remaining tokens separately.
 
     Args:
-        logits: Model logits with shape [B, T, V] or [N, V].
+        logits: Model logits with shape [B, T, V] (batch, sequence, vocab)
+            or [N, V] (flattened tokens, vocab).
         targets: Target token indices with shape [B, T] or [N].
         weights: Optional per-token weights with shape matching targets.
-        ignore_index: Index to ignore in loss computation (default: -100).
-        label_smoothing: Label smoothing factor in [0, 1] (default: 0.0).
-        z_loss: Coefficient for z-loss regularization (default: 0.0).
-        reduction: Reduction type, "mean" or "sum" (default: "sum").
-        token_chunk_size: Token sequence chunk size for memory efficiency (default: 8192).
-        compute_dtype: Dtype for computation (default: jnp.float32).
+        ignore_index: Index value to ignore in loss computation.
+        label_smoothing: Label smoothing factor in [0, 1).
+        z_loss: Coefficient for z-loss regularization.
+        reduction: Reduction type. "mean" divides by weight sum, "sum" returns
+            raw sum. Default is "sum" for external normalization.
+        token_chunk_size: Number of tokens to process at a time.
+        compute_dtype: Data type for computation.
 
     Returns:
-        Tuple of (total_loss, total_z_loss, weight_sum, accuracy).
+        Tuple of four arrays:
+            - total_loss: Reduced loss value.
+            - total_z_loss: Sum of weighted z-loss terms.
+            - weight_sum: Sum of weights.
+            - accuracy: Weighted accuracy.
+
+    Example:
+        >>> # Long sequence with moderate vocabulary
+        >>> logits = jnp.randn(2, 32768, 32000)
+        >>> targets = jnp.randint(0, 32000, (2, 32768))
+        >>> loss, z_loss, w_sum, acc = sparse_cross_entropy_chunked_tokens(
+        ...     logits, targets, token_chunk_size=4096
+        ... )
     """
     logits = logits.astype(compute_dtype)
     V = logits.shape[-1]
@@ -482,6 +652,7 @@ def sparse_cross_entropy_chunked_tokens(
     tail = N - n_full * token_chunk_size
 
     def body(i, carry):
+        """Process a chunk of tokens and accumulate results."""
         tot, wsum, acc_sum, zsum = carry
         start = i * token_chunk_size
         chunk_logits = lax.dynamic_slice_in_dim(logits2d, start, token_chunk_size, axis=0)
@@ -565,28 +736,45 @@ def dynamic_cross_entropy_loss(
     label_smoothing: float = 0.0,
     compute_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Computes the cross-entropy loss with optional label smoothing and ignore index,
-    dynamically handling different reduction types.
+    """Compute cross-entropy loss with flexible reduction and label smoothing.
+
+    This function provides a PyTorch-like interface for cross-entropy loss with
+    support for ignore index, label smoothing, and various reduction modes. It
+    handles the masking of ignored positions and computes the appropriate
+    normalization factors.
 
     Args:
-        logits (jnp.ndarray): The predicted logits from the model (batch_size, ..., num_classes).
-        targets (jnp.ndarray): The target labels (batch_size, ...).
-        weight (tp.Optional[jnp.ndarray]): Optional weights for each element (batch_size, ...).
-            Defaults to None.
-        ignore_index (int): Index in the target labels to ignore. Defaults to -100.
-        reduction (str): Specifies the reduction method: 'mean', 'sum', or 'none'.
-            Defaults to "mean".
-        label_smoothing (float): The amount of label smoothing to apply (0.0 means no smoothing).
-            Defaults to 0.0.
+        logits: Model logits with shape (batch_size, ..., num_classes). The last
+            dimension should be the class dimension.
+        targets: Target class indices with shape (batch_size, ...). Values should
+            be integers in [0, num_classes) or equal to ignore_index.
+        weight: Optional per-element weights with shape (batch_size, ...). If
+            provided, the loss for each position is multiplied by the
+            corresponding weight.
+        ignore_index: Index value to ignore in loss computation. Positions with
+            this target value contribute neither to the loss nor to normalization.
+        reduction: Specifies the reduction to apply to the output:
+            - "mean": Returns the weighted mean of the loss.
+            - "sum": Returns the sum of the weighted loss.
+            - "none": Returns the per-element loss without reduction.
+        label_smoothing: Label smoothing factor in [0, 1). When > 0, the target
+            distribution becomes (1 - eps) * one_hot + eps * uniform.
+        compute_dtype: Data type for internal computation.
 
     Returns:
-        tp.Tuple[jnp.ndarray, jnp.ndarray]:
-            - The computed loss (scalar if reduction is 'mean' or 'sum', array otherwise).
-            - The normalization factor (sum of weights or count of non-ignored elements).
+        Tuple of two arrays:
+            - loss: The computed loss. Scalar if reduction is "mean" or "sum",
+              array with same shape as targets if reduction is "none".
+            - norm: Normalization factor. Sum of weights for "mean"/"sum"
+              reduction, per-element weights for "none" reduction.
 
     Raises:
-        ValueError: If an invalid reduction method is specified.
+        ValueError: If reduction is not one of "mean", "sum", or "none".
+
+    Example:
+        >>> logits = jnp.randn(4, 10, 1000)  # 4 samples, 10 positions, 1000 classes
+        >>> targets = jnp.randint(0, 1000, (4, 10))
+        >>> loss, norm = dynamic_cross_entropy_loss(logits, targets, reduction="mean")
     """
     logits = logits.astype(compute_dtype)
     valid = targets != ignore_index
@@ -618,26 +806,37 @@ def sigmoid_cross_entropy_with_logits(
     label_smoothing: float = 0.0,
     axis: int | tuple | None = None,
 ) -> jnp.ndarray:
-    """
-    Computes sigmoid cross-entropy loss between logits and labels.
+    """Compute sigmoid cross-entropy loss for multi-label classification.
 
-    Measures the probability error in discrete classification tasks in which each
-    class is independent and not mutually exclusive. For instance, one could
-    perform multilabel classification where a picture can contain both an elephant
-    and a dog at the same time.
+    This function computes the binary cross-entropy loss using sigmoid activation,
+    suitable for multi-label classification where each class is independent and
+    not mutually exclusive. Each output is treated as a separate binary
+    classification problem.
+
+    The loss is computed as: -labels * log(sigmoid(logits)) - (1-labels) * log(1-sigmoid(logits))
+
+    This is numerically stable and avoids computing the sigmoid explicitly.
 
     Args:
-        logits: The predicted logits from the model.
-        labels: The target labels.
-        weights (tp.Optional[jnp.ndarray]): Optional weights for the loss computation.
-            Defaults to None.
-        label_smoothing (float): Amount of label smoothing to apply (0.0 means no smoothing).
-            Defaults to 0.0.
-        axis (tp.Optional[tp.Union[int, tuple]]): The axis or axes along which to compute the mean.
-            If None, the mean is computed over all elements. Defaults to None.
+        logits: Model logits with arbitrary shape. Each element is treated as
+            an independent binary classification.
+        labels: Target labels with same shape as logits. Values should be in
+            [0, 1] for binary labels, or soft labels for label smoothing.
+        weights: Optional weights with same shape as logits. If provided,
+            the loss for each position is multiplied by the corresponding weight.
+        label_smoothing: Label smoothing factor in [0, 1). When > 0, labels are
+            smoothed toward 0.5: labels * (1 - eps) + 0.5 * eps.
+        axis: Axis or axes along which to compute the mean. If None, computes
+            the mean over all elements.
 
     Returns:
-        jnp.ndarray: The computed sigmoid cross-entropy loss.
+        Scalar or array containing the mean loss. Shape depends on axis parameter.
+
+    Example:
+        >>> # Multi-label classification with 5 classes
+        >>> logits = jnp.randn(32, 5)
+        >>> labels = jnp.array([[1, 0, 1, 0, 1], ...])  # Multi-hot encoding
+        >>> loss = sigmoid_cross_entropy_with_logits(logits, labels)
     """
     if label_smoothing > 0.0:
         labels = labels * (1.0 - label_smoothing) + 0.5 * label_smoothing
@@ -656,19 +855,36 @@ def sigmoid_cross_entropy_with_logits(
 
 
 def onehot(labels, num_classes, on_value=1.0, off_value=0.0):
-    """
-    Create one-hot encoded versions of integer labels.
+    """Create one-hot encoded representations of integer labels.
+
+    This function converts integer class labels to one-hot vectors, with support
+    for custom on/off values to enable label smoothing or other soft target
+    distributions.
 
     Args:
-        labels (jnp.ndarray): An array of integer labels.
-        num_classes (int): The total number of classes.
-        on_value (float): The value to use for the "on" state (corresponding to the label).
+        labels: Array of integer labels with arbitrary shape. Values should be
+            in [0, num_classes).
+        num_classes: Total number of classes. Determines the size of the last
+            dimension in the output.
+        on_value: Value to use for the "on" position (the true class).
             Defaults to 1.0.
-        off_value (float): The value to use for the "off" states.
+        off_value: Value to use for all "off" positions (non-true classes).
             Defaults to 0.0.
 
     Returns:
-        jnp.ndarray: The one-hot encoded array with shape `labels.shape + (num_classes,)`.
+        One-hot encoded array with shape labels.shape + (num_classes,). The
+        position corresponding to each label value contains on_value, and all
+        other positions contain off_value.
+
+    Example:
+        >>> labels = jnp.array([0, 2, 1])
+        >>> onehot(labels, num_classes=3)
+        Array([[1., 0., 0.],
+               [0., 0., 1.],
+               [0., 1., 0.]], dtype=float32)
+        >>>
+        >>> # With label smoothing (confidence 0.9, smoothing 0.1)
+        >>> onehot(labels, 3, on_value=0.9, off_value=0.05)
     """
     x = lax.eq(labels[..., None], jnp.arange(num_classes)[(None,) * labels.ndim])
     y = lax.select(x, jnp.full(x.shape, on_value), jnp.full(x.shape, off_value))
@@ -681,23 +897,40 @@ def cross_entropy_with_logits(
     targets: Array,
     z_loss: float,
 ) -> tuple[Array, Array]:
-    """
-    Computes cross-entropy loss with potential z-loss regularization.
+    """Compute cross-entropy loss with optional z-loss regularization.
 
-    This function calculates the standard cross-entropy loss between logits and targets.
-    It also includes an optional z-loss term, which penalizes large logits for non-target
-    classes, encouraging the model to be less confident in incorrect predictions.
-    A custom VJP (vector-Jacobian product) is defined for efficient gradient computation.
+    This function calculates the standard cross-entropy loss between logits and
+    soft targets (typically one-hot encoded). It includes an optional z-loss
+    term that penalizes large log-partition function values, encouraging the
+    model to produce smaller logits.
+
+    A custom VJP (vector-Jacobian product) is defined for efficient gradient
+    computation, avoiding redundant softmax calculations in the backward pass.
 
     Args:
-        logits (Array): The predicted logits from the model (batch_size, ..., num_classes).
-        targets (Array): The target labels, typically one-hot encoded (batch_size, ..., num_classes).
-        z_loss (float): The coefficient for the z-loss regularization. If 0, z-loss is not computed.
+        logits: Model logits with shape (batch_size, ..., num_classes). The last
+            dimension is the class dimension.
+        targets: Target distribution with same shape as logits. Typically one-hot
+            encoded but can be soft targets for label smoothing.
+        z_loss: Coefficient for z-loss regularization. The z-loss term is
+            z_loss * logsumexp(logits)^2. Set to 0 to disable.
 
     Returns:
-        tp.Tuple[Array, Array]:
-            - loss: The cross-entropy loss for each example (batch_size, ...).
-            - z_loss: The z-loss value for each example (batch_size, ...). Returns zero if `z_loss` coeff is 0.
+        Tuple of two arrays:
+            - loss: Cross-entropy loss plus z-loss for each sample, shape
+              (batch_size, ...).
+            - z_loss_value: The z-loss contribution for each sample, shape
+              (batch_size, ...). Returns zeros if z_loss coefficient is 0.
+
+    Note:
+        This function expects soft targets (probability distributions). For
+        integer labels, first convert using `onehot()` or use
+        `compute_weighted_cross_entropy()` which handles this internally.
+
+    Example:
+        >>> logits = jnp.randn(4, 1000)
+        >>> targets = jax.nn.one_hot(jnp.array([5, 10, 3, 7]), 1000)
+        >>> loss, z_loss_val = cross_entropy_with_logits(logits, targets, z_loss=1e-4)
     """
     logsumexp = jax.scipy.special.logsumexp(logits, axis=-1, keepdims=False)
     log_softmax = logits - logsumexp[..., None]
@@ -725,11 +958,11 @@ def _cross_entropy_with_logits_fwd(
         Array,
     ],
 ]:
-    """
-    Forward pass for cross_entropy_with_logits custom VJP.
+    """Forward pass for cross_entropy_with_logits custom VJP.
 
-    Computes cross-entropy loss with z-loss regularization and saves intermediates
-    for efficient gradient computation in the backward pass.
+    Computes cross-entropy loss with z-loss regularization and saves intermediate
+    values needed for efficient gradient computation in the backward pass. This
+    implementation uses the numerically stable max-subtraction trick.
 
     Args:
         logits: Model predictions with shape (batch_size, ..., num_classes).
@@ -738,9 +971,12 @@ def _cross_entropy_with_logits_fwd(
 
     Returns:
         Tuple containing:
-            - (loss, z_loss_value): The computed losses.
-            - Residuals: Intermediate values needed for backward pass including
-              targets, z_loss coefficient, exp_shifted, sum_exp, log_softmax, and log_z.
+            - (loss, z_loss_value): The computed losses, both with shape
+              (batch_size, ...).
+            - Residuals tuple for backward pass containing:
+              (targets, z_loss, exp_shifted, sum_exp, log_softmax, log_z)
+              where exp_shifted and sum_exp are intermediate values from the
+              softmax computation.
     """
     max_logit = logits.max(axis=-1, keepdims=True)
     shifted = logits - max_logit
@@ -770,16 +1006,25 @@ def _cross_entropy_with_logits_bwd(
 ) -> tuple[Array, Array, Array]:
     """Backward pass for cross_entropy_with_logits custom VJP.
 
-    Computes gradients with respect to logits and targets using saved intermediates
-    from the forward pass.
+    Computes gradients with respect to logits and targets using saved intermediate
+    values from the forward pass. This avoids recomputing the softmax, making the
+    backward pass more efficient.
+
+    The gradient with respect to logits is:
+        d_loss/d_logits = softmax - targets + 2 * z_loss * log_z * softmax
+
+    The gradient with respect to targets is:
+        d_loss/d_targets = -log_softmax
 
     Args:
-        res: Residuals from forward pass containing targets, z_loss, exp_shifted,
-             sum_exp, log_softmax, and log_z.
-        g: Gradient of the loss with respect to the output.
+        res: Residuals from forward pass containing:
+            (targets, z_loss, exp_shifted, sum_exp, log_softmax, log_z)
+        g: Gradient tuple (g_loss, g_z_loss) where g_loss is the gradient of the
+            final loss with respect to the cross-entropy output.
 
     Returns:
-        Tuple of gradients with respect to (logits, targets, z_loss).
+        Tuple of gradients (g_logits, g_targets, g_z_loss) with respect to the
+        three inputs of the forward function.
     """
     g0 = g[0]
     targets, z_loss, exp_shifted, sum_exp, log_softmax, log_z = res
@@ -806,19 +1051,50 @@ def compute_weighted_cross_entropy(
     loss_normalizing_factor: float | None = None,
     compute_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[Array, Array, Array]:
-    """
-    Computes weighted cross-entropy loss, z-loss, and weight sum.
+    """Compute weighted cross-entropy loss with label smoothing and z-loss.
+
+    This function provides a complete cross-entropy computation pipeline including:
+    - Label smoothing for regularization
+    - Z-loss for numerical stability
+    - Optional weighting for masked or importance-weighted training
+    - Optional normalization factor
+
+    The label smoothing modifies the target distribution from a one-hot encoding
+    to a mixture of the one-hot with a uniform distribution.
 
     Args:
-        logits: The predicted logits.
-        targets: The target class labels (integers).
-        weights: tp.Optional weights for each example.
-        label_smoothing: Label smoothing factor.
-        z_loss: Coefficient for the auxiliary z-loss term.
-        loss_normalizing_factor: A factor to normalize the loss.
+        logits: Model logits with shape (..., num_classes).
+        targets: Integer class labels with shape (...). Must have one fewer
+            dimension than logits.
+        weights: Optional weights with shape (...) matching targets. If provided,
+            the loss is multiplied by these weights element-wise.
+        label_smoothing: Smoothing factor in [0, 1). The target distribution
+            becomes (1 - eps) * one_hot + eps / (num_classes - 1) * (1 - one_hot).
+        z_loss: Coefficient for z-loss regularization.
+        loss_normalizing_factor: If provided, divides the total loss and z-loss
+            by this factor.
+        compute_dtype: Data type for internal computation.
 
     Returns:
-        A tuple containing the total loss, z-loss, and sum of weights.
+        Tuple of three arrays:
+            - total_loss: Sum of weighted cross-entropy losses (scalar).
+            - total_z_loss: Sum of weighted z-loss terms (scalar).
+            - weight_sum: Sum of weights or total number of elements (scalar).
+
+    Raises:
+        TypeError: If logits, targets, or weights are not JAX arrays (or None
+            for weights).
+        ValueError: If label_smoothing is not in [0, 1), z_loss is negative,
+            or shapes are incompatible.
+
+    Example:
+        >>> logits = jnp.randn(4, 10, 1000)
+        >>> targets = jnp.randint(0, 1000, (4, 10))
+        >>> mask = jnp.ones((4, 10))
+        >>> loss, z_loss, w_sum = compute_weighted_cross_entropy(
+        ...     logits, targets, weights=mask, label_smoothing=0.1
+        ... )
+        >>> normalized_loss = loss / w_sum
     """
     if not isinstance(logits, jax.Array):
         raise TypeError(f"logits must be a JAX array, got {type(logits)}")
@@ -864,19 +1140,34 @@ def compute_weighted_cross_entropy_and_accuracy(
     loss_normalizing_factor: float | None = None,
     compute_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[Array, Array, Array, Array]:
-    """
-    Computes weighted cross-entropy loss, z-loss, weight sum, and accuracy.
+    """Compute weighted cross-entropy loss, z-loss, weight sum, and accuracy.
+
+    This is an extension of `compute_weighted_cross_entropy` that also computes
+    the prediction accuracy, useful for monitoring training progress.
 
     Args:
-        logits: The predicted logits.
-        targets: The target class labels (integers).
-        weights: tp.Optional weights for each example.
-        label_smoothing: Label smoothing factor.
-        z_loss: Coefficient for the auxiliary z-loss term.
-        loss_normalizing_factor: A factor to normalize the loss.
+        logits: Model logits with shape (..., num_classes).
+        targets: Integer class labels with shape (...).
+        weights: Optional weights with shape (...) matching targets.
+        label_smoothing: Smoothing factor in [0, 1).
+        z_loss: Coefficient for z-loss regularization.
+        loss_normalizing_factor: Optional factor to divide the loss.
+        compute_dtype: Data type for internal computation.
 
     Returns:
-        A tuple containing the total loss, z-loss, sum of weights, and accuracy.
+        Tuple of four arrays:
+            - total_loss: Sum of weighted cross-entropy losses (scalar).
+            - total_z_loss: Sum of weighted z-loss terms (scalar).
+            - weight_sum: Sum of weights (scalar).
+            - accuracy: Weighted accuracy as fraction of correct predictions (scalar).
+
+    Example:
+        >>> logits = jnp.randn(4, 10, 1000)
+        >>> targets = jnp.randint(0, 1000, (4, 10))
+        >>> loss, z_loss, w_sum, acc = compute_weighted_cross_entropy_and_accuracy(
+        ...     logits, targets, label_smoothing=0.1
+        ... )
+        >>> print(f"Loss: {loss/w_sum:.4f}, Accuracy: {acc:.2%}")
     """
     total_loss, total_z_loss, weight_sum = compute_weighted_cross_entropy(
         logits=logits,
@@ -907,17 +1198,28 @@ def cross_entropy_loss_and_accuracy(
 ):
     """Compute cross-entropy loss and accuracy with optional masking.
 
-    Simple and efficient implementation for computing both loss and accuracy
-    in a single pass through the data.
+    This is a simple and efficient implementation for computing both loss and
+    accuracy in a single pass through the data. Unlike other functions in this
+    module, it uses a straightforward approach without label smoothing or z-loss,
+    making it suitable for simple use cases or validation.
 
     Args:
-        source: Logits with shape [..., num_classes].
+        source: Model logits with shape [..., num_classes].
         target: Integer labels with shape [...].
-        valid: Optional boolean mask indicating valid positions.
+        valid: Optional boolean mask with shape [...] indicating valid positions.
+            If None, all positions are considered valid.
         compute_dtype: Data type for computation.
 
     Returns:
-        Tuple of (loss, accuracy) as scalar values.
+        Tuple of (loss, accuracy) as scalar values. Loss is the mean negative
+        log-likelihood over valid positions. Accuracy is the fraction of valid
+        positions where the predicted class matches the target.
+
+    Example:
+        >>> logits = jnp.randn(8, 128, 32000)
+        >>> targets = jnp.randint(0, 32000, (8, 128))
+        >>> mask = targets != -100  # Mask padding
+        >>> loss, acc = cross_entropy_loss_and_accuracy(logits, targets, valid=mask)
     """
     source = source.astype(compute_dtype)
     if valid is None:
@@ -938,14 +1240,27 @@ def cross_entropy_loss_and_accuracy(
 
 
 def convert_special_loss_normalizing_factor_to_enum(x: str) -> SLNF:
-    """
-    Converts a stringified version of SpecialLossNormalizingFactor to an enum.
+    """Convert a string to SpecialLossNormalizingFactor enum.
+
+    This utility function converts string representations of loss normalizing
+    factors to their corresponding enum values, enabling configuration from
+    strings (e.g., from config files or command line arguments).
 
     Args:
-        x: Stringified version of the enum value.
+        x: String representation of the enum value. Case-insensitive. Valid
+            values are: "NUM_REAL_TARGET_TOKENS", "NUM_TOTAL_TARGET_TOKENS",
+            "AVERAGE_PER_SEQUENCE", "NO_WEIGHT_NUM_REAL_TARGET_TOKENS".
 
     Returns:
         The corresponding SpecialLossNormalizingFactor enum value.
+
+    Raises:
+        ValueError: If the string does not match any valid enum value.
+
+    Example:
+        >>> factor = convert_special_loss_normalizing_factor_to_enum("NUM_REAL_TARGET_TOKENS")
+        >>> factor == SpecialLossNormalizingFactor.NUM_REAL_TARGET_TOKENS
+        True
     """
     x = x.upper()
     if x == "NUM_REAL_TARGET_TOKENS":
@@ -965,31 +1280,47 @@ def _sum_weights_per_segment(
     segment_ids: Array,
     weights: Array,
 ) -> Array:
-    """Sum weights per packed segment to produce a normalizing vector.
+    """Sum weights per segment for packed sequence normalization.
 
     This function is used for handling packed sequences where multiple sequences
     are concatenated together. It computes the sum of weights for each segment
-    to enable per-sequence normalization.
+    to enable per-sequence normalization when using AVERAGE_PER_SEQUENCE
+    loss normalization.
+
+    The function operates by:
+    1. Identifying segment boundaries from position resets
+    2. Computing cumulative weights within each segment
+    3. Propagating the final cumulative weight back to all positions
 
     Args:
-        positions: Position indices within each segment.
-        segment_ids: Segment identifiers for packed sequences.
-        weights: Weights to sum per segment.
+        positions: Position indices within each segment with shape (seq_len,).
+            A value of 0 indicates the start of a new segment.
+        segment_ids: Segment identifiers with shape (seq_len,). Non-zero values
+            indicate valid positions; zero indicates padding.
+        weights: Weights to sum per segment with shape (seq_len,).
 
     Returns:
-        Array containing normalization factors for each position based on
-        the total weight in its segment.
+        Array with shape (seq_len,) containing the total weight for the segment
+        that each position belongs to. This can be used to normalize each
+        position's contribution by its segment's total weight.
+
+    Note:
+        This function is vmapped over the batch dimension, so it operates on
+        individual sequences.
     """
 
     def _repeat_last_nonnegative(xs, reverse=False):
         """Propagate the last non-zero value through zeros in the array.
 
+        This helper function replaces zeros with the most recent non-zero value,
+        either scanning forward (default) or backward (reverse=True).
+
         Args:
-            xs: Input array.
-            reverse: If True, propagate in reverse direction.
+            xs: Input array with shape (seq_len,).
+            reverse: If True, scan from right to left.
 
         Returns:
-            Array with zeros replaced by the last non-zero value.
+            Array with zeros replaced by propagated non-zero values.
         """
 
         def fn(prev, x):
@@ -1017,15 +1348,39 @@ def get_factor_and_weight(
     batch: tp.Mapping[str, Array],
     compute_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[float | None, Array | None]:
-    """
-    Gets the loss normalizing factor and weights from a batch of data.
+    """Get loss normalizing factor and weights from batch data.
+
+    This function resolves dynamic loss normalization factors based on batch
+    properties. It handles both constant factors and special enum-based factors
+    that depend on the actual batch content (e.g., number of non-padding tokens).
 
     Args:
-        loss_normalizing_factor: The loss normalizing factor to use.
-        batch: A dictionary containing the input batch of data.
+        loss_normalizing_factor: The normalization strategy to use. Can be:
+            - None: Return (None, existing weights or None)
+            - A float/int constant: Return (constant, existing weights)
+            - A string or SLNF enum: Compute dynamic factor from batch
+        batch: Dictionary containing batch data. Expected keys:
+            - "decoder_target_tokens": Target tokens for computing masks
+            - "decoder_loss_weights" (optional): Pre-computed loss weights
+            - "decoder_segment_ids" (optional): Segment IDs for packed sequences
+            - "decoder_positions" (optional): Position indices for packed sequences
+        compute_dtype: Data type for computed weights.
 
     Returns:
-        A tuple containing the loss normalizing factor and loss weights.
+        Tuple of (normalizing_factor, loss_weights):
+            - normalizing_factor: Float value to divide the loss by, or None.
+            - loss_weights: Array of per-token weights, or None.
+
+    Raises:
+        ValueError: If an unsupported loss_normalizing_factor value is provided.
+
+    Example:
+        >>> batch = {
+        ...     "decoder_target_tokens": jnp.array([[1, 2, 0, 0], [1, 2, 3, 0]]),
+        ...     "decoder_loss_weights": jnp.array([[1, 1, 0, 0], [1, 1, 1, 0]]),
+        ... }
+        >>> factor, weights = get_factor_and_weight("NUM_REAL_TARGET_TOKENS", batch)
+        >>> # factor is the sum of non-zero weights
     """
     loss_weights = batch.get("decoder_loss_weights", None)
     if loss_normalizing_factor is None or not isinstance(loss_normalizing_factor, (str, SLNF)):
@@ -1066,31 +1421,54 @@ def auxiliary_load_balancing_loss_func(
     attention_mask: Array | None = None,
     compute_dtype: jnp.dtype = jnp.float32,
 ) -> jax.Array | int:
-    r"""
-    Computes auxiliary load balancing loss as in Switch Transformer - implemented in JAX.
+    """Compute auxiliary load balancing loss for Mixture-of-Experts models.
 
-    See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
-    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
-    experts is too unbalanced.
+    This function implements the load balancing loss from the Switch Transformer
+    paper (https://arxiv.org/abs/2101.03961), equations (4)-(6). The loss
+    penalizes unbalanced routing between experts, encouraging the model to
+    utilize all experts equally.
+
+    The loss is computed as:
+        loss = num_experts * sum_i(f_i * P_i)
+
+    where:
+        - f_i is the fraction of tokens routed to expert i
+        - P_i is the fraction of router probability assigned to expert i
+
+    This loss is minimized when routing is perfectly balanced (f_i = P_i = 1/num_experts).
 
     Args:
-        gate_logits:
-            Logits from the `gate`. Should be a tuple/list of JAX arrays,
-            with each array corresponding to a layer and having shape
-            [batch_size * sequence_length, num_experts].
-            Alternatively, can be a single stacked array of shape
-            [num_layers * batch_size * sequence_length, num_experts].
-        num_experts:
-            Number of experts. Must be provided if `gate_logits` is not None.
-        top_k:
-            The number of experts to route per-token, can be also interpreted as the `top-k` routing
-            parameter.
-        attention_mask (`jax.numpy.ndarray`, *optional*):
-            The attention_mask used in forward function
-            shape [batch_size, sequence_length] if not None.
+        gate_logits: Router logits from the MoE layers. Can be:
+            - A tuple/list of arrays, one per layer, each with shape
+              [batch_size * sequence_length, num_experts]
+            - A single stacked array with shape
+              [num_layers * batch_size * sequence_length, num_experts]
+            - None, in which case 0 is returned
+        num_experts: Total number of experts in the MoE layer. Required if
+            gate_logits is not None.
+        top_k: Number of experts selected per token. This affects how the
+            expert mask is computed.
+        attention_mask: Optional attention mask with shape [batch_size, sequence_length].
+            If provided, masked positions are excluded from the loss computation.
+        compute_dtype: Data type for intermediate computations.
 
     Returns:
-        The auxiliary loss as a JAX scalar array, or 0 if gate_logits is None.
+        The auxiliary load balancing loss as a scalar JAX array, or 0 if
+        gate_logits is None.
+
+    Raises:
+        ValueError: If num_experts is None when gate_logits is provided, or if
+            attention_mask has invalid shape.
+        TypeError: If gate_logits is not a valid type.
+
+    Example:
+        >>> # Single layer gate logits
+        >>> gate_logits = jnp.randn(32 * 128, 8)  # batch*seq, num_experts
+        >>> loss = auxiliary_load_balancing_loss_func(gate_logits, num_experts=8, top_k=2)
+        >>>
+        >>> # Multiple layers
+        >>> gate_logits = [jnp.randn(32 * 128, 8) for _ in range(24)]
+        >>> loss = auxiliary_load_balancing_loss_func(gate_logits, num_experts=8, top_k=2)
     """
     if gate_logits is None:
         return 0
@@ -1180,19 +1558,49 @@ def fixed_cross_entropy(
     batch: tp.Mapping[str, Array] | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
-    """
-    Jax implementation of fixed cross-entropy loss with z-loss, label smoothing, masking.
+    """Compute cross-entropy loss with comprehensive configuration options.
+
+    This is the main entry point for cross-entropy loss computation in EasyDeL.
+    It supports multiple computation strategies (chunked, blockwise, standard),
+    various normalization modes, and additional regularization terms.
+
+    The function automatically selects the appropriate computation strategy
+    based on the LossConfig settings, optimizing for memory efficiency when
+    chunking is enabled.
 
     Args:
-        source: Predicted logits, shape (batch_size, num_classes) or (batch_size * seq_len, num_classes).
-        target: True labels, shape (batch_size,) or (batch_size * seq_len,). Must be integers.
-        num_items_in_batch: tp.Optional, used when reduction should be sum.
-        attention_mask: tp.Optional, boolean mask applied to the loss.
-        batch: tp.Optional batch for dynamic loss normalization
-        **kwargs: Additional keyword arguments.
+        source: Model logits with shape (batch_size, num_classes) or
+            (batch_size * seq_len, num_classes) or (batch_size, seq_len, num_classes).
+        target: Target labels with shape matching source's leading dimensions.
+            Must be integer indices for sparse cross-entropy.
+        attention_mask: Optional boolean mask indicating valid positions. If None,
+            positions where target != ignore_index are considered valid.
+        config: LossConfig object specifying loss computation parameters. If None,
+            uses default configuration.
+        num_items_in_batch: Optional number of items for batch-level normalization.
+            If provided, divides the final loss by this value.
+        batch: Optional batch dictionary for dynamic loss normalization. Used when
+            loss_normalizing_factor is a SpecialLossNormalizingFactor.
+        **kwargs: Additional keyword arguments (unused, for API compatibility).
 
     Returns:
-        The computed cross-entropy loss in LossMetrics.
+        LossMetrics object containing:
+            - loss: The computed loss value
+            - z_loss: Z-loss regularization term (if z_loss > 0 in config)
+            - weight_sum: Sum of loss weights
+            - accuracy: Prediction accuracy
+
+    Raises:
+        ValueError: If source or target is None.
+
+    Example:
+        >>> config = LossConfig(
+        ...     label_smoothing=0.1,
+        ...     z_loss=1e-4,
+        ...     loss_normalizing_factor="NUM_REAL_TARGET_TOKENS"
+        ... )
+        >>> metrics = fixed_cross_entropy(logits, targets, config=config)
+        >>> print(f"Loss: {metrics.loss}, Accuracy: {metrics.accuracy}")
     """
     if config is None:
         config = LossConfig()
@@ -1324,18 +1732,46 @@ def ForCausalLMLoss(
     batch: tp.Mapping[str, Array] | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
-    """
-    Jax implementation of loss function for causal language models.
+    """Compute loss for causal language modeling (next-token prediction).
+
+    This function implements the standard causal language modeling loss where
+    the model predicts the next token at each position. It handles the necessary
+    shifting of logits and labels so that position i predicts token i+1.
+
+    The function supports distributed training through optional sharding
+    constraints on the logits and labels.
 
     Args:
-        logits: Predicted logits, shape (batch_size, seq_len, vocab_size).
-        labels: True labels, shape (batch_size, seq_len). Must be integers.
-        num_items_in_batch: tp.Optional, used when reduction should be sum.
-        batch: tp.Optional batch for dynamic loss normalization
-        **kwargs: Additional keyword arguments for the cross-entropy loss.
+        logits: Model output logits with shape (batch_size, seq_len, vocab_size).
+        labels: Target token IDs with shape (batch_size, seq_len). Positions with
+            value equal to ignore_index (default -100) are not included in loss.
+        attention_mask: Optional mask with shape (batch_size, seq_len) indicating
+            valid positions (1) vs padding (0).
+        config: LossConfig specifying loss parameters. If None, uses defaults.
+            Note: config.shift_tokens controls whether to shift logits/labels
+            (default True for causal LM).
+        paxis: Optional PartitionAxis for distributed training. If provided,
+            applies sharding constraints to logits and labels.
+        num_items_in_batch: Optional batch-level normalization factor.
+        batch: Optional batch dictionary for dynamic normalization.
+        **kwargs: Additional arguments passed to fixed_cross_entropy.
 
     Returns:
-        The computed causal language modeling loss.
+        LossMetrics containing loss, z_loss, weight_sum, and accuracy.
+
+    Raises:
+        ValueError: If logits or labels is None.
+
+    Example:
+        >>> # Standard causal LM loss
+        >>> logits = model(input_ids)  # (batch, seq_len, vocab_size)
+        >>> labels = input_ids.copy()
+        >>> labels = labels.at[:, :-1].set(input_ids[:, 1:])
+        >>> metrics = ForCausalLMLoss(logits, labels)
+        >>>
+        >>> # With custom config
+        >>> config = LossConfig(label_smoothing=0.1, z_loss=1e-4)
+        >>> metrics = ForCausalLMLoss(logits, labels, config=config)
     """
     if logits is None or labels is None:
         raise ValueError("Logits and labels cannot be None")
@@ -1391,18 +1827,53 @@ def ForSequenceClassificationLoss(
     batch: tp.Mapping[str, Array] | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
-    """
-    Jax implementation of loss function for sequence classification.
+    """Compute loss for sequence classification tasks.
+
+    This function supports three types of sequence classification:
+    - Regression: Mean squared error for continuous targets
+    - Single-label classification: Cross-entropy for mutually exclusive classes
+    - Multi-label classification: Sigmoid cross-entropy for independent labels
+
+    The problem type is automatically inferred from num_labels and label dtype
+    if not explicitly specified in the config.
 
     Args:
-        labels: True labels, shape (batch_size,) or (batch_size, num_labels) for multi label classification.
-        logits: Predicted logits, shape (batch_size, num_labels) or (batch_size, 1) or (batch_size,) for regression.
-        config: Configuration with problem_type and num_labels attributes.
-        batch: tp.Optional batch for dynamic loss normalization
-        **kwargs: Additional keyword arguments for the cross-entropy loss.
+        logits: Model output logits with shape:
+            - (batch_size, num_labels) for classification
+            - (batch_size, 1) or (batch_size,) for regression
+        labels: Target values with shape:
+            - (batch_size,) integer labels for single-label classification
+            - (batch_size, num_labels) multi-hot for multi-label classification
+            - (batch_size,) or (batch_size, 1) floats for regression
+        attention_mask: Optional mask. Note: For sequence classification, this
+            is typically not used as the loss is per-sequence, not per-token.
+        config: LossConfig with required num_labels field. problem_type is
+            inferred if not set.
+        paxis: Optional PartitionAxis for distributed training.
+        batch: Optional batch dictionary for dynamic normalization.
+        **kwargs: Additional arguments passed to fixed_cross_entropy.
 
     Returns:
-        The computed sequence classification loss.
+        LossMetrics containing the computed loss. For regression and multi-label
+        classification, only loss is populated. For single-label classification,
+        includes accuracy and other metrics.
+
+    Raises:
+        ValueError: If logits or labels is None, num_labels is not set, or
+            problem_type is invalid.
+
+    Example:
+        >>> # Single-label classification
+        >>> config = LossConfig(num_labels=3)
+        >>> logits = jnp.randn(8, 3)
+        >>> labels = jnp.array([0, 1, 2, 0, 1, 2, 0, 1])
+        >>> metrics = ForSequenceClassificationLoss(logits, labels, config=config)
+        >>>
+        >>> # Multi-label classification
+        >>> config = LossConfig(num_labels=5, problem_type="multi_label_classification")
+        >>> logits = jnp.randn(8, 5)
+        >>> labels = jnp.array([[1, 0, 1, 0, 0], ...])  # Multi-hot
+        >>> metrics = ForSequenceClassificationLoss(logits, labels, config=config)
     """
 
     if logits is None or labels is None:
@@ -1466,19 +1937,45 @@ def ForQuestionAnsweringLoss(
     batch: tp.Mapping[str, Array] | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
-    """
-    Jax implementation of loss function for question answering.
+    """Compute loss for extractive question answering (SQuAD-style).
+
+    This function implements the standard extractive QA loss where the model
+    predicts the start and end positions of the answer span within the context.
+    The total loss is the average of the start and end position cross-entropy losses.
+
+    Positions that exceed the sequence length are clipped and treated as the
+    ignore index, handling cases where the answer is not in the context.
 
     Args:
-        start_logits: Predicted start logits, shape (batch_size, seq_len).
-        end_logits: Predicted end logits, shape (batch_size, seq_len).
-        start_positions: True start positions, shape (batch_size,).
-        end_positions: True end positions, shape (batch_size,).
-        batch: tp.Optional batch for dynamic loss normalization
-        **kwargs: Additional keyword arguments for the cross-entropy loss.
+        start_logits: Logits for start position prediction with shape
+            (batch_size, seq_len).
+        end_logits: Logits for end position prediction with shape
+            (batch_size, seq_len).
+        start_positions: Ground truth start positions with shape (batch_size,).
+            Values should be in [0, seq_len) or a special value for "no answer".
+        end_positions: Ground truth end positions with shape (batch_size,).
+        config: LossConfig specifying loss parameters. The ignore_index is
+            automatically set to seq_len for out-of-range positions.
+        paxis: Optional PartitionAxis for distributed training.
+        batch: Optional batch dictionary for dynamic normalization.
+        **kwargs: Additional arguments passed to fixed_cross_entropy.
 
     Returns:
-        The computed question answering loss.
+        LossMetrics containing averaged loss, z_loss, weight_sum, and accuracy
+        from both start and end position predictions.
+
+    Raises:
+        ValueError: If any required input is None.
+
+    Example:
+        >>> # Batch of 4 samples, sequence length 384
+        >>> start_logits = jnp.randn(4, 384)
+        >>> end_logits = jnp.randn(4, 384)
+        >>> start_positions = jnp.array([10, 50, 100, 200])
+        >>> end_positions = jnp.array([15, 55, 110, 210])
+        >>> metrics = ForQuestionAnsweringLoss(
+        ...     start_logits, end_logits, start_positions, end_positions
+        ... )
     """
     if start_logits is None or end_logits is None or start_positions is None or end_positions is None:
         raise ValueError("Logits and labels cannot be None")
@@ -1511,21 +2008,38 @@ def ForTokenClassification(
     batch: tp.Mapping[str, Array] | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
-    """
-    Jax implementation of loss function for token classification.
+    """Compute loss for token classification tasks.
+
+    This function implements loss computation for token-level classification
+    tasks such as Named Entity Recognition (NER), Part-of-Speech (POS) tagging,
+    or any task where each token receives an independent label.
+
+    Unlike sequence classification, the loss is computed for each token position
+    independently, with support for masking special tokens (e.g., [CLS], [SEP],
+    padding) via the ignore_index mechanism.
 
     Args:
-        logits: Predicted logits, shape (batch_size, seq_len, num_labels).
-        labels: True labels, shape (batch_size, seq_len). Must be integers.
-        config: Configuration with num_labels attribute.
-        label_smoothing: Label smoothing factor.
-        z_loss: Coefficient for the auxiliary z-loss term.
-        loss_normalizing_factor: A factor to normalize the loss, can also be enum.
-        batch: tp.Optional batch for dynamic loss normalization
-        **kwargs: Additional keyword arguments for the cross-entropy loss.
+        logits: Model output logits with shape (batch_size, seq_len, num_labels).
+        labels: Target labels with shape (batch_size, seq_len). Positions with
+            value equal to ignore_index are not included in the loss.
+        config: LossConfig specifying loss parameters including num_labels and
+            ignore_index.
+        paxis: Optional PartitionAxis for distributed training.
+        batch: Optional batch dictionary for dynamic normalization.
+        **kwargs: Additional arguments passed to fixed_cross_entropy.
 
     Returns:
-        The computed token classification loss.
+        LossMetrics containing loss, z_loss, weight_sum, and accuracy.
+
+    Raises:
+        ValueError: If logits or labels is None.
+
+    Example:
+        >>> # NER with BIO tagging (9 labels: O, B-PER, I-PER, B-LOC, etc.)
+        >>> config = LossConfig(num_labels=9, ignore_index=-100)
+        >>> logits = jnp.randn(8, 128, 9)  # batch, seq_len, num_labels
+        >>> labels = jnp.randint(-100, 9, (8, 128))  # -100 for special tokens
+        >>> metrics = ForTokenClassification(logits, labels, config=config)
     """
     if logits is None or labels is None:
         raise ValueError("Logits and labels cannot be None")
@@ -1540,6 +2054,7 @@ def ForTokenClassification(
     return loss
 
 
+# Mapping from task name suffix to loss function for automatic selection.
 LOSS_MAPPING = {
     "ForCausalLM": ForCausalLMLoss,
     "ForQuestionAnswering": ForQuestionAnsweringLoss,

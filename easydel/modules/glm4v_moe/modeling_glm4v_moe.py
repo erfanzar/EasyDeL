@@ -43,7 +43,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.components import RMSNorm, RowParallelLinear
+from easydel.layers.components import Embed, RMSNorm, RowParallelLinear
 from easydel.modules.glm4_moe.modeling_glm4_moe import Glm4MoeMLP, Glm4MoeMoE
 from easydel.modules.glm4v.modeling_glm4v import Glm4vModel, Glm4vVisionModel
 

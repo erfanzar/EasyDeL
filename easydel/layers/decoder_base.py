@@ -12,29 +12,95 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Base utilities for decoder layers.
+"""Base utilities for transformer decoder layers.
 
-Provides common patterns and utilities for transformer decoder layers:
-- Pre-norm residual connections
-- KV cache updates
-- Standard decoder layer signature
-- Block-wise FFN for memory efficiency
+This module provides common patterns and utility functions for implementing
+transformer decoder layers. Rather than requiring strict inheritance, it offers
+composable static methods that can be used by any decoder layer implementation.
 
-These are provided as utility functions/mixins that decoder layers can use
-rather than requiring strict inheritance.
+The utilities follow the pre-norm transformer architecture pattern where
+normalization is applied before each sub-layer (attention, MLP) with
+residual connections around the sub-layers.
+
+Key Patterns:
+    Pre-Norm Residual:
+        The standard pattern used by most modern transformers::
+
+            hidden = hidden + sublayer(norm(hidden))
+
+        This is implemented via pre_norm_residual_attn() and pre_norm_residual_mlp().
+
+    Block-wise FFN:
+        For memory efficiency during training, the MLP can be processed in
+        chunks along the sequence dimension via block_wise_ffn().
+
+    Standard Decoder Layer:
+        The complete pattern combining attention and MLP::
+
+            hidden = hidden + attention(norm(hidden))
+            hidden = hidden + mlp(norm(hidden))
+
+Classes:
+    BaseDecoderLayer:
+        Collection of static methods for decoder layer operations.
+
+Functions:
+    block_wise_ffn:
+        Apply MLP in chunks for memory efficiency.
 
 Example:
-    >>> class LlamaDecoderLayer(nn.Module):
-    ...     def __call__(self, hidden_states, ...):
-    ...         # Attention with pre-norm residual
-    ...         hidden_states = BaseDecoderLayer.pre_norm_residual_attn(
-    ...             hidden_states, self.self_attn, self.input_layernorm, ...
-    ...         )
-    ...         # MLP with pre-norm residual
-    ...         hidden_states = BaseDecoderLayer.pre_norm_residual_mlp(
-    ...             hidden_states, self.mlp, self.post_attention_layernorm
-    ...         )
-    ...         return hidden_states
+    Using pre-norm residual patterns in a custom decoder layer::
+
+        >>> from easydel.layers.decoder_base import BaseDecoderLayer
+        >>> import flax.nnx as nn
+        >>>
+        >>> class MyDecoderLayer(nn.Module):
+        ...     def __init__(self, config, rngs):
+        ...         self.attention = MyAttention(config, rngs=rngs)
+        ...         self.mlp = MyMLP(config, rngs=rngs)
+        ...         self.input_layernorm = RMSNorm(config.hidden_size, rngs=rngs)
+        ...         self.post_attention_layernorm = RMSNorm(config.hidden_size, rngs=rngs)
+        ...
+        ...     def __call__(self, hidden_states, mask_info, position_ids, mode, ...):
+        ...         # Attention with pre-norm residual
+        ...         hidden_states, attn_out = BaseDecoderLayer.pre_norm_residual_attn(
+        ...             hidden_states,
+        ...             self.attention,
+        ...             self.input_layernorm,
+        ...             mask_info,
+        ...             position_ids,
+        ...             mode
+        ...         )
+        ...         # MLP with pre-norm residual
+        ...         hidden_states = BaseDecoderLayer.pre_norm_residual_mlp(
+        ...             hidden_states,
+        ...             self.mlp,
+        ...             self.post_attention_layernorm
+        ...         )
+        ...         return hidden_states, attn_out
+
+    Using the complete standard decoder layer::
+
+        >>> output = BaseDecoderLayer.standard_decoder_layer_call(
+        ...     hidden_states,
+        ...     attention_module=self.attention,
+        ...     mlp_module=self.mlp,
+        ...     input_norm=self.input_layernorm,
+        ...     post_attn_norm=self.post_attention_layernorm,
+        ...     mask_info=mask_info,
+        ...     position_ids=position_ids,
+        ...     mode=mode,
+        ...     partition_manager=config.partition_manager
+        ... )
+
+Note:
+    These utilities are designed to work with JAX's checkpoint system via
+    checkpoint_name() for memory-efficient gradient computation during training.
+
+See Also:
+    - easydel.layers.attention_unified: UnifiedAttention for attention implementation
+    - easydel.layers.caching: Cache view implementations for KV caching
+    - easydel.infra.modeling_outputs: Output container types
 """
 
 from collections.abc import Callable
@@ -61,14 +127,47 @@ from .caching import (
 class BaseDecoderLayer:
     """Utility class providing common decoder layer patterns.
 
-    This class provides static/class methods for common operations in
-    decoder layers. It is not meant to be instantiated directly, but
-    rather used as a collection of utilities.
+    This class provides static methods for common operations in transformer
+    decoder layers. It is not meant to be instantiated directly, but rather
+    used as a collection of composable utilities.
 
-    Methods:
-        pre_norm_residual_attn: Apply attention with pre-norm residual
-        pre_norm_residual_mlp: Apply MLP with pre-norm residual
-        update_cache_view: Update KV cache view after attention
+    The methods implement the pre-norm transformer architecture pattern
+    where layer normalization is applied before each sub-layer, with
+    residual connections around the sub-layers.
+
+    Static Methods:
+        pre_norm_residual_attn:
+            Apply attention with pre-norm residual connection.
+            Pattern: ``hidden = hidden + attention(norm(hidden))``
+
+        pre_norm_residual_mlp:
+            Apply MLP with pre-norm residual connection.
+            Pattern: ``hidden = hidden + mlp(norm(hidden))``
+
+        apply_output_sharding:
+            Apply sharding constraints to decoder layer output.
+
+        standard_decoder_layer_call:
+            Complete standard decoder layer forward pass combining
+            both attention and MLP with pre-norm residuals.
+
+    Example:
+        >>> # Use individual methods for custom control flow
+        >>> hidden, attn_out = BaseDecoderLayer.pre_norm_residual_attn(
+        ...     hidden_states, attention_fn, norm_fn, mask_info, ...
+        ... )
+        >>> hidden = BaseDecoderLayer.pre_norm_residual_mlp(
+        ...     hidden, mlp_fn, post_norm_fn
+        ... )
+        >>>
+        >>> # Or use the combined standard call
+        >>> output = BaseDecoderLayer.standard_decoder_layer_call(
+        ...     hidden_states, attention_fn, mlp_fn, input_norm, post_norm, ...
+        ... )
+
+    Note:
+        These methods are designed to work with JAX's gradient checkpointing
+        via checkpoint_name() for memory-efficient training.
     """
 
     @staticmethod
@@ -288,16 +387,41 @@ def block_wise_ffn(
 ) -> Float[Array, "batch_size seq_len hidden_dim"]:
     """Apply MLP block-wise for memory efficiency.
 
-    Processes the input in chunks along the sequence dimension to
-    reduce memory usage during training.
+    Processes the input in chunks along the sequence dimension to reduce
+    peak memory usage during training. This is particularly useful for
+    long sequences where the MLP intermediate states can be very large.
+
+    The function splits the sequence into chunks, applies the MLP to each
+    chunk independently, and concatenates the results. This trades off
+    some computational efficiency for reduced memory footprint.
 
     Args:
-        mlp_module: MLP module to apply
-        inputs: Input tensor
-        chunk_size: Size of chunks to process
+        mlp_module: MLP module (callable) to apply. Should accept input
+            tensors of shape [batch, seq_chunk, hidden_dim] and return
+            tensors of the same shape.
+        inputs: Input tensor with shape [batch_size, seq_len, hidden_dim].
+        chunk_size: Maximum size of chunks along the sequence dimension.
+            Defaults to 1024. Smaller values use less memory but may be
+            slower due to increased loop overhead.
 
     Returns:
-        MLP output
+        MLP output tensor with shape [batch_size, seq_len, hidden_dim],
+        equivalent to mlp_module(inputs) but computed with lower peak memory.
+
+    Example:
+        >>> # Standard MLP application
+        >>> mlp_out = mlp(hidden_states)  # May OOM on long sequences
+        >>>
+        >>> # Block-wise for memory efficiency
+        >>> mlp_out = block_wise_ffn(mlp, hidden_states, chunk_size=512)
+
+    Note:
+        If the sequence length is less than or equal to chunk_size, the
+        MLP is applied directly without chunking for efficiency.
+
+    Warning:
+        The mlp_module should be stateless or handle batched computation
+        correctly, as different chunks are processed independently.
     """
     seq_len: int = inputs.shape[1]
 

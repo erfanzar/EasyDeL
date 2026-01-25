@@ -19,35 +19,51 @@ framework for configuration and runtime options. It includes enums for optimizer
 schedulers, quantization methods, platforms, backends, and various configuration
 options.
 
+The module serves as a central location for all enumeration-based configurations,
+ensuring type safety and consistency across the EasyDeL codebase. By using these
+enums and type aliases, the framework provides clear documentation of valid options
+and enables IDE autocompletion support.
+
 Enumerations:
-    EasyDeLOptimizers: Available optimization algorithms
-    EasyDeLSchedulers: Learning rate scheduling strategies
-    EasyDeLGradientCheckPointers: Gradient checkpointing methods
-    EasyDeLPlatforms: Kernel execution platforms
-    EasyDeLBackends: JAX backend hardware targets
+    EasyDeLOptimizers: Available optimization algorithms for training.
+    EasyDeLSchedulers: Learning rate scheduling strategies.
+    EasyDeLGradientCheckPointers: Gradient checkpointing methods for memory optimization.
+    EasyDeLPlatforms: Kernel execution platforms (JAX, Triton, Pallas).
+    EasyDeLBackends: JAX backend hardware targets (CPU, GPU, TPU, TT).
 
 Type Aliases:
-    AVAILABLE_GRADIENT_CHECKPOINTS: Literal type for gradient checkpoint options
-    AVAILABLE_SCHEDULERS: Literal type for scheduler options
-    AVAILABLE_OPTIMIZERS: Literal type for optimizer options
-    AVAILABLE_ATTENTION_MECHANISMS: Literal type for attention implementations
-    AVAILABLE_SPARSE_MODULE_TYPES: Literal type for sparse matrix formats
-    AVAILABLE_GRADIENT_CHECKPOINT_TARGETS: Literal type for checkpoint names used in models
+    AVAILABLE_GRADIENT_CHECKPOINTS: Literal type for gradient checkpoint options.
+    AVAILABLE_SCHEDULERS: Literal type for scheduler options.
+    AVAILABLE_OPTIMIZERS: Literal type for optimizer options.
+    AVAILABLE_MOE_METHODS: Literal type for mixture-of-experts methods.
+    AVAILABLE_ATTENTION_MECHANISMS: Literal type for attention implementations.
+    AVAILABLE_SPARSE_MODULE_TYPES: Literal type for sparse matrix formats.
+    AVAILABLE_GRADIENT_CHECKPOINT_TARGETS: Literal type for checkpoint target names.
 
 Constants:
-    DEFAULT_ATTENTION_MECHANISM: Default attention mechanism to use
+    DEFAULT_ATTENTION_MECHANISM: Default attention mechanism to use ("vanilla").
+
+Classes:
+    StoreTupleAction: Custom argparse action for parsing tuple arguments.
 
 Functions:
-    define_flags_with_default: Create argparse flags from default values
+    define_flags_with_default: Create argparse flags from default values.
 
 Example:
+    Basic usage with enums for configuration:
+
     >>> from easydel.infra.etils import EasyDeLOptimizers, EasyDeLBackends
     >>>
     >>> # Use enums for configuration
     >>> optimizer = EasyDeLOptimizers.ADAMW
     >>> backend = EasyDeLBackends.TPU
     >>>
-    >>> # Parse command-line arguments with defaults
+    >>> # Check enum values
+    >>> print(optimizer.value)
+    'adamw'
+
+    Using define_flags_with_default for command-line argument parsing:
+
     >>> args, defaults = define_flags_with_default(
     ...     learning_rate=1e-3,
     ...     batch_size=32,
@@ -61,14 +77,40 @@ from enum import Enum
 
 
 class EasyDeLOptimizers(str, Enum):
-    """
-    Enumeration of available optimizers in the EasyDeL library.
+    """Enumeration of available optimizers in the EasyDeL library.
+
+    This enum provides a type-safe way to specify which optimizer to use during
+    model training. Each optimizer has different characteristics in terms of
+    memory usage, convergence speed, and suitability for different model sizes.
+
+    Inherits from both `str` and `Enum` to allow direct string comparisons and
+    serialization while maintaining enum benefits.
 
     Attributes:
-        ADAFACTOR: Represents the Adafactor optimizer.
-        LION: Represents the Lion optimizer.
-        ADAMW: Represents the AdamW optimizer.
-        RMSPROP: Represents the RMSprop optimizer.
+        ADAFACTOR: Adafactor optimizer, memory-efficient for large models.
+            Automatically scales learning rate and uses factored second moments.
+        ADAMW: AdamW optimizer with decoupled weight decay regularization.
+            The most commonly used optimizer for transformer training.
+        MARS: MARS (Memory-efficient Adaptive Rate Scaling) optimizer.
+            Designed for efficient training with adaptive learning rates.
+        MUON: Muon optimizer, an experimental optimizer variant.
+            Provides alternative optimization dynamics.
+        RMSPROP: RMSprop optimizer with adaptive learning rates.
+            Divides gradient by running average of recent gradient magnitudes.
+        LION: Lion (EvoLved Sign Momentum) optimizer.
+            Memory-efficient optimizer using sign operations.
+        SKEW: Skew optimizer for specialized training scenarios.
+            Applies skewed gradient updates.
+        QUAD: Quadratic optimizer variant.
+            Uses quadratic approximations for parameter updates.
+
+    Example:
+        >>> from easydel.infra.etils import EasyDeLOptimizers
+        >>> optimizer = EasyDeLOptimizers.ADAMW
+        >>> print(optimizer.value)
+        'adamw'
+        >>> # String comparison works directly
+        >>> assert optimizer == "adamw"
     """
 
     ADAFACTOR = "adafactor"
@@ -82,13 +124,31 @@ class EasyDeLOptimizers(str, Enum):
 
 
 class EasyDeLSchedulers(str, Enum):
-    """
-    Enumeration of available learning rate schedulers in EasyDeL.
+    """Enumeration of available learning rate schedulers in EasyDeL.
+
+    Learning rate schedulers adjust the learning rate during training to improve
+    convergence and final model performance. This enum provides the available
+    scheduling strategies.
+
+    Inherits from both `str` and `Enum` for string compatibility.
 
     Attributes:
-        NONE: Indicates no scheduler should be used.
-        LINEAR: Represents a linear learning rate decay scheduler.
-        COSINE: Represents a cosine annealing learning rate scheduler.
+        NONE: No scheduler is applied; learning rate remains constant.
+            Use when you want full control over learning rate or for debugging.
+        LINEAR: Linear decay from initial to final learning rate.
+            Decreases learning rate linearly over the training steps.
+        COSINE: Cosine annealing scheduler.
+            Smoothly decreases learning rate following a cosine curve,
+            often with optional warmup period.
+
+    Example:
+        >>> from easydel.infra.etils import EasyDeLSchedulers
+        >>> scheduler = EasyDeLSchedulers.COSINE
+        >>> print(scheduler.value)
+        'cosine'
+        >>> # Check if scheduling is enabled
+        >>> if scheduler != EasyDeLSchedulers.NONE:
+        ...     print("Learning rate scheduling is enabled")
     """
 
     NONE = None
@@ -97,21 +157,49 @@ class EasyDeLSchedulers(str, Enum):
 
 
 class EasyDeLGradientCheckPointers(str, Enum):
-    """
-    Enumeration of gradient checkpointing strategies available in EasyDeL.
+    """Enumeration of gradient checkpointing strategies available in EasyDeL.
 
-    Gradient checkpointing is a technique to reduce memory usage during training
-    by recomputing activations during the backward pass instead of storing them.
+    Gradient checkpointing (also known as activation checkpointing) is a technique
+    to reduce memory usage during training by recomputing activations during the
+    backward pass instead of storing them. This allows training larger models or
+    using larger batch sizes at the cost of additional computation.
+
+    Different strategies provide different trade-offs between memory savings and
+    computational overhead.
 
     Attributes:
         EVERYTHING_SAVEABLE: Checkpoints residuals, attentions, and hidden states.
-            This is the most memory-intensive checkpointing strategy.
+            This is the most memory-intensive checkpointing strategy, saving
+            almost everything. Minimal recomputation but highest memory usage.
         NOTHING_SAVEABLE: Checkpoints only the residuals.
-            This strategy saves the most memory but requires more recomputation.
+            This strategy saves the most memory but requires the most recomputation
+            during the backward pass.
         CHECKPOINT_DOTS: Checkpoints matrix multiplications and intermediate activations.
-        CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS: Similar to CHECKPOINT_DOTS but avoids checkpointing
-            operations involving batch dimensions.
+            Good balance between memory savings and recomputation overhead.
+        CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS: Similar to CHECKPOINT_DOTS but avoids
+            checkpointing operations involving batch dimensions.
+            Useful for specific memory optimization patterns.
         NONE: No gradient checkpointing is applied.
+            All activations are stored in memory. Fastest but uses most memory.
+        DOTS_SAVEABLE: Saves dot product operations specifically.
+            Targets the most memory-intensive operations.
+        DOTS_WITH_NO_BATCH_DIMS_AVAILABLE: Saves dots without batch dimensions.
+            Variant that excludes batch dimension operations.
+        SAVE_ANYTHING_EXCEPT_THESE_NAMES: Policy to save all except specified names.
+            Allows fine-grained control by exclusion list.
+        SAVE_ANY_NAMES_BUT_THESE: Alias for exclusion-based saving policy.
+            Similar to SAVE_ANYTHING_EXCEPT_THESE_NAMES.
+        SAVE_ONLY_THESE_NAMES: Policy to save only specified names.
+            Allows fine-grained control by inclusion list.
+        SAVE_FROM_BOTH_POLICIES: Combines inclusion and exclusion policies.
+            Uses both include and exclude lists for maximum flexibility.
+
+    Example:
+        >>> from easydel.infra.etils import EasyDeLGradientCheckPointers
+        >>> # For memory-constrained training
+        >>> checkpoint_policy = EasyDeLGradientCheckPointers.NOTHING_SAVEABLE
+        >>> # For faster training with more memory
+        >>> checkpoint_policy = EasyDeLGradientCheckPointers.NONE
     """
 
     EVERYTHING_SAVEABLE = "everything_saveable"
@@ -128,16 +216,31 @@ class EasyDeLGradientCheckPointers(str, Enum):
 
 
 class EasyDeLPlatforms(str, Enum):
-    """
-    Enumeration of platforms or kernel execution backends supported by EasyDeL.
+    """Enumeration of platforms or kernel execution backends supported by EasyDeL.
 
-    This allows selecting optimized kernel implementations for different hardware
-    or software environments.
+    This enum allows selecting optimized kernel implementations for different
+    hardware or software environments. Each platform provides different levels
+    of optimization and hardware support.
 
     Attributes:
         JAX: Use standard JAX kernel implementations.
-        TRITON: Use Triton-based kernel implementations (often for GPUs).
-        PALLAS: Use Pallas-based kernel implementations (often for TPUs).
+            Most portable option, works across all JAX-supported hardware.
+            Good default choice for compatibility.
+        TRITON: Use Triton-based kernel implementations.
+            Optimized for NVIDIA GPUs with custom CUDA kernels.
+            Provides significant speedups for GPU workloads.
+        PALLAS: Use Pallas-based kernel implementations.
+            Optimized for Google TPUs and other accelerators.
+            Recommended for TPU deployments.
+
+    Example:
+        >>> from easydel.infra.etils import EasyDeLPlatforms
+        >>> # For GPU with Triton support
+        >>> platform = EasyDeLPlatforms.TRITON
+        >>> # For TPU deployment
+        >>> platform = EasyDeLPlatforms.PALLAS
+        >>> # For maximum compatibility
+        >>> platform = EasyDeLPlatforms.JAX
     """
 
     JAX = "jax"
@@ -146,16 +249,31 @@ class EasyDeLPlatforms(str, Enum):
 
 
 class EasyDeLBackends(str, Enum):
-    """
-    Enumeration of JAX backend types supported by EasyDeL.
+    """Enumeration of JAX backend types supported by EasyDeL.
 
-    Specifies the target hardware device type for JAX computations.
+    Specifies the target hardware device type for JAX computations. This enum
+    is used to configure which hardware backend JAX should use for executing
+    operations.
 
     Attributes:
         CPU: Use the CPU backend.
+            Available on all systems. Useful for debugging and small-scale
+            testing. Slowest option for large models.
         GPU: Use the GPU backend.
+            Requires CUDA-compatible NVIDIA GPU. Provides significant
+            acceleration for matrix operations.
         TPU: Use the TPU backend.
+            Requires Google Cloud TPU access. Optimized for large-scale
+            distributed training.
         TT: Use the Tenstorrent backend.
+            For Tenstorrent accelerator hardware. Experimental support.
+
+    Example:
+        >>> from easydel.infra.etils import EasyDeLBackends
+        >>> # Select backend based on available hardware
+        >>> backend = EasyDeLBackends.GPU
+        >>> print(backend.value)
+        'gpu'
     """
 
     CPU = "cpu"
@@ -164,6 +282,8 @@ class EasyDeLBackends(str, Enum):
     TT = "tt"
 
 
+# Type alias for valid gradient checkpoint options.
+# Used for type hints to ensure only valid checkpoint strategies are used.
 AVAILABLE_GRADIENT_CHECKPOINTS = tp.Literal[
     "everything_saveable",
     "nothing_saveable",
@@ -178,11 +298,22 @@ AVAILABLE_GRADIENT_CHECKPOINTS = tp.Literal[
     "save_from_both_policies",
 ]
 
+# Type alias for valid scheduler options.
+# Includes "none" as a string option for command-line compatibility.
 AVAILABLE_SCHEDULERS = tp.Literal["linear", "cosine", "none"]
 
+# Type alias for valid optimizer options.
+# Maps to the values in EasyDeLOptimizers enum.
 AVAILABLE_OPTIMIZERS = tp.Literal["adafactor", "adamw", "mars", "muon", "rmsprop", "lion", "skew", "quad"]
 
+# Type alias for mixture-of-experts implementation methods.
+# fused_moe: Uses fused kernels for efficiency
+# standard_moe: Standard implementation with separate operations
+# dense_moe: Dense computation across all experts
 AVAILABLE_MOE_METHODS = tp.Literal["fused_moe", "standard_moe", "dense_moe"]
+
+# Type alias for valid attention mechanism implementations.
+# Provides various optimized attention implementations for different use cases.
 AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
     "auto",
     "vanilla",
@@ -199,9 +330,20 @@ AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
     "unified_attention",
 ]
 
+# Default attention mechanism used when none is explicitly specified.
+# "vanilla" provides the most compatible standard attention implementation.
 DEFAULT_ATTENTION_MECHANISM = "vanilla"
+
+# Type alias for sparse matrix format types.
+# bcoo: Batched Coordinate format
+# bcsr: Batched Compressed Sparse Row format
+# coo: Coordinate format
+# csr: Compressed Sparse Row format
 AVAILABLE_SPARSE_MODULE_TYPES = tp.Literal["bcoo", "bcsr", "coo", "csr"]
 
+# Type alias for gradient checkpoint target names.
+# These names identify specific computation points in the model where
+# checkpointing can be applied. Used with name-based checkpoint policies.
 AVAILABLE_GRADIENT_CHECKPOINT_TARGETS = tp.Literal[
     "attn_dense",
     "attn_key",
@@ -232,27 +374,62 @@ AVAILABLE_GRADIENT_CHECKPOINT_TARGETS = tp.Literal[
 def define_flags_with_default(
     _required_fields: list | None = None, **kwargs
 ) -> tuple[argparse.Namespace, dict[str, tp.Any]]:
-    """Defines command-line flags using argparse based on provided keyword arguments.
+    """Define command-line flags using argparse based on provided keyword arguments.
 
-    This function dynamically creates argparse arguments for each key-value pair in `kwargs`.
-    It infers the argument type from the default value and handles tuple types specifically.
-    It also supports marking certain fields as required.
+    This function dynamically creates argparse arguments for each key-value pair
+    in `kwargs`. It infers the argument type from the default value and provides
+    special handling for tuple types using comma-separated strings.
+
+    The function is particularly useful for creating configuration-driven scripts
+    where default values are defined in code but can be overridden via command line.
 
     Args:
-        _required_fields (tp.List, optional): A list of flag names that are mandatory.
-            An error will be raised if these flags are not provided or are empty strings.
-            Defaults to None.
-        **kwargs: Keyword arguments where keys are flag names (without `--`) and values
-            are their default values.
+        _required_fields: A list of flag names that are mandatory. An error will
+            be raised if these flags are not provided or are empty strings on
+            the command line. Defaults to None (no required fields).
+        **kwargs: Keyword arguments where keys are flag names (without `--`)
+            and values are their default values. The type of each argument is
+            inferred from the default value type.
 
     Returns:
-        tp.Tuple[argparse.Namespace, tp.Dict[str, tp.Any]]: A tuple containing:
-            - An `argparse.Namespace` object holding the parsed command-line arguments.
-            - A dictionary mapping the original flag names to their default values.
+        A tuple containing:
+            - An `argparse.Namespace` object holding the parsed command-line
+              arguments with their values.
+            - A dictionary mapping the original flag names to their default
+              values, useful for tracking which values were overridden.
 
     Raises:
         ValueError: If a required field (from `_required_fields`) is not provided
             or is an empty string on the command line.
+        SystemExit: If invalid command-line arguments are provided (standard
+            argparse behavior).
+
+    Note:
+        - For tuple default values, provide comma-separated integers on the
+          command line (e.g., `--shape 1,2,3`).
+        - Boolean arguments should use the flag (e.g., `--verbose True`).
+        - The function calls `parser.parse_args()` which reads from `sys.argv`.
+
+    Example:
+        Basic usage with various argument types:
+
+        >>> args, defaults = define_flags_with_default(
+        ...     learning_rate=1e-3,
+        ...     batch_size=32,
+        ...     model_name="",
+        ...     use_cache=True,
+        ...     shape=(1, 2, 3),
+        ...     _required_fields=["model_name"]
+        ... )
+        >>> print(defaults)
+        {'learning_rate': 0.001, 'batch_size': 32, 'model_name': '', ...}
+
+        Command line usage:
+
+        .. code-block:: bash
+
+            python script.py --learning_rate 0.0001 --batch_size 64 \\
+                --model_name bert-base --shape 2,4,8
     """
     _required_fields = _required_fields if _required_fields is not None else []
     parser = argparse.ArgumentParser()
@@ -284,19 +461,79 @@ def define_flags_with_default(
 
 
 class StoreTupleAction(argparse.Action):
-    """
-    Custom argparse action to parse a comma-separated string into a tuple of integers.
+    """Custom argparse action to parse a comma-separated string into a tuple of integers.
 
-    This action is used by `define_flags_with_default` when a default value is a tuple.
-    It takes the comma-separated string provided on the command line and attempts to
-    convert each part into an integer, storing the result as a tuple in the namespace.
+    This action class is used by `define_flags_with_default` when a default value
+    is a tuple. It enables command-line specification of tuple values using
+    comma-separated integers (e.g., `--shape 1,2,3` becomes `(1, 2, 3)`).
+
+    The action is automatically applied to any argument whose default value is
+    a tuple when using `define_flags_with_default`.
+
+    Attributes:
+        Inherits all attributes from argparse.Action including:
+            - dest: The name of the attribute to be added to the namespace.
+            - option_strings: The command-line option strings.
+            - default: The default value if the argument is not provided.
 
     Raises:
-        argparse.ArgumentTypeError: If the provided value cannot be parsed as a comma-separated
-            list of integers.
+        argparse.ArgumentTypeError: If the provided value cannot be parsed as
+            a comma-separated list of integers. This occurs when non-numeric
+            values are provided or the format is incorrect.
+
+    Example:
+        Direct usage (typically not needed as define_flags_with_default handles this):
+
+        >>> import argparse
+        >>> parser = argparse.ArgumentParser()
+        >>> parser.add_argument(
+        ...     "--shape",
+        ...     type=str,
+        ...     default="(1, 2, 3)",
+        ...     action=StoreTupleAction
+        ... )
+        >>> # With command line: --shape 4,5,6
+        >>> # Result: args.shape = (4, 5, 6)
+
+        Error handling:
+
+        >>> # With command line: --shape a,b,c
+        >>> # Raises: ArgumentTypeError: Invalid value for --shape: a,b,c
+        ...          (should be comma-separated integers)
     """
 
-    def __call__(self, parser, namespace, values, option_string=None):
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str,
+        option_string: str | None = None,
+    ) -> None:
+        """Parse and store the comma-separated string as a tuple of integers.
+
+        This method is called by argparse when the associated argument is
+        encountered on the command line.
+
+        Args:
+            parser: The ArgumentParser object that contains this action.
+                Used for error handling and help generation.
+            namespace: The Namespace object that will be returned by
+                parse_args(). The parsed tuple will be stored as an
+                attribute on this object.
+            values: The string value provided on the command line.
+                Expected to be comma-separated integers (e.g., "1,2,3").
+            option_string: The option string that was used to invoke this
+                action (e.g., "--shape"). Used in error messages.
+                Defaults to None.
+
+        Returns:
+            None. The result is stored in the namespace object.
+
+        Raises:
+            argparse.ArgumentTypeError: If `values` cannot be split and
+                converted to integers. The error message includes the
+                option string and invalid value for debugging.
+        """
         try:
             setattr(namespace, self.dest, tuple(int(v) for v in values.split(",")))
         except ValueError:

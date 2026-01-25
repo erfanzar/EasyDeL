@@ -15,20 +15,35 @@
 """Request management for the eSurge engine.
 
 Defines the core request structures and status tracking for managing
-inference requests throughout their lifecycle.
+inference requests throughout their lifecycle in the eSurge engine.
 
 Classes:
-    EngineRequest: Main request object for tracking generation
-    EngineRequestStatus: Enum of request statuses
+    EngineRequest: Main request object for tracking generation state.
+    EngineRequestStatus: Enumeration of possible request statuses.
+
+Constants:
+    _FINISHED_REASON_MAP: Maps request statuses to finish reasons.
 
 Example:
+    >>> from easydel.inference.esurge.request import (
+    ...     EngineRequest,
+    ...     EngineRequestStatus
+    ... )
+    >>>
+    >>> # Create a new request
     >>> request = EngineRequest(
     ...     request_id="req_123",
     ...     prompt_token_ids=[1, 2, 3],
     ...     sampling_params=params,
     ...     eos_token_id=2
     ... )
+    >>>
+    >>> # Update status
     >>> request.status = EngineRequestStatus.RUNNING
+    >>>
+    >>> # Check if finished
+    >>> if request.is_finished():
+    ...     print(f"Finished: {request.get_finished_reason()}")
 """
 
 import enum
@@ -50,6 +65,7 @@ class EngineRequest:
 
     Manages the state and metadata of a single inference request,
     including tokens, sampling parameters, and execution status.
+    Supports both text-only and vision-language model requests.
 
     Attributes:
         request_id: Unique identifier for the request.
@@ -69,6 +85,15 @@ class EngineRequest:
         pixel_values_videos: Video pixel values for vision-language models.
         video_grid_thw: Grid shape (T, H, W) for each video.
         mm_features: List of multimodal features with metadata for caching.
+        max_tokens: Maximum tokens to generate.
+        num_prompt_tokens: Number of tokens in the prompt.
+        num_computed_tokens: Number of tokens computed so far.
+        num_cached_tokens: Number of tokens loaded from cache.
+        output_token_ids: ConstantList of generated token IDs.
+        all_token_ids: ConstantList of prompt + generated token IDs.
+        kv_transfer_params: Parameters for KV cache transfer.
+        structured_output_request: Guided decoding configuration if any.
+        use_structured_output: Whether structured output is enabled.
 
     Example:
         >>> request = EngineRequest(
@@ -77,6 +102,8 @@ class EngineRequest:
         ...     sampling_params=sampling_params,
         ...     eos_token_id=2
         ... )
+        >>> request.append_output_token_ids([4, 5])
+        >>> print(request.num_output_tokens)  # 2
     """
 
     def __init__(
@@ -105,8 +132,8 @@ class EngineRequest:
             sampling_params: Generation parameters.
             eos_token_id: End-of-sequence token.
             client_index: Client index.
-            arrival_time: Request arrival time.
-            priority: Request priority.
+            arrival_time: Request arrival time (defaults to current time).
+            priority: Request priority (higher = more urgent).
             parent_request_id: Parent request ID for n>1 sampling.
             sample_index: Sample index (0 to n-1) for n>1 sampling.
             pixel_values: Image pixel values for VLMs.
@@ -163,13 +190,21 @@ class EngineRequest:
 
     @property
     def has_vision(self) -> bool:
-        """Check if request has vision data (images or videos)."""
+        """Check if request has vision data (images or videos).
+
+        Returns:
+            True if the request contains pixel values or multimodal features.
+        """
         return self.pixel_values is not None or self.pixel_values_videos is not None or len(self.mm_features) > 0
 
     def clear_vision_data(self) -> None:
         """Clear raw vision data after prefill to free memory.
 
-        Note: mm_features with cached_embeddings are preserved for multi-turn.
+        Removes raw pixel values from both the request and its multimodal
+        features while preserving cached embeddings for multi-turn usage.
+
+        Note:
+            mm_features with cached_embeddings are preserved for multi-turn.
         """
         self.pixel_values = None
         self.image_grid_thw = None
@@ -182,11 +217,26 @@ class EngineRequest:
 
     @property
     def vision_processed(self) -> bool:
-        """Check if vision data has been processed (prefill complete)."""
+        """Check if vision data has been processed (prefill complete).
+
+        Returns:
+            True if clear_vision_data() has been called.
+        """
         return self._vision_processed
 
     @classmethod
     def from_engine_core_request(cls, request: EngineCoreRequest) -> "EngineRequest":
+        """Create an EngineRequest from an EngineCoreRequest.
+
+        Factory method to convert the core request format used in
+        inter-process communication to the full EngineRequest.
+
+        Args:
+            request: An EngineCoreRequest instance.
+
+        Returns:
+            A new EngineRequest with all fields populated from the core request.
+        """
         return cls(
             request_id=request.request_id,
             client_index=request.client_index,
@@ -207,6 +257,13 @@ class EngineRequest:
         self,
         token_ids: int | list[int],
     ) -> None:
+        """Append generated token IDs to the output.
+
+        Updates both output_token_ids and all_token_ids lists.
+
+        Args:
+            token_ids: Single token ID or list of token IDs to append.
+        """
         if isinstance(token_ids, int):
             self._output_token_ids.append(token_ids)
             self._all_token_ids.append(token_ids)
@@ -216,24 +273,54 @@ class EngineRequest:
 
     @property
     def is_output_corrupted(self) -> bool:
+        """Check if output contains NaN values in logits.
+
+        Returns:
+            True if any NaN values were detected during generation.
+        """
         return self.num_nans_in_logits > 0
 
     @property
     def num_tokens(self) -> int:
+        """Get total token count (prompt + generated).
+
+        Returns:
+            Total number of tokens in all_token_ids.
+        """
         return len(self._all_token_ids)
 
     @property
     def num_tokens_with_spec(self) -> int:
+        """Get total tokens including speculative tokens.
+
+        Returns:
+            Total tokens plus any speculative token count.
+        """
         return len(self._all_token_ids) + len(self.spec_token_ids)
 
     @property
     def num_output_tokens(self) -> int:
+        """Get count of generated tokens.
+
+        Returns:
+            Number of tokens in output_token_ids.
+        """
         return len(self._output_token_ids)
 
     def is_finished(self) -> bool:
+        """Check if request has finished processing.
+
+        Returns:
+            True if the request status indicates completion.
+        """
         return EngineRequestStatus.is_finished(self.status)
 
     def get_finished_reason(self) -> FinishReason | None:
+        """Get the reason why generation finished.
+
+        Returns:
+            FinishReason enum value, or None if not finished.
+        """
         return EngineRequestStatus.get_finished_reason(self.status)
 
     def record_event(
@@ -241,9 +328,21 @@ class EngineRequest:
         event_type: EngineCoreEventType,
         timestamp: float | None = None,
     ) -> None:
+        """Record a processing event for the request.
+
+        Args:
+            event_type: Type of event (QUEUED, SCHEDULED, PREEMPTED).
+            timestamp: Optional timestamp (uses current time if None).
+        """
         self.events.append(EngineCoreEvent.new_event(event_type, timestamp))
 
     def take_events(self) -> list[EngineCoreEvent] | None:
+        """Take and clear all recorded events.
+
+        Returns:
+            List of events if any were recorded, None otherwise.
+            Clears the internal events list.
+        """
         if not self.events:
             return None
         events, self.events = self.events, []
@@ -251,7 +350,27 @@ class EngineRequest:
 
 
 class EngineRequestStatus(enum.IntEnum):
-    """Status of a request."""
+    """Status of a request in the engine lifecycle.
+
+    Tracks the current state of a request as it moves through
+    the engine's processing pipeline.
+
+    Attributes:
+        WAITING: Request is in queue waiting to be scheduled.
+        WAITING_FOR_FSM: Request is waiting for finite state machine processing.
+        WAITING_FOR_REMOTE_KVS: Request is waiting for remote KV cache transfer.
+        RUNNING: Request is actively being processed.
+        PREEMPTED: Request was preempted and needs to be rescheduled.
+        FINISHED_STOPPED: Generation stopped due to stop token/string.
+        FINISHED_LENGTH_CAPPED: Generation stopped due to max length.
+        FINISHED_ABORTED: Generation was explicitly aborted.
+        FINISHED_IGNORED: Generation was ignored/skipped.
+
+    Example:
+        >>> status = EngineRequestStatus.RUNNING
+        >>> if EngineRequestStatus.is_finished(status):
+        ...     reason = EngineRequestStatus.get_finished_reason(status)
+    """
 
     WAITING = enum.auto()
     WAITING_FOR_FSM = enum.auto()
@@ -265,14 +384,35 @@ class EngineRequestStatus(enum.IntEnum):
     FINISHED_IGNORED = enum.auto()
 
     def __str__(self):
+        """Return the status name as a string.
+
+        Returns:
+            The name of the status (e.g., "RUNNING", "FINISHED_STOPPED").
+        """
         return self.name
 
     @staticmethod
     def is_finished(status: "EngineRequestStatus") -> bool:
+        """Check if a status indicates the request is finished.
+
+        Args:
+            status: The status to check.
+
+        Returns:
+            True if the status indicates completion (any FINISHED_* status).
+        """
         return status > EngineRequestStatus.PREEMPTED
 
     @staticmethod
     def get_finished_reason(status: "EngineRequestStatus") -> FinishReason | None:
+        """Get the finish reason for a finished status.
+
+        Args:
+            status: The status to get the reason for.
+
+        Returns:
+            FinishReason enum value, or None if status is not finished.
+        """
         return _FINISHED_REASON_MAP.get(status)
 
 

@@ -12,6 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Sampling functions for token generation in language models.
+
+This module provides efficient JAX-based sampling functions for selecting
+the next token during text generation. It includes implementations of
+top-p (nucleus) sampling and dynamic sampling with various penalty mechanisms.
+
+Functions:
+    sample_top_p_efficient: Efficient top-p sampling with temperature scaling.
+    vmaped_sample_top_p_efficient: Vectorized version of top-p sampling.
+    dynamic_sample_tokens: Dynamic token sampling with configurable penalties.
+
+Example:
+    >>> import jax
+    >>> import jax.numpy as jnp
+    >>> from easydel.inference.sampling_funcs import sample_top_p_efficient
+    >>> logits = jnp.array([[1.0, 2.0, 0.5, 3.0]])
+    >>> top_p = jnp.array([0.9])
+    >>> temperature = jnp.array([0.7])
+    >>> rng = jax.random.PRNGKey(42)
+    >>> token = sample_top_p_efficient(logits, top_p, temperature, rng)
+"""
+
 from __future__ import annotations
 
 import os
@@ -37,6 +59,34 @@ def sample_top_p_efficient(
     rng: jax.random.PRNGKey,
     top_k_for_computation: int = TOPK_FOR_COMPUTE,
 ) -> jax.Array:
+    """Perform efficient top-p (nucleus) sampling on logits.
+
+    This function implements nucleus sampling by first selecting the top-k
+    tokens (for computational efficiency), then filtering based on cumulative
+    probability to achieve the top-p cutoff.
+
+    Args:
+        logits: Logits tensor of shape (batch_size, vocab_size) containing
+            unnormalized log probabilities for each token.
+        top_p: Top-p threshold tensor of shape (batch_size,) or scalar.
+            Tokens with cumulative probability exceeding this threshold
+            are filtered out.
+        temperature: Temperature tensor of shape (batch_size,) or scalar.
+            Higher values increase randomness, lower values make sampling
+            more deterministic.
+        rng: JAX random key for sampling.
+        top_k_for_computation: Number of top tokens to consider for
+            efficiency. Defaults to EASYDEL_TOPK_FOR_COMPUTE env var or 64.
+
+    Returns:
+        Sampled token indices of shape (batch_size,).
+
+    Note:
+        The function uses a two-stage approach for efficiency:
+        1. Select top-k tokens based on logits
+        2. Apply top-p filtering within the top-k set
+        This reduces memory and computation while maintaining quality.
+    """
     vocab_size = logits.shape[-1]
     effective_k = min(top_k_for_computation, vocab_size)
     safe_temperature = jnp.where(temperature > 1e-6, temperature, 1.0)
@@ -52,6 +102,21 @@ def sample_top_p_efficient(
 
 
 vmaped_sample_top_p_efficient = jax.vmap(sample_top_p_efficient, in_axes=(0, 0, 0, None, None), out_axes=0)
+"""Vectorized version of sample_top_p_efficient for batch processing.
+
+Maps the sampling function over batches with independent top_p and
+temperature values per sample while sharing the random key.
+
+Args:
+    logits: Batched logits of shape (batch_size, vocab_size).
+    top_p: Per-sample top_p values of shape (batch_size,).
+    temperature: Per-sample temperatures of shape (batch_size,).
+    rng: Shared random key.
+    top_k_for_computation: Number of top tokens to consider.
+
+Returns:
+    Sampled tokens of shape (batch_size,).
+"""
 
 
 @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, None), out_axes=(0))
@@ -67,6 +132,33 @@ def dynamic_sample_tokens(
     repetition_penalty: jax.Array,  # [1] f4/f2
     rngs: jax.Array,  # [*] rng
 ) -> jax.Array:
+    """Dynamically sample tokens with configurable penalties and sampling modes.
+
+    This function provides flexible token sampling that can switch between
+    greedy and random (top-p) sampling modes, while applying various penalty
+    mechanisms to prevent repetition.
+
+    Args:
+        tokens: Previously generated tokens of shape (sequence_length,) used
+            for computing penalties.
+        length: Current sequence length (integer array).
+        logits: Logits tensor of shape (vocab_size,) for the current position.
+        top_p: Top-p threshold for nucleus sampling.
+        temperature: Temperature for scaling logits.
+        random_sampling: Boolean flag - True for random sampling, False for greedy.
+        presence_penalty: Penalty applied to tokens that appear in the sequence.
+        frequency_penalty: Penalty proportional to token frequency in the sequence.
+        repetition_penalty: Multiplicative penalty for repeated tokens.
+        rngs: Random key for sampling.
+
+    Returns:
+        Sampled token index of shape (1,).
+
+    Note:
+        This function is vectorized with jax.vmap and expects batched inputs
+        along axis 0 for all arguments except rngs.
+    """
+
     def _random_sampling_fn(
         tokens,
         length,
@@ -77,6 +169,7 @@ def dynamic_sample_tokens(
         frequency_penalty,
         repetition_penalty,
     ):
+        """Apply random sampling with penalties."""
         logits = logits.reshape(1, -1)
         processors = LogitsProcessorList()
         processors.append(PresencePenaltyLogitsProcessor(presence_penalty))
@@ -95,6 +188,7 @@ def dynamic_sample_tokens(
         frequency_penalty,
         repetition_penalty,
     ):
+        """Apply greedy sampling (argmax)."""
         return jnp.argmax(logits.reshape(1, -1), axis=-1)[:, None]
 
     return jax.lax.cond(

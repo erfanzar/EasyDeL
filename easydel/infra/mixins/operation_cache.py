@@ -12,7 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Operation cache requirements mixin for EasyDeL modules."""
+"""Operation cache requirements mixin for EasyDeL modules.
+
+This module provides mixins and data classes for discovering and managing
+operation cache requirements in EasyDeL neural network models. It enables
+dynamic discovery of cache types needed by different layer operations,
+supporting both standard transformer attention and recurrent/linear
+attention mechanisms.
+
+The primary components are:
+
+- ``LayerOperationInfo``: Information about a single layer's operation and cache needs.
+- ``OperationsCacheInfo``: Aggregated cache requirements for all model layers.
+- ``OperationCacheMixin``: Mixin class providing cache discovery methods for models.
+
+Example:
+    Discovering cache requirements for a model::
+
+        >>> model = AutoEasyDeLModelForCausalLM.from_pretrained("model-name")
+        >>> cache_info = model.get_operations_cache_info()
+        >>> print(f"Recommended cache: {cache_info.get_recommended_cache_type()}")
+        >>> print(f"Supports ragged pages: {cache_info.supports_ragged_pages}")
+"""
 
 from __future__ import annotations
 
@@ -41,20 +62,37 @@ __all__ = [
 class LayerOperationInfo:
     """Information about a single layer's operation and cache requirements.
 
+    This dataclass encapsulates all relevant information about an operation
+    within a specific layer, including the operation name, its requirements,
+    supported cache types, and whether it needs KV cache or recurrent state.
+
     Attributes:
-        layer_index: Index of the layer in the model.
+        layer_index: Index of the layer in the model (0-based).
         slot: Unique slot identifier for this operation within the layer.
             Most models have a single cache-bearing operation per layer (slot=None).
             Some architectures can have multiple cache-bearing operations in the same
             decoder layer (e.g., parallel attention + SSM), in which case different
             slots distinguish them.
-        layer_type: Type of layer (e.g., "full_attention", "linear_attention").
+        layer_type: Type of layer (e.g., "full_attention", "linear_attention",
+            "cross_attention", "vision_attention").
         operation_name: Name of the prefill operation implementation.
         decode_operation_name: Name of the decode operation (if different from prefill).
         requirements: Operation requirements (metadata and cache).
         supported_cache_types: Cache types supported by this operation.
-        requires_kv_cache: Whether this layer requires KV cache.
+        requires_kv_cache: Whether this layer requires KV cache for attention.
         requires_state_cache: Whether this layer requires recurrent state cache.
+
+    Example:
+        >>> layer_info = LayerOperationInfo(
+        ...     layer_index=0,
+        ...     slot=None,
+        ...     layer_type="full_attention",
+        ...     operation_name="vanilla",
+        ...     requirements=OperationRequirements.default("vanilla"),
+        ...     supported_cache_types=CacheType.TRANSFORMER | CacheType.RAGGED_PAGES,
+        ... )
+        >>> print(layer_info.is_attention_layer)
+        True
     """
 
     layer_index: int
@@ -72,7 +110,17 @@ class LayerOperationInfo:
         """Check if this is an attention-based layer.
 
         Determined dynamically from the operation's supported cache types.
-        An operation is primarily attention-based if it supports TRANSFORMER or RAGGED_PAGES cache.
+        An operation is primarily attention-based if it supports TRANSFORMER
+        or RAGGED_PAGES cache.
+
+        Returns:
+            bool: True if the layer supports TRANSFORMER or RAGGED_PAGES cache
+                types, indicating it is an attention-based layer.
+
+        Example:
+            >>> layer_info = LayerOperationInfo(...)
+            >>> if layer_info.is_attention_layer:
+            ...     print("This layer uses attention mechanism")
         """
         return (
             CacheType.TRANSFORMER in self.supported_cache_types or CacheType.RAGGED_PAGES in self.supported_cache_types
@@ -83,9 +131,18 @@ class LayerOperationInfo:
         """Check if this is a recurrent/linear attention layer.
 
         Determined dynamically from the operation's supported cache types.
-        An operation is primarily recurrent if it supports RECURRENT cache but NOT standard
-        attention caches (TRANSFORMER/RAGGED_PAGES). This distinguishes true recurrent
-        operations from cache-agnostic operations like vanilla attention.
+        An operation is primarily recurrent if it supports RECURRENT cache but NOT
+        standard attention caches (TRANSFORMER/RAGGED_PAGES). This distinguishes
+        true recurrent operations from cache-agnostic operations like vanilla attention.
+
+        Returns:
+            bool: True if the layer supports RECURRENT cache but not standard
+                attention caches, indicating it is a recurrent layer.
+
+        Example:
+            >>> layer_info = LayerOperationInfo(...)
+            >>> if layer_info.is_recurrent_layer:
+            ...     print("This layer uses recurrent/linear attention")
         """
         supports_recurrent = CacheType.RECURRENT in self.supported_cache_types
         supports_attention = (
@@ -96,7 +153,25 @@ class LayerOperationInfo:
 
     @property
     def has_separate_decode(self) -> bool:
-        """Whether this layer uses different operations for prefill and decode."""
+        """Whether this layer uses different operations for prefill and decode phases.
+
+        Some models use different operation implementations for the prefill
+        (initial context processing) and decode (autoregressive generation)
+        phases to optimize for different batch sizes and sequence lengths.
+
+        Returns:
+            bool: True if decode_operation_name is set and differs from
+                operation_name, indicating separate operations are used.
+
+        Example:
+            >>> layer_info = LayerOperationInfo(
+            ...     operation_name="flash_attention",
+            ...     decode_operation_name="vanilla",
+            ...     ...
+            ... )
+            >>> print(layer_info.has_separate_decode)
+            True
+        """
         return self.decode_operation_name is not None and self.decode_operation_name != self.operation_name
 
 
@@ -104,18 +179,30 @@ class LayerOperationInfo:
 class OperationsCacheInfo:
     """Complete information about all operations' cache requirements.
 
+    This dataclass aggregates cache requirement information from all layers
+    in a model, providing a comprehensive view of what cache types are
+    supported and required. It is used to determine the appropriate cache
+    class to instantiate for inference.
+
     Attributes:
-        layers: List of layer operation info.
-        prefill_operation: Operation used for prefill phase.
-        decode_operation: Operation used for decode phase.
+        layers: List of LayerOperationInfo for each layer in the model.
+        prefill_operation: Name of the operation used for the prefill phase.
+        decode_operation: Name of the operation used for the decode phase.
         combined_cache_types: Cache types that work for all operations (intersection).
-        combined_metadata: Combined metadata requirements.
+            This represents cache types supported by every layer in the model.
+        combined_metadata: Combined metadata requirements from all layers.
         is_hybrid_model: Whether the model has mixed layer types (attention + recurrent).
         supports_ragged_pages: Whether all operations support RaggedPagesCache.
         supports_transformer_cache: Whether all operations support TransformerCache.
         requires_hybrid_cache: Whether the model needs HybridCache (has recurrent layers).
         requires_state_management: Whether any layer needs recurrent state.
         has_separate_decode_ops: Whether any layer uses different decode operation.
+
+    Example:
+        >>> cache_info = model.get_operations_cache_info()
+        >>> print(f"Number of layers: {len(cache_info.layers)}")
+        >>> print(f"Recommended cache: {cache_info.get_recommended_cache_type()}")
+        >>> print(f"Attention layers: {cache_info.num_attention_layers}")
     """
 
     layers: list[LayerOperationInfo] = field(default_factory=list)
@@ -132,27 +219,71 @@ class OperationsCacheInfo:
 
     @property
     def requires_ragged_pages(self) -> bool:
-        """Deprecated: Use supports_ragged_pages instead."""
+        """Deprecated: Use supports_ragged_pages instead.
+
+        Returns:
+            bool: Whether ragged pages cache is supported.
+
+        .. deprecated::
+            This property is deprecated. Use ``supports_ragged_pages`` instead.
+        """
         return self.supports_ragged_pages
 
     @property
     def requires_transformer_cache(self) -> bool:
-        """Deprecated: Use supports_transformer_cache instead."""
+        """Deprecated: Use supports_transformer_cache instead.
+
+        Returns:
+            bool: Whether transformer cache is supported.
+
+        .. deprecated::
+            This property is deprecated. Use ``supports_transformer_cache`` instead.
+        """
         return self.supports_transformer_cache
 
     @property
     def num_attention_layers(self) -> int:
-        """Count of attention-based layers."""
+        """Count of attention-based layers in the model.
+
+        Returns:
+            int: Number of layers that use attention mechanisms
+                (TRANSFORMER or RAGGED_PAGES cache types).
+
+        Example:
+            >>> cache_info = model.get_operations_cache_info()
+            >>> print(f"Attention layers: {cache_info.num_attention_layers}")
+        """
         return sum(1 for layer in self.layers if layer.is_attention_layer)
 
     @property
     def num_recurrent_layers(self) -> int:
-        """Count of recurrent/linear attention layers."""
+        """Count of recurrent/linear attention layers in the model.
+
+        Returns:
+            int: Number of layers that use recurrent mechanisms
+                (RECURRENT cache type without standard attention).
+
+        Example:
+            >>> cache_info = model.get_operations_cache_info()
+            >>> print(f"Recurrent layers: {cache_info.num_recurrent_layers}")
+        """
         return sum(1 for layer in self.layers if layer.is_recurrent_layer)
 
     @property
     def attention_ratio(self) -> float:
-        """Ratio of attention layers to total layers."""
+        """Ratio of attention layers to total layers.
+
+        This metric is useful for understanding the composition of hybrid
+        models that mix attention and recurrent layers.
+
+        Returns:
+            float: Ratio between 0.0 and 1.0. Returns 1.0 if there are no layers.
+
+        Example:
+            >>> cache_info = model.get_operations_cache_info()
+            >>> if cache_info.attention_ratio < 0.5:
+            ...     print("Model is primarily recurrent")
+        """
         if not self.layers:
             return 1.0
         return self.num_attention_layers / len(self.layers)
@@ -160,13 +291,24 @@ class OperationsCacheInfo:
     def get_recommended_cache_type(self) -> str:
         """Get recommended cache type based on model requirements.
 
-        Priority order:
+        Analyzes the model's cache requirements and returns the most
+        appropriate cache type string. The priority order is:
+
         1. "hybrid" - if model has recurrent layers requiring state management
         2. "transformer" - if supported (simplest, most compatible)
         3. "ragged" - if transformer not supported but ragged is
 
         Returns:
-            "hybrid", "transformer", or "ragged" based on model requirements.
+            str: One of "hybrid", "transformer", or "ragged" based on
+                the model's requirements.
+
+        Example:
+            >>> cache_info = model.get_operations_cache_info()
+            >>> cache_type = cache_info.get_recommended_cache_type()
+            >>> if cache_type == "hybrid":
+            ...     cache = HybridCache(...)
+            >>> elif cache_type == "transformer":
+            ...     cache = TransformerCache(...)
         """
         if self.requires_hybrid_cache or self.requires_state_management:
             return "hybrid"
@@ -180,14 +322,49 @@ class OperationsCacheInfo:
         return "transformer"
 
     def get_layer_by_index(self, index: int) -> LayerOperationInfo | None:
-        """Get layer info by index."""
+        """Get layer info by index.
+
+        Retrieves the LayerOperationInfo for a specific layer by its index.
+        For models with multiple operations per layer (slots), this returns
+        the first matching layer.
+
+        Args:
+            index: The layer index to search for (0-based).
+
+        Returns:
+            LayerOperationInfo | None: The layer info if found, None otherwise.
+
+        Example:
+            >>> cache_info = model.get_operations_cache_info()
+            >>> layer_0 = cache_info.get_layer_by_index(0)
+            >>> if layer_0:
+            ...     print(f"Layer 0 operation: {layer_0.operation_name}")
+        """
         for layer in self.layers:
             if layer.layer_index == index:
                 return layer
         return None
 
     def get_layers_by_index(self, index: int) -> list[LayerOperationInfo]:
-        """Get all layer infos for an index (slot-aware)."""
+        """Get all layer infos for an index (slot-aware).
+
+        Retrieves all LayerOperationInfo instances for a specific layer index.
+        This is useful for models with multiple cache-bearing operations per
+        layer (e.g., parallel attention + SSM in hybrid architectures).
+
+        Args:
+            index: The layer index to search for (0-based).
+
+        Returns:
+            list[LayerOperationInfo]: List of all layer infos matching the index.
+                Empty list if no layers match.
+
+        Example:
+            >>> cache_info = model.get_operations_cache_info()
+            >>> layer_5_ops = cache_info.get_layers_by_index(5)
+            >>> for op in layer_5_ops:
+            ...     print(f"Slot {op.slot}: {op.operation_name}")
+        """
         return [layer for layer in self.layers if layer.layer_index == index]
 
 
@@ -196,9 +373,31 @@ class OperationCacheMixin:
 
     This mixin adds methods to EasyDeLBaseModule for discovering
     what operations are used and what cache types they require.
+    It supports both dynamic discovery (traversing the module graph)
+    and static discovery (reading from configuration).
 
     The recommended approach is to use dynamic discovery (default),
     which traverses the actual module graph to find operations.
+    This provides the most accurate results for complex architectures.
+
+    Methods provided:
+        - ``get_operations_cache_info``: Main entry point for cache discovery.
+        - ``get_operations_cache_info_dynamic``: Dynamic discovery from module graph.
+        - ``get_layer_cache_requirements``: Get requirements for a specific layer.
+        - ``get_required_cache_class``: Get the appropriate cache class.
+        - ``get_operations_cache_view``: Get cache view class per layer.
+        - ``get_unique_cache_view_classes``: Get all unique cache view classes.
+
+    Example:
+        >>> class MyModel(OperationCacheMixin, nn.Module):
+        ...     def __init__(self, config):
+        ...         super().__init__()
+        ...         self.config = config
+        ...         # ... model initialization
+        ...
+        >>> model = MyModel(config)
+        >>> cache_info = model.get_operations_cache_info()
+        >>> cache_class = model.get_required_cache_class()
     """
 
     def _get_operation_requirements(
@@ -208,14 +407,24 @@ class OperationCacheMixin:
     ) -> OperationRequirements | None:
         """Get requirements for an operation by name from the registry.
 
+        Looks up an operation in the global OperationRegistry and retrieves
+        its requirements for the specified execution mode.
+
         Args:
-            name (str | None): Operation name to look up. If None, returns None immediately.
-            mode (ExecutionMode): The execution mode to get requirements for. Can be
-                PREFILL, DECODE, or MIXED. Defaults to ExecutionMode.MIXED.
+            name: Operation name to look up (e.g., "vanilla", "flash_attention").
+                If None, returns None immediately without registry lookup.
+            mode: The execution mode to get requirements for. Can be
+                ExecutionMode.PREFILL, ExecutionMode.DECODE, or ExecutionMode.MIXED.
+                Defaults to ExecutionMode.MIXED.
 
         Returns:
-            OperationRequirements | None: Requirements for the operation if found in
-                the registry, None otherwise.
+            OperationRequirements | None: Requirements for the operation if found
+                in the registry, None if name is None or operation not found.
+
+        Example:
+            >>> reqs = self._get_operation_requirements("flash_attention")
+            >>> if reqs:
+            ...     print(f"Supports cache types: {reqs.cache.supported}")
         """
         if name is None:
             return None
@@ -234,13 +443,21 @@ class OperationCacheMixin:
     ) -> OperationsCacheInfo:
         """Get complete information about operations and their cache requirements.
 
+        This is the main entry point for discovering what cache types a model
+        requires. It can use either dynamic discovery (traversing the module
+        graph) or static discovery (reading from configuration).
+
         Args:
-            mode: Execution mode for requirements lookup.
-            dynamic: If True, discover from actual module graph (recommended).
-                     If False, read from config (faster but less accurate).
+            mode: Execution mode for requirements lookup. Can be PREFILL, DECODE,
+                or MIXED. MIXED combines requirements from both phases.
+                Defaults to ExecutionMode.MIXED.
+            dynamic: If True (default), discover from actual module graph. This is
+                more accurate but slightly slower. If False, read from config
+                (faster but may miss dynamically configured operations).
 
         Returns:
-            OperationsCacheInfo with complete cache requirements information.
+            OperationsCacheInfo: Complete cache requirements information including
+                per-layer details, combined cache types, and recommendations.
 
         Example:
             >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(...)
@@ -261,17 +478,26 @@ class OperationCacheMixin:
     def _get_operations_cache_info_from_config(self, mode: ExecutionMode = ExecutionMode.MIXED) -> OperationsCacheInfo:
         """Get cache info by reading from model configuration (static fallback).
 
-        This is a fallback method that reads from config attributes.
-        Use dynamic=True (default) for more accurate discovery.
+        This is a fallback method that reads from config attributes like
+        ``attn_mechanism``, ``decode_attn_mechanism``, ``layer_types``, etc.
+        Use dynamic=True (default) in get_operations_cache_info() for more
+        accurate discovery.
 
-        Note: This method queries the OperationRegistry to get requirements,
-        so it will work with any registered operation without hardcoding.
+        Note:
+            This method queries the OperationRegistry to get requirements,
+            so it will work with any registered operation without hardcoding.
 
         Args:
             mode: Execution mode for requirements lookup.
+                Defaults to ExecutionMode.MIXED.
 
         Returns:
-            OperationsCacheInfo with cache requirements information.
+            OperationsCacheInfo: Cache requirements information based on
+                configuration attributes. Returns empty info if no config.
+
+        Example:
+            >>> # Usually called internally as fallback
+            >>> cache_info = self._get_operations_cache_info_from_config()
         """
         config = getattr(self, "config", None)
         if config is None:
@@ -413,11 +639,20 @@ class OperationCacheMixin:
     def get_layer_cache_requirements(self, layer_index: int) -> LayerOperationInfo | None:
         """Get cache requirements for a specific layer.
 
+        Convenience method to retrieve cache requirements for a single layer
+        by its index. Uses dynamic discovery by default.
+
         Args:
-            layer_index: Index of the layer.
+            layer_index: Index of the layer (0-based).
 
         Returns:
-            LayerOperationInfo for the layer, or None if not found.
+            LayerOperationInfo | None: Layer operation info if found, None otherwise.
+
+        Example:
+            >>> layer_info = model.get_layer_cache_requirements(5)
+            >>> if layer_info:
+            ...     print(f"Layer 5 uses: {layer_info.operation_name}")
+            ...     print(f"Is attention: {layer_info.is_attention_layer}")
         """
         cache_info = self.get_operations_cache_info()
         return cache_info.get_layer_by_index(layer_index)
@@ -427,19 +662,33 @@ class OperationCacheMixin:
 
         This method traverses the actual model structure to find all
         operation instances, including:
+
         1. FlexibleAttentionModule instances (which contain impl and impl_decode)
         2. BaseOperation instances stored as attributes on any nn.Module
 
         This comprehensive approach works because:
+
         - Standard attention uses FlexibleAttentionModule via attention_performer
         - Some models (like Qwen3Next) use operations directly (e.g., gdr_op)
         - Searching both patterns catches all cases for hybrid models
 
         Args:
-            mode: Execution mode for requirements lookup.
+            mode: Execution mode for requirements lookup. Can be PREFILL, DECODE,
+                or MIXED. Defaults to ExecutionMode.MIXED.
 
         Returns:
-            OperationsCacheInfo with complete cache requirements information.
+            OperationsCacheInfo: Complete cache requirements information discovered
+                from the module graph. May be empty if no operations found.
+
+        Note:
+            For models that don't expose operations in the module graph
+            (e.g., pure recurrent models), this may return empty info.
+            The caller should fall back to config-based discovery.
+
+        Example:
+            >>> cache_info = model.get_operations_cache_info_dynamic()
+            >>> for layer in cache_info.layers:
+            ...     print(f"Layer {layer.layer_index}: {layer.operation_name}")
         """
         from flax import nnx as nn
 
@@ -573,17 +822,26 @@ class OperationCacheMixin:
     def _extract_layer_index_from_path(self, path: tuple) -> int:
         """Extract layer index from module path.
 
-        Path format from nn.graph.iter_graph is a tuple of mixed str/int elements.
-        Examples:
-        - ("model", "layers", 5, "self_attn") -> 5
-        - ("transformer", "h", 3, "attn") -> 3
-        - ("decoder", "block", 0, "layer", 0, "SelfAttention") -> 0
+        Parses a module path tuple to find the layer index. The path format
+        from nn.graph.iter_graph is a tuple of mixed str/int elements.
+
+        Examples of path formats:
+
+        - ("model", "layers", 5, "self_attn") -> returns 5
+        - ("transformer", "h", 3, "attn") -> returns 3
+        - ("decoder", "block", 0, "layer", 0, "SelfAttention") -> returns 0
 
         Args:
-            path: Module path tuple.
+            path: Module path tuple containing strings and integers.
 
         Returns:
-            Layer index, or 0 if not found.
+            int: Layer index extracted from the path. Returns 0 if no
+                valid layer index can be determined.
+
+        Example:
+            >>> path = ("model", "layers", 5, "self_attn", "attention_performer")
+            >>> idx = self._extract_layer_index_from_path(path)
+            >>> print(idx)  # Output: 5
         """
         layer_containers = {
             "layers",
@@ -607,11 +865,22 @@ class OperationCacheMixin:
     def _infer_layer_type_from_path(self, path: tuple) -> str:
         """Infer layer type from the module path.
 
+        Analyzes the module path to determine what type of layer this is.
+        Looks for keywords in the path that indicate specific layer types.
+
         Args:
-            path: Module path tuple.
+            path: Module path tuple containing strings and integers.
 
         Returns:
-            Layer type string.
+            str: Inferred layer type. One of:
+                - "cross_attention": If path contains "cross_attn"
+                - "vision_attention": If path contains "vision"
+                - "full_attention": Default for standard attention layers
+
+        Example:
+            >>> path = ("model", "layers", 0, "cross_attn")
+            >>> layer_type = self._infer_layer_type_from_path(path)
+            >>> print(layer_type)  # Output: "cross_attention"
         """
         path_str = ".".join(map(str, path)).lower()
 
@@ -631,12 +900,21 @@ class OperationCacheMixin:
     ) -> OperationsCacheInfo:
         """Build OperationsCacheInfo from discovered layers.
 
+        Aggregates individual layer information into a comprehensive
+        OperationsCacheInfo object with combined requirements.
+
         Args:
-            layers: List of LayerOperationInfo.
+            layers: List of LayerOperationInfo from discovery.
             has_separate_decode: Whether any layer has separate decode operation.
 
         Returns:
-            OperationsCacheInfo with combined requirements.
+            OperationsCacheInfo: Aggregated cache requirements with combined
+                cache types (intersection), combined metadata (union), and
+                derived flags like is_hybrid_model.
+
+        Example:
+            >>> layers = [layer_info_1, layer_info_2, layer_info_3]
+            >>> cache_info = self._build_cache_info_from_layers(layers, False)
         """
         if not layers:
             return OperationsCacheInfo()
@@ -684,17 +962,24 @@ class OperationCacheMixin:
         Dynamically discovers the cache view classes required by the model's
         operations and returns the appropriate cache class.
 
-        For hybrid models (mixing attention and recurrent), returns HybridCache.
-        For pure attention models, returns TransformerCache.
-        For pure recurrent models, returns RecurrentCache.
+        The logic is:
+
+        - For hybrid models (mixing attention and recurrent): returns HybridCache
+        - For pure attention models: returns TransformerCache
+        - For pure recurrent models: returns RecurrentCache
 
         Returns:
-            The cache class appropriate for the model's operations.
+            type: The cache class appropriate for the model's operations.
+                One of TransformerCache, RecurrentCache, or HybridCache.
 
         Example:
             >>> model = LlamaForCausalLM(config)
             >>> cache_class = model.get_required_cache_class()
             >>> # cache_class is TransformerCache for standard attention models
+            >>> cache = cache_class.init_layers(
+            ...     num_hidden_layers=config.num_hidden_layers,
+            ...     ...
+            ... )
         """
         cache_info = self.get_operations_cache_info()
         cache_view_classes: set[type] = set()
@@ -726,21 +1011,30 @@ class OperationCacheMixin:
         """Get the cache view class required for each layer.
 
         Returns a mapping from layer index to the cache view class that
-        layer's operation requires.
+        layer's operation requires. This is useful for understanding the
+        per-layer cache requirements of hybrid models.
 
         Notes:
             Most models have exactly one cache-bearing operation per layer.
             Some models can have multiple cache-bearing operations in the same
             layer (e.g., parallel attention + SSM). In that case, this method
-            returns a composite cache view class for that layer.
+            returns a composite cache view class (ParallelHybridCacheView)
+            for that layer.
 
         Returns:
-            Dict mapping layer_index -> cache_view_class.
+            dict[int, type]: Mapping from layer_index to cache_view_class.
+                Empty dict if no cache views are required.
+
+        Raises:
+            ValueError: If a layer requires multiple cache view classes that
+                cannot be automatically resolved.
 
         Example:
             >>> model = Qwen3NextForCausalLM(config)  # Hybrid model
             >>> cache_views = model.get_operations_cache_view()
-            >>> # {0: TransformerCacheView, 1: RecurrentCacheView, 2: TransformerCacheView, ...}
+            >>> # {0: TransformerCacheView, 1: RecurrentCacheView, ...}
+            >>> for idx, view_cls in cache_views.items():
+            ...     print(f"Layer {idx}: {view_cls.__name__}")
         """
         cache_info = self.get_operations_cache_info()
         per_layer: dict[int, set[type]] = {}
@@ -778,13 +1072,21 @@ class OperationCacheMixin:
     def get_operations_cache_info_by_slot(self) -> dict[int, dict[int, LayerOperationInfo]]:
         """Get per-layer cache requirements grouped by slot.
 
-        Most models have exactly one cache-bearing operation per layer, in which case
-        each layer maps to a single slot (slot 0). Models that run multiple cache-bearing
-        blocks inside a single decoder layer (e.g., attention + SSM in parallel) will
-        expose multiple slots for that layer.
+        Most models have exactly one cache-bearing operation per layer, in which
+        case each layer maps to a single slot (slot 0). Models that run multiple
+        cache-bearing blocks inside a single decoder layer (e.g., attention + SSM
+        in parallel) will expose multiple slots for that layer.
 
         Returns:
-            Dict mapping layer_index -> {slot_index -> LayerOperationInfo}.
+            dict[int, dict[int, LayerOperationInfo]]: Nested mapping from
+                layer_index -> {slot_index -> LayerOperationInfo}.
+
+        Example:
+            >>> cache_info_by_slot = model.get_operations_cache_info_by_slot()
+            >>> # For a hybrid model with parallel attention + SSM:
+            >>> # {0: {0: attn_info, 1: ssm_info}, 1: {0: attn_info, 1: ssm_info}, ...}
+            >>> for layer_idx, slots in cache_info_by_slot.items():
+            ...     print(f"Layer {layer_idx} has {len(slots)} slots")
         """
         cache_info = self.get_operations_cache_info()
         per_layer: dict[int, list[LayerOperationInfo]] = {}
@@ -804,11 +1106,21 @@ class OperationCacheMixin:
         """Get the cache view classes per layer, grouped by slot.
 
         This is the slot-aware form of :meth:`get_operations_cache_view`.
-        It is useful for architectures where a single decoder layer contains multiple
-        cache-bearing blocks and you want to reason about them separately.
+        It is useful for architectures where a single decoder layer contains
+        multiple cache-bearing blocks and you want to reason about them
+        separately.
 
         Returns:
-            Dict mapping layer_index -> {slot_index -> cache_view_class}.
+            dict[int, dict[int, type]]: Nested mapping from
+                layer_index -> {slot_index -> cache_view_class}.
+
+        Example:
+            >>> views_by_slot = model.get_operations_cache_view_by_slot()
+            >>> # For a hybrid model:
+            >>> # {0: {0: TransformerCacheView, 1: RecurrentCacheView}, ...}
+            >>> for layer_idx, slots in views_by_slot.items():
+            ...     for slot_idx, view_cls in slots.items():
+            ...         print(f"Layer {layer_idx}, Slot {slot_idx}: {view_cls.__name__}")
         """
         info_by_slot = self.get_operations_cache_info_by_slot()
         result: dict[int, dict[int, type]] = {}
@@ -828,12 +1140,22 @@ class OperationCacheMixin:
     def get_unique_cache_view_classes(self) -> set[type]:
         """Get all unique cache view classes used by this model.
 
-        Returns the set of all cache view classes declared by the model's operations.
-        For pure attention models, this will be {TransformerCacheView}.
-        For hybrid models, this could be {TransformerCacheView, RecurrentCacheView}.
+        Returns the set of all cache view classes declared by the model's
+        operations. This is useful for understanding what types of caching
+        the model requires.
 
         Returns:
-            Set of cache view classes used by the model.
+            set[type]: Set of cache view classes used by the model.
+                For pure attention models: {TransformerCacheView}
+                For pure recurrent models: {RecurrentCacheView}
+                For hybrid models: {TransformerCacheView, RecurrentCacheView}
+
+        Example:
+            >>> view_classes = model.get_unique_cache_view_classes()
+            >>> if len(view_classes) > 1:
+            ...     print("This is a hybrid model")
+            >>> for cls in view_classes:
+            ...     print(f"Uses: {cls.__name__}")
         """
         cache_info = self.get_operations_cache_info()
         cache_view_classes: set[type] = set()

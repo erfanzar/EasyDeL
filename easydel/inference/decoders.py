@@ -15,4 +15,11 @@
 """Decoders module for EasyDeL inference.
 
 This module previously contained SmartBytecodeDecoder which has been removed.
+The module is retained for backwards compatibility and potential future
+decoder implementations.
+
+Note:
+    This module currently does not export any classes or functions.
+    Future decoder implementations may be added here for specialized
+    text generation scenarios.
 """

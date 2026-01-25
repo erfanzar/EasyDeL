@@ -19,25 +19,29 @@ Provides optimized linear layers with support for model parallelism,
 tensor parallelism, and various sharding strategies for distributed training.
 
 Classes:
-    ParallelLinear: Linear layer with tensor/model parallelism support
-    Linear: Standard linear layer (alias for ParallelLinear)
+    ParallelLinear: Linear layer with tensor/model parallelism support.
+    RowParallelLinear: Row-parallel variant (input dimension partitioned).
+    ColumnParallelLinear: Column-parallel variant (output dimension partitioned).
 
 Key Features:
     - Automatic sharding and gathering for distributed training
     - Support for various matrix multiplication methods
     - Mixed precision support
-    - Efficient initialization strategies
+    - Efficient initialization strategies with configurable scaling
     - Integration with JAX's shard_map
+    - Conversion to quantized variants
 
 Example:
-    >>> from easydel.layers import ParallelLinear
+    >>> from easydel.layers.components.linears import ParallelLinear
+    >>> from flax import nnx as nn
+    >>>
     >>> # Create a parallel linear layer
     >>> layer = ParallelLinear(
-    ...     features=768,
+    ...     in_features=768,
+    ...     out_features=3072,
     ...     use_bias=True,
-    ...     gather_output=False,
-    ...     axis_name="model",
-    ...     dtype=jnp.bfloat16
+    ...     dtype=jnp.bfloat16,
+    ...     rngs=nn.Rngs(0)
     ... )
     >>> output = layer(input_tensor)
 """
@@ -70,9 +74,17 @@ default_bias_init = nn.initializers.zeros
 
 
 class ParallelLinear(nn.Module):
-    """A Linear layer with optional parallelism.
+    """A linear transformation layer with optional parallelism support.
 
-    Behaves like `nnx.Linear` but can distribute computation and parameters across devices.
+    Behaves like `nnx.Linear` but supports distributed computation and parameters
+    across multiple devices. This layer implements the transformation:
+
+        y = x @ W + b
+
+    where W has shape (in_features, out_features) and b has shape (out_features,).
+
+    The layer supports optional scaling of the output, which can be specified as
+    a fixed value or computed from the fan-in or fan-out dimensions.
 
     Attributes:
         in_features: Number of input features.
@@ -83,6 +95,36 @@ class ParallelLinear(nn.Module):
         precision: JAX precision for the dot product. Default is None.
         kernel_init: Initializer for the kernel weights.
         bias_init: Initializer for the bias.
+        kernel: Weight matrix parameter of shape (in_features, out_features).
+        bias: Optional bias parameter of shape (out_features,).
+        tp_merged: Number of tensor parallel merged outputs.
+        distributed_matmul: Optional distributed matrix multiplication function.
+        _direction: Parallelism direction ("row", "column", or None).
+
+    Example:
+        >>> from easydel.layers.components.linears import ParallelLinear
+        >>> import jax.numpy as jnp
+        >>> from flax import nnx as nn
+        >>>
+        >>> # Create a basic linear layer
+        >>> layer = ParallelLinear(
+        ...     in_features=768,
+        ...     out_features=3072,
+        ...     rngs=nn.Rngs(0)
+        ... )
+        >>>
+        >>> # Forward pass
+        >>> x = jnp.ones((32, 768))
+        >>> y = layer(x)
+        >>> # y.shape = (32, 3072)
+        >>>
+        >>> # With fan-in scaling (useful for certain architectures)
+        >>> layer_scaled = ParallelLinear(
+        ...     in_features=768,
+        ...     out_features=3072,
+        ...     scale="fan_in",
+        ...     rngs=nn.Rngs(0)
+        ... )
     """
 
     _direction: tp.Literal["row", "column"] | None = None
@@ -101,6 +143,35 @@ class ParallelLinear(nn.Module):
         bias_init: Initializer = default_bias_init,
         rngs: nn.Rngs | None = None,
     ):
+        """Initialize a parallel linear layer.
+
+        Creates a linear transformation layer with configurable parameters
+        and optional output scaling.
+
+        Args:
+            in_features: Size of each input sample.
+            out_features: Size of each output sample. Can also be a sequence
+                of integers for tensor-parallel merged outputs.
+            scale: Output scaling factor. Can be:
+                - A float value for direct scaling
+                - "fan_in" for 1/sqrt(in_features) scaling
+                - "fan_out" for 1/sqrt(out_features) scaling
+                Defaults to 1.0 (no scaling).
+            use_bias: If True, adds a learnable bias to the output.
+                Defaults to True.
+            dtype: Data type for computation. If None, uses input dtype.
+                Defaults to None.
+            param_dtype: Data type for storing parameters. Defaults to float32.
+            precision: JAX precision for matrix multiplication. Can be None,
+                'default', 'high', 'highest', or specific precision tuples.
+                Defaults to None.
+            kernel_init: Initializer function for the weight matrix.
+                Defaults to lecun_normal().
+            bias_init: Initializer function for the bias vector.
+                Defaults to zeros.
+            rngs: Random number generators for initialization. If None,
+                creates a default Rngs with seed 0.
+        """
         rngs_computed: nn.Rngs
         if rngs is None:
             rngs_computed = nn.Rngs(0)
@@ -175,18 +246,21 @@ class ParallelLinear(nn.Module):
         inputs: Shaped[Array, "... in_features"],
         w: Array | None = None,
     ) -> Shaped[Array, "... out_features"]:
-        """Applies the linear transformation with optional tensor parallelism.
+        """Apply the linear transformation using native JAX operations.
+
+        Performs the matrix multiplication y = x @ W + b with proper dtype
+        promotion and optional scaling.
 
         Args:
-            inputs: The input array. Shape: (..., in_features).
-                    For ROW parallelism, the input is expected to be sharded
-                    along the feature dimension (`axis_name`).
+            inputs: The input array of shape (..., in_features). The batch
+                dimensions can be arbitrary.
+            w: Optional weight matrix to use instead of self.kernel. This is
+                useful for weight sharing or external weight injection.
+                Defaults to None (uses self.kernel).
 
         Returns:
-            The transformed output array.
-            Shape: (..., out_features).
-            Output is sharded for COLUMN parallelism if `reduce_scatter_output` is True.
-            Otherwise, output is fully replicated.
+            The transformed output array of shape (..., out_features).
+            If scale is configured, the output is scaled accordingly.
         """
         w_is_none: bool = w is None
         kernel: Array
@@ -249,9 +323,49 @@ class ParallelLinear(nn.Module):
         inputs: Shaped[Array, "... in_features"],
         w: Array | None = None,
     ) -> Shaped[Array, "... out_features"]:
+        """Apply the linear transformation to inputs.
+
+        This is the main entry point for the layer. It delegates to
+        native_forward for the actual computation.
+
+        Args:
+            inputs: The input array of shape (..., in_features).
+            w: Optional weight matrix override. Defaults to None.
+
+        Returns:
+            The transformed output array of shape (..., out_features).
+
+        Example:
+            >>> layer = ParallelLinear(768, 3072, rngs=nn.Rngs(0))
+            >>> x = jnp.ones((32, 768))
+            >>> y = layer(x)  # Shape: (32, 3072)
+        """
         return self.native_forward(inputs=inputs, w=w)
 
     def to_quantized(self, config: QuantizationConfig) -> ColumnParallelLinearQuantized | RowParallelLinearQuantized:
+        """Convert this layer to a quantized version.
+
+        Creates a quantized linear layer with the same configuration but
+        weights stored in a compressed format according to the provided
+        quantization configuration.
+
+        Args:
+            config: Quantization configuration specifying the quantization
+                type (INT8, NF4, etc.) and related parameters.
+
+        Returns:
+            A RowParallelLinearQuantized or ColumnParallelLinearQuantized
+            instance, depending on self._direction.
+
+        Raises:
+            ValueError: If _direction is not "row" or "column".
+
+        Example:
+            >>> from easydel.layers.components.quants import QuantizationConfig, QuantizationType
+            >>> layer = ColumnParallelLinear(768, 3072, rngs=nn.Rngs(0))
+            >>> config = QuantizationConfig(dtype=QuantizationType.INT8)
+            >>> quantized_layer = layer.to_quantized(config)
+        """
         firend = self._quantized_firend
         lazy_module = jax.eval_shape(
             lambda rngs: firend(
@@ -272,6 +386,15 @@ class ParallelLinear(nn.Module):
 
     @property
     def _quantized_firend(self) -> type[RowParallelLinearQuantized] | type[ColumnParallelLinearQuantized]:
+        """Get the corresponding quantized layer class.
+
+        Returns:
+            The quantized layer class matching this layer's parallelism
+            direction (RowParallelLinearQuantized or ColumnParallelLinearQuantized).
+
+        Raises:
+            ValueError: If _direction is not "row" or "column".
+        """
         from ._linear_quantized import ColumnParallelLinearQuantized, RowParallelLinearQuantized
 
         if self._direction == "row":
@@ -283,8 +406,58 @@ class ParallelLinear(nn.Module):
 
 
 class RowParallelLinear(ParallelLinear):
+    """Row-parallel variant of ParallelLinear.
+
+    This class specializes ParallelLinear for row-wise parallelism, where the
+    input dimension is partitioned across devices. In row parallelism, each device
+    holds a subset of input features and computes partial results that are then
+    reduced (summed) across devices.
+
+    Row parallelism is typically used for the second linear layer in a two-layer
+    MLP pattern, where the first layer is column-parallel:
+
+        x -> [Column-Parallel] -> activation -> [Row-Parallel] -> y
+                                                     |
+                                                 all-reduce
+
+    Attributes:
+        _direction: Fixed to "row" to indicate row-wise parallelism.
+
+    Example:
+        >>> layer = RowParallelLinear(
+        ...     in_features=3072,
+        ...     out_features=768,
+        ...     rngs=nn.Rngs(0)
+        ... )
+    """
+
     _direction: tp.Literal["row"] = "row"
 
 
 class ColumnParallelLinear(ParallelLinear):
+    """Column-parallel variant of ParallelLinear.
+
+    This class specializes ParallelLinear for column-wise parallelism, where the
+    output dimension is partitioned across devices. In column parallelism, each
+    device computes a different slice of the output features independently
+    without requiring any communication.
+
+    Column parallelism is typically used for the first linear layer in a two-layer
+    MLP pattern:
+
+        x -> [Column-Parallel] -> activation -> [Row-Parallel] -> y
+                  |
+              no comm needed (outputs are sharded)
+
+    Attributes:
+        _direction: Fixed to "column" to indicate column-wise parallelism.
+
+    Example:
+        >>> layer = ColumnParallelLinear(
+        ...     in_features=768,
+        ...     out_features=3072,
+        ...     rngs=nn.Rngs(0)
+        ... )
+    """
+
     _direction: tp.Literal["column"] = "column"

@@ -38,7 +38,7 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, ArrayParam
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.base_modules import BaseImageClassificationModule
-from easydel.layers.components import ColumnParallelLinear
+from easydel.layers.components import ColumnParallelLinear, Embed
 
 from .clip_configuration import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
 

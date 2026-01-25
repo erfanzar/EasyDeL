@@ -11,3 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Quantized linear layers for Mixture-of-Experts models.
+
+This module provides placeholder implementations for quantized MoE linear layers.
+These layers combine the memory efficiency of quantization with the computational
+benefits of Mixture-of-Experts architectures.
+
+Note:
+    This module is currently a placeholder. Full implementations of quantized
+    MoE linear layers are planned for future releases. For non-quantized MoE
+    layers, see the _linear_moe module.
+
+See Also:
+    _linear_moe: Non-quantized MoE linear layers
+    _linear_quantized: Quantized dense linear layers
+"""

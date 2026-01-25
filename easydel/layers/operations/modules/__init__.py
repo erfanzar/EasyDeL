@@ -12,6 +12,63 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Attention and sequence modeling operation implementations.
+
+This subpackage contains the concrete implementations of various attention
+mechanisms and sequence modeling operations used in EasyDeL. Each implementation
+is registered with the OperationRegistry and can be instantiated by name.
+
+Attention Operations:
+    BlockSparseAttn: Splash Attention for TPU using Pallas kernels.
+        Optimized block-sparse attention for sequences divisible by 128.
+
+    FlashAttn: Flash Attention implementation for GPU and TPU.
+        Memory-efficient attention with O(N) memory complexity.
+
+    RingAttn: Ring Attention for sequence parallelism.
+        Distributes attention computation across multiple devices.
+
+    ScaledDotProductAttn: Standard SDPA using JAX primitives.
+        Leverages jax.nn.dot_product_attention with automatic backend selection.
+
+    VanillaAttn: Reference attention implementation.
+        Standard scaled dot-product attention with optional weights.
+
+    AutoRegressiveDecodeAttn: Optimized single-token decoding attention.
+        Specialized for autoregressive generation with KV-cache.
+
+    UnifiedAttn: Unified attention for continuous batching.
+        Combines prefill and decode in a single kernel for vLLM-style serving.
+
+    RaggedPageAttnV2, RaggedPageAttnV3: Paged attention variants.
+        Memory-efficient attention with page-based KV-cache management.
+
+State Space Model Operations:
+    SSM1Op: Mamba/S4 style selective state space layer.
+        Linear-time sequence modeling with selective gating.
+
+    SSM2Op: Mamba-2 style state space layer with SSD kernel.
+        Improved state space model with structured state decay.
+
+    GatedDeltaRuleOp: Gated Delta Rule linear attention.
+        Recurrent linear attention for hybrid transformer architectures.
+
+    KernelDeltaAttnOp: Kernel Delta Attention (KDA).
+        Linear attention variant used in Kimi Linear models.
+
+Example:
+    >>> from easydel.layers.operations import OperationRegistry, OperationMetadata
+    >>> from easydel.layers.operations.modules import FlashAttn, VanillaAttn
+    >>>
+    >>> # Create attention by name through registry
+    >>> metadata = OperationMetadata(runtime_dtype=jnp.float16)
+    >>> attn = OperationRegistry.create("flash", metadata)
+    >>>
+    >>> # Or instantiate directly
+    >>> flash_attn = FlashAttn(metadata)
+    >>> vanilla_attn = VanillaAttn(metadata)
+"""
+
 from .blocksparse_attention import BlockSparseAttn
 from .decode_attention import AutoRegressiveDecodeAttn
 from .flash_attention import FlashAttn

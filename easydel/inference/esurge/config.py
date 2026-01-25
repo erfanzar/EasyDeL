@@ -12,6 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration classes for the eSurge inference engine.
+
+This module provides configuration dataclasses for controlling the behavior
+of the eSurge engine's scheduler, KV cache, and speculative decoding.
+
+Classes:
+    SchedulerConfig: Configuration for request scheduling and batching.
+    CacheConfig: Configuration for KV cache memory management.
+    SpeculativeConfig: Configuration for speculative decoding (Eagle).
+    Config: Unified configuration combining all subsystems.
+
+Constants:
+    LONG_PREFILL_TRS: Default threshold for long prefill detection (2048 tokens).
+
+Example:
+    >>> from easydel.inference.esurge.config import (
+    ...     Config,
+    ...     SchedulerConfig,
+    ...     CacheConfig
+    ... )
+    >>>
+    >>> # Create scheduler config
+    >>> scheduler_config = SchedulerConfig(
+    ...     max_num_seqs=16,
+    ...     max_num_batched_tokens=2048,
+    ...     max_model_len=8192,
+    ...     policy="fcfs"
+    ... )
+    >>>
+    >>> # Create cache config
+    >>> cache_config = CacheConfig(
+    ...     num_pages=1000,
+    ...     page_size=128,
+    ...     enable_prefix_caching=True
+    ... )
+    >>>
+    >>> # Combine into unified config
+    >>> config = Config(
+    ...     scheduler_config=scheduler_config,
+    ...     cache_config=cache_config
+    ... )
+"""
+
 from dataclasses import dataclass
 from typing import Literal
 
@@ -22,23 +65,43 @@ LONG_PREFILL_TRS: int = 2048
 class SchedulerConfig:
     """Configuration for the request scheduler.
 
-    Controls how requests are scheduled and batched for processing.
+    Controls how requests are scheduled and batched for processing,
+    including capacity limits, scheduling policy, and advanced features
+    like chunked prefill and async scheduling.
 
     Attributes:
         max_num_seqs: Maximum number of sequences running simultaneously.
+            This limits the batch size in terms of requests.
         max_num_batched_tokens: Maximum tokens processed in a single batch.
+            This limits the total compute per forward pass.
         max_model_len: Maximum input length the model can handle.
-        policy: Scheduling policy ('fcfs' for first-come-first-served, 'priority' for priority-based).
-        long_prefill_token_threshold: Token count threshold for identifying long prefill requests.
-        chunked_prefill_enabled: Enable chunked processing of long prefill requests.
+            Requests exceeding this will be rejected or truncated.
+        policy: Scheduling policy ('fcfs' for first-come-first-served,
+            'priority' for priority-based). Defaults to 'fcfs'.
+        long_prefill_token_threshold: Token count threshold for identifying
+            long prefill requests. Requests above this threshold may be
+            chunked. Defaults to max_num_batched_tokens.
+        chunked_prefill_enabled: Enable chunked processing of long prefill
+            requests to prevent head-of-line blocking.
+        token_safety_margin: Reserved tokens per running request to prevent
+            over-allocation and OOM errors. Defaults to None.
+        max_num_seq_buckets: Optional explicit request-capacity buckets for
+            compilation (e.g., (8, 16, 32, 64)). Helps reduce JIT recompilation.
+        async_scheduling: Enable async token sampling to overlap with next
+            forward pass, providing 30-40% latency reduction.
 
     Example:
         >>> config = SchedulerConfig(
         ...     max_num_seqs=16,
         ...     max_num_batched_tokens=2048,
         ...     max_model_len=8192,
-        ...     policy="priority"
+        ...     policy="priority",
+        ...     chunked_prefill_enabled=True
         ... )
+
+    Raises:
+        ValueError: If configuration parameters are invalid (negative values,
+            incompatible settings, etc.).
     """
 
     max_num_seqs: int
@@ -69,7 +132,11 @@ class SchedulerConfig:
     """Enable async token sampling to overlap with next forward pass (30-40% latency reduction)."""
 
     def __post_init__(self):
-        """Validate configuration parameters."""
+        """Validate configuration parameters.
+
+        Raises:
+            ValueError: If any configuration parameter is invalid.
+        """
         if self.max_num_seqs <= 0:
             raise ValueError(f"max_num_seqs must be positive, got {self.max_num_seqs}")
 
@@ -109,22 +176,31 @@ class CacheConfig:
     """Configuration for the KV (key-value) cache.
 
     Manages memory allocation and caching strategies for attention mechanisms.
+    The cache uses page-based allocation for efficient memory management and
+    optional prefix caching for sharing common prefixes between sequences.
 
     Attributes:
-        num_pages: Number of GPU pages allocated for cache (None for automatic).
-        page_size: Size of each cache page in tokens.
+        num_pages: Number of GPU pages allocated for cache. Set to None for
+            automatic calculation based on available memory.
+        page_size: Size of each cache page in tokens. Recommended >=256 for
+            GPUs to ensure efficient memory access patterns.
         enable_prefix_caching: Enable caching of common prefixes across requests.
+            This can significantly improve throughput for similar prompts.
 
     Example:
         >>> config = CacheConfig(
         ...     num_pages=1000,
-        ...     page_size=16,
+        ...     page_size=128,
         ...     enable_prefix_caching=True
         ... )
 
     Note:
         Page-based allocation allows efficient memory management and
-        sharing of cache blocks between sequences.
+        sharing of cache blocks between sequences. Larger page sizes
+        reduce metadata overhead but may waste memory for short sequences.
+
+    Raises:
+        ValueError: If page_size is not positive or num_pages is invalid.
     """
 
     num_pages: int | None
@@ -137,7 +213,11 @@ class CacheConfig:
     """A flag to enable or disable prefix caching."""
 
     def __post_init__(self):
-        """Validate configuration parameters."""
+        """Validate configuration parameters.
+
+        Raises:
+            ValueError: If any configuration parameter is invalid.
+        """
         if self.page_size <= 0:
             raise ValueError(f"page_size must be positive, got {self.page_size}")
 
@@ -149,16 +229,42 @@ class CacheConfig:
 class SpeculativeConfig:
     """Configuration for speculative decoding.
 
+    Speculative decoding uses a smaller draft model to predict multiple
+    tokens ahead, which are then verified by the main model in parallel.
+    This can significantly improve throughput for autoregressive generation.
+
     Attributes:
-        num_speculative_tokens: Number of speculative tokens to generate.
-        speculative_model: Path to the speculative model (e.g., Eagle model).
+        num_speculative_tokens: Number of speculative tokens to generate
+            per verification step. Higher values may improve throughput
+            but reduce acceptance rate. Defaults to 0 (disabled).
+        speculative_model: Path to the speculative draft model (e.g., an
+            Eagle model trained for the base model). Required when
+            num_speculative_tokens > 0.
+
+    Example:
+        >>> config = SpeculativeConfig(
+        ...     num_speculative_tokens=5,
+        ...     speculative_model="path/to/eagle-model"
+        ... )
+
+    Note:
+        Currently supports Eagle-style speculative decoding. The draft
+        model must be compatible with the base model's vocabulary.
     """
 
     num_speculative_tokens: int = 0
+    """Number of speculative tokens to generate per step."""
+
     speculative_model: str | None = None
+    """Path to the speculative/draft model."""
 
     def use_eagle(self) -> bool:
-        """Check if Eagle speculative decoding is enabled."""
+        """Check if Eagle speculative decoding is enabled.
+
+        Returns:
+            True if both num_speculative_tokens > 0 and a speculative_model
+            is specified, False otherwise.
+        """
         return self.num_speculative_tokens > 0 and self.speculative_model is not None
 
 
@@ -166,18 +272,35 @@ class SpeculativeConfig:
 class Config:
     """Unified configuration for the eSurge engine.
 
-    Combines scheduler and cache configurations into a single object.
+    Combines scheduler, cache, and speculative decoding configurations
+    into a single object for easy management and passing to the engine.
 
     Attributes:
-        scheduler_config: Configuration for request scheduling.
-        cache_config: Configuration for KV cache management.
-        speculative_config: Configuration for speculative decoding.
+        scheduler_config: Configuration for request scheduling and batching.
+        cache_config: Configuration for KV cache memory management.
+        speculative_config: Optional configuration for speculative decoding.
+            Defaults to None (no speculative decoding).
 
     Example:
+        >>> from easydel.inference.esurge.config import (
+        ...     Config, SchedulerConfig, CacheConfig, SpeculativeConfig
+        ... )
+        >>>
         >>> config = Config(
-        ...     scheduler_config=SchedulerConfig(...),
-        ...     cache_config=CacheConfig(...),
-        ...     speculative_config=SpeculativeConfig(num_speculative_tokens=5)
+        ...     scheduler_config=SchedulerConfig(
+        ...         max_num_seqs=16,
+        ...         max_num_batched_tokens=2048,
+        ...         max_model_len=8192
+        ...     ),
+        ...     cache_config=CacheConfig(
+        ...         num_pages=1000,
+        ...         page_size=128,
+        ...         enable_prefix_caching=True
+        ...     ),
+        ...     speculative_config=SpeculativeConfig(
+        ...         num_speculative_tokens=5,
+        ...         speculative_model="eagle-model"
+        ...     )
         ... )
     """
 

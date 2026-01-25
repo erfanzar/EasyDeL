@@ -50,6 +50,7 @@ from easydel.layers.components import (
     BaseMoeModule,
     ColumnParallelLinear,
     ColumnParallelMoELinear,
+    Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
     RMSNorm,

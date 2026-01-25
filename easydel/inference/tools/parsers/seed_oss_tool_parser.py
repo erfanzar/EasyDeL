@@ -11,6 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Tool parser implementation for Seed OSS models.
+
+This module provides a tool parser specifically designed for Seed OSS model outputs.
+Seed OSS uses an XML-style format with seed: namespace prefixes for tool calls,
+similar to Qwen3Coder but with different tag names.
+
+The parser supports thinking tags for chain-of-thought reasoning and handles
+type-aware parameter conversion based on tool definitions.
+
+Example format:
+    <seed:think>reasoning content</seed:think>
+    <seed:tool_call>
+    <function=function_name>
+    <parameter=param_name>value</parameter>
+    </function>
+    </seed:tool_call>
+"""
+
 from __future__ import annotations
 
 import ast
@@ -40,36 +59,71 @@ logger = get_logger(__name__)
 
 @ToolParserManager.register_module("seed_oss")
 class SeedOssToolParser(ToolParser):
-    """
-    Tool parser for Seed OSS models.
+    """Tool parser for Seed OSS model outputs.
 
-    Handles XML-style tool calls with seed-specific prefixes and
-    thinking tag support. Similar to Qwen3Coder but with seed:
-    namespace prefixes.
+    This parser handles the extraction of function/tool calls from Seed OSS model
+    outputs. Seed OSS uses an XML-style format with seed: namespace prefixes,
+    supporting thinking sections and type-aware parameter conversion.
 
-    Features:
-    - XML parsing with <seed:tool_call> wrapper
-    - Thinking tag support (<seed:think>...</seed:think>)
-    - Function and parameter XML tags
-    - Type-aware parameter conversion
-    - Streaming with state management
+    The parser handles several XML structures:
+    - <seed:think>...</seed:think> for reasoning content
+    - <seed:tool_call>...</seed:tool_call> wrapper for tool calls
+    - <function=name>...</function> for function definitions
+    - <parameter=name>value</parameter> for parameters
 
-    Format:
-    <seed:think>...reasoning...</seed:think>
-    <seed:tool_call>
-    <function=name>
-    <parameter=param>value</parameter>
-    </function>
-    </seed:tool_call>
+    Attributes:
+        TOOL_CALL_START: Class constant for tool call start tag.
+        TOOL_CALL_END: Class constant for tool call end tag.
+        prev_tool_call_arr: List of previously parsed tool call dictionaries.
+        tool_call_start_token: Token marking start of tool call.
+        tool_call_end_token: Token marking end of tool call.
+        tool_call_prefix: Prefix for function declarations.
+        function_end_token: Token marking end of function.
+        parameter_prefix: Prefix for parameter declarations.
+        parameter_end_token: Token marking end of parameter.
+        think_start_token: Token marking start of thinking section.
+        think_end_token: Token marking end of thinking section.
+        is_tool_call_started: Flag indicating tool call parsing has started.
+        is_thinking_end: Flag indicating thinking section has ended.
+        failed_count: Counter for parsing failures.
+        tool_call_start_token_id: Token ID for tool call start.
+        tool_call_end_token_id: Token ID for tool call end.
+        think_end_token_id: Token ID for think end.
+        tool_call_complete_regex: Regex for complete tool calls.
+        tool_call_regex: Regex for partial/complete tool calls.
+        tool_call_function_regex: Regex for function extraction.
+        tool_call_parameter_regex: Regex for parameter extraction.
 
-    Filters tool calls from thinking sections and maintains
-    streaming state for progressive parameter emission.
+    Raises:
+        RuntimeError: If the tokenizer doesn't contain required tool call tokens.
+
+    Example:
+        >>> parser = SeedOssToolParser(tokenizer)
+        >>> result = parser.extract_tool_calls(model_output, request)
+        >>> if result.tools_called:
+        ...     for tool_call in result.tool_calls:
+        ...         print(f"Function: {tool_call.function.name}")
     """
 
     TOOL_CALL_START = "<seed:tool_call>"
     TOOL_CALL_END = "</seed:tool_call>"
 
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize the Seed OSS tool parser.
+
+        Sets up token mappings, regex patterns, and streaming state for parsing
+        Seed OSS format tool calls. Validates that required tokens exist in the
+        tokenizer vocabulary.
+
+        Args:
+            tokenizer: A HuggingFace tokenizer instance used for token processing.
+                This tokenizer should be compatible with the Seed OSS model and
+                must contain <seed:tool_call> and </seed:tool_call> tokens.
+
+        Raises:
+            RuntimeError: If the tokenizer doesn't contain the required
+                <seed:tool_call> or </seed:tool_call> tokens.
+        """
         super().__init__(tokenizer)
 
         self._reset_streaming_state()
@@ -105,11 +159,22 @@ class SeedOssToolParser(ToolParser):
         self.tool_call_parameter_regex = re.compile(r"<parameter=(.*?)</parameter>|<parameter=(.*?)$", re.DOTALL)
 
     def _generate_tool_call_id(self) -> str:
-        """Generate a unique tool call ID."""
+        """Generate a unique tool call ID.
+
+        Creates a unique identifier for a tool call using UUID4, truncated
+        to 24 characters for compatibility.
+
+        Returns:
+            str: A unique tool call ID in the format "call_<24-char-hex>".
+        """
         return f"call_{uuid.uuid4().hex[:24]}"
 
     def _reset_streaming_state(self):
-        """Reset all streaming state."""
+        """Reset all streaming state variables.
+
+        Clears all state variables used during streaming extraction to prepare
+        for a new streaming session or after completing a tool call.
+        """
         self.current_tool_index = 0
         self.is_tool_call_started = False
         self.header_sent = False
@@ -129,7 +194,40 @@ class SeedOssToolParser(ToolParser):
         function_call_str: str,
         tools: list[ToolDefinition] | None,
     ) -> ToolCall | None:
+        """Parse an XML-formatted function call string into a ToolCall object.
+
+        Extracts the function name and parameters from the XML format, performing
+        type conversion based on the tool definitions when available.
+
+        Args:
+            function_call_str: The XML string containing the function call,
+                starting after "<function=" and including the function name
+                and parameter tags.
+            tools: Optional list of tool definitions for type-aware parameter
+                conversion. If provided, parameters will be converted to their
+                declared types (int, float, bool, object, etc.).
+
+        Returns:
+            ToolCall or None: A ToolCall object with the parsed function name
+                and JSON-encoded arguments, or None if parsing fails.
+
+        Note:
+            Parameter type conversion supports:
+            - string/str/text/varchar/char/enum: kept as string
+            - int/uint/long/short/unsigned: converted to integer
+            - num/float: converted to float (or int if whole number)
+            - boolean/bool/binary: converted to bool (true/false)
+            - object/dict: parsed as JSON, falls back to ast.literal_eval
+        """
         def get_arguments_config(func_name: str) -> dict:
+            """Get parameter configuration for a function from tool definitions.
+
+            Args:
+                func_name: The name of the function to look up.
+
+            Returns:
+                dict: Parameter properties from the tool definition, or empty dict.
+            """
             if tools is None:
                 return {}
             for config in tools:
@@ -149,6 +247,17 @@ class SeedOssToolParser(ToolParser):
             return {}
 
         def convert_param_value(param_value: str, param_name: str, param_config: dict, func_name: str) -> Any:
+            """Convert a parameter value to its declared type.
+
+            Args:
+                param_value: The raw string value of the parameter.
+                param_name: The name of the parameter.
+                param_config: The parameter configuration from tool definitions.
+                func_name: The function name (for logging).
+
+            Returns:
+                The converted parameter value in the appropriate type.
+            """
             if param_value.lower() == "null":
                 return None
 
@@ -258,6 +367,18 @@ class SeedOssToolParser(ToolParser):
         )
 
     def _get_function_calls(self, model_output: str) -> list[str]:
+        """Extract raw function call strings from model output.
+
+        Parses the model output to find all function declarations within
+        tool call tags.
+
+        Args:
+            model_output: The model output containing tool calls.
+
+        Returns:
+            list[str]: List of raw function call strings, each starting
+                after "<function=" and containing the function content.
+        """
         matched_ranges = self.tool_call_regex.findall(model_output)
         raw_tool_calls = [match[0] if match[0] else match[1] for match in matched_ranges]
 
@@ -276,6 +397,23 @@ class SeedOssToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
+        """Extract tool calls from a complete model output.
+
+        Parses the model output to find and extract function calls in Seed OSS
+        XML format. Handles thinking sections by preserving them in the content.
+
+        Args:
+            model_output: The complete text output from the model to parse.
+            request: The chat completion request containing tool definitions
+                for type-aware parameter conversion.
+
+        Returns:
+            ExtractedToolCallInformation: An object containing:
+                - tools_called: True if valid tool calls were found, False otherwise.
+                - tool_calls: List of ToolCall objects representing parsed function calls.
+                - content: Thinking content plus any text before tool calls, or the
+                    full output if no valid tool calls were found.
+        """
         if self.tool_call_prefix not in model_output:
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
@@ -329,6 +467,34 @@ class SeedOssToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        """Extract tool calls incrementally during streaming generation.
+
+        Processes tokens as they are generated to progressively extract and emit
+        tool call information. Handles the XML format with nested function and
+        parameter tags, emitting JSON fragments as parameters are parsed.
+
+        Args:
+            previous_text: The accumulated text from all previous tokens.
+            current_text: The complete text including the current delta.
+            delta_text: The new text added in this streaming step.
+            previous_token_ids: Token IDs from all previous generation steps.
+            current_token_ids: All token IDs including the current step.
+            delta_token_ids: The new token IDs added in this step.
+            request: The chat completion request containing tool definitions.
+
+        Returns:
+            DeltaMessage or None: A delta message containing either:
+                - Content text if in thinking section or no tool call detected.
+                - Tool call name when function header is parsed.
+                - JSON argument fragments as parameters are extracted.
+                - None if waiting for more tokens.
+
+        Note:
+            The streaming output builds valid JSON incrementally:
+            1. Emits "{" when entering function body
+            2. Emits '"param_name": "value"' for each parameter
+            3. Emits "}" when function ends
+        """
         if not delta_text:
             if delta_token_ids and self.tool_call_end_token_id not in delta_token_ids:
                 complete_calls = len(self.tool_call_complete_regex.findall(current_text))

@@ -141,7 +141,31 @@ class UpdateApiKeyRequest(BaseModel):
 
 
 class ApiKeyResponse(BaseModel):
-    """Response model for API key operations."""
+    """Response model for API key operations.
+
+    This model standardizes the structure of API key information returned
+    from admin endpoints. It includes both identification metadata and
+    usage statistics while omitting sensitive configuration details.
+
+    The `key` field is only populated during key creation or rotation
+    operations. In all other contexts, only the `key_prefix` is available
+    for identification purposes.
+
+    Attributes:
+        key: Raw API key secret (only returned on creation/rotation).
+        key_id: Unique identifier for the key record.
+        key_prefix: First few characters of the key for display purposes.
+        name: Human-readable name assigned to the key.
+        description: Optional description of the key's purpose.
+        role: Access control role (admin, user, service).
+        status: Current key status (active, suspended, revoked, expired).
+        created_at: Unix timestamp when the key was created.
+        expires_at: Unix timestamp when the key expires, or None if no expiration.
+        last_used_at: Unix timestamp of the last request using this key.
+        total_requests: Cumulative count of requests made with this key.
+        total_tokens: Cumulative count of tokens processed with this key.
+        message: Optional status message about the operation.
+    """
 
     key: str | None = Field(None, description="Raw API key (only returned on creation)")
     key_id: str

@@ -98,33 +98,89 @@ if tp.TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+# Model weight file name constants for different frameworks.
+# These are used when loading/saving models in various formats.
 FLAX_WEIGHTS_NAME = "easydel-model.parameters"
-WEIGHTS_NAME = "pytorch_model.bin"
-WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
-TF2_WEIGHTS_NAME = "tf_model.h5"
-TF2_WEIGHTS_INDEX_NAME = "tf_model.h5.index.json"
-TF_WEIGHTS_NAME = "model.ckpt"
-FLAX_WEIGHTS_INDEX_NAME = "flax_model.msgpack.index.json"
-SAFE_WEIGHTS_NAME = "model.safetensors"
-SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
-FEATURE_EXTRACTOR_NAME = "preprocessor_config.json"
-IMAGE_PROCESSOR_NAME = FEATURE_EXTRACTOR_NAME
-PROCESSOR_NAME = "processor_config.json"
-CHAT_TEMPLATE_NAME = "chat_template.json"
-GENERATION_CONFIG_NAME = "generation_config.json"
-MODEL_CARD_NAME = "modelcard.json"
+"""Default filename for EasyDeL/Flax model parameters."""
 
+WEIGHTS_NAME = "pytorch_model.bin"
+"""Default filename for PyTorch model weights."""
+
+WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
+"""Index file for sharded PyTorch model weights."""
+
+TF2_WEIGHTS_NAME = "tf_model.h5"
+"""Default filename for TensorFlow 2 model weights."""
+
+TF2_WEIGHTS_INDEX_NAME = "tf_model.h5.index.json"
+"""Index file for sharded TensorFlow 2 model weights."""
+
+TF_WEIGHTS_NAME = "model.ckpt"
+"""Default filename for TensorFlow 1 model checkpoints."""
+
+FLAX_WEIGHTS_INDEX_NAME = "flax_model.msgpack.index.json"
+"""Index file for sharded Flax model weights."""
+
+SAFE_WEIGHTS_NAME = "model.safetensors"
+"""Default filename for SafeTensors format model weights."""
+
+SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
+"""Index file for sharded SafeTensors format model weights."""
+
+FEATURE_EXTRACTOR_NAME = "preprocessor_config.json"
+"""Configuration file for feature extractors/preprocessors."""
+
+IMAGE_PROCESSOR_NAME = FEATURE_EXTRACTOR_NAME
+"""Alias for feature extractor config (image processors use same file)."""
+
+PROCESSOR_NAME = "processor_config.json"
+"""Configuration file for multi-modal processors."""
+
+CHAT_TEMPLATE_NAME = "chat_template.json"
+"""Configuration file for chat templates."""
+
+GENERATION_CONFIG_NAME = "generation_config.json"
+"""Configuration file for generation parameters."""
+
+MODEL_CARD_NAME = "modelcard.json"
+"""Model card metadata file."""
+
+# Default block sizes for Pallas matmul kernels.
+# These control the tiling strategy for custom GPU/TPU kernels.
 DEFAULT_PALLAS_M_BLOCK_SIZE = 128
+"""Default M dimension block size for Pallas matmul kernels."""
+
 DEFAULT_PALLAS_K_BLOCK_SIZE = 128
+"""Default K dimension block size for Pallas matmul kernels."""
+
 DEFAULT_PALLAS_N_BLOCK_SIZE = 128
+"""Default N dimension block size for Pallas matmul kernels."""
+
+# Default configuration values for hardware and MoE settings.
 DEFAULT_HARDWARE_ABSTRACTION = False
+"""Whether hardware abstraction is enabled by default."""
+
 DEFAULT_MOE_METHOD = "fused_moe"
+"""Default Mixture of Experts implementation method."""
+
 EXPERT_TP_MODE = False
+"""Whether to treat experts as tensor-parallel by default."""
+
 FSDP_IS_EP_BOUND = True
+"""Whether FSDP axis is folded into expert-parallel axis by default."""
+
 SP_IS_EP_BOUND = True
+"""Whether sequence-parallel axis is folded into expert-parallel axis by default."""
+
 RING_EXPERTS = False
+"""Whether to use ring topology for expert dispatch by default."""
+
+# Environment variable flags for runtime configuration.
 ED_DEFAULT_HARDWARE_ABSTRACTION = check_bool_flag("ED_DEFAULT_HARDWARE_ABSTRACTION", default=False)
+"""Hardware abstraction override from ED_DEFAULT_HARDWARE_ABSTRACTION environment variable."""
+
 EKERNEL_OPS = check_bool_flag("EKERNEL_OPS", default=False)
+"""Flag indicating whether EKernel operations are enabled via EKERNEL_OPS environment variable."""
 
 
 if ED_DEFAULT_HARDWARE_ABSTRACTION:
@@ -428,9 +484,20 @@ class EasyDeLBaseConfig(PretrainedConfig):
         UserWarning: If KV-cache quantization is requested together with sharded KV caching.
     """
 
+    # Whether to show EasyDeL-specific attributes in repr output.
+    # Set to True for debugging to see all configuration values.
     _show_private_attrs: bool = False
+
+    # Cached JAX device mesh with automatic axis types.
+    # Set via set_model_mesh() or lazily created on first access to `mesh` property.
     _hidden_mesh: common_types.Mesh | None = None
+
+    # Cached JAX device mesh with explicit axis types.
+    # Set via set_explicit_mesh() or lazily created on first access to `explicit_mesh` property.
     _hidden_explicit_mesh: common_types.Mesh | None = None
+
+    # Cached JAX device mesh with manual axis types.
+    # Set via set_manual_mesh() or lazily created on first access to `manual_mesh` property.
     _hidden_manual_mesh: common_types.Mesh | None = None
 
     def __init__(
@@ -483,7 +550,15 @@ class EasyDeLBaseConfig(PretrainedConfig):
         operation_configs: dict[str, BaseOperationConfig] | None = None,
         **kwargs,
     ):
-        """Initialize base EasyDeL config fields and honor user overrides."""
+        """Initialize base EasyDeL config fields and honor user overrides.
+
+        This constructor initializes all EasyDeL-specific configuration attributes
+        while preserving any values already set (e.g., by subclass constructors).
+        It uses `getattr` patterns to allow subclasses to set attributes before
+        calling `super().__init__()`.
+
+        See class docstring for detailed parameter descriptions.
+        """
         self.sharding_axis_dims = getattr(self, "sharding_axis_dims", sharding_axis_dims)
         self.sharding_dcn_axis_dims = getattr(self, "sharding_dcn_axis_dims", sharding_dcn_axis_dims)
         self.sharding_axis_names = getattr(self, "sharding_axis_names", sharding_axis_names)
@@ -646,7 +721,19 @@ class EasyDeLBaseConfig(PretrainedConfig):
             tp.Sequence[AxisType | str] | AxisType | str | None | tp.Literal["auto", "explicit", "manual"]
         ) = None,
     ) -> common_types.Mesh:
-        """Create a JAX mesh using the config sharding settings."""
+        """Create a JAX mesh using the config sharding settings.
+
+        Internal helper that normalizes sharding axis dimensions and names from
+        various input formats (dict or sequence) and delegates to `create_mesh`.
+
+        Args:
+            axis_types: Optional axis type(s) for mesh axes. Accepts `AxisType` values
+                or "auto", "explicit", "manual" strings. A single value applies to all
+                axes; a sequence must match `sharding_axis_names`. Default: None (auto).
+
+        Returns:
+            JAX Mesh object configured with the normalized sharding parameters.
+        """
         sharding_axis_dims = (
             [v for k, v in self.sharding_axis_dims.items()]
             if isinstance(self.sharding_axis_dims, dict)
@@ -1212,7 +1299,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 for key_, value_ in kwargs.items():
                     setattr(getattr(self, name), key_, value_)
 
-    # Attributes to hide from __repr__ and __str__ output
+    # Attributes to hide from __repr__ and __str__ output.
+    # These include EasyDeL-specific configuration attributes that are numerous
+    # and would clutter the representation, as well as HuggingFace PretrainedConfig
+    # defaults that are typically not modified by users.
     _hidden_repr_attrs: tp.ClassVar[set[str]] = {
         # EasyDeL-specific attributes
         "sharding_axis_dims",
@@ -1322,9 +1412,30 @@ class EasyDeLBaseConfig(PretrainedConfig):
     def __repr__(self):
         """Return a multi-line summary of public config fields.
 
-        The output lists non-private attributes on separate lines and truncates
-        long values to keep the representation readable. EasyDeL-specific internal
-        attributes are hidden unless `_show_private_attrs` is True.
+        Generates a human-readable representation of the configuration object,
+        displaying each attribute on its own line with proper formatting.
+
+        The output:
+        - Excludes private attributes (those starting with '_')
+        - Hides EasyDeL internal attributes unless `_show_private_attrs` is True
+        - Truncates attribute values longer than 1500 characters
+        - Replaces newlines in values with indented newlines for readability
+
+        Returns:
+            str: Multi-line string representation in the format:
+                ClassName(
+                    attr1 : value1
+                    attr2 : value2
+                    ...
+                )
+
+        Example:
+            >>> config = EasyDeLBaseConfig(hidden_size=768)
+            >>> print(repr(config))
+            EasyDeLBaseConfig(
+                hidden_size : 768
+                ...
+            )
         """
 
         string = f"{self.__class__.__name__}(\n"
@@ -1341,13 +1452,24 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return string + ")"
 
     def to_diff_dict(self) -> dict[str, Any]:
-        """
-        Removes all attributes from the configuration that correspond to the default config attributes for
-        better readability, while always retaining the `config` attribute from the class. Serializes to a
-        Python dictionary.
+        """Serialize config to a minimal dictionary with only non-default values.
+
+        Removes all attributes from the configuration that correspond to the default
+        config attributes for better readability, while always retaining the `config`
+        attribute from the class. Useful for saving compact configuration files that
+        only contain customized settings.
+
+        The method compares against both `PretrainedConfig` defaults and the
+        class-specific defaults to determine which values to include.
 
         Returns:
-            dict[str, Any]: Dictionary of all the attributes that make up this configuration instance.
+            dict[str, Any]: Dictionary containing only non-default configuration
+                attributes, plus essential metadata like `model_type` for nested configs.
+
+        Example:
+            >>> config = MyConfig(hidden_size=1024)  # non-default
+            >>> diff = config.to_diff_dict()
+            >>> # Only contains hidden_size=1024 and other non-defaults
         """
         config_dict = self.to_dict()
         default_config_dict = PretrainedConfig().to_dict()
@@ -1386,10 +1508,24 @@ class EasyDeLBaseConfig(PretrainedConfig):
     def to_dict(self) -> dict[str, tp.Any]:
         """Serialize config to a dictionary while temporarily hiding forbidden types.
 
-        Notes:
-            EasyDeL caches the active JAX mesh on the config (``_hidden_mesh``) for runtime use.
-            That object contains non-picklable JAX devices, so we must exclude it from any deep
-            copies performed during serialization.
+        Converts all configuration attributes to a Python dictionary suitable for
+        JSON serialization. Handles special cases like nested PretrainedConfig objects,
+        JAX mesh objects (which cannot be deep-copied), and dtype representations.
+
+        Returns:
+            dict[str, Any]: Complete dictionary representation of the configuration,
+                including model_type and transformers_version metadata.
+
+        Note:
+            EasyDeL caches the active JAX mesh on the config (``_hidden_mesh``) for
+            runtime use. That object contains non-picklable JAX devices, so we must
+            exclude it from any deep copies performed during serialization. The mesh
+            is temporarily removed and restored after serialization.
+
+        Example:
+            >>> config = MyConfig(hidden_size=1024)
+            >>> config_dict = config.to_dict()
+            >>> # config_dict can be saved to JSON or used to recreate config
         """
         sd = self.__dict__
         forbidden_types = {"_ScalarMeta"}
@@ -1425,7 +1561,21 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 sd[key] = value
 
     def __deepcopy__(self, memo):
-        """Deep copy the config while keeping the cached runtime mesh by reference."""
+        """Deep copy the config while keeping the cached runtime mesh by reference.
+
+        Creates a deep copy of all configuration attributes except for the cached
+        JAX mesh objects (`_hidden_mesh`, `_hidden_explicit_mesh`, `_hidden_manual_mesh`),
+        which are copied by reference since they contain device handles that cannot
+        be safely deep-copied.
+
+        Args:
+            memo: Memoization dictionary used by copy.deepcopy to track already-copied
+                objects and avoid infinite recursion.
+
+        Returns:
+            New EasyDeLBaseConfig instance with deep-copied attributes and
+            shared mesh references.
+        """
         cls = self.__class__
         result = cls.__new__(cls)
         memo[id(self)] = result
@@ -1439,16 +1589,38 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return result
 
     def attach_custom_arguments(self, **kwargs):
-        """Attaches custom arguments as attributes to the configuration.
+        """Attach custom arguments as attributes to the configuration.
+
+        Convenience method for adding arbitrary attributes to the configuration
+        at runtime. Useful for passing model-specific or experiment-specific
+        parameters that aren't part of the standard configuration schema.
 
         Args:
             **kwargs: Arbitrary key-value pairs to attach as attributes.
+                Each key becomes an attribute name and its value is set
+                using `set_attrs_smartly` for proper handling.
+
+        Example:
+            >>> config = EasyDeLBaseConfig()
+            >>> config.attach_custom_arguments(
+            ...     custom_dropout=0.1,
+            ...     experiment_name="test_run"
+            ... )
+            >>> config.custom_dropout
+            0.1
         """
         for k, v in kwargs.items():
             set_attrs_smartly(self, k, v, v)
 
     def __str__(self):
-        """Alias for `__repr__` to provide a readable config summary."""
+        """Return a string representation of the configuration.
+
+        Provides the same output as `__repr__`, displaying a multi-line
+        summary of non-private configuration attributes.
+
+        Returns:
+            str: Human-readable configuration summary.
+        """
         return self.__repr__()
 
     @classmethod  # From HF.
@@ -1624,13 +1796,24 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @classmethod
     def _dict_from_json_file(cls, json_file: str | os.PathLike | ePathLike):
-        """Loads a configuration dictionary from a JSON file.
+        """Load a configuration dictionary from a JSON file.
+
+        Internal helper for parsing JSON configuration files. Supports various
+        path types including local paths, cloud storage paths (via ePath),
+        and standard os.PathLike objects.
 
         Args:
-            json_file: Path to the JSON configuration file.
+            json_file (str | os.PathLike | ePathLike): Path to the JSON
+                configuration file to load.
 
         Returns:
-            Dictionary containing the parsed configuration.
+            dict[str, Any]: Dictionary containing the parsed configuration
+                with all JSON fields as Python objects.
+
+        Raises:
+            json.JSONDecodeError: If the file contains invalid JSON.
+            UnicodeDecodeError: If the file encoding is not UTF-8.
+            FileNotFoundError: If the specified file does not exist.
         """
         return json.loads(ePath(json_file).read_text(encoding="utf-8"))
 
@@ -1640,7 +1823,43 @@ class EasyDeLBaseConfig(PretrainedConfig):
         pretrained_model_name_or_path: str | os.PathLike,
         **kwargs,
     ) -> tuple[dict[str, tp.Any], dict[str, tp.Any]]:
-        """Load a configuration dictionary from local path or Hub, handling gguf."""
+        """Load a configuration dictionary from a local path or HuggingFace Hub.
+
+        Internal method that handles multiple loading scenarios:
+        - Local directory containing config.json
+        - Local JSON file path
+        - HuggingFace Hub model ID
+        - Remote URL
+        - GGUF checkpoint files
+
+        The method extracts relevant kwargs for the loading process and returns
+        remaining unused kwargs for downstream processing.
+
+        Args:
+            pretrained_model_name_or_path (str | os.PathLike): Either:
+                - A model ID string for HuggingFace Hub (e.g., "meta-llama/Llama-2-7b")
+                - A local directory path containing config.json
+                - A direct path to a JSON config file
+                - A remote URL to a config file
+            **kwargs: Additional keyword arguments including:
+                - cache_dir: Directory for caching downloaded files
+                - force_download: Force re-download even if cached
+                - proxies: Proxy configuration dictionary
+                - token: HuggingFace authentication token
+                - local_files_only: Only use local files, no downloads
+                - revision: Git revision (branch, tag, or commit)
+                - subfolder: Subfolder within the repo
+                - gguf_file: Path to GGUF file if loading from GGUF format
+
+        Returns:
+            tuple[dict[str, Any], dict[str, Any]]: A tuple of:
+                - Configuration dictionary loaded from the file
+                - Remaining unused kwargs
+
+        Raises:
+            OSError: If the configuration file cannot be found or loaded.
+            json.JSONDecodeError: If the config file is not valid JSON.
+        """
         cache_dir = kwargs.pop("cache_dir", None)
         force_download = kwargs.pop("force_download", False)
         resume_download = kwargs.pop("resume_download", None)
@@ -1731,20 +1950,49 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @property
     def granted_freq_max_position_embedding(self) -> int:
-        """Return the max position embedding allowed for frequency-based caches."""
+        """Return the max position embedding allowed for frequency-based caches.
+
+        This property determines the maximum sequence length for precomputing
+        rotary position embedding frequencies. It allows models to specify a
+        different (potentially larger) value for frequency caches than for
+        attention masks.
+
+        Returns:
+            int: Maximum position embedding length for frequency computations.
+                Falls back to `max_position_embeddings` if `freq_max_position_embeddings`
+                is not set.
+        """
         return getattr(self, "freq_max_position_embeddings", self.max_position_embeddings)
 
     @property
     def granted_mask_max_position_embedding(self) -> int:
-        """Return the max position embedding allowed for mask precomputation."""
+        """Return the max position embedding allowed for mask precomputation.
+
+        This property determines the maximum sequence length for precomputing
+        causal attention masks. It allows models to specify a different
+        (potentially smaller to save memory) value for mask caches.
+
+        Returns:
+            int: Maximum position embedding length for mask computations.
+                Falls back to `max_position_embeddings` if `mask_max_position_embeddings`
+                is not set.
+        """
         return getattr(self, "mask_max_position_embeddings", self.max_position_embeddings)
 
     def _get_rope_config(self) -> RopeConfig:
-        """Build a `RopeConfig` from the config fields.
+        """Build a RopeConfig from the configuration fields.
 
-        If ``rope_scaling`` is provided, it is converted to a `RopeConfig` and
-        missing ``original_max_position_embeddings`` values are filled from the
-        base config. Otherwise a default `RopeConfig` instance is returned.
+        Constructs a rotary position embedding configuration by:
+        1. Loading from `rope_scaling` dict if present, otherwise using defaults
+        2. Filling `original_max_position_embeddings` from config if not in scaling
+        3. Applying any external rope config kwargs set via `_external_rope_config_kwargs`
+
+        This method is used internally by `get_basic_rope`, `get_basic_frequencies`,
+        and `get_basic_inv_frequencies` to ensure consistent RoPE configuration.
+
+        Returns:
+            RopeConfig: Configured RoPE settings including scaling type,
+                factor, and other rope-specific parameters.
         """
         from easydel.layers.components import RopeConfig
 
@@ -1771,15 +2019,31 @@ class EasyDeLBaseConfig(PretrainedConfig):
     ):
         """Return a rotary position embedding function configured for this model.
 
+        Creates a RoPE (Rotary Position Embedding) function that can be applied
+        to query and key tensors during attention computation. The function
+        incorporates all model-specific settings like rope_scaling, partial_rotary_factor,
+        and max_position_embeddings.
+
         Args:
-            dtype: Target dtype for the generated embeddings.
-            head_size: Attention head size used to derive the rotary dimension.
-            rotary_dim: Number of rotary dimensions (defaults to ``head_size``).
-            is_neox_style: Whether to generate NeoX-style rotary embeddings.
-            base: Optional base used for frequency computation (defaults to ``self.rope_theta``).
+            dtype (Array): Target dtype for the generated embeddings (e.g., jnp.bfloat16).
+            head_size (int): Attention head dimension size.
+            rotary_dim (int, optional): Number of dimensions to apply rotary embeddings to.
+                Defaults to `head_size` if not specified.
+            is_neox_style (bool): Whether to use GPT-NeoX style rotary embeddings
+                (interleaved real/imaginary). Defaults to True.
+            base (float, optional): Base frequency for computing position embeddings.
+                Defaults to `self.rope_theta` (typically 10000.0).
 
         Returns:
-            Callable from `get_rope` ready to be applied to query/key tensors.
+            Callable: A function that takes (query, key, positions) and returns
+                rotated (query, key) tensors with position information encoded.
+
+        Example:
+            >>> rope_fn = config.get_basic_rope(
+            ...     dtype=jnp.bfloat16,
+            ...     head_size=64,
+            ... )
+            >>> rotated_q, rotated_k = rope_fn(query, key, positions)
         """
         from easydel.layers.components import get_rope
 
@@ -1804,16 +2068,31 @@ class EasyDeLBaseConfig(PretrainedConfig):
         base: float | None = None,
         partial_rotary_factor: float = 1.0,
     ) -> ModuleCaches:
-        """Compute inverse frequencies for rotary embeddings.
+        """Compute inverse frequencies for rotary position embeddings.
+
+        Generates the inverse frequency tensor used to compute rotary embeddings.
+        The inverse frequencies are: 1 / (base^(2i/d)) for i in [0, d/2).
+        These frequencies are then used with position indices to create the
+        sinusoidal position encodings.
 
         Args:
-            head_size: Attention head size (defaults to ``self.head_dim``).
-            rotary_dim: Number of rotary dimensions (defaults to ``head_size``).
-            base: Optional base for frequency computation (defaults to ``self.rope_theta``).
-            partial_rotary_factor: Ratio of the head dimension to apply RoPE to.
+            head_size (int, optional): Attention head dimension size.
+                Defaults to `self.head_dim` if not specified.
+            rotary_dim (int, optional): Number of dimensions for rotary embeddings.
+                Defaults to `head_size` if not specified.
+            base (float, optional): Base frequency value (typically 10000.0).
+                Defaults to `self.rope_theta`.
+            partial_rotary_factor (float): Fraction of head dimensions to apply
+                rotary embeddings to. Range [0, 1]. Defaults to 1.0 (full rotation)
+                or the model's `partial_rotary_factor` attribute.
 
         Returns:
-            `ModuleCaches` wrapping the computed frequency tensor.
+            ModuleCaches: Container wrapping the computed inverse frequency tensor
+                with shape dependent on rotary_dim and rope_scaling configuration.
+
+        Example:
+            >>> caches = config.get_basic_inv_frequencies(head_size=64)
+            >>> inv_freqs = caches.data  # The actual frequency tensor
         """
         from easydel.layers.components import get_inv_frequencies
 
@@ -1841,15 +2120,30 @@ class EasyDeLBaseConfig(PretrainedConfig):
         rotary_dim: int | None = None,
         base: float | None = None,
     ) -> ModuleCaches:
-        """Compute frequencies for rotary embeddings placed on the configured mesh.
+        """Compute frequencies for rotary embeddings and place on the device mesh.
+
+        Similar to `get_basic_inv_frequencies` but computes the full frequency
+        tensors (cos and sin of position * inv_freq) and places them on the
+        configured device mesh with appropriate sharding.
+
+        The frequencies are cast to bfloat16 and sharded with a replicated
+        PartitionSpec for efficient distributed access.
 
         Args:
-            head_size: Attention head size (defaults to ``self.head_dim``).
-            rotary_dim: Number of rotary dimensions (defaults to ``head_size``).
-            base: Optional base for frequency computation (defaults to ``self.rope_theta``).
+            head_size (int, optional): Attention head dimension size.
+                Defaults to `self.head_dim` if not specified.
+            rotary_dim (int, optional): Number of dimensions for rotary embeddings.
+                Defaults to `head_size` if not specified.
+            base (float, optional): Base frequency value (typically 10000.0).
+                Defaults to `self.rope_theta`.
 
         Returns:
-            `ModuleCaches` containing the frequencies sharded with `NamedSharding`.
+            ModuleCaches: Container wrapping the frequency tensor, already placed
+                on the device mesh with NamedSharding for efficient distributed access.
+
+        Note:
+            The returned frequencies are in bfloat16 format for memory efficiency
+            and are replicated across all devices (PartitionSpec()).
         """
         from easydel.layers.components import get_frequencies
 
@@ -1873,16 +2167,32 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @staticmethod
     def _create_causal_mask(target_length):
-        """Creates a causal attention mask for autoregressive models.
+        """Create a causal attention mask for autoregressive models.
 
-        Generates a lower triangular boolean mask that prevents attending
-        to future tokens in the sequence.
+        Generates a lower triangular boolean mask that prevents attention
+        from future tokens to past tokens, enforcing the autoregressive property
+        required for language models.
+
+        The mask is True for positions that CAN be attended to (past and current)
+        and uses JAX's efficient boolean operations for construction.
 
         Args:
-            target_length: The sequence length for the mask.
+            target_length (int): The sequence length for the mask. For a sequence
+                of N tokens, creates an NxN mask.
 
         Returns:
-            4D boolean array with shape [1, 1, target_length, target_length].
+            jnp.ndarray: 4D boolean array with shape [1, 1, target_length, target_length].
+                The leading dimensions are batch (1) and heads (1), allowing
+                broadcasting during attention computation. Element [0, 0, i, j]
+                is True if position i can attend to position j (i.e., j <= i).
+
+        Example:
+            >>> mask = EasyDeLBaseConfig._create_causal_mask(4)
+            >>> # mask[0, 0] is:
+            >>> # [[True, False, False, False],
+            >>> #  [True, True,  False, False],
+            >>> #  [True, True,  True,  False],
+            >>> #  [True, True,  True,  True ]]
         """
         causal_mask_bool = jnp.zeros((target_length, target_length), dtype=jnp.bool_)
 
@@ -1930,14 +2240,28 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return None
 
     def get_basic_causal_mask(self, *args, **kwargs):
-        """Gets or creates the basic causal attention mask.
+        """Get or create the precomputed causal attention mask.
 
-        Creates a causal mask for the maximum position embeddings and
-        places it on the appropriate device with sharding.
+        Creates a lower-triangular causal mask for autoregressive attention
+        and places it on the device mesh. The mask prevents tokens from
+        attending to future positions in the sequence.
+
+        The mask is computed for `granted_mask_max_position_embedding` length
+        and cached on the device with replicated sharding.
+
+        Args:
+            *args: Unused positional arguments (for API compatibility).
+            **kwargs: Unused keyword arguments (for API compatibility).
 
         Returns:
-            ModuleCaches containing the causal mask, or False if masks
-            are not precomputed.
+            ModuleCaches | bool: If `precompute_masks` is True, returns a
+                ModuleCaches containing the boolean causal mask with shape
+                [1, 1, max_len, max_len]. Returns False if mask precomputation
+                is disabled.
+
+        Note:
+            When `precompute_masks=False`, attention layers must generate
+            causal masks dynamically, which may impact performance.
         """
         from .utils import ModuleCaches
 
@@ -1949,18 +2273,33 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return ModuleCaches(jax.device_put(self._create_causal_mask(target_length), Ns(self.mesh, Ps())))
 
     def get_fcm_mask(self, batch_size, seq_length, deterministic: bool):
-        """Generates a Forgetful Causal Mask (FCM) for training.
+        """Generate a Forgetful Causal Mask (FCM) for training.
 
-        FCM randomly drops causal constraints during training to improve
-        model robustness. Only applied in non-deterministic mode.
+        FCM is a regularization technique that randomly drops some causal
+        constraints during training. This encourages the model to be more
+        robust by not over-relying on the full context. The dropping ratio
+        is sampled uniformly between `fcm_min_ratio` and `fcm_max_ratio`.
+
+        Only applied in non-deterministic mode (training) and when
+        `fcm_max_ratio > 0`.
 
         Args:
-            batch_size: Number of sequences in the batch.
-            seq_length: Length of each sequence.
-            deterministic: If True, returns None (no FCM applied).
+            batch_size (int): Number of sequences in the batch.
+            seq_length (int): Length of each sequence.
+            deterministic (bool): If True, returns None (no FCM applied).
+                Set to False during training to enable FCM.
 
         Returns:
-            Boolean mask array or None if deterministic or FCM not configured.
+            jnp.ndarray | None: Boolean mask with shape [batch_size, 1, seq_length, seq_length]
+                where True indicates positions that should be attended to.
+                Returns None if:
+                - `deterministic` is True (evaluation/inference mode)
+                - `fcm_max_ratio` is 0 or negative (FCM disabled)
+
+        Note:
+            The first position (index 0) is always attended to, ensuring
+            the model can always see the beginning of sequence token.
+            Requires `self.make_rng("fcm")` to be available for random sampling.
         """
         if not deterministic and self.fcm_max_ratio > 0:
             # Apply forgetful causal mask
@@ -1984,12 +2323,25 @@ class EasyDeLBaseConfig(PretrainedConfig):
     def _fix_parent_kws(kw1, kw2):
         """Merge two keyword argument dictionaries, with kw1 taking precedence.
 
+        Internal utility for combining configuration keyword arguments, typically
+        used when inheriting or composing configurations where child config
+        values should override parent defaults.
+
         Args:
-            kw1: Primary dictionary (takes precedence).
-            kw2: Secondary dictionary (provides defaults for missing keys).
+            kw1 (dict): Primary dictionary whose values take precedence.
+                This is typically the child/override configuration.
+            kw2 (dict): Secondary dictionary providing default values.
+                This is typically the parent/base configuration.
 
         Returns:
-            Merged dictionary with all keys from both inputs, kw1 values preferred.
+            dict: New dictionary containing all keys from both inputs.
+                For keys present in both, values from `kw1` are used.
+
+        Example:
+            >>> base = {"a": 1, "b": 2}
+            >>> override = {"b": 3, "c": 4}
+            >>> merged = EasyDeLBaseConfig._fix_parent_kws(override, base)
+            >>> # merged = {"b": 3, "c": 4, "a": 1}
         """
         result = copy.deepcopy(kw1)
         tkey = result.keys()
@@ -2002,12 +2354,27 @@ class EasyDeLBaseConfig(PretrainedConfig):
     def _prefix_partition_rules(rules: tuple, prefix: str) -> tuple:
         """Add a prefix to all regex patterns in partition rules.
 
+        Internal utility for namespacing partition rules when composing models
+        from sub-models. Used to avoid pattern conflicts when multiple models
+        share the same parameter name patterns.
+
+        Patterns matching ".*" (catch-all) are excluded as they would match
+        everything regardless of prefix.
+
         Args:
-            rules: Tuple of (regex_pattern, partition_spec) pairs.
-            prefix: Prefix to add (e.g., "thinker/").
+            rules (tuple): Tuple of (regex_pattern, PartitionSpec) pairs defining
+                how parameters matching each pattern should be sharded.
+            prefix (str): Prefix to prepend to each pattern, typically the
+                sub-model name (e.g., "encoder", "decoder", "thinker").
 
         Returns:
-            New tuple with prefixed patterns.
+            tuple: New tuple of (prefixed_pattern, PartitionSpec) pairs.
+                Catch-all patterns ".*" are excluded from the output.
+
+        Example:
+            >>> rules = (("embed.*", PartitionSpec("tp")), (".*", PartitionSpec()))
+            >>> prefixed = EasyDeLBaseConfig._prefix_partition_rules(rules, "encoder")
+            >>> # prefixed = (("encoder/embed.*", PartitionSpec("tp")),)
         """
         prefixed = []
         for pattern, spec in rules:

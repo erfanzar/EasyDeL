@@ -11,6 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Specialized cache managers for different attention patterns.
+
+This module provides cache manager implementations for various attention
+types used in transformer models. Each manager handles the specific
+caching requirements of its attention pattern, including page allocation,
+prefix cache lookup, and page eviction.
+
+Classes:
+    SingleTypeCacheManager: Abstract base class for attention-specific managers.
+    FullAttentionManager: Manager for standard full/causal attention.
+    SlidingWindowManager: Manager for sliding window attention.
+    ChunkedLocalAttentionManager: Manager for chunked local attention.
+    MambaManager: Manager for Mamba state-space models.
+
+Functions:
+    get_manager_for_kv_cache_spec: Factory function to create the appropriate manager.
+
+Example:
+    >>> spec = FullAttentionSpec(page_size=16, num_kv_heads=8, head_size=64, dtype=jnp.float16)
+    >>> manager = get_manager_for_kv_cache_spec(spec, page_pool=pool, kv_cache_group_id=0)
+"""
+
 from abc import ABC, abstractmethod
 from collections import defaultdict
 
@@ -22,9 +45,24 @@ from .utils import CachePage, PageHash
 
 
 class SingleTypeCacheManager(ABC):
-    """
-    An abstract base class for a manager that handle the kv cache management
-    logic of one specific type of attention layer.
+    """Abstract base class for attention-type-specific cache managers.
+
+    This class defines the interface for cache managers that handle KV-cache
+    management logic for specific attention patterns. Each subclass implements
+    the caching behavior appropriate for its attention type (full, sliding
+    window, chunked local, or Mamba).
+
+    The manager tracks page allocations per request and coordinates with the
+    page pool for allocation, caching, and deallocation operations.
+
+    Attributes:
+        page_size: Number of tokens per cache page.
+        kv_cache_spec: The cache specification for this manager's attention type.
+        page_pool: Reference to the shared page pool.
+        req_to_pages: Mapping from request IDs to their allocated pages.
+        num_cached_page: Mapping from request IDs to the count of cached pages.
+        kv_cache_group_id: Index of this manager's KV cache group.
+        _null_page: Reference to the pool's null/placeholder page.
     """
 
     def __init__(
@@ -33,14 +71,15 @@ class SingleTypeCacheManager(ABC):
         page_pool: PagePool,
         kv_cache_group_id: int,
     ) -> None:
-        """
-        Initializes the SpecializedManager.
-        Args:
-            kv_cache_spec: The kv_cache_spec for this manager.
-            page_pool: The page pool.
-            kv_cache_group_id: The id of the kv cache group of this manager.
-        """
+        """Initialize the cache manager for a specific attention type.
 
+        Args:
+            kv_cache_spec: The cache specification defining page size and
+                attention pattern parameters.
+            page_pool: The shared page pool for allocation operations.
+            kv_cache_group_id: The index of this manager's KV cache group,
+                used to identify pages belonging to this manager.
+        """
         self.page_size = kv_cache_spec.page_size
         self.kv_cache_spec = kv_cache_spec
         self.page_pool = page_pool
@@ -224,6 +263,20 @@ class SingleTypeCacheManager(ABC):
 
 
 class FullAttentionManager(SingleTypeCacheManager):
+    """Cache manager for standard full/causal attention layers.
+
+    This manager handles KV-cache management for layers that use full
+    attention, where each token attends to all previous tokens. It supports
+    prefix caching by storing and retrieving complete page chains.
+
+    Full attention has the simplest caching behavior - all pages in a
+    sequence are kept and can be reused by requests with matching prefixes.
+
+    Example:
+        >>> manager = FullAttentionManager(spec, page_pool, kv_cache_group_id=0)
+        >>> pages = manager.allocate_new_pages(request_id, num_tokens=100)
+    """
+
     @classmethod
     def find_longest_cache_hit(
         cls,
@@ -251,9 +304,31 @@ class FullAttentionManager(SingleTypeCacheManager):
         return computed_pages
 
     def remove_skipped_pages(self, request_id: str, num_computed_tokens: int) -> None:
+        """Remove pages that are no longer needed (no-op for full attention).
+
+        For full attention, all pages are always needed, so this method
+        does nothing.
+
+        Args:
+            request_id: The request ID.
+            num_computed_tokens: The number of tokens that have been computed.
+        """
         pass
 
     def get_num_common_prefix_pages(self, request_id: str, num_scheduled_requests: int) -> int:
+        """Count pages shared by all scheduled requests.
+
+        Determines how many leading pages in this request's sequence are
+        shared with all other scheduled requests. Used for cascade attention
+        optimization.
+
+        Args:
+            request_id: The request ID to check.
+            num_scheduled_requests: Total number of requests in the scheduled batch.
+
+        Returns:
+            The number of common prefix pages shared by all scheduled requests.
+        """
         pages = self.req_to_pages[request_id]
         num_common_pages = 0
         for page in pages:
@@ -268,7 +343,33 @@ class FullAttentionManager(SingleTypeCacheManager):
 
 
 class SlidingWindowManager(SingleTypeCacheManager):
+    """Cache manager for sliding window attention layers.
+
+    This manager handles KV-cache management for layers that use sliding
+    window attention, where each token only attends to the most recent
+    `sliding_window` tokens. Pages outside the window are replaced with
+    null pages and freed.
+
+    The manager optimizes memory usage by releasing pages that fall outside
+    the sliding window as the sequence grows, while still supporting
+    prefix caching within the window.
+
+    Attributes:
+        sliding_window: The number of tokens in the attention window.
+
+    Example:
+        >>> spec = SlidingWindowSpec(sliding_window=4096, page_size=16, ...)
+        >>> manager = SlidingWindowManager(spec, page_pool, kv_cache_group_id=0)
+    """
+
     def __init__(self, kv_cache_spec: SlidingWindowSpec, page_pool: PagePool, **kwargs) -> None:
+        """Initialize the sliding window cache manager.
+
+        Args:
+            kv_cache_spec: The sliding window cache specification.
+            page_pool: The shared page pool for allocation operations.
+            **kwargs: Additional arguments passed to the base class.
+        """
         super().__init__(kv_cache_spec, page_pool, **kwargs)
         self.sliding_window = kv_cache_spec.sliding_window
         self._null_page = page_pool.null_page
@@ -317,6 +418,15 @@ class SlidingWindowManager(SingleTypeCacheManager):
         return computed_pages
 
     def remove_skipped_pages(self, request_id: str, num_computed_tokens: int) -> None:
+        """Remove pages outside the sliding window and replace with null pages.
+
+        Frees pages that have fallen outside the attention window as the
+        sequence grows, replacing them with null placeholder pages.
+
+        Args:
+            request_id: The request ID.
+            num_computed_tokens: The number of tokens that have been computed.
+        """
         last_useful_token = num_computed_tokens - self.sliding_window + 1
         last_useful_page = last_useful_token // self.page_size
         pages = self.req_to_pages[request_id]
@@ -329,17 +439,52 @@ class SlidingWindowManager(SingleTypeCacheManager):
         self.page_pool.free_pages(removed_pages)
 
     def get_num_common_prefix_pages(self, request_id: str, num_scheduled_requests: int) -> int:
-        """
-        NOTE(Chen): The prefix pages are null pages for sliding window layers.
-        So it's not correct to count ref_cnt like FullAttentionManager. Return
-        0 here for correctness. Need to support cascade attention + sliding
-        window in the future.
+        """Get number of common prefix pages (always 0 for sliding window).
+
+        Sliding window attention uses null pages for positions outside the
+        window, so prefix page counting doesn't apply. Returns 0 for
+        correctness.
+
+        Args:
+            request_id: The request ID.
+            num_scheduled_requests: Total number of scheduled requests.
+
+        Returns:
+            Always returns 0 for sliding window attention.
+
+        Note:
+            Cascade attention with sliding window is not yet supported.
         """
         return 0
 
 
 class ChunkedLocalAttentionManager(SingleTypeCacheManager):
+    """Cache manager for chunked local attention layers.
+
+    This manager handles KV-cache management for layers that use chunked
+    local attention, where tokens only attend within fixed-size chunks.
+    Pages outside the current chunk are replaced with null pages.
+
+    Chunked local attention divides the sequence into non-overlapping chunks
+    of `attention_chunk_size` tokens. Each token only attends to tokens
+    within its chunk.
+
+    Attributes:
+        attention_chunk_size: The size of each attention chunk in tokens.
+
+    Example:
+        >>> spec = ChunkedLocalAttentionSpec(attention_chunk_size=256, ...)
+        >>> manager = ChunkedLocalAttentionManager(spec, page_pool, kv_cache_group_id=0)
+    """
+
     def __init__(self, kv_cache_spec: ChunkedLocalAttentionSpec, page_pool: PagePool, **kwargs) -> None:
+        """Initialize the chunked local attention cache manager.
+
+        Args:
+            kv_cache_spec: The chunked local attention cache specification.
+            page_pool: The shared page pool for allocation operations.
+            **kwargs: Additional arguments passed to the base class.
+        """
         super().__init__(kv_cache_spec, page_pool, **kwargs)
         self.attention_chunk_size = kv_cache_spec.attention_chunk_size
         self._null_page = page_pool.null_page
@@ -411,6 +556,15 @@ class ChunkedLocalAttentionManager(SingleTypeCacheManager):
         return computed_pages
 
     def remove_skipped_pages(self, request_id: str, num_computed_tokens: int) -> None:
+        """Remove pages outside the current attention chunk.
+
+        Frees pages from previous chunks that are no longer needed for
+        attention computation, replacing them with null placeholder pages.
+
+        Args:
+            request_id: The request ID.
+            num_computed_tokens: The number of tokens that have been computed.
+        """
         num_cached_page = self.num_cached_page.get(request_id, 0)
         local_attention_start_idx = (num_computed_tokens) // self.attention_chunk_size * self.attention_chunk_size
         first_useful_page_idx = local_attention_start_idx // self.page_size
@@ -428,13 +582,36 @@ class ChunkedLocalAttentionManager(SingleTypeCacheManager):
         self.page_pool.free_pages(removed_pages)
 
     def get_num_common_prefix_pages(self, request_id: str, num_scheduled_requests: int) -> int:
-        """
-        cascade attention is not supported by chunked local attention.
+        """Get number of common prefix pages (always 0 for chunked local).
+
+        Cascade attention is not supported by chunked local attention,
+        so this always returns 0.
+
+        Args:
+            request_id: The request ID.
+            num_scheduled_requests: Total number of scheduled requests.
+
+        Returns:
+            Always returns 0 for chunked local attention.
         """
         return 0
 
 
 class MambaManager(SingleTypeCacheManager):
+    """Cache manager for Mamba state-space model layers.
+
+    This manager handles state caching for Mamba layers, which use recurrent
+    state-space models instead of attention. Mamba layers maintain a fixed-size
+    state per request, regardless of sequence length.
+
+    Unlike attention-based managers, MambaManager allocates exactly one page
+    per request to store the recurrent state.
+
+    Example:
+        >>> spec = MambaSpec(shapes=((16, 64),), dtype=jnp.float16, page_size=1)
+        >>> manager = MambaManager(spec, page_pool, kv_cache_group_id=0)
+    """
+
     @classmethod
     def find_longest_cache_hit(
         cls,
@@ -451,12 +628,46 @@ class MambaManager(SingleTypeCacheManager):
         return computed_pages
 
     def remove_skipped_pages(self, request_id: str, num_computed_tokens: int) -> None:
+        """Remove skipped pages (no-op for Mamba).
+
+        Mamba maintains a fixed state size, so no pages are ever skipped.
+
+        Args:
+            request_id: The request ID.
+            num_computed_tokens: The number of tokens that have been computed.
+        """
         pass
 
     def get_num_common_prefix_pages(self, request_id: str, num_scheduled_requests: int) -> int:
+        """Get number of common prefix pages (always 0 for Mamba).
+
+        Mamba layers don't use attention-style prefix sharing.
+
+        Args:
+            request_id: The request ID.
+            num_scheduled_requests: Total number of scheduled requests.
+
+        Returns:
+            Always returns 0 for Mamba layers.
+        """
         return 0
 
     def allocate_new_pages(self, request_id: str, num_tokens: int) -> list[CachePage]:
+        """Allocate a single page for Mamba state storage.
+
+        Mamba layers always require exactly one page per request to store
+        the recurrent state, regardless of sequence length.
+
+        Args:
+            request_id: The request ID.
+            num_tokens: The number of tokens (ignored for Mamba).
+
+        Returns:
+            List containing the single allocated page (if newly allocated).
+
+        Raises:
+            AssertionError: If more than one page would be allocated.
+        """
         new_pages = super().allocate_new_pages(request_id, num_tokens)
         assert len(self.req_to_pages[request_id]) == 1, "MambaManager should only allocate 1 page for each request."
         return new_pages
@@ -468,9 +679,34 @@ spec_manager_map: dict[type[CacheSpec], type[SingleTypeCacheManager]] = {
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
     MambaSpec: MambaManager,
 }
+"""Mapping from cache specification types to their corresponding manager classes."""
 
 
 def get_manager_for_kv_cache_spec(kv_cache_spec: CacheSpec, **kwargs) -> SingleTypeCacheManager:
+    """Factory function to create the appropriate cache manager for a specification.
+
+    Creates and returns the correct SingleTypeCacheManager subclass instance
+    based on the type of the provided cache specification.
+
+    Args:
+        kv_cache_spec: The cache specification defining the attention type.
+        **kwargs: Additional arguments passed to the manager constructor,
+            typically including page_pool and kv_cache_group_id.
+
+    Returns:
+        An instance of the appropriate SingleTypeCacheManager subclass:
+        - FullAttentionManager for FullAttentionSpec
+        - SlidingWindowManager for SlidingWindowSpec
+        - ChunkedLocalAttentionManager for ChunkedLocalAttentionSpec
+        - MambaManager for MambaSpec
+
+    Raises:
+        KeyError: If the cache specification type is not in the spec_manager_map.
+
+    Example:
+        >>> spec = FullAttentionSpec(page_size=16, ...)
+        >>> manager = get_manager_for_kv_cache_spec(spec, page_pool=pool, kv_cache_group_id=0)
+    """
     manager_class = spec_manager_map[type(kv_cache_spec)]
     manager = manager_class(kv_cache_spec, **kwargs)
     return manager

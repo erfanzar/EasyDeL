@@ -12,6 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Computation functions for Rotary Position Embeddings (RoPE).
+
+This module provides functions for computing inverse frequencies and frequency
+caches for various RoPE scaling methods, as well as functions for applying
+rotary embeddings to query and key tensors.
+
+Supported RoPE scaling methods:
+    - Basic/Default: Standard RoPE with no scaling.
+    - Linear: Linearly scaled positions for extended context.
+    - Dynamic NTK: Dynamically adjusted base for context extension.
+    - YaRN: Yet another RoPE extensioN method with interpolation/extrapolation.
+    - Llama3: Llama-3 style scaling with wavelength-based adjustments.
+    - Phi3 LongRoPE: Phi-3 style scaling with short/long factors.
+    - Deepseek: Deepseek-YaRN variant with additional mscale parameters.
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from easydel.layers.components.rotary_embedding._compute_fns import (
+    ...     compute_basic_frequencies,
+    ...     apply_basic_rope,
+    ... )
+    >>> # Compute frequency cache
+    >>> freqs = compute_basic_frequencies(base=10000, rotary_dim=64, max_position_embeddings=2048)
+    >>> # Apply RoPE to query and key
+    >>> query = jnp.ones((1, 128, 8, 64))  # [batch, seq, heads, head_dim]
+    >>> key = jnp.ones((1, 128, 8, 64))
+    >>> positions = jnp.arange(128)
+    >>> q_rot, k_rot = apply_basic_rope(query, key, positions, freqs, rotary_dim=64, is_neox_style=True)
+"""
+
 from __future__ import annotations
 
 import math

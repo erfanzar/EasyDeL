@@ -11,6 +11,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Cache coordinator for managing multiple KV cache groups.
+
+This module provides coordinator classes that manage KV-cache operations
+across multiple cache groups. The coordinators handle the complexity of
+hybrid models that use different attention patterns (e.g., full attention
+and sliding window) in different layers.
+
+Classes:
+    CacheCoordinator: Abstract base class for cache coordination.
+    CacheCoordinatorNoPrefixCache: Coordinator when prefix caching is disabled.
+    UnitaryCacheCoordinator: Coordinator for single cache group models.
+    HybridCacheCoordinator: Coordinator for multi-group hybrid models.
+
+Functions:
+    get_kv_cache_coordinator: Factory function to create appropriate coordinator.
+
+Example:
+    >>> coordinator = get_kv_cache_coordinator(
+    ...     num_pages=1000,
+    ...     kv_cache_groups=cache_groups,
+    ...     max_model_len=4096,
+    ...     use_eagle=False,
+    ...     enable_caching=True
+    ... )
+"""
+
 from abc import ABC, abstractmethod
 
 from ..request import EngineRequest
@@ -21,8 +48,25 @@ from .utils import CachePage, PageHash
 
 
 class CacheCoordinator(ABC):
-    """
-    Coordinate the KV cache of different KV cache groups.
+    """Abstract base class for coordinating KV-cache across multiple groups.
+
+    This class coordinates KV-cache management operations across multiple
+    cache groups, each potentially using different attention patterns.
+    It delegates attention-type-specific operations to SingleTypeCacheManager
+    instances while providing a unified interface for the CacheManager.
+
+    Attributes:
+        num_pages: Total number of pages in the shared page pool.
+        kv_cache_groups: List of cache group specifications.
+        max_model_len: Maximum sequence length supported by the model.
+        enable_caching: Whether prefix caching is enabled.
+        page_pool: The shared page pool for all cache groups.
+        use_eagle: Whether EAGLE speculative decoding is enabled.
+        single_type_managers: Tuple of managers for each cache group.
+
+    Note:
+        Subclasses must implement `find_longest_cache_hit` to define
+        the cache lookup strategy for their specific configuration.
     """
 
     def __init__(
@@ -33,6 +77,15 @@ class CacheCoordinator(ABC):
         use_eagle: bool,
         enable_caching: bool,
     ):
+        """Initialize the cache coordinator.
+
+        Args:
+            num_pages: Total number of pages to allocate in the page pool.
+            kv_cache_groups: List of CacheGroupSpec defining each cache group.
+            max_model_len: Maximum sequence length the model supports.
+            use_eagle: Whether EAGLE speculative decoding is enabled.
+            enable_caching: Whether to enable prefix caching.
+        """
         self.num_pages = num_pages
         self.kv_cache_groups = kv_cache_groups
         self.max_model_len = max_model_len
@@ -154,8 +207,13 @@ class CacheCoordinator(ABC):
             manager.remove_skipped_pages(request_id, num_computed_tokens)
 
     def get_pages(self, request_id: str) -> tuple[list[CachePage], ...]:
-        """
-        Get the pages for the request.
+        """Get all pages allocated to a request across all cache groups.
+
+        Args:
+            request_id: The unique identifier of the request.
+
+        Returns:
+            Tuple of page lists, one for each cache group.
         """
         return tuple(manager.req_to_pages.get(request_id) or [] for manager in self.single_type_managers)
 
@@ -165,15 +223,35 @@ class CacheCoordinator(ABC):
         page_hashes: list[PageHash],
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[CachePage], ...], int]:
+        """Find the longest prefix cache hit for a sequence of page hashes.
+
+        Args:
+            page_hashes: List of page hashes to look up in the cache.
+            max_cache_hit_length: Maximum number of tokens to consider.
+
+        Returns:
+            A tuple containing:
+            - Tuple of page lists, one per cache group, with cached pages
+            - Number of tokens in the cache hit
+        """
         pass
 
 
 class CacheCoordinatorNoPrefixCache(CacheCoordinator):
-    """
-    KV cache coordinator to use if prefix caching is disabled or unsupported.
-    In contrast to UnitaryCacheCoordinator and HybridCacheCoordinator,
-    supports arbitrary numbers of KV cache groups (including 0 groups).
-    Does not implement any features related to prefix caching.
+    """Cache coordinator for configurations without prefix caching.
+
+    This coordinator is used when prefix caching is disabled or unsupported.
+    It provides a minimal implementation that allocates pages without any
+    caching behavior. Unlike other coordinators, it supports arbitrary
+    numbers of KV cache groups including zero groups.
+
+    Example:
+        >>> coordinator = CacheCoordinatorNoPrefixCache(
+        ...     num_pages=1000,
+        ...     kv_cache_groups=[],
+        ...     max_model_len=4096,
+        ...     use_eagle=False
+        ... )
     """
 
     def __init__(
@@ -183,10 +261,27 @@ class CacheCoordinatorNoPrefixCache(CacheCoordinator):
         max_model_len: int,
         use_eagle: bool,
     ):
+        """Initialize the no-prefix-cache coordinator.
+
+        Args:
+            num_pages: Total number of pages in the page pool.
+            kv_cache_groups: List of cache group specifications (can be empty).
+            max_model_len: Maximum sequence length supported.
+            use_eagle: Whether EAGLE speculative decoding is enabled.
+        """
         super().__init__(num_pages, kv_cache_groups, max_model_len, use_eagle, False)
         self.num_single_type_manager = len(self.single_type_managers)
 
     def get_num_common_prefix_pages(self, request_id: str, num_scheduled_requests: int) -> list[int]:
+        """Get common prefix page counts (always 0 without caching).
+
+        Args:
+            request_id: The request ID.
+            num_scheduled_requests: Number of scheduled requests.
+
+        Returns:
+            List of zeros, one per cache group.
+        """
         return [0] * self.num_single_type_manager
 
     def find_longest_cache_hit(
@@ -194,15 +289,39 @@ class CacheCoordinatorNoPrefixCache(CacheCoordinator):
         page_hashes: list[PageHash],
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[CachePage], ...], int]:
+        """Find cache hit (always returns empty without caching).
+
+        Args:
+            page_hashes: List of page hashes (ignored).
+            max_cache_hit_length: Maximum hit length (ignored).
+
+        Returns:
+            Empty page lists and zero hit length.
+        """
         pages: tuple[list[CachePage], ...] = tuple([] for _ in range(self.num_single_type_manager))
         return pages, 0
 
 
 class UnitaryCacheCoordinator(CacheCoordinator):
-    """
-    KV cache coordinator for models with only one KV cache group. This is the
-    case for models with only one KV cache type, e.g., all attention layers use
-    full attention or all attention layers use sliding window attention.
+    """Cache coordinator for models with a single KV cache group.
+
+    This coordinator handles the common case where all attention layers
+    use the same attention pattern (e.g., all full attention or all
+    sliding window). It provides optimized cache lookup for this
+    simpler configuration.
+
+    Attributes:
+        kv_cache_spec: The cache specification for the single group.
+        page_size: Number of tokens per page.
+
+    Example:
+        >>> coordinator = UnitaryCacheCoordinator(
+        ...     num_pages=1000,
+        ...     kv_cache_groups=[full_attention_group],
+        ...     max_model_len=4096,
+        ...     use_eagle=False,
+        ...     enable_caching=True
+        ... )
     """
 
     def __init__(
@@ -213,6 +332,18 @@ class UnitaryCacheCoordinator(CacheCoordinator):
         use_eagle: bool,
         enable_caching: bool,
     ):
+        """Initialize the unitary cache coordinator.
+
+        Args:
+            num_pages: Total number of pages in the page pool.
+            kv_cache_groups: List containing exactly one cache group.
+            max_model_len: Maximum sequence length supported.
+            use_eagle: Whether EAGLE speculative decoding is enabled.
+            enable_caching: Whether prefix caching is enabled.
+
+        Raises:
+            AssertionError: If more than one cache group is provided.
+        """
         super().__init__(num_pages, kv_cache_groups, max_model_len, use_eagle, enable_caching)
         self.kv_cache_spec = self.kv_cache_groups[0].kv_cache_spec
         self.page_size = self.kv_cache_spec.page_size
@@ -223,6 +354,17 @@ class UnitaryCacheCoordinator(CacheCoordinator):
         page_hashes: list[PageHash],
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[CachePage], ...], int]:
+        """Find the longest cache hit for the single cache group.
+
+        Args:
+            page_hashes: List of page hashes to look up.
+            max_cache_hit_length: Maximum number of tokens to consider.
+
+        Returns:
+            A tuple containing:
+            - Single-element tuple with the list of cached pages
+            - Number of tokens in the cache hit
+        """
         hit_pages = self.single_type_managers[0].find_longest_cache_hit(
             page_hashes=page_hashes,
             max_length=max_cache_hit_length,
@@ -235,12 +377,31 @@ class UnitaryCacheCoordinator(CacheCoordinator):
 
 
 class HybridCacheCoordinator(CacheCoordinator):
-    """
-    KV cache coordinator for hybrid models with multiple KV cache types, and
-    thus multiple kv cache groups.
-    To simplify `find_longest_cache_hit`, it only supports the combination of
-    two types of KV cache groups, and one of them must be full attention.
-    May extend to more general cases in the future.
+    """Cache coordinator for hybrid models with multiple attention types.
+
+    This coordinator handles models that use different attention patterns
+    in different layers (e.g., some layers with full attention and others
+    with sliding window). It coordinates cache lookup across both types
+    to find a consistent prefix cache hit.
+
+    Currently supports exactly two attention types, with one being full
+    attention. Future versions may support more general configurations.
+
+    Attributes:
+        full_attention_group_ids: Indices of full attention cache groups.
+        other_group_ids: Indices of non-full-attention cache groups.
+        full_attention_spec: Cache spec for full attention groups.
+        other_spec: Cache spec for other attention groups.
+        full_attn_first: Whether full attention groups precede others.
+
+    Example:
+        >>> coordinator = HybridCacheCoordinator(
+        ...     num_pages=1000,
+        ...     kv_cache_groups=[full_attn_group, sliding_window_group],
+        ...     max_model_len=4096,
+        ...     use_eagle=False,
+        ...     enable_caching=True
+        ... )
     """
 
     def __init__(
@@ -251,14 +412,33 @@ class HybridCacheCoordinator(CacheCoordinator):
         use_eagle: bool,
         enable_caching: bool,
     ):
+        """Initialize the hybrid cache coordinator.
+
+        Args:
+            num_pages: Total number of pages in the page pool.
+            kv_cache_groups: List of cache groups with exactly two types.
+            max_model_len: Maximum sequence length supported.
+            use_eagle: Whether EAGLE speculative decoding is enabled.
+            enable_caching: Whether prefix caching is enabled.
+
+        Raises:
+            AssertionError: If cache groups don't meet the hybrid requirements.
+        """
         super().__init__(num_pages, kv_cache_groups, max_model_len, use_eagle, enable_caching)
         self.verify_and_split_kv_cache_groups()
 
     def verify_and_split_kv_cache_groups(self) -> None:
-        """
-        Verifies that the model has exactly two types of KV cache groups, and
-        one of them is full attention. Then, split the kv cache groups into full
-        attention groups and other groups.
+        """Verify cache group configuration and split by attention type.
+
+        Validates that the model has exactly two types of KV cache groups,
+        with one being full attention. Splits groups into full attention
+        and other attention for coordinated cache lookup.
+
+        Raises:
+            AssertionError: If configuration doesn't meet requirements:
+                - Must have exactly one full attention type
+                - Must have exactly one other attention type
+                - Groups must not interleave by type
         """
         full_attention_type_id: str | None = None
         other_type_id: str | None = None
@@ -321,19 +501,26 @@ class HybridCacheCoordinator(CacheCoordinator):
         page_hashes: list[PageHash],
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[CachePage], ...], int]:
-        """
-        Find the longest cache hit for the request.
+        """Find the longest consistent cache hit across all cache groups.
+
+        Performs coordinated cache lookup across full attention and other
+        attention groups to find the longest prefix that hits in both.
+        The full attention groups are searched first, then the other groups
+        are searched up to the hit length from full attention.
 
         Args:
-            page_hashes: The page hashes of the request.
-            max_cache_hit_length: The maximum length of the cache hit.
+            page_hashes: List of page hashes to look up in the cache.
+            max_cache_hit_length: Maximum number of tokens to consider.
 
         Returns:
             A tuple containing:
-                - A list of the cache hit pages for each single type manager.
-                - The number of tokens of the longest cache hit.
-        """
+            - Tuple of page lists, ordered by cache group index
+            - Number of tokens in the consistent cache hit
 
+        Note:
+            The hit length is constrained by both attention types - if one
+            type has a shorter hit, the other is truncated to match.
+        """
         hit_pages_full_attn = self.full_attention_manager_cls.find_longest_cache_hit(
             page_hashes=page_hashes,
             max_length=max_cache_hit_length,
@@ -373,6 +560,33 @@ def get_kv_cache_coordinator(
     use_eagle: bool,
     enable_caching: bool,
 ) -> CacheCoordinator:
+    """Factory function to create the appropriate cache coordinator.
+
+    Selects and instantiates the correct CacheCoordinator subclass based
+    on the caching configuration and number of cache groups.
+
+    Args:
+        num_pages: Total number of pages to allocate in the page pool.
+        kv_cache_groups: List of cache group specifications.
+        max_model_len: Maximum sequence length the model supports.
+        use_eagle: Whether EAGLE speculative decoding is enabled.
+        enable_caching: Whether prefix caching should be enabled.
+
+    Returns:
+        An appropriate CacheCoordinator instance:
+        - CacheCoordinatorNoPrefixCache: When caching is disabled
+        - UnitaryCacheCoordinator: When there's exactly one cache group
+        - HybridCacheCoordinator: When there are multiple cache groups
+
+    Example:
+        >>> coordinator = get_kv_cache_coordinator(
+        ...     num_pages=1000,
+        ...     kv_cache_groups=groups,
+        ...     max_model_len=4096,
+        ...     use_eagle=False,
+        ...     enable_caching=True
+        ... )
+    """
     if not enable_caching:
         return CacheCoordinatorNoPrefixCache(
             num_pages,
