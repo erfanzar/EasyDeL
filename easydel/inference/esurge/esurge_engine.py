@@ -115,6 +115,12 @@ WORKER_DRAIN_INITIAL_DELAY = 0.1  # Initial retry delay in seconds
 
 
 def _set_requested_new(sp, n: int):
+    """Set the max_tokens or max_new_tokens attribute on a SamplingParams object.
+
+    Args:
+        sp: SamplingParams instance to modify.
+        n: Number of tokens to set.
+    """
     if hasattr(sp, "max_tokens"):
         sp.max_tokens = int(n)
     if hasattr(sp, "max_new_tokens"):
@@ -635,6 +641,15 @@ class eSurge:
         self.initiate()
 
     def _calculate_model_size(self, graphstate) -> str:
+        """Calculate the model size in billions of parameters.
+
+        Args:
+            graphstate: The model's graph state containing parameter arrays.
+
+        Returns:
+            String representation of model size in billions (e.g., "7.00").
+            Returns "unknown" if calculation fails.
+        """
         try:
             num_params = sum(n.size for n in jax.tree_util.tree_flatten(graphstate)[0])
             return f"{num_params / 1e9:.2f}"
@@ -642,15 +657,37 @@ class eSurge:
             return "unknown"
 
     def _get_model_type(self, model) -> str:
+        """Get the model type from its configuration.
+
+        Args:
+            model: The EasyDeL model instance.
+
+        Returns:
+            Lowercase model type string (e.g., "llama", "mistral", "unknown").
+        """
         return getattr(model.config, "model_type", "unknown").lower()
 
     def _get_model_name(self, model) -> str:
+        """Generate a human-readable model name.
+
+        Args:
+            model: The EasyDeL model instance.
+
+        Returns:
+            String in format "{model_type}-{size}b" (e.g., "llama-7.00b").
+        """
         model_type = self._get_model_type(model)
         model_size = self._calculate_model_size(model.graphstate)
         return f"{model_type}-{model_size}b"
 
     @cached_property
     def esurge_name(self) -> str:
+        """Get the engine's display name.
+
+        Returns:
+            Custom name if provided during initialization, otherwise an
+            auto-generated name based on model type and size.
+        """
         return self._esurge_name or self._possible_name
 
     def set_sampling_params_callback(
@@ -669,6 +706,16 @@ class eSurge:
         self._sampling_params_callback = callback
 
     def _abort_scheduler_due_to_error(self, exc: BaseException) -> None:
+        """Record a fatal scheduler error and wake all waiting callers.
+
+        Args:
+            exc: The exception that caused the scheduler failure.
+
+        Note:
+            This method records the exception and traceback, stops the scheduler,
+            and signals all waiting events so that blocking calls (generate/stream/chat)
+            can raise the error immediately.
+        """
         # Record the failure so waiting callers can raise immediately.
         self._scheduler_exception = exc
         self._scheduler_exception_tb = traceback.format_exc()
@@ -682,6 +729,12 @@ class eSurge:
             ev.set()
 
     def _raise_if_scheduler_failed(self) -> None:
+        """Check for scheduler failure and raise if one occurred.
+
+        Raises:
+            RuntimeError: If the scheduler encountered a fatal error, with
+                the original exception and traceback included.
+        """
         exc = self._scheduler_exception
         if exc is None:
             return
@@ -691,7 +744,15 @@ class eSurge:
         raise RuntimeError(f"eSurge scheduler crashed: {exc}") from exc
 
     def _track_finished_output(self, request_id: str) -> None:
-        """Track and evict completed RequestOutput objects to cap memory usage."""
+        """Track and evict completed RequestOutput objects to cap memory usage.
+
+        Manages the finished request history using a FIFO eviction policy.
+        When the number of retained outputs exceeds max_request_outputs,
+        the oldest outputs are removed to free memory.
+
+        Args:
+            request_id: ID of the request that just finished.
+        """
         max_outputs = self._max_request_outputs
         if max_outputs is None:
             return
@@ -887,7 +948,15 @@ class eSurge:
             self._reset_runner_state_if_idle("terminate")
 
     def pause(self) -> None:
-        """Pause the background scheduler without clearing queued state."""
+        """Pause the background scheduler without clearing queued state.
+
+        Temporarily stops the scheduler thread while preserving request state.
+        Use resume() to restart processing. Optionally destroys KV cache to
+        free memory if destroy_pages_on_pause is enabled.
+
+        Note:
+            Does not abort pending requests - they will resume when resume() is called.
+        """
         if not self._scheduler_running:
             self._info("Scheduler loop already paused or not running")
             self._paused = True
@@ -911,7 +980,15 @@ class eSurge:
         self._reset_runner_state_if_idle("pause")
 
     def resume(self) -> None:
-        """Resume the scheduler if it was paused."""
+        """Resume the scheduler if it was paused.
+
+        Restarts the background scheduler thread after a pause(). If KV cache
+        was destroyed during pause, it will be reinitialized before processing
+        resumes.
+
+        Note:
+            Safe to call even if the scheduler is already running - will no-op.
+        """
         if self._scheduler_running:
             self._info("Scheduler loop already running")
             return
@@ -970,22 +1047,53 @@ class eSurge:
         )
 
     def _tokenize_prompt(self, request_id: str, prompt: str) -> list[int]:
+        """Tokenize a prompt string using the worker pipeline.
+
+        Args:
+            request_id: Request ID for tracking in the tokenizer worker.
+            prompt: Text prompt to tokenize.
+
+        Returns:
+            List of token IDs.
+        """
         return self._tokenizer_client.tokenize(request_id, prompt)
 
     def _prepare_prompt_segments(self, prompt: typing.Any) -> list[str]:
+        """Convert a prompt to a list of string segments.
+
+        Args:
+            prompt: Input prompt, can be a string or list of strings/objects.
+
+        Returns:
+            List of string segments.
+        """
         if isinstance(prompt, list):
             return [segment if isinstance(segment, str) else str(segment) for segment in prompt]
         return [prompt if isinstance(prompt, str) else str(prompt)]
 
     def _filter_eos_tokens(self, tokens: list[int]) -> list[int]:
-        """Remove eos tokens from a token list before decoding."""
+        """Remove EOS tokens from a token list before decoding.
 
+        Args:
+            tokens: List of token IDs.
+
+        Returns:
+            Token list with EOS tokens removed.
+        """
         eos_set = self.__eos_set
         if not eos_set:
             return tokens
         return [tok for tok in tokens if tok not in eos_set]
 
     def _tokenize_prompt_segments(self, prompt: typing.Any) -> list[list[int]]:
+        """Tokenize prompt segments individually.
+
+        Args:
+            prompt: Input prompt, can be a string or list of strings.
+
+        Returns:
+            List of token ID lists, one per segment.
+        """
         segments = self._prepare_prompt_segments(prompt)
         token_segments: list[list[int]] = []
         for segment in segments:
@@ -1011,6 +1119,19 @@ class eSurge:
         finished: bool,
         skip_special_tokens: bool = True,
     ) -> DetokenizerResult:
+        """Decode tokens using the detokenizer worker pipeline.
+
+        Performs incremental detokenization with streaming text delta support.
+
+        Args:
+            request_id: Request ID for tracking state in the detokenizer.
+            generated_tokens: Full list of generated tokens so far.
+            finished: Whether generation is complete (triggers final flush).
+            skip_special_tokens: Whether to skip special tokens in output.
+
+        Returns:
+            DetokenizerResult with accumulated_text, delta_text, and indices.
+        """
         tokens_for_decode = self._filter_eos_tokens(generated_tokens)
         return self._detokenizer_client.decode(
             request_id,
@@ -1021,6 +1142,14 @@ class eSurge:
 
     @staticmethod
     def _to_python_scalar(value: Any) -> Any:
+        """Convert a value to a Python scalar if possible.
+
+        Args:
+            value: Value to convert (may be a JAX/numpy array).
+
+        Returns:
+            Python scalar if conversion possible, original value otherwise.
+        """
         if hasattr(value, "item"):
             try:
                 return value.item()
@@ -1029,9 +1158,23 @@ class eSurge:
         return value
 
     def _sanitize_metrics_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Sanitize a metrics payload by converting arrays to scalars.
+
+        Args:
+            payload: Dictionary of metric values.
+
+        Returns:
+            Dictionary with all values converted to Python scalars.
+        """
         return {k: self._to_python_scalar(v) for k, v in payload.items()}
 
     def _kv_cache_metadata(self) -> dict[str, Any]:
+        """Get current KV cache configuration metadata.
+
+        Returns:
+            Dictionary with cache configuration including max_model_len,
+            max_num_seqs, page_size, and executor-specific attributes.
+        """
         metadata = getattr(getattr(self.runner, "executor_manager", None), "metadata", None)
         details: dict[str, Any] = {
             "max_model_len": self.max_model_len,
@@ -1046,11 +1189,23 @@ class eSurge:
         return details
 
     def _record_cache_event(self, event: str, payload: dict[str, Any]) -> None:
+        """Record a cache event to the metrics collector.
+
+        Args:
+            event: Event name (e.g., "kv_cache_destroyed", "kv_cache_reinitialized").
+            payload: Event details dictionary.
+        """
         metrics_collector = get_metrics_collector()
         if metrics_collector:
             metrics_collector.record_cache_event(event, payload)
 
     def _log_cache_event(self, event: str, extra: dict[str, Any] | None = None) -> None:
+        """Log a KV cache event with metadata.
+
+        Args:
+            event: Event name for logging.
+            extra: Additional event details to include.
+        """
         payload = self._kv_cache_metadata()
         if extra:
             payload.update(extra)
@@ -1096,6 +1251,14 @@ class eSurge:
                     )
 
     def _clone_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
+        """Create a deep copy of sampling parameters.
+
+        Args:
+            sampling_params: Parameters to clone.
+
+        Returns:
+            Deep copy of the parameters, or original if cloning fails.
+        """
         try:
             return copy.deepcopy(sampling_params)
         except Exception:
@@ -1109,6 +1272,18 @@ class eSurge:
         request_id: str,
         prompt: str,
     ) -> SamplingParams:
+        """Prepare sampling parameters for a specific request.
+
+        Clones the template and applies the sampling_params_callback if configured.
+
+        Args:
+            template: Base sampling parameters to clone.
+            request_id: Request ID for callback context.
+            prompt: Prompt text for callback context.
+
+        Returns:
+            Prepared SamplingParams instance for this request.
+        """
         params = self._clone_sampling_params(template)
         callback = self._sampling_params_callback
         if callback is None:
@@ -1496,7 +1671,14 @@ class eSurge:
                 return outs[0]
 
     def _messages_have_multimodal_content(self, messages: list[dict]) -> bool:
-        """Check if messages contain multimodal content (images/videos)."""
+        """Check if messages contain multimodal content (images/videos).
+
+        Args:
+            messages: List of chat message dictionaries.
+
+        Returns:
+            True if any message contains image or video content.
+        """
         for message in messages:
             content = message.get("content", [])
             if isinstance(content, list):
@@ -1518,7 +1700,24 @@ class eSurge:
         stream: bool = False,
         chat_template: str | None = None,
     ):
-        """Handle multimodal chat with images/videos."""
+        """Handle multimodal chat with images/videos.
+
+        Internal method that processes vision-language model requests.
+
+        Args:
+            messages: Chat messages with multimodal content.
+            tools: Optional tool definitions.
+            sampling_params: Generation parameters.
+            request_id: Optional request ID.
+            stream: Whether to stream output.
+            chat_template: Optional custom chat template.
+
+        Returns:
+            RequestOutput (non-streaming) or Iterator[RequestOutput] (streaming).
+
+        Raises:
+            ValueError: If no processor is configured for multimodal content.
+        """
         if self._multimodal_manager is None:
             raise ValueError(
                 "Multimodal content detected but no processor configured. "
@@ -1586,7 +1785,17 @@ class eSurge:
             return self._wait_for_request(request_id)
 
     def _stream_multimodal_request(self, request_id: str) -> Iterator[RequestOutput]:
-        """Stream output for a multimodal request."""
+        """Stream output for a multimodal request.
+
+        Args:
+            request_id: ID of the multimodal request to stream.
+
+        Yields:
+            RequestOutput snapshots with incremental updates.
+
+        Raises:
+            RuntimeError: If request event is missing.
+        """
         with self._request_lock:
             req_event = self._request_events.get(request_id)
         if req_event is None:
@@ -1655,7 +1864,19 @@ class eSurge:
                             self._request_events.pop(f"{request_id}-{sample_idx}", None)
 
     def _wait_for_request(self, request_id: str) -> RequestOutput:
-        """Wait for a request to complete and return the output."""
+        """Wait for a request to complete and return the output.
+
+        Blocks until the request finishes generation.
+
+        Args:
+            request_id: ID of the request to wait for.
+
+        Returns:
+            Completed RequestOutput with all generated text.
+
+        Raises:
+            RuntimeError: If request event is missing.
+        """
         with self._request_lock:
             req_event = self._request_events.get(request_id)
         if req_event is None:
@@ -2248,7 +2469,11 @@ class eSurge:
             return len(self.scheduler.running)
 
     def _reset_runner_state_if_idle(self, reason: str) -> None:
-        """Reset runner buffers when there are no active/pending requests."""
+        """Reset runner buffers when there are no active/pending requests.
+
+        Args:
+            reason: Reason for the reset (for logging).
+        """
         if not hasattr(self.runner, "reset_state"):
             return
         if self.num_running_requests > 0 or self.num_pending_requests > 0:
@@ -2273,7 +2498,23 @@ class eSurge:
         host_tracer_level: int | None = None,
         python_tracer_level: int | None = None,
     ) -> None:
-        """Start a JAX profiler trace for the next ``num_batches`` scheduler updates."""
+        """Start a JAX profiler trace for the next num_batches scheduler updates.
+
+        Enables JAX profiling to capture performance traces that can be visualized
+        in TensorBoard or the Chrome trace viewer.
+
+        Args:
+            output_dir: Directory to write profiler output files.
+            num_batches: Number of scheduler batches to trace before auto-stopping.
+            host_tracer_level: Optional host tracer level (1-4). Higher levels
+                capture more detail but add overhead.
+            python_tracer_level: Optional Python tracer level for function-level
+                profiling.
+
+        Raises:
+            RuntimeError: If a profiling session is already active.
+            ValueError: If num_batches is not positive.
+        """
         if self._profiling_active:
             raise RuntimeError("A profiling session is already active")
         if num_batches <= 0:
@@ -2300,7 +2541,11 @@ class eSurge:
         )
 
     def stop_profiling(self) -> None:
-        """Stop the active JAX profiler trace, if any."""
+        """Stop the active JAX profiler trace, if any.
+
+        Safe to call even if profiling is not active - will no-op.
+        Resets all profiling state.
+        """
         if not self._profiling_active:
             return
         try:
@@ -2314,6 +2559,12 @@ class eSurge:
             self._profiling_python_level = None
 
     def _drain_runner_future(self, future, scheduler_output: SchedulerOutput) -> None:
+        """Wait for an async runner execution and process results.
+
+        Args:
+            future: The async execution future to wait on.
+            scheduler_output: The scheduler output that triggered the execution.
+        """
         model_output = self.runner.wait_for_execution(future)
         with self._scheduler_lock:
             engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
@@ -2322,6 +2573,11 @@ class eSurge:
         self._handle_profiling_step()
 
     def _handle_profiling_step(self) -> None:
+        """Handle profiling step counter and auto-stop when complete.
+
+        Decrements the profiling step counter and stops profiling when
+        the configured number of batches has been traced.
+        """
         if not self._profiling_active:
             return
         if self._profiling_steps_remaining > 0:
@@ -2540,7 +2796,19 @@ class eSurge:
         datasource_uid: str,
         datasource_url: str,
     ) -> str:
-        """Create temporary provisioning config for Grafana."""
+        """Create temporary provisioning config for Grafana.
+
+        Creates a temporary directory with Grafana provisioning YAML files
+        for auto-configuring a Prometheus data source.
+
+        Args:
+            datasource_name: Display name for the data source.
+            datasource_uid: Unique identifier for the data source.
+            datasource_url: URL of the Prometheus metrics endpoint.
+
+        Returns:
+            Path to the provisioning root directory.
+        """
         provisioning_root = tempfile.mkdtemp(prefix="esurge_grafana_")
         datasources_dir = os.path.join(provisioning_root, "datasources")
         dashboards_dir = os.path.join(provisioning_root, "dashboards")
@@ -2585,7 +2853,19 @@ providers:
         grafana_admin_password: str,
         allow_anonymous: bool,
     ) -> str | None:
-        """Start Grafana using a locally installed grafana-server binary."""
+        """Start Grafana using a locally installed grafana-server binary.
+
+        Args:
+            provisioning_root: Path to provisioning config directory.
+            grafana_host: Host for reporting Grafana URL.
+            grafana_port: Port to run Grafana on.
+            grafana_admin_user: Admin username.
+            grafana_admin_password: Admin password.
+            allow_anonymous: Enable anonymous admin access.
+
+        Returns:
+            Grafana URL if started successfully, None otherwise.
+        """
         if self._grafana_process:
             return self._grafana_url
 
@@ -2647,7 +2927,21 @@ providers:
         allow_anonymous: bool,
         datasource_url: str,
     ) -> str | None:
-        """Start Grafana using Docker."""
+        """Start Grafana using Docker.
+
+        Args:
+            provisioning_root: Path to provisioning config directory (mounted).
+            grafana_host: Host for reporting Grafana URL.
+            grafana_port: Host port to expose Grafana.
+            grafana_image: Docker image to use.
+            grafana_admin_user: Admin username.
+            grafana_admin_password: Admin password.
+            allow_anonymous: Enable anonymous admin access.
+            datasource_url: Prometheus URL for the container to connect to.
+
+        Returns:
+            Grafana URL if started successfully, None otherwise.
+        """
         if self._grafana_container_name:
             return self._grafana_url
 
@@ -2709,7 +3003,26 @@ providers:
         datasource_url: str | None,
         use_docker: bool,
     ) -> str | None:
-        """Attempt to launch Grafana wired to the Prometheus endpoint."""
+        """Attempt to launch Grafana wired to the Prometheus endpoint.
+
+        Tries local grafana-server first, falls back to Docker if enabled.
+
+        Args:
+            prometheus_url: URL of the Prometheus metrics endpoint.
+            grafana_host: Host for reporting Grafana URL.
+            grafana_port: Port to run Grafana on.
+            grafana_image: Docker image (used if use_docker=True).
+            grafana_admin_user: Admin username.
+            grafana_admin_password: Admin password.
+            allow_anonymous: Enable anonymous admin access.
+            datasource_name: Display name for the data source.
+            datasource_uid: Unique identifier for the data source.
+            datasource_url: Override URL for the Prometheus data source.
+            use_docker: Allow falling back to Docker.
+
+        Returns:
+            Grafana URL if started successfully, None otherwise.
+        """
         if self._grafana_container_name or self._grafana_process:
             return self._grafana_url
 
@@ -2765,7 +3078,11 @@ providers:
         return None
 
     def _stop_grafana_service(self) -> None:
-        """Stop the Grafana container if it was started by the engine."""
+        """Stop the Grafana container/process if it was started by the engine.
+
+        Cleans up Docker containers, local processes, and temporary provisioning
+        directories. Safe to call even if Grafana was not started.
+        """
         container = self._grafana_container_id or self._grafana_container_name
         docker_exe = shutil.which("docker") if container else None
         if container and docker_exe:
@@ -3011,9 +3328,23 @@ providers:
 
     @property
     def monitoring_active(self) -> bool:
+        """Check if monitoring services are currently active.
+
+        Returns:
+            True if monitoring has been initialized and is running.
+        """
         return self._monitoring_initialized
 
     def __del__(self):
+        """Destructor that cleans up resources.
+
+        Attempts to gracefully terminate all running services including:
+        - Background scheduler thread
+        - Monitoring services (Prometheus, Grafana)
+        - Profiler trace
+        - Worker processes (tokenizer/detokenizer)
+        - Model runner
+        """
         if getattr(self, "_scheduler_running", False):
             try:
                 self.terminate()
@@ -3041,6 +3372,11 @@ providers:
                 pass
 
     def __repr__(self):
+        """Return a detailed string representation of the engine.
+
+        Returns:
+            Multi-line string with all key configuration parameters.
+        """
         attrs = [
             f"name={self.esurge_name!r}",
             f"max_model_len={self.max_model_len}",

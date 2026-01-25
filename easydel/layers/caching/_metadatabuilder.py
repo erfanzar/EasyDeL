@@ -54,28 +54,90 @@ BoolVectorLike = ArrayLike | tp.Sequence[bool] | tp.Sequence[int]
 
 
 class SupportsStartsIndexs(tp.Protocol):
-    """Protocol for cache views that carry transformer-style starts/indexs."""
+    """Protocol for cache views that carry transformer-style starts/indexs.
+
+    This protocol defines the interface for cache views that support
+    sequence position tracking through starts and indexs arrays.
+    Used by the metadata builder to extract position information
+    from existing cache views.
+
+    Attributes:
+        starts: Array-like containing starting positions for each sequence.
+            Shape: [batch_size]
+        indexs: Array-like containing current position indices for each sequence.
+            Shape: [batch_size]
+    """
 
     starts: ArrayLike
     indexs: ArrayLike
 
 
 class _HasCpuTensor(tp.Protocol):
-    """Protocol for objects exposing a CPU-side tensor."""
+    """Protocol for objects exposing a CPU-side tensor.
 
-    def get_cpu_tensor(self) -> np.ndarray: ...
+    Used by the metadata builder to extract CPU-resident arrays from
+    wrapper objects. This enables compatibility with tensor wrappers
+    that maintain separate CPU and device tensors.
+
+    Methods:
+        get_cpu_tensor: Return the CPU-resident NumPy array.
+    """
+
+    def get_cpu_tensor(self) -> np.ndarray:
+        """Return the CPU-resident NumPy array.
+
+        Returns:
+            np.ndarray: The tensor data as a NumPy array on CPU.
+        """
+        ...
 
 
 class _HasDeviceTensor(tp.Protocol):
-    """Protocol for objects exposing a device-side tensor."""
+    """Protocol for objects exposing a device-side tensor.
 
-    def get_device_tensor(self) -> jax.Array: ...
+    Used by the metadata builder to extract device-resident arrays from
+    wrapper objects. The tensor will be transferred to CPU for metadata
+    computation.
+
+    Methods:
+        get_device_tensor: Return the device-resident JAX array.
+    """
+
+    def get_device_tensor(self) -> jax.Array:
+        """Return the device-resident JAX array.
+
+        Returns:
+            jax.Array: The tensor data as a JAX array on device.
+        """
+        ...
 
 
 PageTableLike = IntMatrixLike | _HasCpuTensor | _HasDeviceTensor
 
 
 class _RaggedComputed(tp.TypedDict):
+    """TypedDict for computed ragged/paged attention metadata fields.
+
+    Contains the CPU-computed fields needed for ragged page attention.
+    These fields are derived from raw batch scheduling information.
+
+    Attributes:
+        pages_tables: Page table mapping requests to physical pages.
+            Shape: [max_num_reqs, max_pages_per_req]
+        context_lens: Context length (total tokens) per request.
+            Shape: [max_num_reqs]
+        query_start_loc: Cumulative query start positions.
+            Shape: [max_num_reqs + 1]
+        num_seqs: Number of active sequences.
+            Shape: [1]
+        request_distribution: Distribution counts for v3 (decode, prefill, total).
+            Shape: [3]. Optional, only present for v3.
+        slot_mapping: Slot mapping for v2-style cache updates.
+            Shape: [3, num_slices]. Optional, only present for v2.
+        num_kv_update_slices: Number of KV update slices for v2.
+            Shape: [1]. Optional, only present for v2.
+    """
+
     pages_tables: np.ndarray
     context_lens: np.ndarray
     query_start_loc: np.ndarray
@@ -88,10 +150,47 @@ class _RaggedComputed(tp.TypedDict):
 class _PagedBatchComputed(tp.TypedDict):
     """CPU-computed fields for a paged/ragged attention batch.
 
-    These fields are intended for runners that:
-    - build a contiguous token batch on CPU
-    - compute ragged/page metadata fields on CPU
-    - transfer everything to device in a single `jax.device_put` call
+    These fields are intended for high-performance inference runners that:
+    - Build a contiguous token batch on CPU
+    - Compute ragged/page metadata fields on CPU
+    - Transfer everything to device in a single `jax.device_put` call
+
+    This TypedDict defines the complete payload structure for paged
+    attention batch processing.
+
+    Attributes:
+        input_ids: Contiguous token IDs for the batch.
+            Shape: [num_tokens_static]
+        position_ids: Position indices for each token.
+            Shape: [num_tokens_static]
+        query_start_loc: Cumulative query start positions.
+            Shape: [max_num_reqs + 1]
+        seq_lens: Context length per request.
+            Shape: [max_num_reqs]
+        logits_indices: Indices for extracting logits per request.
+            Shape: [padded_num_reqs]
+        pages_tables: Page table mapping.
+            Shape: [num_reqs, max_pages_per_req]
+        scheduled: Scheduled token counts per request.
+            Shape: [padded_num_reqs]
+        num_requests: Scalar count of active requests.
+        padded_num_reqs: Scalar padded request count.
+        temperature: Optional sampling temperature per request.
+            Shape: [padded_num_reqs]
+        top_p: Optional top-p sampling parameter.
+            Shape: [padded_num_reqs]
+        top_k: Optional top-k sampling parameter.
+            Shape: [padded_num_reqs]
+        min_p: Optional min-p sampling parameter.
+            Shape: [padded_num_reqs]
+        request_distribution: v3-style distribution [decode, prefill, total].
+            Shape: [3]. Optional, only present for v3.
+        slot_mapping: v2-style slot mapping.
+            Shape: [3, num_slices]. Optional, only present for v2.
+        num_kv_update_slices: v2 update slice count.
+            Shape: [1]. Optional, only present for v2.
+        actual_num_tokens: Total number of scheduled tokens.
+            Shape: scalar. Optional.
     """
 
     input_ids: np.ndarray
@@ -114,7 +213,50 @@ class _PagedBatchComputed(tp.TypedDict):
 
 
 class AttentionMetadataBuilder:
-    """Factory for runtime attention metadata across cache types."""
+    """Factory for runtime attention metadata across cache types.
+
+    This builder provides a unified interface for creating runtime metadata
+    objects for different attention mechanisms. It supports:
+    - Standard transformer KV-cache (TransformerMetadata)
+    - Paged/ragged attention (RaggedPagesMetadata, v2 or v3)
+    - Recurrent/SSM models (RecurrentMetadata)
+
+    The builder can either wrap precomputed metadata fields or derive
+    them from raw batch scheduling state (CPU-first computation).
+
+    Key Features:
+        - Automatic metadata type selection based on attention mechanism
+        - CPU-first computation for ragged fields (avoids JIT issues)
+        - Support for both v2 (slot_mapping) and v3 (request_distribution) formats
+        - Synonym normalization (pages_tables/block_tables, context_lens/seq_lens)
+
+    Class Attributes:
+        _RAGGED_MECH_PREFIXES: Attention mechanism name prefixes that use ragged metadata.
+        _RAGGED_MECH_EXACT: Exact attention mechanism names that use ragged metadata.
+
+    Example:
+        >>> # Build transformer metadata
+        >>> meta = AttentionMetadataBuilder.build_transformer_metadata(
+        ...     postpadded=False,
+        ...     starts=jnp.zeros((batch_size,), dtype=jnp.int32)
+        ... )
+        >>>
+        >>> # Build ragged metadata from precomputed fields
+        >>> meta = AttentionMetadataBuilder.build_ragged_page_metadata(
+        ...     pages_tables=block_tables,
+        ...     context_lens=seq_lens,
+        ...     query_start_loc=query_locs,
+        ...     num_seqs=num_active
+        ... )
+        >>>
+        >>> # Auto-select metadata type
+        >>> meta = AttentionMetadataBuilder.build(
+        ...     attention_mechanism="ragged_page_attention_v3",
+        ...     pages_tables=tables,
+        ...     context_lens=lens,
+        ...     query_start_loc=locs
+        ... )
+    """
 
     _RAGGED_MECH_PREFIXES: tp.ClassVar[tuple[str, ...]] = ("ragged_page_attention",)
     _RAGGED_MECH_EXACT: tp.ClassVar[set[str]] = {
@@ -136,8 +278,28 @@ class AttentionMetadataBuilder:
     ) -> TransformerMetadata:
         """Build transformer-style runtime metadata.
 
+        Creates a TransformerMetadata object for standard KV-cache attention.
         If `starts`/`indexs` are not provided but a `cache_view` is, values
         are taken from the view.
+
+        Args:
+            postpadded: Whether sequences are post-padded (padding at end).
+                Affects how attention masks are computed.
+            starts: Starting positions for each sequence in the batch.
+                Shape: [batch_size]. Optional.
+            indexs: Current position indices for each sequence.
+                Shape: [batch_size]. Optional.
+            cache_view: Optional cache view implementing SupportsStartsIndexs
+                protocol to infer starts/indexs if not provided.
+
+        Returns:
+            TransformerMetadata: Runtime metadata for transformer attention.
+
+        Example:
+            >>> meta = AttentionMetadataBuilder.build_transformer_metadata(
+            ...     postpadded=False,
+            ...     starts=jnp.zeros((batch_size,), dtype=jnp.int32)
+            ... )
         """
         if cache_view is not None:
             if starts is None:
@@ -152,7 +314,19 @@ class AttentionMetadataBuilder:
 
     @classmethod
     def build_recurrent_metadata(cls) -> RecurrentMetadata:
-        """Build recurrent/SSM runtime metadata."""
+        """Build recurrent/SSM runtime metadata.
+
+        Creates a RecurrentMetadata object for recurrent state-space models
+        like Mamba, Mamba2, or GatedDeltaNet. Currently returns an empty
+        metadata placeholder as these models typically don't require
+        runtime metadata beyond the cache state itself.
+
+        Returns:
+            RecurrentMetadata: Runtime metadata for recurrent models.
+
+        Example:
+            >>> meta = AttentionMetadataBuilder.build_recurrent_metadata()
+        """
         return RecurrentMetadata()
 
     @classmethod
@@ -184,8 +358,57 @@ class AttentionMetadataBuilder:
     ) -> RaggedPagesMetadata:
         """Build ragged/paged attention runtime metadata (v2 or v3).
 
+        Creates a RaggedPagesMetadata object for paged attention mechanisms.
         If required ragged fields are missing but raw batch inputs are provided,
         they are computed on CPU (NumPy) similarly to eSurge's metadata prep.
+
+        Synonym normalization:
+            - `block_tables` is treated as synonym for `pages_tables`
+            - `seq_lens` is treated as synonym for `context_lens`
+
+        Args:
+            pages_tables: Page table mapping requests to physical pages.
+                Shape: [max_num_reqs, max_pages_per_req]. Optional.
+            block_tables: Alias for pages_tables. Optional.
+            context_lens: Context length (total tokens) per request.
+                Shape: [max_num_reqs]. Optional.
+            seq_lens: Alias for context_lens. Optional.
+            query_start_loc: Cumulative query start positions.
+                Shape: [max_num_reqs + 1]. Optional.
+            num_seqs: Number of active sequences. Can be int or array.
+            slot_mapping: v2-style slot mapping for cache updates.
+                Shape: [3, num_slices]. Required for v2.
+            position_ids: Position IDs for each token. Optional.
+            request_distribution: v3-style distribution [decode, prefill, total].
+                Shape: [3]. Auto-computed for v3 if not provided.
+            num_kv_update_slices: Number of update slices for v2.
+                Shape: [1]. Auto-computed for v2.
+            version: Ragged attention version ("v2" or "v3").
+            page_size: Number of tokens per page.
+            prefill_chunk_size: Chunk size for prefill processing.
+            num_slices_per_kv_cache_update_page: Slices per update page (v2).
+            scheduled_full: Raw scheduled tokens per request for deriving fields.
+            active_mask_full: Raw active mask for deriving fields.
+            num_computed_tokens: Raw computed token counts for deriving fields.
+            page_table: Raw page table for deriving fields.
+            max_num_reqs: Maximum number of requests (for padding).
+            max_num_tokens: Maximum number of tokens (for padding).
+            ragged_config: RaggedPagesCacheConfig for additional parameters.
+
+        Returns:
+            RaggedPagesMetadata: Runtime metadata for paged attention.
+
+        Raises:
+            ValueError: If required fields cannot be derived or are missing.
+
+        Example:
+            >>> meta = AttentionMetadataBuilder.build_ragged_page_metadata(
+            ...     pages_tables=block_tables,
+            ...     context_lens=seq_lens,
+            ...     query_start_loc=query_locs,
+            ...     num_seqs=num_active,
+            ...     version="v3"
+            ... )
         """
         # Normalize synonyms.
         if pages_tables is None and block_tables is not None:
@@ -291,7 +514,16 @@ class AttentionMetadataBuilder:
         max_num_tokens: int | None = None,
         ragged_config: RaggedPagesCacheConfig | None = None,
     ) -> RaggedPagesMetadata:
-        """Alias of `build_ragged_page_metadata`."""
+        """Alias of `build_ragged_page_metadata`.
+
+        This method provides an alternative name for build_ragged_page_metadata
+        to accommodate different naming conventions.
+
+        See build_ragged_page_metadata for full documentation.
+
+        Returns:
+            RaggedPagesMetadata: Runtime metadata for paged attention.
+        """
         return cls.build_ragged_page_metadata(
             pages_tables=pages_tables,
             block_tables=block_tables,
@@ -342,7 +574,16 @@ class AttentionMetadataBuilder:
         max_num_tokens: int | None = None,
         ragged_config: RaggedPagesCacheConfig | None = None,
     ) -> RaggedPagesMetadata:
-        """Alias of `build_ragged_page_metadata`."""
+        """Alias of `build_ragged_page_metadata`.
+
+        This method provides an alternative name for build_ragged_page_metadata
+        to accommodate paged attention terminology.
+
+        See build_ragged_page_metadata for full documentation.
+
+        Returns:
+            RaggedPagesMetadata: Runtime metadata for paged attention.
+        """
         return cls.build_page_metadata(
             pages_tables=pages_tables,
             block_tables=block_tables,
@@ -489,6 +730,25 @@ class AttentionMetadataBuilder:
         | tp.Sequence[bool]
         | tp.Sequence[tp.Sequence[int]],
     ) -> np.ndarray:
+        """Convert various array-like inputs to a NumPy array on CPU.
+
+        Handles multiple input types including JAX arrays, NumPy arrays,
+        Python sequences, and wrapper objects with CPU/device tensor accessors.
+
+        Args:
+            x: Input array-like value to convert. Can be:
+                - JAX array (will be transferred from device)
+                - NumPy array (returned as-is after asarray)
+                - Python sequence of ints/bools
+                - Object with get_cpu_tensor() method
+                - Object with get_device_tensor() method
+
+        Returns:
+            np.ndarray: The input converted to a NumPy array.
+
+        Raises:
+            ValueError: If x is None.
+        """
         if x is None:
             raise ValueError("Expected an array-like value, got None.")
         if hasattr(x, "get_cpu_tensor"):
@@ -512,7 +772,31 @@ class AttentionMetadataBuilder:
         slices_per_page: int,
         max_padded_slices: int | None,
     ) -> tuple[np.ndarray, int]:
-        """Compute v2 slot_mapping and total updated pages."""
+        """Compute v2 slot_mapping and total updated pages on CPU.
+
+        Generates the slot mapping array for v2-style paged cache updates.
+        The slot mapping describes how to copy new KV tokens into the
+        paged cache, organized as slices with (cache_start, new_kv_start, length).
+
+        Args:
+            num_requests: Number of active requests in the batch.
+            scheduled: Scheduled token counts per request.
+                Shape: [max_num_reqs]
+            num_computed_tokens: Already computed token counts per request.
+                Shape: [max_num_reqs]
+            page_table: Page table mapping requests to physical pages.
+                Shape: [max_num_reqs, max_pages_per_req]
+            page_size: Number of tokens per page.
+            max_pages_per_req: Maximum pages allocated per request.
+            slices_per_page: Slices per processing page (for padding alignment).
+            max_padded_slices: Optional maximum padded slice count.
+
+        Returns:
+            tuple: Pair of (slot_mapping, total_pages) where:
+                - slot_mapping: Array of shape [3, padded_num_slices] containing
+                  (cache_start, new_kv_start, length) per slice
+                - total_pages: Total number of pages being updated
+        """
         if num_requests <= 0:
             return np.zeros((3, 1), dtype=np.int32), 0
 
@@ -592,7 +876,42 @@ class AttentionMetadataBuilder:
         max_num_tokens: int | None,
         ragged_config: RaggedPagesCacheConfig | None,
     ) -> _RaggedComputed:
-        """Compute ragged metadata fields from raw batch inputs on CPU."""
+        """Compute ragged metadata fields from raw batch inputs on CPU.
+
+        Derives all necessary ragged/paged attention metadata from raw
+        scheduler state. This is the CPU-first computation path that
+        mirrors eSurge's metadata preparation logic.
+
+        Args:
+            scheduled_full: Scheduled token counts per request slot.
+                Shape: [max_num_reqs]
+            active_mask_full: Boolean mask indicating active requests.
+                Shape: [max_num_reqs]
+            num_computed_tokens: Already computed token counts per request.
+                Shape: [max_num_reqs]
+            page_table: Page table mapping requests to physical pages.
+                Shape: [max_num_reqs, max_pages_per_req]
+            version: Ragged attention version ("v2" or "v3").
+            page_size: Number of tokens per page.
+            num_slices_per_kv_cache_update_page: Slices per update page (v2).
+            max_num_reqs: Maximum number of requests for padding.
+            max_num_tokens: Maximum number of tokens for padding.
+            ragged_config: Optional RaggedPagesCacheConfig for parameters.
+
+        Returns:
+            _RaggedComputed: Dictionary containing:
+                - pages_tables: Masked page table
+                - context_lens: Per-request context lengths
+                - query_start_loc: Cumulative query positions
+                - num_seqs: Active sequence count
+                - request_distribution (v3): [decode, prefill, total]
+                - slot_mapping (v2): Update slice mapping
+                - num_kv_update_slices (v2): Total update slices
+
+        Raises:
+            ValueError: If v2 is requested but num_slices_per_kv_cache_update_page
+                is not provided.
+        """
         scheduled_full_np = cls._ensure_cpu_array(scheduled_full).astype(np.int32)
         active_mask_np = cls._ensure_cpu_array(active_mask_full).astype(bool)
         num_computed_np = cls._ensure_cpu_array(num_computed_tokens).astype(np.int32)
@@ -695,7 +1014,39 @@ class AttentionMetadataBuilder:
 
         Public wrapper around the CPU-first computation used by
         `build_ragged_page_metadata`. Returns NumPy arrays suitable for
-        host payload assembly (ExecutionManager).
+        host payload assembly (e.g., ExecutionManager in eSurge).
+
+        This is intended for use cases where you need the raw computed
+        fields before constructing the final metadata object.
+
+        Args:
+            scheduled_full: Scheduled token counts per request.
+                Shape: [max_num_reqs]
+            active_mask_full: Boolean mask indicating active requests.
+                Shape: [max_num_reqs]
+            num_computed_tokens: Already computed token counts.
+                Shape: [max_num_reqs]
+            page_table: Page table mapping requests to physical pages.
+                Shape: [max_num_reqs, max_pages_per_req]
+            version: Ragged attention version ("v2" or "v3").
+            page_size: Number of tokens per page. Default: 128.
+            num_slices_per_kv_cache_update_page: Slices per update page (v2).
+            max_num_reqs: Maximum requests for padding.
+            max_num_tokens: Maximum tokens for padding.
+            ragged_config: Optional configuration for additional parameters.
+
+        Returns:
+            _RaggedComputed: Dictionary of NumPy arrays with computed fields.
+
+        Example:
+            >>> fields = AttentionMetadataBuilder.compute_ragged_batch_fields_cpu(
+            ...     scheduled_full=scheduled,
+            ...     active_mask_full=active_mask,
+            ...     num_computed_tokens=computed,
+            ...     page_table=pages,
+            ...     version="v3"
+            ... )
+            >>> pages_tables = fields["pages_tables"]
         """
         return cls._compute_ragged_from_batch_cpu(
             scheduled_full=scheduled_full,
@@ -720,11 +1071,36 @@ class AttentionMetadataBuilder:
     ) -> int:
         """Compute a compilation-friendly padded request count.
 
-        This is the same bucketing strategy commonly used in inference runners:
-        - pad small batches up to `min_input_pad`
-        - otherwise pad to the next power of 2
-        - always honor the caller requested bucket (when larger)
-        - cap at `max_num_reqs`
+        Uses a bucketing strategy to minimize JIT recompilation:
+        - Pad small batches up to `min_input_pad`
+        - Otherwise pad to the next power of 2
+        - Honor caller-requested bucket when larger
+        - Cap at `max_num_reqs`
+
+        This strategy ensures consistent tensor shapes across similar
+        batch sizes, reducing compilation overhead in production.
+
+        Args:
+            num_requests: Actual number of active requests.
+            max_num_reqs: Maximum allowed requests (hard cap).
+            min_input_pad: Minimum padding threshold. Small batches
+                are padded to this value.
+            padded_num_reqs_in: Optional explicit bucket size from caller.
+                If provided and larger than num_requests, used directly.
+
+        Returns:
+            int: Padded request count for tensor allocation.
+
+        Example:
+            >>> # 3 requests with min_pad=8, max=1024
+            >>> padded = AttentionMetadataBuilder.compute_padded_num_reqs(
+            ...     num_requests=3,
+            ...     max_num_reqs=1024,
+            ...     min_input_pad=8,
+            ...     padded_num_reqs_in=None
+            ... )
+            >>> padded
+            8
         """
         max_num_reqs_i = max(int(max_num_reqs), 1)
         min_input_pad_i = max(int(min_input_pad), 1)
@@ -767,18 +1143,81 @@ class AttentionMetadataBuilder:
     ) -> _PagedBatchComputed:
         """Compute CPU batch fields for paged/ragged attention runners.
 
-        This is a higher-level helper than `compute_ragged_batch_fields_cpu`. In
-        addition to ragged fields, it also:
-        - gathers a contiguous `input_ids` batch from `token_ids`
-        - computes `position_ids` for the gathered tokens
-        - computes `logits_indices` for per-request sampling
-        - slices sampling parameters to `padded_num_reqs`
+        This is a higher-level helper than `compute_ragged_batch_fields_cpu`.
+        In addition to ragged fields, it also:
+        - Gathers a contiguous `input_ids` batch from `token_ids`
+        - Computes `position_ids` for the gathered tokens
+        - Computes `logits_indices` for per-request sampling
+        - Slices sampling parameters to `padded_num_reqs`
+
+        This function is designed for high-performance inference runners
+        that need to prepare a complete batch payload on CPU before
+        a single device_put transfer.
 
         Important:
             This function assumes active requests are packed in the first
-            `num_requests` slots (i.e. no holes in `active_mask_full` for the
-            active prefix). This matches the typical scheduling contract used by
-            eSurge and similar runners.
+            `num_requests` slots (i.e., no holes in `active_mask_full` for
+            the active prefix). This matches the typical scheduling contract
+            used by eSurge and similar runners.
+
+        Args:
+            num_tokens_static: Fixed token bucket size for compilation.
+            scheduled_full: Scheduled token counts per request.
+                Shape: [max_num_reqs]
+            active_mask_full: Boolean mask indicating active requests.
+                Shape: [max_num_reqs]
+            token_ids: Full token ID buffer for all requests.
+                Shape: [max_num_reqs, max_seq_len]
+            num_computed_tokens: Already computed token counts.
+                Shape: [max_num_reqs]
+            page_table: Page table mapping requests to physical pages.
+                Shape: [max_num_reqs, max_pages_per_req]
+            padded_num_reqs_in: Optional explicit padded request count.
+            min_input_pad: Minimum padding for request count bucketing.
+            version: Ragged attention version ("v2" or "v3").
+            ragged_config: Optional configuration for additional parameters.
+            max_num_reqs: Maximum requests cap.
+            max_num_tokens: Maximum tokens cap.
+            page_size: Tokens per page (for v2).
+            max_pages_per_req: Maximum pages per request.
+            num_slices_per_kv_cache_update_page: Slices per page (for v2).
+            temperature: Sampling temperature per request. Optional.
+            top_p: Top-p sampling parameter per request. Optional.
+            top_k: Top-k sampling parameter per request. Optional.
+            min_p: Min-p sampling parameter per request. Optional.
+            page_table_padding_val: Padding value for page tables.
+            slot_mapping_padding_val: Padding value for slot mapping (v2).
+
+        Returns:
+            _PagedBatchComputed: Dictionary containing:
+                - input_ids: Contiguous token IDs [num_tokens_static]
+                - position_ids: Position IDs [num_tokens_static]
+                - query_start_loc: Cumulative positions [max_num_reqs + 1]
+                - seq_lens: Context lengths [max_num_reqs]
+                - logits_indices: Sampling indices [padded_num_reqs]
+                - pages_tables: Page table [num_reqs, max_pages_per_req]
+                - scheduled: Scheduled counts [padded_num_reqs]
+                - num_requests: Active request count
+                - padded_num_reqs: Padded request count
+                - actual_num_tokens: Total scheduled tokens
+                - Plus version-specific fields (v2 or v3)
+
+        Raises:
+            ValueError: If token_ids is not 2D or if scheduled tokens
+                exceed num_tokens_static.
+
+        Example:
+            >>> batch = AttentionMetadataBuilder.compute_paged_attention_batch_fields_cpu(
+            ...     num_tokens_static=2048,
+            ...     scheduled_full=scheduled,
+            ...     active_mask_full=active_mask,
+            ...     token_ids=all_tokens,
+            ...     num_computed_tokens=computed,
+            ...     page_table=pages,
+            ...     padded_num_reqs_in=None,
+            ...     min_input_pad=8,
+            ...     version="v3"
+            ... )
         """
 
         scheduled_full_np = cls._ensure_cpu_array(scheduled_full).astype(np.int32, copy=False)
@@ -961,7 +1400,28 @@ class AttentionMetadataBuilder:
         max_padded_slices: int | None,
         pad_value: int,
     ) -> tuple[np.ndarray, int]:
-        """Compute v2 slot_mapping with a fixed padded shape (for compilation stability)."""
+        """Compute v2 slot_mapping with a fixed padded shape.
+
+        Similar to _compute_slot_mapping_v2_cpu but always returns an array
+        of shape [3, max_padded_slices] for compilation stability. Unused
+        slots are filled with pad_value.
+
+        Args:
+            num_requests: Number of active requests.
+            scheduled: Scheduled token counts per request.
+            num_computed_tokens: Already computed token counts.
+            page_table: Page table mapping requests to pages.
+            page_size: Tokens per page.
+            max_pages_per_req: Maximum pages per request.
+            slices_per_page: Slices per processing page.
+            max_padded_slices: Fixed output slice dimension.
+            pad_value: Value for padding unused slots.
+
+        Returns:
+            tuple: Pair of (slot_mapping, total_pages) where:
+                - slot_mapping: [3, max_padded_slices] with padded shape
+                - total_pages: Actual number of pages being updated
+        """
 
         if max_padded_slices is None or int(max_padded_slices) <= 0:
             return cls._compute_slot_mapping_v2_cpu(

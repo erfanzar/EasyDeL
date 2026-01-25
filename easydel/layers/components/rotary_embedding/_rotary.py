@@ -12,6 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Factory functions for creating RoPE embeddings and computing frequencies.
+
+This module provides high-level factory functions that create RotaryEmbedding
+instances and compute frequency caches based on configuration dictionaries.
+These functions serve as the primary entry points for using RoPE in models.
+
+Functions:
+    get_rope: Factory function to create RotaryEmbedding instances.
+    get_frequencies: Compute frequency cache based on scaling configuration.
+    get_inv_frequencies: Compute inverse frequencies based on scaling configuration.
+
+The functions support the following RoPE scaling types via the `rope_scaling` dict:
+    - "default": Standard RoPE with no scaling.
+    - "linear": Linear position scaling.
+    - "dynamic": Dynamic NTK scaling.
+    - "yarn": YaRN (Yet another RoPE extensioN) scaling.
+    - "deepseek_yarn": Deepseek variant of YaRN scaling.
+    - "longrope": Phi-3 LongRoPE scaling with short/long factors.
+    - "llama3": Llama-3 style wavelength-based scaling.
+    - "mrope": Multi-modal RoPE for vision-language models (Qwen2/3-VL).
+
+Example:
+    >>> from easydel.layers.components.rotary_embedding import get_rope, get_frequencies
+    >>> # Create a standard RoPE embedding
+    >>> rope = get_rope(head_size=64, rotary_dim=64, max_position=2048, base=10000)
+    >>> # Create a YaRN-scaled RoPE embedding
+    >>> rope_scaling = {"rope_type": "yarn", "factor": 2.0, "original_max_position_embeddings": 2048}
+    >>> rope_yarn = get_rope(head_size=64, rotary_dim=64, max_position=4096, base=10000, rope_scaling=rope_scaling)
+    >>> # Get pre-computed frequencies
+    >>> freqs = get_frequencies(head_size=64, rotary_dim=64, max_position=2048, base=10000)
+"""
+
 from __future__ import annotations
 
 import typing as tp

@@ -434,7 +434,53 @@ class BaseMoeModule(nn.Module, ABC):
         expert_loads: jax.Array,
         strategy: MoeLoadBalancingStrategy | None = None,
     ) -> float | None:
-        """Computes the load balancing auxiliary loss to distribute tokens evenly across experts."""
+        """Compute the load balancing auxiliary loss for even expert utilization.
+
+        This method calculates an auxiliary loss term that encourages the router to
+        distribute tokens evenly across all experts, preventing expert collapse where
+        a few experts receive most tokens while others are underutilized.
+
+        The loss formulation depends on the chosen strategy:
+
+        **STANDARD:**
+            loss = lbl_coef * sum(f_i * p_i)
+            where f_i = (expert_loads[i] * n_experts) / k is the normalized fraction
+            of tokens to expert i, and p_i = mean(router_probs[:, i]) is the mean
+            routing probability to expert i across all tokens.
+
+        **SWITCH_TRANSFORMER:**
+            loss = lbl_coef * n_experts * sum(f_i * p_i)
+            where f_i = expert_loads[i] / n_tokens and p_i = mean(router_probs[:, i]).
+            This matches the formulation from the Switch Transformer paper.
+
+        **EXPERT_CHOICE:**
+            loss = lbl_coef * variance(expert_loads)
+            Penalizes variance in expert loads, encouraging uniform distribution.
+
+        Args:
+            router_probs: Router output probabilities for all tokens and experts.
+                Shape: (num_tokens, num_experts). These are the softmax-normalized
+                routing probabilities.
+            expert_loads: Count of tokens assigned to each expert.
+                Shape: (num_experts,). Computed via bincount of selected experts.
+            strategy: Load balancing strategy to use. If None, uses
+                self.load_balancing_strategy.
+
+        Returns:
+            The computed load balancing loss as a scalar float, or None if:
+                - strategy is MoeLoadBalancingStrategy.NONE
+                - self.lbl_coef is None (load balancing disabled)
+
+        Raises:
+            ValueError: If an unknown load balancing strategy is provided.
+
+        Example:
+            >>> # Compute loss during forward pass
+            >>> expert_loads = jnp.bincount(selected_experts.flatten(), length=n_experts)
+            >>> lb_loss = self._compute_load_balancing_loss(router_probs, expert_loads)
+            >>> if lb_loss is not None:
+            ...     total_loss = main_loss + lb_loss
+        """
         strategy = strategy or self.load_balancing_strategy
 
         if strategy == MoeLoadBalancingStrategy.NONE or self.lbl_coef is None:
@@ -458,7 +504,39 @@ class BaseMoeModule(nn.Module, ABC):
             raise ValueError(f"Unknown load balancing strategy: {strategy}")
 
     def _compute_router_z_loss(self, router_logits: Float[Array, "batch_seq num_experts"]) -> float | None:
-        """Computes the router z-loss to encourage small logit magnitudes for training stability."""
+        """Compute router z-loss to encourage numerical stability.
+
+        The router z-loss penalizes large router logit magnitudes, which helps prevent
+        router saturation and numerical instability. Large logits cause the softmax to
+        produce near-one-hot distributions, reducing exploration and making training
+        unstable.
+
+        The loss is computed as:
+            z_loss = rzl_coef * mean(logsumexp(logits)^2)
+
+        The logsumexp term measures the "size" of the logits - if all logits are large,
+        logsumexp will be large. Squaring and averaging creates a penalty that
+        encourages the router to keep logits in a reasonable range.
+
+        Args:
+            router_logits: Pre-softmax router output logits for all tokens.
+                Shape: (batch_size * seq_len, num_experts).
+
+        Returns:
+            The computed z-loss as a scalar float, or None if self.rzl_coef is None
+            (z-loss disabled).
+
+        Note:
+            This loss was introduced in the ST-MoE paper and is commonly used
+            alongside load balancing loss for stable MoE training.
+
+        Example:
+            >>> # During forward pass
+            >>> router_logits = gate_layer(hidden_states_flat)
+            >>> z_loss = self._compute_router_z_loss(router_logits)
+            >>> if z_loss is not None:
+            ...     aux_loss += z_loss
+        """
         if self.rzl_coef is None:
             return None
 
@@ -473,7 +551,51 @@ class BaseMoeModule(nn.Module, ABC):
         selected_weights: jax.Array,
         expert_loads: jax.Array,
     ) -> MoeMetrics:
-        """Computes and aggregates all MoE-related metrics and auxiliary losses."""
+        """Compute and aggregate all MoE-related metrics and auxiliary losses.
+
+        This method calculates various metrics useful for monitoring MoE training
+        health, including load balancing loss, router z-loss, expert utilization,
+        and routing entropy. These metrics help diagnose issues like expert collapse,
+        router saturation, and load imbalance.
+
+        Computed metrics include:
+            - **load_balancing_loss**: Auxiliary loss encouraging even expert usage
+            - **router_z_loss**: Auxiliary loss preventing large router logits
+            - **expert_utilization**: Fraction of experts receiving at least one token
+            - **routing_entropy**: Average entropy of routing distributions
+
+        Args:
+            router_logits: Pre-softmax router output logits.
+                Shape: (batch_size * seq_len, num_experts).
+            router_probs: Post-softmax routing probabilities.
+                Shape: (batch_size * seq_len, num_experts).
+            selected_experts: Expert indices selected for each token.
+                Shape: (batch_size * seq_len, num_experts_per_tok).
+            selected_weights: Weights for selected experts.
+                Shape: (batch_size * seq_len, num_experts_per_tok).
+            expert_loads: Number of tokens assigned to each expert.
+                Shape: (num_experts,).
+
+        Returns:
+            MoeMetrics dataclass containing:
+                - expert_loads: Input expert_loads array
+                - router_probs: Input router_probs array
+                - selected_experts: Input selected_experts array
+                - selected_weights: Input selected_weights array
+                - load_balancing_loss: Computed LB loss or None
+                - router_z_loss: Computed z-loss or None
+                - expert_utilization: Fraction of utilized experts (0 to 1)
+                - routing_entropy: Mean entropy of routing distributions
+
+        Example:
+            >>> metrics = self._compute_metrics(
+            ...     router_logits, router_probs, selected_experts, weights, loads
+            ... )
+            >>> print(f"Expert utilization: {metrics.expert_utilization:.2%}")
+            >>> print(f"Routing entropy: {metrics.routing_entropy:.3f}")
+            >>> if metrics.load_balancing_loss:
+            ...     aux_loss = metrics.load_balancing_loss + (metrics.router_z_loss or 0)
+        """
         metrics = MoeMetrics(
             expert_loads=expert_loads,
             router_probs=router_probs,
@@ -588,7 +710,31 @@ class BaseMoeModule(nn.Module, ABC):
     def _validate_routing_inputs(
         self, hidden_states: Float[Array, "batch seq hidden_dim"], router_logits: Float[Array, "batch_seq num_experts"]
     ) -> None:
-        """Validates the shapes of inputs for routing operations."""
+        """Validate input tensor shapes for routing operations.
+
+        Performs shape validation to ensure inputs are compatible with the MoE
+        configuration. This helps catch configuration errors early and provides
+        clear error messages.
+
+        Checks performed:
+            1. Hidden dimension matches config.hidden_size
+            2. Router logits expert dimension matches config.n_routed_experts
+            3. Router logits batch dimension matches flattened input batch
+
+        Args:
+            hidden_states: Input hidden states from transformer layer.
+                Shape: (batch_size, seq_len, hidden_dim).
+            router_logits: Router output logits for expert selection.
+                Shape: (batch_size * seq_len, num_experts).
+
+        Raises:
+            ValueError: If any shape validation fails, with a descriptive message
+                indicating the mismatch.
+
+        Example:
+            >>> # This will raise ValueError if shapes don't match
+            >>> self._validate_routing_inputs(hidden_states, router_logits)
+        """
         if hidden_states.shape[-1] != self.hidden_size:
             raise ValueError(
                 f"Input hidden dimension {hidden_states.shape[-1]} doesn't "
@@ -613,7 +759,48 @@ class BaseMoeModule(nn.Module, ABC):
         selected_weights: jax.Array,
         capacity_factor: float | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        """Applies soft capacity constraint to limit tokens per expert."""
+        """Apply soft capacity constraint to limit tokens per expert.
+
+        This method implements a soft capacity constraint by adjusting expert
+        weights based on how much each expert is over capacity. Unlike hard
+        capacity constraints (which drop tokens), this approach reduces weights
+        proportionally to the over-capacity ratio.
+
+        The algorithm:
+            1. Compute maximum capacity: cap = capacity_factor * n_tokens / n_experts
+            2. Count tokens assigned to each expert
+            3. Compute over-capacity ratio: max(count / cap, 1.0)
+            4. Scale weights by 1 / over_capacity_ratio
+            5. Re-normalize weights to sum to 1 per token
+
+        Args:
+            selected_experts: Expert indices for each token.
+                Shape: (batch_size * seq_len, num_experts_per_tok).
+            selected_weights: Weights for selected experts.
+                Shape: (batch_size * seq_len, num_experts_per_tok).
+            capacity_factor: Multiplier for base capacity. Base capacity is
+                n_tokens / n_experts (perfect balance). Values > 1.0 allow
+                experts to receive more tokens than perfect balance.
+                Defaults to 1.0 if None.
+
+        Returns:
+            Tuple of (selected_experts, constrained_weights) where:
+                - selected_experts: Unchanged expert indices
+                - constrained_weights: Adjusted weights with over-capacity
+                  experts receiving reduced contribution. Normalized to sum
+                  to 1 per token.
+
+        Note:
+            This is a "soft" constraint - no tokens are dropped, but over-used
+            experts have their contributions reduced. This maintains gradient
+            flow while encouraging load balance.
+
+        Example:
+            >>> # Apply capacity constraint with 1.5x buffer
+            >>> experts, weights = self._apply_capacity_constraint(
+            ...     selected_experts, selected_weights, capacity_factor=1.5
+            ... )
+        """
         if capacity_factor is None:
             capacity_factor = 1.0
         num_tokens = selected_experts.shape[0]
@@ -1168,7 +1355,64 @@ class BaseMoeModule(nn.Module, ABC):
         capacity_factor: float | None = None,
         output_metrics: bool = False,
     ):
-        """Dense MoE path using per-token batched matmuls instead of ragged grouping."""
+        """Dense MoE forward pass using per-token batched matmuls.
+
+        This method implements MoE using dense einsum operations instead of ragged
+        or grouped matrix multiplications. For each token, it selects the top-k
+        expert weight matrices and computes the expert outputs via batched
+        operations.
+
+        **Key Differences from Fused MoE:**
+            - Uses jnp.take to select expert weights per token
+            - Computes via einsum with token-local expert batching
+            - More memory intensive but works without grouped matmul kernels
+            - Good for debugging or when Pallas kernels are unavailable
+
+        **Algorithm:**
+            1. Compute router logits and probabilities
+            2. Select top-k experts per token
+            3. For each token, gather weights for selected experts
+            4. Compute expert FFN: act(x @ wi) * (x @ wu) @ wd
+            5. Combine expert outputs with weighted sum
+
+        **Hook Integration:**
+            Uses the MoeFusedHooks system for customization:
+            - before_gate: Preprocess hidden states
+            - after_gate: Postprocess gate logits
+            - before_topk: Modify router probs before selection
+            - select_hook: Custom expert selection
+            - refine_weights_hook: Modify selected weights
+            - before_wo: Modify intermediate before output projection
+            - after_wo: Modify expert outputs
+            - before_combine: Modify outputs/weights before combination
+            - finalize_output: Final output postprocessing
+
+        Args:
+            hidden_state: Input tensor. Shape: [B, S, H].
+            gate_layer: Router module mapping H -> E (produces logits).
+            wi_kernel: Expert W_i (gate) kernel. Shape: [E, H, M].
+            wu_kernel: Expert W_u (up) kernel. Shape: [E, H, M].
+            wd_kernel: Expert W_d (down) kernel. Shape: [E, M, H].
+            wi_bias: Optional bias for W_i. Shape: [E, M].
+            wu_bias: Optional bias for W_u. Shape: [E, M].
+            wd_bias: Optional bias for W_d. Shape: [E, H].
+            ffn_activation: Optional custom activation combining (w0, w1) -> output.
+                If None, uses act_fn(w0) * w1 (gated activation).
+            act_fn: Activation function used when ffn_activation is not provided.
+            capacity_factor: If provided, applies soft capacity constraints
+                to limit tokens per expert.
+            output_metrics: If True, returns MoeMetrics instead of router logits.
+
+        Returns:
+            Tuple of (output, metrics_or_logits) where:
+                - output: MoE layer output. Shape: [B, S, H].
+                - metrics_or_logits: MoeMetrics if output_metrics=True,
+                  else pre-softmax router logits with shape [B*S, E].
+
+        Note:
+            This method is slower than fused MoE but useful for debugging
+            and as a fallback when grouped matmul kernels are unavailable.
+        """
         self._configure_hooks_for_routing_strategy()
         hooks = self.moe_hooks
 

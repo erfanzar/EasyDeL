@@ -14,12 +14,37 @@
 
 """Compatibility shim for vLLM-style imports.
 
-vLLM keeps the ToolParser base class under `tool_parsers/abstract_tool_parser.py`.
-EasyDeL keeps it under `easydel.inference.tools.abstract_tool`.
+This module provides a compatibility layer for vLLM-style imports of the
+ToolParser base class and ToolParserManager registry.
 
-This module exists so code ported from vLLM (or referencing that layout)
-can import from `easydel.inference.tools.parsers.abstract_tool_parser` without
-needing to know EasyDeL's internal path.
+vLLM keeps the ToolParser base class under `tool_parsers/abstract_tool_parser.py`,
+while EasyDeL keeps it under `easydel.inference.tools.abstract_tool`. This module
+exists so code ported from vLLM (or referencing that layout) can import from
+`easydel.inference.tools.parsers.abstract_tool_parser` without needing to know
+EasyDeL's internal path.
+
+Re-exported Classes:
+    ToolParser: Abstract base class for implementing tool call parsers.
+        Provides the interface for extracting tool calls from LLM outputs
+        in both streaming and non-streaming modes.
+    ToolParserManager: Registry for tool parser implementations.
+        Manages registration and retrieval of parser classes by name,
+        enabling automatic parser selection based on model type.
+
+Example:
+    >>> from easydel.inference.tools.parsers.abstract_tool_parser import (
+    ...     ToolParser,
+    ...     ToolParserManager
+    ... )
+    >>> @ToolParserManager.register_module("custom")
+    ... class CustomToolParser(ToolParser):
+    ...     def extract_tool_calls(self, model_output, request):
+    ...         # Implementation here
+    ...         pass
+
+Note:
+    This module exists primarily for compatibility. For new code, consider
+    importing directly from `easydel.inference.tools.abstract_tool`.
 """
 
 from __future__ import annotations

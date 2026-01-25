@@ -12,6 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Utility functions for Rotary Position Embeddings (RoPE).
+
+This module provides low-level utility functions used in the computation and
+application of rotary positional embeddings. These functions are primarily
+internal helpers used by the main computation and module classes.
+
+Functions:
+    _yarn_find_correction_dim: Calculate correction dimension for YaRN scaling.
+    _yarn_find_correction_range: Find correction range bounds for YaRN scaling.
+    _yarn_linear_ramp_mask: Create linear ramp mask for YaRN scaling.
+    _yarn_get_mscale: Calculate mscale factor for YaRN context extension.
+    _rotate_neox: Apply Neox-style rotation to tensor.
+    _rotate_gptj: Apply GPT-J-style rotation to tensor.
+    _apply_rotary_emb: Apply rotary embedding to input tensor.
+    yarn_get_mscale: Calculate mscale with additional parameter (Deepseek variant).
+
+Note:
+    Functions prefixed with underscore are considered internal helpers.
+    The public `yarn_get_mscale` function is exported for external use.
+"""
+
 from __future__ import annotations
 
 import math

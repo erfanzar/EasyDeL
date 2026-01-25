@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Tool parser implementation for GigaChat3 models.
+
+This module provides a tool parser specifically designed for GigaChat3 model outputs.
+It handles the parsing of function calls in the format used by GigaChat3, which uses
+a "function call" prefix followed by JSON data containing the function name and arguments.
+
+The parser supports both complete extraction and streaming extraction modes, making it
+suitable for real-time inference scenarios.
+
+Example format:
+    function call<|role_sep|>
+    {"name": "function_name", "arguments": {"param": "value"}}
+"""
+
 from __future__ import annotations
 
 import json
@@ -42,7 +56,38 @@ ARGS_REGEX = re.compile(r'"arguments"\s*:\s*(.*)', re.DOTALL)
 
 @ToolParserManager.register_module("gigachat3")
 class GigaChat3ToolParser(ToolParser):
+    """Tool parser for GigaChat3 model outputs.
+
+    This parser handles the extraction of function/tool calls from GigaChat3 model
+    outputs. GigaChat3 uses a specific format where function calls are prefixed with
+    "function call" followed by optional role separator tokens and JSON data.
+
+    The parser maintains streaming state to handle incremental token generation,
+    buffering content until a complete function call can be identified and parsed.
+
+    Attributes:
+        tool_started: Flag indicating if a tool call has been detected in the stream.
+        tool_name_sent: Flag indicating if the tool name has been sent in streaming mode.
+        tool_id: The unique identifier for the current tool call being processed.
+        prev_tool_call_arr: List of previously parsed tool call dictionaries.
+        content_buffer: Buffer for accumulating content during streaming.
+        trigger_start: The prefix string that triggers tool call detection.
+
+    Example:
+        >>> parser = GigaChat3ToolParser(tokenizer)
+        >>> result = parser.extract_tool_calls(model_output, request)
+        >>> if result.tools_called:
+        ...     for tool_call in result.tool_calls:
+        ...         print(f"Function: {tool_call.function.name}")
+    """
+
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize the GigaChat3 tool parser.
+
+        Args:
+            tokenizer: A HuggingFace tokenizer instance used for token processing.
+                This tokenizer should be compatible with the GigaChat3 model.
+        """
         super().__init__(tokenizer)
         self.tool_started: bool = False
         self.tool_name_sent: bool = False
@@ -56,6 +101,32 @@ class GigaChat3ToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
+        """Extract tool calls from a complete model output.
+
+        Parses the model output to find and extract function calls in GigaChat3 format.
+        The function looks for the "function call" pattern followed by JSON data
+        containing "name" and "arguments" fields.
+
+        Args:
+            model_output: The complete text output from the model to parse.
+            request: The chat completion request that triggered this response.
+                Used for context but not directly in parsing.
+
+        Returns:
+            ExtractedToolCallInformation: An object containing:
+                - tools_called: True if valid tool calls were found, False otherwise.
+                - tool_calls: List of ToolCall objects representing parsed function calls.
+                - content: Any text content before the function call, or the full
+                    output if no valid function call was found.
+
+        Example:
+            >>> output = 'function call{"name": "search", "arguments": {"query": "test"}}'
+            >>> result = parser.extract_tool_calls(output, request)
+            >>> result.tools_called
+            True
+            >>> result.tool_calls[0].function.name
+            'search'
+        """
         match = REGEX_FUNCTION_CALL.search(model_output)
         if not match:
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
@@ -89,6 +160,36 @@ class GigaChat3ToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        """Extract tool calls incrementally during streaming generation.
+
+        Processes tokens as they are generated to progressively extract and emit
+        tool call information. This method maintains internal state to track the
+        progress of tool call parsing across multiple invocations.
+
+        The method buffers content and checks for the function call trigger pattern.
+        Once a function call is detected, it extracts the function name first, then
+        incrementally streams the arguments as they become available.
+
+        Args:
+            previous_text: The accumulated text from all previous tokens.
+            current_text: The complete text including the current delta.
+            delta_text: The new text added in this streaming step.
+            previous_token_ids: Token IDs from all previous generation steps.
+            current_token_ids: All token IDs including the current step.
+            delta_token_ids: The new token IDs added in this step.
+            request: The chat completion request for context.
+
+        Returns:
+            DeltaMessage or None: A delta message containing either:
+                - Content text if no tool call is in progress.
+                - Tool call information (name or argument delta) if parsing a function.
+                - None if buffering or waiting for more tokens.
+
+        Note:
+            This method modifies internal state (tool_started, tool_name_sent,
+            tool_id, prev_tool_call_arr, content_buffer) and should be called
+            sequentially for each streaming step.
+        """
         func_name = None
         cur_args = None
 

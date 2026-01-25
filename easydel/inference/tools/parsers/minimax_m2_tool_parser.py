@@ -12,6 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Minimax M2 tool parser with XML-style invoke and parameter tags.
+
+This module provides a tool call parser for Minimax M2 models that use
+a structured XML-like format with invoke and parameter tags. Unlike
+JSON-based parsers, this parser handles named parameter elements.
+
+Example format:
+    <minimax:tool_call>
+    <invoke name="function_name">
+    <parameter name="param1">value1</parameter>
+    <parameter name="param2">value2</parameter>
+    </invoke>
+    </minimax:tool_call>
+
+Features:
+    - XML-style invoke and parameter parsing
+    - Schema-aware type conversion for parameters
+    - Streaming support with incremental JSON generation
+    - Multi-tool support with index tracking
+    - Parameter type inference from tool definitions
+"""
+
 from __future__ import annotations
 
 import json
@@ -39,7 +61,54 @@ logger = get_logger(__name__)
 
 @ToolParserManager.register_module("minimax_m2")
 class MinimaxM2ToolParser(ToolParser):
+    """Tool parser for Minimax M2 models with XML-style tool calls.
+
+    Parses tool calls that use <minimax:tool_call>, <invoke>, and
+    <parameter> tags instead of JSON format. Supports schema-aware
+    type conversion for parameters.
+
+    Features:
+        - XML-style invoke and parameter parsing
+        - Schema-aware type conversion (int, float, bool, object, array)
+        - Streaming support with incremental JSON generation
+        - Multi-tool support with index tracking
+        - Parameter type inference from tool definitions
+
+    Format:
+        <minimax:tool_call>
+        <invoke name="function_name">
+        <parameter name="param1">value1</parameter>
+        </invoke>
+        </minimax:tool_call>
+
+    Attributes:
+        tool_call_start_token: Opening delimiter '<minimax:tool_call>'.
+        tool_call_end_token: Closing delimiter '</minimax:tool_call>'.
+        invoke_start_prefix: Prefix for invoke tags '<invoke name='.
+        invoke_end_token: Closing invoke tag '</invoke>'.
+        parameter_prefix: Prefix for parameter tags '<parameter name='.
+        parameter_end_token: Closing parameter tag '</parameter>'.
+
+    Raises:
+        ValueError: If tokenizer is None.
+        RuntimeError: If start/end tokens are not found in vocabulary.
+    """
+
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize the MinimaxM2ToolParser.
+
+        Sets up the parser with XML-style token patterns and initializes
+        streaming state. Validates tokenizer presence and token vocabulary.
+
+        Args:
+            tokenizer: The tokenizer associated with the Minimax M2 model.
+                Used for token-level operations during streaming.
+
+        Raises:
+            ValueError: If tokenizer is None.
+            RuntimeError: If tool call start/end tokens are not found
+                in the tokenizer vocabulary.
+        """
         super().__init__(tokenizer)
 
         self.prev_tool_call_arr: list[dict] = []
@@ -88,9 +157,21 @@ class MinimaxM2ToolParser(ToolParser):
             raise RuntimeError("MiniMax M2 Tool parser could not locate tool call start/end tokens in the tokenizer!")
 
     def _generate_tool_call_id(self) -> str:
+        """Generate a unique tool call ID.
+
+        Creates a unique identifier for a tool call using UUID.
+
+        Returns:
+            A unique string ID in format 'call_<24-char-hex>'.
+        """
         return f"call_{uuid.uuid4().hex[:24]}"
 
-    def _reset_streaming_state(self):
+    def _reset_streaming_state(self) -> None:
+        """Reset all streaming state to initial values.
+
+        Clears all state variables used during streaming to prepare
+        for a new tool call sequence.
+        """
         self.current_tool_index = 0
         self.invoke_index = 0
         self.is_tool_call_started = False
@@ -111,6 +192,16 @@ class MinimaxM2ToolParser(ToolParser):
         self.streamed_args_for_tool.clear()
 
     def _extract_name(self, name_str: str) -> str:
+        """Extract a name from a quoted or unquoted string.
+
+        Removes surrounding quotes (single or double) from the name string.
+
+        Args:
+            name_str: The name string, possibly wrapped in quotes.
+
+        Returns:
+            The extracted name without surrounding quotes.
+        """
         name_str = name_str.strip()
         if (name_str.startswith('"') and name_str.endswith('"')) or (
             name_str.startswith("'") and name_str.endswith("'")
@@ -119,9 +210,34 @@ class MinimaxM2ToolParser(ToolParser):
         return name_str
 
     def _convert_param_value(self, value: str, param_type: str) -> Any:
+        """Convert a parameter value based on a single type.
+
+        Convenience wrapper around _convert_param_value_with_types
+        for single type conversion.
+
+        Args:
+            value: The string value to convert.
+            param_type: The target type name.
+
+        Returns:
+            The converted value.
+        """
         return self._convert_param_value_with_types(value, [param_type])
 
     def _extract_types_from_schema(self, schema: Any) -> list[str]:
+        """Extract possible types from a JSON schema definition.
+
+        Analyzes a JSON schema to determine all possible types for a
+        parameter, including types from anyOf, oneOf, allOf constructs
+        and enum values.
+
+        Args:
+            schema: JSON schema dictionary or None.
+
+        Returns:
+            List of type strings (e.g., ['string', 'integer', 'null']).
+            Defaults to ['string'] if no types can be determined.
+        """
         if schema is None or not isinstance(schema, dict):
             return ["string"]
 
@@ -163,6 +279,20 @@ class MinimaxM2ToolParser(ToolParser):
         return list(types)
 
     def _convert_param_value_with_types(self, value: str, param_types: list[str]) -> Any:
+        """Convert a parameter value based on possible types.
+
+        Attempts to convert the string value to one of the specified
+        types in priority order: integer, number, boolean, object,
+        array, string.
+
+        Args:
+            value: The string value to convert.
+            param_types: List of possible type names.
+
+        Returns:
+            The converted value in the appropriate Python type.
+            Falls back to string if no conversion succeeds.
+        """
         if value.lower() == "null":
             return None
 
@@ -220,6 +350,19 @@ class MinimaxM2ToolParser(ToolParser):
             return value
 
     def _get_param_types_from_config(self, param_name: str, param_config: dict) -> list[str]:
+        """Get possible types for a parameter from tool configuration.
+
+        Looks up the parameter schema in the tool configuration and
+        extracts possible types.
+
+        Args:
+            param_name: Name of the parameter.
+            param_config: Dictionary mapping parameter names to schemas.
+
+        Returns:
+            List of possible type names for the parameter.
+            Defaults to ['string'] if not found.
+        """
         if param_name not in param_config:
             return ["string"]
         param_schema = param_config[param_name]
@@ -228,6 +371,19 @@ class MinimaxM2ToolParser(ToolParser):
         return self._extract_types_from_schema(param_schema)
 
     def _parse_single_invoke(self, invoke_str: str, tools: list | None) -> ToolCall | None:
+        """Parse a single invoke element into a ToolCall.
+
+        Extracts the function name and parameters from an invoke string,
+        converts parameter values based on tool schema, and creates
+        a ToolCall object.
+
+        Args:
+            invoke_str: The content of an invoke element (after 'name=').
+            tools: List of available tool definitions for type inference.
+
+        Returns:
+            ToolCall object or None if parsing fails.
+        """
         name_match = re.search(r"^([^>]+)", invoke_str)
         if not name_match:
             return None
@@ -268,6 +424,21 @@ class MinimaxM2ToolParser(ToolParser):
         )
 
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
+        """Extract tool calls from a complete model response.
+
+        Parses all tool call blocks in the model output and extracts
+        invoke elements with their parameters.
+
+        Args:
+            model_output: Complete model output string.
+            request: Chat completion request containing tool definitions.
+
+        Returns:
+            ExtractedToolCallInformation containing:
+                - tools_called: True if valid tool calls were found
+                - tool_calls: List of ToolCall objects extracted
+                - content: Text content before tool calls, None if none
+        """
         if self.tool_call_start_token not in model_output:
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
@@ -307,6 +478,26 @@ class MinimaxM2ToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        """Extract tool calls incrementally during streaming.
+
+        Processes streaming output to detect invoke and parameter tags,
+        generating JSON argument fragments as they become available.
+
+        Args:
+            previous_text: Text accumulated before this delta.
+            current_text: Complete text including the current delta.
+            delta_text: The new text added in this streaming chunk.
+            previous_token_ids: Token IDs before this delta.
+            current_token_ids: All token IDs including current delta.
+            delta_token_ids: Token IDs in the current delta.
+            request: The chat completion request with tool definitions.
+
+        Returns:
+            DeltaMessage containing either:
+                - content: Regular text content before tool calls
+                - tool_calls: Tool call deltas with function name or arguments
+            Returns None if more tokens are needed.
+        """
         if not previous_text or self.tool_call_start_token in delta_text:
             self._reset_streaming_state()
             self.streaming_request = request

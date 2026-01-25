@@ -269,10 +269,20 @@ class eSurgeRunner:
 
     @property
     def mesh(self):
+        """Get the JAX sharding mesh from the model.
+
+        Returns:
+            The JAX mesh used for distributed execution.
+        """
         return self.model.mesh
 
     @property
     def _empty_sharding(self):
+        """Get empty sharding for replicated arrays.
+
+        Returns:
+            NamedSharding with empty PartitionSpec for fully replicated arrays.
+        """
         return jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
 
     @staticmethod
@@ -311,6 +321,16 @@ class eSurgeRunner:
 
     @staticmethod
     def _get_request_paddings(min_bucket: int, max_bucket: int) -> list[int]:
+        """Generate request count buckets using exponential growth.
+
+        Args:
+            min_bucket: Minimum bucket size.
+            max_bucket: Maximum bucket size (must be included).
+
+        Returns:
+            List of bucket sizes from min_bucket to max_bucket,
+            doubling at each step.
+        """
         min_bucket = max(1, min(min_bucket, max_bucket))
         buckets: list[int] = []
         current = min_bucket
@@ -327,6 +347,16 @@ class eSurgeRunner:
         max_num_seqs: int,
         min_input_pad: int,
     ) -> list[int]:
+        """Initialize sequence count buckets for compilation.
+
+        Args:
+            user_buckets: Optional user-provided bucket sizes.
+            max_num_seqs: Maximum number of sequences.
+            min_input_pad: Minimum input padding.
+
+        Returns:
+            Sorted list of bucket sizes, always including max_num_seqs.
+        """
         if user_buckets:
             buckets = sorted({int(b) for b in user_buckets if 0 < int(b) <= max_num_seqs})
         else:
@@ -404,6 +434,26 @@ class eSurgeRunner:
         num_tokens_static: int,
         uses_mrope_model: bool,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, list[np.ndarray] | None]:
+        """Get or create cached CPU buffers for VLM prefill data.
+
+        Retrieves pre-allocated CPU buffers for VLM embedding overrides,
+        keyed by num_tokens_static to avoid repeated allocations while
+        keeping the step function input shape stable.
+
+        Args:
+            num_tokens_static: Token count bucket size for buffer sizing.
+            uses_mrope_model: Whether the model uses mRoPE positions.
+
+        Returns:
+            Tuple of (prefill_embeds_cpu, prefill_embeds_mask_cpu,
+            mrope_position_ids_cpu, visual_pos_masks_cpu,
+            deepstack_visual_embeds_cpu) where optional arrays are
+            None if not applicable.
+
+        Side Effects:
+            - Creates and caches buffers in self._vlm_cpu_buffers.
+            - Clears masks/position buffers each call (filled by caller).
+        """
         num_tokens_static = int(num_tokens_static)
         cached = self._vlm_cpu_buffers.get(num_tokens_static)
         if cached is None:
@@ -463,6 +513,23 @@ class eSurgeRunner:
         precompile_allowed_mask: bool = False,
         allowed_max: int = 512,
     ) -> None:
+        """Precompile JIT helper kernels for various input configurations.
+
+        Compiles auxiliary JIT functions (pack_prompts, build_sampling_arrays,
+        fill_slice, swap_rows, move_row, build_allowed_mask) for different
+        request and prompt length combinations to avoid runtime compilation.
+
+        Args:
+            reqs_padds: List of request count bucket sizes to compile.
+            prompt_len_buckets: List of prompt length bucket sizes to compile.
+            precompile_allowed_mask: Whether to compile allowed mask kernel.
+            allowed_max: Maximum allowed token count for constrained decoding.
+
+        Note:
+            Compilation failures are logged at debug level and skipped,
+            allowing partial precompilation when some configurations are
+            not supported by the underlying kernels.
+        """
         logger.info("Precompiling eSurgeRunner helper kernels")
 
         B = self.max_num_reqs
@@ -994,7 +1061,19 @@ class eSurgeRunner:
         return placeholder_req_id_to_index
 
     def _reorder_decode_first(self, scheduler_output: SchedulerOutput) -> None:
-        """Reorder active requests so decode tokens are placed first."""
+        """Reorder active requests so decode requests are placed first.
+
+        Partitions the request buffer so all decode requests (single token,
+        with computed tokens > 0) appear before prefill requests. This ordering
+        matches the TPU runner behavior and enables optimized v3 attention
+        with request distribution.
+
+        Args:
+            scheduler_output: Used to determine scheduled tokens per request.
+
+        Side Effects:
+            - Modifies sequence_buffer ordering via swap_states().
+        """
         i, j = 0, self.sequence_buffer.num_reqs - 1
         while i < j:
             i_req_id = self.sequence_buffer.req_ids[i]
@@ -1499,6 +1578,24 @@ class eSurgeRunner:
         )
 
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
+        """Execute the model synchronously on scheduled requests.
+
+        Main public entry point for model execution. Delegates to the internal
+        implementation which handles state synchronization, batch processing,
+        and token generation.
+
+        Args:
+            scheduler_output: Output from the scheduler containing requests to
+                process, tokens to generate per request, and lifecycle information.
+
+        Returns:
+            ModelRunnerOutput containing request IDs, sampled tokens, and optional
+            log probabilities and timing information.
+
+        Note:
+            This is the synchronous version. For async execution that allows
+            overlapping with scheduling, use execute_model_async() instead.
+        """
         return self._execute_model_impl(scheduler_output)
 
     def execute_model_async(self, scheduler_output: SchedulerOutput) -> Future[ModelRunnerOutput]:

@@ -9,7 +9,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Mixin class for tool calling functionality in inference servers."""
+"""Mixin class for tool calling functionality in inference servers.
+
+This module provides the ToolCallingMixin class which adds tool/function calling
+capabilities to inference API servers. It handles the initialization of tool parsers,
+extraction of tool calls from both batch and streaming responses, and provides
+utility methods for tool-related API endpoints.
+
+The mixin is designed to be used with FastAPI-based inference servers that
+implement OpenAI-compatible chat completion APIs.
+
+Example:
+    >>> from easydel.inference.tools import ToolCallingMixin
+    >>>
+    >>> class ChatCompletionServer(ToolCallingMixin):
+    ...     def __init__(self, model_processors, tool_parser_name="hermes"):
+    ...         self.tool_parsers = self.initialize_tool_parsers(
+    ...             model_processors,
+    ...             tool_parser_name,
+    ...             enable_function_calling=True
+    ...         )
+    ...
+    ...     def generate_response(self, request, response_text):
+    ...         message, finish_reason = self.extract_tool_calls_batch(
+    ...             response_text, request, "my_model"
+    ...         )
+    ...         return message, finish_reason
+
+See Also:
+    - easydel.inference.tools.abstract_tool.ToolParser: Base parser class
+    - easydel.inference.tools.abstract_tool.ToolParserManager: Parser registry
+"""
 
 from __future__ import annotations
 
@@ -28,16 +58,37 @@ logger = get_logger("ToolCallingMixin")
 class ToolCallingMixin:
     """Mixin class providing tool calling functionality for inference API servers.
 
-    This mixin provides:
-    - Tool parser initialization and management
-    - Tool call extraction for batch responses
-    - Tool call extraction for streaming responses
-    - Tool listing and metadata endpoints
+    This mixin provides comprehensive tool calling support for inference servers,
+    including parser initialization, tool call extraction for both batch and
+    streaming responses, and utility methods for tool-related API endpoints.
 
-    Classes using this mixin should have:
-    - self.tool_parsers: dict[str, ToolParser]
-    - self.tool_parser_name: str
-    - self.enable_function_calling: bool
+    The mixin is designed to be inherited by inference server classes that need
+    to support OpenAI-compatible function/tool calling APIs.
+
+    Attributes:
+        tool_parsers (dict[str, ToolParser]): Dictionary mapping model names to
+            their corresponding tool parser instances. This attribute should be
+            set by calling initialize_tool_parsers() during server initialization.
+
+    Note:
+        Classes using this mixin should have the following attributes available:
+            - self.tool_parsers: dict[str, ToolParser] - Set via initialize_tool_parsers()
+            - self.tool_parser_name: str - Name of the parser being used (optional)
+            - self.enable_function_calling: bool - Whether function calling is enabled (optional)
+
+    Example:
+        >>> class MyServer(ToolCallingMixin):
+        ...     def __init__(self, tokenizers, parser_name):
+        ...         self.tool_parser_name = parser_name
+        ...         self.enable_function_calling = True
+        ...         self.tool_parsers = self.initialize_tool_parsers(
+        ...             tokenizers, parser_name, True
+        ...         )
+        ...
+        ...     def handle_completion(self, request, model_output, model_name):
+        ...         return self.extract_tool_calls_batch(
+        ...             model_output, request, model_name
+        ...         )
     """
 
     tool_parsers: dict[str, ToolParser]
@@ -48,15 +99,40 @@ class ToolCallingMixin:
         tool_parser_name: str,
         enable_function_calling: bool,
     ) -> dict[str, ToolParser]:
-        """Initialize tool parsers for models.
+        """Initialize tool parsers for all registered models.
+
+        Creates tool parser instances for each model using the specified parser
+        implementation. This method should be called during server initialization
+        to set up tool calling capabilities.
 
         Args:
-            model_processors: Dictionary mapping model names to their processors/tokenizers
-            tool_parser_name: Name of the tool parser to use (e.g., "hermes", "qwen")
-            enable_function_calling: Whether to enable function calling
+            model_processors (dict[str, tp.Any]): Dictionary mapping model names
+                to their tokenizers/processors. Each processor should be compatible
+                with the tool parser's requirements.
+            tool_parser_name (str): Name of the tool parser to use. Must be a
+                registered parser name (e.g., "hermes", "qwen", "mistral").
+                See ToolParserManager for available parsers.
+            enable_function_calling (bool): Whether to enable function calling.
+                If False, returns an empty dictionary and no parsers are initialized.
 
         Returns:
-            Dictionary mapping model names to their tool parsers
+            dict[str, ToolParser]: Dictionary mapping model names to their
+                initialized tool parser instances. Returns an empty dictionary
+                if enable_function_calling is False or if parser initialization
+                fails for all models.
+
+        Example:
+            >>> processors = {"gpt-model": tokenizer1, "llama-model": tokenizer2}
+            >>> parsers = self.initialize_tool_parsers(
+            ...     processors, "hermes", enable_function_calling=True
+            ... )
+            >>> print(parsers.keys())
+            dict_keys(['gpt-model', 'llama-model'])
+
+        Note:
+            If initialization fails for a specific model (e.g., parser not found
+            or incompatible tokenizer), a warning is logged and that model is
+            skipped. Other models will still be initialized.
         """
         tool_parsers = {}
 
@@ -81,15 +157,40 @@ class ToolCallingMixin:
         request: ChatCompletionRequest,
         model_name: str,
     ) -> tuple[ChatMessage, str]:
-        """Extract tool calls from a batch response.
+        """Extract tool calls from a complete (non-streaming) response.
+
+        Parses the complete model response to identify and extract any tool/function
+        calls. This method is used for batch (non-streaming) completions where the
+        entire response is available at once.
 
         Args:
-            response_text: The generated text response
-            request: The original chat completion request
-            model_name: The model name to get the appropriate parser
+            response_text (str): The complete generated text response from the model.
+            request (ChatCompletionRequest): The original chat completion request
+                containing tool definitions and other parameters.
+            model_name (str): The name of the model that generated the response.
+                Used to look up the appropriate parser.
 
         Returns:
-            Tuple of (ChatMessage with potential tool calls, finish_reason)
+            tuple[ChatMessage, str]: A tuple containing:
+                - ChatMessage: The assistant message with role, content, and
+                  optional tool_calls field populated if tools were detected.
+                - str: The finish_reason - "function_call" if tools were called,
+                  or "stop" for regular text completion.
+
+        Example:
+            >>> response = '<tool_call>{"name": "get_weather", "arguments": {"city": "NYC"}}</tool_call>'
+            >>> message, reason = self.extract_tool_calls_batch(
+            ...     response, request, "my_model"
+            ... )
+            >>> print(reason)
+            'function_call'
+            >>> print(message.tool_calls[0].function.name)
+            'get_weather'
+
+        Note:
+            If no tool parser is available for the model or if no tools are
+            detected in the response, returns the original text as content
+            with finish_reason "stop".
         """
         if not hasattr(self, "tool_parsers") or model_name not in self.tool_parsers:
             return ChatMessage(role="assistant", content=response_text), "stop"
@@ -124,20 +225,47 @@ class ToolCallingMixin:
         delta_token_ids: list[int] | None = None,
         request: ChatCompletionRequest | None = None,
     ) -> DeltaMessage | None:
-        """Extract tool calls from streaming response.
+        """Extract tool calls from streaming response chunks.
+
+        Processes incremental model output to identify partial tool calls and emit
+        appropriate streaming updates. This method maintains state across calls
+        (via the parser instance) to handle incomplete JSON/XML structures as
+        they are being generated.
 
         Args:
-            model_name: The model name to get the appropriate parser
-            previous_text: Previously accumulated text
-            current_text: Current accumulated text
-            delta_text: New text in this chunk
-            previous_token_ids: Previous token IDs (optional)
-            current_token_ids: Current token IDs (optional)
-            delta_token_ids: Delta token IDs (optional)
-            request: The original request (optional)
+            model_name (str): The name of the model generating the response.
+                Used to look up the appropriate parser.
+            previous_text (str): The accumulated text up to the previous call.
+            current_text (str): The accumulated text including the current chunk.
+            delta_text (str): The new text in the current streaming chunk.
+            previous_token_ids (list[int] | None, optional): Token IDs accumulated
+                up to the previous call. Defaults to None (treated as empty list).
+            current_token_ids (list[int] | None, optional): Token IDs including
+                the current chunk. Defaults to None (treated as empty list).
+            delta_token_ids (list[int] | None, optional): New token IDs in the
+                current chunk. Defaults to None (treated as empty list).
+            request (ChatCompletionRequest | None, optional): The original request
+                containing tool definitions. Defaults to None.
 
         Returns:
-            DeltaMessage with tool call information or None
+            DeltaMessage | None: A DeltaMessage containing incremental tool call
+                information (tool call index, function name delta, arguments delta),
+                or None if no tool call update is available for this chunk.
+
+        Example:
+            >>> # First chunk with tool call start
+            >>> delta1 = self.extract_tool_calls_streaming(
+            ...     "model", "", "<tool_call>", "<tool_call>"
+            ... )
+            >>> # Subsequent chunk with function name
+            >>> delta2 = self.extract_tool_calls_streaming(
+            ...     "model", "<tool_call>", '<tool_call>{"name":', '{"name":'
+            ... )
+
+        Note:
+            This method is stateful - the parser instance maintains state across
+            calls to track parsing progress. Make sure to use the same model_name
+            consistently for a single streaming session.
         """
         if not hasattr(self, "tool_parsers") or model_name not in self.tool_parsers:
             return None
@@ -159,26 +287,54 @@ class ToolCallingMixin:
         )
 
     def get_tool_parser_for_model(self, model_name: str) -> ToolParser | None:
-        """Get the tool parser for a specific model.
+        """Get the tool parser instance for a specific model.
+
+        Retrieves the tool parser that was initialized for the given model name.
+        Useful for direct access to parser methods or configuration.
 
         Args:
-            model_name: Name of the model
+            model_name (str): The name of the model to get the parser for.
 
         Returns:
-            ToolParser instance or None if not available
+            ToolParser | None: The ToolParser instance for the model, or None
+                if no parser is available (either tool_parsers not initialized
+                or model not found).
+
+        Example:
+            >>> parser = self.get_tool_parser_for_model("my_model")
+            >>> if parser:
+            ...     adjusted_request = parser.adjust_request(original_request)
         """
         if not hasattr(self, "tool_parsers"):
             return None
         return self.tool_parsers.get(model_name)
 
     def create_tools_response(self, model_names: list[str]) -> dict[str, tp.Any]:
-        """Create a standardized tools response for listing endpoints.
+        """Create a standardized tools response for API listing endpoints.
+
+        Generates a response object containing tool information for each model,
+        suitable for returning from a /tools or /models endpoint. Includes
+        example tool definitions and supported formats.
 
         Args:
-            model_names: List of available model names
+            model_names (list[str]): List of model names to include in the response.
 
         Returns:
-            Dictionary with tools information for each model
+            dict[str, tp.Any]: A dictionary containing:
+                - "models": dict mapping model names to their tool configurations,
+                  where each configuration includes:
+                    - "tools": list of example tool definitions
+                    - "tool_parser": name of the parser being used (or None)
+                    - "formats_supported": list of all registered parser names
+                    - "parallel_calls": bool indicating parallel call support
+                - "default_format": the default tool format ("openai")
+
+        Example:
+            >>> response = self.create_tools_response(["model1", "model2"])
+            >>> print(response["default_format"])
+            'openai'
+            >>> print(response["models"]["model1"]["formats_supported"])
+            ['hermes', 'qwen', 'mistral', ...]
         """
         tools_by_model = {}
 
@@ -221,8 +377,20 @@ class ToolCallingMixin:
     def create_tool_execution_placeholder(self) -> JSONResponse:
         """Create a placeholder response for tool execution endpoints.
 
+        Returns a NOT_IMPLEMENTED response indicating that the tool execution
+        endpoint needs to be implemented by the user. This is a placeholder
+        that should be replaced with actual tool execution logic.
+
         Returns:
-            JSONResponse with NOT_IMPLEMENTED status
+            JSONResponse: A FastAPI JSONResponse with HTTP 501 NOT_IMPLEMENTED
+                status and an error message explaining that the endpoint needs
+                implementation.
+
+        Example:
+            >>> @app.post("/tools/execute")
+            ... def execute_tool(self, request: ToolExecuteRequest):
+            ...     # Replace this with actual implementation
+            ...     return self.create_tool_execution_placeholder()
         """
         error_response = {
             "error": {

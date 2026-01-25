@@ -11,6 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Phi-4 Mini JSON tool parser module.
+
+This module provides the Phi4MiniJsonToolParser class for parsing tool calls
+in the functools format used by Phi-4-mini models. The parser extracts
+function calls from a functools[...] wrapper containing JSON array content.
+
+Example format parsed:
+    functools[{"name": "func_name", "arguments": {"arg1": "value1"}}]
+"""
+
 import json
 import re
 from collections.abc import Sequence
@@ -34,29 +45,44 @@ logger = get_logger(__name__)
 
 @ToolParserManager.register_module("phi4_mini_json")
 class Phi4MiniJsonToolParser(ToolParser):
-    """
-    Tool call parser for Phi-4-mini models.
+    """Tool call parser for Phi-4-mini models.
 
     Handles the functools format used by Phi-4-mini models. Extracts
     function calls from functools[...] wrapper with JSON array content.
     Currently supports non-streaming extraction only.
 
     Features:
-    - Regex-based extraction of functools wrapper
-    - JSON array parsing of function calls
-    - Support for both 'arguments' and 'parameters' fields
-    - Automatic tool ID generation
+        - Regex-based extraction of functools wrapper
+        - JSON array parsing of function calls
+        - Support for both 'arguments' and 'parameters' fields
+        - Automatic tool ID generation
 
     Format:
-    functools[{"name": "func", "arguments": {...}}, ...]
+        functools[{"name": "func", "arguments": {...}}, ...]
 
     Used when --enable-auto-tool-choice --tool-call-parser phi4_mini_json
     are all set.
 
-    Note: Streaming extraction is not yet implemented (returns None).
+    Note:
+        Streaming extraction is not yet implemented (returns None).
+
+    Attributes:
+        prev_tool_call_arr: List of previously parsed tool calls as dicts.
+        current_tool_id: Index of the current tool being processed.
+        current_tool_name_sent: Whether the current tool name has been sent.
+        streamed_args_for_tool: List of streamed arguments per tool.
+        bot_token: The token that marks the beginning of tool calls.
     """
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
+        """Initialize the Phi-4 Mini JSON tool parser.
+
+        Sets up the parser with the functools token marker and initializes
+        tracking state for tool call extraction.
+
+        Args:
+            tokenizer: The tokenizer instance used for encoding/decoding tokens.
+        """
         super().__init__(tokenizer)
 
         self.prev_tool_call_arr: list[dict[str, Any]] = []
@@ -66,8 +92,20 @@ class Phi4MiniJsonToolParser(ToolParser):
         self.bot_token: str = "functools"
 
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
-        """
-        Extract the tool calls from a complete model response.
+        """Extract tool calls from a complete model response.
+
+        Parses the model output to find functools[...] patterns and extracts
+        the JSON-encoded function calls within.
+
+        Args:
+            model_output: The complete model output string to parse.
+            request: The chat completion request (unused but required by interface).
+
+        Returns:
+            ExtractedToolCallInformation containing:
+                - tools_called: True if any valid tool calls were found
+                - tool_calls: List of parsed ToolCall objects
+                - content: The original output if no tools found, else None
         """
         logger.debug("Model output: %s", model_output)
 
@@ -121,4 +159,21 @@ class Phi4MiniJsonToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        """Extract tool calls from streaming model output.
+
+        Note:
+            This method is not yet implemented for Phi-4 Mini models.
+
+        Args:
+            previous_text: The accumulated text from previous chunks.
+            current_text: The current accumulated text including the new delta.
+            delta_text: The new text in this chunk.
+            previous_token_ids: Token IDs from previous chunks.
+            current_token_ids: All token IDs including the new chunk.
+            delta_token_ids: Token IDs for just the new chunk.
+            request: The chat completion request.
+
+        Returns:
+            None, as streaming is not implemented.
+        """
         return None

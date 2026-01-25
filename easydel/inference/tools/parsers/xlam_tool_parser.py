@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""xLAM tool parser module.
+
+This module provides the xLAMToolParser class for parsing tool calls in various
+formats used by xLAM and similar models. It supports multiple tool call formats
+including JSON code blocks, [TOOL_CALLS] markers, and XML-style tool_call tags.
+
+Supported formats:
+    - ```json [...] ```
+    - [TOOL_CALLS] [...]
+    - <tool_call>...</tool_call>
+    - </think>[...]  (thinking mode)
+    - Raw JSON arrays starting with [
+"""
+
 from __future__ import annotations
 
 import json
@@ -38,16 +52,66 @@ logger = get_logger(__name__)
 
 
 def _random_uuid() -> str:
+    """Generate a random UUID hex string.
+
+    Returns:
+        A 32-character hexadecimal string from a UUID4.
+    """
     return uuid4().hex
 
 
 def _make_tool_call_id() -> str:
+    """Generate a unique tool call ID.
+
+    Returns:
+        A string in the format "chatcmpl-tool-<uuid>" where uuid is a
+        full UUID4 string.
+    """
     return f"chatcmpl-tool-{uuid4()}"
 
 
 @ToolParserManager.register_module("xlam")
 class xLAMToolParser(ToolParser):
+    """Tool parser for xLAM and similar models with flexible JSON formats.
+
+    Handles multiple tool call formats including JSON code blocks, TOOL_CALLS
+    markers, XML-style tags, and thinking mode output. Supports both complete
+    and streaming extraction.
+
+    Features:
+        - Multiple format detection (JSON blocks, markers, tags)
+        - Thinking mode support (</think> prefix)
+        - Stateful streaming with argument diffing
+        - Backward compatibility with various serving implementations
+
+    Supported formats:
+        - ```json [...] ``` - JSON code blocks
+        - [TOOL_CALLS] [...] - TOOL_CALLS marker
+        - <tool_call>...</tool_call> - XML-style tags
+        - </think>[...] - Thinking mode output
+        - [...] - Raw JSON arrays
+
+    Attributes:
+        prev_tool_calls: List of previously parsed tool calls.
+        current_tool_id: Index of the current tool being processed.
+        current_tool_name_sent: Whether the current tool name has been sent.
+        streamed_args: List of streamed arguments per tool.
+        current_tools_sent: Backward compatibility list for sent tool tracking.
+        prev_tool_call_arr: Backward compatibility list for tool calls.
+        json_code_block_patterns: Regex patterns for detecting JSON blocks.
+        thinking_tag_pattern: Regex pattern for thinking mode output.
+        streaming_state: State dictionary for streaming extraction.
+    """
+
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize the xLAM tool parser.
+
+        Sets up regex patterns for various tool call formats and initializes
+        tracking state for both complete and streaming extraction.
+
+        Args:
+            tokenizer: The tokenizer instance used for encoding/decoding tokens.
+        """
         super().__init__(tokenizer)
 
         self.prev_tool_calls: list[dict] = []
@@ -73,6 +137,19 @@ class xLAMToolParser(ToolParser):
         }
 
     def preprocess_model_output(self, model_output: str) -> tuple[str | None, str | None]:
+        """Preprocess model output to extract potential tool calls.
+
+        Examines the model output for various tool call formats and separates
+        regular content from tool call JSON.
+
+        Args:
+            model_output: The raw model output string to preprocess.
+
+        Returns:
+            A tuple of (content, tool_calls_json) where:
+                - content: Text content outside of tool calls (may be None)
+                - tool_calls_json: JSON string of tool calls if found (may be None)
+        """
         thinking_match = re.search(self.thinking_tag_pattern, model_output)
         if thinking_match:
             content = model_output[: thinking_match.start() + len("</think>")].strip()
@@ -114,6 +191,21 @@ class xLAMToolParser(ToolParser):
         return model_output, None
 
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
+        """Extract tool calls from a complete model output.
+
+        Preprocesses the output to find tool call JSON, then parses each
+        tool call into ToolCall objects.
+
+        Args:
+            model_output: The complete model output string to parse.
+            request: The chat completion request (unused but required by interface).
+
+        Returns:
+            ExtractedToolCallInformation containing:
+                - tools_called: True if valid tool calls were found
+                - tool_calls: List of parsed ToolCall objects
+                - content: Text content if found, else original output on failure
+        """
         try:
             content, potential_tool_calls = self.preprocess_model_output(model_output)
             if not potential_tool_calls:
@@ -157,6 +249,27 @@ class xLAMToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        """Extract tool calls from streaming model output.
+
+        Processes incremental output to detect tool calls and stream
+        function names and arguments as they become available. Uses
+        stateful tracking to send only new content.
+
+        Args:
+            previous_text: The accumulated text from previous chunks.
+            current_text: The current accumulated text including the new delta.
+            delta_text: The new text in this chunk.
+            previous_token_ids: Token IDs from previous chunks.
+            current_token_ids: All token IDs including the new chunk.
+            delta_token_ids: Token IDs for just the new chunk.
+            request: The chat completion request.
+
+        Returns:
+            A DeltaMessage containing either:
+                - content: Regular text if no tool call detected
+                - tool_calls: Delta with function name or argument fragments
+                - None if more data needed or no new content to send
+        """
         stripped_text = current_text.strip()
         _, preprocessed_tool_calls = self.preprocess_model_output(current_text)
 

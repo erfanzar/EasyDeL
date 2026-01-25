@@ -12,6 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ragged/paged KV-cache implementation for efficient memory management.
+
+This module provides a paged attention KV-cache implementation that supports
+efficient memory management through page-based allocation. The cache divides
+the key-value storage into fixed-size pages, enabling:
+
+- Better memory utilization through page-level allocation
+- Support for variable-length sequences without padding waste
+- Efficient batch processing with mixed sequence lengths
+- Hardware-accelerated cache updates on TPU
+
+Key Components:
+    - RaggedPagesCacheConfig: Configuration for paged cache dimensions and layout
+    - RaggedPagesCacheView: Per-layer view into the shared page pool
+    - RaggedPagesCache: Complete multi-layer cache container
+    - RaggedPagesMetadata: Runtime metadata for paged attention operations
+
+Versions:
+    - v3: New format with packed KV heads and improved memory layout
+    - v2: Legacy format with slot-mapping-based updates
+
+Example:
+    >>> config = RaggedPagesCacheConfig.create(
+    ...     mesh=mesh,
+    ...     partition_manager=pm,
+    ...     kvdtype=jnp.bfloat16,
+    ...     num_hidden_layers=32,
+    ...     num_kv_heads=8,
+    ...     max_model_length=8192,
+    ...     kv_head_dim_size=128,
+    ...     page_size=128
+    ... )
+    >>> cache = RaggedPagesCache.init_cache(mesh, config, pm)
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -50,16 +85,47 @@ PERMITTED_KV_KERNELS = check_bool_flag("PERMITTED_KV_KERNELS")
 
 
 def cdiv(a: int, b: int) -> int:
+    """Ceiling division: compute ceil(a / b) using integer arithmetic.
+
+    Args:
+        a: Numerator.
+        b: Denominator (must be positive).
+
+    Returns:
+        int: Ceiling of a / b.
+    """
     return (a + b - 1) // b
 
 
 def previous_power_of_2(n: int) -> int:
+    """Find the largest power of 2 less than or equal to n.
+
+    Args:
+        n: Input integer.
+
+    Returns:
+        int: Largest power of 2 <= n, or 0 if n <= 0.
+    """
     if n <= 0:
         return 0
     return 1 << (n.bit_length() - 1)
 
 
 def get_num_slices_per_kv_cache_update_page(page_size_bytes: int) -> int:
+    """Calculate the number of update slices per processing page.
+
+    Determines how many cache update slices fit in a 16MB processing
+    page, capped at 64 for efficiency.
+
+    Args:
+        page_size_bytes: Size of one KV cache page in bytes.
+
+    Returns:
+        int: Number of slices per processing page (power of 2, max 64).
+
+    Raises:
+        AssertionError: If page_size_bytes is too large (slices <= 0).
+    """
     num_slices_per_page = (16 * 1024 * 1024) // page_size_bytes
     assert num_slices_per_page > 0, "Number of slices should be positive"
     num_slices_per_page = previous_power_of_2(num_slices_per_page)
@@ -69,6 +135,17 @@ def get_num_slices_per_kv_cache_update_page(page_size_bytes: int) -> int:
 
 
 def get_dtype_packing(dtype: jnp.dtype) -> int:
+    """Get the packing factor for a dtype (elements per 32 bits).
+
+    Args:
+        dtype: JAX/NumPy dtype to analyze.
+
+    Returns:
+        int: Number of elements that fit in 32 bits.
+
+    Raises:
+        ValueError: If bit width doesn't divide 32 evenly.
+    """
     bits = jnp.finfo(dtype).bits
     if 32 % bits != 0:
         raise ValueError(f"The bit width must be divisible by 32, but got bits={bits}, dtype={{dtype}}")
@@ -76,6 +153,15 @@ def get_dtype_packing(dtype: jnp.dtype) -> int:
 
 
 def align_to_multiple(value: int, multiple: int) -> int:
+    """Align a value up to the nearest multiple.
+
+    Args:
+        value: Value to align.
+        multiple: Alignment boundary.
+
+    Returns:
+        int: Smallest multiple of `multiple` >= `value`.
+    """
     return cdiv(value, multiple) * multiple
 
 
@@ -85,7 +171,20 @@ def get_page_size_bytes(
     head_size: int,
     kv_cache_dtype: jnp.dtype,
 ) -> int:
-    """Returns the size in bytes of one page of the KV cache."""
+    """Calculate the size in bytes of one page of the KV cache.
+
+    Accounts for alignment requirements and dtype packing to compute
+    the actual memory footprint of a single cache page.
+
+    Args:
+        page_size: Number of tokens per page.
+        num_kv_heads: Number of key-value heads.
+        head_size: Dimension of each head.
+        kv_cache_dtype: Data type for cache storage.
+
+    Returns:
+        int: Size of one page in bytes.
+    """
     padded_head_size = cdiv(head_size, 128) * 128
     num_combined_kv_heads = num_kv_heads * 2
     packing = get_dtype_packing(kv_cache_dtype)
@@ -95,6 +194,22 @@ def get_page_size_bytes(
 
 
 def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_margin: int = 256 << 20) -> int:
+    """Calculate available HBM budget per device for cache allocation.
+
+    Queries device memory statistics and computes usable memory based
+    on utilization target and safety margin.
+
+    Args:
+        util: Target utilization fraction (0.0 to 1.0). Default: 0.9.
+        mode: Calculation mode:
+            - "free": Use fraction of currently free memory
+            - "total": Use fraction of total memory minus current usage
+        safety_margin: Reserved bytes to keep free. Default: 256MB.
+
+    Returns:
+        int: Available bytes for cache allocation per device.
+            Returns 4GB as fallback if device stats unavailable.
+    """
     budgets = []
     for d in jax.local_devices():
         try:
@@ -120,12 +235,43 @@ def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_ma
 
 @auto_pytree
 class RaggedPagesCacheConfig(BaseCacheConfig):
-    """
-    Metadata holding configuration parameters for the Paged Attention KV cache.
+    """Configuration for the Paged Attention KV cache.
 
     This class stores static configuration details required to initialize and manage
-    a paged KV cache, such as dimensions, page sizes, and resource utilization hints.
-    It inherits from `BaseCacheConfig`.
+    a paged KV cache, including dimensions, page sizes, memory layout, and resource
+    utilization hints. It inherits from `BaseCacheConfig`.
+
+    The paged cache divides KV storage into fixed-size pages that can be allocated
+    and deallocated independently, enabling efficient memory management for
+    variable-length sequences.
+
+    Attributes:
+        num_hidden_layers (int): Number of transformer layers in the model.
+        max_model_length (int): Maximum sequence length the model supports.
+        num_kv_heads (int): Number of key-value attention heads.
+        k_headdim (int): Dimension of key heads.
+        v_headdim (int): Dimension of value heads.
+        hbm_utilization (float): Target HBM utilization fraction. Default: 0.9.
+        page_size (int): Number of tokens per cache page. Default: 128.
+        num_pages (int): Total number of pages allocated. Computed automatically.
+        max_num_pages_per_req (int): Maximum pages per request. Computed from
+            max_model_length / page_size.
+        num_slices_per_kv_cache_update_page (int): Update slices per page for v2.
+        max_num_tokens (int): Maximum tokens for batch processing.
+        max_num_reqs (int): Maximum concurrent requests.
+        version (str): Cache format version ("v2" or "v3").
+        _kvdtype_str (str): String representation of KV cache dtype.
+
+    Example:
+        >>> config = RaggedPagesCacheConfig.create(
+        ...     mesh=mesh,
+        ...     partition_manager=pm,
+        ...     kvdtype=jnp.bfloat16,
+        ...     num_hidden_layers=32,
+        ...     num_kv_heads=8,
+        ...     max_model_length=8192,
+        ...     kv_head_dim_size=128
+        ... )
     """
 
     num_hidden_layers: int = field(pytree_node=False)
@@ -147,6 +293,16 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
 
     @staticmethod
     def _compute_free_hbm(mesh: Mesh, partition_manager: PartitionManager, hbm_utilization: float):
+        """Compute available HBM for cache allocation across mesh.
+
+        Args:
+            mesh: JAX device mesh.
+            partition_manager: Partition manager with axis configuration.
+            hbm_utilization: Target memory utilization fraction.
+
+        Returns:
+            int: Total available bytes across all devices on KV head axis.
+        """
         kv_head_axis = partition_manager.paxis.kv_head_axis
         size = int(mesh.shape[kv_head_axis])
         budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
@@ -170,6 +326,33 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         page_size: int = 128,
         version: tp.Literal["v3", "v2"] = "v3",
     ) -> RaggedPagesCacheConfig:
+        """Create a RaggedPagesCacheConfig with automatic capacity calculation.
+
+        Computes the number of pages that can fit in available HBM based on
+        device memory statistics and the specified utilization target.
+
+        Args:
+            mesh: JAX device mesh for distributed execution.
+            partition_manager: Manager for tensor partitioning/sharding.
+            kvdtype: Data type for KV cache storage (e.g., jnp.bfloat16).
+            num_hidden_layers: Number of transformer layers.
+            num_kv_heads: Number of key-value attention heads.
+            max_model_length: Maximum supported sequence length.
+            kv_head_dim_size: Shared dimension for K and V heads. Optional if
+                k_headdim and v_headdim are provided.
+            k_headdim: Key head dimension. Defaults to kv_head_dim_size.
+            v_headdim: Value head dimension. Defaults to kv_head_dim_size.
+            hbm_utilization: Target HBM utilization (0.0-1.0). Default: 0.9.
+            page_size: Tokens per cache page. Default: 128.
+            version: Cache format ("v2" or "v3"). Default: "v3".
+
+        Returns:
+            RaggedPagesCacheConfig: Configured cache metadata.
+
+        Raises:
+            ValueError: If required dimensions are non-positive.
+            AssertionError: If head dimensions are not provided.
+        """
         if k_headdim is None:
             assert kv_head_dim_size is not None, "Either `k_headdim` or `kv_head_dim_size` must be provided"
             k_headdim = kv_head_dim_size
@@ -215,26 +398,53 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
 
     @property
     def kvdtype(self) -> jnp.dtype:
+        """Get the JAX dtype for KV cache storage.
+
+        Returns:
+            jnp.dtype: The data type (e.g., jnp.bfloat16).
+        """
         from eformer.mpric import STRING_TO_DTYPE_MAP
 
         return STRING_TO_DTYPE_MAP[self._kvdtype_str]
 
     @property
     def kv_head_packing(self) -> int:
+        """Get the packing factor for KV heads (elements per 32 bits).
+
+        Returns:
+            int: Number of dtype elements that pack into 32 bits.
+        """
         return get_dtype_packing(self.kvdtype)
 
     @property
     def storage_num_combined_kv_heads(self) -> int:
+        """Get aligned combined KV head count for storage.
+
+        Accounts for packing alignment requirements based on head dimension.
+
+        Returns:
+            int: Aligned number of combined K+V heads.
+        """
         if self.k_headdim == 64:
             return align_to_multiple(self.num_kv_heads, self.kv_head_packing)
         return align_to_multiple(self.num_kv_heads * 2, self.kv_head_packing)
 
     @property
     def storage_num_kv_groups(self) -> int:
+        """Get number of KV groups after packing.
+
+        Returns:
+            int: Number of packed KV groups.
+        """
         return self.storage_num_combined_kv_heads // self.kv_head_packing
 
     @property
     def storage_head_dim(self) -> int:
+        """Get aligned head dimension for storage.
+
+        Returns:
+            int: Head dimension aligned to 128.
+        """
         if self.k_headdim == 64:
             return 128
         return align_to_multiple(self.k_headdim, 128)
@@ -244,6 +454,20 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         num_tokens: int | None = None,
         max_num_reqs: int | None = None,
     ) -> int:
+        """Calculate padded slice count for v2 slot mapping.
+
+        Computes a padded slice count that aligns to the slices-per-page
+        boundary for efficient cache updates.
+
+        Args:
+            num_tokens: Token count for batch. Defaults to max_num_tokens
+                or max_model_length.
+            max_num_reqs: Maximum requests. Defaults to max_num_reqs or
+                computed max.
+
+        Returns:
+            int: Padded slice count aligned to update page boundary.
+        """
         if num_tokens is None or num_tokens <= 0:
             num_tokens = self.max_num_tokens if self.max_num_tokens > 0 else self.max_model_length
         if max_num_reqs is None or max_num_reqs <= 0:
@@ -258,10 +482,29 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         return padded_num_slices
 
     def get_max_num_seqs(self) -> int:
+        """Estimate maximum concurrent sequences based on page budget.
+
+        Uses a heuristic based on page requirements per max-length sequence.
+
+        Returns:
+            int: Estimated maximum concurrent sequences.
+        """
         num_page_per_req = cdiv(self.max_model_length, self.page_size)
         return 1024 * 1024 // 2 // num_page_per_req // 4
 
     def get_shape_and_axes(self):
+        """Get KV pages tensor shape and sharding axes for this version.
+
+        Returns shapes and partition axes appropriate for v2 or v3 format.
+
+        Returns:
+            tuple: Pair of (kv_pages_shape, axes) where:
+                - kv_pages_shape: Tuple of dimensions
+                - axes: List of partition axis types for sharding
+
+        Raises:
+            ValueError: If version is unknown.
+        """
         if self.version == "v3":
             kv_pages_shape = (
                 self.num_pages,
@@ -284,11 +527,21 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         return kv_pages_shape, axes
 
     @property
-    def is_v3(self):
+    def is_v3(self) -> bool:
+        """Check if using v3 cache format.
+
+        Returns:
+            bool: True if version is "v3".
+        """
         return self.version == "v3"
 
     @property
-    def is_v2(self):
+    def is_v2(self) -> bool:
+        """Check if using v2 cache format.
+
+        Returns:
+            bool: True if version is "v2".
+        """
         return self.version == "v2"
 
 
@@ -373,6 +626,25 @@ class RaggedPagesCacheView(BaseCacheView):
         value: Float[Array, "batch seq_len num_value_heads head_dim"],
         cache_metadata: RaggedPagesMetadata | OperationsMetadata,
     ) -> RaggedPagesCacheView:
+        """Update cache pages with new key-value pairs.
+
+        Writes new KV pairs into the appropriate cache pages based on the
+        runtime metadata (slot mapping for v2, direct write for v3).
+
+        For v2 format, uses either TPU-optimized Pallas kernels or pure JAX
+        implementation depending on backend and head dimension.
+
+        Args:
+            key: New key states to cache.
+                Shape: [batch, seq_len, num_kv_heads, head_dim]
+            value: New value states to cache.
+                Shape: [batch, seq_len, num_kv_heads, head_dim]
+            cache_metadata: Runtime metadata containing slot mapping and
+                update slice information.
+
+        Returns:
+            RaggedPagesCacheView: Updated cache view with new KV pairs.
+        """
         # Unwrap OperationsMetadata to RaggedPagesMetadata if needed
         cache_metadata = unwrap_metadata(cache_metadata, "ragged")
 
@@ -437,6 +709,15 @@ class RaggedPagesCacheView(BaseCacheView):
         return self
 
     def flattened_kv_pages(self) -> Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"]:
+        """Get KV pages in flattened format with interleaved K and V.
+
+        Converts the internal storage format to a standard 4D tensor with
+        keys and values interleaved in the head dimension.
+
+        Returns:
+            Array: Flattened KV pages.
+                Shape: [num_pages, page_size, num_kv_heads * 2, head_dim]
+        """
         if self.metadata.is_v2:
             return self.kv_pages
         pages = self.kv_pages
@@ -445,11 +726,23 @@ class RaggedPagesCacheView(BaseCacheView):
 
     @property
     def key_pages(self) -> Float[Array, "num_pages page_size num_kv_heads head_dim"]:
+        """Extract key pages from interleaved KV storage.
+
+        Returns:
+            Array: Key-only pages (even indices from interleaved storage).
+                Shape: [num_pages, page_size, num_kv_heads, head_dim]
+        """
         flat = self.flattened_kv_pages()
         return flat[:, :, 0::2, :]
 
     @property
     def value_pages(self) -> Float[Array, "num_pages page_size num_kv_heads head_dim"]:
+        """Extract value pages from interleaved KV storage.
+
+        Returns:
+            Array: Value-only pages (odd indices from interleaved storage).
+                Shape: [num_pages, page_size, num_kv_heads, head_dim]
+        """
         flat = self.flattened_kv_pages()
         return flat[:, :, 1::2, :]
 
@@ -637,6 +930,46 @@ class RaggedPagesCache(BaseCache):
 
 @auto_pytree(max_print_length=3000)
 class RaggedPagesMetadata:
+    """Runtime metadata for paged attention operations.
+
+    Contains the dynamic information needed during attention computation,
+    including page tables, sequence lengths, and cache update mappings.
+
+    This metadata is passed to attention kernels along with the cache
+    views to enable correct KV lookup and update operations.
+
+    Attributes:
+        pages_tables (Array): Page table mapping requests to physical pages.
+            Shape: [max_num_reqs, max_pages_per_req]
+        context_lens (Array): Context length (total tokens) per request.
+            Shape: [max_num_reqs]
+        query_start_loc (Array): Cumulative query start positions.
+            Shape: [max_num_reqs + 1]
+        num_seqs (Array): Number of active sequences.
+            Shape: [max_num_reqs] or scalar
+        slot_mapping (Array, optional): v2-style slot mapping for updates.
+            Shape: [3, num_slices] containing (cache_pos, new_pos, length)
+        position_ids (Array, optional): Position IDs for tokens.
+            Shape: [num_tokens]
+        request_distribution (Array, optional): v3 distribution counts.
+            Shape: [3] containing [decode_count, prefill_count, total_count]
+        num_kv_update_slices (Array, optional): v2 update slice count.
+            Shape: [1]
+        version (str): Metadata format version ("v2" or "v3").
+        num_slices_per_kv_cache_update_page (int, optional): Slices per page.
+        page_size (int): Tokens per cache page. Default: 128.
+        prefill_chunk_size (int): Chunk size for prefill. Default: 512.
+
+    Example:
+        >>> meta = RaggedPagesMetadata(
+        ...     pages_tables=block_tables,
+        ...     context_lens=seq_lens,
+        ...     query_start_loc=query_locs,
+        ...     num_seqs=jnp.array([batch_size]),
+        ...     version="v3"
+        ... )
+    """
+
     pages_tables: Int[Array, "max_num_reqs max_pages"]
     context_lens: Int[Array, "max_num_reqs"]  # noqa: F821
     query_start_loc: Int[Array, "max_num_reqs_plus_1"]  # noqa: F821
@@ -663,7 +996,21 @@ class RaggedPagesMetadata:
         page_size: int = 128,
         version: tp.Literal["v3", "v2"] = "v3",
     ) -> RaggedPagesMetadata:
-        """Create empty metadata with proper shapes."""
+        """Create empty metadata with proper shapes for compilation.
+
+        Creates zeroed metadata arrays with the correct shapes, useful for
+        JIT compilation where shapes must be known ahead of time.
+
+        Args:
+            num_tokens: Maximum token count for batch.
+            max_num_reqs: Maximum number of requests.
+            max_pages: Maximum pages per request.
+            page_size: Tokens per page. Default: 128.
+            version: Metadata version ("v2" or "v3"). Default: "v3".
+
+        Returns:
+            RaggedPagesMetadata: Empty metadata with proper shapes.
+        """
         return cls(
             slot_mapping=jnp.zeros([num_tokens], dtype=jnp.int32) if version == "v2" else None,
             pages_tables=jnp.zeros((max_num_reqs, max_pages), dtype=jnp.int32),

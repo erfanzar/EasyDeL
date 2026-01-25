@@ -175,21 +175,41 @@ class ParallelMoELinear(nn.Module):
         weight_modif_fn: typing.Callable[[Array], Array] | None = None,
         rngs: nn.Rngs,
     ):
-        """Initializes a `ParallelMoELinear` layer.
+        """Initialize a ParallelMoELinear layer.
+
+        Creates a batched linear transformation for MoE models with support for
+        distributed execution and various parallelism strategies.
 
         Args:
-            num_experts: Number of experts in the layer.
-            in_features: Size of the input feature dimension.
-            out_features: Size of the output feature dimension.
-            use_bias: Whether to include a bias term. Defaults to True.
+            num_experts: Number of experts in the layer. Each expert has its own
+                weight matrix.
+            in_features: Size of the input feature dimension for each expert.
+            out_features: Size of the output feature dimension for each expert.
+            use_bias: Whether to include a bias term for each expert.
+                Defaults to True.
             out_first: If True, kernel shape is `(num_experts, out_features, in_features)`,
-                otherwise `(num_experts, in_features, out_features)`.
+                otherwise `(num_experts, in_features, out_features)`. This affects
+                whether transpose_rhs is needed in grouped_matmul. Defaults to False.
             kernel_init: Initializer for the kernel weights.
-            bias_init: Initializer for the bias.
-            dtype: Data type for computation. Defaults to None (inherits from inputs).
+                Defaults to lecun_normal().
+            bias_init: Initializer for the bias. Defaults to zeros.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
             param_dtype: Data type for parameters (weights, biases).
+                Defaults to jnp.bfloat16.
             partition_manager: Partition manager for parameter sharding and mapping.
+                When provided, enables distributed execution with shard_map.
+                Defaults to None.
             direction: ALT-sharding direction, either `"row"`, `"column"`, or None.
+                - "row": Input features are partitioned across TP axis
+                - "column": Output features are partitioned across TP axis
+                Defaults to None (no parallelism).
+            use_expert_tensor_mode: If True, experts are distributed across the
+                TP axis instead of the EP axis. This is useful when the number
+                of experts is small and can fit on the TP dimension for better
+                hardware utilization. Defaults to False.
+            weight_modif_fn: Optional function to modify weights before the forward
+                pass. Useful for applying runtime transformations like LoRA or
+                quantization. Takes and returns an Array. Defaults to None.
             rngs: Random number generators for parameter initialization.
         """
         self.num_experts = num_experts

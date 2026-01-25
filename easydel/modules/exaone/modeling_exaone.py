@@ -42,7 +42,8 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.components import ColumnParallelLinear, RMSNorm
+from easydel.layers.components import ColumnParallelLinear, Embed, RMSNorm
+from easydel.layers.components.linears._linear import RowParallelLinear
 
 from .exaone_configuration import ExaoneConfig
 
@@ -84,9 +85,18 @@ class ExaoneGatedMLP(nn.Module):
             precision=precision,
             kernel_init=nn.initializers.normal(),
         )
+
+        row_linear = functools.partial(
+            RowParallelLinear,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=nn.initializers.normal(),
+        )
         self.c_fc_0 = linear(config.hidden_size, config.intermediate_size, rngs=rngs)
         self.c_fc_1 = linear(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.c_proj = linear(config.intermediate_size, config.hidden_size, rngs=rngs)
+        self.c_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.activation_function]
 
     def __call__(

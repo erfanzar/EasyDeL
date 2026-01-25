@@ -33,7 +33,7 @@ from easydel.infra.modeling_outputs import BaseModelOutput
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.caching import RecurrentCache, RecurrentCacheConfig, RecurrentCacheView
-from easydel.layers.components import ColumnParallelLinear
+from easydel.layers.components import ColumnParallelLinear, Embed
 from easydel.layers.components import RMSNorm as MambaRMSNorm
 from easydel.layers.operations import OperationMetadata
 from easydel.layers.operations.modules import SSM1Op

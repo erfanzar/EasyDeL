@@ -44,6 +44,7 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
+from easydel.layers.components import Embed
 
 from .gpt2_configuration import GPT2Config as GPT2Config
 

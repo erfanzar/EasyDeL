@@ -603,6 +603,25 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         xk: Float[JArray, "... seq heads dim"],
         freqs_cis: Complex[JArray, "batch seq 1 dim_2"],
     ) -> tuple[Float[JArray, "... seq heads dim"], Float[JArray, "... seq heads dim"]]:
+        """Apply rotary position embeddings using complex number multiplication.
+
+        Implements rotary position embeddings (RoPE) by treating pairs of
+        dimensions as complex numbers and multiplying by rotation frequencies.
+
+        Args:
+            xq: Query tensor with shape [..., seq, heads, dim].
+            xk: Key tensor with shape [..., seq, heads, dim].
+            freqs_cis: Complex frequency tensor with shape [batch, seq, 1, dim/2].
+                Contains precomputed cos + i*sin values for rotation.
+
+        Returns:
+            Tuple of (rotated_query, rotated_key), each with the same shape
+            as the input tensors, containing position-aware representations.
+
+        Note:
+            The head dimension is split into pairs and treated as complex numbers.
+            The rotation is applied via complex multiplication: (a + bi) * (cos + i*sin).
+        """
         xq_float32: Float[JArray, "... seq heads dim"] = xq.astype(jnp.float32)
         xk_float32: Float[JArray, "... seq heads dim"] = xk.astype(jnp.float32)
         xq_reshaped: Float[JArray, "... seq heads dim_2 2"] = xq_float32.reshape(*xq.shape[:-1], -1, 2)
@@ -630,6 +649,23 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         q: Float[JArray, "batch seq heads dim"],
         k: Float[JArray, "batch seq heads dim"],
     ) -> tuple[Float[JArray, "batch seq heads dim"], Float[JArray, "batch seq heads dim"]]:
+        """Apply logical sharding constraints to query and key tensors.
+
+        Constrains the query and key tensors to follow the partition specifications
+        defined in the model configuration for distributed computation.
+
+        Args:
+            q: Query tensor with shape [batch, seq, heads, dim].
+            k: Key tensor with shape [batch, seq, heads, dim].
+
+        Returns:
+            Tuple of (sharded_query, sharded_key) with sharding constraints applied
+            according to the configuration's partition manager.
+
+        Note:
+            Query uses AttnQSharding and key uses AttnKVSharding from common_types.
+            This ensures proper distribution of attention computations across devices.
+        """
         q_sharded: Float[JArray, "batch seq heads dim"] = apply_logical_sharding(
             q,
             dynamic_axes=common_types.AttnQSharding,
@@ -650,6 +686,25 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
     ) -> tuple[
         Float[JArray, "batch seq heads dim"], Float[JArray, "batch seq heads dim"], Float[JArray, "batch seq heads dim"]
     ]:
+        """Apply logical sharding constraints to query, key, and value tensors.
+
+        Constrains the Q, K, V tensors to follow partition specifications defined
+        in the model configuration for distributed attention computation.
+
+        Args:
+            q: Query tensor with shape [batch, seq, heads, dim].
+            k: Key tensor with shape [batch, seq, heads, dim].
+            v: Value tensor with shape [batch, seq, heads, dim].
+
+        Returns:
+            Tuple of (sharded_query, sharded_key, sharded_value) with sharding
+            constraints applied according to the configuration's partition manager.
+
+        Note:
+            Query uses AttnQSharding while key and value use AttnKVSharding.
+            This allows for grouped query attention (GQA) where KV heads may
+            be fewer than query heads.
+        """
         q_sharded: Float[JArray, "batch seq heads dim"] = apply_logical_sharding(
             q,
             dynamic_axes=common_types.AttnQSharding,
@@ -792,7 +847,31 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         TransformerCacheView | None,
         AttnMaskDetail | None,
     ]:
-        """Handles concatenation of current KV states to the cache."""
+        """Handle concatenation of current KV states to the cache.
+
+        Manages KV cache operations during autoregressive generation, including
+        storing new key-value pairs and retrieving cached states.
+
+        Args:
+            query: Current query tensor with shape [batch, seq_q, heads, dim].
+            key: Current key tensor with shape [batch, seq_k, heads, dim].
+            value: Current value tensor with shape [batch, seq_v, heads, dim].
+            mode: Runtime mode (TRAIN, PREFILL, or DECODE).
+            mask_info: Container for attention masks and segment information.
+            cache_view: Current view into the KV cache, or None if caching disabled.
+            cache_metadata: Metadata about cache state (indices, starts).
+
+        Returns:
+            Tuple containing:
+                - key: Key tensor (potentially retrieved from cache in decode mode).
+                - value: Value tensor (potentially retrieved from cache in decode mode).
+                - mask_info: Updated mask information.
+                - cache_view: Updated cache view, or None if no cache.
+                - masking_details: Details about mask type and configuration.
+
+        Note:
+            If cache_view is None, the original key and value are returned unchanged.
+        """
         cache_is_none: bool = cache_view is None
         if cache_is_none:
             return key, value, mask_info, None, None
@@ -822,7 +901,36 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         masking_details: AttnMaskDetail | None,
         cache_metadata: TransformerMetadata | None,
     ) -> tuple[Array, Array, MaskInfo, TransformerMetadata | None]:
-        """Applies sliding window masking and slicing to KV and mask."""
+        """Apply sliding window masking and slicing to KV tensors and mask.
+
+        Implements sliding window attention by restricting each query position
+        to attend only to a local window of key-value positions.
+
+        Args:
+            key: Key tensor with shape [batch, seq_k, heads, dim].
+            value: Value tensor with shape [batch, seq_v, heads, dim].
+            mask_info: Container for attention mask.
+            mode: Runtime mode (TRAIN, PREFILL, or DECODE).
+            cache_view: View into KV cache for position tracking.
+            sliding_window: Window size as int (symmetric) or tuple (left, right).
+            query_length: Length of query sequence.
+            masking_details: Details about mask type from cache.
+            cache_metadata: Metadata for cache position tracking.
+
+        Returns:
+            Tuple containing:
+                - key: Sliced key tensor within sliding window.
+                - value: Sliced value tensor within sliding window.
+                - mask_info: Updated mask with window constraints.
+                - cache_metadata: Updated metadata for sliced window.
+
+        Raises:
+            ValueError: If sliding_window contains negative values.
+
+        Note:
+            In decode mode, KV tensors are dynamically sliced to the window.
+            In prefill mode, a trailing window is used for efficient processing.
+        """
         if isinstance(sliding_window, int):
             if sliding_window < 0:
                 raise ValueError(

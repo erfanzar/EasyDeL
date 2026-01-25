@@ -11,6 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Llama 4 Pythonic tool parser with optional delimiter token support.
+
+This module provides a specialized tool call parser for Llama 4 models that
+generate tool calls as Python function invocations. It extends the base
+pythonic parser with support for optional <|python_start|> and <|python_end|>
+delimiter tokens.
+
+Example formats:
+    <|python_start|>[func1(arg1="val1"), func2(arg2="val2")]<|python_end|>
+    [func1(arg1="val1"), func2(arg2="val2")]
+
+Features:
+    - Python AST-based parsing for safe evaluation
+    - Optional delimiter token handling
+    - Streaming with bracket completion
+    - Regex timeout handling for complex patterns
+    - Support for nested data structures
+"""
 from __future__ import annotations
 
 import ast
@@ -37,28 +56,37 @@ logger = get_logger(__name__)
 
 
 class _UnexpectedAstError(Exception):
+    """Exception raised when AST parsing encounters unexpected structure.
+
+    This exception is used internally to signal that the parsed AST does not
+    match the expected format for tool calls (e.g., not a list of function
+    calls, invalid argument types).
+    """
+
     pass
 
 
 @ToolParserManager.register_module("llama4_pythonic")
 class Llama4PythonicToolParser(ToolParser):
-    """
-    Tool call parser for Llama 4 models with Pythonic syntax.
+    """Tool call parser for Llama 4 models with Pythonic syntax.
 
     Specialized version of the pythonic parser for Llama 4 models that
     generate tool calls as Python function invocations. Supports optional
     <|python_start|> and <|python_end|> delimiters.
 
     Features:
-    - Python AST-based parsing
-    - Optional delimiter token support
-    - Streaming with bracket completion
-    - Regex timeout handling for complex patterns
-    - Support for nested data structures
+        - Python AST-based parsing
+        - Optional delimiter token support
+        - Streaming with bracket completion
+        - Regex timeout handling for complex patterns
+        - Support for nested data structures
 
     Format:
-    <|python_start|>[func1(arg1="val1"), func2(arg2="val2")]<|python_end|>
-    or simply: [func1(arg1="val1"), func2(arg2="val2")]
+        <|python_start|>[func1(arg1="val1"), func2(arg2="val2")]<|python_end|>
+        or simply: [func1(arg1="val1"), func2(arg2="val2")]
+
+    Attributes:
+        TOOL_CALL_REGEX: Compiled regex pattern for detecting tool call syntax.
 
     Use --enable-auto-tool-choice --tool-call-parser llama4_pythonic
     """
@@ -69,19 +97,48 @@ class Llama4PythonicToolParser(ToolParser):
     )
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase):
+        """Initialize the Llama4PythonicToolParser.
+
+        Args:
+            tokenizer: The tokenizer associated with the Llama 4 model.
+                Used for token-level operations during streaming.
+        """
         super().__init__(tokenizer)
 
     @property
     def current_tool_index(self) -> int:
+        """Get the current tool index being processed.
+
+        Returns:
+            The index of the current tool being processed during streaming.
+        """
         return self.current_tool_id
 
     @current_tool_index.setter
     def current_tool_index(self, value: int) -> None:
+        """Set the current tool index being processed.
+
+        Args:
+            value: The new tool index value.
+        """
         self.current_tool_id = value
 
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
-        """
-        Extract the tool calls from a complete model response.
+        """Extract tool calls from a complete model response.
+
+        Parses the model output to identify and extract Python-style function
+        calls. Handles optional <|python_start|> and <|python_end|> delimiters.
+        Uses regex for initial detection and AST parsing for extraction.
+
+        Args:
+            model_output: The complete text output from the model.
+            request: The chat completion request containing context information.
+
+        Returns:
+            ExtractedToolCallInformation containing:
+                - tools_called: True if valid tool calls were found
+                - tool_calls: List of ToolCall objects extracted
+                - content: Original content if no tools called, None otherwise
         """
 
         if model_output.startswith("<|python_start|>"):
@@ -126,6 +183,26 @@ class Llama4PythonicToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        """Extract tool calls incrementally during streaming.
+
+        Processes streaming output token by token, handling optional
+        <|python_start|> and <|python_end|> delimiters. Completes partial
+        Python code to extract tool call information as it becomes available.
+
+        Args:
+            previous_text: Text accumulated before this delta.
+            current_text: Complete text including the current delta.
+            delta_text: The new text added in this streaming chunk.
+            previous_token_ids: Token IDs before this delta.
+            current_token_ids: All token IDs including current delta.
+            delta_token_ids: Token IDs in the current delta.
+            request: The chat completion request for context.
+
+        Returns:
+            DeltaMessage containing either content (if not a tool call) or
+            tool_calls (if tool call deltas detected), or None if more tokens
+            are needed to determine the output type.
+        """
         if not current_text.startswith("[") and not current_text.startswith("<|python_start|>"):
             return DeltaMessage(content=delta_text)
 
@@ -189,6 +266,24 @@ class Llama4PythonicToolParser(ToolParser):
 
 
 def _get_parameter_value(val: ast.expr) -> Any:
+    """Extract parameter value from AST expression.
+
+    Recursively processes AST nodes to extract Python literals
+    including constants, dictionaries, and lists.
+
+    Args:
+        val: AST expression node to evaluate.
+
+    Returns:
+        Python value extracted from the AST node. Can be:
+            - str, int, float, bool, None for ast.Constant
+            - dict for ast.Dict (with recursive value extraction)
+            - list for ast.List (with recursive value extraction)
+
+    Raises:
+        _UnexpectedAstError: If expression is not a supported literal type
+            or if dict keys are not constants.
+    """
     if isinstance(val, ast.Constant):
         return val.value
     elif isinstance(val, ast.Dict):
@@ -205,6 +300,23 @@ def _get_parameter_value(val: ast.expr) -> Any:
 
 
 def _handle_single_tool(call: ast.Call) -> ToolCall:
+    """Convert AST Call node to ToolCall object.
+
+    Extracts function name and keyword arguments from Python
+    function call AST representation.
+
+    Args:
+        call: AST Call node representing a function invocation.
+
+    Returns:
+        ToolCall object with:
+            - type: "function"
+            - function: FunctionCall with name and JSON-encoded arguments
+
+    Raises:
+        _UnexpectedAstError: If the function name is not a simple identifier
+            (ast.Name) or if arguments cannot be extracted.
+    """
     if not isinstance(call.func, ast.Name):
         raise _UnexpectedAstError("Invalid tool call name")
     function_name = call.func.id
@@ -215,6 +327,25 @@ def _handle_single_tool(call: ast.Call) -> ToolCall:
 
 
 def _make_valid_python(text: str) -> tuple[str, str] | None:
+    """Complete partial Python code by adding closing brackets.
+
+    Tracks bracket stack to determine what closing characters
+    are needed to make partial Python code syntactically valid.
+    Handles brackets, parentheses, braces, and quotes.
+
+    Args:
+        text: Partial Python code string that may be incomplete.
+
+    Returns:
+        Tuple of (completed_text, added_text) where:
+            - completed_text: The input text with closing brackets appended
+            - added_text: The characters that were added to complete the code
+        Returns None if the text ends with incomplete parameter name or value
+        (e.g., ends with '=' or ':'), indicating more tokens are needed.
+
+    Raises:
+        _UnexpectedAstError: If mismatched brackets are detected.
+    """
     bracket_stack = []
     for index, char in enumerate(text):
         if char in {"[", "(", "{"}:
@@ -278,6 +409,23 @@ def _make_valid_python(text: str) -> tuple[str, str] | None:
 def _compute_tool_delta(
     previously_sent_args: str, new_call: ToolCall, index: int, withheld_suffix: str
 ) -> DeltaToolCall | None:
+    """Compute the delta between previously sent and current tool call arguments.
+
+    Calculates what new argument data should be sent in a streaming response
+    by comparing previously sent arguments with the current state.
+
+    Args:
+        previously_sent_args: JSON string of arguments already sent to client.
+        new_call: The current ToolCall with updated arguments.
+        index: The index of this tool call in the response.
+        withheld_suffix: Characters to withhold from the end of arguments
+            (used for incomplete streaming data).
+
+    Returns:
+        DeltaToolCall containing the incremental update, or None if no new
+        data to send. For the first delta of a tool call, includes the
+        function name; subsequent deltas only include argument differences.
+    """
     new_call_args = new_call.function.arguments
     if withheld_suffix:
         assert new_call_args.endswith(withheld_suffix)

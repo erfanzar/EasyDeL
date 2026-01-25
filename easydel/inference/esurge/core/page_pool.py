@@ -34,19 +34,44 @@ from .utils import CachePage, FreeCachePageQueue, PageHash, PageHashWithGroupId,
 
 
 class PagePool:
-    """PagePool that manages CachePages.
-    It provides methods to allocate, free and cache the kv cache pages. The
-    free_page_queue stores the free pages in eviction order to enable
-    allocation, free, and cache eviction. The cached_page_hash_to_page
-    maps between page hash and cached page to support finding cached pages
-    by their page hash.
+    """Pool manager for KV-cache pages with prefix caching support.
 
-    Args:
-        num_pages: The number of pages in the pool.
-        enable_caching: Whether to enable prefix caching.
+    This class manages a pool of CachePage objects, providing allocation,
+    deallocation, and prefix caching operations. It uses a free page queue
+    ordered by eviction priority (LRU) and maintains a hash-to-page mapping
+    for efficient prefix cache lookups.
+
+    The pool supports:
+    - O(1) page allocation from the free queue
+    - O(1) page deallocation back to the free queue
+    - Prefix caching with hash-based page lookup
+    - Reference counting for shared page management
+    - LRU eviction when the pool is exhausted
+
+    Attributes:
+        num_pages: Total number of pages in the pool.
+        enable_caching: Whether prefix caching is enabled.
+        pages: List of all CachePage objects in the pool.
+        free_page_queue: Queue of free pages ordered by eviction priority.
+        cached_page_hash_to_page: Mapping from page hash to cached pages.
+        null_page: Special placeholder page that is never freed.
+
+    Example:
+        >>> pool = PagePool(num_pages=1000, enable_caching=True)
+        >>> pages = pool.get_new_pages(num_pages=10)
+        >>> pool.free_pages(reversed(pages))  # Free in reverse for LRU order
     """
 
     def __init__(self, num_pages: int, enable_caching: bool):
+        """Initialize the page pool.
+
+        Args:
+            num_pages: Total number of pages to allocate. Must be a positive integer.
+            enable_caching: Whether to enable prefix caching functionality.
+
+        Raises:
+            AssertionError: If num_pages is not a positive integer.
+        """
         assert isinstance(num_pages, int) and num_pages > 0
         self.num_pages = num_pages
         self.enable_caching = enable_caching
@@ -178,15 +203,22 @@ class PagePool:
         return ret
 
     def _maybe_evict_cached_page(self, page: CachePage) -> bool:
-        """
-        If a page is cached in `cached_page_hash_to_page`, we reset its hash
-        metadata and evict it from the cache.
+        """Evict a page from the prefix cache if it is cached.
+
+        Removes the page's hash association and evicts it from the
+        cached_page_hash_to_page mapping. This is called when a cached
+        page is being reallocated for new content.
 
         Args:
-            page: The page to evict.
+            page: The page to potentially evict from the cache.
 
         Returns:
-            True if the page is evicted, False otherwise.
+            True if the page was cached and has been evicted,
+            False if the page was not in the cache.
+
+        Note:
+            This method handles the case where multiple pages may share
+            the same hash (e.g., when a prefix is duplicated across requests).
         """
         page_hash = page.page_hash
         if page_hash is None:

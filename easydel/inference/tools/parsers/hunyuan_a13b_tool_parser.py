@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Tool parser implementation for Hunyuan A13B models.
+
+This module provides a tool parser specifically designed for Hunyuan A13B model outputs.
+It handles tool calls wrapped in <tool_calls> XML-style tags with support for filtering
+out tool calls that appear within thinking sections.
+
+The parser supports Chinese language tokens (e.g., "assistant:" in Chinese) and handles
+nested JSON objects in function arguments.
+
+Example format:
+    <tool_calls>[{"name": "function_name", "arguments": {"param": "value"}}]</tool_calls>
+"""
+
 from __future__ import annotations
 
 import json
@@ -40,24 +53,49 @@ logger = get_logger(__name__)
 
 @ToolParserManager.register_module("hunyuan_a13b")
 class HunyuanA13BToolParser(ToolParser):
-    """
-    Tool parser for Hunyuan A13B model.
+    """Tool parser for Hunyuan A13B model outputs.
 
-    Handles tool calls wrapped in <tool_calls> tags with support for
-    thinking tags. Parses JSON array format with special handling for
-    Chinese language tokens (助手：).
+    This parser handles the extraction of function/tool calls from Hunyuan A13B model
+    outputs. The model uses XML-style <tool_calls> tags containing a JSON array of
+    function call objects.
 
-    Features:
-    - Filters tool calls from thinking sections
-    - Supports nested JSON in arguments
-    - Handles streaming with state management
-    - Regex-based extraction with JSON validation
+    The parser includes special handling for:
+    - Filtering tool calls that appear within <think>...</think> sections
+    - Chinese language tokens (removes "assistant:" prefix in Chinese)
+    - Nested JSON objects within function arguments
+    - Both empty and non-empty argument patterns
 
-    Format:
-    <tool_calls>[{"name": "func", "arguments": {...}}]</tool_calls>
+    Attributes:
+        prev_tool_calls: List of previously parsed tool call dictionaries.
+        current_tool_id: Index of the current tool being processed in streaming mode.
+        current_tool_name_sent: Flag indicating if the current tool name has been sent.
+        streamed_args: List of argument strings streamed for each tool.
+        current_tools_sent: List tracking which tools have been sent in streaming.
+        prev_tool_call_arr: Array storing parsed tool call data.
+        answer_tool_calls_pattern: Regex pattern for extracting tool calls content.
+        tool_name_reg: Regex pattern for extracting function names.
+        tool_empty_arg_reg: Regex pattern for empty arguments.
+        tool_non_empty_arg_reg: Regex pattern for non-empty arguments.
+        bot_string: The tag that indicates the start of tool calls.
+        streaming_state: Dictionary maintaining state during streaming extraction.
+
+    Example:
+        >>> parser = HunyuanA13BToolParser(tokenizer)
+        >>> result = parser.extract_tool_calls(model_output, request)
+        >>> if result.tools_called:
+        ...     for tool_call in result.tool_calls:
+        ...         print(f"Function: {tool_call.function.name}")
     """
 
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize the Hunyuan A13B tool parser.
+
+        Sets up regex patterns for parsing tool calls and initializes streaming state.
+
+        Args:
+            tokenizer: A HuggingFace tokenizer instance used for token processing.
+                This tokenizer should be compatible with the Hunyuan A13B model.
+        """
         super().__init__(tokenizer)
 
         self.prev_tool_calls: list[dict] = []
@@ -89,6 +127,30 @@ class HunyuanA13BToolParser(ToolParser):
         }
 
     def preprocess_model_output(self, model_output: str) -> tuple[str | None, str | None]:
+        """Preprocess model output to extract tool calls content.
+
+        Scans the model output for <tool_calls> tags and extracts the content,
+        while filtering out any tool calls that appear within <think> sections.
+        This ensures only actual function calls (not reasoning about function calls)
+        are extracted.
+
+        Args:
+            model_output: The raw model output string to preprocess.
+
+        Returns:
+            A tuple of (content, tool_calls_content) where:
+                - content: The text before the tool calls section, or the full
+                    output if no valid tool calls were found.
+                - tool_calls_content: The JSON string inside the tool_calls tags,
+                    or None if no valid tool calls were found.
+
+        Example:
+            >>> content, tools = parser.preprocess_model_output(
+            ...     "Hello<tool_calls>[{...}]</tool_calls>"
+            ... )
+            >>> content
+            'Hello'
+        """
         for match in self.answer_tool_calls_pattern.finditer(model_output):
             start, end = match.span()
             think_regions = [
@@ -106,8 +168,26 @@ class HunyuanA13BToolParser(ToolParser):
         return model_output, None
 
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
-        """
-        Extract tool calls from a complete model output.
+        """Extract tool calls from a complete model output.
+
+        Parses the model output to find and extract function calls in Hunyuan A13B format.
+        The function looks for <tool_calls> tags containing a JSON array of function
+        call objects with "name" and "arguments" fields.
+
+        Args:
+            model_output: The complete text output from the model to parse.
+            request: The chat completion request that triggered this response.
+
+        Returns:
+            ExtractedToolCallInformation: An object containing:
+                - tools_called: True if valid tool calls were found, False otherwise.
+                - tool_calls: List of ToolCall objects representing parsed function calls.
+                - content: Any text content before the tool calls section, or the full
+                    output if no valid tool calls were found.
+
+        Note:
+            This method removes the Chinese "assistant:" prefix ("assistant:") from content
+            if present at the beginning of the output.
         """
         try:
             content, potential_tool_calls = self.preprocess_model_output(model_output)
@@ -167,8 +247,25 @@ class HunyuanA13BToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
-        """
-        Extract tool calls for streaming mode.
+        """Extract tool calls incrementally during streaming generation.
+
+        Processes tokens as they are generated to progressively extract and emit
+        tool call information. Supports multiple tool calls in a single response.
+
+        Args:
+            previous_text: The accumulated text from all previous tokens.
+            current_text: The complete text including the current delta.
+            delta_text: The new text added in this streaming step.
+            previous_token_ids: Token IDs from all previous generation steps.
+            current_token_ids: All token IDs including the current step.
+            delta_token_ids: The new token IDs added in this step.
+            request: The chat completion request for context.
+
+        Returns:
+            DeltaMessage or None: A delta message containing either:
+                - Content text if no tool call is detected.
+                - Tool call information (name or argument delta) if parsing functions.
+                - None if waiting for more tokens to complete parsing.
         """
 
         start_idx = consume_space(0, current_text)
@@ -201,6 +298,15 @@ class HunyuanA13BToolParser(ToolParser):
         return None
 
     def _try_parse_json_tools(self, current_text: str):
+        """Attempt to parse the current text as a JSON array of tools.
+
+        Tries to parse the text as complete JSON and stores the result in
+        prev_tool_call_arr if successful. This is used to maintain state
+        about fully parsed tool calls.
+
+        Args:
+            current_text: The text to attempt parsing, expected to start with '['.
+        """
         try:
             parsed_tools = json.loads(current_text)
             if isinstance(parsed_tools, list):
@@ -209,6 +315,19 @@ class HunyuanA13BToolParser(ToolParser):
             pass
 
     def _handle_test_compatibility(self, current_text: str):
+        """Handle test compatibility for streaming tool calls.
+
+        Provides special handling for test scenarios where current_tools_sent
+        has been pre-initialized. Extracts and sends the first tool name
+        when detected.
+
+        Args:
+            current_text: The current accumulated text being processed.
+
+        Returns:
+            DeltaMessage or None: A delta message with the first tool call
+                if conditions are met, None otherwise.
+        """
         if len(self.current_tools_sent) > 0:
             if len(self.current_tools_sent) == 1 and self.current_tools_sent[0] is False:
                 name_match = self.tool_name_reg.search(current_text)
@@ -243,6 +362,14 @@ class HunyuanA13BToolParser(ToolParser):
         return None
 
     def _ensure_state_arrays(self, tool_count: int):
+        """Ensure streaming state arrays have sufficient capacity.
+
+        Expands the sent_tools and tool_ids arrays to accommodate the
+        specified number of tools.
+
+        Args:
+            tool_count: The number of tools that need to be tracked.
+        """
         while len(self.streaming_state["sent_tools"]) < tool_count:
             self.streaming_state["sent_tools"].append(
                 {
@@ -255,6 +382,20 @@ class HunyuanA13BToolParser(ToolParser):
             self.streaming_state["tool_ids"].append(None)
 
     def _handle_tool_name_streaming(self, current_idx: int, tool_count: int, name_matches):
+        """Handle streaming of tool names.
+
+        Detects when a new tool name should be sent and emits the appropriate
+        delta message with the tool name and ID.
+
+        Args:
+            current_idx: The current tool index being processed.
+            tool_count: Total number of tools detected so far.
+            name_matches: List of regex match objects for tool names.
+
+        Returns:
+            DeltaMessage or None: A delta message with the tool name if a new
+                tool is detected, None otherwise.
+        """
         if current_idx == -1 or current_idx < tool_count - 1:
             next_idx = current_idx + 1
             if next_idx < tool_count and not self.streaming_state["sent_tools"][next_idx]["sent_name"]:
@@ -282,6 +423,20 @@ class HunyuanA13BToolParser(ToolParser):
         return None
 
     def _handle_tool_args_streaming(self, current_text: str, current_idx: int, tool_count: int):
+        """Handle streaming of tool arguments.
+
+        Processes and emits argument deltas for the current tool being streamed.
+        Handles both empty arguments ({}) and non-empty argument objects.
+
+        Args:
+            current_text: The current accumulated text being processed.
+            current_idx: The current tool index being processed.
+            tool_count: Total number of tools detected so far.
+
+        Returns:
+            DeltaMessage or None: A delta message with argument content if new
+                arguments are detected, None otherwise.
+        """
         if current_idx >= 0 and current_idx < tool_count:
             empty_args_match = self.tool_empty_arg_reg.search(current_text)
             if empty_args_match and empty_args_match.start() > 0:

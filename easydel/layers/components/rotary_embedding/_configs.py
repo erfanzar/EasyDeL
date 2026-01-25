@@ -12,6 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Configuration dataclass for Rotary Position Embeddings (RoPE).
+
+This module provides a dataclass for storing and managing RoPE configuration
+parameters. The RopeConfig class supports various RoPE scaling methods and
+can be created from dictionaries (e.g., HuggingFace config dicts).
+
+Classes:
+    RopeConfig: Dataclass storing RoPE type and scaling parameters.
+
+Example:
+    >>> from easydel.layers.components.rotary_embedding import RopeConfig
+    >>> # Create config from dictionary (e.g., from HuggingFace config)
+    >>> config_dict = {
+    ...     "rope_type": "yarn",
+    ...     "factor": 2.0,
+    ...     "original_max_position_embeddings": 2048,
+    ...     "beta_fast": 32,
+    ...     "beta_slow": 1,
+    ... }
+    >>> rope_config = RopeConfig.from_dict(config_dict)
+    >>> # Convert back to dictionary for use with get_rope/get_frequencies
+    >>> scaling_dict = rope_config.to_dict()
+"""
+
 from __future__ import annotations
 
 import typing as tp
@@ -117,11 +141,27 @@ class RopeConfig:
         /,
         **kwargs: tp.Any,
     ) -> None:
-        """Update the RopeConfig instance in-place.
+        """Update the RopeConfig instance in-place with new values.
 
-        Supports HuggingFace-style aliases:
+        Supports HuggingFace-style aliases for compatibility:
         - ``type`` -> ``rope_type``
         - ``scaling_factor`` -> ``factor``
+
+        Also handles nested ``rope_scaling`` dictionaries commonly found in
+        HuggingFace model configurations.
+
+        Args:
+            config_dict: A mapping, RopeConfig instance, or None containing
+                configuration values to update. Positional-only argument.
+            **kwargs: Additional keyword arguments to update. These take
+                precedence over values in config_dict.
+
+        Example:
+            >>> config = RopeConfig()
+            >>> config.update({"rope_type": "yarn", "factor": 2.0})
+            >>> config.update(scaling_factor=4.0)  # Uses alias
+            >>> config.factor
+            4.0
         """
         updates: dict[str, tp.Any]
         if config_dict is None:
@@ -155,15 +195,22 @@ class RopeConfig:
                 setattr(self, key, value)
 
     def to_dict(self) -> dict[str, tp.Any]:
-        """
-        Convert the RopeConfig instance to a dictionary.
+        """Convert the RopeConfig instance to a dictionary.
 
-        Filters out attributes with None values. The dictionary is made hashable
-        using a custom class for potential use with JIT compilation contexts
-        (though making the dict itself static in `get_frequencies` is preferred).
+        Creates a dictionary containing only non-None configuration values.
+        The returned dictionary uses a custom hashable subclass to support
+        use as a static argument in JAX JIT compilation contexts.
 
         Returns:
-            tp.Dict[str, tp.Any]: A hashable dictionary containing non-None configuration values.
+            A hashable dictionary containing non-None configuration values.
+            The dictionary can be passed directly to functions like
+            `get_rope` and `get_frequencies` as the `rope_scaling` argument.
+
+        Example:
+            >>> config = RopeConfig(rope_type="yarn", factor=2.0)
+            >>> scaling_dict = config.to_dict()
+            >>> scaling_dict
+            {'rope_type': 'yarn', 'factor': 2.0}
         """
         from easydel.utils.compiling_utils import hash_fn
 

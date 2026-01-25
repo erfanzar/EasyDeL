@@ -12,7 +12,63 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FastAPI server for eSurge with OpenAI API compatibility."""
+"""FastAPI server for eSurge with OpenAI API compatibility.
+
+This module implements a production-ready API server that exposes eSurge inference
+engines through OpenAI-compatible REST endpoints. It provides comprehensive features
+for serving large language models in production environments.
+
+Key Features:
+    - Full OpenAI API v1 compatibility (/v1/chat/completions, /v1/completions)
+    - Multi-model support with automatic routing based on model name
+    - Streaming responses using Server-Sent Events (SSE)
+    - Function/tool calling with pluggable parsers (Hermes, Qwen, etc.)
+    - Production-grade authentication with RBAC, rate limiting, and audit logging
+    - Real-time metrics and health monitoring
+    - Thread-safe request handling with configurable concurrency limits
+
+Architecture:
+    The server uses an adapter pattern to bridge eSurge engines with the FastAPI
+    infrastructure. The main components are:
+
+    - eSurgeAdapter: Wraps eSurge instances to implement InferenceEngineAdapter
+    - eSurgeApiServer: Main server class combining base server, tool calling,
+      and auth endpoint mixins
+
+Type Aliases:
+    RefineSamplingParamsFn: Callback type for customizing sampling parameters.
+    RefineChatRequestFn: Callback type for preprocessing chat requests.
+
+Example:
+    Basic single-model server::
+
+        from easydel.inference.esurge import eSurge
+        from easydel.inference.esurge.server import eSurgeApiServer
+
+        esurge = eSurge.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
+        server = eSurgeApiServer(esurge, require_api_key=True)
+        server.run(host="0.0.0.0", port=8000)
+
+    Multi-model server with custom configurations::
+
+        esurge_map = {
+            "llama-7b": eSurge.from_pretrained("model-a"),
+            "llama-13b": eSurge.from_pretrained("model-b"),
+        }
+        server = eSurgeApiServer(
+            esurge_map,
+            enable_function_calling=True,
+            tool_parser_name="hermes",
+            require_api_key=True,
+            admin_key="sk-admin-secret",
+        )
+        server.run()
+
+See Also:
+    - `easydel.inference.esurge.esurge_engine.eSurge`: Core inference engine
+    - `easydel.inference.inference_engine_interface`: Base server infrastructure
+    - `easydel.workers.esurge.auth`: Authentication and authorization system
+"""
 
 from __future__ import annotations
 
@@ -73,7 +129,19 @@ RefineSamplingParamsFn = tp.Callable[
     [SamplingParams, ChatCompletionRequest | CompletionRequest, "eSurge"],
     SamplingParams | None,
 ]
+"""Type alias for sampling parameter refinement callbacks.
+
+A callable that receives the initial SamplingParams, the original request,
+and the eSurge instance, and returns modified SamplingParams or None to
+keep the original.
+"""
+
 RefineChatRequestFn = tp.Callable[[ChatCompletionRequest], ChatCompletionRequest | None]
+"""Type alias for chat request preprocessing callbacks.
+
+A callable that receives a ChatCompletionRequest and returns a modified
+request or None to keep the original.
+"""
 
 
 class eSurgeAdapter(InferenceEngineAdapter):
@@ -140,11 +208,21 @@ class eSurgeAdapter(InferenceEngineAdapter):
 
     @property
     def model_name(self) -> str:
-        """Return the model name."""
+        """Return the model name.
+
+        Returns:
+            The model name string assigned during adapter initialization.
+        """
         return self._model_name
 
     @property
     def processor(self) -> tp.Any:
+        """Return the tokenizer/processor associated with the eSurge instance.
+
+        Returns:
+            The tokenizer or processor object used by the underlying eSurge
+            engine for text encoding and decoding.
+        """
         return self.esurge.tokenizer
 
 
@@ -372,7 +450,20 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         return self.auth_manager.generate_api_key(name=name, role=role, **kwargs)
 
     def _extract_api_key(self, raw_request: Request) -> str | None:
-        """Extract API key from Authorization header, X-API-Key header, or query param."""
+        """Extract API key from various request locations.
+
+        Searches for an API key in the following locations (in order):
+        1. Authorization header with "Bearer " prefix
+        2. X-API-Key header
+        3. "api_key" query parameter
+        4. "user" query parameter (OpenAI compatibility)
+
+        Args:
+            raw_request: The incoming FastAPI request object.
+
+        Returns:
+            The extracted API key string if found, None otherwise.
+        """
         auth_header = raw_request.headers.get("Authorization")
         if auth_header and auth_header.lower().startswith("bearer "):
             return auth_header.split(" ", 1)[1].strip()
@@ -393,7 +484,25 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
     @staticmethod
     def _extract_payload_api_keys(payload: tp.Any) -> list[str]:
-        """Collect API key candidates embedded in the JSON payload."""
+        """Extract API key candidates from the request JSON payload.
+
+        Searches for API keys embedded within the request body, checking
+        various field names commonly used for authentication. This allows
+        clients to pass API keys in the request body as an alternative to
+        headers or query parameters.
+
+        Args:
+            payload: The request payload, either as a Pydantic model or dict.
+                For Pydantic models, checks `model_extra` for extra fields.
+
+        Returns:
+            List of unique, non-empty API key candidate strings found in
+            the payload. The list preserves discovery order.
+
+        Note:
+            Checked field names include: api_key, apiKey, api-key, x-api-key,
+            auth, authorization, token, key, and user (for OpenAI compatibility).
+        """
         candidates: list[str] = []
 
         def add_candidate(value: tp.Any) -> None:
@@ -418,7 +527,18 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         return candidates
 
     def _auth_system_enabled(self) -> bool:
-        """Determine whether authentication enforcement is active."""
+        """Determine whether authentication enforcement is active.
+
+        Checks multiple conditions to determine if the authentication system
+        should enforce API key validation:
+        1. Whether an auth_manager exists
+        2. Whether the manager has an `enabled` property set
+        3. Whether the manager supports `authorize_request` method
+        4. Falls back to the `_require_api_key` setting
+
+        Returns:
+            True if authentication should be enforced, False otherwise.
+        """
 
         try:
             manager = self.auth_manager
@@ -531,7 +651,23 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         prompt_tokens: int,
         completion_tokens: int,
     ) -> None:
-        """Track per-key token usage after a request completes."""
+        """Record token usage statistics for the authenticated API key.
+
+        Updates the auth manager's usage tracking for the API key that was
+        used to authenticate the request. This enables per-key usage monitoring
+        and quota enforcement.
+
+        Args:
+            raw_request: The FastAPI request object containing the authenticated
+                API key in `request.state.api_key`. If None, no action is taken.
+            prompt_tokens: Number of tokens in the input prompt.
+            completion_tokens: Number of tokens generated in the response.
+
+        Note:
+            This method silently returns if no API key was used or if the
+            request object is None. It should be called after successful
+            completion of a request.
+        """
         if raw_request is None:
             return
 
@@ -542,7 +678,24 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         self.auth_manager.record_usage(api_key, prompt_tokens, completion_tokens)
 
     def _infer_sequence_length_from_engine(self, esurge: eSurge | None) -> int:
-        """Infer maximum sequence length from the engine or fall back to 128 tokens."""
+        """Infer the maximum sequence length from an eSurge engine.
+
+        Attempts to determine the maximum sequence length for token generation
+        by examining the engine's configuration. This is used as a default when
+        `max_tokens` is not explicitly specified in requests.
+
+        Args:
+            esurge: The eSurge engine instance to query. If None, falls back to
+                the first available adapter.
+
+        Returns:
+            The maximum model length if determinable, otherwise 128 as a
+            conservative default.
+
+        Note:
+            The fallback value of 128 is intentionally conservative to prevent
+            unexpected resource consumption when model configuration is unavailable.
+        """
         if esurge is not None and getattr(esurge, "max_model_len", None):
             try:
                 return int(esurge.max_model_len)
@@ -562,7 +715,26 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         request: ChatCompletionRequest | CompletionRequest,
         esurge: eSurge | None = None,
     ) -> int:
-        """Ensure the request has max_tokens set, inferring from the engine when missing."""
+        """Ensure the request has a valid max_tokens value.
+
+        Validates and normalizes the `max_tokens` field in the request,
+        inferring a reasonable default from the engine configuration when
+        the value is missing, invalid, or negative.
+
+        This method also tracks whether the value was auto-inferred or
+        explicitly provided by setting `request._auto_max_tokens`.
+
+        Args:
+            request: The chat or completion request to validate.
+            esurge: Optional eSurge engine to query for default max length.
+
+        Returns:
+            The validated max_tokens value (either from request or inferred).
+
+        Note:
+            The method modifies the request object in-place when inferring
+            a value, and sets `_auto_max_tokens` flag for downstream processing.
+        """
         max_tokens_raw = getattr(request, "max_tokens", None)
         inferred_value: int | None = None
 
@@ -609,7 +781,19 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         request: ChatCompletionRequest | CompletionRequest,
         esurge: eSurge,
     ) -> SamplingParams:
-        """Create sampling params and allow optional refinement."""
+        """Create and optionally refine sampling parameters for generation.
+
+        Builds SamplingParams from the request and applies any user-provided
+        refinement callback to customize generation behavior.
+
+        Args:
+            request: The chat or completion request containing generation settings.
+            esurge: The eSurge engine instance (passed to refinement callback).
+
+        Returns:
+            SamplingParams configured for the generation, potentially modified
+            by the refinement callback if one was provided during server init.
+        """
         sampling_params = self._create_sampling_params(request)
         if self._refine_sampling_params_callback:
             refined = self._refine_sampling_params_callback(sampling_params, request, esurge)
@@ -829,7 +1013,23 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
     @staticmethod
     def _messages_have_multimodal_content(messages: list[dict[str, tp.Any]]) -> bool:
-        """Check if the message list contains multimodal parts (image/video)."""
+        """Check if the message list contains multimodal content (images or videos).
+
+        Examines message content parts to detect the presence of image or video
+        data that requires special handling through the multimodal processing
+        pipeline.
+
+        Args:
+            messages: List of message dictionaries with content fields.
+
+        Returns:
+            True if any message contains image or video content, False otherwise.
+
+        Note:
+            Supported multimodal type indicators include:
+            - image, image_url, input_image (for images)
+            - video, video_url, input_video (for videos)
+        """
         for msg in messages:
             content = msg.get("content", [])
             if not isinstance(content, list):
@@ -845,7 +1045,20 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         return False
 
     def _prepare_messages_for_engine(self, request: ChatCompletionRequest, esurge: eSurge) -> list[dict[str, tp.Any]]:
-        """Convert pydantic request messages into dicts for the eSurge engine."""
+        """Convert Pydantic request messages into dictionaries for the eSurge engine.
+
+        Extracts messages from the request and applies any necessary format
+        conversions for compatibility with the underlying processor.
+
+        Args:
+            request: The chat completion request containing messages.
+            esurge: The eSurge engine instance with the processor/tokenizer.
+
+        Returns:
+            List of message dictionaries ready for engine processing.
+            Messages may be converted to OpenAI format if using a
+            ProcessorMixin with `oai_like_processor` enabled.
+        """
         conversation = request.model_dump(exclude_unset=True)["messages"]
         processor = esurge.tokenizer
 
@@ -864,7 +1077,25 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         request_id: str,
         raw_request: Request,
     ) -> ChatCompletionResponse:
-        """Handle non-streaming multimodal chat completion via `eSurge.chat(...)`."""
+        """Handle non-streaming multimodal chat completion.
+
+        Processes chat requests containing image or video content using the
+        eSurge.chat() method which handles multimodal inputs natively.
+
+        Args:
+            request: The original chat completion request.
+            esurge: The eSurge engine instance configured for multimodal input.
+            messages: Prepared message dictionaries with multimodal content.
+            request_id: Unique identifier for this request.
+            raw_request: The raw FastAPI request for authentication context.
+
+        Returns:
+            ChatCompletionResponse with the generated response and usage stats.
+
+        Raises:
+            HTTPException: If the server is not configured for multimodal input
+                or if processing fails.
+        """
 
         async with self._acquire_generation_slot():
             sampling_params = self._prepare_sampling_params(request, esurge)
@@ -943,7 +1174,23 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         request_id: str,
         raw_request: Request,
     ) -> StreamingResponse:
-        """Handle streaming multimodal chat completion via `eSurge.chat(..., stream=True)`."""
+        """Handle streaming multimodal chat completion.
+
+        Processes chat requests with image or video content and streams the
+        response using Server-Sent Events. Uses eSurge.chat() with stream=True
+        for incremental token delivery.
+
+        Args:
+            request: The original chat completion request with stream=True.
+            esurge: The eSurge engine instance configured for multimodal input.
+            messages: Prepared message dictionaries with multimodal content.
+            request_id: Unique identifier for this request.
+            raw_request: The raw FastAPI request for authentication and disconnect detection.
+
+        Returns:
+            StreamingResponse that yields SSE-formatted chunks containing
+            incremental response content and usage statistics.
+        """
 
         sampling_params = self._prepare_sampling_params(request, esurge)
 
@@ -1101,6 +1348,18 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
     @staticmethod
     def _prompt_token_count_from_output(output: RequestOutput) -> int:
+        """Extract the prompt token count from a RequestOutput.
+
+        Handles both flat and nested token ID structures that may be present
+        in the output depending on the processing mode (single vs batched).
+
+        Args:
+            output: The RequestOutput containing prompt token information.
+
+        Returns:
+            Total count of prompt tokens. Returns 0 if prompt_token_ids is
+            not available or not in a recognized format.
+        """
         prompt_ids = output.prompt_token_ids
         if isinstance(prompt_ids, list) and prompt_ids:
             first = prompt_ids[0]
@@ -1111,7 +1370,31 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         return 0
 
     async def responses(self, request: ResponsesRequest, raw_request: Request) -> tp.Any:
-        """Handle OpenAI Responses API requests (POST /v1/responses)."""
+        """Handle OpenAI Responses API requests.
+
+        Implements the /v1/responses endpoint for the OpenAI Responses API,
+        supporting conversation continuations via `previous_response_id` or
+        `conversation` parameters, and optional response persistence.
+
+        Args:
+            request: The Responses API request containing input, model selection,
+                and optional continuation/storage parameters.
+            raw_request: The raw FastAPI request for authentication context.
+
+        Returns:
+            For non-streaming: A JSON object conforming to the Responses API spec
+                with output text, usage stats, and metadata.
+            For streaming: A StreamingResponse with SSE events following the
+                Responses API streaming protocol.
+
+        Raises:
+            HTTPException: For validation errors (400), auth failures (401/403/429),
+                or model not found (404).
+
+        Note:
+            The Responses API supports stateful conversations when
+            `enable_response_store=True` is configured on the server.
+        """
 
         response_id = f"resp_{uuid.uuid4().hex}"
         payload_api_keys = self._extract_payload_api_keys(request)
@@ -2165,7 +2448,23 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         prompt_tokens: int,
         start_time: float,
     ) -> ChatCompletionResponse:
-        """Create standard response without function calling."""
+        """Create a standard chat completion response without function calling.
+
+        Builds a ChatCompletionResponse from generation output, calculating
+        usage statistics and formatting the response according to OpenAI API
+        specifications.
+
+        Args:
+            request: The original chat completion request.
+            output: The generation output containing completions.
+            prompt_tokens: Number of tokens in the input prompt.
+            start_time: Unix timestamp when generation started, used to
+                calculate processing time.
+
+        Returns:
+            ChatCompletionResponse with a single choice containing the
+            generated message and computed usage statistics.
+        """
         completion = output.outputs[0]
         completion_tokens = len(completion.token_ids)
         generation_time = time.time() - start_time
@@ -2208,13 +2507,23 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
     @property
     def _endpoints(self) -> list:
-        """Define all API endpoints including admin auth endpoints.
+        """Define all API endpoints including admin authentication endpoints.
 
-        Extends the base endpoints with admin authentication endpoints
-        for API key management.
+        Assembles the complete list of API endpoints by combining base server
+        endpoints with admin authentication endpoints for API key management.
+
+        The admin endpoints provide comprehensive key lifecycle management:
+        - Key CRUD operations (create, read, update, delete)
+        - Key lifecycle actions (suspend, reactivate, revoke, rotate)
+        - Usage statistics and audit logging
 
         Returns:
-            List of EndpointConfig objects defining all server endpoints.
+            List of EndpointConfig objects defining all server endpoints,
+            including both inference endpoints and admin management endpoints.
+
+        Note:
+            Admin endpoints require an API key with admin role for access.
+            They are all prefixed with /v1/admin/.
         """
         from ...inference_engine_interface import EndpointConfig
 

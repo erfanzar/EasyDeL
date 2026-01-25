@@ -215,7 +215,7 @@ _import_structure = {
         "AttentionModule",
         "FlexibleAttentionModule",
     ],
-    "layers.moe": ["MoEMethods"],
+    "layers.components": ["MoEMethods"],
     "modules": [],
     "modules.arctic": [
         "ArcticConfig",
@@ -745,7 +745,7 @@ if _tp.TYPE_CHECKING:
     )
     from .infra.factory import ConfigType, TaskType, register_config, register_module
     from .layers.attention import AttentionMechanisms, AttentionModule, FlexibleAttentionModule
-    from .layers.moe import MoEMethods
+    from .layers.components import MoEMethods
     from .layers.operations import (
         AttentionConfig,
         AttentionOutput,

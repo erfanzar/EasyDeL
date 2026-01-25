@@ -12,6 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Neural network modules for Rotary Position Embeddings (RoPE).
+
+This module provides Flax NNX Module classes that implement various RoPE
+scaling methods for use in transformer attention layers. Each class computes
+and applies rotary positional embeddings to query and key tensors.
+
+Classes:
+    RotaryEmbedding: Standard RoPE with no scaling (default).
+    MultiModalRotaryEmbedding: Multi-modal RoPE for vision-language models (mRoPE).
+    LinearScalingRotaryEmbedding: RoPE with linear position scaling.
+    DynamicNTKScalingRotaryEmbedding: RoPE with dynamic NTK-aware scaling.
+    YaRNScalingRotaryEmbedding: RoPE with YaRN context extension method.
+    DeepseekScalingRotaryEmbedding: RoPE with Deepseek-YaRN variant scaling.
+    Phi3LongRoPEScaledRotaryEmbedding: RoPE with Phi-3 LongRoPE scaling.
+    Llama3RotaryEmbedding: RoPE with Llama-3 wavelength-based scaling.
+
+The `rope_wraper` decorator registers each class in `AVAILABLE_ROPE_TYPES`
+for dynamic lookup by rope type name.
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from easydel.layers.components.rotary_embedding import RotaryEmbedding
+    >>> # Create a standard RoPE module
+    >>> rope = RotaryEmbedding(
+    ...     head_size=64,
+    ...     rotary_dim=64,
+    ...     max_position_embeddings=2048,
+    ...     base=10000,
+    ...     is_neox_style=True,
+    ...     dtype=jnp.float32,
+    ... )
+    >>> # Apply RoPE to query and key tensors
+    >>> query = jnp.ones((1, 128, 8, 64))  # [batch, seq, heads, head_dim]
+    >>> key = jnp.ones((1, 128, 8, 64))
+    >>> positions = jnp.arange(128)
+    >>> q_rot, k_rot = rope(positions, query, key)
+"""
+
 from __future__ import annotations
 
 import jax
@@ -94,6 +132,19 @@ class RotaryEmbedding(nn.Module):
         is_neox_style: bool,
         dtype: jnp.dtype,
     ):
+        """Initialize the RotaryEmbedding module.
+
+        Args:
+            head_size: The dimension size of each attention head.
+            rotary_dim: The dimension size of the rotary embeddings applied.
+                Can be less than or equal to head_size.
+            max_position_embeddings: The maximum sequence length the model can handle.
+            base: The base value for calculating inverse frequencies in the
+                geometric progression.
+            is_neox_style: If True, uses Neox-style rotation (split and concatenate).
+                If False, uses GPT-J-style rotation (interleaved).
+            dtype: Data type for the output embeddings (e.g., jnp.float32).
+        """
         self.head_size = head_size
         self.rotary_dim = rotary_dim
         self.max_position_embeddings = max_position_embeddings
@@ -110,7 +161,29 @@ class RotaryEmbedding(nn.Module):
         offsets: jnp.ndarray | None = None,
         frequencies: jnp.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """__call__ pass for the rotary embedding."""
+        """Apply rotary positional embeddings to query and key tensors.
+
+        Computes the frequency cache if not provided, then applies the rotary
+        transformation to the query and key tensors based on the given positions.
+
+        Args:
+            positions: Position indices for each token in the sequence.
+                Shape: [sequence_length] or broadcastable shape.
+            query: Query tensor from attention computation.
+                Shape: [batch_size, sequence_length, num_heads, head_dim].
+            key: Key tensor from attention computation.
+                Shape: [batch_size, sequence_length, num_heads, head_dim].
+            offsets: Optional position offsets to add to positions (e.g., for
+                KV cache continuation). Shape: broadcastable with positions.
+                Defaults to None.
+            frequencies: Optional pre-computed frequency cache. If None,
+                frequencies are computed internally. Shape: [max_length, rotary_dim].
+                Defaults to None.
+
+        Returns:
+            A tuple of (rotated_query, rotated_key) tensors with the same
+            shapes as the input query and key, cast to self.dtype.
+        """
         with jax.ensure_compile_time_eval():
             if frequencies is None:
                 frequencies = compute_basic_frequencies(
@@ -164,6 +237,29 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         mrope_interleaved: bool = True,
         repetition_style: bool = False,
     ):
+        """Initialize the MultiModalRotaryEmbedding module.
+
+        Args:
+            head_size: The dimension size of each attention head.
+            rotary_dim: The dimension size of the rotary embeddings applied.
+            max_position_embeddings: The maximum sequence length the model can handle.
+            base: The base value for calculating inverse frequencies.
+            is_neox_style: If True, uses Neox-style rotation. If False, uses GPT-J-style.
+            dtype: Data type for the output embeddings.
+            mrope_section: Tuple of (T, H, W) dimensions specifying frequency allocation
+                for Temporal, Height, and Width dimensions. Defaults to (24, 20, 20)
+                for 64-dim rotary embeddings (128 head_dim / 2).
+            attention_scaling: Post-processing scaling factor applied to cos/sin values.
+                Defaults to 1.0 for standard mRoPE.
+            mrope_interleaved: If True, uses Qwen3-VL style interleaved pattern.
+                If False, uses Qwen2-VL style chunked pattern. Defaults to True.
+            repetition_style: If True, uses HuggingFace-style list repetition for
+                chunked mRoPE. Defaults to False.
+
+        Raises:
+            ValueError: If rotary_dim is not positive.
+            ValueError: If mrope_section is incompatible with rotary_dim.
+        """
         super().__init__(
             head_size=head_size,
             rotary_dim=rotary_dim,
@@ -196,21 +292,23 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         self.mrope_interleaved = mrope_interleaved
 
     def _apply_chunked_mrope(self, emb: jax.Array) -> jax.Array:
-        """Apply Qwen2-VL style chunked mRoPE.
+        """Apply Qwen2-VL style chunked mRoPE pattern.
 
-        Matches HuggingFace's apply_multimodal_rotary_pos_emb (Qwen2-VL):
-        - Takes the DOUBLED embedding (freqs concatenated with itself)
-        - Uses mrope_section * 2 to split the full rotary_dim
-        - For chunk i, selects from dimension (i % 3): T=0, H=1, W=2
-        - Concatenates chunks back together
+        This method implements the HuggingFace apply_multimodal_rotary_pos_emb
+        pattern used in Qwen2-VL models. It takes doubled embeddings (frequencies
+        concatenated with themselves) and selects chunks from appropriate
+        dimensions (T=0, H=1, W=2).
 
-        Result pattern: [T:0-31, H:32-79, W:80-127] (contiguous chunks)
+        The chunked pattern produces contiguous frequency blocks for each
+        spatial/temporal dimension, e.g., [T:0-31, H:32-79, W:80-127].
 
         Args:
-            emb: Doubled frequencies with shape (3, batch, seq, rotary_dim)
+            emb: Doubled frequency embeddings with shape (3, batch, seq, rotary_dim),
+                where axis 0 corresponds to T, H, W dimensions.
 
         Returns:
-            Combined frequencies with shape (batch, seq, rotary_dim)
+            Combined frequencies with shape (batch, seq, rotary_dim) after
+            selecting and concatenating appropriate chunks from each dimension.
         """
         if self.repetition_style:
             # HuggingFace splits using `mrope_section * 2` (list repetition), then
@@ -232,7 +330,19 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
             return jnp.concatenate([t_chunk, h_chunk, w_chunk], axis=-1)
 
     def _apply_interleaved_mrope(self, freqs: jax.Array) -> jax.Array:
-        """Interleave THW frequencies from chunked layout."""
+        """Apply Qwen3-VL style interleaved mRoPE pattern.
+
+        This method interleaves frequencies from T, H, W dimensions to create
+        a pattern where frequencies alternate: [T0, H0, W0, T1, H1, W1, ...].
+        This preserves frequency continuity for each spatial/temporal dimension.
+
+        Args:
+            freqs: Frequency embeddings with shape (3, batch, seq, rotary_dim//2),
+                where axis 0 corresponds to T, H, W dimensions.
+
+        Returns:
+            Interleaved frequencies with shape (batch, seq, rotary_dim//2).
+        """
         freqs_t = freqs[0]
         for dim_idx, offset in enumerate((1, 2), start=1):
             section_size = self.mrope_section[dim_idx] * 3
@@ -383,6 +493,18 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         dtype: jnp.dtype,
     ):
+        """Initialize the LinearScalingRotaryEmbedding module.
+
+        Args:
+            scaling_factors: The factor(s) to scale positions by. Can be a single
+                float or a list of floats for multiple scaling factors.
+            head_size: The dimension size of each attention head.
+            rotary_dim: The dimension size of the rotary embeddings applied.
+            max_position_embeddings: The base maximum sequence length before scaling.
+            base: The base value for calculating inverse frequencies.
+            is_neox_style: If True, uses Neox-style rotation. If False, uses GPT-J-style.
+            dtype: Data type for the output embeddings.
+        """
         super().__init__(
             head_size=head_size,
             rotary_dim=rotary_dim,
@@ -402,7 +524,25 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
         offsets: jnp.ndarray | None = None,
         frequencies: jnp.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """__call__ pass for the rotary embedding."""
+        """Apply linearly scaled rotary positional embeddings.
+
+        Computes the frequency cache with linear scaling if not provided,
+        then applies the rotary transformation to query and key tensors.
+
+        Args:
+            positions: Position indices for each token in the sequence.
+            query: Query tensor from attention computation.
+                Shape: [batch_size, sequence_length, num_heads, head_dim].
+            key: Key tensor from attention computation.
+                Shape: [batch_size, sequence_length, num_heads, head_dim].
+            offsets: Optional position offsets to add to positions.
+                Defaults to None.
+            frequencies: Optional pre-computed frequency cache. If None,
+                frequencies are computed with linear scaling. Defaults to None.
+
+        Returns:
+            A tuple of (rotated_query, rotated_key) tensors.
+        """
         with jax.ensure_compile_time_eval():
             if frequencies is None:
                 frequencies = compute_linear_frequencies(
@@ -447,6 +587,18 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         dtype: jnp.dtype,
     ):
+        """Initialize the DynamicNTKScalingRotaryEmbedding module.
+
+        Args:
+            scaling_factor: The scaling factor applied to sequence length and
+                used to dynamically adjust the base parameter.
+            head_size: The dimension size of each attention head.
+            rotary_dim: The dimension size of the rotary embeddings applied.
+            max_position_embeddings: The base maximum sequence length before scaling.
+            base: The initial base value before dynamic adjustment.
+            is_neox_style: If True, uses Neox-style rotation. If False, uses GPT-J-style.
+            dtype: Data type for the output embeddings.
+        """
         super().__init__(
             head_size=head_size,
             rotary_dim=rotary_dim,
@@ -466,7 +618,26 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
         offsets: jnp.ndarray | None = None,
         frequencies: jnp.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """__call__ pass for the rotary embedding."""
+        """Apply Dynamic NTK scaled rotary positional embeddings.
+
+        Computes the frequency cache with dynamic NTK scaling if not provided,
+        then applies the rotary transformation to query and key tensors.
+        The base parameter is dynamically adjusted based on the scaling factor.
+
+        Args:
+            positions: Position indices for each token in the sequence.
+            query: Query tensor from attention computation.
+                Shape: [batch_size, sequence_length, num_heads, head_dim].
+            key: Key tensor from attention computation.
+                Shape: [batch_size, sequence_length, num_heads, head_dim].
+            offsets: Optional position offsets to add to positions.
+                Defaults to None.
+            frequencies: Optional pre-computed frequency cache. If None,
+                frequencies are computed with dynamic NTK scaling. Defaults to None.
+
+        Returns:
+            A tuple of (rotated_query, rotated_key) tensors.
+        """
         with jax.ensure_compile_time_eval():
             if frequencies is None:
                 frequencies = compute_dynamic_frequencies(
@@ -520,6 +691,29 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         beta_fast: int = 32,
         beta_slow: int = 1,
     ):
+        """Initialize the YaRNScalingRotaryEmbedding module.
+
+        YaRN (Yet another RoPE extensioN) combines interpolation and extrapolation
+        with frequency correction and magnitude scaling for context extension.
+
+        Args:
+            head_size: The dimension size of each attention head.
+            rotary_dim: The dimension size of the rotary embeddings applied.
+            max_position_embeddings: The original maximum sequence length before scaling.
+            base: The base value for calculating inverse frequencies.
+            is_neox_style: If True, uses Neox-style rotation. If False, uses GPT-J-style.
+            dtype: Data type for the output embeddings.
+            scaling_factor: The primary scaling factor for context length extension.
+                Defaults to 1.0.
+            extrapolation_factor: Controls the strength of extrapolation correction.
+                Defaults to 1.0.
+            attn_factor: Scales the output attention values (applied to cos/sin).
+                Defaults to 1.0.
+            beta_fast: YaRN parameter for high-frequency dimensions correction range.
+                Defaults to 32.
+            beta_slow: YaRN parameter for low-frequency dimensions correction range.
+                Defaults to 1.
+        """
         super().__init__(
             head_size=head_size,
             rotary_dim=rotary_dim,
@@ -544,7 +738,26 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         offsets: jnp.ndarray | None = None,
         frequencies: jnp.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """__call__ pass for the rotary embedding."""
+        """Apply YaRN scaled rotary positional embeddings.
+
+        Computes the frequency cache with YaRN scaling if not provided,
+        then applies the rotary transformation to query and key tensors.
+        YaRN combines interpolation and extrapolation with mscale adjustment.
+
+        Args:
+            positions: Position indices for each token in the sequence.
+            query: Query tensor from attention computation.
+                Shape: [batch_size, sequence_length, num_heads, head_dim].
+            key: Key tensor from attention computation.
+                Shape: [batch_size, sequence_length, num_heads, head_dim].
+            offsets: Optional position offsets to add to positions.
+                Defaults to None.
+            frequencies: Optional pre-computed frequency cache. If None,
+                frequencies are computed with YaRN scaling. Defaults to None.
+
+        Returns:
+            A tuple of (rotated_query, rotated_key) tensors.
+        """
         with jax.ensure_compile_time_eval():
             if frequencies is None:
                 frequencies = compute_yarn_frequencies(
@@ -612,6 +825,27 @@ class DeepseekScalingRotaryEmbedding(nn.Module):
         mscale: float = 1,
         mscale_all_dim: float = 0,
     ):
+        """Initialize the DeepseekScalingRotaryEmbedding module.
+
+        This implements a YaRN-like scaling method with additional mscale
+        parameters as used in Deepseek models.
+
+        Args:
+            head_size: The dimension size of each attention head.
+            rotary_dim: The dimension size of the rotary embeddings applied.
+            max_position_embeddings: The original maximum sequence length before scaling.
+            base: The base value for calculating inverse frequencies.
+            is_neox_style: If True, uses Neox-style rotation. If False, uses GPT-J-style.
+            dtype: Data type for the output embeddings.
+            scaling_factor: The primary scaling factor for context length extension.
+            extrapolation_factor: Controls the strength of extrapolation correction.
+                Defaults to 1.
+            attn_factor: Scales the output attention values. Defaults to 1.
+            beta_fast: YaRN parameter for high-frequency dimensions. Defaults to 32.
+            beta_slow: YaRN parameter for low-frequency dimensions. Defaults to 1.
+            mscale: Parameter for mscale calculation in yarn_get_mscale. Defaults to 1.
+            mscale_all_dim: Parameter for mscale calculation. Defaults to 0.
+        """
         self.head_size = head_size
         self.rotary_dim = rotary_dim
         self.max_position_embeddings = max_position_embeddings
@@ -635,6 +869,25 @@ class DeepseekScalingRotaryEmbedding(nn.Module):
         offsets: jnp.ndarray | None = None,
         frequencies: jnp.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Apply Deepseek-YaRN scaled rotary positional embeddings.
+
+        Computes the frequency cache with Deepseek-YaRN scaling if not provided,
+        then applies the rotary transformation to query and key tensors.
+
+        Args:
+            positions: Position indices for each token in the sequence.
+            query: Query tensor from attention computation.
+                Shape: [batch_size, sequence_length, num_heads, head_dim].
+            key: Key tensor from attention computation.
+                Shape: [batch_size, sequence_length, num_heads, head_dim].
+            offsets: Optional position offsets to add to positions.
+                Defaults to None.
+            frequencies: Optional pre-computed frequency cache. If None,
+                frequencies are computed with Deepseek scaling. Defaults to None.
+
+        Returns:
+            A tuple of (rotated_query, rotated_key) tensors.
+        """
         if frequencies is None:
             frequencies = compute_deepseek_frequencies(
                 self.base,
@@ -711,6 +964,25 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         short_factor: list[float],
         long_factor: list[float],
     ):
+        """Initialize the Phi3LongRoPEScaledRotaryEmbedding module.
+
+        Phi-3 LongRoPE applies different scaling factors based on whether the
+        target sequence length exceeds the original maximum length.
+
+        Args:
+            head_size: The dimension size of each attention head. Must equal rotary_dim.
+            rotary_dim: The dimension size of the rotary embeddings. Must equal head_size.
+            max_position_embeddings: The target maximum sequence length after scaling.
+            original_max_position_embeddings: The original maximum sequence length
+                before scaling, used to determine which factor to apply.
+            base: The base value for calculating inverse frequencies.
+            is_neox_style: If True, uses Neox-style rotation (expected by apply_phi3_rope).
+            dtype: Data type for the output embeddings.
+            short_factor: List of scaling factors for each frequency dimension,
+                applied when max_position_embeddings <= original_max_position_embeddings.
+            long_factor: List of scaling factors for each frequency dimension,
+                applied when max_position_embeddings > original_max_position_embeddings.
+        """
         super().__init__()
 
         self.head_size = head_size
@@ -732,7 +1004,25 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         offsets: jnp.ndarray | None = None,
         frequencies: jnp.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """__call__ pass for the rotary embedding."""
+        """Apply Phi-3 LongRoPE scaled rotary positional embeddings.
+
+        Computes the frequency cache with Phi-3 LongRoPE scaling if not provided,
+        then applies the rotary transformation to query and key tensors.
+
+        Args:
+            positions: Position indices for each token in the sequence.
+            query: Query tensor from attention computation.
+                Shape: [batch_size, sequence_length, num_heads, head_dim].
+            key: Key tensor from attention computation.
+                Shape: [batch_size, sequence_length, num_heads, head_dim].
+            offsets: Optional position offsets to add to positions.
+                Defaults to None.
+            frequencies: Optional pre-computed frequency cache. If None,
+                frequencies are computed with Phi-3 LongRoPE scaling. Defaults to None.
+
+        Returns:
+            A tuple of (rotated_query, rotated_key) tensors.
+        """
         with jax.ensure_compile_time_eval():
             if frequencies is None:
                 frequencies = compute_phi3_frequencies(
@@ -785,6 +1075,26 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
         high_freq_factor: float,
         orig_max_position: int,
     ):
+        """Initialize the Llama3RotaryEmbedding module.
+
+        Llama-3 style RoPE adjusts frequencies based on wavelength thresholds
+        determined by low_freq_factor and high_freq_factor.
+
+        Args:
+            head_size: The dimension size of each attention head.
+            rotary_dim: The dimension size of the rotary embeddings applied.
+            max_position_embeddings: The target maximum sequence length.
+            base: The base value for calculating inverse frequencies.
+            is_neox_style: If True, uses Neox-style rotation. If False, uses GPT-J-style.
+            dtype: Data type for the output embeddings.
+            scaling_factor: The overall scaling factor applied to frequencies.
+            low_freq_factor: Factor used to compute the low frequency wavelength
+                threshold (orig_max_position / low_freq_factor).
+            high_freq_factor: Factor used to compute the high frequency wavelength
+                threshold (orig_max_position / high_freq_factor).
+            orig_max_position: The original maximum sequence length before scaling,
+                used to compute wavelength thresholds.
+        """
         super().__init__(
             head_size=head_size,
             rotary_dim=rotary_dim,
@@ -808,7 +1118,25 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
         offsets: jnp.ndarray | None = None,
         frequencies: jnp.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """__call__ pass for the rotary embedding."""
+        """Apply Llama-3 scaled rotary positional embeddings.
+
+        Computes the frequency cache with Llama-3 wavelength-based scaling if not
+        provided, then applies the rotary transformation to query and key tensors.
+
+        Args:
+            positions: Position indices for each token in the sequence.
+            query: Query tensor from attention computation.
+                Shape: [batch_size, sequence_length, num_heads, head_dim].
+            key: Key tensor from attention computation.
+                Shape: [batch_size, sequence_length, num_heads, head_dim].
+            offsets: Optional position offsets to add to positions.
+                Defaults to None.
+            frequencies: Optional pre-computed frequency cache. If None,
+                frequencies are computed with Llama-3 scaling. Defaults to None.
+
+        Returns:
+            A tuple of (rotated_query, rotated_key) tensors.
+        """
         with jax.ensure_compile_time_eval():
             if frequencies is None:
                 frequencies = compute_llama3_frequencies(

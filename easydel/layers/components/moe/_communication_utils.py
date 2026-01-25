@@ -444,6 +444,28 @@ class MoeFusedHooks:
         )
 
     def replace(self, **kws) -> MoeFusedHooks:
+        """Create a new MoeFusedHooks instance with some fields replaced.
+
+        This method creates a copy of the current hooks with specified fields
+        updated to new values, leaving other fields unchanged. Uses dataclass
+        replace() for immutable updates.
+
+        Args:
+            **kws: Keyword arguments specifying which hooks to replace and
+                their new values. Valid keys match the hook attribute names:
+                before_gate, after_gate, normalize_gate_logits, before_topk,
+                select_hook, refine_inputs_hook, scale_replicated_inputs,
+                after_ep_receive, refine_weights_hook, output_weights_hook,
+                after_wiwu, before_wo, after_wo, before_combine, finalize_output.
+
+        Returns:
+            A new MoeFusedHooks instance with the specified fields replaced.
+
+        Example:
+            >>> hooks = MoeFusedHooks(before_gate=my_hook)
+            >>> new_hooks = hooks.replace(after_gate=another_hook, before_wo=third_hook)
+            >>> # hooks.before_gate is preserved, after_gate and before_wo are updated
+        """
         return replace(self, **kws)
 
 
@@ -1158,6 +1180,67 @@ def get_moe_partition_spec(
     sp_is_ep_bound: bool = True,
     module_view: bool = False,
 ) -> jax.sharding.PartitionSpec:
+    """Generate JAX PartitionSpec for MoE expert weight tensors.
+
+    This function creates appropriate sharding specifications for expert FFN
+    weight matrices based on the parallelism configuration. It handles both
+    standard expert parallelism (experts on EP axis) and expert tensor mode
+    (experts on TP axis).
+
+    The function supports two weight orientations:
+        - Column-wise (wi/wu kernels): Output dimension is partitioned
+        - Row-wise (wd kernel): Input dimension is partitioned
+
+    Args:
+        partition_manager: EFormer PartitionManager providing axis name resolution
+            and mesh configuration.
+        direction: Weight matrix orientation determining which dimension is sharded:
+            - "column": For gate (wi) and up (wu) projections. Shape [E, H, M] with
+              TP sharding on M (intermediate) dimension.
+            - "row": For down (wd) projection. Shape [E, M, H] with TP sharding
+              on M (intermediate) dimension.
+        tensors_are_expert: Sharding mode selector:
+            - True: Expert tensor mode - all experts sharded across TP axis.
+              Returns [tp, None, None] for weights, [tp, None] for bias.
+            - False: Standard mode - experts on EP axis, features on TP axis.
+              Returns [expert, None, tp] or [expert, tp, None] based on direction.
+        is_bias: Whether generating spec for bias (2D) vs weight (3D) tensor.
+            Bias tensors have shape [E, dim] instead of [E, dim1, dim2].
+        fsdp_is_ep_bound: If True and module_view=True, includes FSDP axis in
+            expert sharding. Allows FSDP and EP to jointly shard experts.
+        sp_is_ep_bound: If True and module_view=True, includes SP axis in
+            expert sharding. Allows SP and EP to jointly shard experts.
+        module_view: If True, combines EP with FSDP and/or SP axes for joint
+            sharding. Creates a tuple axis like (ep, sp, fsdp) for the expert
+            dimension. If False, only uses EP axis for expert dimension.
+
+    Returns:
+        PartitionSpec appropriate for the tensor configuration. Examples:
+            - Standard column weight: PartitionSpec(expert, None, tp)
+            - Standard row weight: PartitionSpec(expert, tp, None)
+            - Standard bias: PartitionSpec(expert, tp)
+            - Expert tensor weight: PartitionSpec(tp, None, None)
+            - Expert tensor bias: PartitionSpec(tp, None)
+
+    Raises:
+        ValueError: If direction is not "row" or "column".
+
+    Example:
+        >>> from eformer.escale import PartitionManager
+        >>> pm = PartitionManager(mesh, ...)
+        >>>
+        >>> # Get spec for gate projection kernel [E, H, M]
+        >>> wi_spec = get_moe_partition_spec(pm, "column", False)
+        >>> # wi_spec = PartitionSpec("expert", None, "tensor")
+        >>>
+        >>> # Get spec for down projection kernel [E, M, H]
+        >>> wd_spec = get_moe_partition_spec(pm, "row", False)
+        >>> # wd_spec = PartitionSpec("expert", "tensor", None)
+        >>>
+        >>> # Expert tensor mode (all experts on TP)
+        >>> wi_spec_et = get_moe_partition_spec(pm, "column", True)
+        >>> # wi_spec_et = PartitionSpec("tensor", None, None)
+    """
     if direction not in ("row", "column"):
         raise ValueError(f"direction must be 'row' or 'column', got '{direction}'")
 
