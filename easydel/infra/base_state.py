@@ -1082,8 +1082,7 @@ class EasyDeLState(struct.PyTreeNode):
         auto_shard_model: bool = True,
         partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
         quantization_config: "QuantizationConfig | None" = None,
-        quantize_tensors: bool = False,
-        quantize_modules: bool = False,
+        apply_quantization: bool = False,
         verbose: bool = True,
         tx_template: optax.GradientTransformation | None = None,
         **kwargs,
@@ -1137,9 +1136,7 @@ class EasyDeLState(struct.PyTreeNode):
                 None (uses model config rules).
             quantization_config (QuantizationConfig | None): Configuration for model
                 quantization. Defaults to None (no quantization).
-            quantize_tensors (bool): If True, applies quantization to loaded tensors.
-                Defaults to False.
-            quantize_modules (bool): If True, applies quantization to model linear
+            apply_quantization (bool): If True, applies quantization to model linear
                 modules. Defaults to False.
             verbose (bool): If True, logs detailed information during loading.
                 Defaults to True.
@@ -1191,7 +1188,7 @@ class EasyDeLState(struct.PyTreeNode):
                 >>> state = EasyDeLState.load_state(
                 ...     "checkpoints/step_10000",
                 ...     quantization_config=QuantizationConfig(bits=8),
-                ...     quantize_modules=True
+                ...     apply_quantization=True
                 ... )
 
         Note:
@@ -1245,8 +1242,7 @@ class EasyDeLState(struct.PyTreeNode):
             auto_shard_model=auto_shard_model,
             partition_rules=partition_rules,
             quantization_config=quantization_config,
-            quantize_tensors=quantize_tensors,
-            quantize_modules=quantize_modules,
+            apply_quantization=apply_quantization,
             verbose=verbose,
             **kwargs,
         )

@@ -599,7 +599,7 @@ class Qwen3MoeModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
+        self.layers = nn.List([
             Qwen3MoeDecoderLayer(
                 config=config,
                 layer_idx=layer_idx,
@@ -609,7 +609,7 @@ class Qwen3MoeModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for layer_idx in range(config.num_hidden_layers)
-        ]
+        ])
         self.norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,

@@ -179,7 +179,7 @@ current_dtype = model.module_dtype
 # Quantize the model
 model.quantize(
     method="nf4",           # Quantization method
-    block_size=64,          # Block size for quantization
+    group_size=64,          # Group size for quantization
     quantization_pattern=".*",  # Regex pattern for layers to quantize
 )
 

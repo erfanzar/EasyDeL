@@ -221,6 +221,7 @@ OperationImplName = tp.Literal[
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",
     "unified_attention",
+    "paged_flash_attention",
     "sdpa",
     "cudnn",
     "cuda_flash_attn2",
@@ -239,6 +240,7 @@ Supported implementations:
     - "ragged_page_attention_v2": Paged attention v2 for variable-length batches.
     - "ragged_page_attention_v3": Paged attention v3 with improvements.
     - "unified_attention": vLLM-style unified paged attention.
+    - "paged_flash_attention": Paged FlashAttention with block tables (CUDA).
     - "sdpa": Scaled dot-product attention (PyTorch-compatible).
     - "cudnn": cuDNN-accelerated attention (NVIDIA GPUs).
     - "cuda_flash_attn2": CUDA FlashAttention 2 implementation.
@@ -276,6 +278,8 @@ class OperationConfigsDict(TypedDict, total=False):
             Improved version with additional optimization options.
         unified_attention: Configuration for unified attention (vLLM-style).
             Controls paged attention parameters for inference serving.
+        paged_flash_attention: Configuration for paged FlashAttention (CUDA).
+            Controls FlashAttention block sizes for paged KV caches.
         sdpa: Configuration for scaled dot-product attention.
             Also used for cudnn and cuda_flash_attn2 backends.
         vanilla: Configuration for vanilla (reference) attention.
@@ -300,6 +304,7 @@ class OperationConfigsDict(TypedDict, total=False):
     ragged_page_attention_v2: NotRequired["BaseOperationConfig | None"]
     ragged_page_attention_v3: NotRequired["BaseOperationConfig | None"]
     unified_attention: NotRequired["BaseOperationConfig | None"]
+    paged_flash_attention: NotRequired["BaseOperationConfig | None"]
     sdpa: NotRequired["BaseOperationConfig | None"]
     vanilla: NotRequired["BaseOperationConfig | None"]
 
@@ -553,15 +558,18 @@ class EasyDeLQuantizationCfg(TypedDict, total=False):
     Attributes:
         dtype: Quantization type for weight storage.
             Options: "nf4" (4-bit NormalFloat), "int8" (8-bit integer),
+            "affine" (scale+bias quantization with configurable bits),
             "ternary" (-1, 0, 1), "binary" (-1, 1), "mxfp8", "nvfp8", "mxfp4".
         runtime_dtype: Quantization type used during computation.
             Can differ from dtype for mixed quantization strategies.
-        block_size: Block size for block-wise quantization. Larger blocks
-            reduce memory overhead but may decrease accuracy. Default: 128.
+        group_size: Group size for quantization. Larger groups reduce
+            memory overhead but may decrease accuracy. Defaults depend on mode.
+        bits: Bit-width for affine quantization (2-8). Defaults depend on mode.
         simulate: If True, uses Straight-Through Estimator (STE) without
             actual bit packing. Useful for Quantization-Aware Training (QAT).
-        use_kernel: If True, uses optimized TPU/GPU kernels for
-            quantized operations when available.
+        jax_native: If True and the quantization type has a native JAX dtype
+            (e.g., MXFP4/MXFP8/NVFP8), use `astype` instead of ejkernel
+            quantization (applies even in simulation/QAT).
         pattern: Regex pattern for selecting layers to quantize.
             Matched against parameter names. Default pattern excludes
             embedding and normalization layers.
@@ -571,7 +579,7 @@ class EasyDeLQuantizationCfg(TypedDict, total=False):
         >>> # 4-bit NF4 quantization for linear layers only
         >>> quant_cfg: EasyDeLQuantizationCfg = {
         ...     "dtype": "nf4",
-        ...     "block_size": 64,
+        ...     "group_size": 64,
         ...     "pattern": r".*linear.*|.*proj.*",
         ... }
         >>> # 8-bit quantization for QAT
@@ -587,11 +595,12 @@ class EasyDeLQuantizationCfg(TypedDict, total=False):
         and norm layers.
     """
 
-    dtype: NotRequired[tp.Literal["nf4", "int8", "ternary", "binary", "mxfp8", "nvfp8", "mxfp4"]]
-    runtime_dtype: NotRequired[tp.Literal["nf4", "int8", "ternary", "binary", "mxfp8", "nvfp8", "mxfp4"]]
-    block_size: NotRequired[int]
+    dtype: NotRequired[tp.Literal["nf4", "int8", "affine", "ternary", "binary", "mxfp8", "nvfp8", "mxfp4"]]
+    runtime_dtype: NotRequired[tp.Literal["nf4", "int8", "affine", "ternary", "binary", "mxfp8", "nvfp8", "mxfp4"]]
+    group_size: NotRequired[int]
+    bits: NotRequired[int]
     simulate: NotRequired[bool]
-    use_kernel: NotRequired[bool]
+    jax_native: NotRequired[bool]
     pattern: NotRequired[str]
 
 
@@ -611,30 +620,25 @@ class QuantizationCfg(TypedDict, total=False):
         model: Model layer quantization configuration. Quantizes model
             weights to reduce model size and potentially speed up inference.
             Can be a QuantizationConfig object or EasyDeLQuantizationCfg dict.
-        quantize_tensors: Whether to quantize tensors during model loading.
-            When True, weights are quantized as they are loaded from disk.
-        quantize_modules: Whether to replace linear modules with quantized
+        apply_quantization: Whether to replace linear modules with quantized
             versions. Enables dynamic quantization of activations.
 
     Example:
         >>> from easydel.infra.elarge_model.types import QuantizationCfg
         >>> # KV cache quantization only (for long-context inference)
         >>> quant_cfg: QuantizationCfg = {
-        ...     "kv_cache": {"dtype": "int8", "block_size": 128},
-        ...     "quantize_tensors": False,
+        ...     "kv_cache": {"dtype": "int8", "group_size": 128},
         ... }
         >>> # Full model quantization with 4-bit weights
         >>> quant_cfg: QuantizationCfg = {
-        ...     "model": {"dtype": "nf4", "block_size": 64},
-        ...     "quantize_tensors": True,
-        ...     "quantize_modules": True,
+        ...     "model": {"dtype": "nf4", "group_size": 64},
+        ...     "apply_quantization": True,
         ... }
         >>> # Combined KV cache and model quantization
         >>> quant_cfg: QuantizationCfg = {
         ...     "platform": "gpu",
         ...     "kv_cache": {"dtype": "int8"},
         ...     "model": {"dtype": "nf4", "pattern": r".*proj.*"},
-        ...     "quantize_tensors": True,
         ... }
 
     Note:
@@ -646,8 +650,7 @@ class QuantizationCfg(TypedDict, total=False):
     platform: NotRequired[EasyDeLPlatforms | None]
     kv_cache: NotRequired[QuantizationConfig | EasyDeLQuantizationCfg | None]
     model: NotRequired[QuantizationConfig | EasyDeLQuantizationCfg | None]
-    quantize_tensors: NotRequired[bool]
-    quantize_modules: NotRequired[bool]
+    apply_quantization: NotRequired[bool]
 
 
 class BaseCfg(TypedDict, total=False):
@@ -761,6 +764,9 @@ class eSurgeCfg(TypedDict, total=False):
             engine. Frees memory but requires reprefilling on resume.
         detokenizer_max_states: Maximum states kept in the detokenizer
             worker. Controls memory usage for streaming output.
+        idle_reset_seconds: If set, automatically pause/resume the engine
+            after this many seconds of continuous idleness to clear state.
+        idle_reset_min_interval: Minimum seconds between idle resets.
         tokenizer_endpoint: External tokenizer worker endpoint URL.
             Enables distributed tokenization.
         detokenizer_endpoint: External detokenizer worker endpoint URL.
@@ -830,6 +836,8 @@ class eSurgeCfg(TypedDict, total=False):
     decode_truncated_prompt: NotRequired[bool]
     destroy_pages_on_pause: NotRequired[bool]
     detokenizer_max_states: NotRequired[int]
+    idle_reset_seconds: NotRequired[float | None]
+    idle_reset_min_interval: NotRequired[float]
     tokenizer_endpoint: NotRequired[str | None]
     detokenizer_endpoint: NotRequired[str | None]
     sampling_params_callback: NotRequired[tp.Callable[[SamplingParams, dict[str, tp.Any]], SamplingParams | None] | None]

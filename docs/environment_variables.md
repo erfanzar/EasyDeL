@@ -135,17 +135,18 @@ These are set during ejkernel import or profiler setup:
 
 ## Inference and eSurge
 
-| Env var                           | Default         | What it does                                                              | Use case                                          |
-| --------------------------------- | --------------- | ------------------------------------------------------------------------- | ------------------------------------------------- |
-| `EASYDEL_TOPK_FOR_COMPUTE`        | `64`            | Limits top-k in efficient top-p sampling.                                 | Trade accuracy vs speed in sampling.              |
-| `EASURGE_MAX_SCHEDULER_ERRORS`    | `1`             | Max consecutive scheduler errors before eSurge stops.                     | Increase for resiliency in flaky environments.    |
-| `EASURGE_TOKENIZER_ENDPOINT`      | none            | Overrides tokenizer worker ZeroMQ endpoint.                               | Run tokenizer/detokenizer on custom endpoints.    |
-| `EASURGE_DETOKENIZER_ENDPOINT`    | none            | Overrides detokenizer worker ZeroMQ endpoint.                             | Same as above.                                    |
-| `EASURGE_SYNC_INPUTS_FOR_TIMING`  | `0`             | If `1`, syncs inputs for more accurate timing (adds a device round-trip). | Benchmarking accurate prep time.                  |
-| `ESURGE_WORKER_TRUST_REMOTE_CODE` | `1`             | Controls `trust_remote_code` for tokenizer workers.                       | Disable to avoid executing remote tokenizer code. |
-| `OPENAI_API_KEY`                  | none            | Used by OpenAI-compatible proxy when `api_key` not provided.              | Required for proxying to OpenAI.                  |
-| `PYTHONHASHSEED`                  | `1524618910112` | Used to derive hash seed for prefix caching in eSurge.                    | Make prefix caching deterministic across runs.    |
-| `HF_HUB_ENABLE_HF_TRANSFER`       | none            | Set to `1` in download scripts to enable hf_transfer.                     | Faster HF downloads in scripts.                   |
+| Env var                             | Default         | What it does                                                              | Use case                                          |
+| ----------------------------------- | --------------- | ------------------------------------------------------------------------- | ------------------------------------------------- |
+| `EASYDEL_TOPK_FOR_COMPUTE`          | `64`            | Limits top-k in efficient top-p sampling.                                 | Trade accuracy vs speed in sampling.              |
+| `EASURGE_MAX_SCHEDULER_ERRORS`      | `1`             | Max consecutive scheduler errors before eSurge stops.                     | Increase for resiliency in flaky environments.    |
+| `EASURGE_TOKENIZER_ENDPOINT`        | none            | Overrides tokenizer worker ZeroMQ endpoint.                               | Run tokenizer/detokenizer on custom endpoints.    |
+| `EASURGE_DETOKENIZER_ENDPOINT`      | none            | Overrides detokenizer worker ZeroMQ endpoint.                             | Same as above.                                    |
+| `EASURGE_SYNC_INPUTS_FOR_TIMING`    | `0`             | If `1`, syncs inputs for more accurate timing (adds a device round-trip). | Benchmarking accurate prep time.                  |
+| `ESURGE_DETOKENIZER_CONTEXT_WINDOW` | `4`             | Token context window used by the detokenizer worker for streaming decode. | Improve joiner/WordPiece decoding in streams.     |
+| `ESURGE_WORKER_TRUST_REMOTE_CODE`   | `1`             | Controls `trust_remote_code` for tokenizer workers.                       | Disable to avoid executing remote tokenizer code. |
+| `OPENAI_API_KEY`                    | none            | Used by OpenAI-compatible proxy when `api_key` not provided.              | Required for proxying to OpenAI.                  |
+| `PYTHONHASHSEED`                    | `1524618910112` | Used to derive hash seed for prefix caching in eSurge.                    | Make prefix caching deterministic across runs.    |
+| `HF_HUB_ENABLE_HF_TRANSFER`         | none            | Set to `1` in download scripts to enable hf_transfer.                     | Faster HF downloads in scripts.                   |
 
 ## MoE, kernels, and quantization
 

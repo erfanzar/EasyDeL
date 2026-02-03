@@ -809,7 +809,7 @@ class MiniMaxModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
+        self.layers = nn.List([
             MiniMaxDecoderLayer(
                 config=config,
                 dtype=dtype,
@@ -819,7 +819,7 @@ class MiniMaxModel(EasyDeLBaseModule):
                 layer_idx=layer_idx,
             )
             for layer_idx in range(config.num_hidden_layers)
-        ]
+        ])
 
         self.norm = RMSNorm(
             config.hidden_size,

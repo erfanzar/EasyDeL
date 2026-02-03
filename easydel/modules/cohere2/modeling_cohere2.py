@@ -503,7 +503,7 @@ class Cohere2Model(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
+        self.layers = nn.List([
             Cohere2Block(
                 config=config,
                 layer_idx=idx,
@@ -513,7 +513,7 @@ class Cohere2Model(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for idx in range(config.num_hidden_layers)
-        ]
+        ])
         self.norm = Cohere2LayerNorm(
             self.config.hidden_size,
             eps=self.config.layer_norm_eps,

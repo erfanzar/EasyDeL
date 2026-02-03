@@ -494,7 +494,7 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
         self.max_source_positions = config.max_source_positions
         self.d_model = config.d_model
 
-        self.layers = [
+        self.layers = nn.List([
             Qwen3OmniMoeAudioEncoderLayer(
                 config=config,
                 layer_idx=i,
@@ -504,7 +504,7 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(config.encoder_layers)
-        ]
+        ])
 
         self.ln_post = nn.LayerNorm(
             config.d_model,
@@ -736,7 +736,7 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.mlp = [
+        self.mlp = nn.List([
             ColumnParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
@@ -756,7 +756,7 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
                 precision=precision,
                 rngs=rngs,
             ),
-        ]
+        ])
 
     def __call__(self, x: Array) -> Array:
         """Merge adjacent patches and project to output dimension.
@@ -1051,7 +1051,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.merger_list = [
+        self.merger_list = nn.List([
             Qwen3OmniMoeVisionPatchMerger(
                 config=config,
                 dtype=dtype,
@@ -1061,7 +1061,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for _ in range(len(config.deepstack_visual_indexes))
-        ]
+        ])
 
         self.spatial_merge_size = config.spatial_merge_size
         self.patch_size = config.patch_size
@@ -1089,7 +1089,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
 
         self._rotary_dim = head_dim // 2
 
-        self.blocks = [
+        self.blocks = nn.List([
             Qwen3OmniMoeVisionBlock(
                 config=config,
                 layer_idx=idx,
@@ -1099,7 +1099,7 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for idx in range(config.depth)
-        ]
+        ])
 
         self.merger = Qwen3OmniMoeVisionPatchMerger(
             config=config,
@@ -2409,7 +2409,7 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.codec_embedding = [
+        self.codec_embedding = nn.List([
             Embed(
                 config.vocab_size,
                 config.hidden_size,
@@ -2419,9 +2419,9 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for _ in range(config.num_code_groups - 1)
-        ]
+        ])
 
-        self.layers = [
+        self.layers = nn.List([
             Qwen3OmniMoeTalkerCodePredictorDecoderLayer(
                 config=config,
                 layer_idx=layer_idx,
@@ -2431,7 +2431,7 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for layer_idx in range(config.num_hidden_layers)
-        ]
+        ])
 
         self.norm = RMSNorm(
             config.hidden_size,
@@ -2544,7 +2544,7 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
             lm_head_name="lm_head",
         )
 
-        self.lm_head = [
+        self.lm_head = nn.List([
             ColumnParallelLinear(
                 config.hidden_size,
                 config.vocab_size,
@@ -2556,7 +2556,7 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
                 kernel_init=jax.nn.initializers.normal(config.initializer_range),
             )
             for _ in range(config.num_code_groups - 1)
-        ]
+        ])
 
     def __call__(
         self,
@@ -2633,7 +2633,7 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
+        self.layers = nn.List([
             Qwen3OmniMoeTalkerTextDecoderLayer(
                 config=config,
                 layer_idx=layer_idx,
@@ -2643,7 +2643,7 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for layer_idx in range(config.num_hidden_layers)
-        ]
+        ])
 
         self.norm = RMSNorm(
             config.hidden_size,
@@ -3138,7 +3138,7 @@ class Qwen3OmniMoeCode2WavTransformerModel(nn.Module):
     ):
         self.config = config
 
-        self.layers = [
+        self.layers = nn.List([
             Qwen3OmniMoeCode2WavTransformerLayer(
                 config=config,
                 layer_idx=layer_idx,
@@ -3148,7 +3148,7 @@ class Qwen3OmniMoeCode2WavTransformerModel(nn.Module):
                 rngs=rngs,
             )
             for layer_idx in range(config.num_hidden_layers)
-        ]
+        ])
 
         self.norm = RMSNorm(
             config.hidden_size,
@@ -3320,7 +3320,7 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
+        self.layers = nn.List([
             Qwen3OmniMoeTextDecoderLayer(
                 config=config,
                 layer_idx=layer_idx,
@@ -3330,7 +3330,7 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for layer_idx in range(config.num_hidden_layers)
-        ]
+        ])
 
         self.norm = RMSNorm(
             config.hidden_size,
@@ -3507,7 +3507,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
+        self.layers = nn.List([
             Qwen3OmniMoeTextDecoderLayer(
                 config=text_config,
                 layer_idx=layer_idx,
@@ -3517,7 +3517,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for layer_idx in range(text_config.num_hidden_layers)
-        ]
+        ])
 
         self.norm = RMSNorm(
             text_config.hidden_size,

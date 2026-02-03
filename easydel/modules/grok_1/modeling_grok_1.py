@@ -397,7 +397,7 @@ class Grok1SparseMoeBlock(nn.Module):
             rngs=rngs,
         )
 
-        self.experts = [
+        self.experts = nn.List([
             Grok1BLockSparseMLP(
                 config=config,
                 dtype=dtype,
@@ -406,7 +406,7 @@ class Grok1SparseMoeBlock(nn.Module):
                 rngs=rngs,
             )
             for i in range(self.config.num_experts)
-        ]
+        ])
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Forward pass through the Sparse MoE block.
@@ -671,7 +671,7 @@ class Grok1Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
+        self.layers = nn.List([
             Grok1DecoderLayer(
                 layer_index=layer_index,
                 config=config,
@@ -681,7 +681,7 @@ class Grok1Model(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for layer_index in range(self.config.num_hidden_layers)
-        ]
+        ])
 
         self.norm = FlaxGrok1RMSNorm(
             self.config.hidden_size,

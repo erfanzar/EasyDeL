@@ -668,7 +668,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         head_dim = config.hidden_size // config.num_heads
         self._head_dim_ro = (head_dim // 2) // 2
 
-        self.blocks = [
+        self.blocks = nn.List([
             Glm4vVisionBlock(
                 config,
                 layer_idx=idx,
@@ -678,7 +678,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for idx in range(config.depth)
-        ]
+        ])
 
         self.downsample = nn.Conv(
             in_features=config.hidden_size,
@@ -1248,7 +1248,7 @@ class Glm4vTextModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
+        self.layers = nn.List([
             Glm4vTextDecoderLayer(
                 config=config,
                 dtype=dtype,
@@ -1258,7 +1258,7 @@ class Glm4vTextModel(EasyDeLBaseModule):
                 layer_idx=i,
             )
             for i in range(config.num_hidden_layers)
-        ]
+        ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
     def __call__(

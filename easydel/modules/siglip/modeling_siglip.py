@@ -612,7 +612,7 @@ class SiglipEncoder(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        self.layers = [
+        self.layers = nn.List([
             SiglipEncoderLayer(
                 config=config,
                 dtype=dtype,
@@ -621,7 +621,7 @@ class SiglipEncoder(nn.Module):
                 rngs=rngs,
             )
             for _ in range(config.num_hidden_layers)
-        ]
+        ])
 
     def __call__(
         self,

@@ -556,7 +556,7 @@ class CLIPEncoder(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        self.layers = [
+        self.layers = nn.List([
             CLIPEncoderLayer(
                 config=config,
                 dtype=dtype,
@@ -565,7 +565,7 @@ class CLIPEncoder(nn.Module):
                 rngs=rngs,
             )
             for _ in range(config.num_hidden_layers)
-        ]
+        ])
 
     @cached_property
     def causal_mask(self):

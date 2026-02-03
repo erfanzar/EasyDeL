@@ -628,7 +628,7 @@ class GPTJModel(EasyDeLBaseModule):
             rate=self.config.embd_pdrop,
             rngs=rngs,
         )
-        self.h = [
+        self.h = nn.List([
             GPTJBlock(
                 config,
                 layer_idx=i,
@@ -638,7 +638,7 @@ class GPTJModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(self.config.num_hidden_layers)
-        ]
+        ])
         self.ln_f = nn.LayerNorm(
             self.config.hidden_size,
             epsilon=self.config.layer_norm_epsilon,

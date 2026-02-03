@@ -328,6 +328,7 @@ AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
     "ragged_page_attention_v3",
     "page_attention",
     "unified_attention",
+    "paged_flash_attention",
 ]
 
 # Default attention mechanism used when none is explicitly specified.

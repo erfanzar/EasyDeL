@@ -401,7 +401,7 @@ class InternLM2Model(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
+        self.layers = nn.List([
             InternLM2Block(
                 config=config,
                 layer_idx=i,
@@ -411,7 +411,7 @@ class InternLM2Model(EasyDeLBaseModule):
                 precision=precision,
             )
             for i in range(config.num_hidden_layers)
-        ]
+        ])
         self.norm = RMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,

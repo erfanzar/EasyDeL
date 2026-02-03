@@ -52,8 +52,9 @@ class FastIncrementalDecoder:
         )
     """
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, *, context_window: int = 4):
         self.tokenizer = tokenizer
+        self.context_window = max(0, int(context_window))
 
     def _decode(self, token_ids: Iterable[int], *, skip_special_tokens: bool) -> str:
         """Wrapper around `tokenizer.decode` that works with all HF versions."""
@@ -76,45 +77,42 @@ class FastIncrementalDecoder:
         buffered_tokens: list,
         *,
         skip_special_tokens: bool,
+        context_tokens: Iterable[int] | None = None,
     ) -> tuple[str, list[int], bool]:
         """
-        Incrementally decode `new_tokens`.
+        Incrementally decode `new_tokens` with optional token context.
 
-        * If the new tokens alone produce a clean string → return that delta.
-          The buffer is cleared.
-
-        * If they contain “�” we prepend the existing `self.buffer` and try
-          again.  If that still contains “�” we keep the whole sequence in
-          `self.buffer` and return an empty delta.
-
-        * If ``finished=True`` (handled by the caller) we always decode
-          everything in `self.buffer + new_tokens` and then drop it.
+        * We decode ``context_tokens + buffered_tokens + new_tokens`` and
+          subtract the decoded context so tokenizers that need preceding
+          context (e.g., WordPiece) still stream correctly.
+        * If the resulting delta contains the UTF-8 replacement character
+          (“�”), we buffer the tokens and emit nothing to avoid corrupt output.
 
         Returns:
             delta_text, buffered (the same list that was passed in), has_buffer
         """
-        decoded_new = self._decode(new_tokens, skip_special_tokens=skip_special_tokens)
+        del previous_text
+        context = list(context_tokens) if context_tokens else []
+        buffered = list(buffered_tokens)
+        fresh = list(new_tokens)
+        candidate = context + buffered + fresh
 
-        if "�" not in decoded_new:
-            delta = (
-                decoded_new[len(previous_text) :]
-                if previous_text and decoded_new.startswith(previous_text)
-                else decoded_new
-            )
-            return delta, [], False
+        if not candidate:
+            return "", buffered, bool(buffered)
 
-        candidate = list(buffered_tokens) + list(new_tokens)
         decoded_candidate = self._decode(candidate, skip_special_tokens=skip_special_tokens)
+        decoded_context = self._decode(context, skip_special_tokens=skip_special_tokens) if context else ""
 
-        if "�" not in decoded_candidate:
-            delta = (
-                decoded_candidate[len(previous_text) :]
-                if previous_text and decoded_candidate.startswith(previous_text)
-                else decoded_candidate
-            )
-            return delta, [], False
+        if decoded_context and not decoded_candidate.startswith(decoded_context):
+            # Fall back to no-context decode if prefix alignment fails.
+            decoded_context = ""
+            decoded_candidate = self._decode(buffered + fresh, skip_special_tokens=skip_special_tokens)
 
-        return "", candidate, True
+        delta = decoded_candidate[len(decoded_context) :]
+        if "�" in delta:
+            return "", buffered + fresh, True
+
+        return delta, [], False
 
 
 def _tokenizer_worker(endpoint: str, tokenizer_path: str, tokenizer_kwargs: dict) -> None:
@@ -176,7 +174,11 @@ def _detokenizer_worker(
     if "trust_remote_code" not in tokenizer_kwargs.keys():
         tokenizer_kwargs["trust_remote_code"] = os.getenv("ESURGE_WORKER_TRUST_REMOTE_CODE", "1") in ["1", "on", "yes"]
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_kwargs)
-    decoder = FastIncrementalDecoder(tokenizer)
+    try:
+        context_window = int(os.getenv("ESURGE_DETOKENIZER_CONTEXT_WINDOW", "4"))
+    except ValueError:
+        context_window = 4
+    decoder = FastIncrementalDecoder(tokenizer, context_window=context_window)
 
     ctx = zmq.Context()
     socket = ctx.socket(zmq.REP)
@@ -202,11 +204,19 @@ def _detokenizer_worker(
                 new_tokens = generated_tokens[last_idx:]
                 detokstart = time.time()
                 if new_tokens or finished:
+                    buffered = state["buffered"]
+                    emitted_index = max(0, last_idx - len(buffered))
+                    if decoder.context_window:
+                        context_start = max(0, emitted_index - decoder.context_window)
+                        context_tokens = generated_tokens[context_start:emitted_index]
+                    else:
+                        context_tokens = []
                     delta, new_buffered, _ = decoder.decode(
                         new_tokens,
                         state["previous_text"],
-                        state["buffered"],
+                        buffered,
                         skip_special_tokens=skip_special,
+                        context_tokens=context_tokens,
                     )
                     state["buffered"] = new_buffered
                     accumulated = state["previous_text"] + delta

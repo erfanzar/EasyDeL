@@ -382,6 +382,10 @@ class ParallelLinear(nn.Module):
             ),
             self.rngs,
         )
+
+        if isinstance(self.kernel.value, jax.ShapeDtypeStruct):
+            return lazy_module
+
         return lazy_module.restage(kernel=self.kernel, bias=self.bias)
 
     @property

@@ -806,7 +806,7 @@ class Xerxes2Model(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
+        self.layers = nn.List([
             Xerxes2DecoderLayer(
                 config=config,
                 layer_idx=layer_idx,
@@ -816,7 +816,7 @@ class Xerxes2Model(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for layer_idx in range(config.num_hidden_layers)
-        ]
+        ])
         self.norm = RMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,

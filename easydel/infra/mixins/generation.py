@@ -2908,6 +2908,7 @@ class EasyGenerationMixin:
             "ragged_page_attention_v2",
             "ragged_page_attention_v3",
             "unified_attention",
+            "paged_flash_attention",
         ]:
             gdef = self.new_graphdef(attn_mechanism="ragged_page_attention_v3", recursive_update=True)
         return gdef
@@ -2940,6 +2941,7 @@ class EasyGenerationMixin:
             "ragged_page_attention_v2",
             "ragged_page_attention_v3",
             "unified_attention",
+            "paged_flash_attention",
         ]:
             return self
 

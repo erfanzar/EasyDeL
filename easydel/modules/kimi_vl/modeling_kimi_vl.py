@@ -664,7 +664,7 @@ class MoonVitEncoder(nn.Module):
         def activation(x):
             return jax.nn.gelu(x, approximate=True)
 
-        self.blocks = [
+        self.blocks = nn.List([
             MoonVitEncoderLayer(
                 base_config=base_config,
                 num_heads=num_heads,
@@ -678,7 +678,7 @@ class MoonVitEncoder(nn.Module):
                 rngs=rngs,
             )
             for _ in range(num_layers)
-        ]
+        ])
         self.final_layernorm = nn.LayerNorm(
             hidden_dim,
             epsilon=1e-5,

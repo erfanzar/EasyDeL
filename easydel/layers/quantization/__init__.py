@@ -16,7 +16,7 @@
 
 This module provides compatibility exports for quantization utilities,
 enabling memory-efficient model inference through various quantization
-schemes including INT8, NF4, MXFP4, MXFP8, and other formats.
+schemes including AFFINE, INT8, NF4, MXFP4, MXFP8, and other formats.
 
 Quantization reduces memory footprint and can improve inference speed
 by representing model weights and activations with lower precision
@@ -28,7 +28,7 @@ Classes:
         including quantization type, block size, and other options.
 
     QuantizationType:
-        Enumeration of available quantization types (INT8, NF4, MXFP4,
+        Enumeration of available quantization types (AFFINE, INT8, NF4, MXFP4,
         MXFP8, NVFP8, 1BIT).
 
     EasyQuantizer:
@@ -77,7 +77,7 @@ Example:
         >>> # Configure NF4 quantization for model weights
         >>> config = QuantizationConfig(
         ...     quantization_type=QuantizationType.NF4,
-        ...     block_size=64,
+        ...     group_size=64,
         ...     compute_dtype=jnp.bfloat16
         ... )
         >>>

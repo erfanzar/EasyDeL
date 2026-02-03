@@ -353,7 +353,7 @@ class GlmModel(EasyDeLBaseModule):
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             rngs=rngs,
         )
-        self.layers = [
+        self.layers = nn.List([
             GlmDecoderLayer(
                 config=config,
                 layer_idx=layer_idx,
@@ -363,7 +363,7 @@ class GlmModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for layer_idx in range(self.config.num_hidden_layers)
-        ]
+        ])
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,

@@ -354,7 +354,7 @@ eLargeModel accepts a dictionary with the following sections:
 | `sharding`     | Distributed setup     | `axis_dims`, `axis_names`, `auto_shard_model`                   |
 | `base_config`  | Model configuration   | `attn_mechanism`, `gradient_checkpointing`, `moe_method`        |
 | `esurge`       | Inference engine      | `max_model_len`, `max_num_seqs`, `hbm_utilization`, `page_size` |
-| `quantization` | Model quantization    | `model.dtype` (nf4/int8), `model.block_size`                    |
+| `quantization` | Model quantization    | `model.dtype` (nf4/int8), `model.group_size`                    |
 | `trainer`      | Training settings     | `trainer_type`, `learning_rate`, `num_train_epochs`             |
 | `mixture`      | Dataset configuration | `informs`, `batch_size`, `streaming`                            |
 | `eval`         | Evaluation settings   | `max_new_tokens`, `temperature`, `batch_size`                   |
@@ -402,7 +402,7 @@ elm = ed.eLargeModel(
             "page_size": 128,
             "enable_prefix_caching": True,
         },
-        "quantization": {"model": {"dtype": "nf4", "block_size": 128}, "quantize_tensors": False},
+        "quantization": {"model": {"dtype": "nf4", "group_size": 128}, "apply_quantization": True},
     }
 )
 
@@ -613,7 +613,7 @@ dataset = elm.build_dataset()
 | `set_model(path)`                      | Set model name/path                      |
 | `set_dtype(dtype)`                     | Set computation dtype (bf16, fp16, fp32) |
 | `set_sharding(axis_dims, axis_names)`  | Configure distributed sharding           |
-| `set_quantization(method, block_size)` | Enable quantization (nf4, int8)          |
+| `set_quantization(method, group_size)` | Enable quantization (nf4, int8)          |
 | `set_esurge(...)`                      | Configure eSurge inference engine        |
 | `set_trainer(type, ...)`               | Configure training paradigm              |
 | `set_mixture(...)`                     | Configure dataset mixture                |
@@ -1017,9 +1017,9 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 model = model.quantize(
     quantization_config=ed.EasyDeLQuantizationConfig(
         dtype=ed.QuantizationType.NF4,
-        block_size=256,
+        group_size=256,
     ),
-    quantize_tensors=False,
+    apply_quantization=True,
 )
 
 # Use quantized model for inference

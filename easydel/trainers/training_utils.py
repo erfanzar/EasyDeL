@@ -27,7 +27,7 @@ SCAN_TRAINER = check_bool_flag("SCAN_TRAINER")
 FAST_COMPILE = check_bool_flag("FAST_COMPILE")
 
 QuantizationMode = tp.Literal["fp8", "int8", "nf4"]
-DEFAULT_NF4_BLOCK_SIZE = 64
+DEFAULT_NF4_GROUP_SIZE = 64
 
 
 def _ste(x: jax.Array, q: jax.Array) -> jax.Array:
@@ -42,19 +42,19 @@ def _quantize_dequantize_int8(x: jax.Array) -> jax.Array:
     return dequantize_int8(q, scale)
 
 
-def _quantize_dequantize_nf4(x: jax.Array, *, block_size: int) -> jax.Array:
+def _quantize_dequantize_nf4(x: jax.Array, *, group_size: int) -> jax.Array:
     from eformer.ops.quantization.quantization_functions import dequantize_nf4, quantize_and_pack_nf4
 
-    if block_size <= 0:
-        raise ValueError(f"`quantization_block` must be > 0 for NF4, got {block_size}.")
+    if group_size <= 0:
+        raise ValueError(f"`quantization_block` must be > 0 for NF4, got {group_size}.")
     original_last_dim = x.shape[-1]
-    if original_last_dim % block_size != 0:
-        pad_amount = block_size - (original_last_dim % block_size)
+    if original_last_dim % group_size != 0:
+        pad_amount = group_size - (original_last_dim % group_size)
         pad_width = [(0, 0)] * (x.ndim - 1) + [(0, pad_amount)]
         x = jnp.pad(x, pad_width, mode="constant", constant_values=0)
 
-    packed, absmax = quantize_and_pack_nf4(x, block_size)
-    deq = dequantize_nf4(packed, absmax, block_size)
+    packed, absmax = quantize_and_pack_nf4(x, group_size)
+    deq = dequantize_nf4(packed, absmax, group_size)
     if deq.shape[-1] != original_last_dim:
         deq = deq[..., :original_last_dim]
     return deq
@@ -75,16 +75,16 @@ def make_default_tensor_straight_through(
     if the transform is identity (STE).
 
     Notes:
-        - `quantization_block` is used for NF4 block-wise quantization.
+        - `quantization_block` is used for NF4 group-wise quantization.
     """
     try:
         from eformer.ops.quantization import straight_through as eformer_straight_through  # type: ignore
     except Exception:  # pragma: no cover
         eformer_straight_through = None
 
-    nf4_block_size: int | None = None
+    nf4_group_size: int | None = None
     if quantization_mode == "nf4":
-        nf4_block_size = DEFAULT_NF4_BLOCK_SIZE if quantization_block is None else int(quantization_block)
+        nf4_group_size = DEFAULT_NF4_GROUP_SIZE if quantization_block is None else int(quantization_block)
 
     def tensor_straight_through(x: jax.Array) -> jax.Array:
         if not jnp.issubdtype(x.dtype, jnp.floating):
@@ -101,7 +101,7 @@ def make_default_tensor_straight_through(
         elif quantization_mode == "nf4":
 
             def qdq(y):
-                return _quantize_dequantize_nf4(y, block_size=tp.cast(int, nf4_block_size))
+                return _quantize_dequantize_nf4(y, group_size=tp.cast(int, nf4_group_size))
         elif quantization_mode == "fp8":
             qdq = _quantize_dequantize_fp8
         else:  # pragma: no cover

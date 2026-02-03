@@ -469,7 +469,7 @@ def refine_graphs(*graphs: dict) -> nnx.State:
     return nnx.merge_state(*_state_creators)
 
 
-def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
+def merge_state_and_tree(tree: dict, state: nnx.State, *, silence: bool = False) -> nnx.State:
     """
     Attaches a parameter tree to an nnx state.
 
@@ -503,7 +503,7 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
         tree_values = tree.get(keys, None)
         if tree_values is not None:
             params[keys].value = tree_values
-        else:
+        elif not silence:
             if keys[-1] != "bias":
                 _path = ".".join([str(k) for k in keys])
                 logger.info(f"a parameter's missing at {_path}, please double check.")
@@ -517,7 +517,7 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
     return state
 
 
-def merge_model_and_tree(model: M, tree: dict) -> M:
+def merge_model_and_tree(model: M, tree: dict, *, silence: bool = False) -> M:
     """
     Attaches a parameter tree to an nnx model.
 
@@ -541,7 +541,7 @@ def merge_model_and_tree(model: M, tree: dict) -> M:
         nnx.Module: The updated nnx model with the attached parameter tree.
     """
     graphdef, graphstate = nnx.split(model)
-    graphstate = merge_state_and_tree(tree=tree, state=graphstate)
+    graphstate = merge_state_and_tree(tree=tree, state=graphstate, silence=silence)
     return nnx.merge(graphdef, graphstate)
 
 

@@ -910,7 +910,7 @@ class DeepseekV2Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
+        self.layers = nn.List([
             DeepseekV2DecoderLayer(
                 config=config,
                 dtype=dtype,
@@ -920,7 +920,7 @@ class DeepseekV2Model(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(self.config.num_hidden_layers)
-        ]
+        ])
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,

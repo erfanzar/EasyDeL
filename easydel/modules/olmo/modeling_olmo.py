@@ -383,7 +383,7 @@ class OlmoModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
+        self.layers = nn.List([
             OlmoDecoderLayer(
                 config=config,
                 layer_idx=i,
@@ -393,7 +393,7 @@ class OlmoModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(config.num_hidden_layers)
-        ]
+        ])
         self.norm = nn.LayerNorm(
             config.hidden_size,
             epsilon=1e-5,

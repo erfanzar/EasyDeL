@@ -667,7 +667,7 @@ class GPT2Model(EasyDeLBaseModule):
         )
 
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop, rngs=rngs)
-        self.h = [
+        self.h = nn.List([
             GPT2Block(
                 self.config,
                 layer_idx=i,
@@ -677,7 +677,7 @@ class GPT2Model(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(self.config.num_hidden_layers)
-        ]
+        ])
         self.ln_f = nn.LayerNorm(
             self.config.hidden_size,
             epsilon=self.config.layer_norm_epsilon,

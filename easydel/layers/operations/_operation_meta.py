@@ -335,6 +335,7 @@ class OperationMetadata:
                 - "ragged_page_attention_v2": Ragged page attention v2
                 - "ragged_page_attention_v3": Ragged page attention v3
                 - "unified_attention": Unified paged attention (vLLM-style)
+                - "paged_flash_attention": Paged FlashAttention (CUDA, block tables)
                 - "sdpa": Scaled dot product attention
                 - "vanilla": Vanilla attention
 

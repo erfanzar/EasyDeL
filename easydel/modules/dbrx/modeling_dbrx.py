@@ -1010,7 +1010,7 @@ class DbrxModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.blocks = [
+        self.blocks = nn.List([
             DbrxBlock(
                 config=config,
                 layer_idx=i,
@@ -1020,7 +1020,7 @@ class DbrxModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(self.config.n_layers)
-        ]
+        ])
         self.norm_f = nn.LayerNorm(
             self.config.hidden_size,
             use_bias=False,

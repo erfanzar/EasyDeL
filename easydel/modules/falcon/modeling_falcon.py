@@ -540,7 +540,7 @@ class FalconModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.h = [
+        self.h = nn.List([
             FalconBlock(
                 config=config,
                 layer_idx=i,
@@ -550,7 +550,7 @@ class FalconModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(self.config.num_hidden_layers)
-        ]
+        ])
         self.ln_f = nn.LayerNorm(
             self.config.hidden_size,
             dtype=dtype,

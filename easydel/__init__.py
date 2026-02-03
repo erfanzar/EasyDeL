@@ -15,7 +15,7 @@
 # pyright:reportUnusedImport=none
 # pyright:reportImportCycles=none
 
-__version__ = "0.2.0.4"
+__version__ = "0.2.0.5"
 
 import os as _os
 import sys as _sys
@@ -196,6 +196,7 @@ _import_structure = {
         "BlockSparseAttn",
         "BlockSparseAttentionConfig",
         "FlashAttn",
+        "PagedFlashAttn",
         "FlashAttentionConfig",
         "OperationImpl",
         "OperationMetadata",
@@ -755,6 +756,7 @@ if _tp.TYPE_CHECKING:
         BlockSparseAttn,
         FlashAttentionConfig,
         FlashAttn,
+        PagedFlashAttn,
         OperationImpl,
         OperationMetadata,
         OperationRegistry,
@@ -1032,8 +1034,8 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_eformer_versions = ["0.0.90"]
-    _targeted_ejkernel_versions = ["0.0.50"]
+    _targeted_eformer_versions = ["0.0.95"]
+    _targeted_ejkernel_versions = ["0.0.55"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version
