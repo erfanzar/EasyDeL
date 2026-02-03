@@ -169,7 +169,7 @@ class StableLmLayerNormPerHead(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             rngs (nn.Rngs): Random number generator state.
         """
-        self.norms = [
+        self.norms = nn.List([
             nn.LayerNorm(
                 head_dim,
                 epsilon=eps,
@@ -179,7 +179,7 @@ class StableLmLayerNormPerHead(nn.Module):
                 rngs=rngs,
             )
             for idx in range(num_heads)
-        ]
+        ])
 
     def __call__(self, hidden_states):
         """Apply layer normalization independently to each head.
@@ -624,7 +624,7 @@ class StableLmModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
+        self.layers = nn.List([
             StableLmDecoderLayer(
                 config=config,
                 layer_idx=idx,
@@ -634,7 +634,7 @@ class StableLmModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for idx in range(config.num_hidden_layers)
-        ]
+        ])
 
         self.norm = nn.LayerNorm(
             config.hidden_size,

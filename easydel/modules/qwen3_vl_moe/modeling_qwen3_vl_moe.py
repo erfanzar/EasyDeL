@@ -856,7 +856,7 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
         head_dim = config.hidden_size // config.num_heads
         self._head_dim_ro = head_dim // 2
 
-        self.blocks = [
+        self.blocks = nn.List([
             Qwen3VLMoeVisionBlock(
                 config=config,
                 layer_idx=idx,
@@ -866,7 +866,7 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for idx in range(config.depth)
-        ]
+        ])
 
         self.merger = Qwen3VLMoeVisionPatchMerger(
             config=config,
@@ -876,7 +876,7 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.deepstack_merger_list = [
+        self.deepstack_merger_list = nn.List([
             Qwen3VLMoeVisionPatchMerger(
                 config=config,
                 dtype=dtype,
@@ -886,7 +886,7 @@ class Qwen3VLMoeVisionTransformerPretrainedModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for _ in config.deepstack_visual_indexes
-        ]
+        ])
 
         self.num_grid_per_side = int(math.sqrt(config.num_position_embeddings))
 
@@ -1644,7 +1644,7 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
+        self.layers = nn.List([
             Qwen3VLMoeTextDecoderLayer(
                 config=config,
                 layer_idx=i,
@@ -1654,7 +1654,7 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(config.num_hidden_layers)
-        ]
+        ])
 
         self.norm = RMSNorm(
             config.hidden_size,

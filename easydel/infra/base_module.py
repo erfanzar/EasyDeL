@@ -199,10 +199,10 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         ...     def __init__(self, config, dtype, param_dtype, precision, rngs):
         ...         super().__init__(config, dtype, param_dtype, precision, rngs)
         ...         self.embed = nn.Embed(config.vocab_size, config.hidden_size)
-        ...         self.layers = [
+        ...         self.layers = nn.List([
         ...             TransformerBlock(config, dtype, param_dtype, precision, rngs)
         ...             for _ in range(config.num_hidden_layers)
-        ...         ]
+        ...         ])
         ...
         ...     def __call__(self, input_ids, attention_mask=None):
         ...         hidden_states = self.embed(input_ids)
@@ -1403,36 +1403,30 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
     def quantize(
         self: Self,
         quantization_config: QuantizationConfig | None = None,
-        quantize_tensors: bool = False,
-        quantize_modules: bool | None = None,
+        apply_quantization: bool = True,
         verbose: bool | None = None,
         raise_error: bool = True,
     ) -> Self:
-        """Apply quantization to the module's linear layers or tensors.
+        """Apply quantization to the module's linear layers.
 
-        Quantizes the model using the specified configuration. Can either
-        replace Linear layers with their quantized equivalents (module-level)
-        or quantize tensor values directly (tensor-level).
+        Quantizes the model using the specified configuration by replacing
+        Linear layers with their quantized equivalents (module-level).
 
         Args:
             quantization_config: Configuration specifying quantization dtype,
-                block_size, and pattern. If None, uses default INT8 quantization.
-            quantize_tensors: If True, quantizes tensor values directly without
-                changing module structure. Defaults to False.
-            quantize_modules: If True, replaces Linear layers with quantized
-                equivalents (e.g., Linear8bit, LinearNF4). Defaults to True
-                when quantize_tensors is False.
+                group_size, and pattern. If None, uses default INT8 quantization.
+            apply_quantization: If True, replaces Linear layers with quantized
+                equivalents (e.g., Linear8bit, LinearNF4). Defaults to True.
             verbose: If True, logs information during quantization. Defaults
                 to True only on process index 0.
-            raise_error: If True, raises error when both quantize_tensors and
-                quantize_modules are False. Defaults to True.
+            raise_error: If True, raises error when apply_quantization is False.
+                Defaults to True.
 
         Returns:
             Self: The quantized model instance.
 
         Raises:
-            ValueError: If both quantize_tensors and quantize_modules are True.
-            ValueError: If both are False and raise_error is True.
+            ValueError: If apply_quantization is False and raise_error is True.
 
         Example:
             >>> from easydel.layers.quantization import QuantizationConfig, QuantizationType
@@ -1441,11 +1435,11 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> model = model.quantize(quantization_config=config)
             >>>
             >>> # NF4 quantization with custom block size
-            >>> config = QuantizationConfig(dtype=QuantizationType.NF4, block_size=64)
+            >>> config = QuantizationConfig(dtype=QuantizationType.NF4, group_size=64)
             >>> model = model.quantize(quantization_config=config)
 
         Note:
-            Module-level quantization (quantize_modules=True) typically provides
+            Module-level quantization (apply_quantization=True) typically provides
             better performance as it can fuse dequantization with computation.
         """
         from easydel.layers.components import EasyQuantizer, QuantizationConfig, QuantizationType
@@ -1454,20 +1448,14 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             quantization_config = QuantizationConfig(dtype=QuantizationType.INT8)
 
         quantizer = EasyQuantizer(quantization_config=quantization_config)
-        if quantize_modules is None:
-            quantize_modules = not quantize_tensors
-        if quantize_modules and quantize_tensors:
-            raise ValueError("`quantize_tensors` and `quantize_modules` both can't be True.")
 
         if verbose is None:
             verbose = jax.process_index() == 0
-        if quantize_tensors:
-            self = quantizer.quantize_model_tensors(self)
-        elif quantize_modules:
-            self = quantizer.quantize_modules(self, verbose=verbose)
+        if apply_quantization:
+            self = quantizer.apply_quantization(self, verbose=verbose)
         elif raise_error:
             raise ValueError(
-                "both `quantize_modules` and `quantize_tensors` can't be False at a time u can pass `raise_error=False` to skip this error."
+                "`apply_quantization` can't be False when quantization is requested; pass `raise_error=False` to skip."
             )
         return self
 

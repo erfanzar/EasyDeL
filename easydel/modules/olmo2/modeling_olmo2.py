@@ -496,7 +496,7 @@ class Olmo2Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
+        self.layers = nn.List([
             Olmo2DecoderLayer(
                 config=config,
                 layer_idx=idx,
@@ -506,7 +506,7 @@ class Olmo2Model(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for idx in range(self.config.num_hidden_layers)
-        ]
+        ])
         self.norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,

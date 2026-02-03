@@ -200,6 +200,11 @@ class eSurgeRunner:
                 "GPU backend detected: `unified_attention` is preferred for eSurge inference; "
                 f"got attn_mechanism={attn_mechanism!r}."
             )
+        elif backend != "gpu" and attn_mechanism == "paged_flash_attention":
+            logger.warning(
+                "Paged flash attention is CUDA-only; falling back to non-CUDA backends may fail. "
+                f"got backend={backend!r}."
+            )
         elif backend == "tpu" and attn_mechanism == "unified_attention":
             logger.warning(
                 "TPU backend detected: `ragged_page_attention_v3` is preferred for eSurge inference; "
@@ -211,7 +216,10 @@ class eSurgeRunner:
                 f"got attn_mechanism={attn_mechanism!r}."
             )
 
-        if getattr(self.model.config.get_text_config(), "attn_mechanism", None) == "unified_attention":
+        if getattr(self.model.config.get_text_config(), "attn_mechanism", None) in (
+            "unified_attention",
+            "paged_flash_attention",
+        ):
             self.metadata = self.model.create_unified_attention_cache_config(
                 hbm_utilization=hbm_utilization,
                 page_size=page_size,
@@ -929,12 +937,12 @@ class eSurgeRunner:
             self.sequence_buffer.page_table.append_rows_batch(pages_per_req, indices)
 
         # 6) Add new / reinserted requests
-        # Sort in reverse order and pop() to get highest indices first (avoid reusing index 0/1)
+        # Sort ascending so pop() returns the highest indices first (avoid reusing index 0/1)
         # This prevents KV cache corruption from repeatedly reusing low indices
-        removed_req_indices = sorted(removed_req_indices, reverse=True)
+        removed_req_indices = sorted(removed_req_indices)
         for req_id in req_ids_to_add:
             req_state = self.requests[req_id]
-            # Pop() from reverse-sorted list gives highest index first
+            # Pop() from sorted list gives highest index first
             reuse_index = removed_req_indices.pop() if removed_req_indices else None
             self.sequence_buffer.add_request(req_state, reuse_index)
 

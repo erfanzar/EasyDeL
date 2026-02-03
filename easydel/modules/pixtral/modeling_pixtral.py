@@ -565,7 +565,7 @@ class PixtralTransformer(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        self.layers = [
+        self.layers = nn.List([
             PixtralBlock(
                 config=config,
                 dtype=dtype,
@@ -574,7 +574,7 @@ class PixtralTransformer(nn.Module):
                 rngs=rngs,
             )
             for i in range(self.config.num_hidden_layers)
-        ]
+        ])
 
     def __call__(
         self,

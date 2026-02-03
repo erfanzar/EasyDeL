@@ -695,7 +695,7 @@ class RwkvModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.blocks = self.blocks = [
+        self.blocks = nn.List([
             RwkvBlock(
                 config=config,
                 dtype=dtype,
@@ -705,7 +705,7 @@ class RwkvModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for idx in range(self.config.num_hidden_layers)
-        ]
+        ])
 
         self.layers_are_rescaled = False
         self.deterministic = True

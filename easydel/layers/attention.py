@@ -130,6 +130,7 @@ class AttentionMechanisms(str, Enum):
         RAGGED_PAGE_ATTENTION_V3: Paged attention for efficient inference.
         RAGGED_PAGE_ATTENTION_V2: Paged attention for efficient inference.
         UNIFIED_ATTENTION: vLLM-style unified paged attention (Triton).
+        PAGED_FLASH_ATTENTION: FlashAttention with paged KV cache (CUDA).
         REGRESSIVE_DECODE: Optimized autoregressive decoding.
     """
 
@@ -147,6 +148,7 @@ class AttentionMechanisms(str, Enum):
     RAGGED_PAGE_ATTENTION_V2: str = "ragged_page_attention_v2"
     PAGED_ATTENTION: str = "page_attention"
     UNIFIED_ATTENTION: str = "unified_attention"
+    PAGED_FLASH_ATTENTION: str = "paged_flash_attention"
     REGRESSIVE_DECODE: str = "autoregressive_decodeattn"
 
 
@@ -427,7 +429,10 @@ class FlexibleAttentionModule(nn.Module):
                 AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3,
             ]
         elif isinstance(cache_view, UnifiedAttentionCacheView):
-            assert self.config.attn_mechanism == AttentionMechanisms.UNIFIED_ATTENTION
+            assert self.config.attn_mechanism in [
+                AttentionMechanisms.UNIFIED_ATTENTION,
+                AttentionMechanisms.PAGED_FLASH_ATTENTION,
+            ]
 
         # NOTE: Attention Dropout is disabled for now.
         # try:

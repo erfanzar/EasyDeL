@@ -1023,7 +1023,7 @@ class FalconH1Model(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = [
+        self.layers = nn.List([
             layer_block(
                 config=config,
                 layer_idx=i,
@@ -1033,7 +1033,7 @@ class FalconH1Model(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(config.num_hidden_layers)
-        ]
+        ])
 
         self.final_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs

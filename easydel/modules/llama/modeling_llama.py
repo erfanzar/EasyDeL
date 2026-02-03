@@ -350,7 +350,7 @@ class LlamaModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop, rngs=rngs)
-        self.layers = [
+        self.layers = nn.List([
             LlamaDecoderLayer(
                 config=config,
                 dtype=dtype,
@@ -360,7 +360,7 @@ class LlamaModel(EasyDeLBaseModule):
                 layer_idx=layer_idx,
             )
             for layer_idx in range(self.config.num_hidden_layers)
-        ]
+        ])
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,

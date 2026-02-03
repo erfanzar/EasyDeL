@@ -390,7 +390,7 @@ def quantize_linear_layers(
 
     Args:
         model: The model to quantize.
-        quantization_config: Quantization config specifying dtype, block_size, and pattern.
+        quantization_config: Quantization config specifying dtype, group_size, and pattern.
         verbose: Whether to use tqdm for logging.
 
     Returns:
@@ -400,7 +400,7 @@ def quantize_linear_layers(
         return model
 
     quantizer = EasyQuantizer(quantization_config=quantization_config)
-    return quantizer.quantize_modules(model, verbose=verbose)
+    return quantizer.apply_quantization(model, verbose=verbose)
 
 
 def apply_lora_to_layers(

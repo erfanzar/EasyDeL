@@ -460,7 +460,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.emb_dropout = nn.Dropout(config.hidden_dropout, rngs=rngs)
-        self.layers = [
+        self.layers = nn.List([
             GPTNeoXBlock(
                 config=config,
                 layer_idx=i,
@@ -470,7 +470,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(config.num_hidden_layers)
-        ]
+        ])
         self.final_layer_norm = nn.LayerNorm(
             config.hidden_size,
             epsilon=self.config.layer_norm_eps,

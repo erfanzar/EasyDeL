@@ -330,6 +330,3 @@ def validate(cfg_like: ELMConfig | Mapping[str, Any]) -> None:
         raise ValueError(f"sharding.axis_dims ({len(dims)}) must match sharding.axis_names ({len(names)})")
     if any((d == 0 or d < -1) for d in dims):
         raise ValueError("sharding.axis_dims must be positive or -1 (auto)")
-    q = cfg.get("quantization", {})
-    if q.get("method") is None and q.get("quantize_tensors", True):
-        pass

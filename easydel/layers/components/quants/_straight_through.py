@@ -26,12 +26,12 @@ original floating-point weights (enabling optimization).
 
 Available STE Functions:
     - straight_through: Unified interface for all quantization types
-    - straight_through_mxfp8: MXFP8 (E5M2) floating-point quantization
+    - straight_through_mxfp8: MXFP8 microscaling floating-point quantization
     - straight_through_nvfp8: NVIDIA FP8 (E4M3) quantization
-    - straight_through_mxfp4: MXFP4 (E2M1) floating-point quantization
-    - straight_through_nf4: 4-bit NormalFloat quantization (from eformer)
-    - straight_through_8bit: 8-bit integer quantization (from eformer)
-    - straight_through_1bit: Binary/ternary quantization (from eformer)
+    - straight_through_mxfp4: MXFP4 (E2M1) microscaling quantization
+    - straight_through_nf4: 4-bit NormalFloat quantization (via ejkernel)
+    - straight_through_8bit: 8-bit affine quantization (via ejkernel)
+    - straight_through_1bit: Binary/ternary quantization
 
 Example:
     >>> import jax
@@ -67,22 +67,63 @@ from __future__ import annotations
 
 import jax
 from eformer.jaximus import ste
-from eformer.ops import straight_through_1bit as straight_through_1bit
-from eformer.ops import straight_through_8bit as straight_through_8bit
-from eformer.ops import straight_through_nf4 as straight_through_nf4
+from ejkernel.quantization import dequantize as ej_dequantize
+from ejkernel.quantization import quantize as ej_quantize
 from jax import numpy as jnp
 
-from ._configs import QuantizationConfig, QuantizationType
+from ._configs import (
+    QuantizationConfig,
+    QuantizationType,
+    resolve_ejkernel_quant_params,
+    resolve_jax_native_dtype,
+)
+
+
+def _ejkernel_dequantized(
+    weights: jax.Array,
+    *,
+    mode: str,
+    group_size: int,
+    bits: int,
+) -> jax.Array:
+    if mode == "affine":
+        wq, scales, biases = ej_quantize(weights, group_size=group_size, bits=bits, mode=mode)
+    else:
+        wq, scales = ej_quantize(weights, group_size=group_size, bits=bits, mode=mode)
+        biases = None
+    dequantized = ej_dequantize(
+        wq,
+        scales,
+        biases,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    return dequantized.astype(weights.dtype)
 
 
 @ste
-def straight_through_mxfp8(weights: jax.Array) -> jax.Array:
-    """Apply straight-through estimation with MXFP8 (E5M2) quantization.
+def _straight_through_ejkernel(
+    weights: jax.Array,
+    *,
+    mode: str,
+    group_size: int,
+    bits: int,
+) -> jax.Array:
+    return _ejkernel_dequantized(weights, mode=mode, group_size=group_size, bits=bits)
 
-    Quantizes weights to 8-bit floating point (E5M2 format) in the forward pass
-    while passing gradients through unchanged in the backward pass. E5M2 format
-    has 5 exponent bits and 2 mantissa bits, providing wider dynamic range but
-    lower precision than E4M3.
+
+@ste
+def _straight_through_cast(weights: jax.Array, *, dtype: jnp.dtype) -> jax.Array:
+    return weights.astype(dtype)
+
+
+def straight_through_mxfp8(weights: jax.Array) -> jax.Array:
+    """Apply straight-through estimation with MXFP8 microscaling quantization.
+
+    Quantizes weights using ejkernel's microscaling FP8 format in the forward
+    pass while passing gradients through unchanged in the backward pass. This
+    mode uses E4M3 codes with a shared E8M0 exponent per group.
 
     Args:
         weights: Input array to quantize. Typically model weights in float32
@@ -90,8 +131,7 @@ def straight_through_mxfp8(weights: jax.Array) -> jax.Array:
 
     Returns:
         Array with the same shape and original dtype as input, but with values
-        that have been quantized through E5M2 representation. The output dtype
-        matches the input dtype (values are cast back after quantization).
+        that have been quantized through microscaling FP8 representation.
 
     Note:
         The @ste decorator ensures gradients bypass this operation during
@@ -103,18 +143,15 @@ def straight_through_mxfp8(weights: jax.Array) -> jax.Array:
         >>> quantized = straight_through_mxfp8(weights)
         >>> # quantized has same dtype as weights, but values are discretized
     """
-    return weights.astype(jnp.float8_e5m2).astype(weights.dtype)
+    return _straight_through_ejkernel(weights, mode="mxfp8", group_size=32, bits=8)
 
 
-@ste
 def straight_through_nvfp8(weights: jax.Array) -> jax.Array:
     """Apply straight-through estimation with NVIDIA FP8 (E4M3) quantization.
 
-    Quantizes weights to 8-bit floating point (E4M3 format) in the forward pass
-    while passing gradients through unchanged in the backward pass. E4M3 format
-    has 4 exponent bits and 3 mantissa bits, providing higher precision but
-    narrower dynamic range than E5M2. This format is optimized for NVIDIA
-    hardware accelerators.
+    Quantizes weights using ejkernel's NVIDIA FP8 (E4M3) mode in the forward
+    pass while passing gradients through unchanged in the backward pass. This
+    mode uses per-group E4M3 scales.
 
     Args:
         weights: Input array to quantize. Typically model weights in float32
@@ -133,17 +170,15 @@ def straight_through_nvfp8(weights: jax.Array) -> jax.Array:
         >>> weights = jnp.array([0.1, 0.5, 1.0], dtype=jnp.float32)
         >>> quantized = straight_through_nvfp8(weights)
     """
-    return weights.astype(jnp.float8_e4m3).astype(weights.dtype)
+    return _straight_through_ejkernel(weights, mode="nvfp8", group_size=16, bits=8)
 
 
-@ste
 def straight_through_mxfp4(weights: jax.Array) -> jax.Array:
     """Apply straight-through estimation with MXFP4 (E2M1) quantization.
 
-    Quantizes weights to 4-bit floating point (E2M1FN format) in the forward pass
-    while passing gradients through unchanged in the backward pass. E2M1 format
-    has 2 exponent bits and 1 mantissa bit, providing aggressive compression
-    with significant precision loss.
+    Quantizes weights using ejkernel's microscaling FP4 format in the forward
+    pass while passing gradients through unchanged in the backward pass. This
+    mode uses E2M1 codes with a shared E8M0 exponent per group.
 
     Args:
         weights: Input array to quantize. Typically model weights in float32
@@ -151,8 +186,7 @@ def straight_through_mxfp4(weights: jax.Array) -> jax.Array:
 
     Returns:
         Array with the same shape and original dtype as input, but with values
-        that have been quantized through E2M1 representation. This represents
-        a 4x memory reduction compared to FP16/BF16.
+        that have been quantized through microscaling FP4 representation.
 
     Warning:
         MXFP4 quantization is very aggressive and may cause significant
@@ -163,14 +197,48 @@ def straight_through_mxfp4(weights: jax.Array) -> jax.Array:
         >>> weights = jnp.array([0.1, 0.5, 1.0], dtype=jnp.float32)
         >>> quantized = straight_through_mxfp4(weights)
     """
-    return weights.astype(jnp.float4_e2m1fn).astype(weights.dtype)
+    return _straight_through_ejkernel(weights, mode="mxfp4", group_size=32, bits=4)
+
+
+def straight_through_nf4(weights: jax.Array, block_size: int = 64) -> jax.Array:
+    """Apply straight-through estimation with NF4 quantization via ejkernel."""
+    return _straight_through_ejkernel(weights, mode="nf4", group_size=int(block_size), bits=4)
+
+
+def straight_through_8bit(
+    weights: jax.Array,
+    axis: int | None = None,
+    *,
+    group_size: int = 64,
+) -> jax.Array:
+    """Apply straight-through estimation with 8-bit affine quantization.
+
+    Note:
+        The `axis` argument is accepted for API compatibility but is not used
+        by ejkernel's group-wise quantization.
+    """
+    _ = axis
+    return _straight_through_ejkernel(weights, mode="affine", group_size=int(group_size), bits=8)
+
+
+@ste
+def straight_through_1bit(weights: jax.Array, axis: int | None = None) -> jax.Array:
+    """Apply straight-through estimation with binary quantization.
+
+    Note:
+        The `axis` argument is accepted for API compatibility but is not used.
+    """
+    _ = axis
+    quantized = jnp.sign(weights)
+    quantized = jnp.where(quantized == 0, 1, quantized)
+    return quantized.astype(weights.dtype)
 
 
 def straight_through(
     array: jax.Array,
     config: QuantizationConfig | None = None,
     dtype: QuantizationType | str | None = None,
-    block_size: int = 64,
+    group_size: int | None = None,
 ) -> jax.Array:
     """Unified straight-through estimator for all supported quantization types.
 
@@ -185,16 +253,19 @@ def straight_through(
     Args:
         array: Input array to quantize. Typically trainable model weights in
             float32 or bfloat16 format.
-        config: QuantizationConfig object specifying dtype, block_size, and other
-            settings. If provided, overrides the dtype and block_size arguments.
+        config: QuantizationConfig object specifying dtype, group_size, and other
+            settings. If provided, overrides the dtype and group_size arguments.
             Defaults to None.
+            When config.jax_native is True and the dtype has a native JAX
+            representation (MXFP4/MXFP8/NVFP8), the forward pass uses
+            `astype` and the backward pass remains straight-through.
         dtype: Quantization type to apply. Can be a QuantizationType enum value
             or its string representation (e.g., "nf4", "int8"). Ignored if config
             is provided. Defaults to QuantizationType.NF4 if neither config nor
             dtype is specified.
-        block_size: Block size for block-wise quantization schemes (NF4).
-            Larger blocks improve throughput but may reduce accuracy. Only used
-            for NF4 quantization. Defaults to 64.
+        group_size: Group size for group-wise quantization schemes (NF4, affine,
+            MXFP, NVFP). Larger groups improve throughput but may reduce accuracy.
+            Defaults depend on dtype when not provided.
 
     Returns:
         Quantized array with the same shape as input. The array is materialized
@@ -256,31 +327,32 @@ def straight_through(
     # Resolve config
     if config is not None:
         dtype = config.dtype
-        block_size = config.block_size
+        group_size = config.group_size
     elif dtype is None:
         dtype = QuantizationType.NF4
 
     if isinstance(dtype, str):
         dtype = QuantizationType(dtype)
 
-    if dtype == QuantizationType.NF4:
-        return straight_through_nf4(array, block_size=block_size)
-
-    elif dtype == QuantizationType.INT8:
-        return straight_through_8bit(array)
-
-    elif dtype in {QuantizationType.BINARY, QuantizationType.TERNARY}:
+    if dtype in {QuantizationType.BINARY, QuantizationType.TERNARY}:
         return straight_through_1bit(array)
 
-    elif dtype == QuantizationType.MXFP4:
-        return straight_through_mxfp4(array)
+    if config is not None and config.jax_native:
+        jax_dtype = resolve_jax_native_dtype(dtype)
+        if jax_dtype is not None:
+            return _straight_through_cast(array, dtype=jax_dtype)
 
-    elif dtype == QuantizationType.MXFP8:
-        return straight_through_mxfp8(array)
+    if dtype in {
+        QuantizationType.AFFINE,
+        QuantizationType.INT8,
+        QuantizationType.NF4,
+        QuantizationType.MXFP4,
+        QuantizationType.MXFP8,
+        QuantizationType.NVFP8,
+    }:
+        config_for_ejkernel = config if config is not None else QuantizationConfig(dtype=dtype, group_size=group_size)
+        mode, group_size, bits, _ = resolve_ejkernel_quant_params(config_for_ejkernel)
+        return _straight_through_ejkernel(array, mode=mode, group_size=group_size, bits=bits)
 
-    elif dtype == QuantizationType.NVFP8:
-        return straight_through_nvfp8(array)
-
-    else:
-        supported = ", ".join([t.value for t in QuantizationType])
-        raise ValueError(f"Unsupported quantization type: {dtype}. Supported types: {supported}")
+    supported = ", ".join([t.value for t in QuantizationType])
+    raise ValueError(f"Unsupported quantization type: {dtype}. Supported types: {supported}")

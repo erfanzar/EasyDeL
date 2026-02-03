@@ -525,7 +525,7 @@ class Qwen2VLPatchMerger(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.mlp = [
+        self.mlp = nn.List([
             ColumnParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
@@ -545,7 +545,7 @@ class Qwen2VLPatchMerger(nn.Module):
                 precision=precision,
                 rngs=rngs,
             ),
-        ]
+        ])
 
     def __call__(self, x: Array) -> Array:
         """Merge and project patches.
@@ -1268,7 +1268,7 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         head_dim = config.embed_dim // config.num_heads
         self._head_dim_ro = head_dim // 2
 
-        self.blocks = [
+        self.blocks = nn.List([
             Qwen2VLVisionBlock(
                 config=config,
                 layer_idx=idx,
@@ -1278,7 +1278,7 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for idx in range(config.depth)
-        ]
+        ])
 
         self.merger = Qwen2VLPatchMerger(
             dim=config.hidden_size,
@@ -1481,7 +1481,7 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
+        self.layers = nn.List([
             Qwen2VLDecoderLayer(
                 config=config,
                 layer_idx=idx,
@@ -1491,7 +1491,7 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for idx in range(self.config.num_hidden_layers)
-        ]
+        ])
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,

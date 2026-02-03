@@ -606,7 +606,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
+        self.layers = nn.List([
             Gemma3DecoderLayer(
                 self.config,
                 layer_idx=i,
@@ -616,7 +616,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(self.config.num_hidden_layers)
-        ]
+        ])
         self.norm = Gemma3RMSNorm(self.config, param_dtype=self.dtype)
 
     @cached_property

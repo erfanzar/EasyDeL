@@ -112,7 +112,7 @@ Example:
         >>> # Configure NF4 quantization
         >>> quant_config = QuantizationConfig(
         ...     quantization_type=QuantizationType.NF4,
-        ...     block_size=64
+        ...     group_size=64
         ... )
 
     Using the UnifiedAttention base class::

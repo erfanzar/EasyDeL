@@ -213,7 +213,7 @@ class PhiMoeSparseMoeBlock(nn.Module):
             kernel_init=nn.initializers.normal(),
         )
 
-        self.experts = [
+        self.experts = nn.List([
             PhiMoEBlockSparseTop2MLP(
                 config=config,
                 dtype=dtype,
@@ -222,7 +222,7 @@ class PhiMoeSparseMoeBlock(nn.Module):
                 rngs=rngs,
             )
             for i in range(self.config.num_local_experts)
-        ]
+        ])
 
     def __call__(
         self,
@@ -507,7 +507,7 @@ class PhiMoeModel(EasyDeLBaseModule):
         )
 
         self.embed_dropout = nn.Dropout(config.embd_pdrop)
-        self.layers = [
+        self.layers = nn.List([
             PhiMoeDecoderLayer(
                 config=config,
                 layer_idx=idx,
@@ -517,7 +517,7 @@ class PhiMoeModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for idx in range(self.config.num_hidden_layers)
-        ]
+        ])
         self.norm = nn.LayerNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,

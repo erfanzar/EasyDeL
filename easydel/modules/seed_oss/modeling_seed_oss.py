@@ -438,7 +438,7 @@ class SeedOssModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.dropout = nn.Dropout(rate=config.embd_pdrop)
-        self.layers = [
+        self.layers = nn.List([
             SeedOssDecoderLayer(
                 config=config,
                 layer_idx=i,
@@ -448,7 +448,7 @@ class SeedOssModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(config.num_hidden_layers)
-        ]
+        ])
         self.norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,

@@ -637,7 +637,7 @@ class OPTDecoder(EasyDeLBaseModule):
         else:
             self.final_layer_norm = None
 
-        self.layers = [
+        self.layers = nn.List([
             OPTDecoderLayer(
                 config=config,
                 dtype=dtype,
@@ -646,7 +646,7 @@ class OPTDecoder(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(config.num_hidden_layers)
-        ]
+        ])
 
     def __call__(
         self,

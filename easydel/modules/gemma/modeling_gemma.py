@@ -458,7 +458,7 @@ class GemmaModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
+        self.layers = nn.List([
             GemmaDecoderLayer(
                 self.config,
                 layer_idx=i,
@@ -468,7 +468,7 @@ class GemmaModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(self.config.num_hidden_layers)
-        ]
+        ])
         self.norm = GemmaRMSNorm(self.config, dtype=self.dtype)
 
     # Ignore copy

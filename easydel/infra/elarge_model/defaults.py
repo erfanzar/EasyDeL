@@ -87,18 +87,18 @@ DEFAULTS: ELMConfig = {
         "sp_is_ep_bound": True,
     },
     # Quantization configuration: Settings for model weight quantization.
-    # - block_size: Block size for block-wise quantization (default 128 elements).
-    # - quantize_tensors: Whether to quantize tensor values.
-    # - quantize_modules: Whether to apply quantization to module weights.
+    # - group_size: Group size for quantization (default 128 elements).
+    # - apply_quantization: Whether to apply quantization to module weights.
     # - linear_pattern: Regex pattern matching linear layers to quantize.
     #   ".*" matches all linear layers by default.
-    # - linear_block_size: Block size specifically for linear layer quantization.
+    # - linear_group_size: Group size specifically for linear layer quantization.
+    # - jax_native: If True and the dtype has a JAX-native format (e.g., MXFP4/MXFP8/NVFP8),
+    #   quantization uses `astype` instead of ejkernel (applies even in QAT/simulate paths).
     "quantization": {
-        "block_size": 128,
-        "quantize_tensors": False,
-        "quantize_modules": False,
+        "group_size": 128,
+        "apply_quantization": False,
         "linear_pattern": ".*",
-        "linear_block_size": 64,
+        "linear_group_size": 64,
     },
     # Base configuration: Overrides for the underlying model configuration.
     # - values: Dictionary of config values to set on the base model config.

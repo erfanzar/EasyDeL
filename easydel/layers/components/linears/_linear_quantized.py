@@ -50,22 +50,20 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
-from eformer.ops.quantization.quantization_functions import (
-    nf4xf32_to_f32,
-    quantize_and_pack_nf4,
-    quantize_int8,
-)
+from ejkernel.modules.operations import quantized_matmul as ej_quantized_matmul
+from ejkernel.quantization import dequantize as ej_dequantize
+from ejkernel.quantization import prepack_quantized_weights
 from flax import nnx as nn
 from flax.nnx import rnglib
 from flax.nnx.nn import initializers
 from flax.typing import Dtype, Initializer, PrecisionLike
 
-from ..quants._quants import QuantizationType, quantize
+from ..quants._configs import QuantizationType, resolve_ejkernel_quant_params
+from ..quants._quants import quantize
 from ._linear import ColumnParallelLinear, RowParallelLinear
-from ._utils import nf4_qmm_jax
 
 if tp.TYPE_CHECKING:
-    from ..quants._quants import QuantizationConfig
+    from ..quants._configs import QuantizationConfig
 
 
 Array = jax.Array
@@ -100,6 +98,7 @@ class ParallelLinearQuantized(nn.Module):
         rngs: Random number generators for initialization.
         quant_kernel: Quantized kernel weights.
         quant_scales: Per-block scaling factors for dequantization.
+        quant_biases: Per-block biases for affine quantization (if applicable).
         bias: Optional bias parameter (not quantized).
         _direction: Parallelism direction ("row", "column", or None).
 
@@ -158,7 +157,7 @@ class ParallelLinearQuantized(nn.Module):
             bias_init: Initializer function for the bias vector.
                 Defaults to zeros.
             config: Quantization configuration specifying the quantization
-                type (INT8, NF4, etc.) and related parameters like block_size.
+                type (INT8, NF4, etc.) and related parameters like group_size.
             rngs: Flax random number generators for initialization.
 
         Raises:
@@ -176,13 +175,18 @@ class ParallelLinearQuantized(nn.Module):
         self.rngs = rngs
 
         kernel = kernel_init(rngs.params(), (in_features, out_features), param_dtype)
-        quant_kernel, quant_scales = self._quantize_array(kernel)
+        quant_kernel, quant_scales, quant_biases = self._quantize_array(kernel)
 
         self.quant_kernel = nn.Param(quant_kernel)
         self.quant_scales = nn.Param(quant_scales)
+        self.quant_biases = nn.Param(quant_biases)
 
         if use_bias:
             self.bias = nn.Param(bias_init(rngs.params(), (out_features,), param_dtype))
+
+    def _resolve_ejkernel_params(self) -> tuple[str, int, int, bool]:
+        """Resolve ejkernel quantization parameters from config."""
+        return resolve_ejkernel_quant_params(self.config)
 
     def _quantize_array(self, array: jax.Array):
         """Quantize an array according to the configured quantization type.
@@ -195,25 +199,34 @@ class ParallelLinearQuantized(nn.Module):
                 weights with shape (in_features, out_features).
 
         Returns:
-            A tuple of (quantized_array, scale_factors):
+            A tuple of (quantized_array, scale_factors, bias_factors):
                 - quantized_array: The quantized weight values
                 - scale_factors: Per-block scaling factors for dequantization
-                  (may be None for some quantization types)
+                - bias_factors: Per-block biases for affine quantization
+                  (None for non-affine modes)
 
         Raises:
             ValueError: If the configured quantization dtype is not supported.
         """
-        if self.config.dtype == QuantizationType.INT8:
-            wq, scale = quantize_int8(array, axis=0)
-            return wq, scale
-        elif self.config.dtype == QuantizationType.NF4:
-            wq, scale = quantize_and_pack_nf4(array, self.config.block_size)
-        elif self.config.dtype in {QuantizationType.MXFP4, QuantizationType.MXFP8, QuantizationType.NVFP8}:
-            wq = quantize(array=array, config=self.config, simulate=False)
-            scale = None
-        else:
-            raise ValueError("given dtype is not Supported!")
-        return wq, scale
+        mode, group_size, bits, needs_biases = self._resolve_ejkernel_params()
+        if needs_biases:
+            wq, scales, biases = prepack_quantized_weights(
+                array,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+                transpose=False,
+            )
+            return wq, scales, biases
+
+        wq, scales = prepack_quantized_weights(
+            array,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+            transpose=False,
+        )
+        return wq, scales, None
 
     def _quantize_runtime(self, array: jax.Array):
         """Quantize activations at runtime if configured.
@@ -233,12 +246,12 @@ class ParallelLinearQuantized(nn.Module):
             return quantize(
                 array=array,
                 dtype=self.config.runtime_dtype,
-                block_size=self.config.block_size,
+                group_size=self.config.group_size,
                 simulate=False,
             )
         return array
 
-    def _dequantize_array(self, wq: jax.Array, scale: jax.Array):
+    def _dequantize_array(self, wq: jax.Array, scale: jax.Array, bias: jax.Array | None):
         """Dequantize weights back to full precision for computation.
 
         Converts quantized weights to full precision using the stored
@@ -248,6 +261,7 @@ class ParallelLinearQuantized(nn.Module):
         Args:
             wq: Quantized weight array.
             scale: Per-block scaling factors.
+            bias: Per-block bias values (affine mode) or None.
 
         Returns:
             Dequantized weight array in full precision (param_dtype).
@@ -256,22 +270,16 @@ class ParallelLinearQuantized(nn.Module):
             ValueError: If the configured quantization dtype is not supported
                 for dequantization.
         """
-        if self.config.dtype == QuantizationType.INT8:
-            array = wq * scale
-        elif self.config.dtype == QuantizationType.NF4:
-            high = (wq >> 4) & 0xF
-            low = wq & 0xF
-            unpacked = jnp.stack([high, low], axis=-1)
-            *batch_dims, num_blocks, _ = wq.shape
-            unpacked = unpacked.reshape(*batch_dims, num_blocks, self.config.block_size)
-            dequantized = nf4xf32_to_f32(unpacked)
-            array = dequantized * scale[..., None]
-            array = array.reshape(*batch_dims, num_blocks * self.config.block_size)
-        elif self.config.dtype in {QuantizationType.MXFP4, QuantizationType.MXFP8, QuantizationType.NVFP8}:
-            array = wq.astype(self.param_dtype)
-        else:
-            raise ValueError("given dtype is not Supported for dequantization!")
-        return array
+        mode, group_size, bits, _ = self._resolve_ejkernel_params()
+        array = ej_dequantize(
+            wq,
+            scale,
+            bias,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+        )
+        return array.astype(self.param_dtype)
 
     def from_quantized(self, rngs: rnglib.Rngs | None = None) -> RowParallelLinear | ColumnParallelLinear:
         """Convert this quantized module back to a regular Linear module.
@@ -324,7 +332,8 @@ class ParallelLinearQuantized(nn.Module):
 
         kernel_value = getattr(self.quant_kernel, "value", self.quant_kernel)
         scale_value = getattr(self.quant_scales, "value", self.quant_scales)
-        dequantized_kernel = self._dequantize_array(kernel_value, scale_value)
+        bias_value = getattr(self.quant_biases, "value", self.quant_biases)
+        dequantized_kernel = self._dequantize_array(kernel_value, scale_value, bias_value)
         linear.kernel = nn.Param(dequantized_kernel)
 
         if self.use_bias:
@@ -355,20 +364,21 @@ class ParallelLinearQuantized(nn.Module):
         """
         kernel_value = getattr(kernel, "value", kernel)
         bias_value = getattr(bias, "value", bias)
-        wq, scale = self._quantize_array(kernel_value)
+        wq, scale, bias = self._quantize_array(kernel_value)
         self.quant_kernel.value = wq
         self.quant_scales.value = scale
+        self.quant_biases.value = bias
         if bias_value is not None and self.use_bias:
             self.bias.value = bias_value
         return self
 
-    @jax.named_scope("easydel-linear-int8-call")
+    @jax.named_scope("easydel-linear-quantized-call")
     def __call__(self, inputs: Array, w: Array | None = None) -> Array:
         """Apply the quantized linear transformation to inputs.
 
         Dequantizes weights on-the-fly and performs matrix multiplication
-        with the input. For NF4 quantization, uses an optimized kernel
-        that avoids full dequantization.
+        with the input. When enabled, uses ejkernel's fused quantized
+        matmul kernels for weight dequantization and multiplication.
 
         Args:
             inputs: Input array of shape (..., in_features).
@@ -381,10 +391,9 @@ class ParallelLinearQuantized(nn.Module):
             transformation and optional bias addition.
 
         Note:
-            The computation path varies by quantization type:
-            - INT8: Dequantize then matmul
-            - NF4: Use optimized nf4_qmm_jax kernel
-            - MXFP/NVFP: Direct matmul with optional runtime quantization
+            The computation path varies by configuration:
+            - If w is provided: uses standard matmul with the provided weights.
+            - Otherwise: uses ejkernel quantized_matmul.
         """
         inputs_gt_one_dim: bool = inputs.ndim > 1
         subscript: str
@@ -394,41 +403,35 @@ class ParallelLinearQuantized(nn.Module):
         else:
             subscript = "...k,...kj->...j"
 
-        def normal_flow(inputs):
-            kernel_value = getattr(self.quant_kernel, "value", self.quant_kernel)
-            scale_value = getattr(self.quant_scales, "value", self.quant_scales)
-            kernel = self._dequantize_array(kernel_value, scale_value)
-
-            if self.dtype is not None:
-                inputs = inputs.astype(self.dtype)
-                kernel = kernel.astype(self.dtype)
-
-            return jnp.einsum(subscript, inputs, kernel, **kws)
+        if self.dtype is not None:
+            inputs = inputs.astype(self.dtype)
 
         if w is not None:
-            kernel = w
-            if self.dtype is not None:
-                inputs = inputs.astype(self.dtype)
-                kernel = kernel.astype(self.dtype)
-
+            kernel = w.astype(self.dtype) if self.dtype is not None else w
             out = jnp.einsum(subscript, inputs, kernel, **kws)
-        elif self.config.dtype == QuantizationType.NF4:
+        else:
             kernel_value = getattr(self.quant_kernel, "value", self.quant_kernel)
             scale_value = getattr(self.quant_scales, "value", self.quant_scales)
-            out = nf4_qmm_jax(inputs, kernel_value, scale_value)
-        elif self.config.dtype in {QuantizationType.MXFP4, QuantizationType.MXFP8, QuantizationType.NVFP8}:
-            kernel = self.quant_kernel.value
+            bias_value = getattr(self.quant_biases, "value", self.quant_biases)
 
-            if self.config.runtime_dtype is None:
-                kernel = kernel.astype(self.dtype)
-            else:
-                inputs = self._quantize_runtime(inputs)
+            mode, group_size, bits, needs_biases = self._resolve_ejkernel_params()
+            if needs_biases and bias_value is None:
+                raise ValueError("Affine quantization requires quant_biases; re-quantize the module weights.")
 
-            out = jnp.einsum(subscript, inputs, kernel, **kws)
-            out = out.astype(self.dtype)
+            out = ej_quantized_matmul(
+                inputs.reshape((-1, inputs.shape[-1])),
+                kernel_value,
+                scale_value,
+                bias_value,
+                transpose=False,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+                platform="auto",
+            ).reshape((*inputs.shape[:-1], self.out_features))
 
-        else:
-            out = normal_flow(inputs)
+            if self.dtype is not None:
+                out = out.astype(self.dtype)
 
         if self.use_bias and self.bias.value is not None:
             bias = self.bias.value

@@ -3102,14 +3102,14 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     def quantize(
         self: Self,
         quantization_config: QuantizationConfig | None = None,
-        quantize_tensors: bool = True,
+        apply_quantization: bool = True,
         verbose: bool | None = None,
     ):
         """Quantizes the model's linear layers.
 
         Args:
             quantization_config: Quantization configuration. Pass None to use default INT8.
-            quantize_tensors: Whether to quantize tensors directly.
+            apply_quantization: Whether to apply quantization to modules.
             verbose: Whether to print verbose output.
 
         Returns:

@@ -498,7 +498,7 @@ class MixtralModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
+        self.layers = nn.List([
             MixtralDecoderLayer(
                 config=config,
                 dtype=dtype,
@@ -508,7 +508,7 @@ class MixtralModel(EasyDeLBaseModule):
                 layer_idx=idx,
             )
             for idx in range(config.num_hidden_layers)
-        ]
+        ])
 
         self.norm = RMSNorm(
             dim=config.hidden_size,

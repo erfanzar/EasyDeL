@@ -659,7 +659,7 @@ class GptOssModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
+        self.layers = nn.List([
             GptOssDecoderLayer(
                 config=config,
                 layer_idx=layer_idx,
@@ -669,7 +669,7 @@ class GptOssModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for layer_idx in range(config.num_hidden_layers)
-        ]
+        ])
 
         self.norm = GptOssRMSNorm(
             dim=config.hidden_size,

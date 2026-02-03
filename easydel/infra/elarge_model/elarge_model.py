@@ -487,7 +487,7 @@ class eLargeModel:
     def set_quantization(
         self,
         method: str | None = None,
-        block_size: int = 128,
+        group_size: int = 128,
         **kwargs,
     ) -> eLargeModel:
         """Configure quantization settings.
@@ -497,8 +497,8 @@ class eLargeModel:
 
         Args:
             method: Quantization method.
-            block_size: Quantization block size (default: 128).
-                Smaller blocks = better accuracy but more overhead.
+            group_size: Quantization group size (default: 128).
+                Smaller groups = better accuracy but more overhead.
             **kwargs: Additional quantization options:
                 - platform: Target platform ("cpu", "cuda", "tpu")
                 - compute_dtype: Dtype for computation (e.g., "fp16")
@@ -508,13 +508,13 @@ class eLargeModel:
             Self for method chaining
 
         Example:
-            >>> elm.set_quantization("nf4", block_size=64)
+            >>> elm.set_quantization("nf4", group_size=64)
             >>> elm.set_quantization("a8bit")
         """
         quant = self._config.setdefault("quantization", {})
         if method is not None:
             quant["method"] = method
-        quant["block_size"] = block_size
+        quant["group_size"] = group_size
         quant.update(kwargs)
         return self
 
@@ -539,6 +539,7 @@ class eLargeModel:
                 - "ragged_page_attention_v2": Ragged page attention v2
                 - "ragged_page_attention_v3": Ragged page attention v3
                 - "unified_attention": Unified paged attention (vLLM-style)
+                - "paged_flash_attention": Paged FlashAttention (CUDA)
                 - "sdpa": Scaled dot product attention
                 - "vanilla": Vanilla attention
             **kwargs: Individual operation configs as keyword arguments.
@@ -1912,7 +1913,7 @@ class eLargeModel:
         # Quantization
         quant = self._config.get("quantization", {})
         if quant.get("method"):
-            lines.append(_line(f"▸ quant: {quant['method']} (block:{quant.get('block_size', 128)})"))
+            lines.append(_line(f"▸ quant: {quant['method']} (group:{quant.get('group_size', 128)})"))
 
         # eSurge
         esurge = self._config.get("esurge", {})

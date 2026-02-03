@@ -674,7 +674,7 @@ class GiddModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
+        self.layers = nn.List([
             GiddLayer(
                 config=config,
                 dtype=dtype,
@@ -684,7 +684,7 @@ class GiddModel(EasyDeLBaseModule):
                 resid_scale=self.resid_scale,
             )
             for _ in range(self.config.num_hidden_layers)
-        ]
+        ])
 
         self.norm = GiddRMSNorm(config=config, dtype=dtype, param_dtype=param_dtype)
 

@@ -72,6 +72,7 @@ Example:
 from .blocksparse_attention import BlockSparseAttn
 from .decode_attention import AutoRegressiveDecodeAttn
 from .flash_attention import FlashAttn
+from .paged_flash_attention import PagedFlashAttn
 from .gated_delta_rule import GatedDeltaRuleOp, GatedDeltaRuleOutput
 from .kda import KDAOutput, KernelDeltaAttnOp, fused_kda_gate
 from .ragged_page_attention import RaggedPageAttnV2, RaggedPageAttnV3
@@ -90,6 +91,7 @@ __all__ = (
     "GatedDeltaRuleOutput",
     "KDAOutput",
     "KernelDeltaAttnOp",
+    "PagedFlashAttn",
     "RaggedPageAttnV2",
     "RaggedPageAttnV3",
     "RingAttn",

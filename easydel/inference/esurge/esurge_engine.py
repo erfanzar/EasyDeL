@@ -291,6 +291,8 @@ class eSurge:
         tokenizer_endpoint: str | None = None,
         detokenizer_endpoint: str | None = None,
         max_request_outputs: int | None = 1000,
+        idle_reset_seconds: float | None = None,
+        idle_reset_min_interval: float = 60.0,
         sampling_params_callback: (
             typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None] | None
         ) = None,
@@ -356,6 +358,11 @@ class eSurge:
             max_request_outputs: Maximum number of completed RequestOutput objects
                 to retain in memory for post-hoc access. Set to None for unlimited
                 retention or <=0 to disable retention entirely.
+            idle_reset_seconds: If set, automatically pause/resume the engine after
+                this many seconds of continuous idleness (no running/pending requests).
+                Useful for clearing stale state under long-running workloads.
+            idle_reset_min_interval: Minimum seconds between idle resets to avoid
+                reset loops when traffic is sparse.
             sampling_params_callback: Optional callable that can inspect/modify
                 the SamplingParams for each submitted request. Receives a cloned
                 SamplingParams instance and request metadata dict containing
@@ -474,6 +481,14 @@ class eSurge:
         self._failed_detokenizer_resets: set[str] = set()
         self._detokenizer_cleanup_threshold = 100  # Clean up after this many failures
 
+        # Idle reset configuration
+        self._idle_reset_seconds = float(idle_reset_seconds) if idle_reset_seconds else None
+        self._idle_reset_min_interval = float(idle_reset_min_interval)
+        self._idle_reset_last_activity = time.time()
+        self._idle_reset_last_reset = 0.0
+        self._idle_monitor_event = threading.Event()
+        self._idle_monitor_thread: threading.Thread | None = None
+
         tokenizer_endpoint = tokenizer_endpoint or os.environ.get("EASURGE_TOKENIZER_ENDPOINT")
         detokenizer_endpoint = detokenizer_endpoint or os.environ.get("EASURGE_DETOKENIZER_ENDPOINT")
 
@@ -512,6 +527,11 @@ class eSurge:
                 ):
                     logger.warning(
                         "GPU backend detected: `unified_attention` is preferred for eSurge inference; "
+                        f"got attn_mechanism={attn_value!r}."
+                    )
+                elif backend != "gpu" and attn_value == AttentionMechanisms.PAGED_FLASH_ATTENTION.value:
+                    logger.warning(
+                        "Paged flash attention is CUDA-only; non-GPU backends are not supported. "
                         f"got attn_mechanism={attn_value!r}."
                     )
                 elif backend == "tpu" and attn_value == AttentionMechanisms.UNIFIED_ATTENTION.value:
@@ -913,6 +933,8 @@ class eSurge:
             self._scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
             self._scheduler_thread.start()
             self._info("Background scheduler initiated")
+            self._touch_activity()
+            self._start_idle_monitor()
             self._paused = False
 
     def terminate(self) -> None:
@@ -922,6 +944,7 @@ class eSurge:
         to terminate. Should be called when the engine is no longer needed
         to free resources.
         """
+        self._stop_idle_monitor()
         with self._scheduler_lock:
             if not self._scheduler_running:
                 self._info("Scheduler loop is not running")
@@ -1249,6 +1272,64 @@ class eSurge:
                         reason,
                         exc_info=True,
                     )
+
+    def _touch_activity(self) -> None:
+        """Update the last-activity timestamp for idle reset tracking."""
+        if self._idle_reset_seconds is None:
+            return
+        self._idle_reset_last_activity = time.time()
+
+    def _start_idle_monitor(self) -> None:
+        """Start the idle-reset monitor thread if enabled."""
+        if self._idle_reset_seconds is None:
+            return
+        if self._idle_monitor_thread and self._idle_monitor_thread.is_alive():
+            return
+        self._idle_monitor_event.clear()
+
+        check_interval = min(1.0, max(self._idle_reset_seconds / 4.0, 0.1))
+
+        def _idle_loop() -> None:
+            while not self._idle_monitor_event.wait(check_interval):
+                if not self._scheduler_running:
+                    continue
+                now = time.time()
+                if self._idle_reset_seconds is None:
+                    continue
+                idle_for = now - self._idle_reset_last_activity
+                if idle_for < self._idle_reset_seconds:
+                    continue
+                if now - self._idle_reset_last_reset < self._idle_reset_min_interval:
+                    continue
+                if self.num_running_requests != 0 or self.num_pending_requests != 0 or self._active_requests:
+                    # Activity resumed while waiting.
+                    self._idle_reset_last_activity = now
+                    continue
+                self._idle_reset_last_reset = now
+                self._idle_reset_last_activity = now
+                self._info("Idle reset triggered after %.1fs of inactivity", idle_for)
+                try:
+                    self.pause()
+                    self.resume()
+                except Exception:
+                    logger.exception("Idle reset failed")
+
+        self._idle_monitor_thread = threading.Thread(target=_idle_loop, daemon=True)
+        self._idle_monitor_thread.start()
+
+    def _stop_idle_monitor(self) -> None:
+        """Stop the idle-reset monitor thread if running."""
+        if not self._idle_monitor_thread:
+            return
+        self._idle_monitor_event.set()
+        if threading.current_thread() is self._idle_monitor_thread:
+            # Avoid joining the current thread; it will exit on the next wake-up.
+            self._idle_monitor_thread = None
+            return
+        self._idle_monitor_thread.join(timeout=2.0)
+        if self._idle_monitor_thread.is_alive():
+            logger.debug("Idle monitor thread did not stop gracefully")
+        self._idle_monitor_thread = None
 
     def _clone_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
         """Create a deep copy of sampling parameters.
@@ -2023,6 +2104,7 @@ class eSurge:
             This method ensures that prompt_len + max_new_tokens + reserve_tokens
             never exceeds max_model_len, preventing OOM errors during generation.
         """
+        self._touch_activity()
 
         # ---- Config knobs ----
         max_model_len = int(self.runner.max_model_len)
@@ -2609,6 +2691,8 @@ class eSurge:
             multiple concurrent requests and streaming consumers.
         """
         metrics_collector = get_metrics_collector()
+        if engine_outputs:
+            self._touch_activity()
 
         # Update both request_data and public outputs atomically
         with self._request_lock, self._output_lock:

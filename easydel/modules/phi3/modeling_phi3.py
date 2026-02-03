@@ -561,7 +561,7 @@ class Phi3Model(EasyDeLBaseModule):
         )
 
         self.embed_dropout = nn.Dropout(config.embd_pdrop)
-        self.layers = [
+        self.layers = nn.List([
             Phi3DecoderLayer(
                 config=config,
                 layer_idx=idx,
@@ -571,7 +571,7 @@ class Phi3Model(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for idx in range(self.config.num_hidden_layers)
-        ]
+        ])
         self.norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,

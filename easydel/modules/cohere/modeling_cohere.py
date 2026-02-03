@@ -505,7 +505,7 @@ class CohereModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
+        self.layers = nn.List([
             CohereBlock(
                 config=config,
                 layer_idx=i,
@@ -515,7 +515,7 @@ class CohereModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(config.num_hidden_layers)
-        ]
+        ])
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.layer_norm_eps,

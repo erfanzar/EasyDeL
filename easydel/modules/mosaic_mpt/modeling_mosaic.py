@@ -635,7 +635,7 @@ class MptModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
         )
 
-        self.blocks = [
+        self.blocks = nn.List([
             MptBlock(
                 config=config,
                 layer_idx=i,
@@ -645,7 +645,7 @@ class MptModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(self.config.n_layers)
-        ]
+        ])
 
         self.norm_f = nn.LayerNorm(
             config.hidden_size,

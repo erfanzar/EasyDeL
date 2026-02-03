@@ -22,8 +22,10 @@ training-compatible (QAT) implementations.
 Supported Quantization Formats:
     - NF4 (4-bit NormalFloat): QLoRA-style block-wise quantization with
       excellent quality-compression tradeoff. Recommended for LLM deployment.
+    - Affine: Scale+bias quantization with configurable bit-width (2-8) and
+      group size (ejkernel mode for quantized kernels).
     - INT8: Standard 8-bit integer quantization with wide hardware support.
-    - MXFP8 (E5M2): Microscaling 8-bit float with wide dynamic range.
+    - MXFP8: Microscaling 8-bit float with shared exponent.
     - NVFP8 (E4M3): NVIDIA-optimized 8-bit float for tensor cores.
     - MXFP4 (E2M1): Aggressive 4-bit float compression.
     - Binary: 1-bit quantization to {-1, +1} values.
@@ -40,11 +42,11 @@ Key Components:
     EasyQuantizer:
         High-level API for quantizing entire models or individual arrays.
         Supports pattern-based layer selection and both module-level and
-        tensor-level quantization strategies.
+        array-level quantization strategies.
 
     quantize:
         Function to quantize individual arrays to specified precision.
-        Returns memory-efficient ImplicitArrays or simulated outputs.
+        Returns ejkernel-packed weights (or simulated outputs).
 
     straight_through:
         Unified straight-through estimator (STE) for quantization-aware
@@ -65,13 +67,13 @@ Example:
     >>> # Configure NF4 quantization (recommended for LLMs)
     >>> config = QuantizationConfig(
     ...     dtype=QuantizationType.NF4,
-    ...     block_size=64,
+    ...     group_size=64,
     ...     pattern=r"^(?!.*(?:embedding|norm|lm_head)).*$"
     ... )
     >>>
     >>> # Create quantizer and apply to model
     >>> quantizer = EasyQuantizer(quantization_config=config)
-    >>> quantized_model = quantizer.quantize_modules(model)
+    >>> quantized_model = quantizer.apply_quantization(model)
 
     Array-level quantization:
 
@@ -97,7 +99,7 @@ See Also:
     - easydel.layers.components.quants._configs: Configuration definitions
     - easydel.layers.components.quants._quants: Main quantization logic
     - easydel.layers.components.quants._straight_through: STE implementations
-    - eformer.ops: Low-level quantization operations from eformer
+    - ejkernel.quantization: Packed quantization utilities for kernels
 """
 
 from ._configs import QuantizationConfig, QuantizationType

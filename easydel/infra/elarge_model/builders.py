@@ -154,8 +154,7 @@ def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[s
         auto_shard_model=bool(sharding.get("auto_shard_model", True)),
         partition_rules=sharding.get("partition_rules"),
         quantization_config=quant_model,
-        quantize_tensors=bool(quant.get("quantize_tensors", False)),
-        quantize_modules=bool(quant.get("quantize_modules", False)),
+        apply_quantization=bool(quant.get("apply_quantization", False)),
         verbose=bool(loader.get("verbose", True)),
         from_torch=loader.get("from_torch"),
         trust_remote_code=loader.get("trust_remote_code", False),
@@ -318,6 +317,11 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     if detokenizer_max_states is not None:
         detokenizer_max_states = int(detokenizer_max_states)
 
+    idle_reset_seconds = es.get("idle_reset_seconds")
+    if idle_reset_seconds is not None:
+        idle_reset_seconds = float(idle_reset_seconds)
+    idle_reset_min_interval = float(es.get("idle_reset_min_interval", 60.0))
+
     extra_eos_token_ids = es.get("extra_eos_token_ids")
     if extra_eos_token_ids is not None:
         extra_eos_token_ids = list(extra_eos_token_ids)
@@ -356,6 +360,8 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         decode_truncated_prompt=True if decode_truncated_prompt_val is None else bool(decode_truncated_prompt_val),
         destroy_pages_on_pause=True if destroy_pages_on_pause_val is None else bool(destroy_pages_on_pause_val),
         detokenizer_max_states=detokenizer_max_states,
+        idle_reset_seconds=idle_reset_seconds,
+        idle_reset_min_interval=idle_reset_min_interval,
         tokenizer_endpoint=es.get("tokenizer_endpoint"),
         detokenizer_endpoint=es.get("detokenizer_endpoint"),
         sampling_params_callback=es.get("sampling_params_callback"),

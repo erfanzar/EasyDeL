@@ -474,7 +474,7 @@ class ExaoneModel(EasyDeLBaseModule):
 
         self.drop = nn.Dropout(self.config.embed_dropout, rngs=rngs)
 
-        self.h = [
+        self.h = nn.List([
             ExaoneDecoderLayer(
                 config=config,
                 layer_idx=i,
@@ -484,7 +484,7 @@ class ExaoneModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(self.config.num_hidden_layers)
-        ]
+        ])
         self.ln_f = RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.layer_norm_epsilon,

@@ -821,7 +821,7 @@ class Llama4TextModel(EasyDeLBaseModule):
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             rngs=rngs,
         )
-        self.layers = [
+        self.layers = nn.List([
             Llama4TextDecoderLayer(
                 config=config,
                 layer_idx=layer_idx,
@@ -831,7 +831,7 @@ class Llama4TextModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for layer_idx in range(self.config.num_hidden_layers)
-        ]
+        ])
         self.norm = Llama4TextRMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -1646,7 +1646,7 @@ class Llama4VisionEncoder(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        self.layers = [
+        self.layers = nn.List([
             Llama4VisionEncoderLayer(
                 config=config,
                 layer_idx=layer_idx,
@@ -1656,7 +1656,7 @@ class Llama4VisionEncoder(nn.Module):
                 rngs=rngs,
             )
             for layer_idx in range(self.config.num_hidden_layers)
-        ]
+        ])
 
     def __call__(
         self,

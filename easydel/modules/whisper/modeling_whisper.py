@@ -719,7 +719,7 @@ class WhisperEncoder(EasyDeLBaseModule):
         )
 
         block = WhisperEncoderLayer
-        self.layers = [
+        self.layers = nn.List([
             block(
                 config=config,
                 dtype=dtype,
@@ -728,7 +728,7 @@ class WhisperEncoder(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(self.config.encoder_layers)
-        ]
+        ])
 
         self.embed_positions = Embed(
             self.config.max_source_positions,
@@ -885,7 +885,7 @@ class WhisperDecoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
+        self.layers = nn.List([
             WhisperDecoderLayer(
                 config=config,
                 dtype=dtype,
@@ -894,7 +894,7 @@ class WhisperDecoder(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for i in range(self.config.decoder_layers)
-        ]
+        ])
 
         self.layerdrop = self.config.decoder_layerdrop
         self.dropout_layer = nn.Dropout(

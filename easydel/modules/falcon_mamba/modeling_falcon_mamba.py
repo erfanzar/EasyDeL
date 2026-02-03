@@ -700,7 +700,7 @@ class FalconMambaModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
+        self.layers = nn.List([
             FalconMambaBlock(
                 config=config,
                 layer_idx=layer_idx,
@@ -710,7 +710,7 @@ class FalconMambaModel(EasyDeLBaseModule):
                 rngs=rngs,
             )
             for layer_idx in range(config.num_hidden_layers)
-        ]
+        ])
         self.norm_f = FalconMambaRMSNorm(
             config.hidden_size,
             eps=config.layer_norm_epsilon,

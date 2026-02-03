@@ -18,10 +18,11 @@ This module provides the primary quantization interface for EasyDeL, including
 the `quantize` function for array-level quantization and the `EasyQuantizer`
 class for model-level quantization operations.
 
-The module supports multiple quantization formats through eformer's implicit
-array infrastructure, enabling efficient memory usage and computation:
+The module supports multiple quantization formats through ejkernel's
+quantization utilities for array-level packing:
 
     - NF4 (4-bit NormalFloat): Block-wise quantization with normal distribution
+    - AFFINE: Scale+bias quantization with configurable bits (ejkernel mode)
     - INT8: Standard 8-bit integer quantization
     - Binary/Ternary: Extreme 1-bit quantization for maximum compression
     - MXFP4/MXFP8/NVFP8: Floating-point quantization formats
@@ -43,7 +44,7 @@ Example:
     >>> # Quantize an entire model
     >>> config = QuantizationConfig(dtype=QuantizationType.NF4)
     >>> quantizer = EasyQuantizer(config)
-    >>> quantized_model = quantizer.quantize_modules(model)
+    >>> quantized_model = quantizer.apply_quantization(model)
 
 See Also:
     - _configs: Quantization configuration types
@@ -57,27 +58,32 @@ import re
 import typing
 
 import jax
-from eformer.ops import Array1B, Array8B, ArrayNF4
-from eformer.pytree import tree_path_to_string
+from ejkernel.quantization import dequantize as ej_dequantize
+from ejkernel.quantization import quantize as ej_quantize
 from flax import nnx as nn
 from jax import numpy as jnp
-from jaxtyping import Array
 
 from easydel.utils.traversals import iter_module_search, set_module_from_path
 
-from ._configs import DEFAULT_QUANTIZATION_PATTERN, QuantizationConfig, QuantizationType
+from ._configs import (
+    DEFAULT_QUANTIZATION_PATTERN,
+    QuantizationConfig,
+    QuantizationType,
+    resolve_ejkernel_quant_params,
+    resolve_jax_native_dtype,
+)
 
 if typing.TYPE_CHECKING:
-    from easydel import EasyDeLBaseModule
+    pass
 
 
 def quantize(
     array: jax.Array,
     config: QuantizationConfig | None = None,
     dtype: QuantizationType | str | None = None,
-    block_size: int = 64,
+    group_size: int | None = None,
     simulate: bool = False,
-) -> Array1B | Array8B | ArrayNF4 | jax.Array:
+) -> jax.Array | tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Quantize an array using the specified quantization format.
 
     This is the primary quantization interface for EasyDeL. It dispatches to
@@ -89,28 +95,34 @@ def quantize(
         array: Input array to quantize. Typically model weights in float32
             or bfloat16 format.
         config: QuantizationConfig object specifying all quantization parameters.
-            If provided, overrides dtype, block_size, and simulate arguments.
+            If provided, overrides dtype, group_size, and simulate arguments.
             Defaults to None.
         dtype: Quantization type to apply. Can be a QuantizationType enum value
             or string (e.g., "nf4", "int8"). Defaults to NF4 if neither config
             nor dtype is specified.
-        block_size: Block size for block-wise quantization (NF4). Controls the
-            granularity of scaling factors. Larger blocks use less memory for
-            scales but may reduce accuracy. Defaults to 64.
+        group_size: Group size for block-wise quantization (NF4). Controls the
+            granularity of scaling factors. Larger groups use less memory for
+            scales but may reduce accuracy. Defaults to 64 when not provided.
         simulate: If True, returns a materialized array with quantization effects
             applied (values discretized) but in the original dtype. Useful for
             understanding quantization impact without memory savings.
             Defaults to False.
+            When config.jax_native is True and the dtype has a native JAX
+            representation (MXFP4/MXFP8/NVFP8), the result is produced via
+            `astype` regardless of simulate.
 
     Returns:
         Quantized representation of the input array:
-            - If simulate=False: Returns an ImplicitArray (Array1B, Array8B, or
-              ArrayNF4) that stores data in compressed format but materializes
-              to full precision during computation.
             - If simulate=True: Returns a standard jax.Array with quantization
-              effects applied (values rounded to quantization levels).
-            - For MXFP4/MXFP8/NVFP8: Returns array in the respective low-precision
-              dtype directly.
+              effects applied (values rounded to quantization levels) using
+              ejkernel's quantization/dequantization.
+            - If simulate=False: Returns ejkernel packed weights plus per-group
+              parameters. The return shape depends on the mode:
+                - affine/int8: (w_q, scales, biases)
+                - nf4/mxfp4/mxfp8/nvfp8: (w_q, scales)
+            - For binary/ternary: Returns int8 codes when simulate=False.
+            - If config.jax_native is True and dtype is supported by JAX:
+              Returns `array.astype(jax_dtype)` (materialized array).
 
     Raises:
         ValueError: If an unsupported quantization type is specified.
@@ -122,11 +134,11 @@ def quantize(
         >>> weights = jnp.ones((128, 256), dtype=jnp.float32)
         >>>
         >>> # Using configuration object
-        >>> config = QuantizationConfig(dtype=QuantizationType.NF4, block_size=64)
+        >>> config = QuantizationConfig(dtype=QuantizationType.NF4, group_size=64)
         >>> quantized = quantize(weights, config=config)
         >>>
         >>> # Direct parameters
-        >>> quantized = quantize(weights, dtype=QuantizationType.NF4, block_size=64)
+        >>> quantized = quantize(weights, dtype=QuantizationType.NF4, group_size=64)
         >>>
         >>> # Simulation mode (returns float array with quantization effects)
         >>> simulated = quantize(weights, dtype=QuantizationType.NF4, simulate=True)
@@ -135,26 +147,15 @@ def quantize(
         >>> # Binary quantization (extreme compression)
         >>> binary = quantize(weights, dtype=QuantizationType.BINARY)
 
-    Note:
-        For NF4 and INT8, the returned ImplicitArray automatically materializes
-        during JAX operations, providing transparent usage in computations while
-        maintaining memory efficiency during storage.
-
-        For Binary and Ternary quantization, weights are first discretized
-        ({-1, 1} for binary, {-1, 0, 1} for ternary) then packed into 1-bit
-        representation.
-
     See Also:
         - straight_through: STE version for quantization-aware training
         - EasyQuantizer: High-level API for model quantization
         - QuantizationConfig: Configuration dataclass
     """
-    # Import here to avoid circular dependencies
-
     # Resolve config
     if config is not None:
         dtype = config.dtype
-        block_size = config.block_size
+        group_size = config.group_size
         simulate = config.simulate
     elif dtype is None:
         dtype = QuantizationType.NF4
@@ -162,47 +163,42 @@ def quantize(
     if isinstance(dtype, str):
         dtype = QuantizationType(dtype)
 
-    # Dispatch to appropriate quantization
-    if dtype == QuantizationType.NF4:
-        quantized = ArrayNF4.quantize(array, block_size=block_size)
-        return quantized.materialize() if simulate else quantized
-
-    elif dtype == QuantizationType.INT8:
-        quantized = Array8B.quantize(array)
-        return quantized.materialize() if simulate else quantized
-
-    elif dtype == QuantizationType.BINARY:
-        # Binary: quantize to {-1, 1}
-        binary = jnp.sign(array)
-        binary = jnp.where(binary == 0, 1, binary)  # Handle zeros
-        quantized = Array1B.quantize(binary.astype(jnp.int8))
-        return quantized.materialize() if simulate else quantized
-
-    elif dtype == QuantizationType.TERNARY:
-        # Ternary: quantize to {-1, 0, 1}
+    if dtype in {QuantizationType.BINARY, QuantizationType.TERNARY}:
+        if dtype == QuantizationType.BINARY:
+            binary = jnp.sign(array)
+            binary = jnp.where(binary == 0, 1, binary)
+            return binary.astype(array.dtype) if simulate else binary.astype(jnp.int8)
         threshold = 0.5 * jnp.std(array)
         ternary = jnp.where(array > threshold, 1, jnp.where(array < -threshold, -1, 0))
-        quantized = Array1B.quantize(ternary.astype(jnp.int8))
-        return quantized.materialize() if simulate else quantized
+        return ternary.astype(array.dtype) if simulate else ternary.astype(jnp.int8)
 
-    elif dtype == QuantizationType.MXFP4:
-        if simulate:
-            return array.astype(jnp.float4_e2m1fn).astype(array.dtype)
-        return array.astype(jnp.float4_e2m1fn)
+    if config is not None and config.jax_native:
+        jax_dtype = resolve_jax_native_dtype(dtype)
+        if jax_dtype is not None:
+            return array.astype(jax_dtype)
 
-    elif dtype == QuantizationType.MXFP8:
-        if simulate:
-            return array.astype(jnp.float8_e5m2).astype(array.dtype)
-        return array.astype(jnp.float8_e5m2)
+    config_for_ejkernel = (
+        config if config is not None else QuantizationConfig(dtype=dtype, group_size=group_size, simulate=simulate)
+    )
+    mode, group_size, bits, needs_biases = resolve_ejkernel_quant_params(config_for_ejkernel)
+    packed = ej_quantize(array, group_size=group_size, bits=bits, mode=mode)
+    if not simulate:
+        return packed
 
-    elif dtype == QuantizationType.NVFP8:
-        if simulate:
-            return array.astype(jnp.float8_e4m3).astype(array.dtype)
-        return array.astype(jnp.float8_e4m3)
-
+    if needs_biases:
+        wq, scales, biases = packed
     else:
-        supported = ", ".join([t.value for t in QuantizationType])
-        raise ValueError(f"Unsupported quantization type: {dtype}. Supported types: {supported}")
+        wq, scales = packed
+        biases = None
+    dequantized = ej_dequantize(
+        wq,
+        scales,
+        biases,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    return dequantized.astype(array.dtype)
 
 
 class EasyQuantizer:
@@ -215,8 +211,7 @@ class EasyQuantizer:
     The quantizer supports multiple quantization approaches:
         1. Module-level quantization: Convert compatible layers (e.g., Linear)
            to their quantized equivalents
-        2. Tensor-level quantization: Quantize model state tensors directly
-        3. Array-level quantization: Quantize individual arrays
+        2. Array-level quantization: Quantize individual arrays
 
     Attributes:
         config: The QuantizationConfig controlling quantization behavior.
@@ -230,15 +225,12 @@ class EasyQuantizer:
         >>> # Create quantizer with NF4 configuration
         >>> config = QuantizationConfig(
         ...     dtype=QuantizationType.NF4,
-        ...     block_size=64
+        ...     group_size=64
         ... )
         >>> quantizer = EasyQuantizer(quantization_config=config)
         >>>
         >>> # Quantize all compatible modules in a model
-        >>> quantized_model = quantizer.quantize_modules(model)
-        >>>
-        >>> # Quantize model tensors directly
-        >>> quantized_model = quantizer.quantize_model_tensors(model)
+        >>> quantized_model = quantizer.apply_quantization(model)
         >>>
         >>> # Quantize a single array
         >>> quantized_array = quantizer.quantize_array(weights)
@@ -294,7 +286,11 @@ class EasyQuantizer:
         return DEFAULT_QUANTIZATION_PATTERN
 
     @jax.named_scope("easydel-easyquantize-call")
-    def __call__(self, array: jax.Array, path: str | tuple[str] | None = None) -> Array:
+    def __call__(
+        self,
+        array: jax.Array,
+        path: str | tuple[str] | None = None,
+    ) -> jax.Array | tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
         """Quantize an array with optional path-based filtering.
 
         This method allows using the quantizer as a callable for convenient
@@ -311,8 +307,8 @@ class EasyQuantizer:
                 (always quantize if config is set).
 
         Returns:
-            If quantization is applied: ImplicitArray with compressed
-            representation. If skipped (no config, or path doesn't match
+            If quantization is applied: ejkernel-packed weights plus per-group
+            parameters (tuple). If skipped (no config, or path doesn't match
             pattern): original array unchanged.
 
         Example:
@@ -346,60 +342,11 @@ class EasyQuantizer:
 
         return quantize(array, self._config)
 
-    def quantize_model_tensors(self, model: EasyDeLBaseModule, simulate: bool = False) -> EasyDeLBaseModule:
-        """Quantize model state tensors directly using tree traversal.
-
-        This method applies quantization to individual tensors in the model's
-        state, using pattern matching to select which tensors to quantize.
-        Unlike `quantize_modules`, this operates on raw tensors rather than
-        module instances.
-
-        Args:
-            model: The EasyDeL model to quantize. Must have a `graphstate_type`
-                attribute for proper state extraction.
-            simulate: If True, uses simulation mode where tensors are discretized
-                but remain in original dtype. Useful for analyzing quantization
-                impact without memory savings. Defaults to False.
-
-        Returns:
-            The model with quantized tensors. The model structure remains
-            unchanged, but selected tensors are replaced with their quantized
-            versions (ImplicitArrays or simulated arrays).
-
-        Example:
-            >>> quantizer = EasyQuantizer(config)
-            >>> quantized_model = quantizer.quantize_model_tensors(model)
-            >>>
-            >>> # With simulation mode
-            >>> simulated_model = quantizer.quantize_model_tensors(model, simulate=True)
-
-        Note:
-            This method uses `jax.block_until_ready` on each quantized tensor
-            to ensure computation completes. For large models, this provides
-            more predictable memory behavior during quantization.
-
-        See Also:
-            - quantize_modules: Module-level quantization (converts layer types)
-            - quantize_array: Single array quantization
-        """
-        if self._config is None:
-            return model
-
-        pattern = re.compile(self.pattern)
-
-        def _quantize(path, tensor):
-            path = tree_path_to_string(path, ".")
-            if pattern.search(path):
-                tensor = quantize(tensor, config=self._config, simulate=simulate)
-                jax.block_until_ready(tensor)
-            return tensor
-
-        gdef, state, others = nn.split(model, model.graphstate_type, ...)
-        state = jax.tree_util.tree_map_with_path(_quantize, state, is_leaf=lambda x: isinstance(x, jax.Array))
-        model = nn.merge(gdef, state, others)
-        return model
-
-    def quantize_array(self, array: jax.Array, simulate: bool = False) -> jax.Array:
+    def quantize_array(
+        self,
+        array: jax.Array,
+        simulate: bool = False,
+    ) -> jax.Array | tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
         """Quantize a single array using the configured quantization method.
 
         This is a convenience method that applies the quantizer's configuration
@@ -414,10 +361,10 @@ class EasyQuantizer:
                 Defaults to False.
 
         Returns:
-            Quantized array. If simulate=False, returns an ImplicitArray with
-            compressed storage. If simulate=True, returns a standard jax.Array
-            with discretized values. If config is None, returns the input
-            unchanged.
+            Quantized array or packed weights. If simulate=False, returns
+            ejkernel packed weights plus per-group parameters (tuple). If
+            simulate=True, returns a standard jax.Array with discretized
+            values. If config is None, returns the input unchanged.
 
         Example:
             >>> quantizer = EasyQuantizer(config)
@@ -433,7 +380,7 @@ class EasyQuantizer:
 
         return quantize(array, config=self._config, simulate=simulate)
 
-    def quantize_modules(
+    def apply_quantization(
         self,
         model: nn.Module,
         /,
@@ -467,10 +414,10 @@ class EasyQuantizer:
             >>> quantizer = EasyQuantizer(config)
             >>>
             >>> # Quantize all matching layers
-            >>> quantized_model = quantizer.quantize_modules(model)
+            >>> quantized_model = quantizer.apply_quantization(model)
             >>>
             >>> # Quantize only attention layers
-            >>> quantized_model = quantizer.quantize_modules(
+            >>> quantized_model = quantizer.apply_quantization(
             ...     model,
             ...     quantization_pattern=r".*attention.*"
             ... )
@@ -484,7 +431,6 @@ class EasyQuantizer:
 
         See Also:
             - dequantize_modules: Reverse operation to restore full precision
-            - quantize_model_tensors: Alternative tensor-level quantization
         """
         if self._config is None:
             return model
@@ -515,7 +461,7 @@ class EasyQuantizer:
 
         This method traverses the model and converts quantized modules back
         to their full-precision implementations. It is the inverse operation
-        of `quantize_modules`.
+        of `apply_quantization`.
 
         Args:
             model: The model with quantized layers to restore.
@@ -536,7 +482,7 @@ class EasyQuantizer:
             - This method modifies the model in-place and also returns it.
 
         See Also:
-            - quantize_modules: Forward operation to quantize modules
+            - apply_quantization: Forward operation to quantize modules
         """
         if self._config is None:
             return model

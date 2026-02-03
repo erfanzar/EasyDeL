@@ -265,6 +265,7 @@ class AttentionMetadataBuilder:
         "page_attention",
         "paged_attention",
         "unified_attention",
+        "paged_flash_attention",
     }
 
     @classmethod

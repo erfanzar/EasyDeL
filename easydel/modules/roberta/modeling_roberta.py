@@ -829,7 +829,7 @@ class RobertaEncoder(nn.Module):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layer = [
+        self.layer = nn.List([
             block(
                 config=config,
                 dtype=dtype,
@@ -838,7 +838,7 @@ class RobertaEncoder(nn.Module):
                 rngs=rngs,
             )
             for _ in range(config.num_hidden_layers)
-        ]
+        ])
 
     def __call__(
         self,
