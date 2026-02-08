@@ -57,6 +57,19 @@ class ReasoningParser:
         self.model_tokenizer = tokenizer
         self.assume_reasoning: bool = False
 
+    def configure_prompt_context(self, prompt_text: str, prompt_token_ids: Sequence[int]) -> None:
+        """Configure parser state from prompt context for this request.
+
+        Parsers that need prompt-aware behavior (for example, when chat templates
+        inject a reasoning start token via ``add_generation_prompt``) can override
+        this hook. The default implementation is a no-op.
+
+        Args:
+            prompt_text: Prompt text that is sent to the model.
+            prompt_token_ids: Token IDs for ``prompt_text``.
+        """
+        del prompt_text, prompt_token_ids
+
     @cached_property
     def vocab(self) -> dict[str, int]:
         """Get the tokenizer vocabulary mapping tokens to IDs."""
