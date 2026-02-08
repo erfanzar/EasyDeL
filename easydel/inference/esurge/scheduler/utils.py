@@ -78,7 +78,11 @@ def check_stop(request: EngineRequest, max_model_len: int) -> bool:
         request.status = EngineRequestStatus.FINISHED_STOPPED
         return True
 
-    if last_token_id in (sampling_params.stop_token_ids or ()):
+    # Respect ignore_eos even when EOS ids were injected into stop_token_ids.
+    is_ignored_eos = bool(
+        sampling_params.ignore_eos and request.eos_token_id is not None and last_token_id == request.eos_token_id
+    )
+    if not is_ignored_eos and last_token_id in (sampling_params.stop_token_ids or ()):
         request.status = EngineRequestStatus.FINISHED_STOPPED
         request.stop_reason = last_token_id
         return True

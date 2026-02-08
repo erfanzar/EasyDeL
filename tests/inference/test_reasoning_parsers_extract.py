@@ -1,5 +1,6 @@
 import pytest
 
+from easydel.inference.esurge.esurge_engine import eSurge
 from easydel.inference.reasoning.abstract_reasoning import ReasoningParserManager
 from easydel.inference.reasoning.parsers import (
     DeepSeekR1ReasoningParser,
@@ -15,8 +16,8 @@ from easydel.inference.reasoning.parsers import (
     Olmo3ReasoningParser,
     Qwen3ReasoningParser,
     SeedOSSReasoningParser,
-    Step3ReasoningParser,
     Step3p5ReasoningParser,
+    Step3ReasoningParser,
 )
 
 
@@ -635,7 +636,250 @@ def test_content_before_start_tag(dummy_tokenizer):
 
 
 # ---------------------------------------------------------------------------
-# assume_reasoning tests (prompt has <think>, model output is asymmetric)
+# Prompt-context tests (tag-based parsers with asymmetric output)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("parser_cls", "start_token", "end_token"),
+    [
+        (DeepSeekR1ReasoningParser, "<think>", "</think>"),
+        (Ernie45ReasoningParser, "<think>", "</think>"),
+        (HunyuanA13BReasoningParser, "<think>", "</think>"),
+        (SeedOSSReasoningParser, "<think>", "</think>"),
+        (Olmo3ReasoningParser, "<think>", "</think>"),
+        (MistralReasoningParser, "[THINK]", "[/THINK]"),
+    ],
+)
+def test_tag_parsers_end_only_batch_requires_prompt_context(
+    dummy_tokenizer,
+    parser_cls,
+    start_token: str,
+    end_token: str,
+):
+    parser = parser_cls(dummy_tokenizer)
+    output = f"reasoning content{end_token}answer"
+
+    reasoning, content = parser.extract_reasoning(output)
+    assert reasoning is None
+    assert content == output
+
+    start_id = dummy_tokenizer.get_vocab()[start_token]
+    parser.configure_prompt_context(prompt_text="prompt without token suffix", prompt_token_ids=[999, start_id])
+    reasoning, content = parser.extract_reasoning(output)
+    assert reasoning == "reasoning content"
+    assert content == "answer"
+
+
+@pytest.mark.parametrize(
+    ("parser_cls", "start_token", "end_token"),
+    [
+        (DeepSeekR1ReasoningParser, "<think>", "</think>"),
+        (Ernie45ReasoningParser, "<think>", "</think>"),
+        (HunyuanA13BReasoningParser, "<think>", "</think>"),
+        (SeedOSSReasoningParser, "<think>", "</think>"),
+        (Olmo3ReasoningParser, "<think>", "</think>"),
+        (MistralReasoningParser, "[THINK]", "[/THINK]"),
+    ],
+)
+def test_tag_parsers_end_only_streaming_requires_prompt_context(
+    dummy_tokenizer,
+    parser_cls,
+    start_token: str,
+    end_token: str,
+):
+    parser = parser_cls(dummy_tokenizer)
+
+    delta = parser.extract_reasoning_streaming(
+        previous_text="",
+        current_text="thinking",
+        delta_text="thinking",
+        previous_token_ids=[],
+        current_token_ids=[100],
+        delta_token_ids=[100],
+    )
+    assert delta is not None
+    assert delta.reasoning_content is None
+    assert delta.content == "thinking"
+
+    parser_with_context = parser_cls(dummy_tokenizer)
+    start_id = dummy_tokenizer.get_vocab()[start_token]
+    end_id = dummy_tokenizer.get_vocab()[end_token]
+    parser_with_context.configure_prompt_context(
+        prompt_text="prompt without token suffix",
+        prompt_token_ids=[999, start_id],
+    )
+
+    delta = parser_with_context.extract_reasoning_streaming(
+        previous_text="",
+        current_text="thinking",
+        delta_text="thinking",
+        previous_token_ids=[],
+        current_token_ids=[100],
+        delta_token_ids=[100],
+    )
+    assert delta is not None
+    assert delta.reasoning_content == "thinking"
+    assert delta.content is None
+
+    delta = parser_with_context.extract_reasoning_streaming(
+        previous_text="thinking",
+        current_text=f"thinking{end_token}answer",
+        delta_text=f"{end_token}answer",
+        previous_token_ids=[100],
+        current_token_ids=[100, end_id, 101],
+        delta_token_ids=[end_id, 101],
+    )
+    assert delta is not None
+    assert delta.content == "answer"
+
+
+def test_prompt_context_text_suffix_fallback_for_base_parser(dummy_tokenizer):
+    parser = DeepSeekR1ReasoningParser(dummy_tokenizer)
+    parser.configure_prompt_context(prompt_text="... <think>   ", prompt_token_ids=[])
+    reasoning, content = parser.extract_reasoning("reasoning text</think>answer")
+    assert reasoning == "reasoning text"
+    assert content == "answer"
+
+
+def test_prompt_context_without_end_token_is_reasoning_for_base_parser(dummy_tokenizer):
+    parser = DeepSeekR1ReasoningParser(dummy_tokenizer)
+    parser.configure_prompt_context(prompt_text="... <think>", prompt_token_ids=[1])
+    reasoning, content = parser.extract_reasoning("still reasoning")
+    assert reasoning == "still reasoning"
+    assert content is None
+
+
+def test_deepseek_v3_prompt_context_is_forwarded_to_delegate_streaming(thinking_tokenizer):
+    parser = DeepSeekV3ReasoningParser(thinking_tokenizer)
+    parser.configure_prompt_context(prompt_text="prompt without suffix", prompt_token_ids=[1])
+
+    delta = parser.extract_reasoning_streaming(
+        previous_text="",
+        current_text="thinking",
+        delta_text="thinking",
+        previous_token_ids=[],
+        current_token_ids=[100],
+        delta_token_ids=[100],
+    )
+    assert delta is not None
+    assert delta.reasoning_content == "thinking"
+    assert delta.content is None
+
+    delta = parser.extract_reasoning_streaming(
+        previous_text="thinking",
+        current_text="thinking</think>answer",
+        delta_text="</think>answer",
+        previous_token_ids=[100],
+        current_token_ids=[100, 2, 101],
+        delta_token_ids=[2, 101],
+    )
+    assert delta is not None
+    assert delta.content == "answer"
+
+
+def test_deepseek_v3_prompt_context_can_enable_delegate_from_plain_template(plain_tokenizer):
+    parser = DeepSeekV3ReasoningParser(plain_tokenizer)
+
+    # Initially uses identity behavior.
+    reasoning, content = parser.extract_reasoning("<think>reason</think>answer")
+    assert reasoning is None
+    assert content == "<think>reason</think>answer"
+
+    # Prompt context with a reasoning start token switches delegate behavior.
+    parser.configure_prompt_context(prompt_text="... <think>", prompt_token_ids=[999, 1])
+
+    delta = parser.extract_reasoning_streaming(
+        previous_text="",
+        current_text="reason",
+        delta_text="reason",
+        previous_token_ids=[],
+        current_token_ids=[100],
+        delta_token_ids=[100],
+    )
+    assert delta is not None
+    assert delta.reasoning_content == "reason"
+    assert delta.content is None
+
+
+def test_deepseek_v3_without_prompt_context_streaming_is_content(thinking_tokenizer):
+    parser = DeepSeekV3ReasoningParser(thinking_tokenizer)
+    delta = parser.extract_reasoning_streaming(
+        previous_text="",
+        current_text="thinking",
+        delta_text="thinking",
+        previous_token_ids=[],
+        current_token_ids=[100],
+        delta_token_ids=[100],
+    )
+    assert delta is not None
+    assert delta.reasoning_content is None
+    assert delta.content == "thinking"
+
+
+def test_qwen3_prompt_context_batch(dummy_tokenizer):
+    parser = Qwen3ReasoningParser(dummy_tokenizer)
+    parser.configure_prompt_context(prompt_text="prompt without suffix", prompt_token_ids=[999, 1])
+    reasoning, content = parser.extract_reasoning("step by step</think>final answer")
+    assert reasoning == "step by step"
+    assert content == "final answer"
+
+
+def test_qwen3_prompt_context_streaming(dummy_tokenizer):
+    parser = Qwen3ReasoningParser(dummy_tokenizer)
+    parser.configure_prompt_context(prompt_text="prompt without suffix", prompt_token_ids=[999, 1])
+
+    delta = parser.extract_reasoning_streaming(
+        previous_text="",
+        current_text="reasoning",
+        delta_text="reasoning",
+        previous_token_ids=[],
+        current_token_ids=[100],
+        delta_token_ids=[100],
+    )
+    assert delta is not None
+    assert delta.reasoning_content == "reasoning"
+    assert delta.content is None
+
+    delta = parser.extract_reasoning_streaming(
+        previous_text="reasoning",
+        current_text="reasoning</think>answer",
+        delta_text="</think>answer",
+        previous_token_ids=[100],
+        current_token_ids=[100, 2, 101],
+        delta_token_ids=[2, 101],
+    )
+    assert delta is not None
+    assert delta.content == "answer"
+
+
+@pytest.mark.parametrize(
+    ("parser_cls", "model_output", "expected"),
+    [
+        (IdentityReasoningParser, "plain content", (None, "plain content")),
+        (GraniteReasoningParser, "plain content", (None, "plain content")),
+        (GptOssReasoningParser, "plain content", (None, "plain content")),
+        (Step3ReasoningParser, "thinking</think>answer", ("thinking", "answer")),
+        (Step3p5ReasoningParser, "thinking</think>answer", ("thinking", "answer")),
+        (MiniMaxM2ReasoningParser, "thinking</think>answer", ("thinking", "answer")),
+    ],
+)
+def test_non_tag_parsers_prompt_context_configuration_is_noop(
+    dummy_tokenizer,
+    parser_cls,
+    model_output: str,
+    expected: tuple[str | None, str | None],
+):
+    parser = parser_cls(dummy_tokenizer)
+    before = parser.extract_reasoning(model_output)
+    parser.configure_prompt_context(prompt_text="...<think>", prompt_token_ids=[1])
+    after = parser.extract_reasoning(model_output)
+    assert before == expected
+    assert after == expected
+
+
+# ---------------------------------------------------------------------------
+# assume_reasoning compatibility tests (manual override)
 # ---------------------------------------------------------------------------
 
 
@@ -772,6 +1016,45 @@ def test_qwen3_no_assume_strict_still_works(dummy_tokenizer):
     reasoning, content = parser.extract_reasoning(output)
     assert reasoning is None
     assert content == output
+
+
+def test_esurge_output_parsers_hide_reasoning_delta_for_prompt_context(dummy_tokenizer):
+    parser = DeepSeekR1ReasoningParser(dummy_tokenizer)
+    parser.configure_prompt_context(prompt_text="...<think>", prompt_token_ids=[1])
+    engine = object.__new__(eSurge)
+
+    rd = {
+        "reasoning_parser_instance": parser,
+        "tool_parser_instance": None,
+        "parser_previous_text": "",
+        "parser_previous_token_ids": [],
+        "accumulated_reasoning": "",
+        "accumulated_content": "",
+    }
+
+    first = eSurge._run_output_parsers(
+        engine,
+        rd=rd,
+        accumulated_text="thinking",
+        delta_text="thinking",
+        token_ids=[100],
+        finished=False,
+    )
+    assert first["delta_reasoning"] == "thinking"
+    assert first["delta_content"] == ""
+    assert first["accumulated_content"] == ""
+
+    second = eSurge._run_output_parsers(
+        engine,
+        rd=rd,
+        accumulated_text="thinking</think>answer",
+        delta_text="</think>answer",
+        token_ids=[100, 2, 101],
+        finished=False,
+    )
+    assert second["delta_reasoning"] is None
+    assert second["delta_content"] == "answer"
+    assert second["accumulated_content"] == "answer"
 
 
 def test_granite_streaming_thought_then_response(dummy_tokenizer):

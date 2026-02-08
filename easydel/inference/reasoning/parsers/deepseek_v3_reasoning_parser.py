@@ -33,25 +33,52 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
     If the tokenizer has a chat template with thinking/enable_thinking support,
     this parser uses DeepSeekR1ReasoningParser. Otherwise, it falls through
     to IdentityReasoningParser (no reasoning extraction).
+
+    Prompt context and compatibility flags are forwarded to the selected delegate.
     """
 
     def __init__(self, tokenizer):
         super().__init__(tokenizer)
         # Check if tokenizer's chat template supports thinking
         chat_template = getattr(tokenizer, "chat_template", "") or ""
-        has_thinking = "thinking" in chat_template or "enable_thinking" in chat_template
+        has_thinking = (
+            "thinking" in chat_template
+            or "enable_thinking" in chat_template
+            or DeepSeekR1ReasoningParser.start_token in chat_template
+        )
         if has_thinking:
             self._delegate = DeepSeekR1ReasoningParser(tokenizer)
         else:
             self._delegate = IdentityReasoningParser(tokenizer)
 
+    def _sync_delegate_state(self) -> None:
+        # Keep compatibility with manual overrides on wrapper instances.
+        self._delegate.assume_reasoning = self.assume_reasoning
+
+    def configure_prompt_context(self, prompt_text: str, prompt_token_ids: Sequence[int]) -> None:
+        super().configure_prompt_context(prompt_text, prompt_token_ids)
+        if isinstance(self._delegate, IdentityReasoningParser):
+            start_token = DeepSeekR1ReasoningParser.start_token
+            start_id = self.vocab.get(start_token)
+            prompt_has_reasoning_start = bool(prompt_text) and prompt_text.rstrip().endswith(start_token)
+            prompt_has_reasoning_start_by_id = bool(prompt_token_ids) and (
+                start_id is not None and prompt_token_ids[-1] == start_id
+            )
+            if prompt_has_reasoning_start or prompt_has_reasoning_start_by_id:
+                self._delegate = DeepSeekR1ReasoningParser(self.model_tokenizer)
+        self._sync_delegate_state()
+        self._delegate.configure_prompt_context(prompt_text, prompt_token_ids)
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
+        self._sync_delegate_state()
         return self._delegate.is_reasoning_end(input_ids)
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
+        self._sync_delegate_state()
         return self._delegate.extract_content_ids(input_ids)
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
+        self._sync_delegate_state()
         return self._delegate.extract_reasoning(model_output, request)
 
     def extract_reasoning_streaming(
@@ -64,7 +91,13 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
         delta_token_ids: Sequence[int],
         request=None,
     ) -> DeltaMessage | None:
+        self._sync_delegate_state()
         return self._delegate.extract_reasoning_streaming(
-            previous_text, current_text, delta_text,
-            previous_token_ids, current_token_ids, delta_token_ids, request,
+            previous_text,
+            current_text,
+            delta_text,
+            previous_token_ids,
+            current_token_ids,
+            delta_token_ids,
+            request,
         )

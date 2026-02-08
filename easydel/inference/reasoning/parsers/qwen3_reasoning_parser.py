@@ -13,8 +13,8 @@
 
 Format: <think>reasoning content</think>response
 
-Qwen3 is strict about requiring both tags. If the start tag is missing,
-the entire output is treated as content.
+Qwen3 is strict about requiring both tags unless prompt context indicates
+that the start tag was already injected by the chat template.
 """
 
 from __future__ import annotations
@@ -30,26 +30,26 @@ from ..basic_parsers import BaseThinkingReasoningParser
 class Qwen3ReasoningParser(BaseThinkingReasoningParser):
     """Reasoning parser for Qwen3 models using <think>...</think>.
 
-    Strict mode: if <think> tag is missing, all output is content.
+    Strict mode:
+    - Missing start tag -> content, unless prompt context already started reasoning.
+    - Missing end tag -> content.
     """
 
     start_token = "<think>"
     end_token = "</think>"
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
-        # Qwen3 is strict: must have both start and end tags
-        # But when assume_reasoning is set (prompt already has <think>), relax to end-only
-        if self.start_token not in model_output:
-            if self.assume_reasoning and self.end_token in model_output:
-                # Prompt had <think>, model output has </think> — asymmetric OK
-                parts = model_output.split(self.end_token, 1)
-                reasoning = parts[0].strip()
-                content = parts[1].strip() if len(parts) > 1 else None
-                return reasoning or None, content
-            return None, model_output
-        # Start tag present — still require end tag in strict mode
+        # Qwen3 strictness: missing end tag is always content.
         if self.end_token not in model_output:
             return None, model_output
+
+        # Missing start tag is only allowed when prompt context indicates
+        # reasoning already started in the prompt.
+        if self.start_token not in model_output:
+            if self._is_prompt_reasoning_active():
+                return super().extract_reasoning(model_output, request)
+            return None, model_output
+
         return super().extract_reasoning(model_output, request)
 
     def extract_reasoning_streaming(
@@ -62,16 +62,26 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         delta_token_ids: Sequence[int],
         request=None,
     ) -> DeltaMessage | None:
-        # If we've accumulated text and no start token found, treat as content
-        # Unless assume_reasoning is set (prompt already has <think>)
+        has_start_in_current = self.start_token in current_text or (
+            self._start_token_id is not None and self._start_token_id in current_token_ids
+        )
+
+        # Strict behavior: if no start tag is observed and we are not in prompt-aware
+        # asymmetric mode, treat streaming output as content.
         if (
-            not self.assume_reasoning
+            not self._is_prompt_reasoning_active()
             and current_text
-            and self.start_token not in current_text
+            and not has_start_in_current
             and len(current_text) > len(self.start_token)
         ):
             return DeltaMessage(content=delta_text) if delta_text else None
+
         return super().extract_reasoning_streaming(
-            previous_text, current_text, delta_text,
-            previous_token_ids, current_token_ids, delta_token_ids, request,
+            previous_text,
+            current_text,
+            delta_text,
+            previous_token_ids,
+            current_token_ids,
+            delta_token_ids,
+            request,
         )
