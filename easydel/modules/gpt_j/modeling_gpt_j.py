@@ -44,6 +44,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.components.norms import LayerNorm
 
 from .gpt_j_configuration import GPTJConfig as GPTJConfig
 
@@ -481,7 +482,7 @@ class GPTJBlock(nn.Module):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.ln_1 = nn.LayerNorm(
+        self.ln_1 = LayerNorm(
             self.config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             dtype=dtype,
@@ -628,18 +629,20 @@ class GPTJModel(EasyDeLBaseModule):
             rate=self.config.embd_pdrop,
             rngs=rngs,
         )
-        self.h = nn.List([
-            GPTJBlock(
-                config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_hidden_layers)
-        ])
-        self.ln_f = nn.LayerNorm(
+        self.h = nn.List(
+            [
+                GPTJBlock(
+                    config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_hidden_layers)
+            ]
+        )
+        self.ln_f = LayerNorm(
             self.config.hidden_size,
             epsilon=self.config.layer_norm_epsilon,
             dtype=dtype,

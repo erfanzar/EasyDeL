@@ -501,17 +501,19 @@ class SmolLM3Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = nn.List([
-            SmolLM3DecoderLayer(
-                config=config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                SmolLM3DecoderLayer(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(
             dim=config.hidden_size,

@@ -16,6 +16,7 @@
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import ColumnWise, Replicated, RowWise
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -45,6 +46,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.components import Embed
+from easydel.layers.components.norms import LayerNorm
 
 from .gpt2_configuration import GPT2Config as GPT2Config
 
@@ -77,6 +79,7 @@ class Conv1D(nn.Module):
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
         dot_general=None,
+        sharding_axis: str | None = None,
         *,
         rngs: nn.Rngs,
     ):
@@ -104,6 +107,19 @@ class Conv1D(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.dot_general = dot_general
+        self.sharding_axis = sharding_axis
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        if self.sharding_axis == "row":
+            kernel_spec = RowWise
+        elif self.sharding_axis == "column":
+            kernel_spec = ColumnWise
+        else:
+            kernel_spec = ColumnWise
+        specs = {"kernel": kernel_spec}
+        if self.bias is not None:
+            specs["bias"] = Replicated
+        return specs
 
     def __call__(self, inputs):
         """Forward pass of the Conv1D layer.
@@ -197,6 +213,7 @@ class GPT2Attention(UnifiedAttention):
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
+                sharding_axis="column",
                 rngs=rngs,
             )
             self.q_attn = Conv1D(
@@ -205,6 +222,7 @@ class GPT2Attention(UnifiedAttention):
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
+                sharding_axis="column",
                 rngs=rngs,
             )
         else:
@@ -214,6 +232,7 @@ class GPT2Attention(UnifiedAttention):
                 dtype=dtype,
                 param_dtype=param_dtype,
                 precision=precision,
+                sharding_axis="column",
                 rngs=rngs,
             )
             self.q_attn = None
@@ -224,6 +243,7 @@ class GPT2Attention(UnifiedAttention):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
+            sharding_axis="row",
             rngs=rngs,
         )
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
@@ -376,6 +396,7 @@ class GPT2MLP(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
+            sharding_axis="column",
             rngs=rngs,
         )
         self.c_proj = Conv1D(
@@ -384,6 +405,7 @@ class GPT2MLP(nn.Module):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
+            sharding_axis="row",
             rngs=rngs,
         )
         self.act = ACT2FN[config.activation_function]
@@ -451,7 +473,7 @@ class GPT2Block(nn.Module):
         hidden_size = self.config.hidden_size
         inner_dim = self.config.n_inner if self.config.n_inner is not None else 4 * hidden_size
 
-        self.ln_1 = nn.LayerNorm(
+        self.ln_1 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             dtype=dtype,
@@ -477,7 +499,7 @@ class GPT2Block(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.ln_2 = nn.LayerNorm(
+        self.ln_2 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             dtype=dtype,
@@ -494,7 +516,7 @@ class GPT2Block(nn.Module):
                 is_cross_attention=True,
                 rngs=rngs,
             )
-            self.ln_cross_attn = nn.LayerNorm(
+            self.ln_cross_attn = LayerNorm(
                 config.hidden_size,
                 epsilon=config.layer_norm_epsilon,
                 dtype=dtype,
@@ -667,18 +689,20 @@ class GPT2Model(EasyDeLBaseModule):
         )
 
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop, rngs=rngs)
-        self.h = nn.List([
-            GPT2Block(
-                self.config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_hidden_layers)
-        ])
-        self.ln_f = nn.LayerNorm(
+        self.h = nn.List(
+            [
+                GPT2Block(
+                    self.config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_hidden_layers)
+            ]
+        )
+        self.ln_f = LayerNorm(
             self.config.hidden_size,
             epsilon=self.config.layer_norm_epsilon,
             dtype=self.dtype,

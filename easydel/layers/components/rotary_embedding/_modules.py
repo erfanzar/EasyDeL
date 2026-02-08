@@ -204,6 +204,10 @@ class RotaryEmbedding(nn.Module):
                 dtype=self.dtype,
             )
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return dynamic partition specs for this module's parameters."""
+        return {}
+
 
 @rope_wraper("mrope")
 class MultiModalRotaryEmbedding(RotaryEmbedding):

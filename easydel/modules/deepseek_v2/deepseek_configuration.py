@@ -15,20 +15,13 @@
 
 import typing as tp
 
-from eformer.common_types import (
-    EMPTY,
-    MODE_TRAIN,
-    TP,
-    ColumnWise,
-    DynamicShardingAxes,
-    Replicated,
-    RowWise,
-)
+from eformer.common_types import EMPTY, MODE_TRAIN, TP, DynamicShardingAxes
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
-from easydel.layers.components import RopeConfig, get_moe_partition_spec
+from easydel.layers.components import RopeConfig
 
 
 class ExpertTensorParallel(DynamicShardingAxes):
@@ -296,50 +289,18 @@ class DeepseekV2Config(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/q_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/q_a_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/q_b_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/kv_a_proj_with_mqa/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/kv_b_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"self_attn/(q_a_layernorm|kv_a_layernorm)/kernel", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/gate/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
-            (
-                r"mlp/experts/(gate_proj|up_proj)/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="column",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (
-                r"mlp/experts/down_proj/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="row",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (r".*(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
+        """
+        return None
 
     @property
     def granted_freq_max_position_embedding(self) -> int:

@@ -18,6 +18,7 @@ import typing as tp
 from functools import partial
 
 import jax.lax
+from eformer.common_types import Replicated
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import numpy as jnp
@@ -30,6 +31,7 @@ from easydel.infra.modeling_outputs import ModelOutput
 from easydel.infra.utils import ArrayParam
 from easydel.layers.base_modules import BaseCausalLMModule
 from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.components.norms import LayerNorm
 
 from .rwkv_configuration import RwkvConfig as RwkvConfig
 
@@ -297,6 +299,16 @@ class RwkvSelfAttention(nn.Module):
             rngs=rngs,
         )
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for temporal mixing parameters."""
+        return {
+            "time_decay": Replicated,
+            "time_first": Replicated,
+            "time_mix_key": Replicated,
+            "time_mix_value": Replicated,
+            "time_mix_receptance": Replicated,
+        }
+
     def __call__(
         self,
         hidden: Array,
@@ -461,6 +473,13 @@ class RwkvFeedForward(nn.Module):
             rngs=rngs,
         )
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for channel mixing parameters."""
+        return {
+            "time_mix_key": Replicated,
+            "time_mix_receptance": Replicated,
+        }
+
     def __call__(self, hidden, state):
         """Apply channel mixing feedforward transformation.
 
@@ -530,7 +549,7 @@ class SingleStandRwkvBlock(nn.Module):
         self.rngs = rngs
 
         if layer_id == 0:
-            self.pre_ln = nn.LayerNorm(
+            self.pre_ln = LayerNorm(
                 config.hidden_size,
                 epsilon=config.layer_norm_epsilon,
                 dtype=self.dtype,
@@ -538,14 +557,14 @@ class SingleStandRwkvBlock(nn.Module):
                 rngs=rngs,
             )
 
-        self.ln1 = nn.LayerNorm(
+        self.ln1 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.ln2 = nn.LayerNorm(
+        self.ln2 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             dtype=dtype,
@@ -695,21 +714,23 @@ class RwkvModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.blocks = nn.List([
-            RwkvBlock(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                layer_id=idx,
-                rngs=rngs,
-            )
-            for idx in range(self.config.num_hidden_layers)
-        ])
+        self.blocks = nn.List(
+            [
+                RwkvBlock(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    layer_id=idx,
+                    rngs=rngs,
+                )
+                for idx in range(self.config.num_hidden_layers)
+            ]
+        )
 
         self.layers_are_rescaled = False
         self.deterministic = True
-        self.ln_out = nn.LayerNorm(
+        self.ln_out = LayerNorm(
             config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -881,7 +902,7 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):
         from easydel.utils.parameters_transformation import StateDictConverter
 
         embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, Embed)]
-        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.LayerNorm)]
+        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, LayerNorm)]
         moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
         moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
 

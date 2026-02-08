@@ -1,4 +1,4 @@
-from easydel.workers.esurge.pipeline.worker_main import FastIncrementalDecoder
+from easydel.workers.esurge.pipeline.worker_main import FastIncrementalDecoder, _compute_suffix_delta
 
 REPLACEMENT_CHAR = "\ufffd"
 
@@ -85,3 +85,15 @@ def test_incremental_decoder_uses_context_for_wordpiece():
     assert delta == "world"
     assert buffered == []
     assert has_buffer is False
+
+
+def test_compute_suffix_delta_prefix_path():
+    assert _compute_suffix_delta("hello world", "hello ") == "world"
+
+
+def test_compute_suffix_delta_overlap_path():
+    assert _compute_suffix_delta("world!", "hello world") == "!"
+
+
+def test_compute_suffix_delta_no_overlap_avoids_replay():
+    assert _compute_suffix_delta("fresh text", "old output") == ""

@@ -42,6 +42,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.components.norms import LayerNorm
 
 from .stablelm_configuration import StableLmConfig
 
@@ -169,17 +170,19 @@ class StableLmLayerNormPerHead(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             rngs (nn.Rngs): Random number generator state.
         """
-        self.norms = nn.List([
-            nn.LayerNorm(
-                head_dim,
-                epsilon=eps,
-                use_bias=bias,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                rngs=rngs,
-            )
-            for idx in range(num_heads)
-        ])
+        self.norms = nn.List(
+            [
+                LayerNorm(
+                    head_dim,
+                    epsilon=eps,
+                    use_bias=bias,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    rngs=rngs,
+                )
+                for idx in range(num_heads)
+            ]
+        )
 
     def __call__(self, hidden_states):
         """Apply layer normalization independently to each head.
@@ -473,7 +476,7 @@ class StableLmDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.input_layernorm = nn.LayerNorm(
+        self.input_layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -481,7 +484,7 @@ class StableLmDecoderLayer(nn.Module):
             rngs=rngs,
         )
         if not self.use_parallel_residual:
-            self.post_attention_layernorm = nn.LayerNorm(
+            self.post_attention_layernorm = LayerNorm(
                 config.hidden_size,
                 epsilon=config.layer_norm_eps,
                 dtype=dtype,
@@ -624,19 +627,21 @@ class StableLmModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = nn.List([
-            StableLmDecoderLayer(
-                config=config,
-                layer_idx=idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for idx in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                StableLmDecoderLayer(
+                    config=config,
+                    layer_idx=idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for idx in range(config.num_hidden_layers)
+            ]
+        )
 
-        self.norm = nn.LayerNorm(
+        self.norm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,

@@ -43,6 +43,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.components.norms import LayerNorm
 
 from .gpt_neox_configuration import GPTNeoXConfig as GPTNeoXConfig
 
@@ -268,8 +269,8 @@ class GPTNeoXBlock(nn.Module):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         use_parallel_residual (bool): Whether to use parallel residual connections.
-        input_layernorm (nn.LayerNorm): Layer normalization before attention.
-        post_attention_layernorm (nn.LayerNorm): Layer normalization before MLP.
+        input_layernorm (LayerNorm): Layer normalization before attention.
+        post_attention_layernorm (LayerNorm): Layer normalization before MLP.
         attention (GPTNeoXAttention): Self-attention module.
         mlp (GPTNeoXMlp): Feed-forward network module.
     """
@@ -311,14 +312,14 @@ class GPTNeoXBlock(nn.Module):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.input_layernorm = nn.LayerNorm(
+        self.input_layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.post_attention_layernorm = nn.LayerNorm(
+        self.post_attention_layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -424,7 +425,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
         embed_in (Embed): Token embedding layer.
         emb_dropout (nn.Dropout): Dropout applied after embeddings.
         layers (list[GPTNeoXBlock]): List of transformer blocks.
-        final_layer_norm (nn.LayerNorm): Final layer normalization.
+        final_layer_norm (LayerNorm): Final layer normalization.
     """
 
     def __init__(
@@ -460,18 +461,20 @@ class GPTNeoXModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.emb_dropout = nn.Dropout(config.hidden_dropout, rngs=rngs)
-        self.layers = nn.List([
-            GPTNeoXBlock(
-                config=config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(config.num_hidden_layers)
-        ])
-        self.final_layer_norm = nn.LayerNorm(
+        self.layers = nn.List(
+            [
+                GPTNeoXBlock(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
+        self.final_layer_norm = LayerNorm(
             config.hidden_size,
             epsilon=self.config.layer_norm_eps,
             dtype=self.dtype,

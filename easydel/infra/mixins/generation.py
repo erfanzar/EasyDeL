@@ -1935,6 +1935,17 @@ class EasyGenerationMixin:
         model_kwargs = generation_config.update(**kwargs)
         self._validate_model_kwargs(model_kwargs.copy())
 
+        # Newer Transformers may leave generation fields as None by default.
+        # Normalize to the canonical greedy defaults expected by this mixin.
+        if generation_config.do_sample is None:
+            generation_config.do_sample = False
+        if generation_config.num_beams is None:
+            generation_config.num_beams = 1
+        if generation_config.num_beam_groups is None:
+            generation_config.num_beam_groups = 1
+        if generation_config.num_return_sequences is None:
+            generation_config.num_return_sequences = 1
+
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
 
         # set init values

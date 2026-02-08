@@ -37,6 +37,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.components import RowParallelLinear
+from easydel.layers.components.norms import LayerNorm
 from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 
 from .aya_vision_configuration import AyaVisionConfig
@@ -141,7 +142,7 @@ class AyaVisionMultiModalProjector(nn.Module):
             config.get_text_config().hidden_size,
         )
 
-        self.layernorm = nn.LayerNorm(
+        self.layernorm = LayerNorm(
             config.vision_config.hidden_size * (config.downsample_factor**2),
             epsilon=config.adapter_layer_norm_eps,
             dtype=dtype,

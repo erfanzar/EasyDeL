@@ -15,7 +15,7 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -165,31 +165,15 @@ class OPTConfig(EasyDeLBaseConfig):
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.num_hidden_layers
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"embed_positions/embedding", pmag.resolve(Replicated)),
-            (r"project_in/kernel", pmag.resolve(ColumnWise)),
-            (r"project_out/kernel", pmag.resolve(RowWise)),
-            (
-                r"(self_attn|crossattention)/(q_proj|k_proj|v_proj|q_attn|c_attn)/kernel",
-                pmag.resolve(ColumnWise),
-            ),
-            (r"(self_attn|crossattention)/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"fc1/kernel", pmag.resolve(ColumnWise)),
-            (r"fc2/kernel", pmag.resolve(RowWise)),
-            (r".*/(self_attn_layer_norm|final_layer_norm)/scale", pmag.resolve(Replicated)),
-            (r".*/(self_attn_layer_norm|final_layer_norm)/bias", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (
-                r".*(q_proj|k_proj|v_proj|q_attn|c_attn|out_proj|fc1|fc2|project_in|project_out|lm_head)/bias",
-                pmag.resolve(Replicated),
-            ),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

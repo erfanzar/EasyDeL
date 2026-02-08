@@ -29,6 +29,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+from eformer.common_types import Replicated
 from eformer.pytree import auto_pytree
 from einops import repeat
 from flax import nnx as nn
@@ -199,6 +200,13 @@ class Conv1D(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for convolution parameters."""
+        specs = {"kernel": Replicated}
+        if getattr(self, "use_bias", False) and hasattr(self, "bias"):
+            specs["bias"] = Replicated
+        return specs
 
     def __call__(self, x: Array) -> Array:
         """Apply 1D convolution to the input tensor.
@@ -418,6 +426,13 @@ class FalconMambaMixer(nn.Module):
             base_config=config,
         )
         self.ssm_op = SSM1Op(metadata)
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for state space parameters."""
+        return {
+            "A_log": Replicated,
+            "D": Replicated,
+        }
 
     def __call__(
         self,
@@ -700,17 +715,19 @@ class FalconMambaModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = nn.List([
-            FalconMambaBlock(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                FalconMambaBlock(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
         self.norm_f = FalconMambaRMSNorm(
             config.hidden_size,
             eps=config.layer_norm_epsilon,

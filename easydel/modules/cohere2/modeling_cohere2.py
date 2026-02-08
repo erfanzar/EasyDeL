@@ -18,6 +18,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -105,6 +106,9 @@ class Cohere2LayerNorm(nn.Module):
         mean = jnp.mean(x, -1, keepdims=True)
         variance = jnp.mean(jnp.pow((x - mean), 2), -1, keepdims=True)
         return (x - mean) * jax.lax.rsqrt(variance + self.eps)
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        return {"kernel": Replicated}
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """Apply layer normalization with learnable scale.
@@ -503,17 +507,19 @@ class Cohere2Model(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = nn.List([
-            Cohere2Block(
-                config=config,
-                layer_idx=idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for idx in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                Cohere2Block(
+                    config=config,
+                    layer_idx=idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for idx in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = Cohere2LayerNorm(
             self.config.hidden_size,
             eps=self.config.layer_norm_eps,

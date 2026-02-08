@@ -32,6 +32,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -246,6 +247,11 @@ class GiddAttention(AttentionModule):
             softmax_scale=1.0 if self.use_qk_norm else 1.0 / self.head_dim**0.5,
             dropout_prob=0.0,
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        if isinstance(self.qk_scale, ArrayParam):
+            return {"qk_scale": Replicated}
+        return {}
 
     @jax.named_scope("gidd-flax-attention-concatenate")
     def concatenate(
@@ -674,17 +680,19 @@ class GiddModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = nn.List([
-            GiddLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-                resid_scale=self.resid_scale,
-            )
-            for _ in range(self.config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                GiddLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                    resid_scale=self.resid_scale,
+                )
+                for _ in range(self.config.num_hidden_layers)
+            ]
+        )
 
         self.norm = GiddRMSNorm(config=config, dtype=dtype, param_dtype=param_dtype)
 

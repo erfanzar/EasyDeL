@@ -34,6 +34,7 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -139,6 +140,10 @@ class KimiRMSNorm(nn.Module):
             KimiRMSNorm.kernel_init(rngs.params(), (hidden_size,), param_dtype),
         )
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for normalization parameters."""
+        return {"kernel": Replicated}
+
     def __call__(self, hidden_states: Float[Array, "... hidden_size"]) -> Float[Array, "... hidden_size"]:
         """Apply RMSNorm normalization.
 
@@ -194,6 +199,10 @@ class KimiRMSNormGated(nn.Module):
         self.kernel = nn.Param(
             KimiRMSNormGated.kernel_init(rngs.params(), (hidden_size,), param_dtype),
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for normalization parameters."""
+        return {"kernel": Replicated}
 
     def __call__(
         self,
@@ -365,6 +374,13 @@ class KimiMoEGate(nn.Module):
             init_kwargs={"value": 0.0},
             key=rngs.params(),
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for router parameters."""
+        return {
+            "kernel": ColumnWise,
+            "e_score_correction_bias": Replicated,
+        }
 
     def __call__(self, hidden_states: Float[Array, "tokens hidden_dim"]):
         """Route tokens to experts.
@@ -1073,6 +1089,13 @@ class KimiDeltaAttention(nn.Module):
         )
         self.kda_op = KernelDeltaAttnOp(metadata)
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for decay parameters."""
+        return {
+            "A_log": Replicated,
+            "dt_bias": Replicated,
+        }
+
     def _apply_conv_with_state(
         self,
         x: Float[Array, "batch seq_len dim"],
@@ -1471,17 +1494,19 @@ class KimiLinearModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = nn.List([
-            KimiDecoderLayer(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                KimiDecoderLayer(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = KimiRMSNorm(
             config.hidden_size,

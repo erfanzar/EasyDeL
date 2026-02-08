@@ -23,7 +23,7 @@ from eformer.paths import ePath
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.infra.base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
+from easydel.infra.base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict, is_remote_url
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
@@ -379,7 +379,6 @@ class BaseAutoEasyModel:
             bool: True if it's an EasyDeL checkpoint, False otherwise.
         """
         from transformers.utils import cached_file as _cached_file
-        from transformers.utils import is_remote_url as _is_remote_url
 
         proxies = None
         subfolder = ""
@@ -403,7 +402,7 @@ class BaseAutoEasyModel:
 
         elif (ePath(subfolder) / epath).is_file():
             ...
-        elif _is_remote_url(pretrained_model_name_or_path):
+        elif is_remote_url(pretrained_model_name_or_path):
             ...
         else:
             try:

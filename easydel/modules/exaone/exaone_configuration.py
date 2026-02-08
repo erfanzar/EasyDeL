@@ -15,7 +15,7 @@
 
 from typing import ClassVar
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -185,27 +185,18 @@ class ExaoneConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"wte/embedding", pmag.resolve(ColumnWise)),
-            (r"attention/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"attention/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"attention/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/(c_fc_0|c_fc_1)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/c_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (r".*/(ln_1|ln_2|ln_f)/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     @property
     def granted_freq_max_position_embedding(self) -> int:

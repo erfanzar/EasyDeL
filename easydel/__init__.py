@@ -47,6 +47,9 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _getlogger("jax._src.xla_bridge").setLevel(30)
     _getlogger("jax._src.mesh_utils").setLevel(30)
     _getlogger("jax._src.distributed").setLevel(30)
+
+    _getlogger("httpx").setLevel(30)
+    _getlogger("httpcore").setLevel(30)
     _getlogger("datasets").setLevel(30)
 
     _getlogger("numexpr.utils").setLevel(30)
@@ -756,10 +759,10 @@ if _tp.TYPE_CHECKING:
         BlockSparseAttn,
         FlashAttentionConfig,
         FlashAttn,
-        PagedFlashAttn,
         OperationImpl,
         OperationMetadata,
         OperationRegistry,
+        PagedFlashAttn,
         RaggedPageAttentionv2Config,
         RaggedPageAttentionv3Config,
         RaggedPageAttnV2,
@@ -1065,10 +1068,10 @@ if _check_bool_flag("ENABLE_DISTRIBUTED_INIT", True):
 
     try:
         _DistributedConfig().initialize()
-    except RuntimeError:
-        _logger.warn("Failed to initialize jax-dist if you have initialized that manually you can ignore this warning")
+    except RuntimeError as e:
+        _logger.warning(f"Failed to initialize jax-dist if you have initialized that manually you can ignore this warning {e}")
     except Exception:  # maybe it's a single process
-        _logger.warn("Failed to initialize jax-dist")
+        _logger.warning("Failed to initialize jax-dist")
     del _DistributedConfig
 else:
     _logger.info(

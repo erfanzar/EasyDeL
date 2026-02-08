@@ -23,30 +23,35 @@ Modules:
 Exports:
     RMSNorm: Root Mean Square normalization layer for efficient normalization
         in transformer models.
+    LayerNorm: Layer Normalization that normalizes across feature dimensions
+        independently per sample.
+    BatchNorm: Batch Normalization that normalizes across the batch dimension
+        with running statistics.
     lowfloats: List of supported float8 data types for low-precision computation.
 
 Example:
-    >>> from easydel.layers.components.norms import RMSNorm, lowfloats
+    >>> from easydel.layers.components.norms import RMSNorm, LayerNorm, BatchNorm
     >>> import jax.numpy as jnp
     >>>
-    >>> # Create RMSNorm layer
-    >>> norm = RMSNorm(dim=768, eps=1e-6, dtype=jnp.bfloat16)
+    >>> # RMSNorm for transformer hidden states
+    >>> rms = RMSNorm(dim=768, eps=1e-6, dtype=jnp.bfloat16)
+    >>> normalized = rms(jnp.ones((2, 512, 768)))
     >>>
-    >>> # Apply normalization
-    >>> inputs = jnp.ones((2, 512, 768))
-    >>> normalized = norm(inputs)
-
-Note:
-    RMSNorm is the preferred normalization for large language models as it
-    provides computational efficiency while maintaining model performance.
-    It requires fewer parameters than LayerNorm since it does not learn
-    separate shift parameters.
+    >>> # LayerNorm for standard normalization
+    >>> ln = LayerNorm(num_features=768, rngs=nn.Rngs(0))
+    >>> normalized = ln(jnp.ones((2, 512, 768)))
+    >>>
+    >>> # BatchNorm for convolutional or dense layers
+    >>> bn = BatchNorm(num_features=64, rngs=nn.Rngs(0))
+    >>> normalized = bn(jnp.ones((8, 64)), use_running_average=False)
 
 See Also:
-    - :class:`RMSNorm`: Main normalization layer class.
+    - :class:`RMSNorm`: Efficient normalization for LLMs.
+    - :class:`LayerNorm`: Standard layer normalization.
+    - :class:`BatchNorm`: Batch normalization with running statistics.
     - :data:`lowfloats`: Supported low-precision float types.
 """
 
-from ._norms import RMSNorm, lowfloats
+from ._norms import BatchNorm, LayerNorm, RMSNorm, lowfloats
 
-__all__ = "RMSNorm", "lowfloats"
+__all__ = "RMSNorm", "lowfloats", LayerNorm, BatchNorm

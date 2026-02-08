@@ -50,6 +50,7 @@ Available Parsers:
 - Qwen3XMLToolParser: Processes Qwen3 XML-style tool calls
 - SeedOssToolParser: Handles Seed OSS model XML tool format
 - Step3ToolParser: Processes Step3 model XML-like tool calls
+- Step3p5ToolParser: Processes Step 3.5 model XML-style tool calls
 - xLAMToolParser: Handles xLAM JSON tool call formats
 
 All parsers inherit from the base ToolParser class and are registered with
@@ -85,6 +86,7 @@ from .qwen3coder_tool_parser import Qwen3CoderToolParser
 from .qwen3xml_tool_parser import Qwen3XMLToolParser
 from .seed_oss_tool_parser import SeedOssToolParser
 from .step3_tool_parser import Step3ToolParser
+from .step3p5_tool_parser import Step3p5ToolParser
 from .xlam_tool_parser import xLAMToolParser
 
 __all__ = [
@@ -117,5 +119,6 @@ __all__ = [
     "Qwen3XMLToolParser",
     "SeedOssToolParser",
     "Step3ToolParser",
+    "Step3p5ToolParser",
     "xLAMToolParser",
 ]

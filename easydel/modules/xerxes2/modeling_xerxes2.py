@@ -60,6 +60,7 @@ from easydel.layers.components import (
     RowParallelLinear,
     RowParallelMoELinear,
 )
+from easydel.layers.components.norms import LayerNorm
 from easydel.layers.components.rotary_embedding import yarn_get_mscale
 
 from .xerxes2_configuration import Xerxes2Config as Xerxes2Config
@@ -193,7 +194,7 @@ class Xerxes2Attention(UnifiedAttention):
             setattr(
                 self,
                 self.projection_mapping["mla_q_a_layernorm"],
-                nn.LayerNorm(
+                LayerNorm(
                     config.q_lora_dim,
                     rngs=rngs,
                     dtype=dtype,
@@ -232,7 +233,7 @@ class Xerxes2Attention(UnifiedAttention):
         setattr(
             self,
             self.projection_mapping["mla_kv_a_layernorm"],
-            nn.LayerNorm(
+            LayerNorm(
                 config.kv_lora_dim,
                 rngs=rngs,
                 dtype=dtype,
@@ -806,17 +807,19 @@ class Xerxes2Model(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = nn.List([
-            Xerxes2DecoderLayer(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                Xerxes2DecoderLayer(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,

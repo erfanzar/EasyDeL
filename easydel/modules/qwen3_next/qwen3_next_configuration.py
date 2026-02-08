@@ -16,20 +16,12 @@
 
 import typing as tp
 
-from eformer.common_types import (
-    EMPTY,
-    MODE_TRAIN,
-    TP,
-    ColumnWise,
-    DynamicShardingAxes,
-    Replicated,
-    RowWise,
-)
+from eformer.common_types import EMPTY, MODE_TRAIN, TP, DynamicShardingAxes
 from eformer.loggings import get_logger
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
-from easydel.layers.components import get_moe_partition_spec
 
 logger = get_logger(__name__)
 
@@ -203,72 +195,18 @@ class Qwen3NextConfig(EasyDeLBaseConfig):
         """Return the state dimension for linear attention recurrence."""
         return self.linear_value_head_dim
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-            Tuple of partition rules mapping regex patterns to partition specs.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"full_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"full_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"full_attn/q_gate_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"full_attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
-            (r"full_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"linear_attn/in_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"linear_attn/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"linear_attn/out_norm/kernel", pmag.resolve(Replicated)),
-            (r"linear_attn/conv1d/kernel", pmag.resolve(Replicated)),
-            (r"linear_attn/beta_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"linear_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r"mlp/gate/kernel",
-                pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise),
-            ),
-            (r"mlp/gate/bias", pmag.resolve(Replicated)),
-            (
-                r"mlp/experts/(gate_proj|up_proj)/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="column",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (
-                r"mlp/experts/down_proj/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="row",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (r"mlp/experts/.*bias", pmag.resolve(Replicated)),
-            (r"shared_expert/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"shared_expert/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"shared_expert/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r".*/(input_layernorm|post_attention_layernorm)/kernel",
-                pmag.resolve(Replicated),
-            ),
-            (r"norm/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     def is_full_attention_layer(self, layer_idx: int) -> bool:
         """Check if a layer uses full attention.

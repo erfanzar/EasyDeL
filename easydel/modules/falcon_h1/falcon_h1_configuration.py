@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -177,32 +177,15 @@ class FalconH1Config(EasyDeLBaseConfig):
             return self.mamba_d_ssm
         return self.mamba_expand * self.hidden_size
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Return regex-based parameter partition rules.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
 
-        The rules follow the standard EasyDeL linear sharding convention:
-        - Column-wise sharding for expanding projections.
-        - Row-wise sharding for contracting projections.
-        - Biases, norms and non-matmul parameters replicated.
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"self_attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
-            (r"feed_forward/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"feed_forward/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"feed_forward/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mamba/in_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"mamba/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"mamba/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mamba/(dt_bias|A_log|D)", pmag.resolve(Replicated)),
-            (r"mamba/conv1d/(kernel|bias)", pmag.resolve(Replicated)),
-            (r"mamba/norm/kernel", pmag.resolve(Replicated)),
-            (r".*(input_layernorm|pre_ff_layernorm|final_layernorm)/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

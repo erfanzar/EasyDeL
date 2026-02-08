@@ -668,17 +668,19 @@ class OpenELMModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = nn.List([
-            OpenELMDecoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                layer_idx=i,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_transformer_layers)
-        ])
+        self.layers = nn.List(
+            [
+                OpenELMDecoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    layer_idx=i,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_transformer_layers)
+            ]
+        )
         self.norm = RMSNorm(
             config.model_dim,
             dtype=self.dtype,

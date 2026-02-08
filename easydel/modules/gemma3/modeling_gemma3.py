@@ -18,6 +18,7 @@ from functools import cached_property, partial
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
@@ -160,6 +161,10 @@ class Gemma3RMSNorm(nn.Module):
             init_method="ones",
             key=None,
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for normalization parameters."""
+        return {"kernel": Replicated}
 
     def _norm(self, x: jax.Array) -> jax.Array:
         """Apply RMS normalization without learnable scale.
@@ -606,17 +611,19 @@ class Gemma3TextModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = nn.List([
-            Gemma3DecoderLayer(
-                self.config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                Gemma3DecoderLayer(
+                    self.config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_hidden_layers)
+            ]
+        )
         self.norm = Gemma3RMSNorm(self.config, param_dtype=self.dtype)
 
     @cached_property
@@ -1222,6 +1229,10 @@ class Gemma3MultiModalProjector(nn.Module):
             window_strides=(1, 1, kernel_size, kernel_size),
             padding="VALID",
         ) / (kernel_size * kernel_size)
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for multimodal projection parameters."""
+        return {"mm_input_projection_weight": ColumnWise}
 
     def __call__(self, vision_outputs: Float[Array, "batch hidden_dim num_patches"]) -> Array:
         """Project vision features to text embedding space.

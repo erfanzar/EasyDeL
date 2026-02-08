@@ -14,7 +14,7 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -141,28 +141,18 @@ class Glm4vVisionConfig(EasyDeLBaseConfig):
         self.intermediate_size = intermediate_size
         self.initializer_range = initializer_range
 
-    def get_partition_rules(self, *args, **kwargs):
-        pmag = self.partition_manager
-        return (
-            (r"patch_embed/proj/kernel", pmag.resolve(ColumnWise)),
-            (r"patch_embed/proj/bias", pmag.resolve(Replicated)),
-            (r"pos_embed/embedding", pmag.resolve(ColumnWise)),
-            (r"blocks/.*/attn/qkv/kernel", pmag.resolve(ColumnWise)),
-            (r"blocks/.*/attn/qkv/bias", pmag.resolve(Replicated)),
-            (r"blocks/.*/attn/proj/kernel", pmag.resolve(RowWise)),
-            (r"blocks/.*/attn/proj/bias", pmag.resolve(Replicated)),
-            (r"blocks/.*/mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"blocks/.*/mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"blocks/.*/norm(1|2)/scale", pmag.resolve(Replicated)),
-            (r"(post_conv_layernorm|post_layernorm)/scale", pmag.resolve(Replicated)),
-            (r"downsample/kernel", pmag.resolve(ColumnWise)),
-            (r"downsample/bias", pmag.resolve(Replicated)),
-            (r"merger/proj/kernel", pmag.resolve(ColumnWise)),
-            (r"merger/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"merger/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"merger/norm/.*", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
+        """
+        return None
 
 
 @register_config("glm4v_text")
@@ -269,20 +259,18 @@ class Glm4vTextConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"layers/.*/self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"layers/.*/self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"layers/.*/self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"layers/.*/mlp/gate_up_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"layers/.*/mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"layers/.*/(input_layernorm|post_attention_layernorm)/scale", pmag.resolve(Replicated)),
-            (r"layers/.*/(post_self_attn_layernorm|post_mlp_layernorm)/scale", pmag.resolve(Replicated)),
-            (r"norm/scale", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
+        """
+        return None
 
 
 @register_config("glm4v")
@@ -381,30 +369,18 @@ class Glm4vConfig(EasyDeLBaseConfig):
     def get_vision_config(self) -> Glm4vVisionConfig:
         return self.vision_config
 
-    def get_partition_rules(self, *args, **kwargs):
-        pmag = self.partition_manager
-        return (
-            (r"model/visual/patch_embed/proj/kernel", pmag.resolve(ColumnWise)),
-            (r"model/visual/patch_embed/proj/bias", pmag.resolve(Replicated)),
-            (r"model/visual/pos_embed/embedding", pmag.resolve(ColumnWise)),
-            (r"model/visual/blocks/.*/attn/qkv/kernel", pmag.resolve(ColumnWise)),
-            (r"model/visual/blocks/.*/attn/proj/kernel", pmag.resolve(RowWise)),
-            (r"model/visual/blocks/.*/mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"model/visual/blocks/.*/mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"model/visual/downsample/kernel", pmag.resolve(ColumnWise)),
-            (r"model/visual/merger/proj/kernel", pmag.resolve(ColumnWise)),
-            (r"model/visual/merger/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"model/visual/merger/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"model/language_model/embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"model/language_model/layers/.*/self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"model/language_model/layers/.*/self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"model/language_model/layers/.*/mlp/gate_up_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"model/language_model/layers/.*/mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*(norm|layernorm).*", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
+        """
+        return None
 
 
 __all__ = ["Glm4vConfig", "Glm4vTextConfig", "Glm4vVisionConfig"]

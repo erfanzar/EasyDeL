@@ -19,6 +19,7 @@ import warnings
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from ejkernel.types import MaskInfo
@@ -97,6 +98,9 @@ class GemmaRMSNorm(nn.Module):
         hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
 
         return (1 + self.kernel.value.astype(self.dtype)) * jnp.asarray(hidden_states, dtype=self.dtype)
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        return {"kernel": Replicated}
 
 
 class GemmaAttention(UnifiedAttention):
@@ -458,17 +462,19 @@ class GemmaModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = nn.List([
-            GemmaDecoderLayer(
-                self.config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                GemmaDecoderLayer(
+                    self.config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_hidden_layers)
+            ]
+        )
         self.norm = GemmaRMSNorm(self.config, dtype=self.dtype)
 
     # Ignore copy

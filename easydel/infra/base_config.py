@@ -70,7 +70,35 @@ from jaxtyping import Array
 # .venv/lib/python3.13/site-packages/transformers/configuration_utils.py
 from transformers.configuration_utils import PretrainedConfig, recursive_diff_dict
 from transformers.modeling_gguf_pytorch_utils import load_gguf_checkpoint
-from transformers.utils import CONFIG_NAME, cached_file, download_url, is_remote_url
+from transformers.utils import CONFIG_NAME, cached_file
+
+try:
+    from transformers.utils import download_url, is_remote_url
+except ImportError:  # transformers>=5 removed helpers
+    import hashlib
+    import os
+    import urllib.request
+    from urllib.parse import urlparse
+
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    def is_remote_url(url_or_filename: str) -> bool:
+        try:
+            return urlparse(url_or_filename).scheme in {"http", "https"}
+        except Exception:
+            return False
+
+    def download_url(url: str, cache_dir: str | None = None) -> str:
+        cache_dir = cache_dir or HF_HUB_CACHE
+        os.makedirs(cache_dir, exist_ok=True)
+        parsed = urlparse(url)
+        filename = os.path.basename(parsed.path) or "download"
+        _, ext = os.path.splitext(filename)
+        hashed = hashlib.sha256(url.encode("utf-8")).hexdigest()
+        cached_path = os.path.join(cache_dir, f"{hashed}{ext}")
+        if not os.path.exists(cached_path):
+            urllib.request.urlretrieve(url, cached_path)
+        return cached_path
 from transformers.utils.generic import is_timm_config_dict
 
 from easydel.layers.components import QuantizationConfig
@@ -499,6 +527,14 @@ class EasyDeLBaseConfig(PretrainedConfig):
     # Cached JAX device mesh with manual axis types.
     # Set via set_manual_mesh() or lazily created on first access to `manual_mesh` property.
     _hidden_manual_mesh: common_types.Mesh | None = None
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+        def _return_none_partition_rules(self, *args, **kwargs):
+            return None
+
+        cls.get_partition_rules = _return_none_partition_rules
 
     def __init__(
         self,
@@ -999,27 +1035,37 @@ class EasyDeLBaseConfig(PretrainedConfig):
         warnings.warn("`jax_mesh` is deprecated use `get_mesh` or `mesh`", stacklevel=1)
         return self.get_mesh()
 
-    def get_partition_rules(self, *args, **kwargs):
+    @classmethod
+    def _set_token_in_kwargs(cls, kwargs: dict[str, tp.Any], token: str | bool | None = None) -> None:
+        """Normalize auth token arguments for Hugging Face Hub utilities."""
+        if token is not None:
+            kwargs["token"] = token
+            return
+        if "token" not in kwargs and "use_auth_token" in kwargs:
+            kwargs["token"] = kwargs.pop("use_auth_token")
+
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, Ps], ...] | None:
         """Gets the parameter sharding partition rules for the model.
 
         Partition rules define how model parameters should be sharded across the device mesh.
         Each rule maps a parameter name pattern (regex) to a PartitionSpec that specifies
         which mesh axes the parameter dimensions should be distributed across.
 
-        This method must be implemented by model-specific configuration classes.
+        Providing explicit partition rules is preferred over relying on automatic sharding
+        resolution, as it gives full control over how parameters are distributed.
+
+        Returning ``None`` signals that partition rules should be resolved
+        automatically from module-level ``craft_sharding`` hooks.
 
         Args:
             *args: Positional arguments (model-specific).
             **kwargs: Keyword arguments (model-specific).
 
         Returns:
-            Tuple of (pattern, PartitionSpec) pairs defining how to shard parameters.
+            Tuple of (pattern, PartitionSpec) pairs defining how to shard parameters,
+            or ``None`` to enable automatic sharding rule resolution.
             For example: (("model/embed.*", PartitionSpec("tp", None)),
                          ("model/layers/\\d+/attn/.*", PartitionSpec(None, "tp")))
-
-        Raises:
-            NotImplementedError: This base class does not provide default partition rules.
-                Subclasses must implement this method.
 
         Example:
             >>> class MyModelConfig(EasyDeLBaseConfig):
@@ -1030,7 +1076,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             ...             ("mlp.*", PartitionSpec(None, "tp")),
             ...         )
         """
-        raise NotImplementedError("`get_partition_rules` is not implemented.")
+        return None
 
     def get_axis_dims(self) -> tp.Sequence[int]:
         """Returns the device mesh axis dimensions for parallelism.

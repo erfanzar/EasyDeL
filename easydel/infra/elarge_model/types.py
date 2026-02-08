@@ -778,6 +778,12 @@ class eSurgeCfg(TypedDict, total=False):
             Useful for models with multiple stopping tokens.
         silent_mode: Suppress informational eSurge engine logs.
             Only errors will be logged.
+        tool_parser: Name of the tool-call parser for automatic function-call
+            extraction (e.g., "hermes", "mistral", "llama3_json").
+            See ``ToolParserManager`` for available parsers.
+        reasoning_parser: Name of the reasoning parser for extracting
+            chain-of-thought content (e.g., "deepseek_r1", "qwen3", "mistral").
+            See ``ReasoningParserManager`` for available parsers.
 
     Example:
         >>> from easydel.infra.elarge_model.types import eSurgeCfg
@@ -843,6 +849,8 @@ class eSurgeCfg(TypedDict, total=False):
     sampling_params_callback: NotRequired[tp.Callable[[SamplingParams, dict[str, tp.Any]], SamplingParams | None] | None]
     extra_eos_token_ids: NotRequired[list[int] | None]
     silent_mode: NotRequired[bool]
+    tool_parser: NotRequired[str | None]
+    reasoning_parser: NotRequired[str | None]
 
 
 class TextDatasetInformCfg(TypedDict, total=False):

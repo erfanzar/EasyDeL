@@ -242,6 +242,7 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         - Execution: compile_runner, overlap_execution, use_aot_forward
         - Truncation: auto_truncate_prompt, truncate_mode, strict_context
         - Tokenization: detokenizer_max_states, extra_eos_token_ids
+        - Parsing: tool_parser, reasoning_parser
 
     Args:
         cfg_like: ELM configuration dictionary or mapping. The function
@@ -367,6 +368,8 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         sampling_params_callback=es.get("sampling_params_callback"),
         extra_eos_token_ids=extra_eos_token_ids,
         silent_mode=False if silent_mode_val is None else bool(silent_mode_val),
+        tool_parser=es.get("tool_parser"),
+        reasoning_parser=es.get("reasoning_parser"),
     )
 
 

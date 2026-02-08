@@ -166,41 +166,15 @@ class Mamba2Config(EasyDeLBaseConfig):
         self.intermediate_size = int(expand * hidden_size)
         super().__init__(**kwargs)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for distributing the Mamba2 model parameters across multiple devices.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
 
-        These rules define how parameters should be partitioned when using techniques like
-        Fully Sharded Data Parallelism (FSDP), Sharded Parallelism (SP), and Tensor Parallelism (TP).
-        Each rule consists of a regex pattern matching parameter names and a corresponding PartitionSpec.
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-            tuple: A tuple of tuples where each inner tuple contains:
-                - A regex pattern matching parameter names
-                - A PartitionSpec object specifying how to partition matching parameters
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        return (
-            # Embeddings
-            ("backbone/embeddings/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-            # Language model head
-            ("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("lm_head/bias", PartitionSpec("tp")),
-            # Mixer layers
-            ("mixer/in_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-            ("mixer/in_proj/bias", PartitionSpec("tp")),
-            ("mixer/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-            ("mixer/out_proj/bias", PartitionSpec(("fsdp", "sp"))),
-            # Conv1d in mixer (3D kernel)
-            ("mixer/conv1d/kernel", PartitionSpec(None, None, "tp")),
-            ("mixer/conv1d/bias", PartitionSpec("tp")),
-            # State space parameters
-            ("mixer/A_log", PartitionSpec(None)),
-            ("mixer/D", PartitionSpec(None)),
-            ("mixer/dt_bias", PartitionSpec(None)),
-            # Normalization layers
-            ("mixer/norm/kernel", PartitionSpec(None)),
-            ("backbone/layers/.*/norm/kernel", PartitionSpec(None)),
-            ("backbone/norm_f/kernel", PartitionSpec(None)),
-            # Catch-all
-            (".*", PartitionSpec(None)),
-        )
+        return None

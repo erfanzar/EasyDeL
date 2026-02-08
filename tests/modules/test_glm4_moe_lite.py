@@ -1,5 +1,7 @@
 """Tests for GLM4-MoE-Lite model."""
 
+import types
+
 import pytest
 import transformers
 
@@ -64,10 +66,7 @@ class TestGLM4MoeLite:
             config=glm4_moe_lite_config,
             small_model_config=small_model_config,
         )
-        assert result.success, (
-            "GLM4-MoE-Lite CAUSAL_LM failed: "
-            f"{result.error_message or result.comparison.details}"
-        )
+        assert result.success, f"GLM4-MoE-Lite CAUSAL_LM failed: {result.error_message or result.comparison.details}"
 
     def test_generation(self, glm4_moe_lite_config, small_model_config):
         """Test GLM4-MoE-Lite text generation."""
@@ -81,6 +80,28 @@ class TestGLM4MoeLite:
             max_new_tokens=16,
         )
         assert result.success, f"GLM4-MoE-Lite generation failed: {result.error_message}"
+
+    def test_ragged_cache_uses_mla_q_head_dim(self, glm4_moe_lite_config, monkeypatch):
+        """Paged-cache config must use MLA q_head_dim, not rope-only head_dim."""
+        captured = {}
+        from easydel.layers.caching import RaggedPagesCacheConfig
+
+        original_create = RaggedPagesCacheConfig.create
+
+        def _capture_create(**kwargs):
+            captured.update(kwargs)
+            return types.SimpleNamespace(**kwargs)
+
+        monkeypatch.setattr(RaggedPagesCacheConfig, "create", staticmethod(_capture_create))
+        try:
+            dummy = types.SimpleNamespace(config=glm4_moe_lite_config, mesh=glm4_moe_lite_config.mesh)
+            ed.Glm4MoeLiteForCausalLM.create_ragged_page_cache_config(dummy, max_length=1024)
+        finally:
+            monkeypatch.setattr(RaggedPagesCacheConfig, "create", original_create)
+
+        expected_q_head_dim = glm4_moe_lite_config.qk_nope_head_dim + glm4_moe_lite_config.qk_rope_head_dim
+        assert captured["kv_head_dim_size"] == expected_q_head_dim
+        assert captured["k_headdim"] == expected_q_head_dim
 
 
 if __name__ == "__main__":

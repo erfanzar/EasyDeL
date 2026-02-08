@@ -57,6 +57,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.components.norms import LayerNorm
 
 from .whisper_configuration import WhisperConfig as WhisperConfig
 
@@ -326,10 +327,10 @@ class WhisperEncoderLayer(nn.Module):
         config (WhisperConfig): Configuration object for the model.
         embed_dim (int): Dimensionality of the input and output features.
         self_attn (WhisperAttention): Self-attention module.
-        self_attn_layer_norm (nn.LayerNorm): Layer normalization before self-attention.
+        self_attn_layer_norm (LayerNorm): Layer normalization before self-attention.
         fc1 (ParallelLinear): First linear layer of the FFN.
         fc2 (ParallelLinear): Second linear layer of the FFN.
-        final_layer_norm (nn.LayerNorm): Layer normalization after the FFN.
+        final_layer_norm (LayerNorm): Layer normalization after the FFN.
         activation_fn (callable): Activation function for the FFN.
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
@@ -378,7 +379,7 @@ class WhisperEncoderLayer(nn.Module):
             precision=precision,
             kernel_init=jax.nn.initializers.normal(self.config.init_std),
         )
-        self.self_attn_layer_norm = nn.LayerNorm(
+        self.self_attn_layer_norm = LayerNorm(
             self.embed_dim,
             param_dtype=self.param_dtype,
             dtype=self.dtype,
@@ -393,7 +394,7 @@ class WhisperEncoderLayer(nn.Module):
         )
         self.fc1 = linear(self.embed_dim, self.config.encoder_ffn_dim, rngs=rngs)
         self.fc2 = linear(self.config.encoder_ffn_dim, self.embed_dim, rngs=rngs)
-        self.final_layer_norm = nn.LayerNorm(
+        self.final_layer_norm = LayerNorm(
             self.embed_dim,
             param_dtype=self.param_dtype,
             dtype=self.dtype,
@@ -458,11 +459,11 @@ class WhisperDecoderLayer(nn.Module):
         embed_dim (int): Dimensionality of the input and output features.
         self_attn (WhisperAttention): Self-attention module (causal).
         encoder_attn (WhisperAttention): Cross-attention module (attends to encoder outputs).
-        self_attn_layer_norm (nn.LayerNorm): Layer normalization before self-attention.
-        encoder_attn_layer_norm (nn.LayerNorm): Layer normalization before cross-attention.
+        self_attn_layer_norm (LayerNorm): Layer normalization before self-attention.
+        encoder_attn_layer_norm (LayerNorm): Layer normalization before cross-attention.
         fc1 (ParallelLinear): First linear layer of the FFN.
         fc2 (ParallelLinear): Second linear layer of the FFN.
-        final_layer_norm (nn.LayerNorm): Layer normalization after the FFN.
+        final_layer_norm (LayerNorm): Layer normalization after the FFN.
         activation_fn (callable): Activation function for the FFN.
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
@@ -514,7 +515,7 @@ class WhisperDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-        self.self_attn_layer_norm = nn.LayerNorm(
+        self.self_attn_layer_norm = LayerNorm(
             self.embed_dim,
             param_dtype=self.param_dtype,
             dtype=self.dtype,
@@ -531,7 +532,7 @@ class WhisperDecoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.encoder_attn_layer_norm = nn.LayerNorm(
+        self.encoder_attn_layer_norm = LayerNorm(
             self.embed_dim,
             param_dtype=self.param_dtype,
             dtype=self.dtype,
@@ -555,7 +556,7 @@ class WhisperDecoderLayer(nn.Module):
             self.embed_dim,
             rngs=rngs,
         )
-        self.final_layer_norm = nn.LayerNorm(
+        self.final_layer_norm = LayerNorm(
             self.embed_dim,
             param_dtype=self.param_dtype,
             dtype=self.dtype,
@@ -651,7 +652,7 @@ class WhisperEncoder(EasyDeLBaseModule):
         conv2 (nn.Conv): Second convolutional layer.
         embed_positions (Embed): Positional embedding layer.
         layers (nn.List[WhisperEncoderLayer]): List of encoder layers.
-        layer_norm (nn.LayerNorm): Final layer normalization.
+        layer_norm (LayerNorm): Final layer normalization.
         embed_dim (int): Dimensionality of the model.
         num_mel_bins (int): Number of Mel frequency bins in the input features.
         padding_idx (int): Index of the padding token.
@@ -719,16 +720,18 @@ class WhisperEncoder(EasyDeLBaseModule):
         )
 
         block = WhisperEncoderLayer
-        self.layers = nn.List([
-            block(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.encoder_layers)
-        ])
+        self.layers = nn.List(
+            [
+                block(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.encoder_layers)
+            ]
+        )
 
         self.embed_positions = Embed(
             self.config.max_source_positions,
@@ -739,7 +742,7 @@ class WhisperEncoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layer_norm = nn.LayerNorm(
+        self.layer_norm = LayerNorm(
             self.config.d_model,
             param_dtype=self.param_dtype,
             dtype=self.dtype,
@@ -833,7 +836,7 @@ class WhisperDecoder(EasyDeLBaseModule):
         embed_tokens (Embed): Embedding layer for target tokens.
         embed_positions (Embed): Positional embedding layer.
         layers (nn.List[WhisperDecoderLayer]): List of decoder layers.
-        layer_norm (nn.LayerNorm): Final layer normalization (applied to pre-final outputs).
+        layer_norm (LayerNorm): Final layer normalization (applied to pre-final outputs).
         dropout (nn.Dropout): Dropout layer.
         padding_idx (int): Index of the padding token.
         max_target_positions (int): Maximum sequence length for the decoder.
@@ -885,16 +888,18 @@ class WhisperDecoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = nn.List([
-            WhisperDecoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.decoder_layers)
-        ])
+        self.layers = nn.List(
+            [
+                WhisperDecoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.decoder_layers)
+            ]
+        )
 
         self.layerdrop = self.config.decoder_layerdrop
         self.dropout_layer = nn.Dropout(
@@ -902,7 +907,7 @@ class WhisperDecoder(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layer_norm = nn.LayerNorm(
+        self.layer_norm = LayerNorm(
             self.config.d_model,
             param_dtype=self.param_dtype,
             dtype=self.dtype,

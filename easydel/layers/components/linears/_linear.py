@@ -52,6 +52,7 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
+from eformer.common_types import ColumnWise, Replicated, RowWise
 from flax import nnx as nn
 from flax.nnx.nn.dtypes import promote_dtype
 from jax import lax
@@ -341,6 +342,25 @@ class ParallelLinear(nn.Module):
             >>> y = layer(x)  # Shape: (32, 3072)
         """
         return self.native_forward(inputs=inputs, w=w)
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, tp.Any]:
+        """Return dynamic partition specs for this module's parameters.
+
+        Uses the configured parallelism direction to pick a sharding pattern
+        for the kernel. Bias is replicated when present.
+        """
+        if self._direction is None:
+            return {}
+        if self._direction == "row":
+            kernel_spec = RowWise
+        elif self._direction == "column":
+            kernel_spec = ColumnWise
+        else:
+            return {}
+        specs: dict[str, tp.Any] = {"kernel": kernel_spec}
+        if self.use_bias:
+            specs["bias"] = Replicated
+        return specs
 
     def to_quantized(self, config: QuantizationConfig) -> ColumnParallelLinearQuantized | RowParallelLinearQuantized:
         """Convert this layer to a quantized version.

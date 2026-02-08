@@ -685,17 +685,19 @@ class Qwen2MoeModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = nn.List([
-            Qwen2MoeDecoderLayer(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(self.config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                Qwen2MoeDecoderLayer(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(self.config.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(
             self.config.hidden_size,

@@ -105,12 +105,16 @@ class ChatMessage(OpenAIBaseModel):
         content: Message content as text or structured content array.
         name: Optional name for the message sender.
         function_call: Optional function call made by the assistant.
+        tool_calls: Optional list of tool calls made by the assistant.
+        reasoning_content: Optional reasoning/thinking content extracted from the response.
     """
 
     role: str
     content: str | list[tp.Mapping[str, tp.Any]]
     name: str | None = None
     function_call: dict[str, tp.Any] | None = None
+    tool_calls: list | None = None
+    reasoning_content: str | None = None
 
 
 class DeltaMessage(OpenAIBaseModel):
@@ -122,11 +126,15 @@ class DeltaMessage(OpenAIBaseModel):
         role: Optional role if starting a new message.
         content: Incremental content to append to the message.
         function_call: Optional function call updates.
+        tool_calls: Optional incremental tool call updates.
+        reasoning_content: Optional incremental reasoning/thinking content.
     """
 
     role: str | None = None
     content: str | list[tp.Mapping[str, tp.Any]] | None = None
     function_call: dict[str, tp.Any] | None = None
+    tool_calls: list | None = None
+    reasoning_content: str | None = None
 
 
 class Function(OpenAIBaseModel):

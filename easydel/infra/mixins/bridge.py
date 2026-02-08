@@ -78,14 +78,31 @@ from huggingface_hub import CommitOperationAdd, create_branch, create_commit
 from huggingface_hub.utils import HfHubHTTPError
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from transformers.utils.generic import working_or_temp_dir
+try:
+    from transformers.utils.generic import working_or_temp_dir
+except ImportError:  # transformers>=5 removed helper
+    import shutil
+    import tempfile
+    from contextlib import contextmanager
+
+    @contextmanager
+    def working_or_temp_dir(working_dir: str | os.PathLike | None = None, use_temp_dir: bool = False):
+        if use_temp_dir or working_dir is None:
+            temp_dir = tempfile.mkdtemp()
+            try:
+                yield temp_dir
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        else:
+            os.makedirs(working_dir, exist_ok=True)
+            yield working_dir
 from transformers.utils.hub import PushToHubMixin
 
 from easydel.layers.components import QuantizationConfig
 from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
 from easydel.utils.traversals import flatten_dict, is_flatten, merge_model_and_tree, string_key_to_int, unflatten_dict
 
-from ..base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
+from ..base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict, download_url as _download_url, is_remote_url
 from ..etils import EasyDeLBackends, EasyDeLPlatforms
 
 if tp.TYPE_CHECKING:
@@ -605,7 +622,7 @@ class EasyBridgeMixin(PushToHubMixin):
             ).load_pytree(
                 mesh=mesh,
                 dtype=param_dtype,  # legacy
-                partition_rules=model.config.get_partition_rules(),
+                partition_rules=model._get_partition_rules(None),
                 prefix="model",
                 discover_latest=True,
                 discover_raise=False,
@@ -826,9 +843,10 @@ class EasyBridgeMixin(PushToHubMixin):
 
         from huggingface_hub import HfApi
         from transformers import GenerationConfig
-        from transformers.utils import download_url as _download_url
-        from transformers.utils import is_offline_mode as _is_offline_mode
-        from transformers.utils import is_remote_url as _is_remote_url
+        try:
+            from transformers.utils import is_offline_mode as _is_offline_mode
+        except ImportError:  # transformers>=5 moved to utils.hub
+            from transformers.utils.hub import is_offline_mode as _is_offline_mode
 
         from easydel.modules.auto.auto_configuration import (
             AutoEasyDeLConfig,
@@ -936,7 +954,7 @@ class EasyBridgeMixin(PushToHubMixin):
                         is_local = True
 
                 if not is_local:
-                    if _is_remote_url(pretrained_model_name_or_path):
+                    if is_remote_url(pretrained_model_name_or_path):
                         filename = pretrained_model_name_or_path
                         resolved_archive_file = _download_url(pretrained_model_name_or_path)
                     else:
@@ -2006,6 +2024,8 @@ class EasyBridgeMixin(PushToHubMixin):
                 partition_rules = ed_config.get_partition_rules(True)
             except Exception:
                 partition_rules = None
+        if partition_rules is None:
+            partition_rules = model.resolve_shardings_automatically()
         spec_map: dict[tuple, PartitionSpec] = {}
         if partition_rules is not None:
             try:

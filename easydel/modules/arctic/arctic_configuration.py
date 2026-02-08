@@ -15,21 +15,13 @@
 
 import typing as tp
 
-from eformer.common_types import (
-    EMPTY,
-    MODE_TRAIN,
-    TP,
-    ColumnWise,
-    DynamicShardingAxes,
-    Replicated,
-    RowWise,
-)
+from eformer.common_types import EMPTY, MODE_TRAIN, TP, DynamicShardingAxes
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
-from easydel.layers.components import get_moe_partition_spec
 
 
 class ExpertTensorParallel(DynamicShardingAxes):
@@ -214,51 +206,18 @@ class ArcticConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        Shard parameters for Arctic model with MoE support.
-        """
-        pmag = self.partition_manager
-        return (
-            (r"model/embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (
-                r"block_sparse_moe/gate/kernel",
-                pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise),
-            ),
-            (
-                r"block_sparse_moe/experts/.*/(w1|w3)/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="column",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (
-                r"block_sparse_moe/experts/.*/w2/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="row",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (r"block_sparse_moe/mlp/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
-            (r"block_sparse_moe/mlp/w2/kernel", pmag.resolve(RowWise)),
-            (r"residual_mlp/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
-            (r"residual_mlp/w2/kernel", pmag.resolve(RowWise)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Retrieve attention mask details for each layer in the model.
