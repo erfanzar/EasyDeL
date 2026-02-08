@@ -369,17 +369,19 @@ class MistralModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = nn.List([
-            MistralDecoderLayer(
-                config=config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                MistralDecoderLayer(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,

@@ -485,8 +485,7 @@ class EasyDeLState(struct.PyTreeNode):
             - :meth:`create`: Create state with optimizer initialization.
             - :meth:`shard_optimizer_state`: Shard existing optimizer state.
         """
-        if partition_rules is None:
-            partition_rules = self.model.config.get_partition_rules()
+        partition_rules = self.model._get_partition_rules(partition_rules)
 
         from eformer.escale import match_partition_rules
 
@@ -558,8 +557,7 @@ class EasyDeLState(struct.PyTreeNode):
             raise ValueError("Optimizer state is not initialized.")
         if opt_state is None:
             opt_state = self.opt_state
-        if partition_rules is None:
-            partition_rules = self.model.config.get_partition_rules()
+        partition_rules = self.model._get_partition_rules(partition_rules)
 
         from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 
@@ -603,8 +601,7 @@ class EasyDeLState(struct.PyTreeNode):
             - :meth:`gather_state`: Gather entire state including model.
         """
         assert self.opt_state is not None, "Optimizer state is not initialized."
-        if partition_rules is None:
-            partition_rules = self.model.config.get_partition_rules()
+        partition_rules = self.model._get_partition_rules(partition_rules)
 
         from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 
@@ -837,6 +834,7 @@ class EasyDeLState(struct.PyTreeNode):
         optim_path = load_directory if AM.is_tensorstore(load_directory) else load_directory / OPTIMIZER_NAME
         struct_path = load_directory / OPTIMIZER_STRUCT_NAME
         tx_struct_path = load_directory / TX_STRUCT_JSON
+        partition_rules = self.model._get_partition_rules(None)
 
         def new_method(tx_template):
             """Load using modern TensorStore format."""
@@ -847,7 +845,7 @@ class EasyDeLState(struct.PyTreeNode):
             opt_state, metadata = checkpointer.load_pytree(
                 mesh=self.model.mesh,
                 path=path,
-                partition_rules=self.model.config.get_partition_rules(),
+                partition_rules=partition_rules,
                 prefix="tx",
                 load_treedef=True,
                 discover_latest=True,
@@ -871,7 +869,7 @@ class EasyDeLState(struct.PyTreeNode):
                 leaves, _ = AsyncCheckpointManager().load(
                     path=AsyncCheckpointManager.safe_loadpath(optim_path),
                     mesh=self.model.mesh,
-                    partition_rules=self.model.config.get_partition_rules(),
+                    partition_rules=partition_rules,
                     prefix="tx",
                 )
                 recreated = [None] * len(leaves)

@@ -43,6 +43,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.components.norms import LayerNorm
 
 from .falcon_configuration import FalconConfig
 
@@ -338,14 +339,14 @@ class FalconBlock(nn.Module):
             config.num_ln_in_parallel_attn = 2
 
         if not config.parallel_attn:
-            self.post_attention_layernorm = nn.LayerNorm(
+            self.post_attention_layernorm = LayerNorm(
                 self.config.hidden_size,
                 epsilon=config.layer_norm_epsilon,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 rngs=rngs,
             )
-            self.input_layernorm = nn.LayerNorm(
+            self.input_layernorm = LayerNorm(
                 self.config.hidden_size,
                 epsilon=config.layer_norm_epsilon,
                 dtype=self.dtype,
@@ -354,14 +355,14 @@ class FalconBlock(nn.Module):
             )
         else:
             if config.num_ln_in_parallel_attn == 2:
-                self.ln_attn = nn.LayerNorm(
+                self.ln_attn = LayerNorm(
                     self.config.hidden_size,
                     epsilon=config.layer_norm_epsilon,
                     dtype=self.dtype,
                     param_dtype=self.param_dtype,
                     rngs=rngs,
                 )
-                self.ln_mlp = nn.LayerNorm(
+                self.ln_mlp = LayerNorm(
                     self.config.hidden_size,
                     epsilon=config.layer_norm_epsilon,
                     dtype=self.dtype,
@@ -369,7 +370,7 @@ class FalconBlock(nn.Module):
                     rngs=rngs,
                 )
             else:
-                self.input_layernorm = nn.LayerNorm(
+                self.input_layernorm = LayerNorm(
                     self.config.hidden_size,
                     epsilon=config.layer_norm_epsilon,
                     dtype=self.dtype,
@@ -540,18 +541,20 @@ class FalconModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.h = nn.List([
-            FalconBlock(
-                config=config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_hidden_layers)
-        ])
-        self.ln_f = nn.LayerNorm(
+        self.h = nn.List(
+            [
+                FalconBlock(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_hidden_layers)
+            ]
+        )
+        self.ln_f = LayerNorm(
             self.config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,

@@ -20,6 +20,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo
@@ -62,6 +63,7 @@ from easydel.layers.components import (
     RowParallelMoELinear,
 )
 from easydel.layers.components import RMSNorm as Llama4TextRMSNorm
+from easydel.layers.components.norms import LayerNorm
 from easydel.utils.compiling_utils import ejit
 
 from .llama4_configuration import Llama4Config, Llama4TextConfig, Llama4VisionConfig
@@ -821,17 +823,19 @@ class Llama4TextModel(EasyDeLBaseModule):
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             rngs=rngs,
         )
-        self.layers = nn.List([
-            Llama4TextDecoderLayer(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(self.config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                Llama4TextDecoderLayer(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(self.config.num_hidden_layers)
+            ]
+        )
         self.norm = Llama4TextRMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -1551,14 +1555,14 @@ class Llama4VisionEncoderLayer(nn.Module):
             rngs=rngs,
         )
 
-        self.input_layernorm = nn.LayerNorm(
+        self.input_layernorm = LayerNorm(
             num_features=config.hidden_size,
             epsilon=0.00001,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.post_attention_layernorm = nn.LayerNorm(
+        self.post_attention_layernorm = LayerNorm(
             num_features=config.hidden_size,
             epsilon=0.00001,
             dtype=dtype,
@@ -1646,17 +1650,19 @@ class Llama4VisionEncoder(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        self.layers = nn.List([
-            Llama4VisionEncoderLayer(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(self.config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                Llama4VisionEncoderLayer(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(self.config.num_hidden_layers)
+            ]
+        )
 
     def __call__(
         self,
@@ -1854,14 +1860,14 @@ class Llama4VisionModel(EasyDeLBaseModule):
             init_kwargs={"stddev": self.scale},
             key=rngs.params(),
         )
-        self.layernorm_pre = nn.LayerNorm(
+        self.layernorm_pre = LayerNorm(
             num_features=self.hidden_size,
             epsilon=0.00001,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layernorm_post = nn.LayerNorm(
+        self.layernorm_post = LayerNorm(
             num_features=self.hidden_size,
             epsilon=0.00001,
             dtype=dtype,
@@ -1877,6 +1883,13 @@ class Llama4VisionModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for vision-only parameters."""
+        return {
+            "class_embedding": Replicated,
+            "positional_embedding_vlm": ColumnWise,
+        }
         self.vision_adapter = Llama4VisionPixelShuffleMLP(
             config=config,
             dtype=dtype,

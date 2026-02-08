@@ -498,17 +498,19 @@ class Exaone4Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = nn.List([
-            Exaone4DecoderLayer(
-                config=config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                Exaone4DecoderLayer(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(
             config.hidden_size,

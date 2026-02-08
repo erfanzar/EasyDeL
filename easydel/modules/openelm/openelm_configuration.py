@@ -16,8 +16,8 @@
 import typing
 from numbers import Number
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
 from jax import numpy as jnp
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -245,30 +245,18 @@ class OpenELMConfig(EasyDeLBaseConfig):
         )
         self.__post_init__()
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"token_embeddings/embedding", pmag.resolve(ColumnWise)),
-            (r"attn/qkv_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"attn/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
-            (r"attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"ffn/proj_1/kernel", pmag.resolve(ColumnWise)),
-            (r"ffn/proj_2/kernel", pmag.resolve(RowWise)),
-            (r"ffn/.*proj/bias", pmag.resolve(Replicated)),
-            (r".*/(attn_norm|ffn_norm|norm)/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"lm_head/bias", pmag.resolve(Replicated)),
-            (r"classifier/kernel", pmag.resolve(ColumnWise)),
-            (r"classifier/bias", pmag.resolve(Replicated)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     def __post_init__(self) -> None:
         """Performs post-initialization checks and calculations.
@@ -339,9 +327,9 @@ class OpenELMConfig(EasyDeLBaseConfig):
                     )
                 ]
             else:
-                assert len(self.ffn_multipliers) == self.num_transformer_layers, (
-                    f"{len(self.ffn_multipliers)=}!={self.num_transformer_layers=}"
-                )
+                assert (
+                    len(self.ffn_multipliers) == self.num_transformer_layers
+                ), f"{len(self.ffn_multipliers)=}!={self.num_transformer_layers=}"
         else:
             raise NotImplementedError(
                 f"FFN multipliers should be a single number or a list containing exactly two numbers. "

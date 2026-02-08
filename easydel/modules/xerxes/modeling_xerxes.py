@@ -335,16 +335,18 @@ class XerxesSparseMoeBlock(nn.Module):
             kernel_init=nn.initializers.normal(config.initializer_range),
             rngs=rngs,
         )
-        self.experts = nn.List([
-            XerxesMLP(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for _ in range(self.config.num_local_experts)
-        ])
+        self.experts = nn.List(
+            [
+                XerxesMLP(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for _ in range(self.config.num_local_experts)
+            ]
+        )
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Apply sparse MoE transformation with top-k expert routing.
@@ -594,17 +596,19 @@ class XerxesModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = nn.List([
-            XerxesDecoderLayer(
-                self.config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                XerxesDecoderLayer(
+                    self.config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,

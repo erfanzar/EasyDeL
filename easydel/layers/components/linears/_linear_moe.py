@@ -290,6 +290,39 @@ class ParallelMoELinear(nn.Module):
             return None
         return self.alt_sharding.axes
 
+    def craft_sharding(self, *, partition_manager=None, **kwargs) -> dict[str, PartitionSpec]:
+        """Return dynamic partition specs for this module's parameters."""
+        pm = partition_manager or self.partition_manager
+        if pm is None or self._direction is None:
+            return {}
+        from ..moe._communication_utils import get_moe_partition_spec
+
+        fsdp_is_ep_bound = kwargs.get("fsdp_is_ep_bound", True)
+        sp_is_ep_bound = kwargs.get("sp_is_ep_bound", True)
+        module_view = kwargs.get("module_view", False)
+
+        kernel_spec = get_moe_partition_spec(
+            pm,
+            self._direction,
+            self.use_expert_tensor_mode,
+            is_bias=False,
+            fsdp_is_ep_bound=fsdp_is_ep_bound,
+            sp_is_ep_bound=sp_is_ep_bound,
+            module_view=module_view,
+        )
+        specs: dict[str, PartitionSpec] = {"kernel": kernel_spec}
+        if self.bias is not None:
+            specs["bias"] = get_moe_partition_spec(
+                pm,
+                self._direction,
+                self.use_expert_tensor_mode,
+                is_bias=True,
+                fsdp_is_ep_bound=fsdp_is_ep_bound,
+                sp_is_ep_bound=sp_is_ep_bound,
+                module_view=module_view,
+            )
+        return specs
+
     @property
     def expert_axis(self) -> str:
         """Semantic axis name representing the expert dimension."""

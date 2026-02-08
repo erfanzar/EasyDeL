@@ -16,6 +16,7 @@
 import typing
 
 from eformer.loggings import get_logger
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config, registry
@@ -117,22 +118,15 @@ class LlavaConfig(EasyDeLBaseConfig):
 
         super().__init__(**kwargs)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for distributed training by combining the partition rules
-        from both the text and vision configurations.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
 
-        This method retrieves the partition rules from the text_config and vision_config
-        components and combines them to create a comprehensive set of rules for the entire
-        multimodal model.
-
-        Args:
-            *args: Variable length argument list to be passed to the text and vision configs.
-            **kwargs: Arbitrary keyword arguments to be passed to the text and vision configs.
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-            tuple: A combined tuple of partition rules from both text and vision configurations.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        tp = self.text_config.get_partition_rules(*args, **kwargs)
-        vp = self.vision_config.get_partition_rules(*args, **kwargs)
-        return tp + vp
+        return None

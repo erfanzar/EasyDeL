@@ -112,6 +112,7 @@ DEFAULT_DECODE_INTERVAL_SECS = 0.04  # Or decode every N seconds (20ms)
 MAX_CONSECUTIVE_SCHEDULER_ERRORS = int(os.environ.get("EASURGE_MAX_SCHEDULER_ERRORS", "5"))
 WORKER_DRAIN_MAX_RETRIES = 3  # Maximum retry attempts for worker drain
 WORKER_DRAIN_INITIAL_DELAY = 0.1  # Initial retry delay in seconds
+SamplingCallable = typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None] | None
 
 
 def _set_requested_new(sp, n: int):
@@ -149,6 +150,8 @@ class CompletionOutput:
     cumulative_logprob: float | None = None
     logprobs: list[dict[int, float]] | None = None
     finish_reason: str | None = None
+    tool_calls: list | None = None
+    reasoning_content: str | None = None
 
 
 @dataclass
@@ -194,6 +197,11 @@ class RequestOutput:
 
     update_seq: int = 0
     delta_seq: int = 0
+
+    tool_calls: list | None = None
+    delta_tool_calls: list | None = None
+    reasoning_content: str | None = None
+    delta_reasoning_content: str | None = None
 
     def get_text(self) -> str:
         """Get the generated text from the first completion output.
@@ -293,15 +301,14 @@ class eSurge:
         max_request_outputs: int | None = 1000,
         idle_reset_seconds: float | None = None,
         idle_reset_min_interval: float = 60.0,
-        sampling_params_callback: (
-            typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None] | None
-        ) = None,
+        sampling_params_callback: SamplingCallable = None,
         extra_eos_token_ids: list[int] | None = None,
         silent_mode: bool = False,
-        # Vision-language model support
         processor: Any | None = None,
         resolution_buckets: list[tuple[int, int]] | None = None,
         vision_cache_capacity_mb: int = 1024,
+        tool_parser: str | None = None,
+        reasoning_parser: str | None = None,
         **kwargs,
     ):
         """Initialize the eSurge engine.
@@ -375,6 +382,18 @@ class eSurge:
             processor: Unified text/multimodal processor. Can be a tokenizer or an
                 HF processor (with an embedded tokenizer). If None, falls back to
                 `tokenizer` and then to loading from `model` when `model` is a string.
+            tool_parser: Name of the tool-call parser to use for automatic function-call
+                extraction (e.g., "hermes", "mistral", "llama3_json"). When set, the
+                engine runs the parser in ``_process_engine_outputs()`` so that
+                ``RequestOutput.tool_calls`` / ``RequestOutput.delta_tool_calls`` are
+                populated directly. If None, tool-call detection is left to the
+                API server layer. See ``ToolParserManager`` for available parsers.
+            reasoning_parser: Name of the reasoning parser to use for extracting
+                chain-of-thought content (e.g., "deepseek_r1", "qwen3", "mistral").
+                When set, the engine separates reasoning from content so that
+                ``RequestOutput.reasoning_content`` / ``RequestOutput.delta_reasoning_content``
+                are populated directly. If None, no reasoning extraction is performed.
+                See ``ReasoningParserManager`` for available parsers.
             **kwargs: Additional configuration passed to model loading.
 
         Raises:
@@ -489,6 +508,32 @@ class eSurge:
         self._idle_monitor_event = threading.Event()
         self._idle_monitor_thread: threading.Thread | None = None
 
+        # Tool calling and reasoning parser initialization
+        self.tool_parser_name = tool_parser
+        self.reasoning_parser_name = reasoning_parser
+        self._tool_parser_class = None
+        self._reasoning_parser_class = None
+
+        if tool_parser:
+            try:
+                from easydel.inference.tools import ToolParserManager
+
+                self._tool_parser_class = ToolParserManager.get_tool_parser(tool_parser)
+                if not silent_mode:
+                    logger.info("Initialized tool parser: %s", tool_parser)
+            except KeyError:
+                logger.warning("Tool parser '%s' not found, function calling disabled", tool_parser)
+
+        if reasoning_parser:
+            try:
+                from easydel.inference.reasoning import ReasoningParserManager
+
+                self._reasoning_parser_class = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
+                if not silent_mode:
+                    logger.info("Initialized reasoning parser: %s", reasoning_parser)
+            except KeyError:
+                logger.warning("Reasoning parser '%s' not found, reasoning disabled", reasoning_parser)
+
         tokenizer_endpoint = tokenizer_endpoint or os.environ.get("EASURGE_TOKENIZER_ENDPOINT")
         detokenizer_endpoint = detokenizer_endpoint or os.environ.get("EASURGE_DETOKENIZER_ENDPOINT")
 
@@ -517,9 +562,7 @@ class eSurge:
                 attn_value = (
                     requested_attn.value
                     if isinstance(requested_attn, AttentionMechanisms)
-                    else str(requested_attn)
-                    if requested_attn is not None
-                    else None
+                    else str(requested_attn) if requested_attn is not None else None
                 )
                 if backend == "gpu" and attn_value in (
                     AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2.value,
@@ -1029,6 +1072,7 @@ class eSurge:
         add_generation_prompt: bool = True,
         chat_template: str | None = None,
         tools: list[dict] | None = None,
+        chat_template_kwargs:dict[str,Any]|None=None,
     ) -> str:
         """Format chat messages into a prompt string using the tokenizer's chat template.
 
@@ -1061,12 +1105,16 @@ class eSurge:
             The exact format depends on the tokenizer's chat template. Different models
             use different special tokens and formatting conventions.
         """
+
+        if chat_template_kwargs is None:
+            chat_template_kwargs = {}
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             tools=tools,
             add_generation_prompt=add_generation_prompt,
             chat_template=chat_template,
+            **chat_template_kwargs,
         )
 
     def _tokenize_prompt(self, request_id: str, prompt: str) -> list[int]:
@@ -1140,7 +1188,7 @@ class eSurge:
         generated_tokens: list[int],
         *,
         finished: bool,
-        skip_special_tokens: bool = True,
+        skip_special_tokens: bool = False,
     ) -> DetokenizerResult:
         """Decode tokens using the detokenizer worker pipeline.
 
@@ -1162,6 +1210,37 @@ class eSurge:
             finished=finished,
             skip_special_tokens=skip_special_tokens,
         )
+
+    @staticmethod
+    def _compute_snapshot_delta_text(current_text: str, previous_text: str, fallback_delta: str) -> str:
+        """Compute a safe streaming delta from accumulated text snapshots.
+
+        Prefer exact prefix-diff semantics and avoid replaying stale fallback
+        chunks when text has not advanced. If prefix alignment is lost, attempt
+        suffix-prefix overlap recovery before falling back.
+        """
+
+        current_text = current_text or ""
+        previous_text = previous_text or ""
+
+        if current_text.startswith(previous_text):
+            return current_text[len(previous_text) :]
+
+        max_overlap = min(len(previous_text), len(current_text))
+        for overlap in range(max_overlap, 0, -1):
+            if previous_text.endswith(current_text[:overlap]):
+                return current_text[overlap:]
+
+        if previous_text:
+            logger.warning(
+                "Stream delta alignment mismatch. prev_len=%s, curr_len=%s; using guarded fallback.",
+                len(previous_text),
+                len(current_text),
+            )
+
+        if fallback_delta and (not previous_text or not previous_text.endswith(fallback_delta)):
+            return fallback_delta
+        return current_text if not previous_text else ""
 
     @staticmethod
     def _to_python_scalar(value: Any) -> Any:
@@ -1575,6 +1654,7 @@ class eSurge:
             raise RuntimeError("Request event missing")
 
         last_update_seq = -1
+        last_accumulated_text = ""
 
         try:
             while True:
@@ -1603,6 +1683,12 @@ class eSurge:
                                 )
                             )
 
+                        snapshot_delta = self._compute_snapshot_delta_text(
+                            ro.accumulated_text,
+                            last_accumulated_text,
+                            ro.delta_text,
+                        )
+
                         snapshot = RequestOutput(
                             request_id=ro.request_id,
                             prompt=ro.prompt,
@@ -1611,7 +1697,7 @@ class eSurge:
                             finished=ro.finished,
                             metrics=dict(ro.metrics) if ro.metrics is not None else None,
                             accumulated_text=ro.accumulated_text,
-                            delta_text=ro.delta_text,
+                            delta_text=snapshot_delta,
                             tokens_per_second=ro.tokens_per_second,
                             num_generated_tokens=ro.num_generated_tokens,
                             time_spent_generating=ro.time_spent_generating,
@@ -1620,6 +1706,7 @@ class eSurge:
                             update_seq=ro.update_seq,
                         )
                         last_update_seq = ro.update_seq
+                        last_accumulated_text = ro.accumulated_text
 
                 if snapshot is not None:
                     yield snapshot
@@ -1648,6 +1735,7 @@ class eSurge:
         request_id: str | None = None,
         stream: bool = False,
         chat_template: str | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ):
         """High-level chat interface compatible with vLLM and OpenAI APIs.
 
@@ -1719,11 +1807,12 @@ class eSurge:
             >>> for chunk in engine.chat(messages, stream=True):
             ...     print(chunk.delta_text, end="", flush=True)
 
-        Note:
+        Note:ƒ
             For multimodal support, you must configure the engine with a processor
             during initialization: eSurge(..., processor=AutoProcessor.from_pretrained(...))
         """
         has_multimodal = self._messages_have_multimodal_content(messages)
+
         if has_multimodal:
             return self._chat_multimodal(
                 messages=messages,
@@ -1732,13 +1821,16 @@ class eSurge:
                 request_id=request_id,
                 stream=stream,
                 chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
             )
         else:
+
             prompt = self._format_chat_prompt(
                 messages,
                 tools=tools,
                 add_generation_prompt=True,
                 chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
             )
             if stream:
                 return self.stream(prompt, sampling_params=sampling_params, request_id=request_id)
@@ -1780,6 +1872,7 @@ class eSurge:
         request_id: str | None = None,
         stream: bool = False,
         chat_template: str | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ):
         """Handle multimodal chat with images/videos.
 
@@ -1835,6 +1928,7 @@ class eSurge:
             tools=tools,
             add_generation_prompt=True,
             chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
         )
 
         effective_params = self._prepare_sampling_params_for_request(
@@ -1883,6 +1977,7 @@ class eSurge:
             raise RuntimeError("Request event missing")
 
         last_update_seq = -1
+        last_accumulated_text = ""
 
         try:
             while True:
@@ -1910,6 +2005,12 @@ class eSurge:
                                 )
                             )
 
+                        snapshot_delta = self._compute_snapshot_delta_text(
+                            ro.accumulated_text,
+                            last_accumulated_text,
+                            ro.delta_text,
+                        )
+
                         snapshot = RequestOutput(
                             request_id=ro.request_id,
                             prompt=ro.prompt,
@@ -1918,7 +2019,7 @@ class eSurge:
                             finished=ro.finished,
                             metrics=dict(ro.metrics) if ro.metrics is not None else None,
                             accumulated_text=ro.accumulated_text,
-                            delta_text=ro.delta_text,
+                            delta_text=snapshot_delta,
                             tokens_per_second=ro.tokens_per_second,
                             num_generated_tokens=ro.num_generated_tokens,
                             time_spent_generating=ro.time_spent_generating,
@@ -1927,6 +2028,7 @@ class eSurge:
                             update_seq=ro.update_seq,
                         )
                         last_update_seq = ro.update_seq
+                        last_accumulated_text = ro.accumulated_text
 
                 if snapshot is not None:
                     yield snapshot
@@ -2254,7 +2356,22 @@ class eSurge:
                 "requested_new_tokens_final": requested_new,
                 "reserve_tokens": self.reserve_tokens,
                 "max_model_len": max_model_len,
+                # Per-request parser instances (fresh per request for streaming state isolation)
+                "tool_parser_instance": self._tool_parser_class(self.tokenizer) if self._tool_parser_class else None,
+                "reasoning_parser_instance": (
+                    self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
+                ),
+                "parser_previous_text": "",
+                "parser_previous_token_ids": [],
+                "accumulated_reasoning": "",
             }
+            # Detect if prompt ends with reasoning start token (e.g., <think>
+            # injected by chat template via add_generation_prompt). If so, the
+            # model output won't contain the start token — only </think>.
+            _rp = self._active_requests[request_id].get("reasoning_parser_instance")
+            if _rp is not None and hasattr(_rp, "start_token"):
+                if prompt_for_engine.rstrip().endswith(_rp.start_token):
+                    _rp.assume_reasoning = True
 
         metrics_collector = get_metrics_collector()
         if metrics_collector:
@@ -2356,7 +2473,21 @@ class eSurge:
                         "max_model_len": max_model_len,
                         "sample_index": sample_idx,
                         "parent_request_id": request_id,
+                        # Per-request parser instances (fresh per sample)
+                        "tool_parser_instance": (
+                            self._tool_parser_class(self.tokenizer) if self._tool_parser_class else None
+                        ),
+                        "reasoning_parser_instance": (
+                            self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
+                        ),
+                        "parser_previous_text": "",
+                        "parser_previous_token_ids": [],
+                        "accumulated_reasoning": "",
                     }
+                    _rp2 = self._active_requests[child_request_id].get("reasoning_parser_instance")
+                    if _rp2 is not None and hasattr(_rp2, "start_token"):
+                        if prompt_for_engine.rstrip().endswith(_rp2.start_token):
+                            _rp2.assume_reasoning = True
 
             with self._scheduler_lock:
                 self.scheduler.add_request(
@@ -2667,6 +2798,141 @@ class eSurge:
         if self._profiling_steps_remaining <= 0:
             self.stop_profiling()
 
+    def _run_output_parsers(
+        self,
+        rd: dict,
+        accumulated_text: str,
+        delta_text: str,
+        token_ids: list[int],
+        finished: bool,
+    ) -> dict:
+        """Run reasoning and tool parsers on decoded text.
+
+        Reasoning runs first, then tool parsing on content portion only.
+
+        Returns:
+            Dict with keys: delta_reasoning, delta_content, accumulated_reasoning,
+            tool_calls, delta_tool_calls.
+        """
+        result = {
+            "delta_reasoning": None,
+            "delta_content": delta_text,
+            "accumulated_reasoning": rd.get("accumulated_reasoning", ""),
+            "tool_calls": None,
+            "delta_tool_calls": None,
+        }
+
+        reasoning_parser = rd.get("reasoning_parser_instance")
+        tool_parser = rd.get("tool_parser_instance")
+        prev_text = rd.get("parser_previous_text", "")
+        prev_token_ids = rd.get("parser_previous_token_ids", [])
+
+        content_for_tools = accumulated_text
+
+        # Step 1: Reasoning extraction
+        if reasoning_parser is not None:
+            try:
+                if finished:
+                    reasoning, content = reasoning_parser.extract_reasoning(accumulated_text)
+                    result["accumulated_reasoning"] = reasoning or ""
+                    content_for_tools = content or accumulated_text
+                    # Calculate delta from previous
+                    old_reasoning = rd.get("accumulated_reasoning", "")
+                    if reasoning and len(reasoning) > len(old_reasoning):
+                        result["delta_reasoning"] = reasoning[len(old_reasoning) :]
+                    # Content delta: use content-only portion
+                    if content is not None:
+                        _, prev_content = reasoning_parser.extract_reasoning(prev_text)
+                        prev_content = prev_content or ""
+                        if len(content) > len(prev_content):
+                            result["delta_content"] = content[len(prev_content) :]
+                        else:
+                            result["delta_content"] = ""
+                else:
+                    delta_ids = token_ids[len(prev_token_ids) :] if prev_token_ids else token_ids
+                    delta_msg = reasoning_parser.extract_reasoning_streaming(
+                        previous_text=prev_text,
+                        current_text=accumulated_text,
+                        delta_text=delta_text,
+                        previous_token_ids=prev_token_ids,
+                        current_token_ids=token_ids,
+                        delta_token_ids=delta_ids,
+                    )
+                    if delta_msg is not None:
+                        result["delta_reasoning"] = delta_msg.reasoning_content
+                        result["delta_content"] = delta_msg.content
+                        # Accumulate reasoning
+                        if delta_msg.reasoning_content:
+                            result["accumulated_reasoning"] = (
+                                rd.get("accumulated_reasoning", "") + delta_msg.reasoning_content
+                            )
+
+                    # Extract content portion for tool parser
+                    reasoning, content = reasoning_parser.extract_reasoning(accumulated_text)
+                    content_for_tools = content or accumulated_text
+            except Exception:
+                logger.debug("Reasoning extraction failed for request", exc_info=True)
+
+        # Step 2: Tool call extraction on content portion
+        if tool_parser is not None and content_for_tools:
+            try:
+                if finished:
+                    from easydel.inference.openai_api_modules import ChatCompletionRequest, ChatMessage
+
+                    dummy_request = ChatCompletionRequest(
+                        model="dummy",
+                        messages=[ChatMessage(role="user", content="")],
+                    )
+                    extracted = tool_parser.extract_tool_calls(content_for_tools, dummy_request)
+                    if extracted.tools_called and extracted.tool_calls:
+                        result["tool_calls"] = extracted.tool_calls
+                        # Update delta_content to exclude tool call markup
+                        if extracted.content is not None:
+                            result["delta_content"] = None  # Content was already streamed
+                else:
+                    # For streaming, compute content deltas
+                    if reasoning_parser is not None:
+                        _, prev_content = reasoning_parser.extract_reasoning(prev_text)
+                    else:
+                        prev_content = prev_text
+
+                    prev_content = prev_content or prev_text
+                    content_delta = result["delta_content"] or delta_text
+
+                    from easydel.inference.openai_api_modules import ChatCompletionRequest, ChatMessage
+
+                    dummy_request = ChatCompletionRequest(
+                        model="dummy",
+                        messages=[ChatMessage(role="user", content="")],
+                    )
+                    delta_ids = token_ids[len(prev_token_ids) :] if prev_token_ids else token_ids
+                    delta_msg = tool_parser.extract_tool_calls_streaming(
+                        previous_text=prev_content,
+                        current_text=content_for_tools,
+                        delta_text=content_delta or "",
+                        previous_token_ids=prev_token_ids,
+                        current_token_ids=token_ids,
+                        delta_token_ids=delta_ids,
+                        request=dummy_request,
+                    )
+                    if delta_msg is not None:
+                        if hasattr(delta_msg, "tool_calls") and delta_msg.tool_calls:
+                            result["delta_tool_calls"] = delta_msg.tool_calls
+                        # If tool parser consumed the content, clear delta_content
+                        if delta_msg.tool_calls and not delta_msg.content:
+                            result["delta_content"] = None
+                        elif delta_msg.content is not None:
+                            result["delta_content"] = delta_msg.content
+            except Exception:
+                logger.debug("Tool call extraction failed for request", exc_info=True)
+
+        # Update tracking state
+        rd["parser_previous_text"] = accumulated_text
+        rd["parser_previous_token_ids"] = list(token_ids)
+        rd["accumulated_reasoning"] = result["accumulated_reasoning"]
+
+        return result
+
     def _process_engine_outputs(self, engine_outputs: dict[int, EngineCoreOutputs]) -> None:
         """Process engine outputs and update request outputs (thread-safe).
 
@@ -2747,15 +3013,36 @@ class eSurge:
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index
                             rd["last_decode_time"] = now
 
+                            # Run reasoning and tool parsers on decoded text
+                            parsed = self._run_output_parsers(
+                                rd=rd,
+                                accumulated_text=pipeline_result.accumulated_text,
+                                delta_text=pipeline_result.delta_text,
+                                token_ids=decodable_tokens,
+                                finished=False,
+                            )
+
                             # Update the specific sample's completion output
                             comp = ro.outputs[sample_index]
                             comp.text = pipeline_result.accumulated_text
                             comp.token_ids = list(rd["generated_tokens"])
+                            if parsed["accumulated_reasoning"]:
+                                comp.reasoning_content = parsed["accumulated_reasoning"]
+                            if parsed["tool_calls"]:
+                                comp.tool_calls = parsed["tool_calls"]
 
-                            # For backwards compatibility, set ro.accumulated_text to first sample's text
+                            # For backwards compatibility, set ro fields to first sample
                             if sample_index == 0:
                                 ro.accumulated_text = pipeline_result.accumulated_text
-                                ro.delta_text = pipeline_result.delta_text
+                                effective_delta = parsed["delta_content"]
+                                if effective_delta is None:
+                                    effective_delta = pipeline_result.delta_text
+                                ro.delta_text = effective_delta or ""
+                                ro.delta_reasoning_content = parsed["delta_reasoning"]
+                                ro.reasoning_content = parsed["accumulated_reasoning"] or None
+                                ro.delta_tool_calls = parsed["delta_tool_calls"]
+                                if parsed["tool_calls"]:
+                                    ro.tool_calls = parsed["tool_calls"]
 
                             if pipeline_result.delta_text:
                                 ro.delta_seq += 1
@@ -2807,14 +3094,36 @@ class eSurge:
                             )
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index
 
+                            # Run reasoning and tool parsers (final decode)
+                            parsed = self._run_output_parsers(
+                                rd=rd,
+                                accumulated_text=pipeline_result.accumulated_text,
+                                delta_text=pipeline_result.delta_text,
+                                token_ids=decodable_tokens,
+                                finished=True,
+                            )
+
                             # Update the specific sample's completion output
                             comp.text = pipeline_result.accumulated_text
                             comp.token_ids = list(rd["generated_tokens"])
+                            if parsed["accumulated_reasoning"]:
+                                comp.reasoning_content = parsed["accumulated_reasoning"]
+                            if parsed["tool_calls"]:
+                                comp.tool_calls = parsed["tool_calls"]
+                                comp.finish_reason = "tool_calls"
 
-                            # For backwards compatibility, set ro.accumulated_text to first sample's text
+                            # For backwards compatibility, set ro fields to first sample
                             if sample_index == 0:
                                 ro.accumulated_text = pipeline_result.accumulated_text
-                                ro.delta_text = pipeline_result.delta_text
+                                effective_delta = parsed["delta_content"]
+                                if effective_delta is None:
+                                    effective_delta = pipeline_result.delta_text
+                                ro.delta_text = effective_delta or ""
+                                ro.delta_reasoning_content = parsed["delta_reasoning"]
+                                ro.reasoning_content = parsed["accumulated_reasoning"] or None
+                                ro.delta_tool_calls = parsed["delta_tool_calls"]
+                                if parsed["tool_calls"]:
+                                    ro.tool_calls = parsed["tool_calls"]
 
                             if pipeline_result.delta_text:
                                 ro.delta_seq += 1

@@ -769,17 +769,19 @@ class ArcticModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = nn.List([
-            ArcticDecoderLayer(
-                layer_idx=layer_idx,
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                ArcticDecoderLayer(
+                    layer_idx=layer_idx,
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(
             self.config.hidden_size,

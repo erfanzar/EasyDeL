@@ -20,6 +20,7 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -29,7 +30,7 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeModelOutput
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
+from easydel.infra.utils import ACT2FN, auto_remat
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.attention_unified import UnifiedAttention
 from easydel.layers.base_modules import BaseCausalLMModule
@@ -126,14 +127,17 @@ class Glm4MoeLiteMLPStack(nn.Module):
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
             "splits": [
-                {"name": "gate_proj.kernel", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
-                {"name": "up_proj.kernel", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
+                # HF layout: [E, 2M, H] -> ED layout: [E, H, M]
+                {"name": "gate_proj.kernel", "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2)},
+                {"name": "up_proj.kernel", "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2)},
             ],
-            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+            # Reverse after ED kernels are converted to torch layout [E, M, H].
+            "inverse_spliter": lambda torch, gate, up: torch.cat((gate, up), dim=1),
         },
         "down_proj$": {
             "splits": [
-                {"name": "down_proj.kernel", "spliter": lambda x: x},
+                # HF layout: [E, H, M] -> ED layout: [E, M, H]
+                {"name": "down_proj.kernel", "spliter": lambda x: x.swapaxes(-1, -2)},
             ],
             "inverse_spliter": lambda x: x,
         },
@@ -235,19 +239,18 @@ class Glm4MoeLiteTopKRouter(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.n_routed_experts = config.n_routed_experts
-        self.kernel = ArrayParam.bound(
-            shape=(config.hidden_size, self.n_routed_experts),
-            dtype=param_dtype,
-            init_method="normal",
-            init_kwargs={"stddev": config.initializer_range},
-            key=rngs.param(),
+        self.kernel = nn.Param(
+            jax.nn.initializers.normal(config.initializer_range)(
+                rngs.param(),
+                (config.hidden_size, self.n_routed_experts),
+                param_dtype,
+            )
         )
-        self.e_score_correction_bias = ArrayParam.bound(
-            shape=(self.n_routed_experts,),
-            dtype=jnp.float32,
-            init_method="zeros",
-            key=None,
-        )
+        self.e_score_correction_bias = nn.Param(jnp.zeros((self.n_routed_experts,), dtype=jnp.float32))
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        kernel_spec = Replicated if self.config.use_expert_tensor_mode else ColumnWise
+        return {"kernel": kernel_spec, "e_score_correction_bias": Replicated}
 
     def __call__(self, hidden_states: Float[Array, "tokens hidden_dim"]) -> Array:
         hidden_states = hidden_states.reshape(-1, self.config.hidden_size)
@@ -317,34 +320,50 @@ class Glm4MoeLiteMoE(BaseMoeModule):
         )
         self.moe_hooks = MoeFusedHooks(
             normalize_gate_logits=lambda x: x,
-            select_hook=self._select_experts,
+            select_hook=partial(
+                self._select_experts_static,
+                n_routed_experts=self.n_routed_experts,
+                n_group=self.n_group,
+                topk_group=self.topk_group,
+                group_topk_k=self.group_topk_k,
+                norm_topk_prob=self.norm_topk_prob,
+                routed_scaling_factor=self.routed_scaling_factor,
+            ),
         )
 
-    def _select_experts(
-        self,
+    @staticmethod
+    def _select_experts_static(
         gate_logits: Array,
         pre_bias_logits: Array | None,
         k: int,
+        *,
+        n_routed_experts: int,
+        n_group: int,
+        topk_group: int,
+        group_topk_k: int,
+        norm_topk_prob: bool,
+        routed_scaling_factor: float,
     ) -> tuple[Array, Array]:
+        del pre_bias_logits
         scores = jax.nn.sigmoid(gate_logits.astype(jnp.float32))
-        scores_for_choice = scores + self.gate.e_score_correction_bias.value
+        scores_for_choice = scores
         batch_size = scores_for_choice.shape[0]
-        group_size = self.n_routed_experts // self.n_group
-        group_scores = scores_for_choice.reshape(batch_size, self.n_group, group_size)
-        top2_per_group = jax.lax.top_k(group_scores, k=self.group_topk_k)[0]
+        group_size = n_routed_experts // n_group
+        group_scores = scores_for_choice.reshape(batch_size, n_group, group_size)
+        top2_per_group = jax.lax.top_k(group_scores, k=group_topk_k)[0]
         group_scores_sum = jnp.sum(top2_per_group, axis=-1)
-        group_k = min(self.topk_group, self.n_group)
+        group_k = min(topk_group, n_group)
         group_idx = jax.lax.top_k(group_scores_sum, k=group_k)[1]
-        group_mask = jax.nn.one_hot(group_idx, self.n_group, dtype=scores_for_choice.dtype)
+        group_mask = jax.nn.one_hot(group_idx, n_group, dtype=scores_for_choice.dtype)
         group_mask = jnp.sum(group_mask, axis=1)
         scores_mask = jnp.repeat(group_mask, group_size, axis=1)
         scores_for_choice = jnp.where(scores_mask > 0, scores_for_choice, 0.0)
         _, topk_indices = jax.lax.top_k(scores_for_choice, k=k)
         topk_weights = jnp.take_along_axis(scores, topk_indices, axis=-1)
-        if self.norm_topk_prob:
+        if norm_topk_prob:
             denominator = jnp.sum(topk_weights, axis=-1, keepdims=True) + 1e-20
             topk_weights = topk_weights / denominator
-        topk_weights = topk_weights * self.routed_scaling_factor
+        topk_weights = topk_weights * routed_scaling_factor
         return topk_weights, topk_indices
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
@@ -814,7 +833,13 @@ class Glm4MoeLiteModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
-        super().__init__(config=config)
+        super().__init__(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -829,17 +854,19 @@ class Glm4MoeLiteModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = nn.List([
-            Glm4MoeLiteDecoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                layer_idx=i,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                Glm4MoeLiteDecoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    layer_idx=i,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -980,6 +1007,50 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
             rngs=rngs,
             lm_head_bias=False,
             router_aux_loss_coef=None,
+        )
+
+    def create_ragged_page_cache_config(
+        self,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+    ):
+        """Create paged cache configuration for MLA attention.
+
+        GLM4-MoE-Lite uses MLA, where the runtime attention head width is
+        ``qk_nope_head_dim + qk_rope_head_dim`` (not ``config.head_dim``).
+        """
+        from easydel.layers.attention import AttentionMechanisms
+        from easydel.layers.caching import RaggedPagesCacheConfig
+
+        text_config = self.config.get_text_config()
+
+        q_head_dim = self.config.qk_nope_head_dim + self.config.qk_rope_head_dim
+        v_head_dim = self.config.v_head_dim
+
+        match text_config.attn_mechanism:
+            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3:
+                version = "v3"
+            case AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2:
+                version = "v2"
+            case _:
+                version = "v3"
+
+        return RaggedPagesCacheConfig.create(
+            mesh=self.mesh,
+            partition_manager=text_config.partition_manager,
+            kvdtype=text_config.kvdtype if dtype is None else dtype,
+            max_model_length=max_length,
+            num_hidden_layers=self.config.num_hidden_layers,
+            num_kv_heads=self.config.num_attention_heads,
+            kv_head_dim_size=q_head_dim,
+            k_headdim=q_head_dim,
+            v_headdim=v_head_dim,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+            version=version,
         )
 
 

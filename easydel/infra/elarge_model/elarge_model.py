@@ -594,6 +594,12 @@ class eLargeModel:
                 - enable_prefix_caching: Enable prefix caching optimization
                 - kv_cache_dtype: Dtype for KV cache (None = auto)
                 - decoding_engine: "ring" or "triton" (default: auto)
+                - tool_parser: Name of tool-call parser for automatic function-call
+                  extraction (e.g., "hermes", "mistral", "llama3_json").
+                  See ``ToolParserManager`` for available parsers.
+                - reasoning_parser: Name of reasoning parser for extracting
+                  chain-of-thought content (e.g., "deepseek_r1", "qwen3", "mistral").
+                  See ``ReasoningParserManager`` for available parsers.
 
         Returns:
             Self for method chaining

@@ -354,17 +354,19 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
             embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
             rngs=rngs,
         )
-        self.layers = nn.List([
-            Glm4vMoeTextDecoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-                layer_idx=i,
-            )
-            for i in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                Glm4vMoeTextDecoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                    layer_idx=i,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
     def __call__(

@@ -1136,15 +1136,36 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             response_text = output.accumulated_text or output.get_text()
             choices: list[ChatCompletionResponseChoice] = []
             for idx, completion in enumerate(output.outputs):
-                message, finish_reason_extracted = self.extract_tool_calls_batch(
-                    response_text=response_text,
-                    request=request,
-                    model_name=request.model,
-                )
-                if finish_reason_extracted != "function_call" and completion.finish_reason:
-                    finish_reason = completion.finish_reason
+                # Use engine-parsed tool calls/reasoning if available, else fallback to server-side parsing
+                if completion.tool_calls:
+                    message = ChatMessage(
+                        role="assistant",
+                        content=completion.text,
+                        tool_calls=completion.tool_calls,
+                        reasoning_content=completion.reasoning_content,
+                    )
+                    finish_reason = "tool_calls"
+                elif completion.reasoning_content is not None or (
+                    hasattr(esurge, "_tool_parser_class") and esurge._tool_parser_class is not None
+                ):
+                    # Engine has parsers configured — use engine output directly
+                    message = ChatMessage(
+                        role="assistant",
+                        content=completion.text,
+                        reasoning_content=completion.reasoning_content,
+                    )
+                    finish_reason = completion.finish_reason or "stop"
                 else:
-                    finish_reason = finish_reason_extracted
+                    # Fallback: server-side tool parsing
+                    message, finish_reason_extracted = self.extract_tool_calls_batch(
+                        response_text=response_text,
+                        request=request,
+                        model_name=request.model,
+                    )
+                    if finish_reason_extracted != "function_call" and completion.finish_reason:
+                        finish_reason = completion.finish_reason
+                    else:
+                        finish_reason = finish_reason_extracted
                 if finish_reason == "finished":
                     finish_reason = "stop"
                 choices.append(ChatCompletionResponseChoice(index=idx, message=message, finish_reason=finish_reason))
@@ -1246,7 +1267,35 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                         current_text = output.accumulated_text or ""
                         delta_text = self._compute_delta_text(current_text, previous_text, output.delta_text or "")
 
-                        if tool_parser:
+                        # Check if engine provides parsed reasoning/tool output
+                        engine_has_parsers = (
+                            hasattr(esurge, "_tool_parser_class") and esurge._tool_parser_class is not None
+                        ) or (
+                            hasattr(esurge, "_reasoning_parser_class") and esurge._reasoning_parser_class is not None
+                        )
+
+                        if engine_has_parsers:
+                            # Engine handles parsing — use its output directly
+                            previous_text = current_text
+                            current_token_ids = output.outputs[0].token_ids if output.outputs else []
+                            previous_token_ids = current_token_ids
+
+                            has_parsed_content = (
+                                output.delta_tool_calls
+                                or output.delta_reasoning_content
+                                or output.delta_text
+                            )
+                            if not has_parsed_content:
+                                continue
+
+                            delta_message = DeltaMessage(
+                                role="assistant",
+                                content=output.delta_text if output.delta_text else None,
+                                tool_calls=output.delta_tool_calls,
+                                reasoning_content=output.delta_reasoning_content,
+                            )
+                        elif tool_parser:
+                            # Fallback: server-side tool parsing
                             current_token_ids = output.outputs[0].token_ids if output.outputs else []
                             delta_token_ids = (
                                 current_token_ids[len(previous_token_ids) :] if previous_token_ids else current_token_ids
@@ -1941,7 +1990,35 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                         current_text = output.accumulated_text or ""
                         delta_text = self._compute_delta_text(current_text, previous_text, output.delta_text or "")
 
-                        if tool_parser:
+                        # Check if engine provides parsed reasoning/tool output
+                        engine_has_parsers = (
+                            hasattr(esurge, "_tool_parser_class") and esurge._tool_parser_class is not None
+                        ) or (
+                            hasattr(esurge, "_reasoning_parser_class") and esurge._reasoning_parser_class is not None
+                        )
+
+                        if engine_has_parsers:
+                            # Engine handles parsing — use its output directly
+                            previous_text = current_text
+                            current_token_ids = output.outputs[0].token_ids if output.outputs else []
+                            previous_token_ids = current_token_ids
+
+                            has_parsed_content = (
+                                output.delta_tool_calls
+                                or output.delta_reasoning_content
+                                or output.delta_text
+                            )
+                            if not has_parsed_content:
+                                continue
+
+                            delta_message = DeltaMessage(
+                                role="assistant",
+                                content=output.delta_text if output.delta_text else None,
+                                tool_calls=output.delta_tool_calls,
+                                reasoning_content=output.delta_reasoning_content,
+                            )
+                        elif tool_parser:
+                            # Fallback: server-side tool parsing
                             current_token_ids = output.outputs[0].token_ids if output.outputs else []
                             delta_token_ids = (
                                 current_token_ids[len(previous_token_ids) :] if previous_token_ids else current_token_ids

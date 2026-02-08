@@ -15,7 +15,7 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -220,31 +220,15 @@ class SmolLM3Config(EasyDeLBaseConfig):
             if layer_type not in valid_types:
                 raise ValueError(f"`layer_types[{idx}]` must be one of {valid_types}, got '{layer_type}'")
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Get the partition rules for the model."""
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r".*/(input_layernorm|post_attention_layernorm|norm)/kernel",
-                pmag.resolve(Replicated),
-            ),
-            (
-                r".*/(input_layernorm|post_attention_layernorm|norm)/scale",
-                pmag.resolve(Replicated),
-            ),
-            (
-                r".*/(input_layernorm|post_attention_layernorm|norm)/bias",
-                pmag.resolve(Replicated),
-            ),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
+        """
+        return None

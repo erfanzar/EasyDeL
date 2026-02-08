@@ -42,6 +42,7 @@ Example:
     >>> embeddings = embed(tokens)  # Shape: (2, 3, 768)
 """
 
+from eformer.common_types import ColumnWise
 from flax import nnx as nn
 from flax.nnx.nn import dtypes, initializers
 from flax.typing import (
@@ -185,6 +186,10 @@ class Embed(nn.Module):
         if self.num_embeddings == 1:
             return jnp.broadcast_to(embedding, (*inputs.shape, self.features))
         return jnp.take(embedding, inputs, axis=0)
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return dynamic partition specs for this module's parameters."""
+        return {"embedding": ColumnWise}
 
     def attend(self, query: Array) -> Array:
         """Compute attention scores between query vectors and embeddings.

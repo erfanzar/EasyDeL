@@ -50,6 +50,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.components import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers.components.norms import LayerNorm
 
 from .qwen3_vl_configuration import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
 
@@ -433,7 +434,7 @@ class Qwen3VLVisionPatchMerger(nn.Module):
         self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
         self.use_postshuffle_norm = use_postshuffle_norm
 
-        self.norm = nn.LayerNorm(
+        self.norm = LayerNorm(
             self.hidden_size if use_postshuffle_norm else config.hidden_size,
             epsilon=1e-6,
             dtype=dtype,
@@ -709,14 +710,14 @@ class Qwen3VLVisionBlock(nn.Module):
         """
         super().__init__()
         self.layer_idx = layer_idx
-        self.norm1 = nn.LayerNorm(
+        self.norm1 = LayerNorm(
             config.hidden_size,
             epsilon=1e-6,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.norm2 = nn.LayerNorm(
+        self.norm2 = LayerNorm(
             config.hidden_size,
             epsilon=1e-6,
             dtype=dtype,
@@ -832,17 +833,19 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
         head_dim = config.hidden_size // config.num_heads
         self._head_dim_ro = head_dim // 2
 
-        self.blocks = nn.List([
-            Qwen3VLVisionBlock(
-                config=config,
-                layer_idx=idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for idx in range(config.depth)
-        ])
+        self.blocks = nn.List(
+            [
+                Qwen3VLVisionBlock(
+                    config=config,
+                    layer_idx=idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for idx in range(config.depth)
+            ]
+        )
 
         self.merger = Qwen3VLVisionPatchMerger(
             config=config,
@@ -852,17 +855,19 @@ class Qwen3VisionTransformerPretrainedModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.deepstack_merger_list = nn.List([
-            Qwen3VLVisionPatchMerger(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                use_postshuffle_norm=True,
-                rngs=rngs,
-            )
-            for _ in config.deepstack_visual_indexes
-        ])
+        self.deepstack_merger_list = nn.List(
+            [
+                Qwen3VLVisionPatchMerger(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    use_postshuffle_norm=True,
+                    rngs=rngs,
+                )
+                for _ in config.deepstack_visual_indexes
+            ]
+        )
 
         self.num_grid_per_side = int(math.sqrt(config.num_position_embeddings))
 
@@ -1400,17 +1405,19 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = nn.List([
-            Qwen3VLTextDecoderLayer(
-                config=config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                Qwen3VLTextDecoderLayer(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(
             config.hidden_size,

@@ -14,7 +14,6 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
 from eformer.loggings import get_logger
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -24,55 +23,7 @@ logger = get_logger(__name__)
 
 
 def _get_partition_rules(self, *arg, **kwargs):
-    """Generic partition rules for CLIP text and vision models.
-
-    Args:
-            self: The configuration object (unused but part of method signature).
-            *arg: Additional positional arguments (unused).
-            **kwargs: Additional keyword arguments (unused).
-
-    Returns:
-            Tuple: A tuple of partition rules for model parameters.
-    """
-    pmag = self.partition_manager  # Handles resolving strategies
-    return (
-        (r"text_model/embeddings/token_embedding/embedding", pmag.resolve(ColumnWise)),
-        (r"text_model/embeddings/position_embedding/embedding", pmag.resolve(ColumnWise)),
-        (r"vision_model/embeddings/class_embedding", pmag.resolve(Replicated)),
-        (r"vision_model/embeddings/patch_embedding/kernel", pmag.resolve(ColumnWise)),
-        (r"vision_model/embeddings/patch_embedding/bias", pmag.resolve(Replicated)),
-        (r"vision_model/embeddings/position_embedding/embedding", pmag.resolve(ColumnWise)),
-        (
-            r"(text|vision)_model/encoder/layers/\d+/self_attn/(q_proj|k_proj|v_proj)/kernel",
-            pmag.resolve(ColumnWise),
-        ),
-        (
-            r"(text|vision)_model/encoder/layers/\d+/self_attn/out_proj/kernel",
-            pmag.resolve(RowWise),
-        ),
-        (
-            r"(text|vision)_model/encoder/layers/\d+/self_attn/.*proj/bias",
-            pmag.resolve(Replicated),
-        ),
-        (
-            r"(text|vision)_model/encoder/layers/\d+/mlp/fc1/kernel",
-            pmag.resolve(ColumnWise),
-        ),
-        (r"(text|vision)_model/encoder/layers/\d+/mlp/fc2/kernel", pmag.resolve(RowWise)),
-        (
-            r"(text|vision)_model/encoder/layers/\d+/mlp/fc(1|2)/bias",
-            pmag.resolve(Replicated),
-        ),
-        (r".*norm.*/scale", pmag.resolve(Replicated)),
-        (r".*norm.*/bias", pmag.resolve(Replicated)),
-        (r"(visual|text)_projection/kernel", pmag.resolve(ColumnWise)),
-        (r"(visual|text)_projection/bias", pmag.resolve(Replicated)),
-        (r"logit_scale", pmag.resolve(Replicated)),
-        (r"classifier/kernel", pmag.resolve(RowWise)),
-        (r"classifier/bias", pmag.resolve(Replicated)),
-        (r".*bias", pmag.resolve(Replicated)),
-        (r".*", pmag.resolve(Replicated)),
-    )
+    return None
 
 
 @register_config("clip_text_model")

@@ -19,6 +19,7 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import ColumnWise, RowWise
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -50,6 +51,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.components.norms import LayerNorm
 
 from .dbrx_configuration import DbrxConfig
 
@@ -304,9 +306,9 @@ class DbrxNormAttentionNorm(nn.Module):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        norm_1 (nn.LayerNorm): Pre-attention layer normalization.
+        norm_1 (LayerNorm): Pre-attention layer normalization.
         attn (DbrxAttention): DBRX attention module.
-        norm_2 (nn.LayerNorm): Post-attention layer normalization.
+        norm_2 (LayerNorm): Post-attention layer normalization.
         dropout (nn.Dropout): Dropout layer for regularization.
     """
 
@@ -338,7 +340,7 @@ class DbrxNormAttentionNorm(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        self.norm_1 = nn.LayerNorm(
+        self.norm_1 = LayerNorm(
             self.config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -353,7 +355,7 @@ class DbrxNormAttentionNorm(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.norm_2 = nn.LayerNorm(
+        self.norm_2 = LayerNorm(
             self.config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -481,6 +483,9 @@ class DbrxExpertGLU(nn.Module):
         self.v1 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_method="normal", key=rngs.params())
         self.w2 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_method="normal", key=rngs.params())
         self.activation_fn = ACT2FN[self.config.ffn_config.ffn_act_fn["name"]]
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        return {"w1": ColumnWise, "v1": ColumnWise, "w2": RowWise}
 
     def __call__(self, x: Array, expert_idx: int) -> Array:
         """Apply the gated linear unit transformation for a specific expert.
@@ -971,7 +976,7 @@ class DbrxModel(EasyDeLBaseModule):
         emb_pdrop (float): Embedding dropout probability.
         wte (Embed): Token embedding layer.
         blocks (list[DbrxBlock]): List of decoder blocks.
-        norm_f (nn.LayerNorm): Final layer normalization.
+        norm_f (LayerNorm): Final layer normalization.
     """
 
     def __init__(
@@ -1010,18 +1015,20 @@ class DbrxModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.blocks = nn.List([
-            DbrxBlock(
-                config=config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.n_layers)
-        ])
-        self.norm_f = nn.LayerNorm(
+        self.blocks = nn.List(
+            [
+                DbrxBlock(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.n_layers)
+            ]
+        )
+        self.norm_f = LayerNorm(
             self.config.hidden_size,
             use_bias=False,
             dtype=dtype,

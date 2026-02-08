@@ -17,6 +17,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo
@@ -39,6 +40,7 @@ from easydel.infra.utils import ACT2FN, ArrayParam
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.base_modules import BaseImageClassificationModule
 from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.components.norms import LayerNorm
 
 from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionConfig
 
@@ -521,7 +523,7 @@ class SiglipEncoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.layer_norm1 = nn.LayerNorm(
+        self.layer_norm1 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -535,7 +537,7 @@ class SiglipEncoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.layer_norm2 = nn.LayerNorm(
+        self.layer_norm2 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -612,16 +614,18 @@ class SiglipEncoder(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        self.layers = nn.List([
-            SiglipEncoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for _ in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                SiglipEncoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
 
     def __call__(
         self,
@@ -721,7 +725,7 @@ class SiglipTextTransformer(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.final_layer_norm = nn.LayerNorm(
+        self.final_layer_norm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -984,7 +988,7 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.post_layernorm = nn.LayerNorm(
+        self.post_layernorm = LayerNorm(
             embed_dim,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -1145,6 +1149,13 @@ class MultiheadAttention(nn.Module):
             rngs=rngs,
         )
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for custom attention parameters."""
+        return {
+            "in_proj_weight": ColumnWise,
+            "in_proj_bias": Replicated,
+        }
+
     def __call__(
         self,
         query: Array,
@@ -1228,7 +1239,11 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
             rngs=rngs,
         )
 
-        self.layernorm = nn.LayerNorm(
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for attention pooling parameters."""
+        return {"probe": Replicated}
+
+        self.layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -1440,6 +1455,13 @@ class SiglipModel(EasyDeLBaseModule):
             init_method="normal",
             key=rngs.param(),
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for logit scaling parameters."""
+        return {
+            "logit_scale": Replicated,
+            "logit_bias": Replicated,
+        }
 
     def get_text_features(
         self,

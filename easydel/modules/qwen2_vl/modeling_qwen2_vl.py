@@ -50,6 +50,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.components import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers.components.norms import LayerNorm
 
 from .qwen2_vl_configuration import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
 
@@ -518,34 +519,36 @@ class Qwen2VLPatchMerger(nn.Module):
         super().__init__()
         self.dtype = dtype
         self.hidden_size = context_dim * (spatial_merge_size**2)
-        self.ln_q = nn.LayerNorm(
+        self.ln_q = LayerNorm(
             context_dim,
             epsilon=1e-6,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.mlp = nn.List([
-            ColumnParallelLinear(
-                self.hidden_size,
-                self.hidden_size,
-                use_bias=True,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            ),
-            partial(nn.gelu, approximate=False),
-            RowParallelLinear(
-                self.hidden_size,
-                dim,
-                use_bias=True,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            ),
-        ])
+        self.mlp = nn.List(
+            [
+                ColumnParallelLinear(
+                    self.hidden_size,
+                    self.hidden_size,
+                    use_bias=True,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                ),
+                partial(nn.gelu, approximate=False),
+                RowParallelLinear(
+                    self.hidden_size,
+                    dim,
+                    use_bias=True,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                ),
+            ]
+        )
 
     def __call__(self, x: Array) -> Array:
         """Merge and project patches.
@@ -830,14 +833,14 @@ class Qwen2VLVisionBlock(nn.Module):
             rngs (nn.Rngs): Random number generator state.
         """
         super().__init__()
-        self.norm1 = nn.LayerNorm(
+        self.norm1 = LayerNorm(
             config.embed_dim,
             epsilon=1e-6,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.norm2 = nn.LayerNorm(
+        self.norm2 = LayerNorm(
             config.embed_dim,
             epsilon=1e-6,
             dtype=dtype,
@@ -1268,17 +1271,19 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         head_dim = config.embed_dim // config.num_heads
         self._head_dim_ro = head_dim // 2
 
-        self.blocks = nn.List([
-            Qwen2VLVisionBlock(
-                config=config,
-                layer_idx=idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for idx in range(config.depth)
-        ])
+        self.blocks = nn.List(
+            [
+                Qwen2VLVisionBlock(
+                    config=config,
+                    layer_idx=idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for idx in range(config.depth)
+            ]
+        )
 
         self.merger = Qwen2VLPatchMerger(
             dim=config.hidden_size,
@@ -1481,17 +1486,19 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = nn.List([
-            Qwen2VLDecoderLayer(
-                config=config,
-                layer_idx=idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for idx in range(self.config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                Qwen2VLDecoderLayer(
+                    config=config,
+                    layer_idx=idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for idx in range(self.config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,

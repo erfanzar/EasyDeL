@@ -50,6 +50,7 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
+from eformer.common_types import ColumnWise, Replicated, RowWise
 from ejkernel.modules.operations import quantized_matmul as ej_quantized_matmul
 from ejkernel.quantization import dequantize as ej_dequantize
 from ejkernel.quantization import prepack_quantized_weights
@@ -440,6 +441,25 @@ class ParallelLinearQuantized(nn.Module):
             out = out + jnp.reshape(bias, (1,) * (out.ndim - 1) + (-1,))
 
         return out
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, tp.Any]:
+        """Return dynamic partition specs for quantized parameters."""
+        if self._direction is None:
+            return {}
+        if self._direction == "row":
+            kernel_spec = RowWise
+        elif self._direction == "column":
+            kernel_spec = ColumnWise
+        else:
+            return {}
+        specs: dict[str, tp.Any] = {
+            "quant_kernel": kernel_spec,
+            "quant_scales": Replicated,
+            "quant_biases": Replicated,
+        }
+        if self.use_bias:
+            specs["bias"] = Replicated
+        return specs
 
     @property
     def wqdtype(self) -> QuantizationType:

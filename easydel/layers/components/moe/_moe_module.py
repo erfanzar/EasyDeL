@@ -178,6 +178,10 @@ class BaseMoeModule(nn.Module, ABC):
 
         self.dtype = getattr(self, "dtype", jnp.bfloat16)
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, tp.Any]:
+        """Return dynamic partition specs for this module's parameters."""
+        return {}
+
     def get_moe_spec(
         self,
         direction: tp.Literal["row", "column"],

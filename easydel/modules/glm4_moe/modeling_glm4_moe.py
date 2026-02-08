@@ -18,6 +18,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -297,6 +298,10 @@ class Glm4MoeTopKRouter(nn.Module):
             init_method="zeros",
             key=None,
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        kernel_spec = Replicated if self.config.use_expert_tensor_mode else ColumnWise
+        return {"kernel": kernel_spec, "e_score_correction_bias": Replicated}
 
     def get_selected_experts(self, scores):
         """Select top-k experts using grouped routing strategy.
@@ -688,17 +693,19 @@ class Glm4MoeModel(EasyDeLBaseModule):
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             rngs=rngs,
         )
-        self.layers = nn.List([
-            Glm4MoeDecoderLayer(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(self.config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                Glm4MoeDecoderLayer(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(self.config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,

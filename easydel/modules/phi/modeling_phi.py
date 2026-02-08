@@ -42,6 +42,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.components.norms import LayerNorm
 
 from .phi_configuration import PhiConfig
 
@@ -203,7 +204,7 @@ class PhiAttention(UnifiedAttention):
         Returns:
             LayerNorm applied to query states before attention.
         """
-        return nn.LayerNorm(
+        return LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -227,7 +228,7 @@ class PhiAttention(UnifiedAttention):
         Returns:
             LayerNorm applied to key states before attention.
         """
-        return nn.LayerNorm(
+        return LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -334,7 +335,7 @@ class PhiDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.input_layernorm = nn.LayerNorm(
+        self.input_layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -470,18 +471,20 @@ class PhiModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.embed_dropout = nn.Dropout(config.embd_pdrop, rngs=rngs)
-        self.layers = nn.List([
-            PhiDecoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                layer_idx=idx,
-                rngs=rngs,
-            )
-            for idx in range(self.config.num_hidden_layers)
-        ])
-        self.final_layernorm = nn.LayerNorm(
+        self.layers = nn.List(
+            [
+                PhiDecoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    layer_idx=idx,
+                    rngs=rngs,
+                )
+                for idx in range(self.config.num_hidden_layers)
+            ]
+        )
+        self.final_layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,

@@ -30,6 +30,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -139,6 +140,10 @@ class Qwen3NextRMSNorm(nn.Module):
 
         self.kernel = nn.Param(jnp.zeros((hidden_size,), dtype=param_dtype))
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for normalization parameters."""
+        return {"kernel": Replicated}
+
     def _norm(self, x):
         """Compute RMS normalization.
 
@@ -202,6 +207,10 @@ class Qwen3NextRMSNormGated(nn.Module):
         self.param_dtype = param_dtype
 
         self.kernel = nn.Param(jnp.ones((hidden_size,), dtype=param_dtype))
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for normalization parameters."""
+        return {"kernel": Replicated}
 
     def __call__(
         self,
@@ -900,6 +909,9 @@ class Qwen3NextLinearAttention(nn.Module):
         )
         self.gdr_op = GatedDeltaRuleOp(metadata)
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        return {"A_log": Replicated, "dt_bias": Replicated}
+
     def fix_query_key_value_ordering(
         self,
         mixed_qkvz: Float[Array, "batch seq proj_dim"],
@@ -1325,17 +1337,19 @@ class Qwen3NextModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = nn.List([
-            Qwen3NextDecoderLayer(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                Qwen3NextDecoderLayer(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = Qwen3NextRMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,

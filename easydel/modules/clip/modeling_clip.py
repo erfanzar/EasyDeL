@@ -17,6 +17,7 @@ from functools import cached_property, partial
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -39,6 +40,7 @@ from easydel.infra.utils import ACT2FN, ArrayParam
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.base_modules import BaseImageClassificationModule
 from easydel.layers.components import ColumnParallelLinear, Embed
+from easydel.layers.components.norms import LayerNorm
 
 from .clip_configuration import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
 
@@ -135,6 +137,10 @@ class CLIPVisionEmbeddings(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for custom embedding parameters."""
+        return {"class_embedding": Replicated}
 
     def __call__(self, pixel_values):
         """Create vision embeddings from pixel values.
@@ -464,7 +470,7 @@ class CLIPEncoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.layer_norm1 = nn.LayerNorm(
+        self.layer_norm1 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -478,7 +484,7 @@ class CLIPEncoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.layer_norm2 = nn.LayerNorm(
+        self.layer_norm2 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -556,16 +562,18 @@ class CLIPEncoder(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        self.layers = nn.List([
-            CLIPEncoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for _ in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                CLIPEncoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
 
     @cached_property
     def causal_mask(self):
@@ -673,7 +681,7 @@ class CLIPTextTransformer(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.final_layer_norm = nn.LayerNorm(
+        self.final_layer_norm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -809,7 +817,7 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.pre_layrnorm = nn.LayerNorm(
+        self.pre_layrnorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -823,7 +831,7 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.post_layernorm = nn.LayerNorm(
+        self.post_layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -1415,6 +1423,10 @@ class CLIPModel(EasyDeLBaseModule):
             key=None,
             value=jnp.ones((), dtype=jnp.float32) * self.config.logit_scale_init_value,
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for custom scalar parameters."""
+        return {"logit_scale": Replicated}
 
     def __call__(
         self,

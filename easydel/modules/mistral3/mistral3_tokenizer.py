@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 
 try:
-    from mistral_common.tokens.tokenizers.mistral import ChatCompletionRequest, MistralTokenizer, SpecialTokenPolicy
+    from mistral_common.tokens.tokenizers.mistral import ChatCompletionRequest, MistralTokenizer, SpecialTokenPolicy#type:ignore #noqa
 except ImportError:
     ChatCompletionRequest, MistralTokenizer, SpecialTokenPolicy = (
         type(None),

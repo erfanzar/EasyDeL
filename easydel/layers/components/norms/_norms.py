@@ -44,11 +44,15 @@ Note:
     similar normalization benefits.
 """
 
+import typing as tp
+
 import jax
+from eformer.common_types import Replicated
 from flax import nnx as nn
+from flax.nnx.nn import normalization as nutil
 from jax import lax
 from jax import numpy as jnp
-from jaxtyping import Array, Float
+from jaxtyping import Array, DTypeLike, Float
 
 lowfloats = [
     jnp.float4_e2m1fn,
@@ -144,8 +148,8 @@ class RMSNorm(nn.Module):
         self,
         dim: int,
         eps: float = 1e-6,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
+        dtype: DTypeLike = jnp.bfloat16,
+        param_dtype: DTypeLike = jnp.bfloat16,
         *,
         rngs: nn.Rngs | None = None,
     ) -> None:
@@ -260,3 +264,394 @@ class RMSNorm(nn.Module):
         output = self._norm(x).astype(self.dtype)
         weight = self.kernel.astype(self.dtype)
         return (weight * output).astype(org_dtype)
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return dynamic partition specs for this module's parameters."""
+        return {"kernel": Replicated}
+
+
+class BatchNorm(nn.Module):
+    """Batch Normalization layer.
+
+    Normalizes activations across the batch dimension by subtracting the batch
+    mean and dividing by the batch standard deviation. Maintains running
+    statistics (mean and variance) for use during inference.
+
+    During training, batch statistics are computed from the current mini-batch
+    and exponential moving averages are updated. During inference, the stored
+    running statistics are used instead.
+
+    Attributes:
+        num_features: Number of feature channels to normalize.
+        use_running_average: If True, use stored running statistics instead
+            of computing batch statistics.
+        axis: Feature axis (or axes) to normalize over.
+        momentum: Decay rate for exponential moving average of batch statistics.
+        epsilon: Small constant for numerical stability in division.
+        dtype: Computation dtype. Inputs are promoted to this dtype.
+        param_dtype: Dtype for learnable scale and bias parameters.
+        use_bias: Whether to include a learnable bias (shift) parameter.
+        use_scale: Whether to include a learnable scale parameter.
+        mean: Running mean batch statistic.
+        var: Running variance batch statistic.
+        scale: Learnable scale parameter, or None if ``use_scale=False``.
+        bias: Learnable bias parameter, or None if ``use_bias=False``.
+
+    Example:
+        >>> norm = BatchNorm(num_features=64, rngs=nn.Rngs(0))
+        >>> x = jnp.ones((8, 64))
+        >>> y = norm(x, use_running_average=False)
+        >>> assert y.shape == (8, 64)
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        *,
+        use_running_average: bool = False,
+        axis: int = -1,
+        momentum: float = 0.99,
+        epsilon: float = 1e-5,
+        dtype: DTypeLike | None = None,
+        param_dtype: DTypeLike = jnp.float32,
+        use_bias: bool = True,
+        use_scale: bool = True,
+        bias_init: nutil.Initializer = nn.initializers.zeros_init(),
+        scale_init: nutil.Initializer = nn.initializers.ones_init(),
+        axis_name: str | None = None,
+        axis_index_groups: tp.Any = None,
+        use_fast_variance: bool = True,
+        promote_dtype: nutil.PromoteDtypeFn = nutil.dtypes.promote_dtype,
+        rngs: nn.Rngs,
+        bias_metadata: tp.Mapping[str, tp.Any] = nutil.MappingProxyType({}),
+        scale_metadata: tp.Mapping[str, tp.Any] = nutil.MappingProxyType({}),
+    ):
+        """Initialize the BatchNorm layer.
+
+        Args:
+            num_features: Size of the feature dimension to normalize.
+            use_running_average: If True, use stored running statistics for
+                normalization instead of computing from the input batch.
+                Typically False during training and True during evaluation.
+            axis: Feature axis of the input to normalize over. Defaults to -1
+                (last axis).
+            momentum: Decay factor for the exponential moving average of running
+                statistics. A value of 0.99 means 99% of the old statistic is
+                retained per update. Defaults to 0.99.
+            epsilon: Small constant added to variance for numerical stability.
+                Defaults to 1e-5.
+            dtype: Dtype for computation. If None, uses the input dtype.
+            param_dtype: Dtype for scale and bias parameters.
+                Defaults to jnp.float32.
+            use_bias: Whether to add a learnable bias parameter.
+                Defaults to True.
+            use_scale: Whether to add a learnable scale parameter.
+                Defaults to True.
+            bias_init: Initializer for bias parameter. Defaults to zeros.
+            scale_init: Initializer for scale parameter. Defaults to ones.
+            axis_name: Name of the axis used for ``jax.lax.pmean`` for
+                cross-replica statistics aggregation. If None, no aggregation
+                is performed.
+            axis_index_groups: Groups of axis indices for partitioned
+                cross-replica statistics.
+            use_fast_variance: If True, uses a numerically faster but
+                potentially less stable variance computation. Defaults to True.
+            promote_dtype: Function used for dtype promotion of inputs and
+                parameters.
+            rngs: Flax NNX random number generators for parameter initialization.
+            bias_metadata: Additional metadata for the bias parameter.
+            scale_metadata: Additional metadata for the scale parameter.
+        """
+        feature_shape = (num_features,)
+        self.mean = nn.BatchStat(jnp.zeros(feature_shape, jnp.float32))
+        self.var = nn.BatchStat(jnp.ones(feature_shape, jnp.float32))
+
+        self.scale: nn.Param[jax.Array] | None
+        if use_scale:
+            key = rngs.params()
+            self.scale = nn.Param(scale_init(key, feature_shape, param_dtype), **scale_metadata)
+        else:
+            self.scale = nn.data(None)
+
+        self.bias: nn.Param[jax.Array] | None
+        if use_bias:
+            key = rngs.params()
+            self.bias = nn.Param(bias_init(key, feature_shape, param_dtype), **bias_metadata)
+        else:
+            self.bias = nn.data(None)
+
+        self.num_features = num_features
+        self.use_running_average = use_running_average
+        self.axis = axis
+        self.momentum = momentum
+        self.epsilon = epsilon
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.use_bias = use_bias
+        self.use_scale = use_scale
+        self.axis_name = axis_name
+        self.axis_index_groups = axis_index_groups
+        self.use_fast_variance = use_fast_variance
+        self.promote_dtype = promote_dtype
+
+    def __call__(
+        self,
+        x,
+        use_running_average: bool | None = None,
+        *,
+        mask: jax.Array | None = None,
+    ):
+        """Apply batch normalization to the input.
+
+        Normalizes the input by subtracting the mean and dividing by the
+        standard deviation computed over the batch (and spatial) dimensions.
+        During training, batch statistics are computed and running averages
+        are updated. During inference, stored running statistics are used.
+
+        Args:
+            x: Input array to normalize.
+            use_running_average: If provided, overrides the instance-level
+                ``use_running_average`` setting. Set to True for inference
+                and False for training.
+            mask: Optional boolean mask of the same shape as ``x``. If
+                provided, masked positions are excluded from statistics
+                computation.
+
+        Returns:
+            Normalized array with the same shape as the input.
+        """
+        use_running_average = nutil.first_from(
+            use_running_average,
+            self.use_running_average,
+            error_msg="""No `use_running_average` argument was provided to BatchNorm
+        as either a __call__ argument, class attribute, or nnx.flag.""",
+        )
+        feature_axes = nutil._canonicalize_axes(x.ndim, self.axis)
+        reduction_axes = tuple(i for i in range(x.ndim) if i not in feature_axes)
+
+        # Promote dtypes for input and all Variables
+        scale = self.scale[...] if self.scale is not None else None
+        bias = self.bias[...] if self.bias is not None else None
+        x, mean, var, scale, bias = self.promote_dtype((x, self.mean[...], self.var[...], scale, bias), dtype=self.dtype)
+        if not use_running_average:
+            mean, var = nutil._compute_stats(
+                x,
+                reduction_axes,
+                dtype=self.dtype,
+                axis_name=self.axis_name,
+                axis_index_groups=self.axis_index_groups,
+                use_fast_variance=self.use_fast_variance,
+                mask=mask,
+            )
+            # stop_gradient only for flax_array_ref
+            if self.mean._can_update or self.var._can_update:
+                stop_gradient = jax.lax.stop_gradient
+            else:
+
+                def stop_gradient(x):
+                    return x
+
+            self.mean[...] = stop_gradient(self.momentum * self.mean[...] + (1 - self.momentum) * mean)
+            self.var[...] = stop_gradient(self.momentum * self.var[...] + (1 - self.momentum) * var)
+
+        return nutil._normalize(
+            x,
+            mean,
+            var,
+            scale,
+            bias,
+            reduction_axes,
+            feature_axes,
+            self.dtype,
+            self.epsilon,
+        )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return dynamic partition specs for this module's parameters."""
+        specs: dict[str, object] = {"mean": Replicated, "var": Replicated}
+        if self.scale is not None:
+            specs["scale"] = Replicated
+        if self.bias is not None:
+            specs["bias"] = Replicated
+        return specs
+
+    def set_mode(
+        self,
+        use_running_average: bool | None = None,
+        **kwargs,
+    ) -> dict:
+        """Class method used by ``nnx.set_mode``.
+
+        Args:
+          use_running_average: if True, the stored batch statistics will be
+            used instead of computing the batch statistics on the input.
+        """
+        if use_running_average is not None:
+            self.use_running_average = use_running_average
+        return kwargs
+
+
+class LayerNorm(nn.Module):
+    """Layer Normalization layer.
+
+    Normalizes activations across the feature dimension by subtracting the mean
+    and dividing by the standard deviation, computed independently for each
+    sample in the batch. Unlike BatchNorm, statistics are computed per-sample
+    rather than across the batch, making LayerNorm independent of batch size
+    and suitable for sequence models.
+
+    The normalization formula is:
+        output = ((x - mean) / sqrt(var + eps)) * scale + bias
+
+    Attributes:
+        num_features: Size of the feature dimension.
+        epsilon: Small constant for numerical stability.
+        dtype: Computation dtype. If None, uses the input dtype.
+        param_dtype: Dtype for learnable parameters.
+        use_bias: Whether a learnable bias parameter is included.
+        use_scale: Whether a learnable scale parameter is included.
+        reduction_axes: Axes over which mean and variance are computed.
+        feature_axes: Axes corresponding to feature dimensions for
+            scale/bias application.
+        scale: Learnable scale parameter, or None if ``use_scale=False``.
+        bias: Learnable bias parameter, or None if ``use_bias=False``.
+
+    Example:
+        >>> norm = LayerNorm(num_features=768, rngs=nn.Rngs(0))
+        >>> x = jnp.ones((2, 512, 768))
+        >>> y = norm(x)
+        >>> assert y.shape == (2, 512, 768)
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        *,
+        epsilon: float = 1e-6,
+        dtype: DTypeLike | None = None,
+        param_dtype: DTypeLike = jnp.float32,
+        use_bias: bool = True,
+        use_scale: bool = True,
+        bias_init: nutil.Initializer = nn.initializers.zeros_init(),
+        scale_init: nutil.Initializer = nn.initializers.ones_init(),
+        reduction_axes: nutil.Axes = -1,
+        feature_axes: nutil.Axes = -1,
+        axis_name: str | None = None,
+        axis_index_groups: tp.Any = None,
+        use_fast_variance: bool = True,
+        promote_dtype: nutil.PromoteDtypeFn = nutil.dtypes.promote_dtype,
+        rngs: nn.Rngs,
+        bias_metadata: tp.Mapping[str, tp.Any] = nutil.MappingProxyType({}),
+        scale_metadata: tp.Mapping[str, tp.Any] = nutil.MappingProxyType({}),
+    ):
+        """Initialize the LayerNorm layer.
+
+        Args:
+            num_features: Size of the feature dimension. Scale and bias
+                parameters are created with this shape.
+            epsilon: Small constant added to variance for numerical stability.
+                Defaults to 1e-6.
+            dtype: Dtype for computation. If None, uses the input dtype.
+            param_dtype: Dtype for scale and bias parameters.
+                Defaults to jnp.float32.
+            use_bias: Whether to add a learnable bias parameter.
+                Defaults to True.
+            use_scale: Whether to add a learnable scale parameter.
+                Defaults to True.
+            bias_init: Initializer for bias parameter. Defaults to zeros.
+            scale_init: Initializer for scale parameter. Defaults to ones.
+            reduction_axes: Axes over which mean and variance are computed.
+                Defaults to -1 (last axis).
+            feature_axes: Axes that represent features for scale/bias
+                broadcasting. Defaults to -1.
+            axis_name: Name of the axis used for ``jax.lax.pmean`` for
+                cross-replica statistics aggregation. If None, no aggregation
+                is performed.
+            axis_index_groups: Groups of axis indices for partitioned
+                cross-replica statistics.
+            use_fast_variance: If True, uses a numerically faster but
+                potentially less stable variance computation. Defaults to True.
+            promote_dtype: Function used for dtype promotion of inputs and
+                parameters.
+            rngs: Flax NNX random number generators for parameter initialization.
+            bias_metadata: Additional metadata for the bias parameter.
+            scale_metadata: Additional metadata for the scale parameter.
+        """
+        feature_shape = (num_features,)
+
+        self.scale: nn.Param[jax.Array] | None
+        if use_scale:
+            key = rngs.params()
+            self.scale = nn.Param(scale_init(key, feature_shape, param_dtype), **scale_metadata)
+        else:
+            self.scale = nn.data(None)
+
+        self.bias: nn.Param[jax.Array] | None
+        if use_bias:
+            key = rngs.params()
+            self.bias = nn.Param(bias_init(key, feature_shape, param_dtype), **bias_metadata)
+        else:
+            self.bias = nn.data(None)
+
+        self.num_features = num_features
+        self.epsilon = epsilon
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.use_bias = use_bias
+        self.use_scale = use_scale
+        self.reduction_axes = reduction_axes
+        self.feature_axes = feature_axes
+        self.axis_name = axis_name
+        self.axis_index_groups = axis_index_groups
+        self.use_fast_variance = use_fast_variance
+        self.promote_dtype = promote_dtype
+
+    def __call__(self, x, *, mask: jax.Array | None = None):
+        """Apply layer normalization to the input.
+
+        Computes per-sample mean and variance over the reduction axes,
+        normalizes the input, and applies learned scale and bias.
+
+        Args:
+            x: Input array to normalize. The last dimension (by default)
+                must match ``num_features``.
+            mask: Optional boolean mask of the same shape as ``x``. If
+                provided, masked positions are excluded from statistics
+                computation.
+
+        Returns:
+            Normalized array with the same shape as the input.
+        """
+        scale = self.scale[...] if self.scale else None
+        bias = self.bias[...] if self.bias else None
+        x, scale, bias = self.promote_dtype((x, scale, bias), dtype=self.dtype)
+        mean, var = nutil._compute_stats(
+            x,
+            self.reduction_axes,
+            self.dtype,
+            self.axis_name,
+            self.axis_index_groups,
+            use_fast_variance=self.use_fast_variance,
+            mask=mask,
+        )
+
+        return nutil._normalize(
+            x,
+            mean,
+            var,
+            scale,
+            bias,
+            self.reduction_axes,
+            self.feature_axes,
+            self.dtype,
+            self.epsilon,
+        )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return dynamic partition specs for this module's parameters."""
+        specs: dict[str, object] = {}
+        if self.scale is not None:
+            specs["scale"] = Replicated
+        if self.bias is not None:
+            specs["bias"] = Replicated
+        return specs

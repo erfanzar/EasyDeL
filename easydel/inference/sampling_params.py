@@ -494,7 +494,7 @@ class SamplingParams:
     logprobs: int | None = None
     prompt_logprobs: int | None = None
     detokenize: bool = True
-    skip_special_tokens: bool = True
+    skip_special_tokens: bool = False
     spaces_between_special_tokens: bool = True
     include_stop_str_in_output: bool = False
     output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE

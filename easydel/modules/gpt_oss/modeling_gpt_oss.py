@@ -18,6 +18,7 @@ import typing
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -440,6 +441,10 @@ class GptOssAttention(UnifiedAttention):
             key=rngs.param(),
         )
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for sink parameters."""
+        return {"sinks": Replicated}
+
 
 class GptOssDecoderLayer(nn.Module):
     """GPT-OSS decoder layer with attention and Mixture-of-Experts MLP.
@@ -659,17 +664,19 @@ class GptOssModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = nn.List([
-            GptOssDecoderLayer(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                GptOssDecoderLayer(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = GptOssRMSNorm(
             dim=config.hidden_size,

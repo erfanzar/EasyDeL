@@ -44,6 +44,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.components.norms import LayerNorm
 
 from .mosaic_configuration import MptConfig as MptConfig
 
@@ -402,9 +403,9 @@ class MptBlock(nn.Module):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
-        norm_1 (nn.LayerNorm): Layer normalization before the attention layer.
+        norm_1 (LayerNorm): Layer normalization before the attention layer.
         attn (MptAttention): The self-attention module.
-        norm_2 (nn.LayerNorm): Layer normalization before the MLP layer.
+        norm_2 (LayerNorm): Layer normalization before the MLP layer.
         ffn (MptMLP): The feed-forward (MLP) module.
         resid_attn_dropout (nn.Dropout): Dropout applied after the attention layer's residual connection.
     """
@@ -443,7 +444,7 @@ class MptBlock(nn.Module):
             exclude_names=config.gradient_checkpointing_targets,
         )
 
-        self.norm_1 = nn.LayerNorm(
+        self.norm_1 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             dtype=dtype,
@@ -460,7 +461,7 @@ class MptBlock(nn.Module):
             layer_idx=layer_idx,
         )
 
-        self.norm_2 = nn.LayerNorm(
+        self.norm_2 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             dtype=dtype,
@@ -598,7 +599,7 @@ class MptModel(EasyDeLBaseModule):
         wte (Embed): Token embedding layer.
         emb_drop (nn.Dropout): Dropout layer applied after embeddings.
         blocks (tp.List[MptBlock]): List of transformer blocks.
-        norm_f (nn.LayerNorm): Final layer normalization.
+        norm_f (LayerNorm): Final layer normalization.
         alibi (Array, optional): Precomputed ALiBi tensor if using ALiBi.
     """
 
@@ -635,19 +636,21 @@ class MptModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
         )
 
-        self.blocks = nn.List([
-            MptBlock(
-                config=config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.n_layers)
-        ])
+        self.blocks = nn.List(
+            [
+                MptBlock(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.n_layers)
+            ]
+        )
 
-        self.norm_f = nn.LayerNorm(
+        self.norm_f = LayerNorm(
             config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,

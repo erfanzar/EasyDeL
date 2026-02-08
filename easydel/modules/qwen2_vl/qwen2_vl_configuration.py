@@ -15,12 +15,14 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.factory import register_config
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 
 
+@register_config("qwen2_vl_vision")
 class Qwen2VLVisionConfig(EasyDeLBaseConfig):
     """
     Configuration class for the vision component of Qwen2VL model.
@@ -82,6 +84,7 @@ class Qwen2VLVisionConfig(EasyDeLBaseConfig):
         self.initializer_range = initializer_range
 
 
+@register_config("qwen2_vl_text")
 class Qwen2VLTextConfig(EasyDeLBaseConfig):
     """Configuration for the Qwen2-VL text decoder stack."""
 
@@ -150,13 +153,16 @@ class Qwen2VLTextConfig(EasyDeLBaseConfig):
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [
-                "sliding_attention"
-                if self.sliding_window is not None and i >= self.max_window_layers
-                else "full_attention"
+                (
+                    "sliding_attention"
+                    if self.sliding_window is not None and i >= self.max_window_layers
+                    else "full_attention"
+                )
                 for i in range(self.num_hidden_layers)
             ]
 
 
+@register_config("qwen2_vl")
 class Qwen2VLConfig(EasyDeLBaseConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen2VLModel`]. It is used to instantiate a
@@ -210,47 +216,18 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (r"(input_layernorm|post_attention_layernorm)/kernel", pmag.resolve(Replicated)),
-            (r"norm/kernel", pmag.resolve(Replicated)),
-            (r"visual/patch_embed/proj/kernel", pmag.resolve(ColumnWise)),
-            (r"attn/qkv/kernel", pmag.resolve(ColumnWise)),
-            (r"attn/qkv/bias", pmag.resolve(Replicated)),
-            (r"attn/proj/kernel", pmag.resolve(RowWise)),
-            (r"attn/proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/fc1/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/fc1/bias", pmag.resolve(Replicated)),
-            (r"mlp/fc2/kernel", pmag.resolve(RowWise)),
-            (r"mlp/fc2/bias", pmag.resolve(Replicated)),
-            (r"norm(1|2)/scale", pmag.resolve(Replicated)),
-            (r"norm(1|2)/bias", pmag.resolve(Replicated)),
-            (r"visual/merger/ln_q/scale", pmag.resolve(Replicated)),
-            (r"visual/merger/ln_q/bias", pmag.resolve(Replicated)),
-            (r"visual/merger/mlp/0/kernel", pmag.resolve(ColumnWise)),
-            (r"visual/merger/mlp/0/bias", pmag.resolve(Replicated)),
-            (r"visual/merger/mlp/2/kernel", pmag.resolve(RowWise)),
-            (r"visual/merger/mlp/2/bias", pmag.resolve(Replicated)),
-            (r"multi_modal_projector/linear_1/kernel", pmag.resolve(ColumnWise)),
-            (r"multi_modal_projector/linear_1/bias", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"lm_head/bias", pmag.resolve(Replicated)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Retrieve attention mask details for each layer in the model.

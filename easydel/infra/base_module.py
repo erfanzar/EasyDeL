@@ -80,6 +80,7 @@ import flax.struct
 import jax
 import jax.extend
 import jax.tree_util
+from eformer.common_types import Replicated
 from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 from eformer.loggings import get_logger
 from flax import nnx as nn
@@ -89,6 +90,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jaxtyping import Array, Float, Int
 
 from easydel.infra.utils import ArrayParam
+from easydel.layers.components.norms import LayerNorm
 from easydel.utils import traversals
 from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 
@@ -983,7 +985,8 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
         Args:
             partition_rules: The partition rules to use for matching. If None,
-                uses rules from self.config.get_partition_rules(). Defaults to None.
+                uses config rules when available, otherwise resolves automatic
+                sharding rules. Defaults to None.
 
         Returns:
             dict: A nested dictionary mapping parameter paths to PartitionSpec
@@ -1089,11 +1092,13 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         """Retrieve partition rules, with fallback to configuration.
 
         Gets the partition rules to use for sharding, prioritizing the provided
-        argument over rules from the configuration.
+        argument over rules from the configuration. If the configuration returns
+        ``None``, falls back to :meth:`resolve_shardings_automatically`.
 
         Args:
             partition_rules: Partition rules to use. If None, calls
-                self.config.get_partition_rules(fully_sharded_data_parallel=True).
+                ``self.config.get_partition_rules(...)`` and falls back to
+                automatic sharding rules when it returns ``None``.
 
         Returns:
             PartitionLike: The resolved partition rules as a mapping from
@@ -1104,16 +1109,128 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 support partition rule generation.
 
         Example:
-            >>> rules = model._get_partition_rules(None)  # Uses config rules
+            >>> rules = model._get_partition_rules(None)  # Uses config or auto
             >>> custom_rules = [(".*kernel", ("fsdp", "tp"))]
             >>> rules = model._get_partition_rules(custom_rules)  # Uses provided
         """
-        if partition_rules is None:
-            if not hasattr(self, "config"):
-                raise ValueError("Partition rules must be provided either as an argument or through the model config.")
+        if partition_rules is not None:
+            return partition_rules
 
-            return self.config.get_partition_rules(fully_sharded_data_parallel=True)
-        return partition_rules
+        if not hasattr(self, "config"):
+            raise ValueError("Partition rules must be provided either as an argument or through the model config.")
+
+        try:
+            rules = self.config.get_partition_rules(fully_sharded_data_parallel=True)
+        except TypeError:
+            rules = self.config.get_partition_rules()
+        except NotImplementedError:
+            rules = None
+
+        if rules is None:
+            return self.resolve_shardings_automatically()
+
+        return rules
+
+    def resolve_shardings_automatically(
+        self,
+        *,
+        partition_manager: tp.Any | None = None,
+        **kwargs,
+    ) -> tuple[tuple[str, tp.Any], ...]:
+        """Resolve partition rules from module-level dynamic specs.
+
+        Traverses all submodules and collects partition specs from any module
+        exposing a ``craft_sharding`` hook. Returned rules match the format of
+        ``get_partition_rules``: a tuple of (pattern, spec) pairs.
+
+        Args:
+            partition_manager: Optional partition manager to resolve specs.
+                If None, uses ``self.config.partition_manager`` when available.
+            **kwargs: Extra context forwarded to ``craft_sharding``.
+
+        Returns:
+            Tuple of (pattern, PartitionSpec) rules.
+        """
+        from easydel.utils.traversals import iter_module_search
+
+        pm = partition_manager
+        if pm is None and hasattr(self, "config"):
+            pm = getattr(self.config, "partition_manager", None)
+
+        raw_rules: list[tuple[str, tp.Any]] = []
+
+        def _resolve_spec(spec: tp.Any) -> tp.Any:
+            if pm is None or not hasattr(pm, "resolve"):
+                return spec
+            try:
+                return pm.resolve(spec)
+            except Exception:
+                return spec
+
+        for path, module in iter_module_search(self, nn.Module):
+            if not hasattr(module, "craft_sharding"):
+                continue
+            spec_attr = module.craft_sharding
+            if spec_attr is None:
+                continue
+            if callable(spec_attr):
+                try:
+                    spec = spec_attr(partition_manager=pm, **kwargs)
+                except TypeError:
+                    spec = spec_attr()
+            else:
+                spec = spec_attr
+
+            if not spec:
+                continue
+
+            prefix = "/".join(str(p) for p in path) if path else ""
+
+            def _add_rule(suffix: tp.Any, spec_value: tp.Any, prefix: str) -> None:
+                if suffix in (None, ""):
+                    pattern = prefix
+                elif prefix:
+                    pattern = f"{prefix}/{suffix}"
+                else:
+                    pattern = str(suffix)
+                if pattern:
+                    raw_rules.append((pattern, _resolve_spec(spec_value)))
+
+            if isinstance(spec, dict):
+                for suffix, spec_value in spec.items():
+                    _add_rule(suffix, spec_value, prefix)
+            elif isinstance(spec, (list, tuple)):
+                for item in spec:
+                    if isinstance(item, tuple) and len(item) == 2:
+                        _add_rule(item[0], item[1], prefix)
+                    else:
+                        _add_rule("", item, prefix)
+            else:
+                _add_rule("", spec, prefix)
+
+        def _generalize_numeric_path(pattern: str) -> str:
+            parts = pattern.split("/")
+            regex_parts: list[str] = []
+            for part in parts:
+                if part.isdigit():
+                    regex_parts.append(r"\d+")
+                else:
+                    regex_parts.append(re.escape(part))
+            return "^" + "/".join(regex_parts) + "$"
+
+        seen: set[tuple[str, tp.Any]] = set()
+        rules: list[tuple[str, tp.Any]] = []
+        for pattern, spec in raw_rules:
+            generalized = _generalize_numeric_path(pattern)
+            key = (generalized, spec)
+            if key in seen:
+                continue
+            seen.add(key)
+            rules.append((generalized, spec))
+
+        rules.append((".*", _resolve_spec(Replicated)))
+
+        return tuple(rules)
 
     def _apply_sharding_fns(
         self: Self,
@@ -1760,6 +1877,8 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         rng = kwargs.get("rngs", flax.nnx.Rngs(44))
         lazy_model = cls.lazy_init(**kwargs)
         partition_rules = lazy_model.config.get_partition_rules()
+        if partition_rules is None:
+            partition_rules = lazy_model.resolve_shardings_automatically()
         for path, module in iter_module_search(lazy_model, (flax.nnx.Module, ArrayParam)):
             if path:
                 joined_path = "/".join([str(p) for p in path])
@@ -1804,6 +1923,13 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 )
                 arr = jax.jit(_shard, out_shardings=shardings["bias"])(arr)
                 module.bias.value = arr
+            # Handle modules (e.g., nnx.LayerNorm) that don't store init fns.
+            if hasattr(module, "bias") and module.bias is not None:
+                bias = module.bias
+                if isinstance(bias, nn.Param) and isinstance(bias.value, jax.ShapeDtypeStruct):
+                    arr = jax.nn.initializers.zeros(rng.param(), bias.value.shape, bias.value.dtype)
+                    arr = jax.jit(_shard, out_shardings=shardings["bias"])(arr)
+                    bias.value = arr
 
             if hasattr(module, "embedding") and hasattr(module, "embedding_init"):
                 arr = module.embedding_init(
@@ -1822,6 +1948,13 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 )
                 arr = jax.jit(_shard, out_shardings=shardings["scale"])(arr)
                 module.scale.value = arr
+            # Handle modules (e.g., nnx.LayerNorm) that don't store init fns.
+            if hasattr(module, "scale"):
+                scale = module.scale
+                if isinstance(scale, nn.Param) and isinstance(scale.value, jax.ShapeDtypeStruct):
+                    arr = jax.nn.initializers.ones(rng.param(), scale.value.shape, scale.value.dtype)
+                    arr = jax.jit(_shard, out_shardings=shardings["scale"])(arr)
+                    scale.value = arr
 
             if hasattr(module, "rngs"):
                 module.rngs = rng.fork()
@@ -2139,7 +2272,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
         embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.Embed)]
         embedding_path.extend([".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, Embed)])
-        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.LayerNorm)]
+        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, LayerNorm)]
         moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
         moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
 
@@ -2458,7 +2591,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
         embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.Embed)]
         embedding_path.extend([".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, Embed)])
-        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.LayerNorm)]
+        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, LayerNorm)]
         moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
         moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
 

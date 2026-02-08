@@ -35,6 +35,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -59,6 +60,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.components.norms import LayerNorm
 
 from .opt_configuration import OPTConfig
 
@@ -275,10 +277,10 @@ class OPTDecoderLayer(nn.Module):
         do_layer_norm_before (bool): Whether to apply layer normalization before the attention/FFN blocks.
         dropout_layer (nn.Dropout): Dropout layer applied to the hidden states.
         activation_fn (callable): The activation function used in the FFN.
-        self_attn_layer_norm (nn.LayerNorm): Layer normalization applied before the self-attention module.
+        self_attn_layer_norm (LayerNorm): Layer normalization applied before the self-attention module.
         fc1 (ParallelLinear): The first linear layer of the FFN.
         fc2 (ParallelLinear): The second linear layer (output) of the FFN.
-        final_layer_norm (nn.LayerNorm): Layer normalization applied before the FFN module.
+        final_layer_norm (LayerNorm): Layer normalization applied before the FFN module.
     """
 
     def __init__(
@@ -321,7 +323,7 @@ class OPTDecoderLayer(nn.Module):
         self.dropout_layer = nn.Dropout(rate=self.config.dropout, rngs=rngs)
         self.activation_fn = ACT2FN[self.config.activation_function]
 
-        self.self_attn_layer_norm = nn.LayerNorm(
+        self.self_attn_layer_norm = LayerNorm(
             self.embed_dim,
             dtype=self.dtype,
             param_dtype=param_dtype,
@@ -346,7 +348,7 @@ class OPTDecoderLayer(nn.Module):
             kernel_init=nn.initializers.normal(config.init_std),
             rngs=rngs,
         )
-        self.final_layer_norm = nn.LayerNorm(
+        self.final_layer_norm = LayerNorm(
             self.embed_dim,
             dtype=self.dtype,
             param_dtype=param_dtype,
@@ -501,6 +503,9 @@ class OPTLearnedPositionalEmbedding(nn.Module):
                 key=rngs.params(),
             )
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        return {"kernel": Replicated}
+
     def __call__(self, inputs: Array) -> Array:
         """Apply learned positional embeddings with offset.
 
@@ -541,7 +546,7 @@ class OPTDecoder(EasyDeLBaseModule):
         project_in (ColumnParallelLinear, optional): Optional linear projection layer before embeddings.
         layers (tp.List[OPTDecoderLayer]): List of OPT decoder layers.
         dropout_layer (nn.Dropout): Dropout layer applied after embeddings.
-        final_layer_norm (nn.LayerNorm, optional): Optional final layer normalization.
+        final_layer_norm (LayerNorm, optional): Optional final layer normalization.
         gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
     """
 
@@ -627,7 +632,7 @@ class OPTDecoder(EasyDeLBaseModule):
             self.project_out = None
 
         if self.config.do_layer_norm_before and not self.config._remove_final_layer_norm:
-            self.final_layer_norm = nn.LayerNorm(
+            self.final_layer_norm = LayerNorm(
                 self.config.hidden_size,
                 dtype=self.dtype,
                 param_dtype=param_dtype,
@@ -637,16 +642,18 @@ class OPTDecoder(EasyDeLBaseModule):
         else:
             self.final_layer_norm = None
 
-        self.layers = nn.List([
-            OPTDecoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                OPTDecoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
     def __call__(
         self,

@@ -48,7 +48,7 @@ class FastIncrementalDecoder:
             tokens,
             previous_text="",
             buffered=decoder.buffered,   # mutable list that the decoder updates
-            skip_special_tokens=True,
+            skip_special_tokens=False,
         )
     """
 
@@ -113,6 +113,27 @@ class FastIncrementalDecoder:
             return "", buffered + fresh, True
 
         return delta, [], False
+
+
+def _compute_suffix_delta(current_text: str, previous_text: str) -> str:
+    """Return the append-only delta from ``previous_text`` to ``current_text``.
+
+    Falls back to suffix-prefix overlap when strict prefix alignment fails to
+    avoid replaying already streamed text.
+    """
+
+    if not current_text:
+        return ""
+    if not previous_text:
+        return current_text
+    if current_text.startswith(previous_text):
+        return current_text[len(previous_text) :]
+
+    max_overlap = min(len(previous_text), len(current_text))
+    for overlap in range(max_overlap, 0, -1):
+        if previous_text.endswith(current_text[:overlap]):
+            return current_text[overlap:]
+    return ""
 
 
 def _tokenizer_worker(endpoint: str, tokenizer_path: str, tokenizer_kwargs: dict) -> None:
@@ -232,12 +253,8 @@ def _detokenizer_worker(
                             )
                         except TypeError:
                             full_decoded = tokenizer.decode(generated_tokens, skip_special_tokens=skip_special)
-                        if full_decoded.startswith(accumulated):
-                            delta = full_decoded[len(accumulated) :]
-                            accumulated = full_decoded
-                        else:
-                            delta = full_decoded
-                            accumulated = full_decoded
+                        delta = _compute_suffix_delta(full_decoded, accumulated)
+                        accumulated = full_decoded
                         states.pop(rid, None)
                     result = {
                         "accumulated_text": accumulated,

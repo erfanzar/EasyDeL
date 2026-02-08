@@ -24,7 +24,7 @@ HuggingFace reference:
 
 import math
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -112,24 +112,15 @@ class FalconMambaConfig(EasyDeLBaseConfig):
         )
         super().__init__(**kwargs)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Return regex-based parameter partition rules.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
 
-        These follow the standard EasyDeL linear sharding convention:
-        - Column-wise sharding for "expanding" projections (output dimension sharded).
-        - Row-wise sharding for "contracting" projections (input dimension sharded).
-        - Biases and norms replicated.
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embeddings/embedding", pmag.resolve(ColumnWise)),
-            (r"mixer/(in_proj|x_proj|dt_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mixer/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"mixer/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mixer/(A_log|D)", pmag.resolve(Replicated)),
-            (r"mixer/conv1d/(kernel|bias)", pmag.resolve(Replicated)),
-            (r"(norm|norm_f)/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

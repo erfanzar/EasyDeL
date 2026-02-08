@@ -628,9 +628,9 @@ class BaseInferenceApiServer(ABC):
         current_text = current_text or ""
 
         if current_text.startswith(previous_text):
+            # If accumulated text did not grow, emit nothing. Replaying fallback
+            # deltas here can duplicate previously streamed content.
             delta_text = current_text[len(previous_text) :]
-            if not delta_text:
-                delta_text = fallback_delta or ""
         else:
             if previous_text:
                 logger.warning(

@@ -15,7 +15,6 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -248,52 +247,15 @@ class WhisperConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Returns the partition rules for the Whisper model. Arguments are ignored.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-            tuple: Partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            ("model/encoder/conv[12]/kernel", PartitionSpec(None, "tp", ("fsdp", "sp"))),
-            (r"encoder/embed_positions/embedding", pmag.resolve(Replicated)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"fc1/kernel", pmag.resolve(ColumnWise)),
-            (r"fc2/kernel", pmag.resolve(RowWise)),
-            (r"fc(1|2)/bias", pmag.resolve(Replicated)),
-            (r"(self_attn_layer_norm|final_layer_norm)/scale", pmag.resolve(Replicated)),
-            (r"(self_attn_layer_norm|final_layer_norm)/bias", pmag.resolve(Replicated)),
-            (r"encoder/layer_norm/scale", pmag.resolve(Replicated)),
-            (r"encoder/layer_norm/bias", pmag.resolve(Replicated)),
-            (r"decoder/embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"decoder/embed_positions/embedding", pmag.resolve(Replicated)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"encoder_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"encoder_attn/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"encoder_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"fc1/kernel", pmag.resolve(ColumnWise)),
-            (r"fc2/kernel", pmag.resolve(RowWise)),
-            (r"fc(1|2)/bias", pmag.resolve(Replicated)),
-            (
-                r"(self_attn_layer_norm|encoder_attn_layer_norm|final_layer_norm)/scale",
-                pmag.resolve(Replicated),
-            ),
-            (
-                r"(self_attn_layer_norm|encoder_attn_layer_norm|final_layer_norm)/bias",
-                pmag.resolve(Replicated),
-            ),
-            (r"decoder/layer_norm/scale", pmag.resolve(Replicated)),
-            (r"decoder/layer_norm/bias", pmag.resolve(Replicated)),
-            (r"proj_out/kernel", pmag.resolve(ColumnWise)),
-            (r"projector/kernel", pmag.resolve(ColumnWise)),
-            (r"projector/bias", pmag.resolve(Replicated)),
-            (r"classifier/kernel", pmag.resolve(RowWise)),
-            (r"classifier/bias", pmag.resolve(Replicated)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

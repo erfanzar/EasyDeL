@@ -44,6 +44,7 @@ from functools import cached_property
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import Replicated
 from flax import nnx as nn
 from jaxtyping import Array, Bool, Float, Int
 
@@ -51,6 +52,7 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import VLMCausalLMOutput
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.base_modules import BaseVisionLanguageModule
+from easydel.layers.components.norms import LayerNorm
 
 from ..deepseek_v3.modeling_deepseek import DeepseekV3ForCausalLM
 from .kimi_vl_configuration import KimiVLConfig, MoonViTConfig
@@ -170,6 +172,10 @@ class Learnable2DInterpPosEmb(nn.Module):
             nn.initializers.normal()(rngs.params(), (dim, width, height), param_dtype),
         )
         self.dtype = dtype
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for position embedding parameters."""
+        return {"kernel": Replicated}
 
     def __call__(self, x: Array, grid_hws: Array) -> Array:
         """Add interpolated position embeddings to input features.
@@ -504,14 +510,14 @@ class MoonVitEncoderLayer(nn.Module):
         self.head_dim = hidden_dim // num_heads
         self.dtype = dtype
 
-        self.norm0 = nn.LayerNorm(
+        self.norm0 = LayerNorm(
             hidden_dim,
             epsilon=1e-5,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.norm1 = nn.LayerNorm(
+        self.norm1 = LayerNorm(
             hidden_dim,
             epsilon=1e-5,
             dtype=dtype,
@@ -664,22 +670,24 @@ class MoonVitEncoder(nn.Module):
         def activation(x):
             return jax.nn.gelu(x, approximate=True)
 
-        self.blocks = nn.List([
-            MoonVitEncoderLayer(
-                base_config=base_config,
-                num_heads=num_heads,
-                hidden_dim=hidden_dim,
-                mlp_dim=mlp_dim,
-                activation=activation,
-                attn_bias=True,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for _ in range(num_layers)
-        ])
-        self.final_layernorm = nn.LayerNorm(
+        self.blocks = nn.List(
+            [
+                MoonVitEncoderLayer(
+                    base_config=base_config,
+                    num_heads=num_heads,
+                    hidden_dim=hidden_dim,
+                    mlp_dim=mlp_dim,
+                    activation=activation,
+                    attn_bias=True,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.final_layernorm = LayerNorm(
             hidden_dim,
             epsilon=1e-5,
             dtype=dtype,
@@ -884,7 +892,7 @@ class KimiVLMultiModalProjector(nn.Module):
         hidden_size = config.vision_config.hidden_size * merge_kernel[0] * merge_kernel[1]
 
         self.hidden_size = hidden_size
-        self.pre_norm = nn.LayerNorm(
+        self.pre_norm = LayerNorm(
             config.vision_config.hidden_size,
             epsilon=1e-5,
             dtype=dtype,

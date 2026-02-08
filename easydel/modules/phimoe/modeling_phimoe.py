@@ -42,6 +42,7 @@ from easydel.layers.caching import (
 )
 from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.components import RMSNorm as RMSNorm
+from easydel.layers.components.norms import LayerNorm
 
 from .phimoe_configuration import PhiMoeConfig
 
@@ -213,16 +214,18 @@ class PhiMoeSparseMoeBlock(nn.Module):
             kernel_init=nn.initializers.normal(),
         )
 
-        self.experts = nn.List([
-            PhiMoEBlockSparseTop2MLP(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_local_experts)
-        ])
+        self.experts = nn.List(
+            [
+                PhiMoEBlockSparseTop2MLP(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_local_experts)
+            ]
+        )
 
     def __call__(
         self,
@@ -363,7 +366,7 @@ class PhiMoeDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.input_layernorm = nn.LayerNorm(
+        self.input_layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             dtype=dtype,
@@ -372,7 +375,7 @@ class PhiMoeDecoderLayer(nn.Module):
             rngs=rngs,
         )
 
-        self.post_attention_layernorm = nn.LayerNorm(
+        self.post_attention_layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             dtype=dtype,
@@ -507,18 +510,20 @@ class PhiMoeModel(EasyDeLBaseModule):
         )
 
         self.embed_dropout = nn.Dropout(config.embd_pdrop)
-        self.layers = nn.List([
-            PhiMoeDecoderLayer(
-                config=config,
-                layer_idx=idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for idx in range(self.config.num_hidden_layers)
-        ])
-        self.norm = nn.LayerNorm(
+        self.layers = nn.List(
+            [
+                PhiMoeDecoderLayer(
+                    config=config,
+                    layer_idx=idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for idx in range(self.config.num_hidden_layers)
+            ]
+        )
+        self.norm = LayerNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
             dtype=dtype,

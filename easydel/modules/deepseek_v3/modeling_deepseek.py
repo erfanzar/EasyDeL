@@ -20,6 +20,7 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -205,6 +206,13 @@ class MoEGate(nn.Module):
                 init_method="zeros",
                 key=rngs.params(),
             )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        kernel_spec = Replicated if self.config.use_expert_tensor_mode else ColumnWise
+        specs = {"kernel": kernel_spec}
+        if hasattr(self, "e_score_correction_bias"):
+            specs["e_score_correction_bias"] = Replicated
+        return specs
 
     def __call__(self, hidden_states):
         """Compute expert routing weights for input tokens.
@@ -931,17 +939,19 @@ class DeepseekV3Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = nn.List([
-            DeepseekV3DecoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                layer_idx=i,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                DeepseekV3DecoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    layer_idx=i,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,

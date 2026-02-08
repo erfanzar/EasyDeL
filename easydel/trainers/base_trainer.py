@@ -1970,7 +1970,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     self.model_state = self.model_state.replace(tx=self.tx)
 
                 shape = nn.eval_shape(lambda: self.model_state)
-                rules = self.model.config.get_partition_rules()
+                rules = self.model._get_partition_rules(None)
                 state_shardings = specs_to_name_sharding(match_partition_rules(rules, shape))
 
                 self.state_shardings = state_shardings
@@ -2609,7 +2609,7 @@ class BaseTrainer(BaseTrainerProtocol):
     def _format_partition_rules(self) -> str:
         """Format partition rules with proper indentation and formatting."""
         try:
-            return pprint.pformat(self.model.config.get_partition_rules(), indent=2, width=80)
+            return pprint.pformat(self.model._get_partition_rules(None), indent=2, width=80)
         except Exception as e:
             logger.error(f"Error formatting partition rules: {e!s}")
             return "Error retrieving partition rules"

@@ -18,6 +18,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -117,6 +118,9 @@ class RMSNorm(nn.Module):
             jnp.ndarray: RMS-normalized tensor.
         """
         return x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        return {"kernel": Replicated}
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """Apply RMS normalization with learnable scale.
@@ -505,17 +509,19 @@ class CohereModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = nn.List([
-            CohereBlock(
-                config=config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.List(
+            [
+                CohereBlock(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.layer_norm_eps,

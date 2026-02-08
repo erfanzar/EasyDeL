@@ -15,6 +15,7 @@
 
 import jax
 from eformer import common_types
+from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -57,6 +58,7 @@ from easydel.layers.caching import (
     TransformerMetadata,
 )
 from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.components.norms import LayerNorm
 
 from .roberta_configuration import RobertaConfig as RobertaConfig
 
@@ -76,7 +78,7 @@ class RobertaEmbeddings(nn.Module):
         word_embeddings (Embed): Token embedding layer.
         position_embeddings (Embed): Position embedding layer.
         token_type_embeddings (Embed): Token type (segment) embedding layer.
-        LayerNorm (nn.LayerNorm): Layer normalization applied after embedding sum.
+        LayerNorm (LayerNorm): Layer normalization applied after embedding sum.
         dropout (nn.Dropout): Dropout layer for regularization.
     """
 
@@ -117,7 +119,7 @@ class RobertaEmbeddings(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.LayerNorm = nn.LayerNorm(
+        self.LayerNorm = LayerNorm(
             self.config.hidden_size,
             epsilon=self.config.layer_norm_eps,
             param_dtype=param_dtype,
@@ -380,7 +382,7 @@ class RobertaSelfOutput(nn.Module):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (lax.Precision): Precision setting for JAX operations.
         dense (RowParallelLinear): Dense projection layer.
-        LayerNorm (nn.LayerNorm): Layer normalization for residual connection.
+        LayerNorm (LayerNorm): Layer normalization for residual connection.
         dropout (nn.Dropout): Dropout layer for regularization.
     """
 
@@ -406,7 +408,7 @@ class RobertaSelfOutput(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.LayerNorm = nn.LayerNorm(
+        self.LayerNorm = LayerNorm(
             self.config.hidden_size,
             epsilon=self.config.layer_norm_eps,
             dtype=dtype,
@@ -598,7 +600,7 @@ class RobertaOutput(nn.Module):
         precision (lax.Precision): Precision setting for JAX operations.
         dense (RowParallelLinear): Dense layer projecting back to hidden size.
         dropout (nn.Dropout): Dropout layer for regularization.
-        LayerNorm (nn.LayerNorm): Layer normalization for residual connection.
+        LayerNorm (LayerNorm): Layer normalization for residual connection.
     """
 
     def __init__(
@@ -627,7 +629,7 @@ class RobertaOutput(nn.Module):
             rate=self.config.hidden_dropout_prob,
             rngs=rngs,
         )
-        self.LayerNorm = nn.LayerNorm(
+        self.LayerNorm = LayerNorm(
             self.config.hidden_size,
             epsilon=self.config.layer_norm_eps,
             dtype=dtype,
@@ -829,16 +831,18 @@ class RobertaEncoder(nn.Module):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layer = nn.List([
-            block(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for _ in range(config.num_hidden_layers)
-        ])
+        self.layer = nn.List(
+            [
+                block(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
 
     def __call__(
         self,
@@ -1008,7 +1012,7 @@ class RobertaLMHead(nn.Module):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (lax.Precision): Precision setting for JAX operations.
         dense (RowParallelLinear): Dense transformation layer.
-        layer_norm (nn.LayerNorm): Layer normalization.
+        layer_norm (LayerNorm): Layer normalization.
         decoder (RowParallelLinear): Projection layer to vocabulary size.
         bias (ArrayParam): Output bias for vocabulary predictions.
     """
@@ -1035,7 +1039,7 @@ class RobertaLMHead(nn.Module):
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             rngs=rngs,
         )
-        self.layer_norm = nn.LayerNorm(
+        self.layer_norm = LayerNorm(
             self.config.hidden_size,
             epsilon=self.config.layer_norm_eps,
             dtype=dtype,
@@ -1058,6 +1062,10 @@ class RobertaLMHead(nn.Module):
             init_method="zeros",
             key=rngs.params(),
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for LM head bias."""
+        return {"bias": Replicated}
 
     def __call__(self, hidden_states, shared_embedding=None):
         """Forward pass of the RobertaLMHead.

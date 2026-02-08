@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -104,41 +103,15 @@ class PixtralVisionConfig(EasyDeLBaseConfig):
         self.head_dim = hidden_size // num_attention_heads
         self.initializer_range = initializer_range
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Get the partition rules for distributed training of the Pixtral vision model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
 
-        This method defines how model parameters should be partitioned across devices
-        for tensor parallelism. It specifies which dimensions of each parameter should
-        be sharded and which should be replicated.
-
-        Args:
-            *args: Additional positional arguments (unused).
-            **kwargs: Additional keyword arguments (unused).
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-            tuple: A tuple of tuples, where each inner tuple contains:
-                - str: Regular expression pattern matching parameter names
-                - PartitionSpec: Specification for how to partition the parameter
-
-        Note:
-            The partition rules follow these patterns:
-            - Query/Key/Value projections: Column-wise partitioning for parallelism
-            - Output projections: Row-wise partitioning to match column-wise inputs
-            - Feed-forward layers: Column-wise for gate/up, row-wise for down
-            - Normalization and biases: Replicated across all devices
-            - Patch convolution kernel: Partitioned on the output feature dimension
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            ("patch_conv/kernel", PartitionSpec(None, None, None, "tp")),
-            (r"ln_pre/kernel", pmag.resolve(Replicated)),
-            (r"transformer/layers/\d+/attention/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"transformer/layers/\d+/attention/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"transformer/layers/\d+/attention/.*proj/bias", pmag.resolve(Replicated)),
-            (r"transformer/layers/\d+/feed_forward/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"transformer/layers/\d+/feed_forward/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"transformer/layers/\d+/feed_forward/.*proj/bias", pmag.resolve(Replicated)),
-            (r"transformer/layers/\d+/(attention_norm|ffn_norm)/kernel", pmag.resolve(Replicated)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
