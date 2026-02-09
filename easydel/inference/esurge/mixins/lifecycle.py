@@ -23,11 +23,10 @@ from typing import Any
 
 import flax
 import jax
-from eformer.loggings import get_logger
 
+from ..logger import logger
 from ..scheduler import Scheduler, SchedulerOutput
 
-logger = get_logger("eSurgeEngine")
 MAX_CONSECUTIVE_SCHEDULER_ERRORS = int(os.environ.get("EASURGE_MAX_SCHEDULER_ERRORS", "5"))
 
 if typing.TYPE_CHECKING:

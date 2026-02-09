@@ -16,13 +16,10 @@ from __future__ import annotations
 
 import time
 
-from eformer.loggings import get_logger
-
 from ..engine_types import EngineCoreOutputs
+from ..logger import logger
 from ..metrics import get_metrics_collector
 from ..request import EngineRequestStatus
-
-logger = get_logger("eSurgeEngine")
 
 
 class EngineParsingMixin:

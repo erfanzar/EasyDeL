@@ -15,24 +15,234 @@
 from __future__ import annotations
 
 import copy
+import json
 import threading
 import time
 import typing
 from typing import Any
 
-from eformer.loggings import get_logger
-
 from easydel.inference.sampling_params import SamplingParams
 from easydel.workers.esurge.pipeline import DetokenizerResult
 
+from ..logger import logger
 from ..metrics import get_metrics_collector
 
-logger = get_logger("eSurgeEngine")
 WORKER_DRAIN_MAX_RETRIES = 3
 WORKER_DRAIN_INITIAL_DELAY = 0.1
 
 
 class EngineUtilsMixin:
+    @staticmethod
+    def _coerce_mapping_like(value: Any) -> Any:
+        """Coerce JSON-string payloads into mapping-like objects when possible."""
+
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except Exception:
+                return value
+            return parsed
+        return value
+
+    @staticmethod
+    def _normalize_chat_template_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Normalize message payloads for HF/Jinja chat template compatibility."""
+
+        normalized_messages: list[dict[str, Any]] = []
+        for message in messages:
+            msg = dict(message)
+
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list):
+                normalized_calls: list[dict[str, Any]] = []
+                for raw_call in tool_calls:
+                    if not isinstance(raw_call, dict):
+                        continue
+                    call = dict(raw_call)
+                    function_payload = call.get("function")
+                    if isinstance(function_payload, dict):
+                        function_dict = dict(function_payload)
+                        arguments = EngineUtilsMixin._coerce_mapping_like(function_dict.get("arguments"))
+                        if arguments is None:
+                            arguments = {}
+                        if not isinstance(arguments, dict):
+                            arguments = {"value": str(arguments)}
+                        function_dict["arguments"] = arguments
+                        call["function"] = function_dict
+                    elif isinstance(function_payload, str):
+                        coerced = EngineUtilsMixin._coerce_mapping_like(function_payload)
+                        if isinstance(coerced, dict):
+                            call["function"] = coerced
+                    normalized_calls.append(call)
+                msg["tool_calls"] = normalized_calls
+
+            function_call = msg.get("function_call")
+            if isinstance(function_call, dict):
+                fc = dict(function_call)
+                arguments = EngineUtilsMixin._coerce_mapping_like(fc.get("arguments"))
+                if isinstance(arguments, dict):
+                    fc["arguments"] = arguments
+                msg["function_call"] = fc
+
+            normalized_messages.append(msg)
+
+        return normalized_messages
+
+    @staticmethod
+    def _normalize_chat_template_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        """Normalize tool definitions for HF chat templates.
+
+        Some templates iterate on nested mapping fields (e.g. ``parameters.items()``).
+        This helper hardens tool payloads by ensuring those fields are dictionaries.
+        """
+
+        if not tools:
+            return None
+
+        normalized: list[dict[str, Any]] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+
+            candidate = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            if not isinstance(candidate, dict):
+                continue
+
+            payload = dict(candidate)
+            name = payload.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+
+            description = payload.get("description")
+            if description is not None and not isinstance(description, str):
+                payload["description"] = str(description)
+
+            parameters = payload.get("parameters", {})
+            if isinstance(parameters, str):
+                try:
+                    parsed = json.loads(parameters)
+                except Exception:
+                    parsed = {}
+                parameters = parsed if isinstance(parsed, dict) else {}
+            elif not isinstance(parameters, dict):
+                parameters = {}
+
+            properties = parameters.get("properties")
+            if isinstance(properties, str):
+                try:
+                    parsed_properties = json.loads(properties)
+                except Exception:
+                    parsed_properties = {}
+                properties = parsed_properties if isinstance(parsed_properties, dict) else {}
+            elif properties is not None and not isinstance(properties, dict):
+                properties = {}
+            if properties is not None:
+                parameters["properties"] = properties
+
+            required = parameters.get("required")
+            if isinstance(required, str):
+                parameters["required"] = [required]
+            elif required is not None and not isinstance(required, list):
+                parameters["required"] = []
+
+            payload["parameters"] = parameters
+            normalized.append(payload)
+
+        return normalized or None
+
+    @staticmethod
+    def _to_structured_text_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert message content into structured text-part arrays."""
+
+        normalized: list[dict[str, Any]] = []
+        for message in messages:
+            msg = dict(message)
+            content = msg.get("content")
+            if isinstance(content, str):
+                msg["content"] = [{"type": "text", "text": content}]
+            elif content is None:
+                msg["content"] = []
+            elif isinstance(content, dict):
+                msg["content"] = [content]
+            elif isinstance(content, list):
+                parts: list[dict[str, Any]] = []
+                for part in content:
+                    if isinstance(part, str):
+                        parts.append({"type": "text", "text": part})
+                        continue
+                    if not isinstance(part, dict):
+                        parts.append({"type": "text", "text": str(part)})
+                        continue
+                    part_type = part.get("type")
+                    if part_type in ("text", "input_text", "output_text"):
+                        text = part.get("text", part.get("content", ""))
+                        parts.append({"type": "text", "text": "" if text is None else str(text)})
+                    else:
+                        parts.append(part)
+                msg["content"] = parts
+            normalized.append(msg)
+        return normalized
+
+    @staticmethod
+    def _normalize_stop_sequences(stop: typing.Any) -> list[str]:
+        """Normalize stop input into a de-duplicated list of non-empty strings."""
+
+        if stop is None:
+            return []
+        if isinstance(stop, str):
+            candidates = [stop]
+        elif isinstance(stop, (list, tuple, set)):
+            candidates = list(stop)
+        else:
+            candidates = [stop]
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            value = candidate if isinstance(candidate, str) else str(candidate)
+            if value == "" or value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        return normalized
+
+    def _apply_extra_stops_to_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
+        """Merge engine-level stop strings into request sampling parameters."""
+
+        extra_stops = self._normalize_stop_sequences(getattr(self, "extra_stops", None))
+        if not extra_stops:
+            return sampling_params
+
+        merged = self._normalize_stop_sequences(getattr(sampling_params, "stop", None))
+        seen = set(merged)
+        for stop in extra_stops:
+            if stop in seen:
+                continue
+            seen.add(stop)
+            merged.append(stop)
+        sampling_params.stop = merged
+        return sampling_params
+
+    def _apply_generation_config_to_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
+        """Merge model generation-config EOS IDs into sampling stop-token policy."""
+
+        generation_config = getattr(self, "_generation_config_dict", None)
+        primary_eos_token_id = getattr(self, "_primary_eos_token_id", None)
+
+        if not generation_config and primary_eos_token_id is None:
+            return sampling_params
+
+        try:
+            sampling_params.update_with_generation_config(
+                generation_config or {},
+                model_eos_token_id=primary_eos_token_id,
+            )
+        except Exception:
+            logger.debug("Failed to merge generation_config EOS token IDs into sampling params", exc_info=True)
+        return sampling_params
+
     def _format_chat_prompt(
         self,
         messages: list[dict[str, str]],
@@ -75,14 +285,60 @@ class EngineUtilsMixin:
 
         if chat_template_kwargs is None:
             chat_template_kwargs = {}
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            tools=tools,
-            add_generation_prompt=add_generation_prompt,
-            chat_template=chat_template,
-            **chat_template_kwargs,
-        )
+        normalized_messages = self._normalize_chat_template_messages(messages)
+        normalized_tools = self._normalize_chat_template_tools(tools)
+        try:
+            return self.tokenizer.apply_chat_template(
+                normalized_messages,
+                tokenize=False,
+                tools=normalized_tools,
+                add_generation_prompt=add_generation_prompt,
+                chat_template=chat_template,
+                **chat_template_kwargs,
+            )
+        except Exception as exc:
+            # Some tokenizer chat templates expect `.items()` on tools/content parts
+            # and can fail when malformed payloads are passed in.
+            exc_text = str(exc)
+            if tools is None or ("has no attribute 'items'" not in exc_text and "items" not in exc_text):
+                raise
+
+            structured_messages = self._to_structured_text_messages(normalized_messages)
+
+            retries = [
+                ("normalized_tools", normalized_messages, normalized_tools),
+                ("structured_messages", structured_messages, normalized_tools),
+                ("structured_messages+normalized_tools", structured_messages, normalized_tools),
+                ("structured_messages_no_tools", structured_messages, None),
+            ]
+            if len(normalized_tools or []) != len(tools or []):
+                logger.warning(
+                    "Malformed tool entries detected in chat template tools "
+                    "(kept=%d dropped=%d); trying sanitized fallback.",
+                    len(normalized_tools or []),
+                    len(tools or []) - len(normalized_tools or []),
+                )
+
+            last_error: Exception = exc
+            for label, retry_messages, retry_tools in retries:
+                try:
+                    prompt = self.tokenizer.apply_chat_template(
+                        retry_messages,
+                        tokenize=False,
+                        tools=retry_tools,
+                        add_generation_prompt=add_generation_prompt,
+                        chat_template=chat_template,
+                        **chat_template_kwargs,
+                    )
+                    logger.warning("Recovered chat template rendering via %s fallback.", label)
+                    return prompt
+                except Exception as retry_exc:
+                    retry_text = str(retry_exc)
+                    if "has no attribute 'items'" not in retry_text and "items" not in retry_text:
+                        raise
+                    last_error = retry_exc
+
+            raise last_error from exc
 
     def _tokenize_prompt(self, request_id: str, prompt: str) -> list[int]:
         """Tokenize a prompt string using the worker pipeline.
@@ -192,14 +448,28 @@ class EngineUtilsMixin:
 
         current_text = current_text or ""
         previous_text = previous_text or ""
+        fallback_delta = fallback_delta or ""
 
         if current_text.startswith(previous_text):
             return current_text[len(previous_text) :]
+
+        if not current_text and previous_text and not fallback_delta:
+            # Tool-call parsers can collapse previously emitted protocol markup
+            # into empty visible content; treat as benign rollback.
+            return ""
 
         max_overlap = min(len(previous_text), len(current_text))
         for overlap in range(max_overlap, 0, -1):
             if previous_text.endswith(current_text[:overlap]):
                 return current_text[overlap:]
+
+        if len(current_text) < len(previous_text):
+            # Parser normalization can rewrite previously emitted snapshots into a
+            # shorter canonical form (e.g. stripping protocol/control markup).
+            # Treat as benign realignment and avoid noisy warnings.
+            if fallback_delta and not previous_text.endswith(fallback_delta):
+                return fallback_delta
+            return ""
 
         if previous_text:
             logger.warning(
@@ -416,15 +686,21 @@ class EngineUtilsMixin:
         """
         params = self._clone_sampling_params(template)
         callback = self._sampling_params_callback
+
+        def _finalize(prepared: SamplingParams) -> SamplingParams:
+            prepared = self._apply_extra_stops_to_sampling_params(prepared)
+            prepared = self._apply_generation_config_to_sampling_params(prepared)
+            return prepared
+
         if callback is None:
-            return params
+            return _finalize(params)
 
         metadata = {"request_id": request_id, "prompt": prompt, "engine": self}
         try:
             result = callback(params, metadata)
             if result is None:
-                return params
-            return result
+                return _finalize(params)
+            return _finalize(result)
         except Exception:
             logger.exception("Sampling params callback failed; falling back to unmodified parameters")
-            return params
+            return _finalize(params)

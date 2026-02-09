@@ -337,7 +337,7 @@ class ChatCompletionStreamResponseChoice(OpenAIBaseModel):
 
     index: int
     delta: DeltaMessage
-    finish_reason: tp.Literal["stop", "length", "function_call", "finished"] | None = None
+    finish_reason: tp.Literal["stop", "length", "function_call", "tool_calls", "finished", "abort"] | None = None
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):
@@ -516,7 +516,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
     text: str
     index: int
     logprobs: CompletionLogprobs | None = None
-    finish_reason: tp.Literal["stop", "length", "function_call", "finished"] | None = None
+    finish_reason: tp.Literal["stop", "length", "function_call", "tool_calls", "finished", "abort"] | None = None
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -552,7 +552,7 @@ class CompletionStreamResponseChoice(OpenAIBaseModel):
     index: int
     text: str  # The delta text content
     logprobs: CompletionLogprobs | None = None
-    finish_reason: tp.Literal["stop", "length", "function_call", "finished"] | None = None
+    finish_reason: tp.Literal["stop", "length", "function_call", "tool_calls", "finished", "abort"] | None = None
 
 
 class CompletionStreamResponse(OpenAIBaseModel):

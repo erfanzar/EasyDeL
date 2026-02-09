@@ -9,6 +9,14 @@ class _StopPolicyHarness(EngineParsingMixin, EngineUtilsMixin):
     pass
 
 
+class _SamplingParamsHarness(EngineUtilsMixin):
+    def __init__(self, extra_stops=None, callback=None, generation_config=None, primary_eos_token_id=None):
+        self.extra_stops = self._normalize_stop_sequences(extra_stops)
+        self._sampling_params_callback = callback
+        self._generation_config_dict = generation_config or {}
+        self._primary_eos_token_id = primary_eos_token_id
+
+
 def test_check_stop_with_custom_stop_token_id():
     sampling_params = SamplingParams(max_tokens=16, stop_token_ids=[42], ignore_eos=True)
     request = EngineRequest(
@@ -89,3 +97,81 @@ def test_stop_string_policy_can_include_stop_string_when_requested():
     assert stop_reason == "<user>"
     assert visible_text == "ans<user>"
     assert visible_delta == "ans<user>"
+
+
+def test_snapshot_delta_handles_empty_reset_without_fallback():
+    harness = _StopPolicyHarness()
+
+    delta = harness._compute_snapshot_delta_text(
+        current_text="",
+        previous_text="tool markup before parser normalization",
+        fallback_delta="",
+    )
+
+    assert delta == ""
+
+
+def test_prepare_sampling_params_for_request_merges_engine_extra_stops():
+    harness = _SamplingParamsHarness(extra_stops=["<user>", "DONE"])
+    template = SamplingParams(max_tokens=64, stop=["DONE", "</assistant>"])
+
+    prepared = harness._prepare_sampling_params_for_request(
+        template,
+        request_id="req-extra-stops",
+        prompt="hello",
+    )
+
+    assert prepared.stop == ["DONE", "</assistant>", "<user>"]
+    assert template.stop == ["DONE", "</assistant>"]
+
+
+def test_prepare_sampling_params_for_request_applies_callback_then_extra_stops():
+    def _callback(params: SamplingParams, _metadata):
+        params.stop = ["CALLBACK_STOP"]
+        return params
+
+    harness = _SamplingParamsHarness(extra_stops="<user>", callback=_callback)
+    template = SamplingParams(max_tokens=64, stop=["INITIAL"])
+
+    prepared = harness._prepare_sampling_params_for_request(
+        template,
+        request_id="req-extra-stops-callback",
+        prompt="hello",
+    )
+
+    assert prepared.stop == ["CALLBACK_STOP", "<user>"]
+
+
+def test_prepare_sampling_params_for_request_merges_generation_config_eos_ids():
+    harness = _SamplingParamsHarness(
+        generation_config={"eos_token_id": [154820, 154827, 154829]},
+        primary_eos_token_id=154820,
+    )
+    template = SamplingParams(max_tokens=64, stop_token_ids=[777])
+
+    prepared = harness._prepare_sampling_params_for_request(
+        template,
+        request_id="req-generation-config-eos",
+        prompt="hello",
+    )
+
+    assert set(prepared.stop_token_ids) == {777, 154827, 154829}
+    assert prepared.all_stop_token_ids == {777, 154820, 154827, 154829}
+    assert template.stop_token_ids == [777]
+
+
+def test_prepare_sampling_params_respects_ignore_eos_for_generation_config_ids():
+    harness = _SamplingParamsHarness(
+        generation_config={"eos_token_id": [154820, 154827]},
+        primary_eos_token_id=154820,
+    )
+    template = SamplingParams(max_tokens=64, stop_token_ids=[777], ignore_eos=True)
+
+    prepared = harness._prepare_sampling_params_for_request(
+        template,
+        request_id="req-generation-config-ignore-eos",
+        prompt="hello",
+    )
+
+    assert set(prepared.stop_token_ids) == {777}
+    assert prepared.all_stop_token_ids == {777, 154820}

@@ -20,15 +20,12 @@ import typing
 import uuid
 from typing import Any
 
-from eformer.loggings import get_logger
-
 from easydel.inference.sampling_params import SamplingParams
 
+from ..logger import logger
 from ..metrics import get_metrics_collector, log_metrics_summary
 from ..request import EngineRequest, EngineRequestStatus
 from ..utils import truncate_tokens
-
-logger = get_logger("eSurgeEngine")
 
 
 def _set_requested_new(sp, n: int):
@@ -155,7 +152,8 @@ class EngineRequestsMixin:
                 max_model_len,
             )
 
-        allowed_new_if_keep_prompt = max(0, max_model_len - prompt_len)
+        # Keep prompt *and* reserve safety margin when capping new tokens.
+        allowed_new_if_keep_prompt = max(0, max_model_len - prompt_len - self.reserve_tokens)
 
         if requested_new > allowed_new_if_keep_prompt:
             do_cap_first = self.prefer_preserve_prompt or not self.auto_truncate_prompt
@@ -299,25 +297,28 @@ class EngineRequestsMixin:
                 delta_seq=0,
             )
 
-        # Prepare EOS token IDs: merge tokenizer default with extra_eos_token_ids
-        eos_token_ids = []
-        if self.tokenizer.eos_token_id is not None:
-            if isinstance(self.tokenizer.eos_token_id, list):
-                eos_token_ids.extend(self.tokenizer.eos_token_id)
-            else:
-                eos_token_ids.append(self.tokenizer.eos_token_id)
-        eos_token_ids.extend(self.extra_eos_token_ids)
+        # Prepare EOS token IDs from engine-normalized EOS set
+        eos_token_ids = [int(tid) for tid in (getattr(self, "_eos_ids", None) or []) if tid is not None]
+
+        if not eos_token_ids:
+            eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+            fallback_ids = eos_token_id if isinstance(eos_token_id, list) else [eos_token_id]
+            eos_token_ids = [int(tid) for tid in fallback_ids if tid is not None]
 
         # Use the first EOS token as the primary one for backwards compatibility
-        primary_eos_token_id = eos_token_ids[0] if eos_token_ids else None
+        primary_eos_token_id = eos_token_ids[0] if eos_token_ids else getattr(self, "_primary_eos_token_id", None)
 
         # Add all EOS tokens to sampling_params.stop_token_ids if not already present
         if eos_token_ids:
-            current_stop_ids = set(sampling_params.stop_token_ids)
+            current_stop_ids = set(sampling_params.stop_token_ids or [])
+            all_stop_ids = getattr(sampling_params, "_all_stop_token_ids", None)
+            if all_stop_ids is None:
+                all_stop_ids = set(current_stop_ids)
+                sampling_params._all_stop_token_ids = all_stop_ids
             for eos_id in eos_token_ids:
                 if eos_id not in current_stop_ids:
                     sampling_params.stop_token_ids.append(eos_id)
-                    sampling_params._all_stop_token_ids.add(eos_id)
+                    all_stop_ids.add(eos_id)
 
         # Create n EngineRequest objects for parallel sampling
         mm_features_cache_key_only = None

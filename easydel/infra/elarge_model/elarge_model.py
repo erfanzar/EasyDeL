@@ -600,6 +600,8 @@ class eLargeModel:
                 - reasoning_parser: Name of reasoning parser for extracting
                   chain-of-thought content (e.g., "deepseek_r1", "qwen3", "mistral").
                   See ``ReasoningParserManager`` for available parsers.
+                - extra_stops: Global stop strings (e.g., ["<|user|>"]) merged
+                  into request SamplingParams.stop at runtime.
 
         Returns:
             Self for method chaining

@@ -276,15 +276,41 @@ class ToolCallingMixin:
         current_token_ids = current_token_ids or []
         delta_token_ids = delta_token_ids or []
 
-        return tool_parser.extract_tool_calls_streaming(
-            previous_text=previous_text,
-            current_text=current_text,
-            delta_text=delta_text,
-            previous_token_ids=previous_token_ids,
-            current_token_ids=current_token_ids,
-            delta_token_ids=delta_token_ids,
-            request=request,
-        )
+        try:
+            delta = tool_parser.extract_tool_calls_streaming(
+                previous_text=previous_text,
+                current_text=current_text,
+                delta_text=delta_text,
+                previous_token_ids=previous_token_ids,
+                current_token_ids=current_token_ids,
+                delta_token_ids=delta_token_ids,
+                request=request,
+            )
+        except Exception:
+            logger.debug(
+                "Tool parser streaming extraction failed for model %s; falling back to raw text delta.",
+                model_name,
+                exc_info=True,
+            )
+            return DeltaMessage(content=delta_text)
+
+        if delta is None or isinstance(delta, DeltaMessage):
+            return delta
+        if isinstance(delta, str):
+            return DeltaMessage(content=delta)
+        if isinstance(delta, dict):
+            try:
+                return DeltaMessage(**delta)
+            except Exception:
+                return DeltaMessage(content=delta_text)
+        if hasattr(delta, "model_dump"):
+            payload = delta.model_dump(exclude_unset=True, exclude_none=True)
+            if isinstance(payload, dict):
+                try:
+                    return DeltaMessage(**payload)
+                except Exception:
+                    return DeltaMessage(content=delta_text)
+        return DeltaMessage(content=delta_text)
 
     def get_tool_parser_for_model(self, model_name: str) -> ToolParser | None:
         """Get the tool parser instance for a specific model.
