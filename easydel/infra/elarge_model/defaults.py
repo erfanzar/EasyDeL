@@ -118,6 +118,7 @@ DEFAULTS: ELMConfig = {
         "hbm_utilization": 0.80,
         "page_size": 128,
         "enable_prefix_caching": True,
+        "extra_stops": None,
         "verbose": False,
     },
     # Mixture configuration: Settings for data loading and mixing during training.

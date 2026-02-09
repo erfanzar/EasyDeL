@@ -241,7 +241,7 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         - Caching: enable_prefix_caching, destroy_pages_on_pause
         - Execution: compile_runner, overlap_execution, use_aot_forward
         - Truncation: auto_truncate_prompt, truncate_mode, strict_context
-        - Tokenization: detokenizer_max_states, extra_eos_token_ids
+        - Tokenization: detokenizer_max_states, extra_eos_token_ids, extra_stops
         - Parsing: tool_parser, reasoning_parser
 
     Args:
@@ -327,6 +327,13 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     if extra_eos_token_ids is not None:
         extra_eos_token_ids = list(extra_eos_token_ids)
 
+    extra_stops = es.get("extra_stops")
+    if extra_stops is not None and not isinstance(extra_stops, str):
+        if isinstance(extra_stops, (list, tuple, set)):
+            extra_stops = list(extra_stops)
+        else:
+            extra_stops = [str(extra_stops)]
+
     runner_verbose = bool(es.get("runner_verbose", es.get("verbose", False)))
     truncate_mode = es.get("truncate_mode", "left")
 
@@ -367,6 +374,7 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         detokenizer_endpoint=es.get("detokenizer_endpoint"),
         sampling_params_callback=es.get("sampling_params_callback"),
         extra_eos_token_ids=extra_eos_token_ids,
+        extra_stops=extra_stops,
         silent_mode=False if silent_mode_val is None else bool(silent_mode_val),
         tool_parser=es.get("tool_parser"),
         reasoning_parser=es.get("reasoning_parser"),

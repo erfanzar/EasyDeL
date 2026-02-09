@@ -73,7 +73,6 @@ from typing import Any
 
 import jax
 from eformer.common_types import NOT_GIVEN, _Empty
-from eformer.loggings import get_logger
 from jax import numpy as jnp
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
@@ -81,6 +80,7 @@ from easydel.inference.sampling_params import SamplingParams
 from easydel.utils import Registry
 from easydel.workers.esurge.pipeline import WorkerManager
 
+from .logger import logger
 from .mixins import (
     EngineIOMixin,
     EngineLifecycleMixin,
@@ -95,8 +95,6 @@ from .scheduler import Scheduler
 
 if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
-
-logger = get_logger("eSurgeEngine")
 
 # Configuration constants
 DEFAULT_DETOKENIZER_MAX_STATES = 1 << 16  # 65536 states for streaming decode
@@ -299,6 +297,7 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
         idle_reset_min_interval: float = 60.0,
         sampling_params_callback: SamplingCallable = None,
         extra_eos_token_ids: list[int] | None = None,
+        extra_stops: str | list[str] | None = None,
         silent_mode: bool = False,
         processor: Any | None = None,
         resolution_buckets: list[tuple[int, int]] | None = None,
@@ -374,6 +373,9 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
             extra_eos_token_ids: Additional EOS token IDs beyond the tokenizer's default.
                 These will be treated as end-of-sequence tokens for all requests unless
                 overridden in SamplingParams.
+            extra_stops: Additional stop strings applied to every request. These are
+                merged into per-request ``SamplingParams.stop`` at runtime and
+                de-duplicated while preserving existing stop order.
             silent_mode: If True, suppress informational eSurge engine logs.
             processor: Unified text/multimodal processor. Can be a tokenizer or an
                 HF processor (with an embedded tokenizer). If None, falls back to
@@ -680,6 +682,7 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
         self.prefer_preserve_prompt = prefer_preserve_prompt
         self.decode_truncated_prompt = decode_truncated_prompt
         self.extra_eos_token_ids = extra_eos_token_ids or []
+        self.extra_stops = self._normalize_stop_sequences(extra_stops)
         # Locks and signals
         self._scheduler_lock = threading.RLock()
         self._request_lock = threading.RLock()
@@ -692,10 +695,51 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
         self._scheduler_running = False
         self._scheduler_exception: BaseException | None = None
         self._scheduler_exception_tb: str | None = None
-        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
 
-        self.__eos_ids = eos_token_id if isinstance(eos_token_id, (list, tuple, set)) else [eos_token_id]
-        self.__eos_set = {int(tid) for tid in self.__eos_ids if tid is not None}
+        generation_config = getattr(model, "generation_config", None)
+        if isinstance(generation_config, dict):
+            self._generation_config_dict = dict(generation_config)
+        elif generation_config is not None and hasattr(generation_config, "to_dict"):
+            try:
+                self._generation_config_dict = generation_config.to_dict()
+            except Exception:
+                self._generation_config_dict = {}
+                logger.debug("Failed to serialize model generation_config; continuing without it", exc_info=True)
+        else:
+            self._generation_config_dict = {}
+
+        def _coerce_token_ids(raw: Any) -> list[int]:
+            if raw is None:
+                return []
+            candidates = raw if isinstance(raw, (list, tuple, set)) else [raw]
+            token_ids: list[int] = []
+            for candidate in candidates:
+                if candidate is None:
+                    continue
+                try:
+                    token_id = int(candidate)
+                except (TypeError, ValueError):
+                    logger.debug("Ignoring non-integer EOS token candidate: %r", candidate)
+                    continue
+                token_ids.append(token_id)
+            return token_ids
+
+        tokenizer_eos_ids = _coerce_token_ids(getattr(self.tokenizer, "eos_token_id", None))
+        generation_config_eos_ids = _coerce_token_ids(self._generation_config_dict.get("eos_token_id"))
+        engine_extra_eos_ids = _coerce_token_ids(self.extra_eos_token_ids)
+
+        combined_eos_ids: list[int] = []
+        seen_eos_ids: set[int] = set()
+        for token_id in [*tokenizer_eos_ids, *generation_config_eos_ids, *engine_extra_eos_ids]:
+            if token_id in seen_eos_ids:
+                continue
+            seen_eos_ids.add(token_id)
+            combined_eos_ids.append(token_id)
+
+        self._generation_config_eos_token_ids = generation_config_eos_ids
+        self.__eos_ids = combined_eos_ids
+        self.__eos_set = set(combined_eos_ids)
+        self._primary_eos_token_id = self.__eos_ids[0] if self.__eos_ids else None
         # Publicly-named aliases for mixins/helpers to avoid class-name mangling.
         self._eos_ids = self.__eos_ids
         self._eos_set = self.__eos_set
@@ -878,6 +922,7 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
             f"prefer_preserve_prompt={self.prefer_preserve_prompt}",
             f"decode_truncated_prompt={self.decode_truncated_prompt}",
             f"extra_eos_token_ids={self.extra_eos_token_ids}",
+            f"extra_stops={self.extra_stops!r}",
             f"scheduler_running={self._scheduler_running}",
         ]
         return "eSurge(\n  " + ",\n  ".join(attrs) + "\n)"

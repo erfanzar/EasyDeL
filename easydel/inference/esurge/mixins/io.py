@@ -404,6 +404,7 @@ class EngineIOMixin:
                 chat_template_kwargs=chat_template_kwargs,
             )
         else:
+
             prompt = self._format_chat_prompt(
                 messages,
                 tools=tools,
@@ -411,6 +412,7 @@ class EngineIOMixin:
                 chat_template=chat_template,
                 chat_template_kwargs=chat_template_kwargs,
             )
+
             if stream:
                 return self.stream(prompt, sampling_params=sampling_params, request_id=request_id)
             else:

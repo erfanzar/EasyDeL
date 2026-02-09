@@ -776,6 +776,9 @@ class eSurgeCfg(TypedDict, total=False):
             modified params or None.
         extra_eos_token_ids: Additional EOS token IDs applied globally.
             Useful for models with multiple stopping tokens.
+        extra_stops: Additional stop strings applied globally to every request.
+            Useful for enforcing delimiters like ``"<|user|>"`` without setting
+            request-level stop values each time.
         silent_mode: Suppress informational eSurge engine logs.
             Only errors will be logged.
         tool_parser: Name of the tool-call parser for automatic function-call
@@ -848,6 +851,7 @@ class eSurgeCfg(TypedDict, total=False):
     detokenizer_endpoint: NotRequired[str | None]
     sampling_params_callback: NotRequired[tp.Callable[[SamplingParams, dict[str, tp.Any]], SamplingParams | None] | None]
     extra_eos_token_ids: NotRequired[list[int] | None]
+    extra_stops: NotRequired[str | list[str] | None]
     silent_mode: NotRequired[bool]
     tool_parser: NotRequired[str | None]
     reasoning_parser: NotRequired[str | None]

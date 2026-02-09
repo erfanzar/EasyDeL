@@ -78,6 +78,7 @@ from huggingface_hub import CommitOperationAdd, create_branch, create_commit
 from huggingface_hub.utils import HfHubHTTPError
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
+
 try:
     from transformers.utils.generic import working_or_temp_dir
 except ImportError:  # transformers>=5 removed helper
@@ -96,13 +97,16 @@ except ImportError:  # transformers>=5 removed helper
         else:
             os.makedirs(working_dir, exist_ok=True)
             yield working_dir
+
+
 from transformers.utils.hub import PushToHubMixin
 
 from easydel.layers.components import QuantizationConfig
 from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
 from easydel.utils.traversals import flatten_dict, is_flatten, merge_model_and_tree, string_key_to_int, unflatten_dict
 
-from ..base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict, download_url as _download_url, is_remote_url
+from ..base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict, is_remote_url
+from ..base_config import download_url as _download_url
 from ..etils import EasyDeLBackends, EasyDeLPlatforms
 
 if tp.TYPE_CHECKING:
@@ -158,6 +162,84 @@ class StreamingCheckpointInfo:
     generation_config: tp.Any
     pretrained_model_name_or_path: str
     resolve_shard: tp.Callable[[str, str | None], str]
+
+
+def _save_generation_config(generation_config: tp.Any, save_directory: ePathLike) -> None:
+    """Persist generation config with EasyDeL path handling (local and remote filesystems)."""
+    if generation_config is None:
+        return
+
+    output_path = ePath(save_directory) / GENERATION_CONFIG_NAME
+    try:
+        if isinstance(generation_config, dict):
+            output_path.write_text(json.dumps(generation_config, indent=2, sort_keys=True))
+            return
+        if hasattr(generation_config, "to_json_string"):
+            output_path.write_text(generation_config.to_json_string(use_diff=False))
+            return
+        if hasattr(generation_config, "to_dict"):
+            output_path.write_text(json.dumps(generation_config.to_dict(), indent=2, sort_keys=True))
+            return
+        generation_config.save_pretrained(str(save_directory))
+    except Exception:
+        logger.warning(
+            "Failed to save generation config at %s via EasyDeL writer; trying transformers save_pretrained.",
+            output_path,
+            exc_info=True,
+        )
+        generation_config.save_pretrained(str(save_directory))
+
+
+def _load_generation_config(
+    pretrained_model_name_or_path: str | os.PathLike,
+    *,
+    subfolder: str = "",
+    trust_remote_code: bool | None = None,
+    log_missing: bool = False,
+    **hf_kwargs,
+):
+    """Load generation config with ePath-first lookup (supports GCS paths)."""
+    from transformers import GenerationConfig
+
+    model_path = ePath(str(pretrained_model_name_or_path))
+    normalized_subfolder = str(subfolder or "").strip("/")
+    candidates: list[ePath] = []  # type:ignore
+    if normalized_subfolder:
+        candidates.append(model_path / normalized_subfolder / GENERATION_CONFIG_NAME)
+    candidates.append(model_path / GENERATION_CONFIG_NAME)
+
+    for candidate in candidates:
+        try:
+            if not candidate.exists():
+                continue
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return GenerationConfig.from_dict(payload)
+            logger.warning("Invalid generation config payload at %s (expected JSON object).", candidate)
+        except Exception:
+            logger.warning(
+                "Failed to load generation config from %s; falling back to transformers loader.",
+                candidate,
+                exc_info=True,
+            )
+
+    loader_kwargs = dict(hf_kwargs)
+    if normalized_subfolder:
+        loader_kwargs["subfolder"] = normalized_subfolder
+    elif "subfolder" in loader_kwargs:
+        loader_kwargs.pop("subfolder")
+    if trust_remote_code is not None:
+        loader_kwargs["trust_remote_code"] = trust_remote_code
+
+    try:
+        return GenerationConfig.from_pretrained(str(pretrained_model_name_or_path), **loader_kwargs)
+    except OSError:
+        if log_missing:
+            logger.warning(
+                "generation_config.json not found for '%s'; falling back to model-config defaults.",
+                pretrained_model_name_or_path,
+            )
+        return None
 
 
 def _parse_torch_load_options(kwargs: dict[str, tp.Any]) -> TorchLoadOptions:
@@ -285,7 +367,7 @@ class EasyBridgeMixin(PushToHubMixin):
 
         if self.can_generate() and hasattr(self, "generation_config"):
             if self.generation_config is not None:
-                self.generation_config.save_pretrained(str(save_directory))
+                _save_generation_config(self.generation_config, save_directory)
 
         state = nn.split(self, nn.Param, ...)[1]  # NOTE: This one here ignores LoRA Params...
         if gather_fns is None:
@@ -843,6 +925,7 @@ class EasyBridgeMixin(PushToHubMixin):
 
         from huggingface_hub import HfApi
         from transformers import GenerationConfig
+
         try:
             from transformers.utils import is_offline_mode as _is_offline_mode
         except ImportError:  # transformers>=5 moved to utils.hub
@@ -1048,22 +1131,25 @@ class EasyBridgeMixin(PushToHubMixin):
             raise_error=False,
         )
         if model.can_generate():
-            try:
-                model.generation_config = GenerationConfig.from_pretrained(
-                    pretrained_model_name_or_path,
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    proxies=proxies,
-                    local_files_only=local_files_only,
-                    token=token,
-                    revision=revision,
-                    subfolder=subfolder,
-                    _from_auto=from_auto_class,
-                    _from_pipeline=from_pipeline,
-                    **kwargs,
-                )
-            except OSError:
-                logger.info("Generation config file not found, using a generation config created from the model config.")
+            model.generation_config = _load_generation_config(
+                pretrained_model_name_or_path,
+                cache_dir=cache_dir,
+                force_download=force_download,
+                proxies=proxies,
+                local_files_only=local_files_only,
+                token=token,
+                revision=revision,
+                subfolder=subfolder,
+                _from_auto=from_auto_class,
+                _from_pipeline=from_pipeline,
+                log_missing=True,
+                **kwargs,
+            )
+            if model.generation_config is None:
+                try:
+                    model.generation_config = GenerationConfig.from_model_config(model.config)
+                except Exception:
+                    logger.debug("Failed to build fallback generation config from model.config", exc_info=True)
         if auto_shard_model:
             # double check to make sure weights are correct or just a simple non-op.
             model = model.shard_model(partition_rules=partition_rules)
@@ -1326,8 +1412,6 @@ class EasyBridgeMixin(PushToHubMixin):
             FileNotFoundError: If no valid PyTorch checkpoint files can be found.
             ValueError: If the shard index file is invalid (missing weight_map).
         """
-        from transformers import GenerationConfig
-
         logger.debug(f"Resolving checkpoint files (streaming) for {pretrained_model_name_or_path}")
 
         ckpt_weight_format: tp.Literal["safetensors", "bin"] | None = None
@@ -1459,10 +1543,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 ckpt_filename_to_path[WEIGHTS_NAME] = resolved_single_file
 
         ed_config = config_class.from_pretrained(pretrained_model_name_or_path, **hub_kwargs)
-        try:
-            generation_config = GenerationConfig.from_pretrained(pretrained_model_name_or_path, **hub_kwargs)
-        except Exception:
-            generation_config = None
+        generation_config = _load_generation_config(pretrained_model_name_or_path, **hub_kwargs)
 
         return StreamingCheckpointInfo(
             ckpt_weight_format=ckpt_weight_format,
@@ -1924,7 +2005,7 @@ class EasyBridgeMixin(PushToHubMixin):
         from huggingface_hub.errors import EntryNotFoundError
         from jax.experimental.array_serialization import serialization as jax_ser
         from jax.experimental.array_serialization import tensorstore_impl as ts_impl
-        from transformers import AutoConfig, GenerationConfig
+        from transformers import AutoConfig
 
         from easydel.modules.auto.auto_configuration import get_modules_by_type
         from easydel.utils.parameters_transformation import StateDictConverter, TensorConverter
@@ -1970,15 +2051,11 @@ class EasyBridgeMixin(PushToHubMixin):
         model_type: str = hf_config.model_type
         ed_config_cls, module = get_modules_by_type(model_type, task_type=cls._model_task)
 
-        generation_config = None
-        try:
-            generation_config = GenerationConfig.from_pretrained(
-                pretrained_model_name_or_path,
-                trust_remote_code=trust_remote_code,
-                **hub_kwargs,
-            )
-        except Exception:
-            generation_config = None
+        generation_config = _load_generation_config(
+            pretrained_model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **hub_kwargs,
+        )
 
         ed_config: EasyDeLBaseConfig = ed_config_cls.from_pretrained(
             pretrained_model_name_or_path,
@@ -2279,7 +2356,7 @@ class EasyBridgeMixin(PushToHubMixin):
             config_to_save.architectures = [module.__name__]
             config_to_save.save_pretrained(str(save_root))
             if generation_config is not None:
-                generation_config.save_pretrained(str(save_root))
+                _save_generation_config(generation_config, save_root)
 
         _save_configs()
 

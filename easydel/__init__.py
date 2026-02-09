@@ -1063,7 +1063,9 @@ else:
     del _eform_version
 
 
-if _check_bool_flag("ENABLE_DISTRIBUTED_INIT", True):
+# Keep import side effects minimal: distributed/JAX backend initialization is opt-in.
+_distributed_init_enabled = _check_bool_flag("ENABLE_DISTRIBUTED_INIT", False)
+if _distributed_init_enabled:
     from eformer.executor import DistributedConfig as _DistributedConfig
 
     try:
@@ -1074,13 +1076,18 @@ if _check_bool_flag("ENABLE_DISTRIBUTED_INIT", True):
         _logger.warning("Failed to initialize jax-dist")
     del _DistributedConfig
 else:
-    _logger.info(
+    _distributed_msg = (
         "Skipping initialization of `DistributedConfig` (ENABLE_DISTRIBUTED_INIT=0), "
         "you can initialize that via `ed.init_cluster()`."
     )
+    if "ENABLE_DISTRIBUTED_INIT" in _os.environ:
+        _logger.info(_distributed_msg)
+    else:
+        _logger.debug(_distributed_msg)
 
 
 del _os
 del _logger
 del _LazyModule
 del _is_package_available
+del _distributed_init_enabled

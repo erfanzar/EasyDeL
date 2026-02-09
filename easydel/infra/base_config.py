@@ -1793,7 +1793,14 @@ class EasyDeLBaseConfig(PretrainedConfig):
         if easy_directory.is_file():
             raise AssertionError(f"Provided path ({save_directory}) should be a directory, not a file")
 
-        non_default_generation_parameters = self._get_non_default_generation_parameters()
+        non_default_generation_parameters_getter = getattr(self, "_get_non_default_generation_parameters", None)
+        if callable(non_default_generation_parameters_getter):
+            non_default_generation_parameters = non_default_generation_parameters_getter()
+        else:
+            generation_parameters_getter = getattr(self, "_get_generation_parameters", None)
+            non_default_generation_parameters = (
+                generation_parameters_getter() if callable(generation_parameters_getter) else {}
+            )
         if len(non_default_generation_parameters) > 0:
             warnings.warn(
                 "Some non-default generation parameters are set in the model config. These should go into either a) "

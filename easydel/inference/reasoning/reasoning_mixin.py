@@ -88,15 +88,35 @@ class ReasoningMixin:
             return None
 
         parser = self.reasoning_parsers[model_name]
-        return parser.extract_reasoning_streaming(
-            previous_text=previous_text,
-            current_text=current_text,
-            delta_text=delta_text,
-            previous_token_ids=previous_token_ids or [],
-            current_token_ids=current_token_ids or [],
-            delta_token_ids=delta_token_ids or [],
-            request=request,
-        )
+        try:
+            delta = parser.extract_reasoning_streaming(
+                previous_text=previous_text,
+                current_text=current_text,
+                delta_text=delta_text,
+                previous_token_ids=previous_token_ids or [],
+                current_token_ids=current_token_ids or [],
+                delta_token_ids=delta_token_ids or [],
+                request=request,
+            )
+        except Exception:
+            return DeltaMessage(content=delta_text)
+        if delta is None or isinstance(delta, DeltaMessage):
+            return delta
+        if isinstance(delta, str):
+            return DeltaMessage(reasoning_content=delta)
+        if isinstance(delta, dict):
+            try:
+                return DeltaMessage(**delta)
+            except Exception:
+                return DeltaMessage(content=delta_text)
+        if hasattr(delta, "model_dump"):
+            payload = delta.model_dump(exclude_unset=True, exclude_none=True)
+            if isinstance(payload, dict):
+                try:
+                    return DeltaMessage(**payload)
+                except Exception:
+                    return DeltaMessage(content=delta_text)
+        return DeltaMessage(content=delta_text)
 
     def get_reasoning_parser_for_model(self, model_name: str) -> ReasoningParser | None:
         if not hasattr(self, "reasoning_parsers"):
