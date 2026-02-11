@@ -181,7 +181,7 @@ class CPOTrainer(Trainer):
         empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
-            quantization_block=self.arguments.quantization_block,
+            quantization_group_size=self.arguments.quantization_group_size,
             tensor_straight_through=self.arguments.tensor_straight_through,
             straight_through_emulator=self.arguments.straight_through_emulator,
         )

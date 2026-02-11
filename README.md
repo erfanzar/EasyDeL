@@ -234,7 +234,7 @@ AutoEasyDeLConfig                        # Auto configuration
 
 ### Quick Start TL; DR
 
-1. **Install**: `uv pip install "easydel[gpu]"` (or `[tpu]` , `[torch]` , `[lm_eval]` as needed).
+1. **Install**: `uv pip install "easydel[cuda]"` (or `[tpu]` , `[torch]` , `[lm_eval]` as needed).
 2. **Serve**: Jump to [Inference Example](#inference-example) to run eSurge with streaming.
 3. **Fine-tune**: Try [Supervised Fine-Tuning](#training-example---supervised-fine-tuning), or align with [DPO](#training-example---preference-optimization-dpo)/[GRPO](#training-example---reinforcement-learning-grpo).
 
@@ -245,7 +245,7 @@ AutoEasyDeLConfig                        # Auto configuration
 uv pip install easydel
 
 # With GPU support
-uv pip install easydel[gpu]
+uv pip install easydel[cuda]
 
 # With TPU support
 uv pip install easydel[tpu]
@@ -258,7 +258,7 @@ uv pip install easydel[lm_eval]
 ```
 
 > [!NOTE]
-> Choose `[gpu]` for NVIDIA GPUs with Triton kernels, or `[tpu]` for Google TPUs with Pallas kernels. The `[torch]` extra enables PyTorch model conversion via `from_torch=True`.
+> Choose `[cuda]` for NVIDIA GPUs with Triton kernels, or `[tpu]` for Google TPUs with Pallas kernels. The `[torch]` extra enables PyTorch model conversion via `from_torch=True`.
 
 ### Inference Example
 

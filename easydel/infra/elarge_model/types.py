@@ -86,7 +86,9 @@ from .trainer_types import TrainerConfig
 if tp.TYPE_CHECKING:
     from ejkernel.modules.operations.configs import BaseOperationConfig
 
+    from easydel.inference.reasoning.abstract_reasoning import ReasoningParserName
     from easydel.inference.sampling_params import SamplingParams
+    from easydel.inference.tools.abstract_tool import ToolParserName
 
 DTypeLike = tp.Union[  # noqa
     str,
@@ -853,8 +855,8 @@ class eSurgeCfg(TypedDict, total=False):
     extra_eos_token_ids: NotRequired[list[int] | None]
     extra_stops: NotRequired[str | list[str] | None]
     silent_mode: NotRequired[bool]
-    tool_parser: NotRequired[str | None]
-    reasoning_parser: NotRequired[str | None]
+    tool_parser: NotRequired[ToolParserName | None]
+    reasoning_parser: NotRequired[ReasoningParserName | None]
 
 
 class TextDatasetInformCfg(TypedDict, total=False):

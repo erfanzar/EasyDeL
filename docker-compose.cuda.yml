@@ -1,13 +1,13 @@
 services:
-  easydel-gpu:
+  easydel-cuda:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        HARDWARE_TYPE: gpu
+        HARDWARE_TYPE: cuda
         PYTHON_VERSION: ${PYTHON_VERSION:-3.13}
-    image: easydel:gpu-cuda12.8
-    container_name: easydel-gpu
+    image: easydel:cuda
+    container_name: easydel-cuda
     stdin_open: true
     tty: true
     privileged: true
@@ -27,6 +27,5 @@ services:
       - /dev/nvidia-modeset
     working_dir: /workspace
     environment:
-      - CUDA_VISIBLE_DEVICES=0
       - JAX_PLATFORM_NAME=cuda
     command: bash

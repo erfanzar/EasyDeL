@@ -95,6 +95,8 @@ from .scheduler import Scheduler
 
 if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
+    from easydel.inference.reasoning.abstract_reasoning import ReasoningParserName
+    from easydel.inference.tools.abstract_tool import ToolParserName
 
 # Configuration constants
 DEFAULT_DETOKENIZER_MAX_STATES = 1 << 16  # 65536 states for streaming decode
@@ -302,8 +304,8 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
         processor: Any | None = None,
         resolution_buckets: list[tuple[int, int]] | None = None,
         vision_cache_capacity_mb: int = 1024,
-        tool_parser: str | None = None,
-        reasoning_parser: str | None = None,
+        tool_parser: ToolParserName | None = None,
+        reasoning_parser: ReasoningParserName | None = None,
         **kwargs,
     ):
         """Initialize the eSurge engine.

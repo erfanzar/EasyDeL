@@ -72,9 +72,9 @@ Example:
 from .blocksparse_attention import BlockSparseAttn
 from .decode_attention import AutoRegressiveDecodeAttn
 from .flash_attention import FlashAttn
-from .paged_flash_attention import PagedFlashAttn
 from .gated_delta_rule import GatedDeltaRuleOp, GatedDeltaRuleOutput
 from .kda import KDAOutput, KernelDeltaAttnOp, fused_kda_gate
+from .paged_flash_attention import PagedFlashAttn
 from .ragged_page_attention import RaggedPageAttnV2, RaggedPageAttnV3
 from .ring_attention import RingAttn
 from .scaled_dot_product_attention import ScaledDotProductAttn

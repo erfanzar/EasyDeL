@@ -195,13 +195,13 @@ class DPOConfig(TrainingArguments):
         metadata={"help": "Additional tools for training process."},
     )
 
-    def __post_init__(self, max_sequence_length: int | None):
+    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
         """Post-initialization processing to derive dependent parameters."""
         self._handle_deprecated_max_sequence_length(max_sequence_length)
         if self.max_completion_length is None:
             self.max_completion_length = self.max_length - self.max_prompt_length
         # Call the post_init of the parent class if it exists. Important for inheritance
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=None)
+            super().__post_init__(max_sequence_length=None, quantization_block=quantization_block)
 
     __hash__ = hash_fn

@@ -47,6 +47,7 @@ Example:
 from __future__ import annotations
 
 import typing as tp
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -58,6 +59,7 @@ from flax import nnx as nn
 from flax.nnx import rnglib
 from flax.nnx.nn import initializers
 from flax.typing import Dtype, Initializer, PrecisionLike
+from jax import shard_map
 
 from ..quants._configs import QuantizationType, resolve_ejkernel_quant_params
 from ..quants._quants import quantize
@@ -73,6 +75,203 @@ Size = int
 
 default_kernel_init = initializers.lecun_normal()
 default_bias_init = initializers.zeros_init()
+
+
+def _mesh_matches(lhs: jax.sharding.Mesh, rhs: jax.sharding.Mesh) -> bool:
+    if lhs.axis_names != rhs.axis_names:
+        return False
+    if lhs.devices.shape != rhs.devices.shape:
+        return False
+
+    lhs_fingerprint = tuple(
+        (
+            getattr(device, "process_index", None),
+            getattr(device, "id", None),
+            getattr(device, "platform", None),
+            getattr(device, "device_kind", None),
+        )
+        for device in lhs.devices.flat
+    )
+    rhs_fingerprint = tuple(
+        (
+            getattr(device, "process_index", None),
+            getattr(device, "id", None),
+            getattr(device, "platform", None),
+            getattr(device, "device_kind", None),
+        )
+        for device in rhs.devices.flat
+    )
+    return lhs_fingerprint == rhs_fingerprint
+
+
+def _pick_mesh_from_arrays(*arrays: jax.Array | None) -> jax.sharding.Mesh | None:
+    for array in arrays:
+        if array is None:
+            continue
+        sharding = getattr(array, "sharding", None)
+        if isinstance(sharding, jax.sharding.NamedSharding):
+            return sharding.mesh
+    try:
+        from eformer.escale import get_incontext_mesh
+
+        mesh = get_incontext_mesh(raise_error=False)
+        if getattr(mesh, "empty", True):
+            return None
+        return mesh
+    except Exception:
+        return None
+
+
+def _spec_for_mesh(array: jax.Array | None, mesh: jax.sharding.Mesh) -> jax.sharding.PartitionSpec:
+    if array is None:
+        return jax.sharding.PartitionSpec()
+    sharding = getattr(array, "sharding", None)
+    if isinstance(sharding, jax.sharding.NamedSharding) and _mesh_matches(sharding.mesh, mesh):
+        return sharding.spec
+    return jax.sharding.PartitionSpec()
+
+
+def _spec_is_sharded(spec: jax.sharding.PartitionSpec) -> bool:
+    return any(axis is not None for axis in tuple(spec))
+
+
+def _spec_matches_kernel_parallel_layout(
+    kernel_spec: jax.sharding.PartitionSpec,
+    aux_spec: jax.sharding.PartitionSpec,
+    direction: tp.Literal["row", "column"] | None,
+) -> bool:
+    """Return whether aux tensor sharding is compatible with kernel sharding.
+
+    Quantized kernels, scales, and affine zero-points are packed with matching
+    `(in_features, out_features_*)` semantics. When the kernel is sharded, aux
+    tensors must use the same partitioning so local ejkernel calls see aligned
+    shard-local shapes.
+    """
+    if direction not in {"row", "column"}:
+        return False
+
+    kernel_tuple = tuple(kernel_spec)
+    aux_tuple = tuple(aux_spec)
+    kernel_is_sharded = _spec_is_sharded(kernel_spec)
+    aux_is_sharded = _spec_is_sharded(aux_spec)
+
+    if not kernel_is_sharded:
+        # Keep replicated aux params on the non-distributed path.
+        return True
+    if not aux_is_sharded:
+        return False
+
+    # Require exact parallel layout when entering shard_map.
+    return kernel_tuple == aux_tuple
+
+
+def _axis_names(axis_spec: tp.Any) -> tuple[str, ...]:
+    if axis_spec is None:
+        return ()
+    if isinstance(axis_spec, str):
+        return (axis_spec,)
+    if isinstance(axis_spec, (list, tuple)):
+        return tuple(axis for axis in axis_spec if isinstance(axis, str))
+    return ()
+
+
+def _extract_tp_axis_name(
+    kernel_spec: jax.sharding.PartitionSpec,
+    direction: tp.Literal["row", "column"] | None,
+    mesh: jax.sharding.Mesh,
+) -> str | None:
+    if direction not in {"row", "column"}:
+        return None
+    dim = 0 if direction == "row" else 1
+    if len(kernel_spec) <= dim:
+        return None
+    axis = kernel_spec[dim]
+    if axis is None:
+        return None
+    candidates = _axis_names(axis)
+
+    # Prefer canonical tensor axis name when available.
+    for candidate in candidates:
+        if candidate == "tp" and candidate in mesh.axis_names and mesh.shape[candidate] > 1:
+            return candidate
+    for candidate in candidates:
+        if candidate in mesh.axis_names and mesh.shape[candidate] > 1:
+            return candidate
+    return None
+
+
+def _quantized_linear_sharding_fn(
+    *,
+    direction: tp.Literal["row", "column"] | None,
+    param_name: str,
+    mode: str,
+    group_size: int,
+    needs_biases: bool,
+) -> tp.Any | None:
+    """Return sharding dynamic-axes for a quantized linear parameter.
+
+    Notes:
+        - `prepack_quantized_weights(..., transpose=False)` stores packed tensors in
+          `(in_features, out_features_*)` layout for all supported modes.
+        - `group_size` only changes the grouped output extent (`out_features_*`), not
+          the sharded axis semantics.
+    """
+    if direction is None:
+        return None
+
+    # Validate supported grouped quantization modes early.
+    if mode not in {"affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"}:
+        return None
+    if group_size <= 0:
+        raise ValueError(f"`group_size` must be > 0, got {group_size}.")
+
+    if param_name == "bias":
+        return Replicated
+
+    if param_name == "quant_biases" and not needs_biases:
+        # Non-affine modes do not materialize per-group zero/bias tensors.
+        return None
+
+    if param_name in {"quant_kernel", "quant_scales", "quant_biases"}:
+        return RowWise if direction == "row" else ColumnWise
+
+    return None
+
+
+def _quantized_linear_craft_spec(
+    *,
+    direction: tp.Literal["row", "column"] | None,
+    use_bias: bool,
+    mode: str,
+    group_size: int,
+    needs_biases: bool,
+) -> dict[str, tp.Any]:
+    """Craft dynamic sharding specs for quantized linear parameters."""
+    specs: dict[str, tp.Any] = {}
+
+    for param_name in ("quant_kernel", "quant_scales", "quant_biases"):
+        spec = _quantized_linear_sharding_fn(
+            direction=direction,
+            param_name=param_name,
+            mode=mode,
+            group_size=group_size,
+            needs_biases=needs_biases,
+        )
+        if spec is not None:
+            specs[param_name] = spec
+
+    if use_bias:
+        spec = _quantized_linear_sharding_fn(
+            direction=direction,
+            param_name="bias",
+            mode=mode,
+            group_size=group_size,
+            needs_biases=needs_biases,
+        )
+        if spec is not None:
+            specs["bias"] = spec
+
+    return specs
 
 
 class ParallelLinearQuantized(nn.Module):
@@ -373,6 +572,164 @@ class ParallelLinearQuantized(nn.Module):
             self.bias.value = bias_value
         return self
 
+    def _distributed_quantized_matmul(
+        self,
+        inputs_2d: Array,
+        kernel_value: Array,
+        scale_value: Array,
+        bias_value: Array | None,
+        *,
+        group_size: int,
+        bits: int,
+        mode: str,
+    ) -> Array:
+        """Run quantized matmul under shard_map with explicit TP communication.
+
+        Quantized CUDA/Pallas kernels are invoked on local shards only; cross-shard
+        semantics are restored with collectives:
+            - row parallel: reduce partial outputs with `psum` on TP
+            - column parallel: gather TP-sharded inputs when needed
+        """
+        platform = "auto"
+
+        if jax.default_backend() == "tpu":
+            platform = "xla"
+
+        def _fallback() -> Array:
+            return ej_quantized_matmul(
+                inputs_2d,
+                kernel_value,
+                scale_value,
+                bias_value,
+                transpose=False,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+                platform=platform,
+            )
+
+        mesh = _pick_mesh_from_arrays(inputs_2d, kernel_value, scale_value, bias_value)
+        if mesh is None:
+            return _fallback()
+
+        input_spec = _spec_for_mesh(inputs_2d, mesh)
+        kernel_spec = _spec_for_mesh(kernel_value, mesh)
+        scale_spec = _spec_for_mesh(scale_value, mesh)
+        bias_spec = _spec_for_mesh(bias_value, mesh)
+
+        distributed = any(_spec_is_sharded(spec) for spec in (input_spec, kernel_spec, scale_spec, bias_spec))
+        if not distributed or self._direction not in {"row", "column"}:
+            return _fallback()
+
+        if not _spec_matches_kernel_parallel_layout(kernel_spec, scale_spec, self._direction):
+            return _fallback()
+        if bias_value is not None and not _spec_matches_kernel_parallel_layout(kernel_spec, bias_spec, self._direction):
+            return _fallback()
+
+        tp_axis_name = _extract_tp_axis_name(kernel_spec, self._direction, mesh)
+        if self._direction in {"row", "column"}:
+            kernel_k_axes = _axis_names(kernel_spec[0] if len(kernel_spec) > 0 else None)
+            input_k_axes = _axis_names(input_spec[-1] if len(input_spec) > 0 else None)
+            unsupported_k_axes = {axis for axis in (*kernel_k_axes, *input_k_axes) if axis != tp_axis_name}
+            if unsupported_k_axes:
+                return _fallback()
+        if self._direction == "row" and tp_axis_name is not None:
+            input_batch_axes = _axis_names(input_spec[0] if len(input_spec) > 0 else None)
+            # Row-parallel reduction assumes the mapped batch dimension is local.
+            # If TP shards batch too, psum would combine different examples.
+            if tp_axis_name in input_batch_axes:
+                return _fallback()
+
+        output_spec = jax.sharding.PartitionSpec(
+            input_spec[0] if len(input_spec) > 0 else None,
+            kernel_spec[1] if len(kernel_spec) > 1 else None,
+        )
+
+        def _prepare_inputs_for_kernel(local_inputs: Array, local_kernel: Array) -> Array:
+            if local_inputs.shape[-1] == local_kernel.shape[0]:
+                return local_inputs
+
+            if self._direction == "column":
+                if tp_axis_name is None:
+                    raise ValueError("Column-parallel quantized matmul requires a TP axis to reconcile local K sizes.")
+                # Column-parallel kernels keep full K and shard N; gather K when TP-sharded.
+                return jax.lax.all_gather(local_inputs, tp_axis_name, axis=-1, tiled=True)
+
+            # Row-parallel kernels shard K; slice local K chunk when inputs are replicated.
+            if tp_axis_name is None:
+                raise ValueError("Row-parallel quantized matmul requires a TP axis to reconcile local K sizes.")
+            if local_inputs.shape[-1] % local_kernel.shape[0] != 0:
+                raise ValueError(
+                    "Row-parallel quantized matmul got incompatible local K sizes: "
+                    f"input={local_inputs.shape[-1]} kernel={local_kernel.shape[0]}."
+                )
+            shard_index = jax.lax.axis_index(tp_axis_name)
+            start = shard_index * local_kernel.shape[0]
+            return jax.lax.dynamic_slice_in_dim(local_inputs, start, local_kernel.shape[0], axis=-1)
+
+        if bias_value is None:
+
+            @partial(
+                shard_map,
+                mesh=mesh,
+                in_specs=(input_spec, kernel_spec, scale_spec),
+                out_specs=output_spec,
+                check_vma=False,
+            )
+            def _mapped(
+                local_inputs: Array,
+                local_kernel: Array,
+                local_scales: Array,
+            ) -> Array:
+                local_inputs = _prepare_inputs_for_kernel(local_inputs, local_kernel)
+                out = ej_quantized_matmul(
+                    local_inputs,
+                    local_kernel,
+                    local_scales,
+                    None,
+                    transpose=False,
+                    group_size=group_size,
+                    bits=bits,
+                    mode=mode,
+                    platform=platform,
+                )
+                if tp_axis_name is not None and self._direction == "row":
+                    out = jax.lax.psum(out.astype(jnp.float32), tp_axis_name).astype(out.dtype)
+                return out
+
+            return _mapped(inputs_2d, kernel_value, scale_value)
+
+        @partial(
+            shard_map,
+            mesh=mesh,
+            in_specs=(input_spec, kernel_spec, scale_spec, bias_spec),
+            out_specs=output_spec,
+            check_vma=False,
+        )
+        def _mapped(
+            local_inputs: Array,
+            local_kernel: Array,
+            local_scales: Array,
+            local_biases: Array,
+        ) -> Array:
+            local_inputs = _prepare_inputs_for_kernel(local_inputs, local_kernel)
+            out = ej_quantized_matmul(
+                local_inputs,
+                local_kernel,
+                local_scales,
+                local_biases,
+                transpose=False,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+                platform=platform,
+            )
+            if tp_axis_name is not None and self._direction == "row":
+                out = jax.lax.psum(out.astype(jnp.float32), tp_axis_name).astype(out.dtype)
+            return out
+
+        return _mapped(inputs_2d, kernel_value, scale_value, bias_value)
+
     @jax.named_scope("easydel-linear-quantized-call")
     def __call__(self, inputs: Array, w: Array | None = None) -> Array:
         """Apply the quantized linear transformation to inputs.
@@ -419,16 +776,14 @@ class ParallelLinearQuantized(nn.Module):
             if needs_biases and bias_value is None:
                 raise ValueError("Affine quantization requires quant_biases; re-quantize the module weights.")
 
-            out = ej_quantized_matmul(
+            out = self._distributed_quantized_matmul(
                 inputs.reshape((-1, inputs.shape[-1])),
                 kernel_value,
                 scale_value,
                 bias_value,
-                transpose=False,
                 group_size=group_size,
                 bits=bits,
                 mode=mode,
-                platform="auto",
             ).reshape((*inputs.shape[:-1], self.out_features))
 
             if self.dtype is not None:
@@ -446,20 +801,14 @@ class ParallelLinearQuantized(nn.Module):
         """Return dynamic partition specs for quantized parameters."""
         if self._direction is None:
             return {}
-        if self._direction == "row":
-            kernel_spec = RowWise
-        elif self._direction == "column":
-            kernel_spec = ColumnWise
-        else:
-            return {}
-        specs: dict[str, tp.Any] = {
-            "quant_kernel": kernel_spec,
-            "quant_scales": Replicated,
-            "quant_biases": Replicated,
-        }
-        if self.use_bias:
-            specs["bias"] = Replicated
-        return specs
+        mode, group_size, _bits, needs_biases = self._resolve_ejkernel_params()
+        return _quantized_linear_craft_spec(
+            direction=self._direction,
+            use_bias=self.use_bias,
+            mode=mode,
+            group_size=group_size,
+            needs_biases=needs_biases,
+        )
 
     @property
     def wqdtype(self) -> QuantizationType:

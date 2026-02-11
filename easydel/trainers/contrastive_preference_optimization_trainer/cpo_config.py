@@ -133,7 +133,7 @@ class CPOConfig(TrainingArguments):
         metadata={"help": "Number of processes used when tokenising datasets (datasets.map `num_proc`)."},
     )
 
-    def __post_init__(self, max_sequence_length: int | None):
+    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
         self._handle_deprecated_max_sequence_length(max_sequence_length)
         if self.max_length is not None and self.max_prompt_length is not None:
             if self.max_completion_length is None:
@@ -145,6 +145,6 @@ class CPOConfig(TrainingArguments):
             self.cpo_alpha = 0.0
 
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=None)
+            super().__post_init__(max_sequence_length=None, quantization_block=quantization_block)
 
     __hash__ = hash_fn

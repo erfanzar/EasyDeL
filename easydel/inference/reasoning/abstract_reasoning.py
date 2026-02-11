@@ -32,11 +32,38 @@ import os
 import sys
 from collections.abc import Callable, Sequence
 from functools import cached_property
-from typing import Literal, assert_never
+from typing import Literal, TypeAlias, assert_never
 
 from transformers import AutoTokenizer as AnyTokenizer
 
 from ..openai_api_modules import DeltaMessage
+
+ReasoningParserName: TypeAlias = Literal[
+    "deepseek_r1",
+    "deepseek-r1",
+    "deepseek_v3",
+    "glm45",
+    "holo2",
+    "kimi_k2",
+    "qwen3",
+    "qwen3_reasoning",
+    "granite",
+    "olmo3",
+    "mistral",
+    "seed_oss",
+    "ernie45",
+    "step3p5",
+    "step3.5",
+    "openai_gptoss",
+    "gptoss",
+    "identity",
+    "none",
+    "passthrough",
+    "minimax_m2",
+    "minimax_m2_append_think",
+    "step3",
+    "hunyuan_a13b",
+]
 
 
 class ReasoningParser:
