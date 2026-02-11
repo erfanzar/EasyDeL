@@ -56,11 +56,49 @@ import os
 import sys
 from collections.abc import Callable, Sequence
 from functools import cached_property
-from typing import Literal, assert_never
+from typing import Literal, TypeAlias, assert_never
 
 from transformers import AutoTokenizer as AnyTokenizer
 
 from ..openai_api_modules import ChatCompletionRequest, DeltaMessage, ExtractedToolCallInformation
+
+ToolParserName: TypeAlias = Literal[
+    "glm47",
+    "glm-4.7",
+    "openai",
+    "phi4_mini_json",
+    "qwen3_xml",
+    "pythonic",
+    "deepseek_v3",
+    "step3",
+    "internlm",
+    "xlam",
+    "glm45",
+    "glm-4.5",
+    "gigachat3",
+    "minimax_m2",
+    "deepseek_v31",
+    "jamba",
+    "ernie45",
+    "llama3_json",
+    "llama4_json",
+    "granite-20b-fc",
+    "deepseek_v32",
+    "kimi_k2",
+    "minimax",
+    "longcat",
+    "granite",
+    "olmo3",
+    "hunyuan_a13b",
+    "step3p5",
+    "step3.5",
+    "seed_oss",
+    "hermes",
+    "qwen3_coder",
+    "functiongemma",
+    "llama4_pythonic",
+    "mistral",
+]
 
 
 class ToolParser:

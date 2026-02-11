@@ -65,11 +65,14 @@ if typing.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset
 
     from easydel.data.core.protocols import ShardedDataSource
+    from easydel.inference.reasoning.abstract_reasoning import ReasoningParserName
     from easydel.inference import eSurge
+    from easydel.inference.tools.abstract_tool import ToolParserName
     from easydel.trainers import Trainer
 
     from .types import TextDatasetInformCfg, VisualDatasetInformCfg
 logger = get_logger("eLargeModel")
+_ESURGE_UNSET = object()
 
 
 class BuildTrainerKws(typing.TypedDict, total=False):
@@ -575,6 +578,8 @@ class eLargeModel:
         max_model_len: int | None = None,
         max_num_seqs: int = 16,
         hbm_utilization: float = 0.85,
+        tool_parser: ToolParserName | None | object = _ESURGE_UNSET,
+        reasoning_parser: ReasoningParserName | None | object = _ESURGE_UNSET,
         **kwargs,
     ) -> eLargeModel:
         """Configure eSurge inference settings.
@@ -589,6 +594,11 @@ class eLargeModel:
                 Higher values increase throughput but require more memory.
             hbm_utilization: HBM memory utilization ratio (0.0-1.0).
                 Controls how much device memory to use for KV cache.
+            tool_parser: Tool parser name to use for automatic function-call
+                extraction. Pass None to clear a previously configured parser.
+            reasoning_parser: Reasoning parser name to use for separating
+                reasoning content from final response content. Pass None to
+                clear a previously configured parser.
             **kwargs: Additional eSurge options:
                 - page_size: PagedAttention page size (default: 128)
                 - enable_prefix_caching: Enable prefix caching optimization
@@ -620,6 +630,10 @@ class eLargeModel:
         esurge["max_num_seqs"] = max_num_seqs
         esurge["hbm_utilization"] = hbm_utilization
         esurge.update(kwargs)
+        if tool_parser is not _ESURGE_UNSET:
+            esurge["tool_parser"] = tool_parser
+        if reasoning_parser is not _ESURGE_UNSET:
+            esurge["reasoning_parser"] = reasoning_parser
         return self
 
     def set_mixture(

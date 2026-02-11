@@ -1,6 +1,6 @@
 import pytest
 
-from easydel.inference.esurge.esurge_engine import eSurge
+from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
 from easydel.inference.reasoning.abstract_reasoning import ReasoningParserManager
 from easydel.inference.reasoning.parsers import (
     DeepSeekR1ReasoningParser,
@@ -19,6 +19,10 @@ from easydel.inference.reasoning.parsers import (
     Step3p5ReasoningParser,
     Step3ReasoningParser,
 )
+
+
+class _ParsingHarness(EngineParsingMixin):
+    pass
 
 
 class _DummyTokenizer:
@@ -1021,7 +1025,7 @@ def test_qwen3_no_assume_strict_still_works(dummy_tokenizer):
 def test_esurge_output_parsers_hide_reasoning_delta_for_prompt_context(dummy_tokenizer):
     parser = DeepSeekR1ReasoningParser(dummy_tokenizer)
     parser.configure_prompt_context(prompt_text="...<think>", prompt_token_ids=[1])
-    engine = object.__new__(eSurge)
+    engine = _ParsingHarness()
 
     rd = {
         "reasoning_parser_instance": parser,
@@ -1032,8 +1036,7 @@ def test_esurge_output_parsers_hide_reasoning_delta_for_prompt_context(dummy_tok
         "accumulated_content": "",
     }
 
-    first = eSurge._run_output_parsers(
-        engine,
+    first = engine._run_output_parsers(
         rd=rd,
         accumulated_text="thinking",
         delta_text="thinking",
@@ -1044,8 +1047,7 @@ def test_esurge_output_parsers_hide_reasoning_delta_for_prompt_context(dummy_tok
     assert first["delta_content"] == ""
     assert first["accumulated_content"] == ""
 
-    second = eSurge._run_output_parsers(
-        engine,
+    second = engine._run_output_parsers(
         rd=rd,
         accumulated_text="thinking</think>answer",
         delta_text="</think>answer",
@@ -1055,6 +1057,56 @@ def test_esurge_output_parsers_hide_reasoning_delta_for_prompt_context(dummy_tok
     assert second["delta_reasoning"] is None
     assert second["delta_content"] == "answer"
     assert second["accumulated_content"] == "answer"
+
+
+def test_esurge_output_parsers_dont_leak_standalone_start_token(dummy_tokenizer):
+    parser = DeepSeekR1ReasoningParser(dummy_tokenizer)
+    engine = _ParsingHarness()
+
+    rd = {
+        "reasoning_parser_instance": parser,
+        "tool_parser_instance": None,
+        "parser_previous_text": "",
+        "parser_previous_token_ids": [],
+        "accumulated_reasoning": "",
+        "accumulated_content": "",
+    }
+
+    result = engine._run_output_parsers(
+        rd=rd,
+        accumulated_text="<think>",
+        delta_text="<think>",
+        token_ids=[1],
+        finished=False,
+    )
+    assert result["delta_reasoning"] is None
+    assert result["delta_content"] == ""
+    assert result["accumulated_content"] == ""
+
+
+def test_esurge_output_parsers_step3_reasoning_only_delta_is_not_text(dummy_tokenizer):
+    parser = Step3ReasoningParser(dummy_tokenizer)
+    engine = _ParsingHarness()
+
+    rd = {
+        "reasoning_parser_instance": parser,
+        "tool_parser_instance": None,
+        "parser_previous_text": "",
+        "parser_previous_token_ids": [],
+        "accumulated_reasoning": "",
+        "accumulated_content": "",
+    }
+
+    result = engine._run_output_parsers(
+        rd=rd,
+        accumulated_text="thinking",
+        delta_text="thinking",
+        token_ids=[100],
+        finished=False,
+    )
+    assert result["delta_reasoning"] == "thinking"
+    assert result["delta_content"] == ""
+    assert result["accumulated_content"] == ""
 
 
 def test_granite_streaming_thought_then_response(dummy_tokenizer):

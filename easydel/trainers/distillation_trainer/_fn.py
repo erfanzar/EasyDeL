@@ -191,6 +191,7 @@ def distillation_step(
     attention_weight: float = 0.0,
     attention_layers: tuple[int, ...] | None = None,
     attention_normalize: bool = False,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics]:
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
@@ -203,6 +204,8 @@ def distillation_step(
         raise ValueError(f"Unsupported hidden state loss '{hidden_state_loss}'. Only 'mse' is available.")
 
     def loss_fn(tree, minibatch):
+        if is_training and straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
         module = flax.nnx.merge(student_state.graphdef, tree, student_state.graphother)
         request_hidden_states = hidden_state_weight != 0.0
         request_attentions = attention_weight != 0.0

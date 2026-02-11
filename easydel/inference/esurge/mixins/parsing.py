@@ -158,13 +158,26 @@ class EngineParsingMixin:
                                 rd.get("accumulated_reasoning", "") + delta_msg.reasoning_content
                             )
 
-                    # Extract content portion for tool parser
                     reasoning, content = reasoning_parser.extract_reasoning(accumulated_text)
-                    if content is None:
+                    reasoning_only_delta = (
+                        delta_msg is not None and delta_msg.reasoning_content is not None and delta_msg.content is None
+                    )
+                    unparseable_control_delta = (
+                        delta_msg is None and (content is None or content == accumulated_text)
+                    )
+
+                    if reasoning_only_delta or unparseable_control_delta:
+                        # Keep prior visible content for reasoning/control-token chunks.
+                        content_for_tools = rd.get("accumulated_content", "")
+                        result["accumulated_content"] = content_for_tools
+                        if unparseable_control_delta:
+                            result["delta_content"] = ""
+                    elif content is None:
                         content_for_tools = "" if reasoning is not None else accumulated_text
+                        result["accumulated_content"] = content_for_tools
                     else:
                         content_for_tools = content
-                    result["accumulated_content"] = content_for_tools
+                        result["accumulated_content"] = content_for_tools
             except Exception:
                 result["accumulated_content"] = accumulated_text
                 logger.debug("Reasoning extraction failed for request", exc_info=True)

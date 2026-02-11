@@ -172,7 +172,7 @@ class PPOConfig(TrainingArguments):
         metadata={"help": "If True, drop completions that do not terminate with EOS from loss calculation."},
     )
 
-    def __post_init__(self, max_sequence_length: int | None):
+    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
         self._handle_deprecated_max_sequence_length(max_sequence_length)
 
         if self.max_length is not None:
@@ -190,6 +190,6 @@ class PPOConfig(TrainingArguments):
             self.num_return_sequences = self.num_generations
 
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=None)
+            super().__post_init__(max_sequence_length=None, quantization_block=quantization_block)
 
     __hash__ = hash_fn

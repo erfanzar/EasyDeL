@@ -311,6 +311,7 @@ def orpo_step(
     loss_config: LossConfig | None = None,
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """
     Performs a single training or evaluation step for the ORPO method.
@@ -365,6 +366,8 @@ def orpo_step(
             tp.Tuple[Array, LossMetrics]: The computed loss and a LossMetrics object containing
             additional metrics.
         """
+        if mode == "train" and straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
         (
             mean_chosen_logits,
             mean_rejected_logits,

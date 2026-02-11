@@ -82,8 +82,8 @@ class GKDConfig(SFTConfig):
 
     __hash__ = hash_fn
 
-    def __post_init__(self, max_sequence_length: int | None):
-        super().__post_init__(max_sequence_length=max_sequence_length)
+    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+        super().__post_init__(max_sequence_length=max_sequence_length, quantization_block=quantization_block)
         if not 0.0 <= self.lmbda <= 1.0:
             raise ValueError("`lmbda` must be within [0, 1].")
         if not 0.0 <= self.beta <= 1.0:

@@ -37,8 +37,8 @@ from .parsers import (
     Olmo3ReasoningParser,
     Qwen3ReasoningParser,
     SeedOSSReasoningParser,
-    Step3ReasoningParser,
     Step3p5ReasoningParser,
+    Step3ReasoningParser,
 )
 from .reasoning_mixin import ReasoningMixin
 

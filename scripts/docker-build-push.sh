@@ -1,6 +1,6 @@
 #!/bin/bash
 # Docker build and push script for EasyDeL
-# Usage: ./scripts/docker-build-push.sh [--push] [--hardware cpu|gpu|tpu|all]
+# Usage: ./scripts/docker-build-push.sh [--push] [--hardware cpu|cuda|tpu|all]
 
 set -e
 
@@ -26,7 +26,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --help)
-            echo "Usage: $0 [--push] [--hardware cpu|gpu|tpu|all]"
+            echo "Usage: $0 [--push] [--hardware cpu|cuda|tpu|all]"
             echo "  --push: Push images to registry after building"
             echo "  --hardware: Specify which hardware variant to build (default: all)"
             exit 0
@@ -86,20 +86,20 @@ case $HARDWARE in
     cpu)
         build_and_push "cpu" ""
         ;;
-    gpu)
-        build_and_push "gpu" "-gpu"
+    cuda)
+        build_and_push "cuda" "-cuda"
         ;;
     tpu)
         build_and_push "tpu" "-tpu"
         ;;
     all)
         build_and_push "cpu" ""
-        build_and_push "gpu" "-gpu"
+        build_and_push "cuda" "-cuda"
         build_and_push "tpu" "-tpu"
         ;;
     *)
         echo "Invalid hardware type: ${HARDWARE}"
-        echo "Valid options: cpu, gpu, tpu, all"
+        echo "Valid options: cpu, cuda, tpu, all"
         exit 1
         ;;
 esac

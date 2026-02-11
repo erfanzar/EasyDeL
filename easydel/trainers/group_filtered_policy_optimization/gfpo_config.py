@@ -101,9 +101,9 @@ class GFPOConfig(GRPOConfig):
         },
     )
 
-    def __post_init__(self, max_sequence_length: int | None):
+    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
         """Post initialization to validate GFPO-specific parameters."""
-        super().__post_init__(max_sequence_length=max_sequence_length)
+        super().__post_init__(max_sequence_length=max_sequence_length, quantization_block=quantization_block)
 
         if self.num_remains_in_group is not None:
             if self.num_remains_in_group < 2:

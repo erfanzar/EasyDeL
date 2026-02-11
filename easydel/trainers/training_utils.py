@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import typing as tp
+import warnings
 
 import jax
 from jax import lax
@@ -46,7 +47,7 @@ def _quantize_dequantize_nf4(x: jax.Array, *, group_size: int) -> jax.Array:
     from eformer.ops.quantization.quantization_functions import dequantize_nf4, quantize_and_pack_nf4
 
     if group_size <= 0:
-        raise ValueError(f"`quantization_block` must be > 0 for NF4, got {group_size}.")
+        raise ValueError(f"`quantization_group_size` must be > 0 for NF4, got {group_size}.")
     original_last_dim = x.shape[-1]
     if original_last_dim % group_size != 0:
         pad_amount = group_size - (original_last_dim % group_size)
@@ -67,6 +68,8 @@ def _quantize_dequantize_fp8(x: jax.Array) -> jax.Array:
 
 def make_default_tensor_straight_through(
     quantization_mode: QuantizationMode,
+    quantization_group_size: int | None = None,
+    *,
     quantization_block: int | None = None,
 ) -> tp.Callable[[jax.Array], jax.Array]:
     """Create a per-tensor STE quantization function.
@@ -75,8 +78,24 @@ def make_default_tensor_straight_through(
     if the transform is identity (STE).
 
     Notes:
-        - `quantization_block` is used for NF4 group-wise quantization.
+        - `quantization_group_size` is used for NF4 group-wise quantization.
     """
+    if quantization_block is not None:
+        warnings.warn(
+            "`quantization_block` is deprecated; use `quantization_group_size` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        if quantization_group_size is None:
+            quantization_group_size = quantization_block
+        elif quantization_group_size != quantization_block:
+            warnings.warn(
+                f"Both `quantization_group_size` ({quantization_group_size}) and "
+                f"`quantization_block` ({quantization_block}) are set; ignoring `quantization_block`.",
+                FutureWarning,
+                stacklevel=2,
+            )
+
     try:
         from eformer.ops.quantization import straight_through as eformer_straight_through  # type: ignore
     except Exception:  # pragma: no cover
@@ -84,12 +103,14 @@ def make_default_tensor_straight_through(
 
     nf4_group_size: int | None = None
     if quantization_mode == "nf4":
-        nf4_group_size = DEFAULT_NF4_GROUP_SIZE if quantization_block is None else int(quantization_block)
+        nf4_group_size = DEFAULT_NF4_GROUP_SIZE if quantization_group_size is None else int(quantization_group_size)
 
     def tensor_straight_through(x: jax.Array) -> jax.Array:
         if not jnp.issubdtype(x.dtype, jnp.floating):
             return x
-        if eformer_straight_through is not None and (quantization_mode != "nf4" or quantization_block is None):
+        if eformer_straight_through is not None and (
+            quantization_mode != "nf4" or quantization_group_size is None
+        ):
             try:
                 q = eformer_straight_through(x, method=quantization_mode)
             except TypeError:
@@ -114,18 +135,35 @@ def make_default_tensor_straight_through(
 def resolve_straight_through_emulator(
     *,
     quantization_mode: QuantizationMode | None,
-    quantization_block: int | None,
+    quantization_group_size: int | None = None,
     tensor_straight_through: tp.Callable[[jax.Array], jax.Array] | None,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None,
+    quantization_block: int | None = None,
 ) -> tp.Callable[[tp.Any], tp.Any] | None:
     """Resolve the graphstate-level straight-through emulator callable.
 
     Priority:
       1) `straight_through_emulator` (user-provided)
       2) `tensor_straight_through` mapped over graphstate
-      3) default tensor STE built from (`quantization_mode`, `quantization_block`) and mapped over graphstate
+      3) default tensor STE built from (`quantization_mode`, `quantization_group_size`) and mapped over graphstate
       4) None (disabled)
     """
+    if quantization_block is not None:
+        warnings.warn(
+            "`quantization_block` is deprecated; use `quantization_group_size` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        if quantization_group_size is None:
+            quantization_group_size = quantization_block
+        elif quantization_group_size != quantization_block:
+            warnings.warn(
+                f"Both `quantization_group_size` ({quantization_group_size}) and "
+                f"`quantization_block` ({quantization_block}) are set; ignoring `quantization_block`.",
+                FutureWarning,
+                stacklevel=2,
+            )
+
     if straight_through_emulator is not None:
         return straight_through_emulator
 
@@ -135,7 +173,7 @@ def resolve_straight_through_emulator(
     if tensor_straight_through is None:
         tensor_straight_through = make_default_tensor_straight_through(
             quantization_mode,
-            quantization_block=quantization_block,
+            quantization_group_size=quantization_group_size,
         )
 
     def _default_emulator(graphstate: tp.Any) -> tp.Any:
@@ -327,7 +365,8 @@ def minibatch_call(
     num_accum_steps = batch_size // minibatch_size
     if num_accum_steps * minibatch_size != batch_size:
         raise ValueError(
-            f"Batch size ({batch_size}) must be divisible by minibatch_size ({minibatch_size}) for gradient accumulation."
+            f"Batch size ({batch_size}) must be divisible by minibatch_size "
+            f"({minibatch_size}) for gradient accumulation."
         )
     if num_accum_steps > 1:
 

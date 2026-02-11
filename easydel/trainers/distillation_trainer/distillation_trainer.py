@@ -26,6 +26,7 @@ from easydel.utils.compiling_utils import ejit
 
 from ..trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
+from ..training_utils import resolve_straight_through_emulator
 from ..utils import DataCollatorForCompletionOnlyLM
 from ._fn import distillation_step
 from .distillation_config import DistillationConfig
@@ -131,6 +132,12 @@ class DistillationTrainer(Trainer):
 
         hidden_layers = self.arguments.hidden_state_layers
         attention_layers = self.arguments.attention_layers
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_group_size=self.arguments.quantization_group_size,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
 
         self._train_shared_fn_static_args = (
             self.arguments.loss_config,
@@ -146,9 +153,10 @@ class DistillationTrainer(Trainer):
             float(self.arguments.attention_loss_weight),
             attention_layers,
             bool(self.arguments.attention_normalize),
+            straight_through_emulator,
         )
 
-        static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+        static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
         sharded_training_step_function = ejit(
             distillation_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
@@ -171,6 +179,7 @@ class DistillationTrainer(Trainer):
             float(self.arguments.attention_loss_weight),
             attention_layers,
             bool(self.arguments.attention_normalize),
+            None,
         )
 
         sharded_evaluation_step_function = ejit(

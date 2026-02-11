@@ -131,6 +131,7 @@ def gkd_step(
     is_training: bool = True,
     beta: float = 0.5,
     temperature: float = 1.0,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Execute GKD training or evaluation step.
 
@@ -157,6 +158,8 @@ def gkd_step(
     batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
     def loss_fn(tree, minibatch):
+        if is_training and straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
         module = flax.nnx.merge(student_state.graphdef, tree, student_state.graphother)
         call_kwargs = dict(minibatch)
         labels = call_kwargs.pop("labels", None)

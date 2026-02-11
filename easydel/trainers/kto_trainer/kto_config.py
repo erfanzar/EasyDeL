@@ -88,11 +88,11 @@ class KTOConfig(TrainingArguments):
         metadata={"help": "Whether to precompute reference log probabilities into the dataset."},
     )
 
-    def __post_init__(self, max_sequence_length: int | None):
+    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
         self._handle_deprecated_max_sequence_length(max_sequence_length)
         if self.max_completion_length is None and self.max_length is not None and self.max_prompt_length is not None:
             self.max_completion_length = max(self.max_length - self.max_prompt_length, 1)
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=None)
+            super().__post_init__(max_sequence_length=None, quantization_block=quantization_block)
 
     __hash__ = hash_fn

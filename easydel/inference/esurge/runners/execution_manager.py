@@ -83,6 +83,7 @@ from eformer import escale as es
 from eformer.jaximus import implicit
 from eformer.loggings import ProgressLogger, get_logger
 from eformer.pytree import key_path_to_str
+from ejkernel.ops import forward_autotune_only
 from jax import numpy as jnp
 
 from easydel.layers.caching import (
@@ -767,7 +768,8 @@ class ExecutionManager:
         model_fn = self._model_executor.get_compiled(num_tokens=num_tokens, padded_num_reqs=padded_num_reqs)
         # Do not block here: allow the caller to pipeline dependent work
         # (e.g. enqueue sampling) before synchronizing.
-        outputs = model_fn(self.graphstate, self.graphother, inputs.kv_pages, inputs.batch_metadata)
+        with forward_autotune_only():
+            outputs = model_fn(self.graphstate, self.graphother, inputs.kv_pages, inputs.batch_metadata)
         self.kv_pages = outputs.kv_pages
         return outputs
 
