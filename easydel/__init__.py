@@ -1038,7 +1038,7 @@ else:
     )
 
     _targeted_eformer_versions = ["0.0.95"]
-    _targeted_ejkernel_versions = ["0.0.55"]
+    _targeted_ejkernel_versions = ["0.0.60"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version
@@ -1071,7 +1071,9 @@ if _distributed_init_enabled:
     try:
         _DistributedConfig().initialize()
     except RuntimeError as e:
-        _logger.warning(f"Failed to initialize jax-dist if you have initialized that manually you can ignore this warning {e}")
+        _logger.warning(
+            f"Failed to initialize jax-dist if you have initialized that manually you can ignore this warning {e}"
+        )
     except Exception:  # maybe it's a single process
         _logger.warning("Failed to initialize jax-dist")
     del _DistributedConfig
