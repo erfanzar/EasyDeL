@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -64,6 +64,12 @@ from jax import numpy as jnp
 from jaxtyping import Array
 from transformers.generation.configuration_utils import GenerationConfig
 
+from easydel.caching import (
+    RaggedPagesCache,
+    RaggedPagesCacheConfig,
+    UnifiedAttentionCache,
+    UnifiedAttentionCacheConfig,
+)
 from easydel.inference.logits_process import (
     ForcedBOSTokenLogitsProcessor,
     ForcedEOSTokenLogitsProcessor,
@@ -77,12 +83,6 @@ from easydel.inference.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
-from easydel.layers.caching import (
-    RaggedPagesCache,
-    RaggedPagesCacheConfig,
-    UnifiedAttentionCache,
-    UnifiedAttentionCacheConfig,
-)
 
 from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutput
@@ -90,8 +90,8 @@ from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutpu
 if tp.TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
+    from easydel.caching import OperationsMetadata
     from easydel.inference.sampling_params import SamplingParams
-    from easydel.layers.caching import OperationsMetadata
 
 logger = get_logger(__name__)
 
@@ -391,7 +391,7 @@ class EasyGenerationMixin:
         Returns:
             TransformerCache or HybridCache depending on the model type.
         """
-        from easydel.layers.caching import TransformerCache
+        from easydel.caching import TransformerCache
 
         text_config = self.config.get_text_config()
         cache_type = self.get_inference_cache_type()
@@ -466,7 +466,7 @@ class EasyGenerationMixin:
         Returns:
             TransformerCacheConfig configured for the model.
         """
-        from easydel.layers.caching import TransformerCacheConfig
+        from easydel.caching import TransformerCacheConfig
 
         text_config = self.config.get_text_config()
 
@@ -552,7 +552,7 @@ class EasyGenerationMixin:
         Raises:
             ValueError: If intermediate_size cannot be inferred for certain architectures.
         """
-        from easydel.layers.caching import RecurrentCacheConfig
+        from easydel.caching import RecurrentCacheConfig
 
         text_config = self.config.get_text_config()
 
@@ -738,7 +738,7 @@ class EasyGenerationMixin:
         Raises:
             ValueError: If num_heads cannot be inferred from the model configuration.
         """
-        from easydel.layers.caching import KDACacheConfig
+        from easydel.caching import KDACacheConfig
 
         text_config = self.config.get_text_config()
 
@@ -787,7 +787,7 @@ class EasyGenerationMixin:
             LightningCacheConfig: Cache configuration for Lightning Attention layers.
         """
 
-        from easydel.layers.caching import LightningCacheConfig
+        from easydel.caching import LightningCacheConfig
 
         text_config = self.config.get_text_config()
 
@@ -847,7 +847,7 @@ class EasyGenerationMixin:
         Returns:
             RaggedPagesCacheConfig: Cache configuration for paged attention.
         """
-        from easydel.layers.caching import RaggedPagesCacheConfig
+        from easydel.caching import RaggedPagesCacheConfig
 
         text_config = self.config.get_text_config()
 
@@ -897,7 +897,7 @@ class EasyGenerationMixin:
         This cache layout matches ejkernel's Triton UnifiedAttention kernel:
         `[num_blocks, block_size, num_kv_heads, head_dim]` for both K and V.
         """
-        from easydel.layers.caching import UnifiedAttentionCacheConfig
+        from easydel.caching import UnifiedAttentionCacheConfig
 
         text_config = self.config.get_text_config()
 
@@ -915,7 +915,6 @@ class EasyGenerationMixin:
                 head_dim = hidden_size // num_heads
 
         num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
-
         return UnifiedAttentionCacheConfig.create(
             mesh=text_config.mesh,
             partition_manager=text_config.partition_manager,
@@ -973,7 +972,7 @@ class EasyGenerationMixin:
             >>> # configs[0] might be TransformerCacheConfig
             >>> # configs[3] might be RecurrentCacheConfig
         """
-        from easydel.layers.caching import (
+        from easydel.caching import (
             KDACacheView,
             LightningCacheView,
             ParallelHybridCacheView,
@@ -999,7 +998,7 @@ class EasyGenerationMixin:
         needs_unified = any(view_class is UnifiedAttentionCacheView for view_class in cache_view_mapping.values())
 
         if needs_ragged:
-            from easydel.layers.caching import RaggedPagesCacheConfig
+            from easydel.caching import RaggedPagesCacheConfig
 
             if ragged_config is not None and not isinstance(ragged_config, RaggedPagesCacheConfig):
                 raise TypeError(f"`ragged_config` must be a RaggedPagesCacheConfig, got {type(ragged_config)}")
@@ -1011,7 +1010,7 @@ class EasyGenerationMixin:
             )
 
         if needs_unified:
-            from easydel.layers.caching import UnifiedAttentionCacheConfig
+            from easydel.caching import UnifiedAttentionCacheConfig
 
             if unified_config is not None and not isinstance(unified_config, UnifiedAttentionCacheConfig):
                 raise TypeError(f"`unified_config` must be a UnifiedAttentionCacheConfig, got {type(unified_config)}")
@@ -1106,7 +1105,7 @@ class EasyGenerationMixin:
             >>> # cache.views[0] might be RecurrentCacheView (for linear attention layer)
             >>> # cache.views[3] might be TransformerCacheView (for full attention layer)
         """
-        from easydel.layers.caching import (
+        from easydel.caching import (
             HybridCache,
             KDACacheView,
             LightningCacheView,
@@ -1275,7 +1274,7 @@ class EasyGenerationMixin:
             ...     pages_tables=..., context_lens=...
             ... )
         """
-        from easydel.layers.caching import OperationsMetadata
+        from easydel.caching import OperationsMetadata
 
         # Check if ragged pages metadata is requested
         if pages_tables is not None and context_lens is not None:
@@ -1306,7 +1305,7 @@ class EasyGenerationMixin:
         Returns:
             type: The EasyQuantizer class.
         """
-        from easydel.layers.components.quants._quants import EasyQuantizer
+        from easydel.layers.quantization._quants import EasyQuantizer
 
         return EasyQuantizer
 

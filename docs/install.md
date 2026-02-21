@@ -89,7 +89,7 @@ eopod run "python -m eformer.executor.tpu_patch_ray --tpu-version v4 --tpu-slice
 This repo also ships a helper script to install EasyDeL + Ray on TPU VMs and run `eopod auto-config-ray`:
 
 ```shell
-./tpu_setup.sh
+./scripts/tpu_setup.sh
 ```
 
 ## Usage Example

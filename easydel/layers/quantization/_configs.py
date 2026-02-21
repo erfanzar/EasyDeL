@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ The module supports multiple quantization formats including:
     - Binary/Ternary: Extreme quantization for efficiency
 
 Example:
-    >>> from easydel.layers.components.quants import QuantizationConfig, QuantizationType
+    >>> from easydel.layers.quantization import QuantizationConfig, QuantizationType
     >>>
     >>> # Configure NF4 quantization (4-bit)
     >>> config = QuantizationConfig(
@@ -85,7 +85,7 @@ class QuantizationType(str, enum.Enum):
         BINARY: 2-level quantization {-1, 1}. Maximum compression using sign only.
 
     Example:
-        >>> from easydel.layers.components.quants import QuantizationType
+        >>> from easydel.layers.quantization import QuantizationType
         >>>
         >>> # Use NF4 for memory-efficient fine-tuning
         >>> quant_type = QuantizationType.NF4
@@ -145,7 +145,7 @@ class QuantizationConfig:
             pattern excludes embedding, normalization, and output head layers.
 
     Example:
-        >>> from easydel.layers.components.quants import QuantizationConfig, QuantizationType
+        >>> from easydel.layers.quantization import QuantizationConfig, QuantizationType
         >>>
         >>> # NF4 quantization with 64-element groups (recommended for LLMs)
         >>> config = QuantizationConfig(

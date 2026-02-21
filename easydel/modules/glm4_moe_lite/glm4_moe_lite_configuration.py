@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 import typing
 import typing as tp
 
-from eformer.common_types import EMPTY, MODE_TRAIN, TP, DynamicShardingAxes
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -55,13 +54,6 @@ def _rope_scaling_from_rope_parameters(
         if key in rope_parameters:
             rope_scaling_out[key] = rope_parameters[key]
     return rope_scaling_out
-
-
-class ExpertTensorParallel(DynamicShardingAxes):
-    """Expert Tensor Parallelism (EPxTP) sharding axes."""
-
-    axes: tp.ClassVar = [TP, EMPTY, EMPTY]
-    mode: tp.ClassVar = MODE_TRAIN
 
 
 @register_config("glm4_moe_lite")

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import typing
+
 import jax
 import jax.numpy as jnp
 from eformer import common_types
@@ -23,14 +25,7 @@ from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
-from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeCausalLMOutput, MoeModelOutput
-from easydel.infra.utils import ACT2FN, auto_remat
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -40,7 +35,12 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.components import (
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
+from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeCausalLMOutput, MoeModelOutput
+from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
     ColumnParallelMoELinear,
@@ -51,6 +51,8 @@ from easydel.layers.components import (
     RowParallelLinear,
     RowParallelMoELinear,
 )
+from easydel.layers.attention import UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule
 
 from .minimax_configuration import MiniMaxConfig
 
@@ -351,6 +353,23 @@ class MiniMaxExperts(nn.Module):
         act_fn: Activation function for the gating mechanism.
     """
 
+    reform_param: typing.ClassVar = {
+        "gate_up_proj$": {
+            "splits": [
+                {"name": "w1.kernel", "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2)},
+                {"name": "w3.kernel", "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2)},
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.cat(
+                (gate.transpose(-1, -2), up.transpose(-1, -2)),
+                dim=1,
+            ),
+        },
+        "down_proj$": {
+            "splits": [{"name": "w2.kernel", "spliter": lambda x: x.swapaxes(-1, -2)}],
+            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
+        },
+    }
+
     def __init__(
         self,
         config: MiniMaxConfig,
@@ -580,6 +599,35 @@ class MiniMaxDecoderLayer(nn.Module):
         input_layernorm: Pre-attention layer normalization.
         post_attention_layernorm: Pre-FFN layer normalization.
     """
+
+    # Accept HF MoE tensor naming (`mlp.*`) directly during state-dict conversion
+    # so conversion does not depend on test-only key remaps.
+    reform_param: typing.ClassVar = {
+        "mlp.gate.weight$": {
+            "splits": [{"name": "block_sparse_moe.gate.kernel", "spliter": lambda x: x.swapaxes(-1, -2)}],
+            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
+        },
+        "mlp.experts.gate_up_proj$": {
+            "splits": [
+                {
+                    "name": "block_sparse_moe.experts.w1.kernel",
+                    "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
+                },
+                {
+                    "name": "block_sparse_moe.experts.w3.kernel",
+                    "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
+                },
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.cat(
+                (gate.transpose(-1, -2), up.transpose(-1, -2)),
+                dim=1,
+            ),
+        },
+        "mlp.experts.down_proj$": {
+            "splits": [{"name": "block_sparse_moe.experts.w2.kernel", "spliter": lambda x: x.swapaxes(-1, -2)}],
+            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
+        },
+    }
 
     def __init__(
         self,
@@ -1149,7 +1197,7 @@ class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):
                 cache view types (RecurrentCacheView for lightning attention,
                 TransformerCacheView for standard attention).
         """
-        from easydel.layers.caching import RecurrentCacheView, TransformerCacheView
+        from easydel.caching import RecurrentCacheView, TransformerCacheView
 
         layer_types = self.config.get_text_config().layer_types
         return {
@@ -1169,7 +1217,7 @@ class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):
         """
         from eformer.escale import PartitionAxis
 
-        from easydel.layers.caching import RecurrentCacheConfig
+        from easydel.caching import RecurrentCacheConfig
 
         text_config = self.config.get_text_config()
         partition_axis = getattr(text_config, "partition_axis", None) or PartitionAxis()

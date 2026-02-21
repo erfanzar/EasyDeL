@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -80,13 +80,12 @@ from functools import partial
 import jax
 import numpy
 from eformer import escale as es
-from eformer.jaximus import implicit
 from eformer.loggings import ProgressLogger, get_logger
 from eformer.pytree import key_path_to_str
 from ejkernel.ops import forward_autotune_only
 from jax import numpy as jnp
 
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     RaggedPagesCache,
     RaggedPagesCacheConfig,
@@ -224,6 +223,7 @@ def _tree_hash(tree):
         This is used for debugging recompilation issues by comparing hash
         trees between compilation and execution to detect structural changes.
     """
+
     def _map(p, x):
         p = key_path_to_str(p)
         maybe_info = (
@@ -273,6 +273,7 @@ def _tree_hash_diff(orgin, new):
     Returns:
         PyTree of booleans indicating whether each leaf matches.
     """
+
     def _map(p, t1, t2):
         p = key_path_to_str(p)
         oo = t1 == t2
@@ -364,6 +365,7 @@ class ExecutionManager:
         self,
         model: EasyDeLBaseModule,
         use_aot_forward: bool = True,
+        bind_graphstate_for_aot: bool = False,
         min_input_pad: int = 8,
         max_model_len: int = 2**13,
         max_num_reqs: int = 16,
@@ -375,11 +377,14 @@ class ExecutionManager:
 
         Args:
             model: The EasyDeL model instance.
-            mesh: JAX sharding mesh for distributed execution.
             use_aot_forward: Whether to use Ahead-of-Time (AOT) compilation for model
                 execution. When True (default), functions are pre-compiled for better
                 performance. When False, uses Just-In-Time (JIT) compilation with
                 the graph definition passed as a static argument.
+            bind_graphstate_for_aot: When True (AOT mode), compile model-step
+                executables with graphstate/graphother closed over as compile-time
+                constants. This can improve TPU kernel selection for concrete
+                weights, but may increase compilation/memory pressure. Default: False.
             min_input_pad: Minimum padding for inputs.
             max_model_len: Maximum model sequence length.
             max_num_reqs: Maximum number of requests.
@@ -394,6 +399,7 @@ class ExecutionManager:
         self.mesh = model.mesh
 
         self.use_aot_forward = use_aot_forward
+        self.bind_graphstate_for_aot = bool(bind_graphstate_for_aot)
         self.min_input_pad = min_input_pad
         self.max_model_len = max_model_len
         self.max_num_reqs = max_num_reqs
@@ -451,8 +457,8 @@ class ExecutionManager:
             graphdef=self.graphdef,
             empty_sharding=self._empty_sharding,
             use_aot_forward=self.use_aot_forward,
+            bind_graphstate_for_aot=self.bind_graphstate_for_aot,
             cache_capacity=self._cache_capacity,
-            maybe_implicit=self.maybe_implicit,
         )
         self._sampler_executor = SamplerExecutor(
             model=self.model,
@@ -460,7 +466,6 @@ class ExecutionManager:
             empty_sharding=self._empty_sharding,
             use_aot_forward=self.use_aot_forward,
             cache_capacity=self._cache_capacity,
-            maybe_implicit=self.maybe_implicit,
         )
 
     def clear_cache(self) -> None:
@@ -525,6 +530,12 @@ class ExecutionManager:
         if graphother is not None:
             shardings = es.extract_shardings(self.graphother, self.mesh)
             self.graphother = _device_put_tree_with_shardings(graphother, shardings)
+
+        # AOT mode may capture graphstate/graphother as compile-time constants.
+        # In that configuration, cached model executables must be rebuilt when
+        # graphs change to avoid stale-weight execution.
+        if self.use_aot_forward and getattr(self._model_executor, "bind_graphstate_for_aot", False):
+            self._model_executor.clear_cache()
 
         # Clear cached baselines so future diagnostics re-hash with new weights.
         self._debug_baselines.clear()
@@ -1320,27 +1331,3 @@ class ExecutionManager:
         )
 
         return [self.graphdef, self.graphstate, self.graphother, inputs]
-
-    @property
-    def maybe_implicit(self):
-        """Get the implicit wrapper function based on model quantization state.
-
-        For quantized models, returns the implicit function wrapper that handles
-        implicit array broadcasts for quantized operations. For non-quantized
-        models, returns an identity function.
-
-        Returns:
-            Callable that wraps functions with implicit array handling if the
-            model is quantized, otherwise a no-op identity wrapper.
-
-        Note:
-            This property is used when building compiled step functions to
-            ensure proper handling of quantized weight arrays.
-        """
-        def no_implicit(fn):
-            return fn
-
-        if self.model.is_quantized:
-            return implicit
-
-        return no_implicit

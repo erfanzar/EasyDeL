@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,6 +21,47 @@ from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 
 logger = get_logger(__name__)
+
+
+def _patch_hf_llama4_pooler_output() -> None:
+    """HF compatibility: ensure Llama4 image features expose `pooler_output`."""
+    try:
+        from transformers.modeling_outputs import BaseModelOutputWithPooling
+        from transformers.models.llama4 import modeling_llama4 as hf_llama4
+    except Exception:
+        return
+
+    llama4_cls = getattr(hf_llama4, "Llama4ForConditionalGeneration", None)
+    if llama4_cls is None:
+        return
+
+    original_get_image_features = getattr(llama4_cls, "get_image_features", None)
+    if original_get_image_features is None or getattr(original_get_image_features, "_easydel_pooler_patch", False):
+        return
+
+    def _patched_get_image_features(self, *args, **kwargs):
+        outputs = original_get_image_features(self, *args, **kwargs)
+        if hasattr(outputs, "pooler_output"):
+            return outputs
+
+        last_hidden_state = getattr(outputs, "last_hidden_state", None)
+        if last_hidden_state is None and isinstance(outputs, tuple) and len(outputs) > 0:
+            last_hidden_state = outputs[0]
+        if last_hidden_state is None:
+            return outputs
+
+        return BaseModelOutputWithPooling(
+            last_hidden_state=last_hidden_state,
+            pooler_output=last_hidden_state,
+            hidden_states=getattr(outputs, "hidden_states", None),
+            attentions=getattr(outputs, "attentions", None),
+        )
+
+    _patched_get_image_features._easydel_pooler_patch = True  # type: ignore[attr-defined]
+    llama4_cls.get_image_features = _patched_get_image_features
+
+
+_patch_hf_llama4_pooler_output()
 
 
 def _get_partition_rules(self, *args, **kwargs):

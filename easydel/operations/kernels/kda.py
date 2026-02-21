@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,7 +51,7 @@ from eformer.pytree import auto_pytree
 from jax import lax
 from jaxtyping import Array, Float
 
-from easydel.layers.caching import KDACacheView
+from easydel.caching import KDACacheView
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
@@ -446,7 +446,7 @@ class KernelDeltaAttnOp(OperationImpl):
     Registered under the names "kda" and "kernel_delta_attention".
 
     Example:
-        >>> from easydel.layers.operations import OperationMetadata, OperationRegistry
+        >>> from easydel.operations import OperationMetadata, OperationRegistry
         >>> metadata = OperationMetadata(runtime_dtype=jnp.float16)
         >>> kda_op = OperationRegistry.create("kda", metadata)
         >>> output = kda_op(

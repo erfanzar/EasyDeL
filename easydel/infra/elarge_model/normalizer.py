@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,7 +40,7 @@ from typing import Any, cast
 
 from easydel.infra.base_config import EasyDeLBaseConfigDict
 from easydel.infra.factory import TaskType
-from easydel.layers.components.quants._quants import QuantizationConfig
+from easydel.layers.quantization._quants import QuantizationConfig
 
 from .defaults import DEFAULTS
 from .types import ELMConfig
@@ -246,6 +246,9 @@ def materialize_base_config(cfg: ELMConfig, prefer: tp.Literal["base", "sections
 
     # model layer quantization config
     set_maybe("quantization_config", quant.get("model"))
+    set_maybe("use_qmm_best_config", quant.get("use_qmm_best_config"))
+    set_maybe("qmm_platform_override", quant.get("qmm_platform_override"))
+    set_maybe("qmm_tpu_path_override", quant.get("qmm_tpu_path_override"))
 
     base.setdefault("hardware_abstraction", True)
 

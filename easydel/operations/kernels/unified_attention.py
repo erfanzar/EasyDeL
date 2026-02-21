@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,12 +33,49 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Float
 
-from easydel.layers.caching import OperationsMetadata, RaggedPagesMetadata, unwrap_metadata
-from easydel.layers.caching.unified_attention import UnifiedAttentionCacheView
+from easydel.axis import ATTN_DP
+from easydel.caching import OperationsMetadata, RaggedPagesMetadata, unwrap_metadata
+from easydel.caching.unified_attention import UnifiedAttentionCacheView
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
 from ..requirements import CacheType, ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
+
+
+def _normalize_axis_names(axis: str | tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    """Normalize a partition axis spec into concrete mesh axis names."""
+    if axis is None:
+        return ()
+    if isinstance(axis, (tuple, list)):
+        return tuple(str(a) for a in axis if a)
+    return (str(axis),)
+
+
+def _mesh_axis_size(mesh, axis_names: tuple[str, ...]) -> int:
+    """Compute the product of mesh axis sizes for the provided axis names."""
+    size = 1
+    if mesh is None:
+        return size
+    for axis_name in axis_names:
+        size *= int(mesh.shape.get(axis_name, 1))
+    return int(size)
+
+
+def _axis_index(axis_names: tuple[str, ...]) -> jax.Array:
+    """Return a linearized axis index over one or more mesh axes."""
+    if not axis_names:
+        return jnp.int32(0)
+    idx = jax.lax.axis_index(axis_names[0]).astype(jnp.int32)
+    for axis_name in axis_names[1:]:
+        axis_size = jax.lax.psum(jnp.int32(1), axis_name)
+        idx = idx * axis_size + jax.lax.axis_index(axis_name).astype(jnp.int32)
+    return idx
+
+
+def _dp_page_axis(cache_view: UnifiedAttentionCacheView):
+    """Resolve the logical page axis for the active cache view."""
+    dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
+    return ATTN_DP if dp_size > 1 else ct.EMPTY
 
 
 @OperationRegistry.register
@@ -194,19 +231,26 @@ class UnifiedAttn(OperationImpl):
             sinks_axis = resolve(axes=[ct.HEAD], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
             softmax_aux = softmax_aux.astype("f4")
 
-        qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
-
-        kv_pages_spec = resolve(
-            axes=[ct.EMPTY, ct.EMPTY, ct.KV_HEAD, ct.EMPTY],
-            mode=ct.MODE_PREFILL,
-            shape=kv_pages.shape,
-        )
-
         query_in = query
         orig_is_4d = query_in.ndim == 4
         if orig_is_4d:
             batch, seqlen, num_heads, head_dim = query_in.shape
         query_ragged = query_in.reshape(-1, *query_in.shape[-2:])
+        qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query_ragged.shape)
+
+        page_axis = _dp_page_axis(cache_view)
+        kv_pages_spec = resolve(
+            axes=[page_axis, ct.EMPTY, ct.KV_HEAD, ct.EMPTY],
+            mode=ct.MODE_PREFILL,
+            shape=kv_pages.shape,
+        )
+        page_axis_names = _normalize_axis_names(kv_pages_spec[0] if len(kv_pages_spec) > 0 else None)
+        page_axis_size = _mesh_axis_size(self.metadata.mesh, page_axis_names)
+        kv_pages_spec_replicated = resolve(
+            axes=[ct.EMPTY, ct.EMPTY, ct.KV_HEAD, ct.EMPTY],
+            mode=ct.MODE_PREFILL,
+            shape=kv_pages.shape,
+        )
 
         cfg = self.metadata.get_operation_config("unified_attention")
         if cfg is None:
@@ -216,29 +260,140 @@ class UnifiedAttn(OperationImpl):
                 num_par_softmax_segments=4,
                 seq_threshold_3d=64,
             )
-        extras = dict(
+        common_kwargs = dict(
             softmax_scale=softmax_scale,
             causal=causal,
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
-            in_specs=(qaxes, kv_pages_spec, kv_pages_spec, Ps(), Ps(), Ps(), None, None, sinks_axis),
-            out_specs=qaxes,
-            mesh=self.metadata.mesh,
             platform="triton",
             cfg=cfg,
         )
-        out = unified_attention(
-            query_ragged.astype(self.metadata.runtime_dtype),
-            cache_view.key_cache,
-            cache_view.value_cache,
-            cache_metadata.context_lens.astype(jnp.int32),
-            cache_metadata.pages_tables.astype(jnp.int32),
-            cache_metadata.query_start_loc.astype(jnp.int32),
-            None,
-            None,
-            softmax_aux,
-            **extras,
+        can_use_dp_local = (
+            page_axis == ATTN_DP
+            and page_axis_size > 1
+            and len(page_axis_names) > 0
+            and int(cache_metadata.context_lens.shape[0]) % page_axis_size == 0
+            and int(cache_metadata.pages_tables.shape[0]) % page_axis_size == 0
         )
+        if can_use_dp_local:
+            rows_per_shard = int(cache_metadata.context_lens.shape[0]) // page_axis_size
+
+            @jax.shard_map(
+                mesh=self.metadata.mesh,
+                in_specs=(qaxes, kv_pages_spec, kv_pages_spec, Ps(), Ps(), Ps(), None, None, sinks_axis),
+                out_specs=qaxes,
+                check_vma=False,
+            )
+            def _mapped(
+                local_query,
+                local_key_cache,
+                local_value_cache,
+                full_context_lens,
+                full_pages_tables,
+                full_query_start_loc,
+                local_alibi_slopes,
+                local_qq_bias,
+                local_softmax_aux,
+            ):
+                shard_idx = _axis_index(page_axis_names)
+                row_start = shard_idx * jnp.int32(rows_per_shard)
+                local_context_lens = jax.lax.dynamic_slice_in_dim(
+                    full_context_lens,
+                    start_index=row_start,
+                    slice_size=rows_per_shard,
+                    axis=0,
+                )
+                local_block_tables = jax.lax.dynamic_slice_in_dim(
+                    full_pages_tables,
+                    start_index=row_start,
+                    slice_size=rows_per_shard,
+                    axis=0,
+                )
+                local_query_start_loc = jax.lax.dynamic_slice_in_dim(
+                    full_query_start_loc,
+                    start_index=row_start,
+                    slice_size=rows_per_shard + 1,
+                    axis=0,
+                )
+
+                local_num_pages = jnp.int32(local_key_cache.shape[0])
+                page_offset = shard_idx * local_num_pages
+                local_block_tables = local_block_tables - page_offset
+
+                # unified_attention expects query_start_loc[0] == 0. Rotate packed
+                # tokens so this shard's query span starts at index zero.
+                q_base = local_query_start_loc[0].astype(jnp.int32)
+                total_tokens = jnp.int32(local_query.shape[0])
+                token_ids = jnp.arange(local_query.shape[0], dtype=jnp.int32)
+                rotate_idx = (token_ids + q_base) % total_tokens
+                query_rotated = local_query[rotate_idx]
+                query_start_loc_rotated = (local_query_start_loc - q_base).astype(jnp.int32)
+                local_token_count = query_start_loc_rotated[-1]
+
+                local_output = unified_attention(
+                    query_rotated.astype(self.metadata.runtime_dtype),
+                    local_key_cache,
+                    local_value_cache,
+                    local_context_lens.astype(jnp.int32),
+                    local_block_tables.astype(jnp.int32),
+                    query_start_loc_rotated,
+                    local_alibi_slopes,
+                    local_qq_bias,
+                    local_softmax_aux,
+                    **common_kwargs,
+                )
+
+                # Zero tokens that do not belong to this DP-local request slice.
+                local_mask_rot = token_ids < local_token_count
+                local_output = jnp.where(
+                    local_mask_rot[:, None, None],
+                    local_output,
+                    jnp.zeros_like(local_output),
+                )
+                unrotate_idx = (token_ids - q_base) % total_tokens
+                local_output = local_output[unrotate_idx]
+
+                if len(page_axis_names) == 1:
+                    return jax.lax.psum(local_output.astype(jnp.float32), page_axis_names[0]).astype(local_output.dtype)
+                return jax.lax.psum(local_output.astype(jnp.float32), tuple(page_axis_names)).astype(local_output.dtype)
+
+            out = _mapped(
+                query_ragged,
+                cache_view.key_cache,
+                cache_view.value_cache,
+                cache_metadata.context_lens.astype(jnp.int32),
+                cache_metadata.pages_tables.astype(jnp.int32),
+                cache_metadata.query_start_loc.astype(jnp.int32),
+                None,
+                None,
+                softmax_aux,
+            )
+        else:
+            out = unified_attention(
+                query_ragged.astype(self.metadata.runtime_dtype),
+                cache_view.key_cache,
+                cache_view.value_cache,
+                cache_metadata.context_lens.astype(jnp.int32),
+                cache_metadata.pages_tables.astype(jnp.int32),
+                cache_metadata.query_start_loc.astype(jnp.int32),
+                None,
+                None,
+                softmax_aux,
+                in_specs=(
+                    qaxes,
+                    kv_pages_spec_replicated,
+                    kv_pages_spec_replicated,
+                    Ps(),
+                    Ps(),
+                    Ps(),
+                    None,
+                    None,
+                    sinks_axis,
+                ),
+                out_specs=qaxes,
+                mesh=self.metadata.mesh,
+                **common_kwargs,
+            )
 
         if orig_is_4d:
             out = out.reshape(batch, seqlen, num_heads, head_dim)

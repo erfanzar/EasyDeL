@@ -4,6 +4,7 @@ easydel.modules package
 .. toctree::
    :maxdepth: 2
 
+   _base/index
    arctic/index
    auto/index
    aya_vision/index

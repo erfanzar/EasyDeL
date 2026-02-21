@@ -1510,7 +1510,7 @@ import librosa
 audio, sr = librosa.load("audio.wav", sr=16000)
 
 # Process
-inputs = processor(audio, sampling_rate=sr, return_tensors="jax")
+inputs = processor(audio, sampling_rate=sr, return_tensors="np")
 
 # Transcribe
 outputs = model.generate(**inputs)

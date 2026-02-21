@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -885,7 +885,9 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         """Build a bounded debug payload for streaming failures."""
 
         observed_output = output or last_output
-        primary_output = observed_output.outputs[0] if (observed_output is not None and observed_output.outputs) else None
+        primary_output = (
+            observed_output.outputs[0] if (observed_output is not None and observed_output.outputs) else None
+        )
         context: dict[str, tp.Any] = {
             "endpoint": endpoint,
             "request_id": request_id,
@@ -894,16 +896,16 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             "disconnected": disconnected,
             "tools_type": type(tools).__name__ if tools is not None else None,
             "tools_len": cls._stream_debug_len(tools),
-            "first_tool_type": (
-                type(tools[0]).__name__ if isinstance(tools, list) and len(tools) > 0 else None
-            ),
+            "first_tool_type": (type(tools[0]).__name__ if isinstance(tools, list) and len(tools) > 0 else None),
             "messages_type": type(messages).__name__ if messages is not None else None,
             "messages_len": cls._stream_debug_len(messages),
             "stream_error_type": type(stream_error).__name__ if stream_error is not None else None,
             "stream_error_message": str(stream_error) if stream_error is not None else None,
             "raw_delta_message_type": type(raw_delta_message).__name__ if raw_delta_message is not None else None,
             "delta_message_type": type(delta_message).__name__ if delta_message is not None else None,
-            "delta_tool_calls_raw_type": type(delta_tool_calls_raw).__name__ if delta_tool_calls_raw is not None else None,
+            "delta_tool_calls_raw_type": type(delta_tool_calls_raw).__name__
+            if delta_tool_calls_raw is not None
+            else None,
             "delta_tool_calls_raw_len": cls._stream_debug_len(delta_tool_calls_raw),
             "delta_text_type": type(delta_text).__name__ if delta_text is not None else None,
             "delta_text_len": cls._stream_debug_len(delta_text),
@@ -920,7 +922,9 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         }
 
         if isinstance(delta_message, DeltaMessage):
-            context["delta_message_content_type"] = type(delta_message.content).__name__ if delta_message.content is not None else None
+            context["delta_message_content_type"] = (
+                type(delta_message.content).__name__ if delta_message.content is not None else None
+            )
             context["delta_message_content_len"] = cls._stream_debug_len(delta_message.content)
             context["delta_message_content_preview"] = cls._stream_debug_preview(delta_message.content)
             context["delta_message_tool_calls_type"] = (
@@ -937,7 +941,9 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             context["output_delta_text_len"] = cls._stream_debug_len(observed_output.delta_text)
             context["output_reasoning_len"] = cls._stream_debug_len(observed_output.reasoning_content)
             context["output_delta_reasoning_len"] = cls._stream_debug_len(observed_output.delta_reasoning_content)
-            context["output_tool_calls_type"] = type(observed_output.tool_calls).__name__ if observed_output.tool_calls else None
+            context["output_tool_calls_type"] = (
+                type(observed_output.tool_calls).__name__ if observed_output.tool_calls else None
+            )
             context["output_delta_tool_calls_type"] = (
                 type(observed_output.delta_tool_calls).__name__ if observed_output.delta_tool_calls else None
             )
@@ -1862,7 +1868,12 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                                             "output_index": message_output_index,
                                             "item_id": message_item_id,
                                             "content_index": content_index,
-                                            "part": {"type": "output_text", "annotations": [], "logprobs": [], "text": ""},
+                                            "part": {
+                                                "type": "output_text",
+                                                "annotations": [],
+                                                "logprobs": [],
+                                                "text": "",
+                                            },
                                         },
                                     )
 
@@ -2230,7 +2241,9 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         if self.metrics.average_tokens_per_second == 0:
             self.metrics.average_tokens_per_second = tokens_per_second
         else:
-            self.metrics.average_tokens_per_second = self.metrics.average_tokens_per_second * 0.9 + tokens_per_second * 0.1
+            self.metrics.average_tokens_per_second = (
+                self.metrics.average_tokens_per_second * 0.9 + tokens_per_second * 0.1
+            )
 
         response_text = output.accumulated_text or output.get_text()
         engine_has_parsers = (hasattr(esurge, "_tool_parser_class") and esurge._tool_parser_class is not None) or (
@@ -2500,14 +2513,14 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                     final_chunk = ChatCompletionStreamResponse(
                         model=request.model,
                         choices=[
-                                ChatCompletionStreamResponseChoice(
-                                    index=0,
-                                    delta=DeltaMessage(content="", role="assistant"),
-                                    finish_reason="tool_calls" if saw_tool_call_delta else "stop",
-                                )
-                            ],
-                            usage=usage,
-                        )
+                            ChatCompletionStreamResponseChoice(
+                                index=0,
+                                delta=DeltaMessage(content="", role="assistant"),
+                                finish_reason="tool_calls" if saw_tool_call_delta else "stop",
+                            )
+                        ],
+                        usage=usage,
+                    )
 
                     yield f"data: {final_chunk.model_dump_json(exclude_unset=True)}\n\n"
                     yield "data: [DONE]\n\n"

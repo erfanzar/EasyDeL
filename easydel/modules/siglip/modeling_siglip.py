@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,10 +37,10 @@ from easydel.infra.modeling_outputs import (
     ModelOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.base_modules import BaseImageClassificationModule
-from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
-from easydel.layers.components.norms import LayerNorm
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseImageClassificationModule
 
 from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionConfig
 
@@ -1238,11 +1238,6 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for attention pooling parameters."""
-        return {"probe": Replicated}
-
         self.layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
@@ -1257,6 +1252,10 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
             precision=precision,
             rngs=rngs,
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for attention pooling parameters."""
+        return {"probe": Replicated}
 
     def __call__(self, hidden_state):
         """Apply attention pooling over patch representations.

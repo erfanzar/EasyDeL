@@ -38,7 +38,7 @@ The setup process is identical to previous tutorials.
 2. **Run the EasyDeL setup script:**
 
     ```bash
-    bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/tpu_setup.sh)
+    bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/scripts/tpu_setup.sh)
     ```
 
 3. **Set Environment Variables:**

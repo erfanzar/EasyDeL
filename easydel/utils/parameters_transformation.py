@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -240,8 +240,15 @@ class StateDictConverter:
 
         key_tuple = tuple(int(n) if n.isdigit() else n for n in new_key.split("."))
 
-        if config["uses_tie_word_embedding"] and config["lm_head_name"] and key_tuple[0] == config["lm_head_name"]:
-            return None
+        # Do not drop tied LM-head weights during conversion.
+        # Some EasyDeL module graphs still materialize `lm_head.kernel` even when
+        # logits use tied embeddings at runtime; dropping this leaf causes noisy
+        # "missing parameter" warnings during merge.
+        #
+        # Keeping it here preserves graph/tree key parity without changing tied
+        # runtime behavior (`apply_lm_head` still uses embedding weights when tied).
+        # if config["uses_tie_word_embedding"] and config["lm_head_name"] and key_tuple[0] == config["lm_head_name"]:
+        #     return None
 
         array = TensorConverter.convert_pytorch_to_jnp(tensor, config["dtype"])
         return [(key_tuple, array)]
@@ -556,7 +563,7 @@ class StateDictConverter:
         graphtree = unflatten_dict(module.parameters)
         model_parameters = flatten_dict(graphtree, sep=".")
 
-        from easydel.layers.components import BaseMoeModule, ParallelMoELinear
+        from easydel.layers import BaseMoeModule, ParallelMoELinear
         from easydel.utils import traversals
 
         md = ParallelMoELinear

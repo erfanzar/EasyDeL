@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -50,7 +50,7 @@ from eformer.pytree import auto_pytree
 from jax import lax
 from jaxtyping import Array, Float
 
-from easydel.layers.caching import RecurrentCacheView
+from easydel.caching import RecurrentCacheView
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
@@ -431,7 +431,7 @@ class GatedDeltaRuleOp(OperationImpl):
     Registered under the name "gated_delta_rule".
 
     Example:
-        >>> from easydel.layers.operations import OperationMetadata, OperationRegistry
+        >>> from easydel.operations import OperationMetadata, OperationRegistry
         >>> metadata = OperationMetadata(runtime_dtype=jnp.float16)
         >>> gdr_op = OperationRegistry.create("gated_delta_rule", metadata)
         >>> output = gdr_op(

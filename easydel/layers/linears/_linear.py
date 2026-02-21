@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 # Copyright 2024 The Improved Version Contributors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,7 +32,7 @@ Key Features:
     - Conversion to quantized variants
 
 Example:
-    >>> from easydel.layers.components.linears import ParallelLinear
+    >>> from easydel.layers.linears import ParallelLinear
     >>> from flax import nnx as nn
     >>>
     >>> # Create a parallel linear layer
@@ -58,7 +58,7 @@ from flax.nnx.nn.dtypes import promote_dtype
 from jax import lax
 from jaxtyping import Array, Shaped
 
-from ..quants._quants import QuantizationConfig
+from easydel.layers.quantization._quants import QuantizationConfig
 
 if tp.TYPE_CHECKING:
     from ._linear_quantized import ColumnParallelLinearQuantized, RowParallelLinearQuantized
@@ -103,7 +103,7 @@ class ParallelLinear(nn.Module):
         _direction: Parallelism direction ("row", "column", or None).
 
     Example:
-        >>> from easydel.layers.components.linears import ParallelLinear
+        >>> from easydel.layers.linears import ParallelLinear
         >>> import jax.numpy as jnp
         >>> from flax import nnx as nn
         >>>
@@ -362,7 +362,11 @@ class ParallelLinear(nn.Module):
             specs["bias"] = Replicated
         return specs
 
-    def to_quantized(self, config: QuantizationConfig) -> ColumnParallelLinearQuantized | RowParallelLinearQuantized:
+    def to_quantized(
+        self,
+        config: QuantizationConfig,
+        **kwargs,
+    ) -> ColumnParallelLinearQuantized | RowParallelLinearQuantized:
         """Convert this layer to a quantized version.
 
         Creates a quantized linear layer with the same configuration but
@@ -372,6 +376,9 @@ class ParallelLinear(nn.Module):
         Args:
             config: Quantization configuration specifying the quantization
                 type (INT8, NF4, etc.) and related parameters.
+            **kwargs: Optional runtime quantized-matmul controls forwarded
+                to the quantized linear module (for example qmm platform/path
+                overrides and tuned-config toggles).
 
         Returns:
             A RowParallelLinearQuantized or ColumnParallelLinearQuantized
@@ -381,7 +388,7 @@ class ParallelLinear(nn.Module):
             ValueError: If _direction is not "row" or "column".
 
         Example:
-            >>> from easydel.layers.components.quants import QuantizationConfig, QuantizationType
+            >>> from easydel.layers.quantization import QuantizationConfig, QuantizationType
             >>> layer = ColumnParallelLinear(768, 3072, rngs=nn.Rngs(0))
             >>> config = QuantizationConfig(dtype=QuantizationType.INT8)
             >>> quantized_layer = layer.to_quantized(config)
@@ -398,6 +405,7 @@ class ParallelLinear(nn.Module):
                 kernel_init=self.kernel_init,
                 bias_init=self.bias_init,
                 config=config,
+                **kwargs,
                 rngs=rngs,
             ),
             self.rngs,

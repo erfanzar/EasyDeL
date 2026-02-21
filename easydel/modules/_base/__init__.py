@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -50,7 +50,7 @@ Example Usage:
 
     Explicit Subclassing (Recommended):
         ```python
-        from easydel.layers.base_modules import BaseCausalLMModule
+        from easydel.modules._base import BaseCausalLMModule
         from easydel.modules.arctic import ArcticModel, ArcticConfig
 
         class ArcticForCausalLM(BaseCausalLMModule[ArcticModel, ArcticConfig]):
@@ -71,7 +71,7 @@ Example Usage:
 
     Factory Function Approach:
         ```python
-        from easydel.layers.base_modules import create_causal_lm_class
+        from easydel.modules._base import create_causal_lm_class
         from easydel.modules.arctic import ArcticModel, ArcticConfig
 
         ArcticForCausalLM = create_causal_lm_class(

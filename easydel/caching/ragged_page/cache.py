@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -65,13 +65,14 @@ from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float, Int
 
+from easydel.axis import ATTN_DP
 from easydel.utils.helpers import check_bool_flag
 
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, OperationsMetadata, unwrap_metadata
 from .utils import kv_cache_update, kv_cache_update_jax
 
 if tp.TYPE_CHECKING:
-    from easydel.layers.components.quants._quants import EasyQuantizer
+    from easydel.layers.quantization._quants import EasyQuantizer
 else:
     EasyQuantizer = object
 
@@ -165,6 +166,19 @@ def align_to_multiple(value: int, multiple: int) -> int:
     return cdiv(value, multiple) * multiple
 
 
+def _mesh_axis_size(mesh: Mesh, axis: str | tuple[str, ...] | list[str] | None) -> int:
+    """Return product of mesh sizes for a semantic axis mapping."""
+    if axis is None or axis is EMPTY:
+        return 1
+    if isinstance(axis, tuple | list):
+        size = 1
+        for ax in axis:
+            if ax in mesh.shape:
+                size *= int(mesh.shape[ax])
+        return max(1, int(size))
+    return int(mesh.shape[axis]) if axis in mesh.shape else 1
+
+
 def get_page_size_bytes(
     page_size: int,
     num_kv_heads: int,
@@ -252,6 +266,8 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         k_headdim (int): Dimension of key heads.
         v_headdim (int): Dimension of value heads.
         hbm_utilization (float): Target HBM utilization fraction. Default: 0.9.
+        data_parallel_size (int): Mesh ``dp`` axis size used for KV page
+            sharding metadata.
         page_size (int): Number of tokens per cache page. Default: 128.
         num_pages (int): Total number of pages allocated. Computed automatically.
         max_num_pages_per_req (int): Maximum pages per request. Computed from
@@ -280,6 +296,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
     k_headdim: int = field(pytree_node=False)
     v_headdim: int = field(pytree_node=False)
     hbm_utilization: float = field(pytree_node=False, default=0.9)
+    data_parallel_size: int = field(pytree_node=False, default=1)
     page_size: int = field(pytree_node=False, default=128)
     num_pages: int = field(pytree_node=False, default=-1)
     max_num_pages_per_req: int = field(pytree_node=False, default=-1)
@@ -292,7 +309,11 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
     _kvdtype_str: str = field(pytree_node=False, default="bf16")
 
     @staticmethod
-    def _compute_free_hbm(mesh: Mesh, partition_manager: PartitionManager, hbm_utilization: float):
+    def _compute_free_hbm(
+        mesh: Mesh,
+        partition_manager: PartitionManager,
+        hbm_utilization: float,
+    ):
         """Compute available HBM for cache allocation across mesh.
 
         Args:
@@ -301,13 +322,15 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             hbm_utilization: Target memory utilization fraction.
 
         Returns:
-            int: Total available bytes across all devices on KV head axis.
+            int: Available bytes used for KV page-pool sizing, scaled by
+                both KV-head and data-parallel page-axis factors.
         """
         kv_head_axis = partition_manager.paxis.kv_head_axis
-        size = int(mesh.shape[kv_head_axis])
+        kv_head_size = _mesh_axis_size(mesh, kv_head_axis)
         budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
-        available_alloc = budget * size
-        logger.info(f"{kv_head_axis=} {size=} {budget=} {available_alloc=} {hbm_utilization=}")
+        page_axis_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
+        available_alloc = budget * kv_head_size * page_axis_size
+        logger.info(f"{kv_head_axis=} {kv_head_size=} {page_axis_size=} {budget=} {available_alloc=} {hbm_utilization=}")
         return available_alloc
 
     @classmethod
@@ -365,10 +388,23 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             raise ValueError("`num_kv_heads` must be positive")
         if kv_head_dim_size <= 0:
             raise ValueError("`kv_head_dim_size` must be positive")
-        free = cls._compute_free_hbm(mesh=mesh, partition_manager=partition_manager, hbm_utilization=hbm_utilization)
+        data_parallel_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
+        if data_parallel_size > 1:
+            logger.info(f"Scaling KV page budget by data-parallel page axis: {data_parallel_size=}.")
+        free = cls._compute_free_hbm(
+            mesh=mesh,
+            partition_manager=partition_manager,
+            hbm_utilization=hbm_utilization,
+        )
         bytes_av = jnp.finfo(kvdtype).bits // 8
         page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * kv_head_dim_size * bytes_av
         num_pages = int(free) // page_bytes
+        if data_parallel_size > 1:
+            num_pages = (num_pages // data_parallel_size) * data_parallel_size
+        if num_pages <= 0:
+            raise ValueError(
+                "Computed `num_pages` is non-positive; increase `hbm_utilization` or reduce page footprint."
+            )
         logger.info(
             f"Creating PagesCacheConfig with {num_pages=} {page_bytes=} "
             f"sequence_capacity={int((num_pages * page_size) / 1000)}K"
@@ -381,6 +417,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             k_headdim=k_headdim,
             v_headdim=v_headdim,
             hbm_utilization=hbm_utilization,
+            data_parallel_size=data_parallel_size,
             page_size=page_size,
             num_pages=num_pages,
             max_num_pages_per_req=cdiv(max_model_length, page_size),
@@ -505,6 +542,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         Raises:
             ValueError: If version is unknown.
         """
+        page_axis = ATTN_DP if self.data_parallel_size > 1 else common_types.EMPTY
         if self.version == "v3":
             kv_pages_shape = (
                 self.num_pages,
@@ -513,7 +551,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
                 self.kv_head_packing,
                 self.storage_head_dim,
             )
-            axes = [common_types.EMPTY, common_types.EMPTY, common_types.HEAD, common_types.EMPTY, common_types.EMPTY]
+            axes = [page_axis, common_types.EMPTY, common_types.HEAD, common_types.EMPTY, common_types.EMPTY]
         elif self.version == "v2":
             kv_pages_shape = (
                 self.num_pages,
@@ -521,7 +559,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
                 self.num_kv_heads * 2,
                 self.k_headdim,
             )
-            axes = [common_types.EMPTY, common_types.EMPTY, common_types.HEAD, common_types.EMPTY]
+            axes = [page_axis, common_types.EMPTY, common_types.HEAD, common_types.EMPTY]
         else:
             raise ValueError(f"got unknown version {self.version} it should be v3/v2.")
         return kv_pages_shape, axes
@@ -601,7 +639,7 @@ class RaggedPagesCacheView(BaseCacheView):
         Returns:
             RaggedPagesCacheView: Initialized cache view.
         """
-        from easydel.layers.components.quants._quants import EasyQuantizer as EQ
+        from easydel.layers.quantization._quants import EasyQuantizer as EQ
 
         if quantizer is None:
             quantizer = EQ(quantization_config=None)
@@ -653,13 +691,19 @@ class RaggedPagesCacheView(BaseCacheView):
             head_size = key.shape[3]
             key = key.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages.dtype)
             value = value.reshape(-1, num_kv_heads, head_size).astype(self.kv_pages.dtype)
+            data_parallel_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1)))
             use_kernel = jax.default_backend() == "tpu" and PERMITTED_KV_KERNELS
-
             if head_size != 128 and use_kernel:
                 use_kernel = False
                 use_shardmap = True
             else:
                 use_shardmap = use_kernel
+            if data_parallel_size > 1:
+                # DP-sharded page buffers require per-shard slot localization.
+                # Keep shard_map enabled so each shard can derive its own page index.
+                use_shardmap = True
+
+            data_parallel_axis = self.partition_manager.paxis.data_parallel_axis
 
             def _update_fn(
                 kv: Float[Array, "num_tokens num_kv_heads_x2 head_dim"],
@@ -669,6 +713,17 @@ class RaggedPagesCacheView(BaseCacheView):
             ) -> Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"]:
                 orgshape = pages.shape
                 pages = pages.reshape(-1, *orgshape[2:])
+                page_shard_index = jnp.int32(0)
+                if data_parallel_size > 1 and use_shardmap:
+                    if isinstance(data_parallel_axis, tuple | list):
+                        axes = tuple(str(ax) for ax in data_parallel_axis if ax)
+                        if len(axes) > 0:
+                            page_shard_index = jax.lax.axis_index(axes[0]).astype(jnp.int32)
+                            for axis_name in axes[1:]:
+                                axis_size = jax.lax.psum(jnp.int32(1), axis_name)
+                                page_shard_index = page_shard_index * axis_size + jax.lax.axis_index(axis_name)
+                    else:
+                        page_shard_index = jax.lax.axis_index(data_parallel_axis).astype(jnp.int32)
                 if use_kernel:
                     pages = kv_cache_update(
                         kv,
@@ -677,6 +732,7 @@ class RaggedPagesCacheView(BaseCacheView):
                         num_update_slices,
                         page_size=cache_metadata.page_size,
                         slices_per_processing_page=cache_metadata.num_slices_per_kv_cache_update_page,
+                        page_shard_index=page_shard_index,
                     )
                 else:
                     pages = kv_cache_update_jax(
@@ -685,20 +741,22 @@ class RaggedPagesCacheView(BaseCacheView):
                         pages,
                         num_update_slices,
                         page_size=cache_metadata.page_size,
+                        page_shard_index=page_shard_index,
                     )
                 return pages.reshape(*orgshape)
 
             if use_shardmap:
                 resolve = self.partition_manager.resolve
+                page_axis = ATTN_DP if data_parallel_size > 1 else EMPTY
                 _update_fn = jax.shard_map(
                     _update_fn,
                     in_specs=(
                         resolve([EMPTY, common_types.HEAD, EMPTY], mode=MODE_PREFILL),
                         resolve([EMPTY, EMPTY], mode=MODE_PREFILL),
-                        resolve([EMPTY, EMPTY, common_types.HEAD, EMPTY], mode=MODE_PREFILL),
+                        resolve([page_axis, EMPTY, common_types.HEAD, EMPTY], mode=MODE_PREFILL),
                         resolve([EMPTY], mode=MODE_PREFILL),
                     ),
-                    out_specs=resolve([EMPTY, EMPTY, common_types.HEAD, EMPTY], mode=MODE_PREFILL),
+                    out_specs=resolve([page_axis, EMPTY, common_types.HEAD, EMPTY], mode=MODE_PREFILL),
                     mesh=es.get_incontext_mesh(),
                     check_vma=False,
                 )

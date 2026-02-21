@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -76,6 +76,7 @@ from eformer.common_types import NOT_GIVEN, _Empty
 from jax import numpy as jnp
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from easydel.axis import register_attention_data_parallel_axis
 from easydel.inference.sampling_params import SamplingParams
 from easydel.utils import Registry
 from easydel.workers.esurge.pipeline import WorkerManager
@@ -94,9 +95,9 @@ from .runners import eSurgeRunner
 from .scheduler import Scheduler
 
 if typing.TYPE_CHECKING:
-    from easydel.infra import EasyDeLBaseModule
     from easydel.inference.reasoning.abstract_reasoning import ReasoningParserName
     from easydel.inference.tools.abstract_tool import ToolParserName
+    from easydel.infra import EasyDeLBaseModule
 
 # Configuration constants
 DEFAULT_DETOKENIZER_MAX_STATES = 1 << 16  # 65536 states for streaming decode
@@ -122,6 +123,43 @@ def _set_requested_new(sp, n: int):
         sp.max_tokens = int(n)
     if hasattr(sp, "max_new_tokens"):
         sp.max_new_tokens = int(n)
+
+
+def _normalize_data_parallelism_axis(axis: str) -> str:
+    """Normalize and validate the requested data-parallel axis name."""
+    axis_name = str(axis).strip()
+    if not axis_name:
+        raise ValueError("`data_parallelism_axis` must be a non-empty string.")
+    return axis_name
+
+
+def _with_data_parallel_axis(partition_axis: Any, data_parallelism_axis: str) -> Any:
+    """Return partition-axis metadata with an updated data-parallel axis."""
+    if partition_axis is None:
+        return {"data_parallel_axis": data_parallelism_axis}
+
+    if isinstance(partition_axis, dict):
+        merged = dict(partition_axis)
+        merged["data_parallel_axis"] = data_parallelism_axis
+        return merged
+
+    if hasattr(partition_axis, "data_parallel_axis"):
+        try:
+            partition_axis.data_parallel_axis = data_parallelism_axis
+            return partition_axis
+        except Exception:
+            pass
+
+    attrs = getattr(partition_axis, "__dict__", None)
+    if isinstance(attrs, dict) and attrs:
+        merged = dict(attrs)
+        merged["data_parallel_axis"] = data_parallelism_axis
+        try:
+            return type(partition_axis)(**merged)
+        except Exception:
+            return merged
+
+    return {"data_parallel_axis": data_parallelism_axis}
 
 
 @dataclass
@@ -226,7 +264,9 @@ class RequestOutput:
 
 
 @Registry.register("serve", "esurge")
-class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, EngineIOMixin, EngineLifecycleMixin, EngineUtilsMixin):
+class eSurge(
+    EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, EngineIOMixin, EngineLifecycleMixin, EngineUtilsMixin
+):
     """High-level engine interface for text generation with eSurge.
 
     eSurge is a high-performance inference engine built on JAX that provides:
@@ -275,6 +315,7 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
         hbm_utilization: float = 0.85,
         page_size: int = 128,
         use_aot_forward: bool = True,
+        bind_graphstate_for_aot: bool = False,
         enable_prefix_caching: bool = True,
         auto_shard_model: bool = True,
         sharding_axis_dims: tuple[int, ...] = (1, 1, 1, -1, 1),
@@ -282,6 +323,7 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
         runner_verbose: bool = False,
         overlap_execution: bool = False,
         sampler_metrics: bool = False,
+        data_parallelism_axis: str = "dp",
         esurge_name: str | None = None,
         reserve_tokens: int | None = None,
         auto_truncate_prompt: bool = True,
@@ -327,9 +369,13 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
             max_num_batched_tokens: Maximum tokens per batch (auto-computed if None).
             hbm_utilization: Target HBM memory utilization (0.0-1.0).
             page_size: Page size for paged attention KV cache. Recommended >=256 for GPUs.
+            bind_graphstate_for_aot: Whether AOT model-step compilations should
+                close over graphstate/graphother as compile-time constants.
+                Default: False.
             enable_prefix_caching: Enable caching of common prefixes for efficiency.
             auto_shard_model: Automatically shard model across devices.
-            sharding_axis_dims: Sharding configuration for model parallelism.
+            sharding_axis_dims: Base sharding configuration for model parallelism.
+                Default order is ``(dp, fsdp, ep, tp, sp)``.
             compile_runner: JIT pre-compile the runner for better performance.
             runner_verbose: Enable verbose logging in runner.
             esurge_name: Optional custom name for this engine instance.
@@ -353,6 +399,9 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
                 scheduler work with device execution (experimental).
             sampler_metrics: Enable the lightweight sampler JIT for recording
                 token log-probabilities on-device.
+            data_parallelism_axis: Mesh axis name used as the data-parallel page
+                axis for KV-cache sharding and slot localization. Defaults to
+                ``"dp"``. Set to ``"ep"`` to run data parallelism over the expert axis.
             detokenizer_max_states: Maximum number of streaming decode states
                 the detokenizer worker will keep resident (power-of-two recommended).
             destroy_pages_on_pause: When True, destroying the ragged KV cache upon
@@ -415,6 +464,8 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
         self.page_size = page_size
+        self.data_parallelism_axis = _normalize_data_parallelism_axis(data_parallelism_axis)
+        register_attention_data_parallel_axis(self.data_parallelism_axis)
         if kwargs.pop("use_combined_forward", None) is not None:
             logger.warning("`use_combined_forward` is deprecated (the fused step will be used now).")
         # `processor` is the unified interface for text + multimodal workflows.
@@ -562,7 +613,9 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
                 attn_value = (
                     requested_attn.value
                     if isinstance(requested_attn, AttentionMechanisms)
-                    else str(requested_attn) if requested_attn is not None else None
+                    else str(requested_attn)
+                    if requested_attn is not None
+                    else None
                 )
                 if backend == "gpu" and attn_value in (
                     AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2.value,
@@ -588,23 +641,46 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
                         f"got attn_mechanism={attn_value!r}."
                     )
 
+            sharding_axis_names = tuple(kwargs.pop("sharding_axis_names", ("dp", "fsdp", "ep", "tp", "sp")))
+            sharding_axis_dims_resolved = tuple(int(v) for v in sharding_axis_dims)
+            sharding_axis_names_resolved = tuple(str(v) for v in sharding_axis_names)
+            if self.data_parallelism_axis not in sharding_axis_names_resolved:
+                logger.warning(
+                    "`data_parallelism_axis=%r` not found in `sharding_axis_names=%r`; "
+                    "KV page sharding will behave as unsharded for that axis.",
+                    self.data_parallelism_axis,
+                    sharding_axis_names_resolved,
+                )
+
+            config_kwargs = dict(kwargs.pop("config_kwargs", {}) or {})
+            config_partition_axis = config_kwargs.pop("partition_axis", None)
+            kwargs_partition_axis = kwargs.pop("partition_axis", None)
+            resolved_partition_axis = _with_data_parallel_axis(
+                kwargs_partition_axis if kwargs_partition_axis is not None else config_partition_axis,
+                self.data_parallelism_axis,
+            )
+
             model = AutoEasyDeLModelForCausalLM.from_pretrained(
                 model,
                 dtype=dtype,
                 param_dtype=dtype,
                 precision=jax.lax.Precision.DEFAULT,
                 auto_shard_model=auto_shard_model,
-                sharding_axis_dims=sharding_axis_dims,
+                sharding_axis_dims=sharding_axis_dims_resolved,
+                sharding_axis_names=sharding_axis_names_resolved,
+                partition_axis=resolved_partition_axis,
                 config_kwargs=EasyDeLBaseConfigDict(
                     attn_mechanism=requested_attn if user_provided_attn else preferred_attn_mechanism,
                     attn_dtype=dtype,
                     kvdtype=dtype,
                     freq_max_position_embeddings=max_model_len,
                     mask_max_position_embeddings=max_model_len,
-                    **kwargs.get("config_kwargs", {}),
+                    **config_kwargs,
                 ),
                 **{k: v for k, v in kwargs.items() if k not in ["attn_mechanism", "config_kwargs"]},
             )
+
+        self._apply_data_parallel_axis_to_model(model)
 
         if self._multimodal_manager is not None and self._multimodal_manager.model is None:
             self._multimodal_manager.model = model
@@ -627,6 +703,7 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
             max_num_seq_buckets=max_num_seq_buckets,
             min_token_pad=min_token_pad,
             use_aot_forward=use_aot_forward,
+            bind_graphstate_for_aot=bind_graphstate_for_aot,
             verbose=runner_verbose,
             enable_overlap_execution=overlap_execution,
             enable_sampler_metrics=sampler_metrics,
@@ -813,61 +890,29 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
 
         self._sampling_params_callback = callback
 
+    def _apply_data_parallel_axis_to_model(self, model: EasyDeLBaseModule) -> None:
+        """Patch model config partition axes so eSurge KV-cache uses the requested DP axis."""
+        cfg = getattr(model, "config", None)
+        if cfg is None:
+            return
 
+        maybe_text_cfg = getattr(cfg, "get_text_config", None)
+        text_cfg = maybe_text_cfg() if callable(maybe_text_cfg) else None
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        seen: set[int] = set()
+        for target_cfg in (cfg, text_cfg):
+            if target_cfg is None or id(target_cfg) in seen:
+                continue
+            seen.add(id(target_cfg))
+            current_axis = getattr(target_cfg, "partition_axis", None)
+            updated_axis = _with_data_parallel_axis(current_axis, self.data_parallelism_axis)
+            try:
+                target_cfg.partition_axis = updated_axis
+            except Exception:
+                logger.warning(
+                    "Failed to update model partition_axis with data_parallelism_axis=%r",
+                    self.data_parallelism_axis,
+                )
 
     def __del__(self):
         """Destructor that cleans up resources.
@@ -916,6 +961,7 @@ class eSurge(EngineMonitoringMixin, EngineParsingMixin, EngineRequestsMixin, Eng
             f"max_model_len={self.max_model_len}",
             f"max_num_seqs={self.max_num_seqs}",
             f"page_size={self.page_size}",
+            f"data_parallelism_axis={self.data_parallelism_axis!r}",
             f"reserve_tokens={self.reserve_tokens}",
             f"auto_truncate_prompt={self.auto_truncate_prompt}",
             f"auto_cap_new_tokens={self.auto_cap_new_tokens}",

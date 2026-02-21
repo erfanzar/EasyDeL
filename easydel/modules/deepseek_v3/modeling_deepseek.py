@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,6 +27,16 @@ from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
@@ -37,20 +47,7 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers.attention import FlexibleAttentionModule
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.caching import (
-    HybridCache,
-    OperationsMetadata,
-    RaggedPagesCache,
-    RaggedPagesCacheView,
-    RaggedPagesMetadata,
-    TransformerCache,
-    TransformerCacheView,
-    TransformerMetadata,
-)
-from easydel.layers.components import (
+from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
     ColumnParallelMoELinear,
@@ -61,7 +58,9 @@ from easydel.layers.components import (
     RowParallelLinear,
     RowParallelMoELinear,
 )
-from easydel.layers.components.rotary_embedding import yarn_get_mscale
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.rotary import yarn_get_mscale
+from easydel.modules._base import BaseCausalLMModule
 
 from .deepseek_configuration import DeepseekV3Config
 
@@ -1283,7 +1282,7 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         Returns:
             TransformerCacheConfig: Configuration object for MLA-compatible transformer cache.
         """
-        from easydel.layers.caching import TransformerCacheConfig
+        from easydel.caching import TransformerCacheConfig
 
         config = self.config
 
@@ -1326,8 +1325,8 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         Returns:
             RaggedPagesCacheConfig: Configuration object for MLA-compatible paged cache.
         """
+        from easydel.caching import RaggedPagesCacheConfig
         from easydel.layers.attention import AttentionMechanisms
-        from easydel.layers.caching import RaggedPagesCacheConfig
 
         config = self.config
         text_config = config.get_text_config()

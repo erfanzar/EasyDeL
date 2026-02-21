@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -59,7 +59,7 @@ from jaxtyping import Array, Bool, Float, Int
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, BaseRunTimeMetadata
 
 if tp.TYPE_CHECKING:
-    from easydel.layers.components.quants._quants import EasyQuantizer
+    from easydel.layers.quantization._quants import EasyQuantizer
 else:
     EasyQuantizer = object
 

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,7 +29,7 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
 from easydel.infra.factory import TaskType, registry
 from easydel.infra.mixins.bridge import TENSORSTORE_INDEX_NAME
-from easydel.layers.components import QuantizationConfig
+from easydel.layers import QuantizationConfig
 
 SAFETENSOR_INDEX_NAME = "tensorstore_index.json"
 MODEL_INDEX_NAME = "model_structure.json"

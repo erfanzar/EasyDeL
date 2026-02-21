@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -267,6 +267,12 @@ class DbrxConfig(EasyDeLBaseConfig):
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.n_layers
+        if getattr(self.ffn_config, "ffn_hidden_size", None) != d_model:
+            self.ffn_config.ffn_hidden_size = d_model
+        if not hasattr(self.ffn_config, "hidden_size"):
+            self.ffn_config.hidden_size = d_model
+        self.rope_theta = getattr(self.attn_config, "rope_theta", 10000.0)
+        self.rope_parameters = {"rope_type": "default", "rope_theta": self.rope_theta}
 
         tie_word_embeddings = kwargs.pop("tie_word_embeddings", False)
         if tie_word_embeddings:

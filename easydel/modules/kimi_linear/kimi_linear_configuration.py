@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,24 +24,15 @@ References:
 """
 
 import typing
-import typing as tp
 
-from eformer.common_types import EMPTY, MODE_TRAIN, TP, DynamicShardingAxes
 from jax.sharding import PartitionSpec
 
+from easydel.caching.hybrid import FULL_ATTENTION, KDA_LINEAR_ATTENTION
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
-from easydel.layers.caching.hybrid import FULL_ATTENTION, KDA_LINEAR_ATTENTION
-from easydel.layers.components import RopeConfig
+from easydel.layers import RopeConfig
 
 KIMI_LINEAR_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
-
-
-class KimiExpertTensorParallel(DynamicShardingAxes):
-    """Expert Tensor Parallelism (EPxTP) sharding axes for Kimi Linear."""
-
-    axes: tp.ClassVar = [TP, EMPTY, EMPTY]
-    mode: tp.ClassVar = MODE_TRAIN
 
 
 @register_config("kimi_linear")

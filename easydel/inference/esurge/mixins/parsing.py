@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -162,9 +162,7 @@ class EngineParsingMixin:
                     reasoning_only_delta = (
                         delta_msg is not None and delta_msg.reasoning_content is not None and delta_msg.content is None
                     )
-                    unparseable_control_delta = (
-                        delta_msg is None and (content is None or content == accumulated_text)
-                    )
+                    unparseable_control_delta = delta_msg is None and (content is None or content == accumulated_text)
 
                     if reasoning_only_delta or unparseable_control_delta:
                         # Keep prior visible content for reasoning/control-token chunks.

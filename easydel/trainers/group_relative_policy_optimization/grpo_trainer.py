@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -528,7 +528,7 @@ class GRPOTrainer(Trainer):
                             dict(
                                 reward_processing_class(
                                     texts,
-                                    return_tensors="jax",
+                                    return_tensors="np",
                                     padding="max_length",
                                     padding_side="right",
                                     add_special_tokens=False,

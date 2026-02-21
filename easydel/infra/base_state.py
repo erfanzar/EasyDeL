@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -101,7 +101,7 @@ if tp.TYPE_CHECKING:
 
     from easydel.infra.base_config import EasyDeLBaseConfigDict
     from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
-    from easydel.layers.components import QuantizationConfig
+    from easydel.layers import QuantizationConfig
 
     from .base_module import EasyDeLBaseModule, PartitionLike
 
@@ -1182,7 +1182,7 @@ class EasyDeLState(struct.PyTreeNode):
 
             Loading with quantization::
 
-                >>> from easydel.layers.components import QuantizationConfig
+                >>> from easydel.layers import QuantizationConfig
                 >>> state = EasyDeLState.load_state(
                 ...     "checkpoints/step_10000",
                 ...     quantization_config=QuantizationConfig(bits=8),

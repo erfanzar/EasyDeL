@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -99,9 +99,11 @@ except ImportError:  # transformers>=5 removed helpers
         if not os.path.exists(cached_path):
             urllib.request.urlretrieve(url, cached_path)
         return cached_path
+
+
 from transformers.utils.generic import is_timm_config_dict
 
-from easydel.layers.components import QuantizationConfig
+from easydel.layers import QuantizationConfig
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.helpers import check_bool_flag, get_logger
 
@@ -119,7 +121,7 @@ from .etils import (
 if tp.TYPE_CHECKING:
     from ejkernel.modules.operations.configs import BaseOperationConfig
 
-    from easydel.layers.components import RopeConfig
+    from easydel.layers import RopeConfig
 
     from .utils import AttnMaskDetail, ModuleCaches
 
@@ -423,6 +425,9 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     gradient_checkpointing_targets: NotRequired[list[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS] | None]
     kv_cache_quantization_config: NotRequired[QuantizationConfig | None]
     kv_cache_sharding_sequence_axis_name: NotRequired[str | tuple[str, ...]]
+    use_qmm_best_config: NotRequired[bool]
+    qmm_platform_override: NotRequired[str | None]
+    qmm_tpu_path_override: NotRequired[str | None]
     flash_attention_backward_pass_impl: NotRequired[tp.Literal["triton", "xla"]]
     attn_dtype: NotRequired[jnp.dtype]
     kvdtype: NotRequired[jnp.dtype]
@@ -488,6 +493,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
         precompute_masks: Whether to precompute and cache causal masks on the mesh.
         kv_cache_quantization_config: Quantization config for KV cache tensors. Pass ``None`` to disable.
         quantization_config: Quantization config for linear layers. Pass ``None`` to disable.
+        use_qmm_best_config: Whether quantized linear kernels should request
+            ejkernel tuned block configs by default. Defaults to ``True``.
+        qmm_platform_override: Optional explicit quantized-matmul platform
+            override (for example ``"pallas"``, ``"xla"``, ``"triton"``).
+        qmm_tpu_path_override: Optional explicit quantized-matmul TPU fused
+            path override (``"hybrid"``, ``"packed"``, ``"predecode"``).
         kv_cache_sharding_sequence_axis_name: Axis (or axes) used when sharding the KV cache.
         flash_attention_backward_pass_impl: Backward kernel for flash attention
             (``"triton"`` or ``"xla"``). Defaults to ``"triton"``.
@@ -528,6 +539,42 @@ class EasyDeLBaseConfig(PretrainedConfig):
     # Set via set_manual_mesh() or lazily created on first access to `manual_mesh` property.
     _hidden_manual_mesh: common_types.Mesh | None = None
 
+    # Backward-compat defaults that were implicitly available in older
+    # transformers.PreTrainedConfig versions.
+    _hf_compat_defaults: tp.ClassVar[dict[str, tp.Any]] = {
+        "pad_token_id": None,
+        "bos_token_id": None,
+        "eos_token_id": None,
+        "sep_token_id": None,
+        "decoder_start_token_id": None,
+        "add_cross_attention": False,
+        "tie_encoder_decoder": False,
+        "is_decoder": False,
+        "tie_word_embeddings": True,
+        "cross_attention_hidden_size": None,
+    }
+
+    _rope_relevant_keys: tp.ClassVar[set[str]] = {
+        "rope_parameters",
+        "rope_scaling",
+        "rope_theta",
+        "partial_rotary_factor",
+        "layer_types",
+    }
+
+    def __setattr__(self, key, value):
+        # HF v5 expects `rope_parameters` to include `rope_theta`.
+        # Keep late assignments (e.g. tests mutating `config.rope_scaling`) compatible.
+        if key in {"rope_scaling", "rope_parameters"} and isinstance(value, dict):
+            value = self._normalize_rope_assignment(value)
+        super().__setattr__(key, value)
+        # Keep common MoE expert-count aliases in sync for late config mutations.
+        # Several HF MoE implementations read `num_local_experts` directly.
+        if key in {"n_routed_experts", "num_experts"}:
+            super().__setattr__("num_local_experts", value)
+        if key in self._rope_relevant_keys:
+            self._backfill_rope_parameters()
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
 
@@ -535,6 +582,178 @@ class EasyDeLBaseConfig(PretrainedConfig):
             return None
 
         cls.get_partition_rules = _return_none_partition_rules
+
+    @staticmethod
+    def _normalize_rope_parameters_dict(
+        rope_parameters: dict[str, tp.Any],
+        *,
+        rope_theta: float | int | None = None,
+    ) -> dict[str, tp.Any]:
+        """Normalize a single RoPE parameter dictionary to HF v5-style keys."""
+        normalized = dict(rope_parameters)
+        if "type" in normalized and "rope_type" not in normalized:
+            normalized["rope_type"] = normalized["type"]
+        normalized.setdefault("rope_type", "default")
+        normalized.setdefault("type", normalized["rope_type"])
+        if rope_theta is not None:
+            normalized.setdefault("rope_theta", rope_theta)
+        return normalized
+
+    def _normalize_rope_assignment(self, rope_parameters: dict[str, tp.Any]) -> dict[str, tp.Any]:
+        rope_theta = getattr(self, "rope_theta", None)
+        partial_rotary_factor = getattr(self, "partial_rotary_factor", None)
+        layer_types = getattr(self, "layer_types", None)
+
+        layer_types_set = set(layer_types) if isinstance(layer_types, (list, tuple, set)) else None
+        is_nested = bool(layer_types_set) and set(rope_parameters.keys()).issubset(layer_types_set)
+        if is_nested:
+            return {
+                key: self._normalize_rope_parameters_dict(
+                    value if isinstance(value, dict) else {},
+                    rope_theta=rope_theta,
+                )
+                for key, value in rope_parameters.items()
+            }
+
+        normalized = self._normalize_rope_parameters_dict(rope_parameters, rope_theta=rope_theta)
+        if partial_rotary_factor is not None:
+            normalized.setdefault("partial_rotary_factor", partial_rotary_factor)
+        return normalized
+
+    def _backfill_rope_parameters(self) -> None:
+        """Ensure rope parameters remain usable after late attribute mutations."""
+        rope_theta = getattr(self, "rope_theta", None)
+        partial_rotary_factor = getattr(self, "partial_rotary_factor", None)
+        layer_types = getattr(self, "layer_types", None)
+        unique_layer_types = list(dict.fromkeys(layer_types)) if isinstance(layer_types, (list, tuple)) else None
+        # Only a small set of models encode RoPE parameters per layer-type in HF configs.
+        # Most models (e.g. Gemma2) expect a flat `rope_parameters` mapping.
+        per_layer_rope_model_types = {"gemma3_text"}
+        model_type = getattr(self, "model_type", None)
+        multi_layer_rope = model_type in per_layer_rope_model_types and bool(unique_layer_types)
+
+        rope_parameters = getattr(self, "rope_parameters", None) if hasattr(self, "rope_parameters") else None
+        if rope_parameters is None and rope_theta is None:
+            return
+
+        if rope_parameters is None:
+            rope_parameters = {}
+
+        if not isinstance(rope_parameters, dict):
+            return
+
+        if rope_parameters:
+            normalized = self._normalize_rope_assignment(rope_parameters)
+        else:
+            normalized = {}
+
+        if not normalized and rope_theta is not None:
+            normalized = {"rope_type": "default", "rope_theta": rope_theta}
+            if partial_rotary_factor is not None:
+                normalized["partial_rotary_factor"] = partial_rotary_factor
+
+        if (
+            multi_layer_rope
+            and isinstance(normalized, dict)
+            and "rope_type" in normalized
+            and unique_layer_types is not None
+        ):
+            normalized = {layer_type: dict(normalized) for layer_type in unique_layer_types}
+
+        if (
+            isinstance(normalized, dict)
+            and unique_layer_types is not None
+            and set(normalized.keys()).issubset(set(unique_layer_types))
+        ):
+            for layer_type in unique_layer_types:
+                layer_params = normalized.get(layer_type, {})
+                if not isinstance(layer_params, dict):
+                    layer_params = {}
+                layer_params = self._normalize_rope_parameters_dict(layer_params, rope_theta=rope_theta)
+                if partial_rotary_factor is not None:
+                    layer_params.setdefault("partial_rotary_factor", partial_rotary_factor)
+                normalized[layer_type] = layer_params
+
+        if isinstance(normalized, dict) and "rope_type" in normalized:
+            if rope_theta is not None:
+                normalized.setdefault("rope_theta", rope_theta)
+            if partial_rotary_factor is not None:
+                normalized.setdefault("partial_rotary_factor", partial_rotary_factor)
+
+        super().__setattr__("rope_parameters", normalized)
+
+    def _ensure_hf_compat_fields(self, kwargs: dict[str, tp.Any]) -> None:
+        """Populate fields commonly expected by HF model implementations."""
+        for key, default_value in self._hf_compat_defaults.items():
+            if key in kwargs:
+                setattr(self, key, kwargs[key])
+            elif not hasattr(self, key):
+                setattr(self, key, default_value)
+
+        # Common alias used by several MoE model implementations.
+        if not hasattr(self, "num_local_experts"):
+            if hasattr(self, "num_experts"):
+                self.num_local_experts = self.num_experts
+            elif hasattr(self, "n_routed_experts"):
+                self.num_local_experts = self.n_routed_experts
+
+    def _ensure_rope_context_fields(self, kwargs: dict[str, tp.Any]) -> None:
+        """Ensure fields needed by HF rope standardization exist before super().__init__."""
+        if hasattr(self, "max_position_embeddings"):
+            return
+
+        max_position_embeddings = kwargs.get("max_position_embeddings")
+        if max_position_embeddings is None:
+            max_position_embeddings = kwargs.get("original_max_position_embeddings")
+        if max_position_embeddings is None:
+            max_position_embeddings = kwargs.get("freq_max_position_embeddings")
+        if max_position_embeddings is None:
+            max_position_embeddings = kwargs.get("mask_max_position_embeddings")
+
+        # HF converts rope params early inside PretrainedConfig.__init__ and expects
+        # this attribute to exist whenever rope parameters are present.
+        if max_position_embeddings is None:
+            rope_parameters = kwargs.get("rope_parameters", kwargs.get("rope_scaling"))
+            if isinstance(rope_parameters, dict):
+                max_position_embeddings = rope_parameters.get("original_max_position_embeddings")
+
+        self.max_position_embeddings = max_position_embeddings
+
+    def _ensure_rope_parameters(self, kwargs: dict[str, tp.Any]) -> None:
+        """Bridge legacy rope fields to `rope_parameters` expected by HF v5."""
+        rope_theta = kwargs.get("rope_theta", getattr(self, "rope_theta", None))
+        partial_rotary_factor = kwargs.get("partial_rotary_factor", getattr(self, "partial_rotary_factor", None))
+        layer_types = kwargs.get("layer_types", getattr(self, "layer_types", None))  # noqa
+
+        rope_parameters = kwargs.get("rope_parameters", getattr(self, "rope_parameters", None))
+        if rope_parameters is None and "rope_scaling" in kwargs:
+            rope_parameters = kwargs["rope_scaling"]
+
+        # Some configs assign `self.rope_scaling` before calling super().__init__.
+        if rope_parameters is None and hasattr(self, "rope_parameters"):
+            rope_parameters = getattr(self, "rope_parameters", None)
+
+        has_rope_signal = (
+            rope_parameters is not None
+            or "rope_scaling" in kwargs
+            or "rope_theta" in kwargs
+            or hasattr(self, "rope_theta")
+            or partial_rotary_factor is not None
+        )
+        if not has_rope_signal:
+            return
+
+        if rope_parameters is None:
+            rope_parameters = {}
+
+        if isinstance(rope_parameters, dict):
+            rope_parameters = self._normalize_rope_assignment(rope_parameters)
+            if rope_theta is not None and "rope_theta" not in rope_parameters and "rope_type" in rope_parameters:
+                rope_parameters["rope_theta"] = rope_theta
+            if partial_rotary_factor is not None and "rope_type" in rope_parameters:
+                rope_parameters.setdefault("partial_rotary_factor", partial_rotary_factor)
+
+        self.rope_parameters = rope_parameters
 
     def __init__(
         self,
@@ -566,6 +785,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         precompute_masks: bool = True,
         kv_cache_quantization_config: QuantizationConfig | None = None,
         quantization_config: QuantizationConfig | None = None,
+        use_qmm_best_config: bool = False,
+        qmm_platform_override: str | None = None,
+        qmm_tpu_path_override: str | None = None,
         kv_cache_sharding_sequence_axis_name: str | tuple[str, ...] = "sp",
         flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = "triton",
         attn_dtype: jnp.dtype = jnp.bfloat16,
@@ -640,6 +862,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         self.kv_cache_quantization_config = getattr(self, "kv_cache_quantization_config", kv_cache_quantization_config)
         self.quantization_config = getattr(self, "quantization_config", quantization_config)
+        self.use_qmm_best_config = getattr(self, "use_qmm_best_config", bool(use_qmm_best_config))
+        self.qmm_platform_override = getattr(self, "qmm_platform_override", qmm_platform_override)
+        self.qmm_tpu_path_override = getattr(self, "qmm_tpu_path_override", qmm_tpu_path_override)
         self.flash_attention_backward_pass_impl = getattr(
             self, "flash_attention_backward_pass_impl", flash_attention_backward_pass_impl
         )
@@ -660,6 +885,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.sp_is_ep_bound = getattr(self, "sp_is_ep_bound", sp_is_ep_bound)
         self.operation_configs = getattr(self, "operation_configs", operation_configs)
         self.pretraining_tp = 1  # it's for pytorch models.
+
+        # Keep legacy HF-compatible config fields available even when subclasses
+        # don't pass them explicitly to super().__init__.
+        self._ensure_hf_compat_fields(kwargs)
+        self._ensure_rope_context_fields(kwargs)
+        self._ensure_rope_parameters(kwargs)
+
         if self.kv_cache_quantization_config is not None and self.use_sharded_kv_caching:
             use_sharded_kv_caching = self.use_sharded_kv_caching
             warnings.warn(
@@ -1166,6 +1398,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "precompute_masks",
             "kv_cache_quantization_config",
             "quantization_config",
+            "use_qmm_best_config",
+            "qmm_platform_override",
+            "qmm_tpu_path_override",
             "kv_cache_sharding_sequence_axis_name",
             "flash_attention_backward_pass_impl",
             "attn_dtype",
@@ -1216,6 +1451,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         precompute_masks: bool = NOT_GIVEN,
         kv_cache_quantization_config: QuantizationConfig | None = NOT_GIVEN,
         quantization_config: QuantizationConfig | None = NOT_GIVEN,
+        use_qmm_best_config: bool = NOT_GIVEN,
+        qmm_platform_override: str | None = NOT_GIVEN,
+        qmm_tpu_path_override: str | None = NOT_GIVEN,
         kv_cache_sharding_sequence_axis_name: str | tuple[str, ...] = NOT_GIVEN,
         flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = NOT_GIVEN,
         attn_dtype: jnp.dtype = NOT_GIVEN,
@@ -1273,6 +1511,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
             precompute_masks: Whether to precompute and cache masks (default ``True``).
             kv_cache_quantization_config: KV cache quantization config (default ``None`` = no quantization).
             quantization_config: Linear-layer quantization config (default ``None`` = no quantization).
+            use_qmm_best_config: Whether quantized linear kernels request
+                ejkernel tuned block configs by default (default ``False``).
+            qmm_platform_override: Optional explicit quantized-matmul platform override.
+            qmm_tpu_path_override: Optional explicit quantized-matmul TPU path override.
             kv_cache_sharding_sequence_axis_name: Axis name(s) for KV cache sharding (default ``"sp"``).
             flash_attention_backward_pass_impl: Backward kernel for flash attention (default ``"triton"``).
             attn_dtype: Attention activation dtype (default ``jnp.float32``).
@@ -1322,6 +1564,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "precompute_masks", True, precompute_masks)
         set_attrs_smartly(self, "kv_cache_quantization_config", None, kv_cache_quantization_config)
         set_attrs_smartly(self, "quantization_config", None, quantization_config)
+        set_attrs_smartly(self, "use_qmm_best_config", False, use_qmm_best_config)
+        set_attrs_smartly(self, "qmm_platform_override", None, qmm_platform_override)
+        set_attrs_smartly(self, "qmm_tpu_path_override", None, qmm_tpu_path_override)
         set_attrs_smartly(self, "flash_attention_backward_pass_impl", "triton", flash_attention_backward_pass_impl)
         set_attrs_smartly(self, "attn_dtype", jnp.float32, attn_dtype)
         set_attrs_smartly(self, "kvdtype", jnp.bfloat16, kvdtype if kvdtype is not None else self.attn_dtype)
@@ -1379,6 +1624,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         "precompute_masks",
         "kv_cache_quantization_config",
         "quantization_config",
+        "use_qmm_best_config",
+        "qmm_platform_override",
+        "qmm_tpu_path_override",
         "kv_cache_sharding_sequence_axis_name",
         "flash_attention_backward_pass_impl",
         "attn_dtype",
@@ -1628,9 +1876,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         for key, value in self.__dict__.items():
             if key in {"_hidden_mesh", "_hidden_explicit_mesh", "_hidden_manual_mesh"}:
-                setattr(result, key, value)
+                object.__setattr__(result, key, value)
             else:
-                setattr(result, key, copy.deepcopy(value, memo))
+                object.__setattr__(result, key, copy.deepcopy(value, memo))
 
         return result
 
@@ -2047,7 +2295,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             RopeConfig: Configured RoPE settings including scaling type,
                 factor, and other rope-specific parameters.
         """
-        from easydel.layers.components import RopeConfig
+        from easydel.layers import RopeConfig
 
         if not hasattr(self, "rope_scaling") or self.rope_scaling is None:
             config = RopeConfig()
@@ -2098,7 +2346,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             ... )
             >>> rotated_q, rotated_k = rope_fn(query, key, positions)
         """
-        from easydel.layers.components import get_rope
+        from easydel.layers import get_rope
 
         partial_rotary_factor = getattr(self, "partial_rotary_factor", 1.0)
         rotary_dim = rotary_dim or head_size
@@ -2147,7 +2395,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             >>> caches = config.get_basic_inv_frequencies(head_size=64)
             >>> inv_freqs = caches.data  # The actual frequency tensor
         """
-        from easydel.layers.components import get_inv_frequencies
+        from easydel.layers import get_inv_frequencies
 
         from .utils import ModuleCaches
 
@@ -2198,7 +2446,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             The returned frequencies are in bfloat16 format for memory efficiency
             and are replicated across all devices (PartitionSpec()).
         """
-        from easydel.layers.components import get_frequencies
+        from easydel.layers import get_frequencies
 
         from .utils import ModuleCaches
 

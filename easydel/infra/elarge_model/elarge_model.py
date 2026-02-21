@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -65,14 +65,15 @@ if typing.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset
 
     from easydel.data.core.protocols import ShardedDataSource
-    from easydel.inference.reasoning.abstract_reasoning import ReasoningParserName
     from easydel.inference import eSurge
+    from easydel.inference.reasoning.abstract_reasoning import ReasoningParserName
     from easydel.inference.tools.abstract_tool import ToolParserName
     from easydel.trainers import Trainer
 
     from .types import TextDatasetInformCfg, VisualDatasetInformCfg
 logger = get_logger("eLargeModel")
 _ESURGE_UNSET = object()
+_QUANT_UNSET = object()
 
 
 class BuildTrainerKws(typing.TypedDict, total=False):
@@ -491,6 +492,9 @@ class eLargeModel:
         self,
         method: str | None = None,
         group_size: int = 128,
+        use_qmm_best_config: bool = False,
+        qmm_platform_override: str | None | object = _QUANT_UNSET,
+        qmm_tpu_path_override: str | None | object = _QUANT_UNSET,
         **kwargs,
     ) -> eLargeModel:
         """Configure quantization settings.
@@ -502,6 +506,12 @@ class eLargeModel:
             method: Quantization method.
             group_size: Quantization group size (default: 128).
                 Smaller groups = better accuracy but more overhead.
+            use_qmm_best_config: Whether quantized linear kernels should request
+                ejkernel tuned block configs by default.
+            qmm_platform_override: Optional explicit quantized-matmul platform
+                override. Pass None to clear a previous value.
+            qmm_tpu_path_override: Optional explicit TPU quantized-matmul path
+                override. Pass None to clear a previous value.
             **kwargs: Additional quantization options:
                 - platform: Target platform ("cpu", "cuda", "tpu")
                 - compute_dtype: Dtype for computation (e.g., "fp16")
@@ -518,6 +528,11 @@ class eLargeModel:
         if method is not None:
             quant["method"] = method
         quant["group_size"] = group_size
+        quant["use_qmm_best_config"] = bool(use_qmm_best_config)
+        if qmm_platform_override is not _QUANT_UNSET:
+            quant["qmm_platform_override"] = qmm_platform_override
+        if qmm_tpu_path_override is not _QUANT_UNSET:
+            quant["qmm_tpu_path_override"] = qmm_tpu_path_override
         quant.update(kwargs)
         return self
 
@@ -578,6 +593,7 @@ class eLargeModel:
         max_model_len: int | None = None,
         max_num_seqs: int = 16,
         hbm_utilization: float = 0.85,
+        bind_graphstate_for_aot: bool | object = _ESURGE_UNSET,
         tool_parser: ToolParserName | None | object = _ESURGE_UNSET,
         reasoning_parser: ReasoningParserName | None | object = _ESURGE_UNSET,
         **kwargs,
@@ -594,6 +610,10 @@ class eLargeModel:
                 Higher values increase throughput but require more memory.
             hbm_utilization: HBM memory utilization ratio (0.0-1.0).
                 Controls how much device memory to use for KV cache.
+            bind_graphstate_for_aot: Optional override for AOT model-step
+                compilation behavior. When True, compiled model-step variants
+                capture graphstate/graphother as compile-time constants.
+                When omitted, keeps the current value (default config is False).
             tool_parser: Tool parser name to use for automatic function-call
                 extraction. Pass None to clear a previously configured parser.
             reasoning_parser: Reasoning parser name to use for separating
@@ -601,6 +621,8 @@ class eLargeModel:
                 clear a previously configured parser.
             **kwargs: Additional eSurge options:
                 - page_size: PagedAttention page size (default: 128)
+                - data_parallelism_axis: Mesh axis used for KV-cache data-parallel
+                  page sharding (default: "dp", set "ep" for expert-axis DP)
                 - enable_prefix_caching: Enable prefix caching optimization
                 - kv_cache_dtype: Dtype for KV cache (None = auto)
                 - decoding_engine: "ring" or "triton" (default: auto)
@@ -630,6 +652,8 @@ class eLargeModel:
         esurge["max_num_seqs"] = max_num_seqs
         esurge["hbm_utilization"] = hbm_utilization
         esurge.update(kwargs)
+        if bind_graphstate_for_aot is not _ESURGE_UNSET:
+            esurge["bind_graphstate_for_aot"] = bool(bind_graphstate_for_aot)
         if tool_parser is not _ESURGE_UNSET:
             esurge["tool_parser"] = tool_parser
         if reasoning_parser is not _ESURGE_UNSET:

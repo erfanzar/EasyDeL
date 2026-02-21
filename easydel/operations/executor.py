@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,10 +19,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from easydel.layers.operations.requirements import ExecutionMode, OperationRequirements
+from easydel.operations.requirements import ExecutionMode, OperationRequirements
 
 if TYPE_CHECKING:
-    from easydel.layers.operations._base_operation import BaseOperation
+    from easydel.operations._base_operation import BaseOperation
 
 __all__ = ["OperationExecutor"]
 

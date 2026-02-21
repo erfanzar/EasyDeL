@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -83,7 +83,7 @@ from jax import numpy as jnp
 from jax.sharding import Mesh
 from jaxtyping import Array, Bool, Float, Int, Shaped
 
-from easydel.layers.components import ParallelLinear, QuantizationConfig
+from easydel.layers import ParallelLinear, QuantizationConfig
 
 from ..base_config import EasyDeLBaseConfig
 from ..loss_utils import LossConfig, LossMetrics
@@ -142,8 +142,7 @@ RecurrentState = list[Float[Array, "..."]]
 if tp.TYPE_CHECKING:
     from transformers import PreTrainedModel
 
-    from easydel.infra.base_state import EasyDeLState
-    from easydel.layers.caching import (
+    from easydel.caching import (
         HybridCache,
         OperationsMetadata,
         RaggedPagesCache,
@@ -152,6 +151,7 @@ if tp.TYPE_CHECKING:
         TransformerCache,
         TransformerMetadata,
     )
+    from easydel.infra.base_state import EasyDeLState
 
 
 def return_type_adjuster(

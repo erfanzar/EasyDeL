@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -75,7 +75,7 @@ from eformer import escale as es
 from flax import nnx as nn
 from jax import numpy as jnp
 
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     RaggedPagesCache,
     RaggedPagesCacheConfig,
@@ -111,6 +111,8 @@ class ModelStepExecutor:
         max_num_reqs (int): Maximum number of concurrent requests.
         graphdef (Any): Model graph definition (static structure).
         use_aot_forward (bool): Whether to use AOT compilation.
+        bind_graphstate_for_aot (bool): Whether AOT-compiled model steps
+            close over graphstate/graphother as compile-time constants.
 
     Example:
         >>> executor = ModelStepExecutor(
@@ -143,8 +145,8 @@ class ModelStepExecutor:
         graphdef: tp.Any,
         empty_sharding: jax.sharding.Sharding,
         use_aot_forward: bool,
+        bind_graphstate_for_aot: bool = False,
         cache_capacity: int = 64,
-        maybe_implicit: tp.Callable[[tp.Callable[..., tp.Any]], tp.Callable[..., tp.Any]] | None = None,
     ) -> None:
         """Initialize the ModelStepExecutor.
 
@@ -160,10 +162,12 @@ class ModelStepExecutor:
             empty_sharding: Default JAX sharding for replicated arrays.
             use_aot_forward: If True, use AOT compilation via lower().compile().
                 If False, use JIT compilation on first call.
+            bind_graphstate_for_aot: When True in AOT mode, compile model-step
+                variants with graphstate/graphother closed over as constants
+                (runtime call signature is preserved). This enables weight-
+                concrete kernel policies (e.g. TPU predecode-once). Default: False.
             cache_capacity: Maximum number of compiled variants to cache.
                 Defaults to 64. Uses LRU eviction when full.
-            maybe_implicit: Optional wrapper function for implicit array
-                handling (used for quantized models). Defaults to identity.
         """
         self.model = model
         self.mesh = mesh
@@ -174,9 +178,8 @@ class ModelStepExecutor:
         self._use_slot_mapping = self._metadata_version == "v2"
         self._empty_sharding = empty_sharding
         self.use_aot_forward = bool(use_aot_forward)
+        self.bind_graphstate_for_aot = bool(bind_graphstate_for_aot)
         self._cache_capacity = int(cache_capacity)
-
-        self._maybe_implicit = maybe_implicit or (lambda f: f)
 
         self._model_step_fn = self._build_model_step_fn(
             kv_pages_template=kv_pages_template,
@@ -310,10 +313,23 @@ class ModelStepExecutor:
             return None
 
         if self.use_aot_forward:
-            compiled = self._model_step_fn.lower(
-                *(graphdef, graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
-            ).compile()
-            self._cache_put(key, compiled)
+            if self.bind_graphstate_for_aot:
+
+                def _bound_step(kv_pages_, metadata_):
+                    return self._model_step_fn(graphdef, graphstate, graphother, kv_pages_, metadata_)
+
+                compiled_bound = jax.jit(_bound_step).lower(inputs.kv_pages, inputs.batch_metadata).compile()
+
+                def _wrapped_bound(graphstate_, graphother_, kv_pages_, metadata_):
+                    del graphstate_, graphother_
+                    return compiled_bound(kv_pages_, metadata_)
+
+                self._cache_put(key, _wrapped_bound)
+            else:
+                compiled = self._model_step_fn.lower(
+                    *(graphdef, graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
+                ).compile()
+                self._cache_put(key, compiled)
             return None
 
         def wrapped(graphstate_, graphother_, kv_pages_, metadata_):
@@ -390,7 +406,6 @@ class ModelStepExecutor:
             ),
             out_shardings=outputs_shardings,
         )
-        @self._maybe_implicit
         def _model_step(
             graphdef,
             graphstate,

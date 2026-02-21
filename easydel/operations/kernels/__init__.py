@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -57,8 +57,8 @@ State Space Model Operations:
         Linear attention variant used in Kimi Linear models.
 
 Example:
-    >>> from easydel.layers.operations import OperationRegistry, OperationMetadata
-    >>> from easydel.layers.operations.modules import FlashAttn, VanillaAttn
+    >>> from easydel.operations import OperationRegistry, OperationMetadata
+    >>> from easydel.operations.kernels import FlashAttn, VanillaAttn
     >>>
     >>> # Create attention by name through registry
     >>> metadata = OperationMetadata(runtime_dtype=jnp.float16)

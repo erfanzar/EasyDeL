@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@ for:
     - Automatic sharding and partitioning for distributed training
 
 Example:
-    >>> from easydel.layers.components import BaseMoeModule, ParallelMoELinear
+    >>> from easydel.layers import BaseMoeModule, ParallelMoELinear
     >>> # Create a custom MoE layer by extending BaseMoeModule
     >>> class CustomMoE(BaseMoeModule):
     ...     def __init__(self, config):

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,16 +23,16 @@ from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array
 
+from easydel.caching import RecurrentCache, RecurrentCacheView
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.caching import RecurrentCache, RecurrentCacheView
-from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
-from easydel.layers.components import RMSNorm as FlaxMamba2RMSNorm
-from easydel.layers.operations import OperationMetadata
-from easydel.layers.operations.modules import SSM2Op
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers import RMSNorm as FlaxMamba2RMSNorm
+from easydel.modules._base import BaseCausalLMModule
+from easydel.operations import OperationMetadata
+from easydel.operations.kernels import SSM2Op
 
 from .mamba2_configuration import Mamba2Config as Mamba2Config
 
@@ -997,7 +997,7 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):
         """
         from eformer.escale import PartitionAxis
 
-        from easydel.layers.caching import RecurrentCache, RecurrentCacheConfig
+        from easydel.caching import RecurrentCache, RecurrentCacheConfig
 
         cache_params = kwargs.get("cache_params", None)
         cache_position = kwargs.get("cache_position", None)

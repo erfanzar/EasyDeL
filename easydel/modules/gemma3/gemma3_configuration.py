@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -224,6 +224,29 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
                 for i in range(self.num_hidden_layers)
             ]
         self.rope_scaling = rope_scaling
+        full_attention_rope_params: dict[str, typing.Any] = {
+            "rope_type": "default",
+            "rope_theta": self.rope_theta,
+        }
+        if isinstance(self.rope_scaling, dict):
+            full_attention_rope_params.update(self.rope_scaling)
+        if "type" in full_attention_rope_params and "rope_type" not in full_attention_rope_params:
+            full_attention_rope_params["rope_type"] = full_attention_rope_params["type"]
+        full_attention_rope_params.setdefault("type", full_attention_rope_params["rope_type"])
+        full_attention_rope_params.setdefault("rope_theta", self.rope_theta)
+
+        # Gemma3 uses per-layer RoPE settings: local base for sliding attention,
+        # global (optionally scaled) RoPE for full attention.
+        rope_parameters: dict[str, dict[str, typing.Any]] = {}
+        layer_type_set = set(self.layer_types)
+        if "sliding_attention" in layer_type_set:
+            rope_parameters["sliding_attention"] = {
+                "rope_type": "default",
+                "rope_theta": self.rope_local_base_freq,
+            }
+        if "full_attention" in layer_type_set:
+            rope_parameters["full_attention"] = full_attention_rope_params
+        self.rope_parameters = rope_parameters
 
     def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
         """Returns partition rules for model sharding.

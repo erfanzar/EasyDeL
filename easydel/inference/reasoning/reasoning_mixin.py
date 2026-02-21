@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -49,7 +49,7 @@ class ReasoningMixin:
                 logger.info(f"Initialized {reasoning_parser_name} reasoning parser for model {model_name}")
             except KeyError:
                 logger.warning(
-                    f"Reasoning parser '{reasoning_parser_name}' not found, " f"reasoning disabled for {model_name}"
+                    f"Reasoning parser '{reasoning_parser_name}' not found, reasoning disabled for {model_name}"
                 )
             except Exception as e:
                 logger.warning(f"Failed to initialize reasoning parser for {model_name}: {e}")

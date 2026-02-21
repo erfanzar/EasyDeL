@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,9 +29,9 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
 from easydel.infra.utils import ArrayParam
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
-from easydel.layers.components.norms import LayerNorm
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseCausalLMModule
 
 from .rwkv_configuration import RwkvConfig as RwkvConfig
 
@@ -897,7 +897,7 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):
 
     @property
     def transform_fn(self):
-        from easydel.layers.components import BaseMoeModule, ParallelMoELinear
+        from easydel.layers import BaseMoeModule, ParallelMoELinear
         from easydel.utils import traversals
         from easydel.utils.parameters_transformation import StateDictConverter
 

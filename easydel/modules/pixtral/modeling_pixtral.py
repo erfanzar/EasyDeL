@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,8 +28,8 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.layers import ColumnParallelLinear, RMSNorm, RowParallelLinear
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.components import ColumnParallelLinear, RMSNorm, RowParallelLinear
 
 from .pixtral_configuration import PixtralVisionConfig
 

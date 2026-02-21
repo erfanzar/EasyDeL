@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,6 +24,16 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
@@ -34,19 +44,7 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
-from easydel.layers.caching import (
-    HybridCache,
-    OperationsMetadata,
-    RaggedPagesCache,
-    RaggedPagesCacheView,
-    RaggedPagesMetadata,
-    TransformerCache,
-    TransformerCacheView,
-    TransformerMetadata,
-)
-from easydel.layers.components import (
+from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
     ColumnParallelMoELinear,
@@ -56,6 +54,8 @@ from easydel.layers.components import (
     RMSNorm,
     RowParallelMoELinear,
 )
+from easydel.layers.attention import UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .mixtral_configuration import MixtralConfig as MixtralConfig
 
@@ -115,16 +115,19 @@ class MixtralMoEMlp(nn.Module):
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
             "splits": [
-                {"name": "w1.kernel", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
-                {"name": "w3.kernel", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
+                {"name": "w1.kernel", "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2)},
+                {"name": "w3.kernel", "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2)},
             ],
-            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+            "inverse_spliter": lambda torch, gate, up: torch.cat(
+                (gate.transpose(-1, -2), up.transpose(-1, -2)),
+                dim=1,
+            ),
         },
         "down_proj$": {
             "splits": [
-                {"name": "w2.kernel", "spliter": lambda x: x},
+                {"name": "w2.kernel", "spliter": lambda x: x.swapaxes(-1, -2)},
             ],
-            "inverse_spliter": lambda x: x,
+            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
         },
     }
 
@@ -306,6 +309,35 @@ class MixtralDecoderLayer(nn.Module):
     Combines multi-head attention with sliding window and Sparse MoE feedforward
     networks, using RMS normalization and residual connections.
     """
+
+    # Accept HF MoE tensor naming (`mlp.*`) directly during state-dict conversion
+    # so conversion does not depend on test-only key remaps.
+    reform_param: typing.ClassVar = {
+        "mlp.gate.weight$": {
+            "splits": [{"name": "block_sparse_moe.gate.kernel", "spliter": lambda x: x.swapaxes(-1, -2)}],
+            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
+        },
+        "mlp.experts.gate_up_proj$": {
+            "splits": [
+                {
+                    "name": "block_sparse_moe.experts.w1.kernel",
+                    "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
+                },
+                {
+                    "name": "block_sparse_moe.experts.w3.kernel",
+                    "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
+                },
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.cat(
+                (gate.transpose(-1, -2), up.transpose(-1, -2)),
+                dim=1,
+            ),
+        },
+        "mlp.experts.down_proj$": {
+            "splits": [{"name": "block_sparse_moe.experts.w2.kernel", "spliter": lambda x: x.swapaxes(-1, -2)}],
+            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
+        },
+    }
 
     def __init__(
         self,

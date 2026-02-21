@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,16 +25,7 @@ from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-    DecoderLayerOutput,
-    MoeModelOutput,
-)
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -44,7 +35,14 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.components import (
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import (
+    DecoderLayerOutput,
+    MoeModelOutput,
+)
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
+from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
     ColumnParallelMoELinear,
@@ -55,6 +53,8 @@ from easydel.layers.components import (
     RowParallelLinear,
     RowParallelMoELinear,
 )
+from easydel.layers.attention import UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .glm4_moe_configuration import Glm4MoeConfig
 
@@ -73,6 +73,7 @@ class Glm4MoeMLP(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.PrecisionLike = None,
+        intermediate_size: int | None = None,
         *,
         rngs: nn.Rngs,
     ):
@@ -84,12 +85,15 @@ class Glm4MoeMLP(nn.Module):
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
             precision (jax.lax.PrecisionLike, optional): Numerical precision for operations.
                 Defaults to None.
+            intermediate_size (int | None, optional): Optional MLP intermediate size override.
+                If None, uses config.intermediate_size.
             rngs (nn.Rngs): Random number generator state.
         """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
+        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
         column_parallel_linear = partial(
             ColumnParallelLinear,
             dtype=dtype,
@@ -108,9 +112,9 @@ class Glm4MoeMLP(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.gate_proj = column_parallel_linear(config.hidden_size, config.intermediate_size)
-        self.up_proj = column_parallel_linear(config.hidden_size, config.intermediate_size)
-        self.down_proj = row_parallel_linear(config.intermediate_size, config.hidden_size)
+        self.gate_proj = column_parallel_linear(config.hidden_size, self.intermediate_size)
+        self.up_proj = column_parallel_linear(config.hidden_size, self.intermediate_size)
+        self.down_proj = row_parallel_linear(self.intermediate_size, config.hidden_size)
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> jnp.ndarray:
@@ -150,16 +154,25 @@ class Glm4MoeMLPStack(nn.Module):
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
             "splits": [
-                {"name": "gate_proj.kernel", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
-                {"name": "up_proj.kernel", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
+                {
+                    "name": "gate_proj.kernel",
+                    "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
+                },
+                {
+                    "name": "up_proj.kernel",
+                    "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
+                },
             ],
-            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+            "inverse_spliter": lambda torch, gate, up: torch.cat(
+                (gate.transpose(-1, -2), up.transpose(-1, -2)),
+                dim=1,
+            ),
         },
         "down_proj$": {
             "splits": [
-                {"name": "down_proj.kernel", "spliter": lambda x: x},
+                {"name": "down_proj.kernel", "spliter": lambda x: x.swapaxes(-1, -2)},
             ],
-            "inverse_spliter": lambda x: x,
+            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
         },
     }
 
@@ -190,7 +203,7 @@ class Glm4MoeMLPStack(nn.Module):
         self.gate_proj = ColumnParallelMoELinear(
             num_experts=config.n_routed_experts,
             in_features=config.hidden_size,
-            out_features=config.intermediate_size,
+            out_features=config.moe_intermediate_size,
             rngs=rngs,
             kernel_init=nn.initializers.normal(),
             use_bias=False,
@@ -201,7 +214,7 @@ class Glm4MoeMLPStack(nn.Module):
         )
         self.down_proj = RowParallelMoELinear(
             num_experts=config.n_routed_experts,
-            in_features=config.intermediate_size,
+            in_features=config.moe_intermediate_size,
             out_features=config.hidden_size,
             rngs=rngs,
             use_bias=False,
@@ -214,7 +227,7 @@ class Glm4MoeMLPStack(nn.Module):
         self.up_proj = ColumnParallelMoELinear(
             num_experts=config.n_routed_experts,
             in_features=config.hidden_size,
-            out_features=config.intermediate_size,
+            out_features=config.moe_intermediate_size,
             rngs=rngs,
             use_bias=False,
             kernel_init=nn.initializers.normal(),
@@ -295,8 +308,9 @@ class Glm4MoeTopKRouter(nn.Module):
         self.e_score_correction_bias = ArrayParam.bound(
             shape=(self.n_routed_experts,),
             dtype=jnp.float32,
-            init_method="zeros",
-            key=None,
+            init_method="normal",
+            init_kwargs={"stddev": 0.0},
+            key=rngs.param(),
         )
 
     def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
@@ -341,30 +355,19 @@ class Glm4MoeTopKRouter(nn.Module):
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Compute routing weights for input tokens.
+        """Compute pre-activation router logits for input tokens.
 
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_dim]
 
         Returns:
-            Selected expert weights [batch * seq_len, top_k] with optional
-            probability normalization and routed scaling factor applied.
+            Router logits [batch * seq_len, n_routed_experts].
         """
         hidden_states = hidden_states.reshape(-1, self.config.hidden_size)
-        router_logits = checkpoint_name(
+        return checkpoint_name(
             jnp.matmul(hidden_states.astype(jnp.float32), self.kernel.value.astype(jnp.float32)),
             name="moe_router_logits",
         )
-        scores = jax.nn.sigmoid(router_logits)
-        selected_experts = self.get_selected_experts(scores)
-        batch_size = scores.shape[0]
-        batch_indices = jnp.arange(batch_size)[:, None]
-        selected_weights = scores[batch_indices, selected_experts]
-        if self.norm_topk_prob:
-            denominator = jnp.sum(selected_weights, axis=-1, keepdims=True) + 1e-20
-            selected_weights = selected_weights / denominator
-        selected_weights = selected_weights * self.routed_scaling_factor
-        return selected_weights
 
 
 class Glm4MoeMoE(BaseMoeModule):
@@ -408,6 +411,7 @@ class Glm4MoeMoE(BaseMoeModule):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
+        self.group_topk_k = min(2, config.n_routed_experts // max(config.n_group, 1))
 
         self.experts = Glm4MoeMLPStack(
             config=config,
@@ -430,8 +434,57 @@ class Glm4MoeMoE(BaseMoeModule):
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
+            intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
             rngs=rngs,
         )
+        self.moe_hooks = self.moe_hooks.replace(
+            normalize_gate_logits=lambda x: x,
+            select_hook=partial(
+                self._select_experts_static,
+                n_routed_experts=self.n_routed_experts,
+                n_group=self.config.n_group,
+                topk_group=self.config.topk_group,
+                group_topk_k=self.group_topk_k,
+                norm_topk_prob=self.config.norm_topk_prob,
+                routed_scaling_factor=self.config.routed_scaling_factor,
+            ),
+        )
+
+    @staticmethod
+    def _select_experts_static(
+        gate_logits: Array,
+        pre_bias_logits: Array | None,
+        k: int,
+        *,
+        n_routed_experts: int,
+        n_group: int,
+        topk_group: int,
+        group_topk_k: int,
+        norm_topk_prob: bool,
+        routed_scaling_factor: float,
+    ) -> tuple[Array, Array]:
+        del pre_bias_logits
+        scores = jax.nn.sigmoid(gate_logits.astype(jnp.float32))
+        scores_for_choice = scores
+        batch_size = scores_for_choice.shape[0]
+        group_size = n_routed_experts // n_group
+        group_scores = scores_for_choice.reshape(batch_size, n_group, group_size)
+        top2_per_group = jax.lax.top_k(group_scores, k=group_topk_k)[0]
+        group_scores_sum = jnp.sum(top2_per_group, axis=-1)
+        group_k = min(topk_group, n_group)
+        group_idx = jax.lax.top_k(group_scores_sum, k=group_k)[1]
+        group_mask = jax.nn.one_hot(group_idx, n_group, dtype=scores.dtype)
+        group_mask = jnp.sum(group_mask, axis=1)
+        score_mask = jnp.repeat(group_mask, group_size, axis=1)
+        scores_for_choice = jnp.where(score_mask > 0, scores_for_choice, 0.0)
+        topk_indices = jax.lax.top_k(scores_for_choice, k=k)[1]
+        topk_weights = jnp.take_along_axis(scores, topk_indices, axis=-1)
+
+        if norm_topk_prob:
+            denominator = jnp.sum(topk_weights, axis=-1, keepdims=True) + 1e-20
+            topk_weights = topk_weights / denominator
+        topk_weights = topk_weights * routed_scaling_factor
+        return topk_weights, topk_indices
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
         """Forward pass through the MoE layer.

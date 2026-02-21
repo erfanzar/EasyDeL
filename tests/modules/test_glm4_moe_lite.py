@@ -84,7 +84,7 @@ class TestGLM4MoeLite:
     def test_ragged_cache_uses_mla_q_head_dim(self, glm4_moe_lite_config, monkeypatch):
         """Paged-cache config must use MLA q_head_dim, not rope-only head_dim."""
         captured = {}
-        from easydel.layers.caching import RaggedPagesCacheConfig
+        from easydel.caching import RaggedPagesCacheConfig
 
         original_create = RaggedPagesCacheConfig.create
 

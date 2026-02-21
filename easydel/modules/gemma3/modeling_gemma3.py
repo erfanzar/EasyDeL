@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,6 +27,16 @@ from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
@@ -38,21 +48,10 @@ from easydel.infra.modeling_outputs import (
     VLMCausalLMOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat, block_wise_ffn
-from easydel.layers.attention import FlexibleAttentionModule
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule, BaseVisionLanguageModule
-from easydel.layers.caching import (
-    HybridCache,
-    OperationsMetadata,
-    RaggedPagesCache,
-    RaggedPagesCacheView,
-    RaggedPagesMetadata,
-    TransformerCache,
-    TransformerCacheView,
-    TransformerMetadata,
-)
-from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
-from easydel.layers.components.norms._norms import lowfloats
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.norms._norms import lowfloats
+from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule, BaseVisionLanguageModule
 from easydel.modules.auto.auto_modeling import AutoEasyDeLVisionModel
 
 from .gemma3_configuration import Gemma3Config, Gemma3TextConfig
@@ -634,7 +633,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
             ModuleCaches: Cached RoPE frequencies with local base frequency.
         """
         from easydel.infra.utils import ModuleCaches
-        from easydel.layers.components import get_frequencies
+        from easydel.layers import get_frequencies
 
         frequencies = get_frequencies(
             head_size=self.config.head_dim,

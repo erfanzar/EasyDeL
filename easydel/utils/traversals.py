@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -488,6 +488,7 @@ def merge_state_and_tree(tree: dict, state: nnx.State, *, silence: bool = False)
     Args:
         tree: The parameter tree to attach.
         state: The nnx state to attach the tree to.
+        silence: Suppress missing-parameter warnings.
 
     Returns:
         nnx.State: The updated nnx state with the attached parameter tree.
@@ -536,6 +537,7 @@ def merge_model_and_tree(model: M, tree: dict, *, silence: bool = False) -> M:
     Args:
         tree: The parameter tree to attach.
         model: The nnx model to attach the tree to.
+        silence: Suppress missing-parameter warnings.
 
     Returns:
         nnx.Module: The updated nnx model with the attached parameter tree.

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ Key Features:
     - Hybrid caching for mixed-attention architectures
 
 Example:
-    >>> from easydel.layers.caching import TransformerCache
+    >>> from easydel.caching import TransformerCache
     >>> # Create a transformer cache
     >>> cache = TransformerCache.init(
     ...     batch_size=2,
@@ -54,7 +54,7 @@ Example:
     >>> # Update cache with new key-value pairs
     >>> cache = cache.update(keys, values, positions)
 
-    >>> from easydel.layers.caching import RecurrentCache, RecurrentCacheConfig
+    >>> from easydel.caching import RecurrentCache, RecurrentCacheConfig
     >>> # Create a recurrent cache for Mamba-style models
     >>> metadata = RecurrentCacheConfig.create_for_mamba(
     ...     num_hidden_layers=24,

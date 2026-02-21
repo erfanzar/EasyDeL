@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,11 +31,43 @@ from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Float
 
-from easydel.layers.caching import OperationsMetadata, RaggedPagesMetadata, UnifiedAttentionCacheView, unwrap_metadata
+from easydel.axis import ATTN_DP
+from easydel.caching import OperationsMetadata, RaggedPagesMetadata, UnifiedAttentionCacheView, unwrap_metadata
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
 from ..requirements import CacheType, ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
+
+
+def _dp_page_axis(cache_view: UnifiedAttentionCacheView):
+    """Resolve the logical page axis for the active cache view."""
+    dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
+    return ATTN_DP if dp_size > 1 else ct.EMPTY
+
+
+def _localize_block_tables_for_dp_pages(
+    block_tables: Array,
+    *,
+    num_pages: int,
+    dp_size: int,
+) -> Array:
+    """Translate global page IDs into DP-local page IDs per request row.
+
+    Assumes rows are assigned contiguously per DP shard and page IDs are from
+    a globally indexed page pool partitioned evenly over DP shards.
+    """
+    if dp_size <= 1:
+        return block_tables
+    rows = int(block_tables.shape[0])
+    if rows <= 0 or rows % dp_size != 0 or num_pages <= 0 or num_pages % dp_size != 0:
+        return block_tables
+    rows_per_shard = rows // dp_size
+    pages_per_shard = num_pages // dp_size
+    row_ids = jnp.arange(rows, dtype=jnp.int32)[:, None]
+    row_shards = row_ids // jnp.int32(rows_per_shard)
+    offsets = row_shards * jnp.int32(pages_per_shard)
+    # Keep explicit padding entries unchanged (current page-table padding is 0).
+    return jnp.where(block_tables == 0, block_tables, block_tables - offsets)
 
 
 @OperationRegistry.register
@@ -122,6 +154,13 @@ class PagedFlashAttn(OperationImpl):
         query = query.astype(dtype)
         key_cache = cache_view.key_cache.astype(dtype)
         value_cache = cache_view.value_cache.astype(dtype)
+        dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
+        page_axis = _dp_page_axis(cache_view)
+        block_tables = _localize_block_tables_for_dp_pages(
+            block_tables.astype(jnp.int32),
+            num_pages=int(key_cache.shape[0]),
+            dp_size=dp_size,
+        )
         if bias is not None:
             bias = bias.astype(dtype)
 
@@ -145,12 +184,12 @@ class PagedFlashAttn(OperationImpl):
 
         resolve = self.metadata.partition_manager.resolve
         key_sharding = resolve(
-            axes=[ct.EMPTY, ct.EMPTY, ct.KV_HEAD, ct.EMPTY],
+            axes=[page_axis, ct.EMPTY, ct.KV_HEAD, ct.EMPTY],
             mode=ct.MODE_PREFILL,
             shape=key_cache.shape,
         )
         value_sharding = resolve(
-            axes=[ct.EMPTY, ct.EMPTY, ct.KV_HEAD, ct.EMPTY],
+            axes=[page_axis, ct.EMPTY, ct.KV_HEAD, ct.EMPTY],
             mode=ct.MODE_PREFILL,
             shape=value_cache.shape,
         )

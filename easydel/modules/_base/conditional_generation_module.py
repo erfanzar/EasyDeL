@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -69,9 +69,7 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.modeling_outputs import Seq2SeqLMOutput
-from easydel.infra.utils import auto_remat
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -79,7 +77,9 @@ from easydel.layers.caching import (
     TransformerCache,
     TransformerMetadata,
 )
-from easydel.layers.components import ColumnParallelLinear
+from easydel.infra.modeling_outputs import Seq2SeqLMOutput
+from easydel.infra.utils import auto_remat
+from easydel.layers import ColumnParallelLinear
 
 from ._base_task_module import BaseTaskModule, ConfigT, ModelT
 

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -60,7 +60,7 @@ Key Components:
 Example:
     Basic model quantization:
 
-    >>> from easydel.layers.components.quants import (
+    >>> from easydel.layers.quantization import (
     ...     EasyQuantizer, QuantizationConfig, QuantizationType
     ... )
     >>>
@@ -77,7 +77,7 @@ Example:
 
     Array-level quantization:
 
-    >>> from easydel.layers.components.quants import quantize, QuantizationType
+    >>> from easydel.layers.quantization import quantize, QuantizationType
     >>> import jax.numpy as jnp
     >>>
     >>> weights = jnp.ones((128, 256), dtype=jnp.float32)
@@ -85,7 +85,7 @@ Example:
 
     Quantization-aware training with STE:
 
-    >>> from easydel.layers.components.quants import straight_through
+    >>> from easydel.layers.quantization import straight_through
     >>> import jax
     >>>
     >>> @jax.jit
@@ -114,7 +114,11 @@ from ._straight_through import (
     straight_through_nvfp8,
 )
 
+# Backward-compatible alias for older API surface.
+EasyDeLQuantizationConfig = QuantizationConfig
+
 __all__ = (
+    "EasyDeLQuantizationConfig",
     "EasyQuantizer",
     "QuantizationConfig",
     "QuantizationType",

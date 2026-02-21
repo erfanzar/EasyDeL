@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,6 +28,16 @@ from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from easydel.inference.logits_process import (
     ForceTokensLogitsProcessor,
     LogitsProcessorList,
@@ -44,20 +54,10 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.base_modules import BaseConditionalGenerationModule
-from easydel.layers.caching import (
-    HybridCache,
-    OperationsMetadata,
-    RaggedPagesCache,
-    RaggedPagesCacheView,
-    RaggedPagesMetadata,
-    TransformerCache,
-    TransformerCacheView,
-    TransformerMetadata,
-)
-from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
-from easydel.layers.components.norms import LayerNorm
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseConditionalGenerationModule
 
 from .whisper_configuration import WhisperConfig as WhisperConfig
 

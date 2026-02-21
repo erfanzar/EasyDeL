@@ -13,7 +13,7 @@ blocksparse, etc.) to return consistent output structures while supporting
 their unique capabilities.
 
 Example:
-    >>> from easydel.layers.operations import FlashAttn, OperationMetadata
+    >>> from easydel.operations import FlashAttn, OperationMetadata
     >>>
     >>> metadata = OperationMetadata(runtime_dtype=jnp.float16)
     >>> attn = FlashAttn(metadata)
@@ -34,7 +34,8 @@ from eformer.pytree import auto_pytree
 from jax import Array
 from jaxtyping import Float
 
-from ..caching import RaggedPagesCacheView, TransformerCacheView, UnifiedAttentionCacheView
+from easydel.caching import RaggedPagesCacheView, TransformerCacheView, UnifiedAttentionCacheView
+
 from ._operation_impl import OperationOutput
 
 

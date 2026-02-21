@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1220,7 +1220,7 @@ class HybridCache(BaseCache):
                     )
                 )
             elif layer_type == LINEAR_ATTENTION:
-                from easydel.layers.caching.recurrent import RecurrentCacheView
+                from easydel.caching.recurrent import RecurrentCacheView
 
                 views.append(
                     RecurrentCacheView(

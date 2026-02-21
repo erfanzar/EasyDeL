@@ -36,7 +36,7 @@ The provided script relies on a setup script from EasyDeL to prepare the TPU env
 2. **Run the EasyDeL setup script:**
 
     ```bash
-    bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/tpu_setup.sh)
+    bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/scripts/tpu_setup.sh)
     ```
 
     This command downloads and executes a script that installs required packages such as JAX, EasyDeL, Ray, Hugging Face libraries, and other Python dependencies optimized for TPU operation. This process might take several minutes.
@@ -74,7 +74,7 @@ The provided script relies on a setup script from EasyDeL to prepare the TPU env
 Save the provided Python script as `sft_finetune.py` (or any other `.py` name) on your TPU VM. Let's walk through its key components, focusing on what makes SFT unique.
 
 ```python
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 # ... (license header) ...
 
 import os

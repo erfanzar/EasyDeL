@@ -5,6 +5,7 @@ easydel.inference.esurge package
    :maxdepth: 2
 
    core/index
+   mixins/index
    multimodal/index
    runners/index
    scheduler/index
@@ -13,6 +14,7 @@ easydel.inference.esurge package
    dashboard
    engine_types
    esurge_engine
+   logger
    metrics
    monitoring
    outputs
