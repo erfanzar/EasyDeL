@@ -12,103 +12,99 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Quantization utilities for EasyDeL layers.
+"""Quantization components for EasyDeL neural network layers.
 
-This module provides compatibility exports for quantization utilities,
-enabling memory-efficient model inference through various quantization
-schemes including AFFINE, INT8, NF4, MXFP4, MXFP8, and other formats.
+This package provides comprehensive quantization support for EasyDeL models,
+enabling memory-efficient storage and computation of neural network weights.
+It supports multiple quantization formats with both inference-optimized and
+training-compatible (QAT) implementations.
 
-Quantization reduces memory footprint and can improve inference speed
-by representing model weights and activations with lower precision
-while maintaining acceptable model quality.
+Supported Quantization Formats:
+    - NF4 (4-bit NormalFloat): QLoRA-style block-wise quantization with
+      excellent quality-compression tradeoff. Recommended for LLM deployment.
+    - Affine: Scale+bias quantization with configurable bit-width (2-8) and
+      group size (ejkernel mode for quantized kernels).
+    - INT8: Standard 8-bit integer quantization with wide hardware support.
+    - MXFP8: Microscaling 8-bit float with shared exponent.
+    - NVFP8 (E4M3): NVIDIA-optimized 8-bit float for tensor cores.
+    - MXFP4 (E2M1): Aggressive 4-bit float compression.
+    - Binary: 1-bit quantization to {-1, +1} values.
+    - Ternary: 1.5-bit quantization to {-1, 0, +1} values.
 
-Classes:
-    QuantizationConfig:
-        Configuration class for specifying quantization parameters
-        including quantization type, block size, and other options.
-
+Key Components:
     QuantizationType:
-        Enumeration of available quantization types (AFFINE, INT8, NF4, MXFP4,
-        MXFP8, NVFP8, 1BIT).
+        Enum defining all supported quantization data types.
+
+    QuantizationConfig:
+        Configuration dataclass controlling quantization behavior including
+        dtype, block size, layer patterns, and simulation mode.
 
     EasyQuantizer:
-        Unified interface for quantizing and dequantizing tensors
-        with support for various quantization schemes.
+        High-level API for quantizing entire models or individual arrays.
+        Supports pattern-based layer selection and both module-level and
+        array-level quantization strategies.
 
-    EasyDeLQuantizationConfig:
-        Backward-compatible alias for QuantizationConfig.
-
-Functions:
     quantize:
-        Main quantization function that dispatches to the appropriate
-        quantization method based on configuration.
+        Function to quantize individual arrays to specified precision.
+        Returns ejkernel-packed weights (or simulated outputs).
 
     straight_through:
-        Generic straight-through estimator for gradient computation
-        during quantization-aware training.
+        Unified straight-through estimator (STE) for quantization-aware
+        training. Enables gradient flow through non-differentiable
+        quantization operations.
 
-    straight_through_8bit:
-        8-bit integer quantization with straight-through gradient.
-
-    straight_through_nf4:
-        4-bit NormalFloat quantization (used in QLoRA/QLORA).
-
-    straight_through_mxfp4:
-        Microscaling 4-bit floating point quantization.
-
-    straight_through_mxfp8:
-        Microscaling 8-bit floating point quantization.
-
-    straight_through_nvfp8:
-        NVIDIA FP8 format quantization.
-
-    straight_through_1bit:
-        1-bit quantization for extreme compression.
+    straight_through_*:
+        Type-specific STE implementations for NF4, INT8, MXFP4, MXFP8,
+        NVFP8, and binary/ternary formats.
 
 Example:
-    Basic quantization configuration::
+    Basic model quantization:
 
-        >>> from easydel.layers.quantization import (
-        ...     QuantizationConfig,
-        ...     QuantizationType,
-        ...     EasyQuantizer
-        ... )
-        >>>
-        >>> # Configure NF4 quantization for model weights
-        >>> config = QuantizationConfig(
-        ...     quantization_type=QuantizationType.NF4,
-        ...     group_size=64,
-        ...     compute_dtype=jnp.bfloat16
-        ... )
-        >>>
-        >>> # Create quantizer instance
-        >>> quantizer = EasyQuantizer(quantization_config=config)
+    >>> from easydel.layers.components.quants import (
+    ...     EasyQuantizer, QuantizationConfig, QuantizationType
+    ... )
+    >>>
+    >>> # Configure NF4 quantization (recommended for LLMs)
+    >>> config = QuantizationConfig(
+    ...     dtype=QuantizationType.NF4,
+    ...     group_size=64,
+    ...     pattern=r"^(?!.*(?:embedding|norm|lm_head)).*$"
+    ... )
+    >>>
+    >>> # Create quantizer and apply to model
+    >>> quantizer = EasyQuantizer(quantization_config=config)
+    >>> quantized_model = quantizer.apply_quantization(model)
 
-    Using straight-through quantization::
+    Array-level quantization:
 
-        >>> from easydel.layers.quantization import straight_through_8bit
-        >>> import jax.numpy as jnp
-        >>>
-        >>> # Quantize tensor with straight-through gradient
-        >>> weights = jnp.ones((768, 768), dtype=jnp.float32)
-        >>> quantized = straight_through_8bit(weights)
+    >>> from easydel.layers.components.quants import quantize, QuantizationType
+    >>> import jax.numpy as jnp
+    >>>
+    >>> weights = jnp.ones((128, 256), dtype=jnp.float32)
+    >>> quantized = quantize(weights, dtype=QuantizationType.NF4)
 
-Note:
-    This module re-exports quantization utilities from
-    ``easydel.layers.components.quants`` for convenience and
-    maintains backward compatibility with the older API surface
-    through the ``EasyDeLQuantizationConfig`` alias.
+    Quantization-aware training with STE:
+
+    >>> from easydel.layers.components.quants import straight_through
+    >>> import jax
+    >>>
+    >>> @jax.jit
+    ... def train_step(params, x, y):
+    ...     def loss_fn(p):
+    ...         w_quant = straight_through(p['w'], dtype=QuantizationType.NF4)
+    ...         return jnp.mean((x @ w_quant - y) ** 2)
+    ...     return jax.value_and_grad(loss_fn)(params)
 
 See Also:
-    - easydel.layers.components.quants: Source implementation
-    - easydel.layers.components.linears: Quantized linear layers
+    - easydel.layers.components.quants._configs: Configuration definitions
+    - easydel.layers.components.quants._quants: Main quantization logic
+    - easydel.layers.components.quants._straight_through: STE implementations
+    - ejkernel.quantization: Packed quantization utilities for kernels
 """
 
-from ..components.quants import (
-    EasyQuantizer,
-    QuantizationConfig,
-    QuantizationType,
-    quantize,
+from ._configs import QuantizationConfig, QuantizationType
+from ._quants import EasyQuantizer, quantize
+from ._straight_through import (
     straight_through,
     straight_through_1bit,
     straight_through_8bit,
@@ -118,11 +114,7 @@ from ..components.quants import (
     straight_through_nvfp8,
 )
 
-# Backward-compatible alias for older API surface.
-EasyDeLQuantizationConfig = QuantizationConfig
-
 __all__ = (
-    "EasyDeLQuantizationConfig",
     "EasyQuantizer",
     "QuantizationConfig",
     "QuantizationType",
