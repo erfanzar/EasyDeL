@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,14 +27,7 @@ from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeModelOutput
-from easydel.infra.utils import ACT2FN, auto_remat
-from easydel.layers.attention import FlexibleAttentionModule
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -44,7 +37,11 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.components import (
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import AttentionLayerOutput, DecoderLayerOutput, MoeModelOutput
+from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.layers import (
     BaseMoeModule,
     ColumnParallelLinear,
     ColumnParallelMoELinear,
@@ -56,7 +53,9 @@ from easydel.layers.components import (
     RowParallelLinear,
     RowParallelMoELinear,
 )
-from easydel.layers.components.rotary_embedding import yarn_get_mscale
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.rotary import yarn_get_mscale
+from easydel.modules._base import BaseCausalLMModule
 
 from .glm4_moe_lite_configuration import Glm4MoeLiteConfig
 
@@ -1022,8 +1021,8 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
         GLM4-MoE-Lite uses MLA, where the runtime attention head width is
         ``qk_nope_head_dim + qk_rope_head_dim`` (not ``config.head_dim``).
         """
+        from easydel.caching import RaggedPagesCacheConfig
         from easydel.layers.attention import AttentionMechanisms
-        from easydel.layers.caching import RaggedPagesCacheConfig
 
         text_config = self.config.get_text_config()
 

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -69,7 +69,7 @@ import numpy as np
 from eformer.loggings import get_logger
 from jax import numpy as jnp
 
-from easydel.layers.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
+from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
 
 from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
@@ -185,13 +185,33 @@ class eSurgeRunner:
         max_num_seqs: int = 16,
         max_num_seq_buckets: list[int] | None = None,
         use_aot_forward: bool = True,
+        bind_graphstate_for_aot: bool = False,
         verbose: bool = False,
         enable_overlap_execution: bool = False,
         enable_sampler_metrics: bool = False,
     ):
+        """Initialize the model runner.
+
+        Args:
+            model: EasyDeL model instance.
+            hbm_utilization: Target cache-memory utilization ratio.
+            page_size: KV page size used by cache metadata.
+            max_model_len: Maximum sequence length.
+            min_input_pad: Minimum request-count bucket.
+            min_token_pad: Optional minimum token bucket size.
+            max_num_seqs: Maximum concurrent sequences.
+            max_num_seq_buckets: Optional explicit request-count buckets.
+            use_aot_forward: Whether to use AOT compilation.
+            bind_graphstate_for_aot: Whether model-step AOT executables
+                capture graphstate/graphother as compile-time constants.
+                Default: False.
+            verbose: Enable verbose execution logs.
+            enable_overlap_execution: Enable overlap execution path.
+            enable_sampler_metrics: Enable sampler-side metrics.
+        """
+        self.model = model.esurge_compatible_model
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
         logger.debug(f"Configuration: {hbm_utilization=}, {page_size=}")
-        self.model = model.esurge_compatible_model
 
         backend = jax.default_backend()
         attn_mechanism = getattr(self.model.config.get_text_config(), "attn_mechanism", None)
@@ -253,6 +273,7 @@ class eSurgeRunner:
         self.executor_manager = ExecutionManager(
             model=self.model,
             use_aot_forward=use_aot_forward,
+            bind_graphstate_for_aot=bind_graphstate_for_aot,
             min_input_pad=self.min_input_pad,
             max_model_len=max_model_len,
             max_num_reqs=self.max_num_reqs,

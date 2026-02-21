@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -49,7 +49,7 @@ from eformer.pytree import auto_pytree
 from ejkernel.modules import state_space_v1
 from jaxtyping import Array, Float
 
-from easydel.layers.caching import RecurrentCacheView
+from easydel.caching import RecurrentCacheView
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
@@ -91,7 +91,7 @@ class SSM1Op(OperationImpl):
     Registered under the names "ssm1", "mamba1", "mamba".
 
     Example:
-        >>> from easydel.layers.operations import OperationMetadata, OperationRegistry
+        >>> from easydel.operations import OperationMetadata, OperationRegistry
         >>> metadata = OperationMetadata(runtime_dtype=jnp.float16)
         >>> ssm_op = OperationRegistry.create("ssm1", metadata)
         >>> output = ssm_op(

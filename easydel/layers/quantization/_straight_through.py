@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,7 +36,7 @@ Available STE Functions:
 Example:
     >>> import jax
     >>> import jax.numpy as jnp
-    >>> from easydel.layers.components.quants import straight_through, QuantizationType
+    >>> from easydel.layers.quantization import straight_through, QuantizationType
     >>>
     >>> # Use STE in a training loop
     >>> @jax.jit
@@ -280,7 +280,7 @@ def straight_through(
     Example:
         >>> import jax
         >>> import jax.numpy as jnp
-        >>> from easydel.layers.components.quants import straight_through, QuantizationType
+        >>> from easydel.layers.quantization import straight_through, QuantizationType
         >>>
         >>> # Basic usage with NF4 quantization
         >>> weights = jnp.ones((128, 256))

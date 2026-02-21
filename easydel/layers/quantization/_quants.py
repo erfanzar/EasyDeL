@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@ Key Components:
     - EasyQuantizer: High-level class for quantizing entire models
 
 Example:
-    >>> from easydel.layers.components.quants import (
+    >>> from easydel.layers.quantization import (
     ...     quantize, EasyQuantizer, QuantizationConfig, QuantizationType
     ... )
     >>> import jax.numpy as jnp
@@ -54,6 +54,7 @@ See Also:
 
 from __future__ import annotations
 
+import inspect
 import re
 import typing
 
@@ -75,6 +76,81 @@ from ._configs import (
 
 if typing.TYPE_CHECKING:
     pass
+
+
+_QMM_KWARG_ALIASES: dict[str, str] = {
+    "qmm_use_best_config": "qmm_use_best_config",
+    "use_qmm_best_config": "qmm_use_best_config",
+    "qmm_platform": "qmm_platform",
+    "qmm_platform_override": "qmm_platform",
+    "qmm_tpu_path": "qmm_tpu_path",
+    "qmm_tpu_path_override": "qmm_tpu_path",
+    "qmm_fuse": "qmm_fuse",
+    "qmm_strict_fuse": "qmm_strict_fuse",
+    "qmm_allow_dense_fallback": "qmm_allow_dense_fallback",
+    "qmm_tpu_auto_xla_max_m": "qmm_tpu_auto_xla_max_m",
+    "qmm_policy_table": "qmm_policy_table",
+    "qmm_allow_input_all_gather": "qmm_allow_input_all_gather",
+}
+
+
+def _extract_explicit_qmm_kwargs(kwargs: dict[str, typing.Any]) -> dict[str, typing.Any]:
+    overrides: dict[str, typing.Any] = {}
+    for key, value in kwargs.items():
+        mapped_key = _QMM_KWARG_ALIASES.get(key)
+        if mapped_key is not None:
+            overrides[mapped_key] = value
+    return overrides
+
+
+def _extract_model_qmm_defaults(model: nn.Module) -> dict[str, typing.Any]:
+    config = getattr(model, "config", None)
+    if config is None:
+        return {}
+
+    defaults: dict[str, typing.Any] = {}
+
+    use_best_config = getattr(config, "use_qmm_best_config", None)
+    if use_best_config is None:
+        use_best_config = getattr(config, "qmm_use_best_config", None)
+    if use_best_config is not None:
+        defaults["qmm_use_best_config"] = bool(use_best_config)
+
+    platform_override = getattr(config, "qmm_platform_override", None)
+    if platform_override is None:
+        platform_override = getattr(config, "qmm_platform", None)
+    if platform_override is not None:
+        defaults["qmm_platform"] = platform_override
+
+    tpu_path_override = getattr(config, "qmm_tpu_path_override", None)
+    if tpu_path_override is None:
+        tpu_path_override = getattr(config, "qmm_tpu_path", None)
+    if tpu_path_override is not None:
+        defaults["qmm_tpu_path"] = tpu_path_override
+
+    return defaults
+
+
+def _filter_supported_to_quantized_kwargs(
+    to_quantized: typing.Callable[..., typing.Any],
+    overrides: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    if not overrides:
+        return {}
+    try:
+        signature = inspect.signature(to_quantized)
+    except (TypeError, ValueError):
+        return dict(overrides)
+
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return dict(overrides)
+
+    accepted_keys = {
+        name
+        for name, param in signature.parameters.items()
+        if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    return {key: value for key, value in overrides.items() if key in accepted_keys}
 
 
 def quantize(
@@ -129,7 +205,7 @@ def quantize(
 
     Example:
         >>> import jax.numpy as jnp
-        >>> from easydel.layers.components.quants import quantize, QuantizationType
+        >>> from easydel.layers.quantization import quantize, QuantizationType
         >>>
         >>> weights = jnp.ones((128, 256), dtype=jnp.float32)
         >>>
@@ -218,7 +294,7 @@ class EasyQuantizer:
         pattern: Regex pattern for selecting layers to quantize.
 
     Example:
-        >>> from easydel.layers.components.quants import (
+        >>> from easydel.layers.quantization import (
         ...     EasyQuantizer, QuantizationConfig, QuantizationType
         ... )
         >>>
@@ -400,7 +476,11 @@ class EasyQuantizer:
             quantization_pattern: Regex pattern specifying which layers to
                 quantize based on their path names. If None, uses the pattern
                 from the configuration. Defaults to None.
-            **kwargs: Additional keyword arguments (reserved for future use).
+            **kwargs: Optional quantized-linear runtime controls. Recognized
+                keys include ``qmm_use_best_config`` (or
+                ``use_qmm_best_config``), ``qmm_platform``
+                (or ``qmm_platform_override``), ``qmm_tpu_path`` (or
+                ``qmm_tpu_path_override``), and other ``qmm_*`` knobs.
 
         Returns:
             The model with compatible modules replaced by their quantized
@@ -408,7 +488,7 @@ class EasyQuantizer:
             layers (typically Linear layers) are converted.
 
         Example:
-            >>> from easydel.layers.components.quants import EasyQuantizer, QuantizationConfig
+            >>> from easydel.layers.quantization import EasyQuantizer, QuantizationConfig
             >>>
             >>> config = QuantizationConfig(dtype=QuantizationType.NF4)
             >>> quantizer = EasyQuantizer(config)
@@ -442,16 +522,25 @@ class EasyQuantizer:
         if hasattr(model, "config"):
             model.config.quantization_config = self.config
 
+        qmm_overrides = _extract_model_qmm_defaults(model)
+        qmm_overrides.update(_extract_explicit_qmm_kwargs(kwargs))
+
         pattern = re.compile(quantization_pattern)
 
         for path, block_instance in iter_module_search(model, nn.Module):
             str_path = ".".join([str(p) for p in path])
             if pattern.search(str_path):
                 if hasattr(block_instance, "to_quantized") and callable(block_instance.to_quantized):
+                    to_quantized = block_instance.to_quantized
+                    quantized_kwargs = _filter_supported_to_quantized_kwargs(to_quantized, qmm_overrides)
+                    if quantized_kwargs:
+                        new_value = to_quantized(config=self.config, **quantized_kwargs)
+                    else:
+                        new_value = to_quantized(config=self.config)
                     set_module_from_path(
                         model=model,
                         path=path,
-                        new_value=block_instance.to_quantized(config=self.config),
+                        new_value=new_value,
                     )
 
         return model

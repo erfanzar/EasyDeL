@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,7 +51,7 @@ Parallelism Strategies:
 Example:
     Basic usage with standard linear layers:
 
-    >>> from easydel.layers.components.linears import (
+    >>> from easydel.layers.linears import (
     ...     ColumnParallelLinear,
     ...     RowParallelLinear,
     ... )
@@ -68,8 +68,8 @@ Example:
 
     Using quantized layers:
 
-    >>> from easydel.layers.components.linears import ColumnParallelLinearQuantized
-    >>> from easydel.layers.components.quants import QuantizationConfig, QuantizationType
+    >>> from easydel.layers.linears import ColumnParallelLinearQuantized
+    >>> from easydel.layers.quantization import QuantizationConfig, QuantizationType
     >>>
     >>> config = QuantizationConfig(dtype=QuantizationType.INT8)
     >>> quant_layer = ColumnParallelLinearQuantized(
@@ -81,7 +81,7 @@ Example:
 
     MoE linear layers:
 
-    >>> from easydel.layers.components.linears import (
+    >>> from easydel.layers.linears import (
     ...     ColumnParallelMoELinear,
     ...     RowParallelMoELinear,
     ... )

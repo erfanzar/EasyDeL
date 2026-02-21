@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ Exports:
     lowfloats: List of supported float8 data types for low-precision computation.
 
 Example:
-    >>> from easydel.layers.components.norms import RMSNorm, LayerNorm, BatchNorm
+    >>> from easydel.layers.norms import RMSNorm, LayerNorm, BatchNorm
     >>> import jax.numpy as jnp
     >>>
     >>> # RMSNorm for transformer hidden states

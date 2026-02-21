@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +25,16 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
@@ -39,26 +49,16 @@ from easydel.infra.modeling_outputs import (
     TokenClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.base_modules import (
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import (
     BaseCausalLMModule,
     BaseQuestionAnsweringModule,
     BaseSequenceClassificationModule,
     BaseTaskModule,
     BaseTokenClassificationModule,
 )
-from easydel.layers.caching import (
-    HybridCache,
-    OperationsMetadata,
-    RaggedPagesCache,
-    RaggedPagesCacheView,
-    RaggedPagesMetadata,
-    TransformerCache,
-    TransformerCacheView,
-    TransformerMetadata,
-)
-from easydel.layers.components import ColumnParallelLinear, Embed, RowParallelLinear
-from easydel.layers.components.norms import LayerNorm
 
 from .roberta_configuration import RobertaConfig as RobertaConfig
 

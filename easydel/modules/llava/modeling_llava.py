@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,12 +23,7 @@ from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import ModelOutput, VLMCausalLMOutput
-from easydel.infra.utils import ACT2FN
-from easydel.layers.base_modules import BaseVisionLanguageModule
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -36,7 +31,12 @@ from easydel.layers.caching import (
     TransformerCache,
     TransformerMetadata,
 )
-from easydel.layers.components import RowParallelLinear
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import ModelOutput, VLMCausalLMOutput
+from easydel.infra.utils import ACT2FN
+from easydel.layers import RowParallelLinear
+from easydel.modules._base import BaseVisionLanguageModule
 
 from ..auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 from .llava_configuration import LlavaConfig

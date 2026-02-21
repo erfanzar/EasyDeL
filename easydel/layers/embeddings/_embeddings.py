@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ The embedding implementation supports:
     - Efficient attention mechanism via the `attend` method for weight-tying
 
 Example:
-    >>> from easydel.layers.components.embeddings import Embed
+    >>> from easydel.layers.embeddings import Embed
     >>> from flax import nnx as nn
     >>> import jax.numpy as jnp
     >>>
@@ -82,7 +82,7 @@ class Embed(nn.Module):
         promote_dtype: Function to promote dtypes during computation.
 
     Example:
-        >>> from easydel.layers.components.embeddings import Embed
+        >>> from easydel.layers.embeddings import Embed
         >>> from flax import nnx as nn
         >>> import jax.numpy as jnp
         >>>

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ The functions support the following RoPE scaling types via the `rope_scaling` di
     - "mrope": Multi-modal RoPE for vision-language models (Qwen2/3-VL).
 
 Example:
-    >>> from easydel.layers.components.rotary_embedding import get_rope, get_frequencies
+    >>> from easydel.layers.rotary import get_rope, get_frequencies
     >>> # Create a standard RoPE embedding
     >>> rope = get_rope(head_size=64, rotary_dim=64, max_position=2048, base=10000)
     >>> # Create a YaRN-scaled RoPE embedding

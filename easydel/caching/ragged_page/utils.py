@@ -50,6 +50,61 @@ def cdiv(a: int, v: int) -> int:
     return (a + v - 1) // v
 
 
+def localize_slice_indices_for_page_shard(
+    slice_indices: Int[Array, "3 num_slices"],
+    total_update_slices: Int[Array, ""],
+    *,
+    page_size: int,
+    local_flat_cache_positions: int,
+    page_shard_index: Int[Array, ""] | int = 0,
+) -> Int[Array, "3 num_slices"]:
+    """Translate global v2 slice mapping offsets to one page shard.
+
+    Slot-mapping metadata stores flattened cache offsets in global page space.
+    When KV pages are sharded over a page axis (for example ``dp``), each shard
+    receives only a contiguous subset of pages. This helper remaps row-0
+    destination offsets into local shard coordinates and zeroes non-local slices.
+
+    Args:
+        slice_indices: Global slice mapping ``[3, num_slices]``.
+        total_update_slices: Number of valid slices.
+        page_size: Tokens per page.
+        local_flat_cache_positions: Local flattened cache capacity on this shard.
+        page_shard_index: Linear page-shard index for current shard.
+
+    Returns:
+        Localized slice mapping with same shape/dtype as ``slice_indices``.
+    """
+    num_valid_slices = jnp.asarray(total_update_slices).reshape(-1)[0].astype(jnp.int32)
+    num_slices = int(slice_indices.shape[1])
+    if num_slices == 0:
+        return slice_indices
+
+    page_size_i32 = jnp.asarray(page_size, dtype=jnp.int32)
+    local_flat_cache_positions_i32 = jnp.asarray(local_flat_cache_positions, dtype=jnp.int32)
+    # Keep at least one page to avoid div-by-zero in shape-polymorphic traces.
+    local_num_pages = jnp.maximum(local_flat_cache_positions_i32 // page_size_i32, jnp.int32(1))
+    shard_index = jnp.asarray(page_shard_index, dtype=jnp.int32)
+
+    slice_ids = jnp.arange(num_slices, dtype=jnp.int32)
+    active_slices = slice_ids < num_valid_slices
+
+    global_cache_start = slice_indices[0].astype(jnp.int32)
+    global_page = global_cache_start // page_size_i32
+    page_offset = global_cache_start % page_size_i32
+
+    local_page_base = shard_index * local_num_pages
+    local_page = global_page - local_page_base
+    is_local_page = (local_page >= 0) & (local_page < local_num_pages)
+    keep = active_slices & is_local_page
+
+    local_cache_start = local_page * page_size_i32 + page_offset
+    row0 = jnp.where(keep, local_cache_start, jnp.int32(0))
+    row1 = jnp.where(keep, slice_indices[1].astype(jnp.int32), jnp.int32(0))
+    row2 = jnp.where(keep, slice_indices[2].astype(jnp.int32), jnp.int32(0))
+    return jnp.stack((row0, row1, row2), axis=0).astype(slice_indices.dtype)
+
+
 def _kv_cache_update_kernel(
     slice_indices_ref,  # Pallas reference type
     new_kv_tokens_hbm_ref,  # Pallas reference type
@@ -131,6 +186,7 @@ def kv_cache_update(
     *,
     page_size: int = 32,
     slices_per_processing_page: int = 8,
+    page_shard_index: Int[Array, ""] | int = 0,
 ) -> Float[Array, "total_cache_positions num_combined_kv_heads head_dim"]:
     """TPU-optimized paged KV cache update using Pallas kernels.
 
@@ -161,6 +217,8 @@ def kv_cache_update(
             Must be static for compilation.
         slices_per_processing_page (int): Slices processed per kernel invocation.
             Default: 8. Must divide slice_indices.shape[1] evenly.
+        page_shard_index (jax.Array | int): Linear page-shard index for local
+            cache buffer when pages are sharded. Defaults to 0 (unsharded/global).
 
     Returns:
         jax.Array: Updated KV cache pages with same shape as kv_cache_pages.
@@ -182,6 +240,13 @@ def kv_cache_update(
         ...     page_size=32
         ... )
     """
+    slice_indices = localize_slice_indices_for_page_shard(
+        slice_indices,
+        total_update_slices,
+        page_size=page_size,
+        local_flat_cache_positions=kv_cache_pages.shape[0],
+        page_shard_index=page_shard_index,
+    )
     assert slice_indices.shape[1] % slices_per_processing_page == 0, (
         f"{slices_per_processing_page=}, {slice_indices.shape[1]=}"
     )
@@ -222,6 +287,7 @@ def kv_cache_update_jax(
     total_update_slices: Int[Array, ""],
     *,
     page_size: int = 32,
+    page_shard_index: Int[Array, ""] | int = 0,
 ) -> Float[Array, "total_cache_positions num_kv_heads head_dim"]:
     """Portable JAX implementation of paged KV-cache update.
 
@@ -234,6 +300,13 @@ def kv_cache_update_jax(
     workloads this is typically much faster than a `lax.scan` of
     `dynamic_update_slice`.
     """
+    slice_indices = localize_slice_indices_for_page_shard(
+        slice_indices,
+        total_update_slices,
+        page_size=page_size,
+        local_flat_cache_positions=kv_cache_pages.shape[0],
+        page_shard_index=page_shard_index,
+    )
     # `total_update_slices` is typically shape (1,), but accept scalar too.
     num_valid_slices = jnp.asarray(total_update_slices).reshape(-1)[0].astype(jnp.int32)
     if kv_cache_pages.size == 0:
@@ -258,19 +331,22 @@ def kv_cache_update_jax(
     token_ids = jnp.arange(new_kv_tokens.shape[0], dtype=jnp.int32)  # [num_tokens_bucket]
     slice_for_token = jnp.searchsorted(slice_ends_safe, token_ids, side="right").astype(jnp.int32)
 
-    # Token offsets within their slice: offset = token_id - slice_start.
+    # Token offsets within their slice: offset = packed_token_id - slice_start.
     token_slice_len = slice_lens[slice_for_token]
     token_slice_end = slice_ends[slice_for_token]
     token_slice_start = token_slice_end - token_slice_len
     token_offset = token_ids - token_slice_start
 
-    # Destination indices in the flattened KV pages buffer.
+    # Source and destination indices for each packed token.
+    src_start = slice_indices[1].astype(jnp.int32)[slice_for_token]
+    src = src_start + token_offset
     dst_start = slice_indices[0].astype(jnp.int32)[slice_for_token]
     dst = dst_start + token_offset
 
-    # Drop tokens beyond the valid packed prefix (padding in the token bucket).
-    token_mask = token_ids < total_tokens
+    # Drop tokens beyond valid packed prefix (and any accidental src OOB).
+    token_mask = (token_ids < total_tokens) & (src >= 0) & (src < new_kv_tokens.shape[0])
+    src = jnp.where(token_mask, src, 0)
     dst_oob = jnp.asarray(kv_cache_pages.shape[0], dtype=jnp.int32)
     dst = jnp.where(token_mask, dst, dst_oob)
-
-    return kv_cache_pages.at[dst].set(new_kv_tokens, mode="drop")
+    values = new_kv_tokens[src]
+    return kv_cache_pages.at[dst].set(values, mode="drop")

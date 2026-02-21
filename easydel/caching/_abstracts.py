@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -233,7 +233,7 @@ class OperationsMetadata(BaseRunTimeMetadata):
         Returns:
             OperationsMetadata with transformer field populated.
         """
-        from easydel.layers.caching.transformer import TransformerMetadata
+        from easydel.caching.transformer import TransformerMetadata
 
         return cls(transformer=TransformerMetadata(postpadded=postpadded, starts=starts, indexs=indexs))
 
@@ -258,7 +258,7 @@ class OperationsMetadata(BaseRunTimeMetadata):
         Returns:
             OperationsMetadata with hybrid field populated.
         """
-        from easydel.layers.caching.hybrid import HybridMetadata
+        from easydel.caching.hybrid import HybridMetadata
 
         return cls(hybrid=HybridMetadata(postpadded=postpadded, starts=starts, indexs=indexs))
 
@@ -295,7 +295,7 @@ class OperationsMetadata(BaseRunTimeMetadata):
         Returns:
             OperationsMetadata with ragged field populated.
         """
-        from easydel.layers.caching.ragged_page import RaggedPagesMetadata
+        from easydel.caching.ragged_page import RaggedPagesMetadata
 
         return cls(
             ragged=RaggedPagesMetadata(
@@ -320,7 +320,7 @@ class OperationsMetadata(BaseRunTimeMetadata):
         Returns:
             OperationsMetadata with recurrent field populated.
         """
-        from easydel.layers.caching.recurrent import RecurrentMetadata
+        from easydel.caching.recurrent import RecurrentMetadata
 
         return cls(recurrent=RecurrentMetadata())
 
@@ -399,7 +399,7 @@ def unwrap_metadata(metadata: tp.Any, expected_type: str | None = None) -> tp.An
                 return metadata.transformer
             # If we have hybrid metadata, convert to transformer metadata
             if metadata.hybrid is not None:
-                from easydel.layers.caching.transformer import TransformerMetadata
+                from easydel.caching.transformer import TransformerMetadata
 
                 return TransformerMetadata(
                     postpadded=getattr(metadata.hybrid, "postpadded", False),
@@ -419,10 +419,10 @@ def unwrap_metadata(metadata: tp.Any, expected_type: str | None = None) -> tp.An
 
     # Check if it's HybridMetadata and we need TransformerMetadata
     # Import here to avoid circular import
-    from easydel.layers.caching.hybrid import HybridMetadata
+    from easydel.caching.hybrid import HybridMetadata
 
     if isinstance(metadata, HybridMetadata) and expected_type == "transformer":
-        from easydel.layers.caching.transformer import TransformerMetadata
+        from easydel.caching.transformer import TransformerMetadata
 
         return TransformerMetadata(
             postpadded=getattr(metadata, "postpadded", False),

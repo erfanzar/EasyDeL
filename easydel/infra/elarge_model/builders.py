@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -61,7 +61,7 @@ from eformer.common_types import NOT_GIVEN
 from easydel.inference.esurge.esurge_engine import DEFAULT_DETOKENIZER_MAX_STATES
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType
-from easydel.layers.components.quants._quants import QuantizationConfig
+from easydel.layers.quantization._quants import QuantizationConfig
 from easydel.modules.auto import (
     AutoEasyDeLAnyToAnyModel,
     AutoEasyDeLModel,
@@ -239,7 +239,8 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         - Memory: hbm_utilization, page_size
         - Batching: max_num_seqs, max_num_batched_tokens, min_input_pad
         - Caching: enable_prefix_caching, destroy_pages_on_pause
-        - Execution: compile_runner, overlap_execution, use_aot_forward
+        - Execution: compile_runner, overlap_execution, use_aot_forward,
+          bind_graphstate_for_aot
         - Truncation: auto_truncate_prompt, truncate_mode, strict_context
         - Tokenization: detokenizer_max_states, extra_eos_token_ids, extra_stops
         - Parsing: tool_parser, reasoning_parser
@@ -247,7 +248,8 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     Args:
         cfg_like: ELM configuration dictionary or mapping. The function
             primarily uses the 'esurge' section but also reads from
-            'base_config.values' for max_model_len inference.
+            'base_config.values' for selected defaults (for example
+            max_model_len).
 
     Returns:
         Dictionary of keyword arguments for eSurge initialization containing
@@ -290,6 +292,7 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     page_size_val = es.get("page_size")
     hbm_utilization_val = es.get("hbm_utilization")
     use_aot_forward_val = es.get("use_aot_forward")
+    bind_graphstate_for_aot_val = es.get("bind_graphstate_for_aot")
     enable_prefix_caching_val = es.get("enable_prefix_caching")
     auto_shard_model_val = es.get("auto_shard_model")
     compile_runner_val = es.get("compile_runner")
@@ -336,6 +339,9 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
 
     runner_verbose = bool(es.get("runner_verbose", es.get("verbose", False)))
     truncate_mode = es.get("truncate_mode", "left")
+    data_parallelism_axis_val = es.get("data_parallelism_axis")
+    if data_parallelism_axis_val is None:
+        data_parallelism_axis_val = "dp"
 
     max_num_seq_buckets = None
     if max_num_seq_buckets_val is not None:
@@ -351,6 +357,7 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         hbm_utilization=float(hbm_utilization_val) if hbm_utilization_val is not None else 0.85,
         page_size=int(page_size_val) if page_size_val is not None else 128,
         use_aot_forward=True if use_aot_forward_val is None else bool(use_aot_forward_val),
+        bind_graphstate_for_aot=False if bind_graphstate_for_aot_val is None else bool(bind_graphstate_for_aot_val),
         enable_prefix_caching=True if enable_prefix_caching_val is None else bool(enable_prefix_caching_val),
         auto_shard_model=True if auto_shard_model_val is None else bool(auto_shard_model_val),
         sharding_axis_dims=sharding_axis_dims,
@@ -358,6 +365,7 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         runner_verbose=runner_verbose,
         overlap_execution=False if overlap_execution_val is None else bool(overlap_execution_val),
         sampler_metrics=False if sampler_metrics_val is None else bool(sampler_metrics_val),
+        data_parallelism_axis=str(data_parallelism_axis_val),
         esurge_name=es.get("esurge_name"),
         reserve_tokens=reserve_tokens,
         auto_truncate_prompt=True if auto_truncate_prompt_val is None else bool(auto_truncate_prompt_val),

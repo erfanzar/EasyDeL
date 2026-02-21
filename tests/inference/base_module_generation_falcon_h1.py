@@ -48,7 +48,7 @@ def main():
     prompt = "hello my name is"
     PAD = True
     extra = dict(max_length=max_model_len // 2, padding="max_length") if PAD else {}
-    ids = tokenizer(prompt, return_tensors="jax", **extra)
+    ids = tokenizer(prompt, return_tensors="np", **extra)
     model.generation_config.max_new_tokens = max_model_len // 2
     model.generation_config.temperature = 0.4
     model.generation_config.top_k = 0

@@ -18,7 +18,7 @@ def _load_symbols():
 
     try:
         from easydel.infra.mixins.operation_cache import OperationCacheMixin
-        from easydel.layers.operations.requirements import CacheType, MetadataField
+        from easydel.operations.requirements import CacheType, MetadataField
 
         return OperationCacheMixin, CacheType, MetadataField
     except Exception:

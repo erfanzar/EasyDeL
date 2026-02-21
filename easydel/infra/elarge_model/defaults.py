@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -92,6 +92,9 @@ DEFAULTS: ELMConfig = {
     # - linear_pattern: Regex pattern matching linear layers to quantize.
     #   ".*" matches all linear layers by default.
     # - linear_group_size: Group size specifically for linear layer quantization.
+    # - use_qmm_best_config: Prefer ejkernel tuned QMM block configs by default.
+    # - qmm_platform_override: Optional explicit QMM platform override.
+    # - qmm_tpu_path_override: Optional explicit TPU fused-path override.
     # - jax_native: If True and the dtype has a JAX-native format (e.g., MXFP4/MXFP8/NVFP8),
     #   quantization uses `astype` instead of ejkernel (applies even in QAT/simulate paths).
     "quantization": {
@@ -99,6 +102,9 @@ DEFAULTS: ELMConfig = {
         "apply_quantization": False,
         "linear_pattern": ".*",
         "linear_group_size": 64,
+        "use_qmm_best_config": False,
+        "qmm_platform_override": None,
+        "qmm_tpu_path_override": None,
     },
     # Base configuration: Overrides for the underlying model configuration.
     # - values: Dictionary of config values to set on the base model config.
@@ -117,6 +123,7 @@ DEFAULTS: ELMConfig = {
         "max_num_seqs": 32,
         "hbm_utilization": 0.80,
         "page_size": 128,
+        "bind_graphstate_for_aot": False,
         "enable_prefix_caching": True,
         "extra_stops": None,
         "verbose": False,

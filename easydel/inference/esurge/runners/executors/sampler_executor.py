@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -118,7 +118,6 @@ class SamplerExecutor:
         empty_sharding: jax.sharding.Sharding,
         use_aot_forward: bool,
         cache_capacity: int = 64,
-        maybe_implicit: tp.Callable[[tp.Callable[..., tp.Any]], tp.Callable[..., tp.Any]] | None = None,
     ) -> None:
         """Initialize the SamplerExecutor.
 
@@ -134,16 +133,12 @@ class SamplerExecutor:
                 JIT compilation on first call.
             cache_capacity: Maximum number of compiled variants to cache.
                 Defaults to 64. Uses LRU eviction when full.
-            maybe_implicit: Optional wrapper function for implicit array
-                handling (used for quantized models). Defaults to identity.
         """
         self.model = model
         self.max_model_len = int(max_model_len)
         self._empty_sharding = empty_sharding
         self.use_aot_forward = bool(use_aot_forward)
         self._cache_capacity = int(cache_capacity)
-
-        self._maybe_implicit = maybe_implicit or (lambda f: f)
 
         self._sampling_fn = self._build_sampling_fn()
         self._cache: OrderedDict[tuple[int, int, str, str], tp.Any] = OrderedDict()
@@ -298,8 +293,8 @@ class SamplerExecutor:
             (metadata, req_num_tokens_full, active_mask_full, logits, rng_key)
             -> (updated_rng_key, sampled_tokens, valid_mask)
         """
+
         @ejit
-        @self._maybe_implicit
         def _sampling_fn(
             metadata: BatchMetadata,
             req_num_tokens_full: jax.Array,

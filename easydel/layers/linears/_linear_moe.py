@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,7 +37,7 @@ with per-expert weight shards using grouped matmul kernels.
 
 Example Workflow:
     >>> # Complete MoE FFN example with row/column parallelism
-    >>> from easydel.layers.components import ColumnParallelMoELinear, RowParallelMoELinear
+    >>> from easydel.layers import ColumnParallelMoELinear, RowParallelMoELinear
     >>> from flax import nnx as nn
     >>>
     >>> # Column-parallel layers (W_i and W_u)
@@ -133,7 +133,7 @@ class ParallelMoELinear(nn.Module):
 
 
     Example:
-        >>> from easydel.layers.components import ParallelMoELinear
+        >>> from easydel.layers import ParallelMoELinear
         >>> from flax import nnx as nn
         >>>
         >>> # Create a column-parallel MoE linear layer
@@ -264,7 +264,7 @@ class ParallelMoELinear(nn.Module):
         strategies, simplifying the configuration of distributed execution.
         """
 
-        from ..moe._communication_utils import get_moe_partition_spec
+        from easydel.layers.moe._communication_utils import get_moe_partition_spec
 
         if self.direction is None:
             return None
@@ -295,7 +295,7 @@ class ParallelMoELinear(nn.Module):
         pm = partition_manager or self.partition_manager
         if pm is None or self._direction is None:
             return {}
-        from ..moe._communication_utils import get_moe_partition_spec
+        from easydel.layers.moe._communication_utils import get_moe_partition_spec
 
         fsdp_is_ep_bound = kwargs.get("fsdp_is_ep_bound", True)
         sp_is_ep_bound = kwargs.get("sp_is_ep_bound", True)

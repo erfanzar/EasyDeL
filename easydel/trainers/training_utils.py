@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -108,9 +108,7 @@ def make_default_tensor_straight_through(
     def tensor_straight_through(x: jax.Array) -> jax.Array:
         if not jnp.issubdtype(x.dtype, jnp.floating):
             return x
-        if eformer_straight_through is not None and (
-            quantization_mode != "nf4" or quantization_group_size is None
-        ):
+        if eformer_straight_through is not None and (quantization_mode != "nf4" or quantization_group_size is None):
             try:
                 q = eformer_straight_through(x, method=quantization_mode)
             except TypeError:

@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,8 +40,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from easydel.layers.operations import OperationRegistry
-from easydel.layers.operations.requirements import (
+from easydel.operations import OperationRegistry
+from easydel.operations.requirements import (
     CacheType,
     ExecutionMode,
     MetadataField,
@@ -693,7 +693,7 @@ class OperationCacheMixin:
         from flax import nnx as nn
 
         from easydel.layers.attention import FlexibleAttentionModule
-        from easydel.layers.operations._base_operation import BaseOperation
+        from easydel.operations._base_operation import BaseOperation
         from easydel.utils.traversals import iter_module_search
 
         layers: list[LayerOperationInfo] = []
@@ -989,7 +989,7 @@ class OperationCacheMixin:
             if cache_view_class is not None:
                 cache_view_classes.add(cache_view_class)
 
-        from easydel.layers.caching import (
+        from easydel.caching import (
             HybridCache,
             RecurrentCache,
             RecurrentCacheView,
@@ -1050,7 +1050,7 @@ class OperationCacheMixin:
         if not per_layer:
             return result
 
-        from easydel.layers.caching import ParallelHybridCacheView, RecurrentCacheView, TransformerCacheView
+        from easydel.caching import ParallelHybridCacheView, RecurrentCacheView, TransformerCacheView
 
         for layer_idx, view_classes in per_layer.items():
             if len(view_classes) == 1:

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -219,6 +219,7 @@ class SeedOssToolParser(ToolParser):
             - boolean/bool/binary: converted to bool (true/false)
             - object/dict: parsed as JSON, falls back to ast.literal_eval
         """
+
         def get_arguments_config(func_name: str) -> dict:
             """Get parameter configuration for a function from tool definitions.
 

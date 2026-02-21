@@ -31,7 +31,7 @@ The provided script uses a setup script from EasyDeL to prepare the TPU environm
 2. **Run the setup script:**
 
     ```bash
-    bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/tpu_setup.sh)
+    bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/scripts/tpu_setup.sh)
     ```
 
     This script will install necessary dependencies like JAX, EasyDeL, Ray, and other Python packages required for TPU operation. It might take a few minutes.
@@ -61,7 +61,7 @@ The provided script uses a setup script from EasyDeL to prepare the TPU environm
 Let's break down the provided Python script. Save it as `launch.py` (or any name you prefer) on your TPU VM.
 
 ```python
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 # ... (license header) ...
 
 import os

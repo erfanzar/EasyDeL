@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -90,7 +90,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jaxtyping import Array, Float, Int
 
 from easydel.infra.utils import ArrayParam
-from easydel.layers.components.norms import LayerNorm
+from easydel.layers.norms import LayerNorm
 from easydel.utils import traversals
 from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 
@@ -102,7 +102,7 @@ from .modeling_outputs import EmbeddingInfo
 
 if tp.TYPE_CHECKING:
     from easydel.infra.base_state import EasyDeLState
-    from easydel.layers.components import Embed, ParallelLinear, QuantizationConfig
+    from easydel.layers import Embed, ParallelLinear, QuantizationConfig
 
 
 PartitionLike = tp.Mapping[str, tp.Callable] | tp.Mapping[tuple, tp.Callable] | None
@@ -1559,7 +1559,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             Module-level quantization (apply_quantization=True) typically provides
             better performance as it can fuse dequantization with computation.
         """
-        from easydel.layers.components import EasyQuantizer, QuantizationConfig, QuantizationType
+        from easydel.layers import EasyQuantizer, QuantizationConfig, QuantizationType
 
         if quantization_config is None:
             quantization_config = QuantizationConfig(dtype=QuantizationType.INT8)
@@ -2107,7 +2107,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         """
         from eformer.ops.quantization import Array1B, Array8B, ArrayNF4
 
-        from easydel.layers.components import (
+        from easydel.layers import (
             ColumnParallelLinearQuantized,
             ParallelLinearQuantized,
             RowParallelLinearQuantized,
@@ -2266,7 +2266,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> transform_fn = model.transform_fn
             >>> easydel_params = transform_fn(hf_state_dict)
         """
-        from easydel.layers.components import BaseMoeModule, Embed, ParallelMoELinear
+        from easydel.layers import BaseMoeModule, Embed, ParallelMoELinear
         from easydel.utils import traversals
         from easydel.utils.parameters_transformation import StateDictConverter
 
@@ -2585,7 +2585,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> # Convert without sharding
             >>> easydel_params = transform_fn(hf_state_dict, shard_fns=None)
         """
-        from easydel.layers.components import BaseMoeModule, Embed, ParallelMoELinear
+        from easydel.layers import BaseMoeModule, Embed, ParallelMoELinear
         from easydel.utils import traversals
         from easydel.utils.parameters_transformation import StateDictConverter
 

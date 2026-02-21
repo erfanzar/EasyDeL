@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1637,7 +1637,7 @@ class BaseTrainer(BaseTrainerProtocol):
             padding="max_length",
             max_length=self.arguments.max_length,
             return_attention_mask=True,
-            return_tensors="jax",
+            return_tensors="np",
             return_dict=True,
             padding_side="left",
             add_generation_prompt=True,
@@ -2324,9 +2324,11 @@ class BaseTrainer(BaseTrainerProtocol):
                     lambda: dataset,
                     output_signature={
                         col: tf.TensorSpec(
-                            shape=vals.shape[1:]
-                            if len(vals.shape) > 1 and vals.shape[0] == 1  # auto remove batch dim
-                            else vals.shape,
+                            shape=(
+                                vals.shape[1:]
+                                if len(vals.shape) > 1 and vals.shape[0] == 1  # auto remove batch dim
+                                else vals.shape
+                            ),
                             dtype=tf_data_mapping[str(vals.dtype)],
                         )
                         for col, vals in next(iter(dataset)).items()

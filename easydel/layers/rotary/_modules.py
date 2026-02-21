@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@ for dynamic lookup by rope type name.
 
 Example:
     >>> import jax.numpy as jnp
-    >>> from easydel.layers.components.rotary_embedding import RotaryEmbedding
+    >>> from easydel.layers.rotary import RotaryEmbedding
     >>> # Create a standard RoPE module
     >>> rope = RotaryEmbedding(
     ...     head_size=64,

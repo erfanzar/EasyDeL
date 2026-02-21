@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -164,18 +164,31 @@ class Exaone4Config(EasyDeLBaseConfig):
         if self.rope_scaling is None:
             return
 
-        if not isinstance(self.rope_scaling, dict) or len(self.rope_scaling) != 2:
+        if not isinstance(self.rope_scaling, dict):
             raise ValueError(
                 f"`rope_scaling` must be a dictionary with two fields, `type` and `factor`, got {self.rope_scaling}"
             )
-        rope_scaling_type = self.rope_scaling.get("type", None)
-        rope_scaling_factor = self.rope_scaling.get("factor", None)
-        if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic"]:
+
+        rope_scaling_type = self.rope_scaling.get("type", self.rope_scaling.get("rope_type"))
+        if rope_scaling_type in {None, "default"}:
+            self.rope_scaling = None
+            return
+
+        if rope_scaling_type not in {"linear", "dynamic"}:
             raise ValueError(
                 f"`rope_scaling`'s type field must be one of ['linear', 'dynamic'], got {rope_scaling_type}"
             )
-        if rope_scaling_factor is None or not isinstance(rope_scaling_factor, float) or rope_scaling_factor <= 1.0:
-            raise ValueError(f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}")
+
+        rope_scaling_factor = self.rope_scaling.get("factor", 1.0)
+        try:
+            rope_scaling_factor = float(rope_scaling_factor)
+        except Exception as err:  # pragma: no cover
+            raise ValueError(f"`rope_scaling`'s factor field must be a float >= 1, got {rope_scaling_factor}") from err
+
+        if rope_scaling_factor < 1.0:
+            raise ValueError(f"`rope_scaling`'s factor field must be a float >= 1, got {rope_scaling_factor}")
+
+        self.rope_scaling = {"type": rope_scaling_type, "factor": rope_scaling_factor}
 
     def _validate_layer_types(self):
         """Validate layer_types list."""

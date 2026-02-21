@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ Main Components:
 
 Example:
     >>> import jax.numpy as jnp
-    >>> from easydel.layers.components.rotary_embedding import (
+    >>> from easydel.layers.rotary import (
     ...     get_rope,
     ...     get_frequencies,
     ...     RopeConfig,

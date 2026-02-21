@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,6 +18,52 @@ from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+
+
+def _patch_hf_glm4v_moe_router_logits_output() -> None:
+    """HF compatibility: expose missing router_logits on GLM4V-MoE model output."""
+    try:
+        from transformers.models.glm4v_moe import modeling_glm4v_moe as hf_glm4v_moe
+    except Exception:
+        return
+
+    output_cls = getattr(hf_glm4v_moe, "Glm4vMoeModelOutputWithPast", None)
+    if output_cls is not None and not hasattr(output_cls, "router_logits"):
+        output_cls.router_logits = None
+
+    causal_lm_cls = getattr(hf_glm4v_moe, "Glm4vMoeForConditionalGeneration", None)
+    if causal_lm_cls is not None and not hasattr(causal_lm_cls, "num_experts"):
+        causal_lm_cls.num_experts = property(lambda self: getattr(self.config.text_config, "n_routed_experts", 0))
+    if causal_lm_cls is not None and not hasattr(causal_lm_cls, "num_experts_per_tok"):
+        causal_lm_cls.num_experts_per_tok = property(
+            lambda self: getattr(self.config.text_config, "num_experts_per_tok", 0)
+        )
+
+    load_balancing_loss_func = getattr(hf_glm4v_moe, "load_balancing_loss_func", None)
+    if load_balancing_loss_func is not None and not getattr(
+        load_balancing_loss_func,
+        "_easydel_returns_tensor",
+        False,
+    ):
+        import torch
+
+        def _patched_load_balancing_loss_func(*args, **kwargs):
+            result = load_balancing_loss_func(*args, **kwargs)
+            if isinstance(result, int):
+                attention_mask = kwargs.get("attention_mask")
+                device = getattr(attention_mask, "device", None)
+                if device is None and args:
+                    gate_logits = args[0]
+                    if isinstance(gate_logits, tuple) and gate_logits:
+                        device = getattr(gate_logits[0], "device", None)
+                result = torch.tensor(float(result), device=device)
+            return result
+
+        _patched_load_balancing_loss_func._easydel_returns_tensor = True  # type: ignore[attr-defined]
+        hf_glm4v_moe.load_balancing_loss_func = _patched_load_balancing_loss_func
+
+
+_patch_hf_glm4v_moe_router_logits_output()
 
 
 def _rope_scaling_from_rope_parameters(

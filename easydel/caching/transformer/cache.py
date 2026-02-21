@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -98,8 +98,8 @@ from .._abstracts import (
 )
 
 if tp.TYPE_CHECKING:
-    from easydel.layers.caching.hybrid import HybridMetadata
-    from easydel.layers.components.quants._quants import EasyQuantizer
+    from easydel.caching.hybrid import HybridMetadata
+    from easydel.layers.quantization._quants import EasyQuantizer
 else:
     EasyQuantizer = object
     HybridMetadata = object
@@ -483,7 +483,7 @@ class TransformerCacheView(BaseCacheView):
             TransformerCacheView: Initialized cache view.
         """
         from easydel.infra.utils import AttnMaskType
-        from easydel.layers.components.quants._quants import EasyQuantizer as EQ
+        from easydel.layers.quantization._quants import EasyQuantizer as EQ
 
         if quantizer is None:
             quantizer = EQ(quantization_config=None)
@@ -729,7 +729,7 @@ class TransformerCache(BaseCache):
         quantizer: EasyQuantizer | None = None,
         mask_type_details: dict[int, AttnMaskDetail] | None = None,
     ):
-        from easydel.layers.components.quants._quants import EasyQuantizer
+        from easydel.layers.quantization._quants import EasyQuantizer
 
         quantizer = quantizer or EasyQuantizer(quantization_config=None)
         if dtype is None:

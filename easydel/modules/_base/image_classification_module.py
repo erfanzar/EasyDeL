@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -66,7 +66,7 @@ from jaxtyping import Array, Float
 
 from easydel.infra.modeling_outputs import ImageClassifierOutput
 from easydel.infra.utils import auto_remat
-from easydel.layers.components import ColumnParallelLinear
+from easydel.layers import ColumnParallelLinear
 
 from ._base_task_module import BaseTaskModule, ConfigT, ModelT
 

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -101,7 +101,7 @@ except ImportError:  # transformers>=5 removed helper
 
 from transformers.utils.hub import PushToHubMixin
 
-from easydel.layers.components import QuantizationConfig
+from easydel.layers import QuantizationConfig
 from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
 from easydel.utils.traversals import flatten_dict, is_flatten, merge_model_and_tree, string_key_to_int, unflatten_dict
 
@@ -656,8 +656,8 @@ class EasyBridgeMixin(PushToHubMixin):
             if quantization_config is None:
                 quantization_config = _normalize_quantization_config(getattr(model.config, "quantization_config", None))
             if quantization_config is None:
-                from easydel.layers.components import QuantizationConfig as _QConfig
-                from easydel.layers.components import QuantizationType as _QType
+                from easydel.layers import QuantizationConfig as _QConfig
+                from easydel.layers import QuantizationType as _QType
 
                 quantization_config = _QConfig(dtype=_QType.INT8)
                 logger.warning(
@@ -665,7 +665,7 @@ class EasyBridgeMixin(PushToHubMixin):
                     "defaulting to INT8. Pass quantization_config to control quantization type."
                 )
 
-            from easydel.layers.components.quants._quants import EasyQuantizer
+            from easydel.layers.quantization._quants import EasyQuantizer
             from easydel.utils.traversals import iter_module_search
 
             quantizer_for_modules = EasyQuantizer(quantization_config=quantization_config)
@@ -729,8 +729,8 @@ class EasyBridgeMixin(PushToHubMixin):
                         getattr(model.config, "quantization_config", None)
                     )
                 if quantization_config is None:
-                    from easydel.layers.components import QuantizationConfig as _QConfig
-                    from easydel.layers.components import QuantizationType as _QType
+                    from easydel.layers import QuantizationConfig as _QConfig
+                    from easydel.layers import QuantizationType as _QType
 
                     quantization_config = _QConfig(dtype=_QType.INT8)
                     logger.warning(
@@ -749,8 +749,8 @@ class EasyBridgeMixin(PushToHubMixin):
                         getattr(model.config, "quantization_config", None)
                     )
                 if quantization_config is None:
-                    from easydel.layers.components import QuantizationConfig as _QConfig
-                    from easydel.layers.components import QuantizationType as _QType
+                    from easydel.layers import QuantizationConfig as _QConfig
+                    from easydel.layers import QuantizationType as _QType
 
                     quantization_config = _QConfig(dtype=_QType.INT8)
                     logger.warning(
@@ -764,11 +764,11 @@ class EasyBridgeMixin(PushToHubMixin):
                     prepack_quantized_weights,
                     static_argnames=["group_size", "bits", "mode", "transpose"],
                 )
-                from easydel.layers.components.quants._configs import resolve_ejkernel_quant_params
+                from easydel.layers.quantization._configs import resolve_ejkernel_quant_params
 
                 if kernel_map:
                     if quantizer_for_modules is None:
-                        from easydel.layers.components.quants._quants import EasyQuantizer
+                        from easydel.layers.quantization._quants import EasyQuantizer
 
                         quantizer_for_modules = EasyQuantizer(quantization_config=quantization_config)
                     model = quantizer_for_modules.apply_quantization(model, verbose=verbose)

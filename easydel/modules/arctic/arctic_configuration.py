@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,22 +13,12 @@
 # limitations under the License.
 
 
-import typing as tp
-
-from eformer.common_types import EMPTY, MODE_TRAIN, TP, DynamicShardingAxes
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
-
-
-class ExpertTensorParallel(DynamicShardingAxes):
-    """Expert Tensor Parallelism (EPxTP) sharding axes."""
-
-    axes: tp.ClassVar = [TP, EMPTY, EMPTY]
-    mode: tp.ClassVar = MODE_TRAIN
 
 
 @register_config("arctic")

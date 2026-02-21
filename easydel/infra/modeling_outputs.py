@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -103,7 +103,7 @@ from jax.core import Tracer
 from jaxtyping import Array
 
 if tp.TYPE_CHECKING:
-    from easydel.layers.caching import TransformerCache, TransformerCacheView
+    from easydel.caching import TransformerCache, TransformerCacheView
 else:
     TransformerCacheView = tp.Any
     TransformerCache = tp.Any

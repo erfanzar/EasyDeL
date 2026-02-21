@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -72,8 +72,8 @@ import typing as tp
 import jax
 import numpy as np
 
-from easydel.layers.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
-from easydel.layers.caching._metadatabuilder import AttentionMetadataBuilder
+from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
+from easydel.caching._metadatabuilder import AttentionMetadataBuilder
 
 from ...page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
 from ..execution_types import BatchMetadata
@@ -257,6 +257,73 @@ class BatchMetadataPreparer:
         # the input PyTree stable (non-None fields) without paying host→device cost
         # on steps where those buffers are effectively unused (e.g., all-false masks).
         self._zero_dev_cache: dict[tuple[str, tuple[int, ...], str], jax.Array] = {}
+
+    def _enforce_dp_local_page_tables(
+        self,
+        *,
+        num_requests: int,
+        scheduled: np.ndarray,
+        num_computed_tokens_cpu: np.ndarray,
+        page_table_cpu: np.ndarray,
+    ) -> None:
+        """Validate that active rows only use page IDs local to their DP shard.
+
+        The current DP-sharded page-cache path requires request rows and block-table
+        IDs to be aligned by shard:
+            - row shard: ``req_idx // rows_per_dp``
+            - page shard: ``page_id // pages_per_dp``
+
+        If this invariant is violated, TPU kernels may trigger page all-gathers or
+        access non-local page IDs. We fail early with a clear error so allocator/
+        scheduler plumbing can be corrected.
+        """
+        dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1)))
+        if dp_size <= 1 or num_requests <= 0:
+            return
+
+        total_rows = int(self._num_reqs_max_model_len)
+        if total_rows % dp_size != 0:
+            raise ValueError(
+                "DP-local page-table invariant requires rows divisible by data-parallel size: "
+                f"rows={total_rows}, dp_size={dp_size}."
+            )
+
+        total_pages = int(getattr(self.metadata, "num_pages", 0) or 0)
+        if total_pages <= 0 or total_pages % dp_size != 0:
+            raise ValueError(
+                "DP-local page-table invariant requires total pages divisible by data-parallel size: "
+                f"num_pages={total_pages}, dp_size={dp_size}."
+            )
+
+        rows_per_shard = total_rows // dp_size
+        pages_per_shard = total_pages // dp_size
+        page_size = max(1, int(getattr(self.metadata, "page_size", 1)))
+        max_pages_per_req = int(page_table_cpu.shape[1])
+
+        for req_idx in range(int(num_requests)):
+            seq_len = int(num_computed_tokens_cpu[req_idx]) + int(scheduled[req_idx])
+            if seq_len <= 0:
+                continue
+
+            req_shard = min(req_idx // rows_per_shard, dp_size - 1)
+            page_lo = req_shard * pages_per_shard
+            page_hi = page_lo + pages_per_shard
+            page_cnt = min((seq_len + page_size - 1) // page_size, max_pages_per_req)
+
+            row = np.asarray(page_table_cpu[req_idx, :page_cnt], dtype=np.int32)
+            # Ignore explicit padding/null entries.
+            row = row[row != int(PAGE_TABLE_PADDING_VAL)]
+            if row.size == 0:
+                continue
+
+            invalid = row[(row < page_lo) | (row >= page_hi)]
+            if invalid.size:
+                raise ValueError(
+                    "Non-DP-local page IDs detected for active request row. "
+                    f"req_idx={req_idx} req_shard={req_shard} "
+                    f"valid_range=[{page_lo}, {page_hi}) sample_bad_page={int(invalid[0])}. "
+                    "Ensure scheduler/allocator produce per-DP-local block IDs."
+                )
 
     def _get_zero_dev(self, *, namespace: str, shape: tuple[int, ...], dtype: np.dtype) -> jax.Array:
         """Get or create a cached zero-filled device array.
@@ -572,6 +639,12 @@ class BatchMetadataPreparer:
                 scheduled[:num_requests],
                 out=seq_lens[:num_requests],
                 dtype=np.int32,
+            )
+            self._enforce_dp_local_page_tables(
+                num_requests=num_requests,
+                scheduled=scheduled,
+                num_computed_tokens_cpu=num_computed_tokens_cpu,
+                page_table_cpu=page_table_cpu,
             )
 
         # logits_indices: last token index per request in the packed batch.

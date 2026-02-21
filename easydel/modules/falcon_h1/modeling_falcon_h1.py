@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float
 
+from easydel.caching import HybridCache, HybridCacheView, OperationsMetadata
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
@@ -34,13 +35,11 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers.attention import MaskInfo
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.caching import HybridCache, HybridCacheView, OperationsMetadata
-from easydel.layers.components import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
-from easydel.layers.operations import OperationMetadata
-from easydel.layers.operations.modules import SSM2Op
+from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers.attention import MaskInfo, UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule
+from easydel.operations import OperationMetadata
+from easydel.operations.kernels import SSM2Op
 
 from .falcon_h1_configuration import FalconH1Config
 

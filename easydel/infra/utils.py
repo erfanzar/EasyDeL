@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -70,7 +70,7 @@ from flax import nnx as nn
 from jaxtyping import Array, DTypeLike, PRNGKeyArray
 from tqdm.auto import tqdm
 
-from easydel.layers.components import EasyQuantizer, ParallelLinear, QuantizationConfig
+from easydel.layers import EasyQuantizer, ParallelLinear, QuantizationConfig
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 

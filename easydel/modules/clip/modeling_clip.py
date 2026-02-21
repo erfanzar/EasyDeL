@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,10 +37,10 @@ from easydel.infra.modeling_outputs import (
     ImageClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam
+from easydel.layers import ColumnParallelLinear, Embed
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.base_modules import BaseImageClassificationModule
-from easydel.layers.components import ColumnParallelLinear, Embed
-from easydel.layers.components.norms import LayerNorm
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseImageClassificationModule
 
 from .clip_configuration import CLIPConfig, CLIPTextConfig, CLIPVisionConfig
 

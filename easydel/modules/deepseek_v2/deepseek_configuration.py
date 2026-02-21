@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,22 +13,12 @@
 # limitations under the License.
 
 
-import typing as tp
-
-from eformer.common_types import EMPTY, MODE_TRAIN, TP, DynamicShardingAxes
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
-from easydel.layers.components import RopeConfig
-
-
-class ExpertTensorParallel(DynamicShardingAxes):
-    """Expert Tensor Parallelism (EPxTP) sharding axes."""
-
-    axes: tp.ClassVar = [TP, EMPTY, EMPTY]
-    mode: tp.ClassVar = MODE_TRAIN
+from easydel.layers import RopeConfig
 
 
 @register_config("deepseek_v2")
@@ -133,6 +123,16 @@ class DeepseekV2Config(EasyDeLBaseConfig):
     """
 
     model_type: str = "deepseek_v2"
+
+    def __setattr__(self, key, value):
+        # DeepSeek HF remote code expects `rope_scaling=None` for default RoPE.
+        # Newer config normalization can materialize {"type":"default", ...},
+        # which triggers legacy branches that require `factor`.
+        if key == "rope_scaling" and isinstance(value, dict):
+            rope_type = value.get("rope_type", value.get("type"))
+            if rope_type in (None, "default"):
+                value = None
+        super().__setattr__(key, value)
 
     def __init__(
         self,
@@ -288,6 +288,11 @@ class DeepseekV2Config(EasyDeLBaseConfig):
             bits=bits,
             **kwargs,
         )
+        rope_scaling_value = getattr(self, "rope_scaling", None)
+        if isinstance(rope_scaling_value, dict):
+            rope_type = rope_scaling_value.get("rope_type", rope_scaling_value.get("type"))
+            if rope_type in (None, "default"):
+                object.__setattr__(self, "rope_scaling", None)
 
     def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
         """Returns partition rules for model sharding.

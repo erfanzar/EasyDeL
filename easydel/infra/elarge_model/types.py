@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -79,7 +79,7 @@ from jax import numpy as jnp
 from easydel.infra.base_config import EasyDeLBaseConfigDict
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
 from easydel.infra.factory import TaskType
-from easydel.layers.components import QuantizationConfig
+from easydel.layers import QuantizationConfig
 
 from .trainer_types import TrainerConfig
 
@@ -624,6 +624,12 @@ class QuantizationCfg(TypedDict, total=False):
             Can be a QuantizationConfig object or EasyDeLQuantizationCfg dict.
         apply_quantization: Whether to replace linear modules with quantized
             versions. Enables dynamic quantization of activations.
+        use_qmm_best_config: Whether quantized linear kernels should request
+            ejkernel tuned block configs by default. Defaults to True.
+        qmm_platform_override: Optional explicit ejkernel platform override
+            for quantized matmul (for example "pallas", "xla", "triton").
+        qmm_tpu_path_override: Optional explicit TPU fused path override for
+            quantized matmul ("hybrid", "packed", or "predecode").
 
     Example:
         >>> from easydel.infra.elarge_model.types import QuantizationCfg
@@ -653,6 +659,9 @@ class QuantizationCfg(TypedDict, total=False):
     kv_cache: NotRequired[QuantizationConfig | EasyDeLQuantizationCfg | None]
     model: NotRequired[QuantizationConfig | EasyDeLQuantizationCfg | None]
     apply_quantization: NotRequired[bool]
+    use_qmm_best_config: NotRequired[bool]
+    qmm_platform_override: NotRequired[str | None]
+    qmm_tpu_path_override: NotRequired[str | None]
 
 
 class BaseCfg(TypedDict, total=False):
@@ -729,6 +738,8 @@ class eSurgeCfg(TypedDict, total=False):
             Default: 128.
         use_aot_forward: Use ahead-of-time compiled forward pass.
             Can improve latency by pre-compiling common shapes.
+        bind_graphstate_for_aot: In AOT mode, compile model-step variants
+            with graphstate/graphother captured as constants. Default: False.
         enable_prefix_caching: Enable prefix caching optimization.
             Caches KV states for common prompt prefixes to reduce
             redundant computation.
@@ -745,6 +756,10 @@ class eSurgeCfg(TypedDict, total=False):
             Experimental feature for improved throughput.
         sampler_metrics: Enable sampler-side metrics collection.
             Provides detailed sampling statistics.
+        data_parallelism_axis: Mesh axis name used by eSurge as the
+            data-parallel page axis for KV-cache sharding metadata.
+            Default: "dp". Set to "ep" to run data parallelism across
+            the expert-parallel axis.
         esurge_name: Optional display name for the engine instance.
             Useful when running multiple engines.
         reserve_tokens: Number of tokens reserved from the context budget.
@@ -829,6 +844,7 @@ class eSurgeCfg(TypedDict, total=False):
     hbm_utilization: NotRequired[float]
     page_size: NotRequired[int]
     use_aot_forward: NotRequired[bool]
+    bind_graphstate_for_aot: NotRequired[bool]
     enable_prefix_caching: NotRequired[bool]
     auto_shard_model: NotRequired[bool]
     sharding_axis_dims: NotRequired[tp.Sequence[int]]
@@ -837,6 +853,7 @@ class eSurgeCfg(TypedDict, total=False):
     verbose: NotRequired[bool]
     overlap_execution: NotRequired[bool]
     sampler_metrics: NotRequired[bool]
+    data_parallelism_axis: NotRequired[str]
     esurge_name: NotRequired[str | None]
     reserve_tokens: NotRequired[int | None]
     auto_truncate_prompt: NotRequired[bool]

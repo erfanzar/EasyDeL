@@ -66,7 +66,7 @@ class TestKimiVL:
             qk_nope_head_dim=16,
             qk_rope_head_dim=16,
             v_head_dim=32,
-            rope_scaling=None,
+            rope_scaling={"type": "linear", "factor": 1.0},
             attention_bias=False,
             attention_dropout=0.0,
             tie_word_embeddings=False,
@@ -163,4 +163,3 @@ if __name__ == "__main__":
     import pytest
 
     pytest.main([__file__, "-s"])
-

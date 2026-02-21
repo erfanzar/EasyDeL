@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 # pyright:reportUnusedImport=none
 # pyright:reportImportCycles=none
 
-__version__ = "0.2.0.5"
+__version__ = "0.3.0"
 
 import os as _os
 import sys as _sys
@@ -40,6 +40,134 @@ from .utils import is_package_available as _is_package_available
 _logger = _get_logger("EasyDeL")
 
 
+def _patch_transformers_import_utils() -> None:
+    """Backfill removed transformers import-utils symbols for remote model code."""
+    try:
+        from transformers.utils import import_utils as _hf_import_utils
+    except Exception:
+        return
+
+    if not hasattr(_hf_import_utils, "is_torch_fx_available"):
+
+        def _is_torch_fx_available() -> bool:
+            try:
+                is_torch_available = getattr(_hf_import_utils, "is_torch_available", None)
+                return bool(is_torch_available()) if callable(is_torch_available) else False
+            except Exception:
+                return False
+
+        _hf_import_utils.is_torch_fx_available = _is_torch_fx_available
+
+
+_patch_transformers_import_utils()
+
+
+def _patch_transformers_rope_scaling_property() -> None:
+    """Normalize HF rope_scaling access for legacy DeepSeek remote modules."""
+    try:
+        from transformers.configuration_utils import PretrainedConfig as _HFPretrainedConfig
+    except Exception:
+        return
+
+    rope_scaling_prop = getattr(_HFPretrainedConfig, "rope_scaling", None)
+    if not isinstance(rope_scaling_prop, property):
+        return
+
+    original_get = rope_scaling_prop.fget
+    if original_get is None or getattr(original_get, "_easydel_rope_scaling_patch", False):
+        return
+
+    def _patched_get(self):
+        value = original_get(self)
+        if getattr(self, "model_type", None) in {"deepseek_v2", "deepseek_v3"} and isinstance(value, dict):
+            rope_type = value.get("rope_type", value.get("type"))
+            if rope_type in (None, "default"):
+                return None
+        return value
+
+    _patched_get._easydel_rope_scaling_patch = True  # type: ignore[attr-defined]
+    _HFPretrainedConfig.rope_scaling = property(
+        _patched_get,
+        rope_scaling_prop.fset,
+        rope_scaling_prop.fdel,
+        rope_scaling_prop.__doc__,
+    )
+
+
+_patch_transformers_rope_scaling_property()
+
+
+def _patch_transformers_init_weights_tie_signature() -> None:
+    """Handle legacy remote-model `tie_weights()` signatures on new HF versions."""
+    try:
+        from transformers.modeling_utils import PreTrainedModel as _HFPreTrainedModel
+    except Exception:
+        return
+
+    original_init_weights = getattr(_HFPreTrainedModel, "init_weights", None)
+    if original_init_weights is None or getattr(original_init_weights, "_easydel_tie_patch", False):
+        return
+
+    def _patched_init_weights(self):
+        try:
+            return original_init_weights(self)
+        except TypeError as exc:
+            if "recompute_mapping" not in str(exc):
+                raise
+            return self.tie_weights()
+
+    _patched_init_weights._easydel_tie_patch = True  # type: ignore[attr-defined]
+    _HFPreTrainedModel.init_weights = _patched_init_weights
+
+
+_patch_transformers_init_weights_tie_signature()
+
+
+def _patch_transformers_autoconfig_gated_repo_skip() -> None:
+    """Convert gated-repo config load failures to pytest skips."""
+    try:
+        from transformers import AutoConfig as _HFAutoConfig
+    except Exception:
+        return
+
+    auto_config_from_pretrained = _HFAutoConfig.__dict__.get("from_pretrained", None)
+    if not isinstance(auto_config_from_pretrained, classmethod):
+        return
+    original_fn = auto_config_from_pretrained.__func__
+    if getattr(original_fn, "_easydel_gated_repo_patch", False):
+        return
+
+    def _patched_from_pretrained(cls, *args, **kwargs):
+        import os as _runtime_os
+
+        try:
+            return original_fn(cls, *args, **kwargs)
+        except OSError as exc:
+            if "PYTEST_CURRENT_TEST" not in _runtime_os.environ:
+                raise
+            message = str(exc).lower()
+            is_gated_error = (
+                "gated repo" in message
+                or "gated model" in message
+                or "you are trying to access a gated repo" in message
+                or "access to this model is restricted" in message
+                or "access to this repository is restricted" in message
+                or ("401" in message and "huggingface" in message)
+            )
+            if not is_gated_error:
+                raise
+            import unittest as _unittest
+
+            model_id = args[0] if args else kwargs.get("pretrained_model_name_or_path", "<unknown>")
+            raise _unittest.SkipTest(f"Skipping gated Hugging Face repo during tests: {model_id}") from exc
+
+    _patched_from_pretrained._easydel_gated_repo_patch = True  # type: ignore[attr-defined]
+    _HFAutoConfig.from_pretrained = classmethod(_patched_from_pretrained)
+
+
+_patch_transformers_autoconfig_gated_repo_skip()
+
+
 if _check_bool_flag("EASYDEL_AUTO", True):
     _sys.setrecursionlimit(10000)
 
@@ -62,7 +190,7 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _os.environ["NUMEXPR_NUM_THREADS"] = "8"
 
     _os.environ["KMP_AFFINITY"] = "noverbose"
-    _os.environ["GRPC_VERBOSITY"] = "3"
+    _os.environ["GRPC_VERBOSITY"] = "ERROR"
     _os.environ["GLOG_minloglevel"] = "3"
 
     _os.environ["CACHE_TRITON_KERNELS"] = "1"
@@ -73,6 +201,7 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
     _os.environ["JAX_ENABLE_PGLE"] = "true"
+    _os.environ["JAX_CAPTURED_CONSTANTS_WARN_BYTES"] = "-1"
 
     _os.environ["JAX_PGLE_PROFILING_RUNS"] = "3"
     _os.environ["JAX_PGLE_AGGREGATION_PERCENTILE"] = "85"
@@ -191,7 +320,7 @@ _import_structure = {
         "EasyQuantizer",
         "QuantizationType",
     ],
-    "layers.operations": [
+    "operations": [
         "AttentionConfig",
         "AttentionOutput",
         "AutoRegressiveDecodeAttn",
@@ -219,7 +348,7 @@ _import_structure = {
         "AttentionModule",
         "FlexibleAttentionModule",
     ],
-    "layers.components": ["MoEMethods"],
+    "layers.moe": ["MoEMethods"],
     "modules": [],
     "modules.arctic": [
         "ArcticConfig",
@@ -749,30 +878,7 @@ if _tp.TYPE_CHECKING:
     )
     from .infra.factory import ConfigType, TaskType, register_config, register_module
     from .layers.attention import AttentionMechanisms, AttentionModule, FlexibleAttentionModule
-    from .layers.components import MoEMethods
-    from .layers.operations import (
-        AttentionConfig,
-        AttentionOutput,
-        AutoRegressiveDecodeAttn,
-        BaseOperationConfig,
-        BlockSparseAttentionConfig,
-        BlockSparseAttn,
-        FlashAttentionConfig,
-        FlashAttn,
-        OperationImpl,
-        OperationMetadata,
-        OperationRegistry,
-        PagedFlashAttn,
-        RaggedPageAttentionv2Config,
-        RaggedPageAttentionv3Config,
-        RaggedPageAttnV2,
-        RaggedPageAttnV3,
-        RingAttentionConfig,
-        RingAttn,
-        ScaledDotProductAttentionConfig,
-        ScaledDotProductAttn,
-        VanillaAttn,
-    )
+    from .layers.moe import MoEMethods
     from .layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer, QuantizationType
     from .modules.arctic import ArcticConfig, ArcticForCausalLM, ArcticModel
     from .modules.auto import (
@@ -983,6 +1089,29 @@ if _tp.TYPE_CHECKING:
     )
     from .modules.xerxes import XerxesConfig, XerxesForCausalLM, XerxesModel
     from .modules.xerxes2 import Xerxes2Config, Xerxes2ForCausalLM, Xerxes2Model
+    from .operations import (
+        AttentionConfig,
+        AttentionOutput,
+        AutoRegressiveDecodeAttn,
+        BaseOperationConfig,
+        BlockSparseAttentionConfig,
+        BlockSparseAttn,
+        FlashAttentionConfig,
+        FlashAttn,
+        OperationImpl,
+        OperationMetadata,
+        OperationRegistry,
+        PagedFlashAttn,
+        RaggedPageAttentionv2Config,
+        RaggedPageAttentionv3Config,
+        RaggedPageAttnV2,
+        RaggedPageAttnV3,
+        RingAttentionConfig,
+        RingAttn,
+        ScaledDotProductAttentionConfig,
+        ScaledDotProductAttn,
+        VanillaAttn,
+    )
     from .trainers import (
         BaseTrainer,
         BCOConfig,
@@ -1037,8 +1166,8 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_eformer_versions = ["0.0.95"]
-    _targeted_ejkernel_versions = ["0.0.60"]
+    _targeted_eformer_versions = ["0.0.98"]
+    _targeted_ejkernel_versions = ["0.0.66"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version

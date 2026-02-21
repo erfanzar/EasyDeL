@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,7 +41,7 @@ Supported Model Architectures:
 Example:
     Creating a vision-language model::
 
-        from easydel.layers.base_modules import BaseVisionLanguageModule
+        from easydel.modules._base import BaseVisionLanguageModule
 
         class LlavaForConditionalGeneration(
             BaseVisionLanguageModule[LlavaModel, LlavaConfig]
@@ -77,8 +77,7 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.modeling_outputs import VLMCausalLMOutput
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -86,6 +85,7 @@ from easydel.layers.caching import (
     TransformerCache,
     TransformerMetadata,
 )
+from easydel.infra.modeling_outputs import VLMCausalLMOutput
 
 from ._base_task_module import ConfigT, ModelT
 from ._vlm_features import (

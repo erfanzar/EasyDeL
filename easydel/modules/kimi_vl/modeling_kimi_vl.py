@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,8 +51,8 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import VLMCausalLMOutput
 from easydel.layers.attention import FlexibleAttentionModule
-from easydel.layers.base_modules import BaseVisionLanguageModule
-from easydel.layers.components.norms import LayerNorm
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseVisionLanguageModule
 
 from ..deepseek_v3.modeling_deepseek import DeepseekV3ForCausalLM
 from .kimi_vl_configuration import KimiVLConfig, MoonViTConfig

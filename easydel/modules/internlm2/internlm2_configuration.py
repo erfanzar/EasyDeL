@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -188,6 +188,18 @@ class InternLM2Config(EasyDeLBaseConfig):
             bits=bits,
             **kwargs,
         )
+        # Keep legacy InternLM2 remote-code expectation:
+        # `rope_scaling` is a property alias to `rope_parameters` in transformers>=5.
+        # InternLM2 remote-code expects either:
+        #   - None
+        #   - {"type": ..., "factor": ...}
+        if rope_scaling is None:
+            object.__setattr__(self, "rope_parameters", None)
+        elif isinstance(rope_scaling, dict):
+            legacy_rope_scaling = dict(rope_scaling)
+            if "rope_type" in legacy_rope_scaling and "type" not in legacy_rope_scaling:
+                legacy_rope_scaling["type"] = legacy_rope_scaling["rope_type"]
+            object.__setattr__(self, "rope_parameters", legacy_rope_scaling)
 
     def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
         """Returns partition rules for model sharding.

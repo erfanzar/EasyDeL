@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ The inference engine uses these declarations to:
 
 Example usage:
 
-    >>> from easydel.layers.operations.requirements import (
+    >>> from easydel.operations.requirements import (
     ...     RequirementsBuilder,
     ...     MetadataField,
     ...     CacheType,

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ Key Features:
     - Automatic dtype promotion
 
 Example:
-    >>> from easydel.layers.components import RMSNorm
+    >>> from easydel.layers import RMSNorm
     >>> norm = RMSNorm(
     ...     dim=768,
     ...     eps=1e-6,
@@ -115,7 +115,7 @@ class RMSNorm(nn.Module):
     Example:
         >>> import jax.numpy as jnp
         >>> from flax import nnx as nn
-        >>> from easydel.layers.components.norms import RMSNorm
+        >>> from easydel.layers.norms import RMSNorm
         >>>
         >>> # Create RMSNorm layer for 768-dim hidden states
         >>> norm = RMSNorm(
@@ -371,14 +371,14 @@ class BatchNorm(nn.Module):
             key = rngs.params()
             self.scale = nn.Param(scale_init(key, feature_shape, param_dtype), **scale_metadata)
         else:
-            self.scale = nn.data(None)
+            self.scale = None
 
         self.bias: nn.Param[jax.Array] | None
         if use_bias:
             key = rngs.params()
             self.bias = nn.Param(bias_init(key, feature_shape, param_dtype), **bias_metadata)
         else:
-            self.bias = nn.data(None)
+            self.bias = None
 
         self.num_features = num_features
         self.use_running_average = use_running_average
@@ -584,14 +584,14 @@ class LayerNorm(nn.Module):
             key = rngs.params()
             self.scale = nn.Param(scale_init(key, feature_shape, param_dtype), **scale_metadata)
         else:
-            self.scale = nn.data(None)
+            self.scale = None
 
         self.bias: nn.Param[jax.Array] | None
         if use_bias:
             key = rngs.params()
             self.bias = nn.Param(bias_init(key, feature_shape, param_dtype), **bias_metadata)
         else:
-            self.bias = nn.data(None)
+            self.bias = None
 
         self.num_features = num_features
         self.epsilon = epsilon
@@ -622,8 +622,8 @@ class LayerNorm(nn.Module):
         Returns:
             Normalized array with the same shape as the input.
         """
-        scale = self.scale[...] if self.scale else None
-        bias = self.bias[...] if self.bias else None
+        scale = self.scale[...] if self.scale is not None else None
+        bias = self.bias[...] if self.bias is not None else None
         x, scale, bias = self.promote_dtype((x, scale, bias), dtype=self.dtype)
         mean, var = nutil._compute_stats(
             x,

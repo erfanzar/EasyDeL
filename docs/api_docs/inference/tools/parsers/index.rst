@@ -34,5 +34,6 @@ easydel.inference.tools.parsers package
    qwen3xml_tool_parser
    seed_oss_tool_parser
    step3_tool_parser
+   step3p5_tool_parser
    utils
    xlam_tool_parser

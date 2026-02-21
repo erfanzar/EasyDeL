@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -72,8 +72,8 @@ from jax import random as jr
 from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float
 
-from easydel.layers.caching import TransformerCacheView
-from easydel.layers.caching.transformer import TransformerMetadata
+from easydel.caching import TransformerCacheView
+from easydel.caching.transformer import TransformerMetadata
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry

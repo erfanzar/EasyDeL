@@ -690,7 +690,7 @@ wheels = [
 
 [[package]]
 name = "easydel"
-version = "0.2.0.4"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -753,11 +753,11 @@ tpu = [
 requires-dist = [
     { name = "cryptography", specifier = ">=45.0.6" },
     { name = "datasets", specifier = ">=3.6.0" },
-    { name = "eformer", specifier = "==0.0.95" },
+    { name = "eformer", specifier = "==0.0.98" },
     { name = "einops", specifier = "~=0.8.0" },
-    { name = "ejkernel", specifier = "==0.0.60" },
-    { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.60" },
-    { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.60" },
+    { name = "ejkernel", specifier = "==0.0.66" },
+    { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.66" },
+    { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.66" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "flax", specifier = "==0.12.3" },
     { name = "gcsfs", specifier = ">=2024.2,<2026" },
@@ -797,7 +797,7 @@ provides-extras = ["torch", "cuda", "tpu", "tensorflow", "lm-eval", "profile"]
 
 [[package]]
 name = "eformer"
-version = "0.0.95"
+version = "0.0.98"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "braceexpand" },
@@ -819,9 +819,9 @@ dependencies = [
     { name = "tensorstore" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/be/81/1b7c794d6c9ee06da2eb85df6a4e9ce135f4a787f1973f93b163ad43ae5a/eformer-0.0.95.tar.gz", hash = "sha256:dac1ca3d83331369e74cf050f78585ccd21cb3c202143873071ed84b0baba98a", size = 272289, upload-time = "2026-02-09T14:42:42.429Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4f/af/30b1ed7d6f9616ffb6cb1e735f0d2817cc91b755a1039c6fefcdd3ab1a84/eformer-0.0.98.tar.gz", hash = "sha256:ee6f785b34df6bf448904b57a95980cc2519ec8c08ab15424cec5d972b2af95f", size = 274650, upload-time = "2026-02-21T13:37:26.082Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ab/c6/54f321eb689945fad2b81d2e26f7d780f5b8426ae645e760132973b90c3b/eformer-0.0.95-py3-none-any.whl", hash = "sha256:555e20f02162f75175acf0cdf4105c66088e51299ece19e9515e15819bde5435", size = 333822, upload-time = "2026-02-09T14:42:43.842Z" },
+    { url = "https://files.pythonhosted.org/packages/f8/c2/86a24d66d6b71b3bb91c34a7f9bc9af75754b1c79d3f412f3fb835c83113/eformer-0.0.98-py3-none-any.whl", hash = "sha256:925bf6e48f07668940fbaf617ea46ed57183a40d181e9405b0f9a0065e677bbc", size = 335765, upload-time = "2026-02-21T13:37:27.401Z" },
 ]
 
 [[package]]
@@ -835,7 +835,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.60"
+version = "0.0.66"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beartype" },
@@ -845,10 +845,11 @@ dependencies = [
     { name = "jaxlib" },
     { name = "jaxtyping" },
     { name = "pydantic" },
+    { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/61/81/bacf3b07c7918579eb8a6c8d667a118b2d381308e4745e26e7cfcf43d9a1/ejkernel-0.0.60.tar.gz", hash = "sha256:dba8c503de07eab50030d23962bfdbd8452b0bd0fc80f3defd3922b4460a1427", size = 1451283, upload-time = "2026-02-12T17:27:18.653Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3f/1e/60e24c0087ffeea93008a306dfd5a4ca2d05b9d150f2fd70500c0caf8394/ejkernel-0.0.66.tar.gz", hash = "sha256:fadaf2b621b526f692c286ff141a93eaa4364dd71383d82e5a226bf59dfade9c", size = 1475695, upload-time = "2026-02-21T12:00:16.653Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/28/fc/073bb3f73274eaf34393c322388bbf5230d76713931e61eba7c6171c00a9/ejkernel-0.0.60-py3-none-any.whl", hash = "sha256:fdcd9ed6ae2af4005c2c3db7c655fc4cb1163cb2b687482d62ccb417f40be786", size = 3179355, upload-time = "2026-02-12T17:27:20.604Z" },
+    { url = "https://files.pythonhosted.org/packages/bb/c9/f410130c464f1f42e22fc56b313dc42eba94c7926feddab3bab0fabea4a6/ejkernel-0.0.66-py3-none-any.whl", hash = "sha256:9fe451577d0dfc33d660e69d334ee7330e0aea79089fb97fe42b2aa3a8fa0b83", size = 3203301, upload-time = "2026-02-21T12:00:18.149Z" },
 ]
 
 [package.optional-dependencies]
