@@ -623,6 +623,15 @@ class eLargeModel:
                 - page_size: PagedAttention page size (default: 128)
                 - data_parallelism_axis: Mesh axis used for KV-cache data-parallel
                   page sharding (default: "dp", set "ep" for expert-axis DP)
+                - distributed_mode: Enable lockstep multi-host serving where
+                  rank 0 is leader and other ranks are worker executors.
+                - distributed_role: "auto" (default), "leader", or "worker".
+                - distributed_service_name: DNS service name used to discover
+                  all hosts in fixed world-size mode.
+                - distributed_world_size: Expected number of hosts.
+                - distributed_rank: Optional explicit rank override.
+                - distributed_control_port: ZMQ control-plane port (default: 19666).
+                - distributed_auth_token: Shared secret required for control RPC.
                 - enable_prefix_caching: Enable prefix caching optimization
                 - kv_cache_dtype: Dtype for KV cache (None = auto)
                 - decoding_engine: "ring" or "triton" (default: auto)
@@ -1770,6 +1779,9 @@ class eLargeModel:
         max_new_tokens = eval_config.pop("max_new_tokens", 2048)
         temperature = eval_config.pop("temperature", 0.0)
         top_p = eval_config.pop("top_p", 0.95)
+        include_path = eval_config.pop("include_path", None)
+        include_defaults = bool(eval_config.pop("include_defaults", True))
+        task_manager = eval_config.pop("task_manager", None)
 
         eval_adapter = None
         engine_instance = None
@@ -1823,6 +1835,16 @@ class eLargeModel:
         if eval_adapter is None:
             raise RuntimeError("Failed to create evaluation adapter")
 
+        if task_manager is None and (include_path is not None or not include_defaults):
+            from lm_eval.tasks import TaskManager  # type:ignore
+
+            task_manager = TaskManager(
+                verbosity=eval_config.get("verbosity"),
+                include_path=include_path,
+                include_defaults=include_defaults,
+                metadata=eval_config.get("metadata"),
+            )
+
         try:
             logger.info(f"Starting evaluation on tasks: {tasks}")
             logger.info(f"Using {engine if isinstance(engine, str) else type(engine).__name__} engine")
@@ -1834,6 +1856,7 @@ class eLargeModel:
                 num_fewshot=num_fewshot,
                 batch_size=batch_size,
                 device="cpu",
+                task_manager=task_manager,
                 **eval_config,
             )
 

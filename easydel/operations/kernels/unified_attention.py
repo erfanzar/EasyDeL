@@ -36,10 +36,13 @@ from jaxtyping import Array, Float
 from easydel.axis import ATTN_DP
 from easydel.caching import OperationsMetadata, RaggedPagesMetadata, unwrap_metadata
 from easydel.caching.unified_attention import UnifiedAttentionCacheView
+from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
 from ..requirements import CacheType, ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
+
+ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
 
 
 def _normalize_axis_names(axis: str | tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
@@ -269,7 +272,8 @@ class UnifiedAttn(OperationImpl):
             cfg=cfg,
         )
         can_use_dp_local = (
-            page_axis == ATTN_DP
+            ENABLE_DP_LOCAL_PAGE_PATH
+            and page_axis == ATTN_DP
             and page_axis_size > 1
             and len(page_axis_names) > 0
             and int(cache_metadata.context_lens.shape[0]) % page_axis_size == 0

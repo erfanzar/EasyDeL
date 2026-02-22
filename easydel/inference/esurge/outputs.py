@@ -237,7 +237,7 @@ class ModelRunnerOutput:
     """Request IDs processed in this batch."""
 
     req_id_to_index: dict[str, int]
-    """Mapping from request ID to batch index."""
+    """Mapping from request ID to output batch index."""
 
     sampled_token_ids: list[list[int]]
     """Sampled token IDs for each request."""
@@ -250,6 +250,9 @@ class ModelRunnerOutput:
 
     prompt_logprobs_dict: dict[str, LogprobsTensors | None]
     """Prompt log probabilities by request ID."""
+
+    req_id_to_row_index: dict[str, int] | None = None
+    """Optional mapping from request ID to sequence-buffer row index."""
 
     finished_sending: set[str] | None = None
     """Request IDs that finished sending KV cache."""

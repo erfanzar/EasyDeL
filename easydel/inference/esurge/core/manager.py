@@ -224,12 +224,21 @@ class CacheManager:
         """
         return self.page_pool.get_usage()
 
-    def get_computed_pages(self, request: EngineRequest) -> tuple[CachePages, int]:
+    def get_computed_pages(
+        self,
+        request: EngineRequest,
+        *,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
+    ) -> tuple[CachePages, int]:
         """Get the computed (cached) pages for the request.
         Note that the computed pages must be full.
 
         Args:
             request: The request to get the computed pages.
+            dp_shard_hint: Optional request shard hint used to select
+                shard-local prefix cache pages.
+            data_parallel_size: Total data-parallel shard count.
 
         Returns:
             A tuple containing:
@@ -250,10 +259,46 @@ class CacheManager:
 
         max_cache_hit_length = request.num_tokens - 1
         computed_pages, num_new_computed_tokens = self.coordinator.find_longest_cache_hit(
-            page_hashes, max_cache_hit_length
+            page_hashes,
+            max_cache_hit_length,
+            dp_shard_hint=dp_shard_hint,
+            data_parallel_size=data_parallel_size,
         )
 
         return CachePages(computed_pages), num_new_computed_tokens
+
+    def _infer_dp_shard_from_pages(
+        self,
+        pages: tuple[list[CachePage], ...],
+        *,
+        data_parallel_size: int | None,
+    ) -> int | None:
+        """Infer a consistent DP shard from already-attached pages.
+
+        Returns ``None`` when shard inference is not possible (e.g. single-DP,
+        uneven page partitioning, no pages, or mixed-shard pages).
+        """
+        dp_size = int(data_parallel_size or 1)
+        if dp_size <= 1:
+            return None
+        if self.num_pages <= 0 or self.num_pages % dp_size != 0:
+            return None
+
+        pages_per_shard = self.num_pages // dp_size
+        inferred_shard: int | None = None
+        for group_pages in pages:
+            for page in group_pages:
+                if page.is_null:
+                    continue
+                page_id = int(page.page_id)
+                if page_id < 0:
+                    continue
+                shard = min(page_id // pages_per_shard, dp_size - 1)
+                if inferred_shard is None:
+                    inferred_shard = shard
+                elif inferred_shard != shard:
+                    return None
+        return inferred_shard
 
     def allocate_slots(
         self,
@@ -263,6 +308,8 @@ class CacheManager:
         new_computed_pages: CachePages | None = None,
         num_lookahead_tokens: int = 0,
         delay_cache_pages: bool = False,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
     ) -> CachePages | None:
         """Add slots for a request with new tokens to append.
 
@@ -281,6 +328,12 @@ class CacheManager:
             delay_cache_pages: Whether to skip caching the pages. This is
                 used by P/D when allocating pages used in a KV transfer
                 which will complete in a future step.
+            dp_shard_hint: Optional request shard hint for DP-local page
+                allocation. When provided with ``data_parallel_size > 1``,
+                new pages are preferentially allocated from that shard's
+                page-ID range.
+            data_parallel_size: Total data-parallel shard count for
+                ``dp_shard_hint`` interpretation.
 
         Pages layout:
         ```
@@ -328,7 +381,28 @@ class CacheManager:
 
         self.coordinator.save_new_computed_pages(request.request_id, new_computed_page_list)
 
-        new_pages = self.coordinator.allocate_new_pages(request.request_id, num_tokens_need_slot)
+        effective_dp_shard_hint = dp_shard_hint
+        if data_parallel_size is not None and int(data_parallel_size) > 1:
+            inferred_shard = self._infer_dp_shard_from_pages(
+                self.coordinator.get_pages(request.request_id),
+                data_parallel_size=data_parallel_size,
+            )
+            if inferred_shard is not None:
+                effective_dp_shard_hint = inferred_shard
+
+        try:
+            new_pages = self.coordinator.allocate_new_pages(
+                request.request_id,
+                num_tokens_need_slot,
+                dp_shard_hint=effective_dp_shard_hint,
+                data_parallel_size=data_parallel_size,
+            )
+        except ValueError:
+            self.coordinator.rollback_new_computed_pages(request.request_id, new_computed_page_list)
+            if self.enable_caching:
+                for computed_group_pages in new_computed_page_list:
+                    self.page_pool.free_pages(computed_group_pages)
+            return None
 
         if not self.enable_caching or delay_cache_pages:
             return CachePages(new_pages)

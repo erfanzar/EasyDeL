@@ -25,6 +25,44 @@ def main():
         help="Pre-provisioned API key (can be passed multiple times)",
     )
     parser.add_argument("--log-level", type=str, default="info", help="Logging level")
+    parser.add_argument("--distributed-mode", action="store_true", help="Enable distributed lockstep serving mode")
+    parser.add_argument(
+        "--distributed-role",
+        type=str,
+        default="auto",
+        choices=["auto", "leader", "worker"],
+        help="Distributed role for this host",
+    )
+    parser.add_argument(
+        "--distributed-service-name",
+        type=str,
+        default=None,
+        help="DNS service name resolving all distributed hosts",
+    )
+    parser.add_argument(
+        "--distributed-world-size",
+        type=int,
+        default=None,
+        help="Expected number of distributed hosts",
+    )
+    parser.add_argument(
+        "--distributed-rank",
+        type=int,
+        default=None,
+        help="Optional distributed rank override",
+    )
+    parser.add_argument(
+        "--distributed-control-port",
+        type=int,
+        default=19666,
+        help="Distributed control-plane port",
+    )
+    parser.add_argument(
+        "--distributed-auth-token",
+        type=str,
+        default=None,
+        help="Shared auth token for distributed control-plane RPC",
+    )
 
     args = parser.parse_args()
 
@@ -42,7 +80,17 @@ def main():
         max_num_seqs=args.max_num_seqs,
         hbm_utilization=args.hbm_utilization,
         enable_prefix_caching=True,
+        distributed_mode=args.distributed_mode,
+        distributed_role=args.distributed_role,
+        distributed_service_name=args.distributed_service_name,
+        distributed_world_size=args.distributed_world_size,
+        distributed_rank=args.distributed_rank,
+        distributed_control_port=args.distributed_control_port,
+        distributed_auth_token=args.distributed_auth_token,
     )
+
+    if args.distributed_mode and engine.distributed_role == "worker":
+        raise RuntimeError("This script runs the public API server and must be launched on distributed leader rank.")
 
     print(f"\nStarting eSurge API server on http://{args.host}:{args.port}")
     print("OpenAI-compatible endpoints:")
