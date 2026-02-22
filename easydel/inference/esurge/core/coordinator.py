@@ -139,7 +139,27 @@ class CacheCoordinator(ABC):
         for i, manager in enumerate(self.single_type_managers):
             manager.save_new_computed_pages(request_id, new_computed_pages[i])
 
-    def allocate_new_pages(self, request_id: str, num_tokens: int) -> tuple[list[CachePage], ...]:
+    def rollback_new_computed_pages(self, request_id: str, new_computed_pages: tuple[list[CachePage], ...]) -> None:
+        """Rollback a previous :meth:`save_new_computed_pages` call.
+
+        This is used when page allocation fails after computed prefix pages
+        were attached to a request for this scheduling attempt.
+
+        Args:
+            request_id: The request ID.
+            new_computed_pages: The computed pages that were previously saved.
+        """
+        for i, manager in enumerate(self.single_type_managers):
+            manager.rollback_new_computed_pages(request_id, new_computed_pages[i])
+
+    def allocate_new_pages(
+        self,
+        request_id: str,
+        num_tokens: int,
+        *,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
+    ) -> tuple[list[CachePage], ...]:
         """
         Allocate new pages for the request to give it at least `num_tokens`
         token slots.
@@ -152,7 +172,15 @@ class CacheCoordinator(ABC):
         Returns:
             The new allocated pages.
         """
-        return tuple(manager.allocate_new_pages(request_id, num_tokens) for manager in self.single_type_managers)
+        return tuple(
+            manager.allocate_new_pages(
+                request_id,
+                num_tokens,
+                dp_shard_hint=dp_shard_hint,
+                data_parallel_size=data_parallel_size,
+            )
+            for manager in self.single_type_managers
+        )
 
     def cache_pages(self, request: EngineRequest, page_hashes: list[PageHash], num_computed_tokens: int) -> None:
         """
@@ -222,12 +250,17 @@ class CacheCoordinator(ABC):
         self,
         page_hashes: list[PageHash],
         max_cache_hit_length: int,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
     ) -> tuple[tuple[list[CachePage], ...], int]:
         """Find the longest prefix cache hit for a sequence of page hashes.
 
         Args:
             page_hashes: List of page hashes to look up in the cache.
             max_cache_hit_length: Maximum number of tokens to consider.
+            dp_shard_hint: Optional DP shard hint used to constrain cache
+                hits to shard-local page IDs.
+            data_parallel_size: Total number of DP shards.
 
         Returns:
             A tuple containing:
@@ -288,6 +321,8 @@ class CacheCoordinatorNoPrefixCache(CacheCoordinator):
         self,
         page_hashes: list[PageHash],
         max_cache_hit_length: int,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
     ) -> tuple[tuple[list[CachePage], ...], int]:
         """Find cache hit (always returns empty without caching).
 
@@ -353,6 +388,8 @@ class UnitaryCacheCoordinator(CacheCoordinator):
         self,
         page_hashes: list[PageHash],
         max_cache_hit_length: int,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
     ) -> tuple[tuple[list[CachePage], ...], int]:
         """Find the longest cache hit for the single cache group.
 
@@ -372,6 +409,8 @@ class UnitaryCacheCoordinator(CacheCoordinator):
             page_pool=self.page_pool,
             kv_cache_spec=self.kv_cache_spec,
             use_eagle=self.use_eagle,
+            dp_shard_hint=dp_shard_hint,
+            data_parallel_size=data_parallel_size,
         )
         return hit_pages, len(hit_pages[0]) * self.page_size
 
@@ -500,6 +539,8 @@ class HybridCacheCoordinator(CacheCoordinator):
         self,
         page_hashes: list[PageHash],
         max_cache_hit_length: int,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
     ) -> tuple[tuple[list[CachePage], ...], int]:
         """Find the longest consistent cache hit across all cache groups.
 
@@ -528,6 +569,8 @@ class HybridCacheCoordinator(CacheCoordinator):
             page_pool=self.page_pool,
             kv_cache_spec=self.full_attention_spec,
             use_eagle=self.use_eagle,
+            dp_shard_hint=dp_shard_hint,
+            data_parallel_size=data_parallel_size,
         )
         hit_length = len(hit_pages_full_attn[0]) * self.full_attention_page_size
 
@@ -538,6 +581,8 @@ class HybridCacheCoordinator(CacheCoordinator):
             page_pool=self.page_pool,
             kv_cache_spec=self.other_spec,
             use_eagle=self.use_eagle,
+            dp_shard_hint=dp_shard_hint,
+            data_parallel_size=data_parallel_size,
         )
         hit_length = len(hit_pages_other_attn[0]) * self.other_page_size
 

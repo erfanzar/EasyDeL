@@ -88,6 +88,7 @@ from jaxtyping import Array, DTypeLike, Float
 
 from easydel.axis import ATTN_DP
 from easydel.caching import RaggedPagesCacheView, RaggedPagesMetadata
+from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
@@ -100,7 +101,7 @@ from ..requirements import (
 )
 
 USE_SHARDMAP = True
-
+ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
 
 def _normalize_axis_names(axis: str | tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
     """Normalize a partition axis spec into a tuple of concrete mesh axis names."""
@@ -306,6 +307,8 @@ class _RaggedPageAttn(OperationImpl):
         # For DP-sharded page buffers, consume per-DP-local block tables and sequence metadata
         # inside the shard_map body. This avoids materializing global page all-gathers.
         can_use_dp_local = (
+            ENABLE_DP_LOCAL_PAGE_PATH
+            and
             page_axis == ATTN_DP
             and page_axis_size > 1
             and len(page_axis_names) > 0

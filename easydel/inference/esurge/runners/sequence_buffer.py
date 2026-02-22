@@ -339,6 +339,11 @@ class SequenceBuffer:
         return len(self.req_id_to_index)
 
     @property
+    def num_slots(self) -> int:
+        """Number of materialized row slots (includes empty holes)."""
+        return len(self._req_ids)
+
+    @property
     def all_greedy(self) -> bool:
         return len(self.random_reqs) == 0
 
@@ -480,8 +485,25 @@ class SequenceBuffer:
         if req_index is None:
             return None
 
+        if req_index < 0 or req_index >= len(self._req_ids) or req_index >= len(self.req_output_token_ids):
+            logger.warning(
+                "Ignoring stale request index while removing %s: req_index=%s req_ids_len=%s output_ids_len=%s",
+                req_id,
+                req_index,
+                len(self._req_ids),
+                len(self.req_output_token_ids),
+            )
+            self._update_request_distribution()
+            return None
+
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
+        self.token_ids[req_index].fill(0)
+        self.num_tokens[req_index] = 0
+        self.num_tokens_no_spec[req_index] = 0
+        self.num_prompt_tokens[req_index] = 0
+        self.num_computed_tokens[req_index] = 0
+        self.page_table.add_row([[] for _ in self.page_table.page_tables], req_index)
 
         for req_set in [
             self.greedy_reqs,

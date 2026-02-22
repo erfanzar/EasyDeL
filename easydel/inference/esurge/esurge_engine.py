@@ -81,6 +81,7 @@ from easydel.inference.sampling_params import SamplingParams
 from easydel.utils import Registry
 from easydel.workers.esurge.pipeline import WorkerManager
 
+from .distributed import DistributedController, make_config_fingerprint, resolve_distributed_role
 from .logger import logger
 from .mixins import (
     EngineIOMixin,
@@ -348,6 +349,18 @@ class eSurge(
         vision_cache_capacity_mb: int = 1024,
         tool_parser: ToolParserName | None = None,
         reasoning_parser: ReasoningParserName | None = None,
+        distributed_mode: bool = False,
+        distributed_role: typing.Literal["auto", "leader", "worker"] = "auto",
+        distributed_service_name: str | None = None,
+        distributed_world_size: int | None = None,
+        distributed_rank: int | None = None,
+        distributed_control_port: int = 19666,
+        distributed_control_bind_host: str = "0.0.0.0",
+        distributed_advertise_addr: str | None = None,
+        distributed_auth_token: str | None = None,
+        distributed_step_timeout_s: float = 30.0,
+        distributed_connect_timeout_s: float = 15.0,
+        distributed_verify_sampling_digest: bool = True,
         **kwargs,
     ):
         """Initialize the eSurge engine.
@@ -443,6 +456,24 @@ class eSurge(
                 ``RequestOutput.reasoning_content`` / ``RequestOutput.delta_reasoning_content``
                 are populated directly. If None, no reasoning extraction is performed.
                 See ``ReasoningParserManager`` for available parsers.
+            distributed_mode: Enable lockstep multi-host serving mode. Rank 0
+                acts as leader and all other ranks are worker executors.
+            distributed_role: Role override for distributed mode. Use ``\"auto\"``
+                (default) to map rank 0 -> leader and others -> worker.
+            distributed_service_name: DNS service name resolved into host
+                membership for fixed world-size serving.
+            distributed_world_size: Expected number of hosts in the service.
+            distributed_rank: Optional rank override. Defaults to JAX process
+                index when distributed mode is enabled.
+            distributed_control_port: ZMQ control-plane port.
+            distributed_control_bind_host: Bind host for worker control server.
+            distributed_advertise_addr: Optional advertised address override.
+            distributed_auth_token: Shared secret used to authenticate
+                control-plane requests.
+            distributed_step_timeout_s: Worker step reply timeout in seconds.
+            distributed_connect_timeout_s: Worker connect/handshake timeout.
+            distributed_verify_sampling_digest: Validate sampled-token digest
+                from workers against leader output each step.
             **kwargs: Additional configuration passed to model loading.
 
         Raises:
@@ -466,6 +497,50 @@ class eSurge(
         self.page_size = page_size
         self.data_parallelism_axis = _normalize_data_parallelism_axis(data_parallelism_axis)
         register_attention_data_parallel_axis(self.data_parallelism_axis)
+        self.distributed_mode = bool(distributed_mode)
+        self.distributed_service_name = distributed_service_name
+        self.distributed_control_port = int(distributed_control_port)
+        self.distributed_control_bind_host = str(distributed_control_bind_host)
+        self.distributed_advertise_addr = distributed_advertise_addr
+        self.distributed_step_timeout_s = float(distributed_step_timeout_s)
+        self.distributed_connect_timeout_s = float(distributed_connect_timeout_s)
+        self.distributed_verify_sampling_digest = bool(distributed_verify_sampling_digest)
+        self._distributed_controller: DistributedController | None = None
+
+        if self.distributed_mode:
+            if not distributed_auth_token:
+                raise ValueError("`distributed_auth_token` must be provided when distributed_mode=True.")
+            if distributed_world_size is None:
+                raise ValueError("`distributed_world_size` must be provided when distributed_mode=True.")
+            if overlap_execution:
+                raise ValueError(
+                    "`overlap_execution=True` is not supported with distributed_mode=True. "
+                    "Use overlap_execution=False for lockstep multi-host serving."
+                )
+
+            world_size = int(distributed_world_size)
+            if world_size <= 0:
+                raise ValueError(f"`distributed_world_size` must be positive, got {distributed_world_size}.")
+
+            rank = int(distributed_rank) if distributed_rank is not None else int(jax.process_index())
+            if rank < 0 or rank >= world_size:
+                raise ValueError(
+                    f"`distributed_rank` out of range: rank={rank}, world_size={world_size}. "
+                    "Ensure JAX distributed init and DNS membership agree."
+                )
+
+            role = resolve_distributed_role(distributed_role, rank)
+
+            self.distributed_role = role
+            self.distributed_world_size = world_size
+            self.distributed_rank = rank
+            self.distributed_auth_token = str(distributed_auth_token)
+        else:
+            self.distributed_role = "leader"
+            self.distributed_world_size = 1
+            self.distributed_rank = 0
+            self.distributed_auth_token = ""
+
         if kwargs.pop("use_combined_forward", None) is not None:
             logger.warning("`use_combined_forward` is deprecated (the fused step will be used now).")
         # `processor` is the unified interface for text + multimodal workflows.
@@ -823,6 +898,35 @@ class eSurge(
         self._eos_ids = self.__eos_ids
         self._eos_set = self.__eos_set
 
+        if self.distributed_mode:
+            distributed_config = {
+                "max_model_len": int(self.max_model_len),
+                "max_num_seqs": int(self.max_num_seqs),
+                "page_size": int(self.page_size),
+                "data_parallelism_axis": str(self.data_parallelism_axis),
+                "max_num_batched_tokens": int(self.scheduler.max_num_scheduled_tokens),
+                "scheduler_policy": str(self.scheduler.policy.value if hasattr(self.scheduler.policy, "value") else self.scheduler.policy),
+            }
+            self._distributed_config_fingerprint = make_config_fingerprint(distributed_config)
+            self._distributed_controller = DistributedController(
+                enabled=True,
+                role=self.distributed_role,
+                rank=self.distributed_rank,
+                world_size=self.distributed_world_size,
+                service_name=self.distributed_service_name,
+                control_port=self.distributed_control_port,
+                control_bind_host=self.distributed_control_bind_host,
+                advertise_addr=self.distributed_advertise_addr,
+                auth_token=self.distributed_auth_token,
+                step_timeout_s=self.distributed_step_timeout_s,
+                connect_timeout_s=self.distributed_connect_timeout_s,
+                verify_sampling_digest=self.distributed_verify_sampling_digest,
+                config_fingerprint=self._distributed_config_fingerprint,
+                execute_step=self._distributed_execute_step,
+            )
+        else:
+            self._distributed_config_fingerprint = None
+
         self.initiate()
 
     def _calculate_model_size(self, graphstate) -> str:
@@ -914,6 +1018,12 @@ class eSurge(
                     self.data_parallelism_axis,
                 )
 
+    def _distributed_execute_step(self, scheduler_output):
+        """Execute a single scheduler step on worker ranks via control-plane RPC."""
+
+        with self._scheduler_lock:
+            return self.runner.execute_model(scheduler_output)
+
     def __del__(self):
         """Destructor that cleans up resources.
 
@@ -944,6 +1054,11 @@ class eSurge(
                 self._worker_manager.shutdown()
             except Exception:
                 pass
+        if getattr(self, "_distributed_controller", None) is not None:
+            try:
+                self._distributed_controller.shutdown()
+            except Exception:
+                pass
         if hasattr(self, "runner"):
             try:
                 self.runner.shutdown()
@@ -971,6 +1086,10 @@ class eSurge(
             f"decode_truncated_prompt={self.decode_truncated_prompt}",
             f"extra_eos_token_ids={self.extra_eos_token_ids}",
             f"extra_stops={self.extra_stops!r}",
+            f"distributed_mode={self.distributed_mode}",
+            f"distributed_role={self.distributed_role!r}",
+            f"distributed_rank={self.distributed_rank}",
+            f"distributed_world_size={self.distributed_world_size}",
             f"scheduler_running={self._scheduler_running}",
         ]
         return "eSurge(\n  " + ",\n  ".join(attrs) + "\n)"

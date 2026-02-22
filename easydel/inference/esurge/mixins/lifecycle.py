@@ -34,6 +34,19 @@ if typing.TYPE_CHECKING:
 
 
 class EngineLifecycleMixin:
+    @staticmethod
+    def _is_nonrecoverable_scheduler_error(exc: BaseException) -> bool:
+        """Classify scheduler errors that should abort immediately.
+
+        Some failures indicate a hard state invariant violation (for example
+        DP-local page-table mismatch) and retrying the same loop iteration
+        only causes follow-up errors from stale intermediate state.
+        """
+        msg = str(exc)
+        return isinstance(exc, ValueError) and (
+            "Non-DP-local page IDs detected" in msg or "Distributed step synchronization failure" in msg
+        )
+
     def _abort_scheduler_due_to_error(self, exc: BaseException) -> None:
         """Record a fatal scheduler error and wake all waiting callers.
 
@@ -111,6 +124,23 @@ class EngineLifecycleMixin:
         4. Signal waiting threads when updates are available
         """
         with self._scheduler_lock:
+            distributed_controller = getattr(self, "_distributed_controller", None)
+            if distributed_controller is not None:
+                distributed_controller.start()
+                if distributed_controller.is_worker:
+                    if self.runner.executor_manager.kv_pages is None:
+                        self.runner.initialize_kv_cache()
+                        self._kv_cache_valid = True
+
+                    self._scheduler_exception = None
+                    self._scheduler_exception_tb = None
+                    self._scheduler_running = False
+                    self._touch_activity()
+                    self._start_idle_monitor()
+                    self._paused = False
+                    self._info("Distributed worker control server is running (scheduler loop disabled).")
+                    return
+
             if self._scheduler_running:
                 self._info("Scheduler loop is already running")
                 return
@@ -127,13 +157,19 @@ class EngineLifecycleMixin:
                 self._info("Starting background scheduler loop")
                 consecutive_errors = 0
                 max_consecutive_errors = MAX_CONSECUTIVE_SCHEDULER_ERRORS
+                distributed_controller = getattr(self, "_distributed_controller", None)
 
                 if not self._overlap_execution:
                     while self._scheduler_running:
                         try:
                             with self._scheduler_lock:
                                 scheduler_output = self.scheduler.schedule()
+                            dispatch = None
+                            if distributed_controller is not None and distributed_controller.has_remote_workers:
+                                dispatch = distributed_controller.dispatch_step(scheduler_output)
                             model_output = self.runner.execute_model(scheduler_output)
+                            if dispatch is not None:
+                                distributed_controller.verify_step(dispatch, model_output)
                             with self._scheduler_lock:
                                 engine_outputs = self.scheduler.update_from_output(scheduler_output, model_output)
                             if engine_outputs:
@@ -152,6 +188,13 @@ class EngineLifecycleMixin:
                                 max_consecutive_errors,
                                 e,
                             )
+                            if self._is_nonrecoverable_scheduler_error(e):
+                                logger.critical(
+                                    "Fatal scheduler error (non-recoverable invariant violation): %s",
+                                    e,
+                                )
+                                self._abort_scheduler_due_to_error(e)
+                                break
 
                             if consecutive_errors >= max_consecutive_errors:
                                 logger.critical(
@@ -166,6 +209,12 @@ class EngineLifecycleMixin:
 
                 pending_future: tuple[Any, SchedulerOutput] | None = None
                 prefetched_schedule: SchedulerOutput | None = None
+
+                if distributed_controller is not None and distributed_controller.has_remote_workers:
+                    raise ValueError(
+                        "Distributed step synchronization failure: overlap_execution=True is not supported "
+                        "with remote distributed workers."
+                    )
 
                 def _can_prefetch_next(current: SchedulerOutput) -> bool:
                     # Only prefetch when the current batch is guaranteed not to
@@ -219,6 +268,13 @@ class EngineLifecycleMixin:
                             max_consecutive_errors,
                             e,
                         )
+                        if self._is_nonrecoverable_scheduler_error(e):
+                            logger.critical(
+                                "Fatal scheduler error (non-recoverable invariant violation): %s",
+                                e,
+                            )
+                            self._abort_scheduler_due_to_error(e)
+                            break
 
                         if consecutive_errors >= max_consecutive_errors:
                             logger.critical(
@@ -256,6 +312,12 @@ class EngineLifecycleMixin:
         self._stop_idle_monitor()
         with self._scheduler_lock:
             if not self._scheduler_running:
+                distributed_controller = getattr(self, "_distributed_controller", None)
+                if distributed_controller is not None and distributed_controller.is_worker:
+                    try:
+                        distributed_controller.shutdown()
+                    except Exception:
+                        logger.debug("Distributed worker controller shutdown encountered an error", exc_info=True)
                 self._info("Scheduler loop is not running")
                 return
             self._info("Stopping background scheduler loop...")

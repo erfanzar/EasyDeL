@@ -175,6 +175,7 @@ class Scheduler(SchedulerInterface):
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
         self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_model_len = self.scheduler_config.max_model_len
+        self.data_parallel_size = 1
         num_pages = self.cache_config.num_pages
         assert num_pages is not None and num_pages > 0
 
@@ -200,6 +201,9 @@ class Scheduler(SchedulerInterface):
 
         self.waiting = create_request_queue(self.policy)
         self.running: list[EngineRequest] = []
+        # Maintained from model-runner outputs; used to keep DP-shard hints
+        # aligned with actual sequence-buffer row placement.
+        self.req_id_to_row_index: dict[str, int] = {}
 
         self.finished_req_ids: set[str] = set()
 
@@ -232,6 +236,15 @@ class Scheduler(SchedulerInterface):
             buckets.append(self.max_num_running_reqs)
         self.max_num_seq_buckets = buckets
         self._current_seq_bucket = self._select_seq_bucket(0)
+
+    def _dp_shard_hint_for_row(self, row_index: int) -> int | None:
+        """Compute a DP shard hint for a logical request row index."""
+        dp_size = int(getattr(self, "data_parallel_size", 1))
+        if dp_size <= 1:
+            return None
+        rows_cap = max(1, int(self.max_num_seq_buckets[-1]))
+        rows_per_shard = max(1, rows_cap // dp_size)
+        return min(max(int(row_index), 0) // rows_per_shard, dp_size - 1)
 
     @classmethod
     def from_runner(
@@ -284,7 +297,7 @@ class Scheduler(SchedulerInterface):
             use_mla=False,
         )
 
-        return Scheduler(
+        scheduler = Scheduler(
             config=Config(
                 scheduler_config=SchedulerConfig(
                     max_num_seqs=runner.max_num_seqs,
@@ -300,6 +313,8 @@ class Scheduler(SchedulerInterface):
             ),
             kv_cache_config=CacheGroupsConfig(num_pages=metadata.num_pages, kv_cache_groups=kv_cache_groups),
         )
+        scheduler.data_parallel_size = int(getattr(metadata, "data_parallel_size", 1) or 1)
+        return scheduler
 
     def _select_seq_bucket(self, num_reqs: int) -> int:
         """Select the appropriate sequence bucket for the given request count.
@@ -378,6 +393,66 @@ class Scheduler(SchedulerInterface):
         else:
             token_budget = self.max_num_scheduled_tokens
 
+        dp_size = max(1, int(getattr(self, "data_parallel_size", 1) or 1))
+        num_pages = int(getattr(self.cache_config, "num_pages", 0) or 0)
+        use_dp_local_shard_hints = (
+            dp_size > 1
+            and int(self.max_num_running_reqs) > 0
+            and int(self.max_num_running_reqs) % dp_size == 0
+            and num_pages > 0
+            and num_pages % dp_size == 0
+        )
+        rows_per_shard = int(self.max_num_running_reqs) // dp_size if use_dp_local_shard_hints else 0
+        pages_per_shard = num_pages // dp_size if use_dp_local_shard_hints else 0
+        planned_shard_counts: list[int] | None = [0] * dp_size if use_dp_local_shard_hints else None
+
+        def _row_to_dp_shard(row_index: int | None) -> int | None:
+            if not use_dp_local_shard_hints or row_index is None:
+                return None
+            return min(max(int(row_index), 0) // rows_per_shard, dp_size - 1)
+
+        def _infer_dp_shard_from_pages(request: EngineRequest) -> int | None:
+            if not use_dp_local_shard_hints:
+                return None
+            inferred: int | None = None
+            for group_page_ids in self.kv_cache_manager.get_page_ids(request.request_id):
+                for page_id in group_page_ids:
+                    pid = int(page_id)
+                    # 0 is reserved as the null page.
+                    if pid <= 0:
+                        continue
+                    shard = min(pid // pages_per_shard, dp_size - 1)
+                    if inferred is None:
+                        inferred = shard
+                    elif inferred != shard:
+                        return None
+            return inferred
+
+        def _pick_dp_shard_hint(request: EngineRequest) -> int | None:
+            if not use_dp_local_shard_hints:
+                return None
+            assert planned_shard_counts is not None
+
+            page_shard = _infer_dp_shard_from_pages(request)
+            if page_shard is not None and planned_shard_counts[page_shard] < rows_per_shard:
+                return page_shard
+
+            mapped_shard = _row_to_dp_shard(self.req_id_to_row_index.get(request.request_id))
+            if mapped_shard is not None and planned_shard_counts[mapped_shard] < rows_per_shard:
+                return mapped_shard
+
+            candidate_shards = [sid for sid, cnt in enumerate(planned_shard_counts) if cnt < rows_per_shard]
+            if not candidate_shards:
+                return None
+            # Keep per-shard occupancy balanced to avoid overfilling one DP row range.
+            return min(candidate_shards, key=lambda sid: (planned_shard_counts[sid], sid))
+
+        def _reserve_dp_shard(shard_hint: int | None) -> None:
+            if not use_dp_local_shard_hints or shard_hint is None:
+                return
+            assert planned_shard_counts is not None
+            planned_shard_counts[shard_hint] += 1
+
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
         req_index = 0
@@ -400,8 +475,20 @@ class Scheduler(SchedulerInterface):
             max_preemption_attempts = len(self.running) + 1  # Allow one full cycle plus one
 
             while True:
+                row_shard_hint = _pick_dp_shard_hint(request)
+                if use_dp_local_shard_hints and row_shard_hint is None:
+                    logger.warning(
+                        "No DP shard capacity available while scheduling running request %s. Deferring.",
+                        request.request_id,
+                    )
+                    can_schedule = False
+                    break
                 new_pages = self.kv_cache_manager.allocate_slots(
-                    request, num_new_tokens, num_lookahead_tokens=self.num_lookahead_tokens
+                    request,
+                    num_new_tokens,
+                    num_lookahead_tokens=self.num_lookahead_tokens,
+                    dp_shard_hint=row_shard_hint,
+                    data_parallel_size=self.data_parallel_size,
                 )
                 if new_pages is None:
                     preemption_attempts += 1
@@ -440,6 +527,7 @@ class Scheduler(SchedulerInterface):
             assert new_pages is not None
 
             scheduled_running_reqs.append(request)
+            _reserve_dp_shard(row_shard_hint)
             req_to_new_page_ids[request.request_id] = new_pages.get_page_ids()
             num_scheduled_tokens[request.request_id] = num_new_tokens
             if self._token_budget_manager:
@@ -479,9 +567,16 @@ class Scheduler(SchedulerInterface):
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
+                row_shard_hint = _pick_dp_shard_hint(request)
+                if use_dp_local_shard_hints and row_shard_hint is None:
+                    break
 
                 if request.num_computed_tokens == 0:
-                    new_computed_pages, num_new_local_computed_tokens = self.kv_cache_manager.get_computed_pages(request)
+                    new_computed_pages, num_new_local_computed_tokens = self.kv_cache_manager.get_computed_pages(
+                        request,
+                        dp_shard_hint=row_shard_hint,
+                        data_parallel_size=self.data_parallel_size,
+                    )
 
                     num_computed_tokens = num_new_local_computed_tokens + num_external_computed_tokens
 
@@ -526,6 +621,8 @@ class Scheduler(SchedulerInterface):
                     new_computed_pages,
                     num_lookahead_tokens=self.num_lookahead_tokens,
                     delay_cache_pages=load_kv_async,
+                    dp_shard_hint=row_shard_hint,
+                    data_parallel_size=self.data_parallel_size,
                 )
                 if new_pages is None:
                     break
@@ -544,6 +641,7 @@ class Scheduler(SchedulerInterface):
                     scheduled_resumed_reqs.append(request)
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
+                _reserve_dp_shard(row_shard_hint)
 
                 req_to_new_page_ids[request.request_id] = self.kv_cache_manager.get_page_ids(request.request_id)
                 if self._token_budget_manager:
@@ -563,6 +661,14 @@ class Scheduler(SchedulerInterface):
 
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
+
+        # Keep row-index affinity for requests that were preempted and resumed in
+        # the same schedule step; drop stale mapping only for preempted requests
+        # that are not scheduled this step.
+        if preempted_reqs:
+            for preempted_req in preempted_reqs:
+                if preempted_req.request_id not in num_scheduled_tokens:
+                    self.req_id_to_row_index.pop(preempted_req.request_id, None)
 
         self._ensure_capacity(len(self.running))
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -749,8 +855,27 @@ class Scheduler(SchedulerInterface):
             if request is None:
                 continue
 
-            req_index = model_runner_output.req_id_to_index[req_id]
-            generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
+            out_index = model_runner_output.req_id_to_index.get(req_id)
+            if out_index is None:
+                logger.warning(
+                    "Skipping scheduler output for request %s: missing req_id_to_index entry in model output.",
+                    req_id,
+                )
+                continue
+            row_index_map = model_runner_output.req_id_to_row_index
+            row_index = row_index_map.get(req_id) if row_index_map is not None else out_index
+            if row_index is not None:
+                self.req_id_to_row_index[req_id] = int(row_index)
+
+            if sampled_token_ids and (out_index < 0 or out_index >= len(sampled_token_ids)):
+                logger.warning(
+                    "Skipping scheduler output for request %s: req_index=%s out of sampled_token_ids range=%s.",
+                    req_id,
+                    out_index,
+                    len(sampled_token_ids),
+                )
+                continue
+            generated_token_ids = sampled_token_ids[out_index] if sampled_token_ids else []
             stopped = False
             new_token_ids = generated_token_ids
             status_before_stop = request.status
@@ -923,6 +1048,7 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
         self.kv_cache_manager.free_page_hashes(request)
+        self.req_id_to_row_index.pop(request.request_id, None)
         del self.requests[request.request_id]
 
     def get_num_unfinished_requests(self) -> int:

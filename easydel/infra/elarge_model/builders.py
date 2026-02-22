@@ -305,6 +305,18 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     decode_truncated_prompt_val = es.get("decode_truncated_prompt")
     destroy_pages_on_pause_val = es.get("destroy_pages_on_pause")
     silent_mode_val = es.get("silent_mode")
+    distributed_mode_val = es.get("distributed_mode")
+    distributed_role_val = es.get("distributed_role")
+    distributed_service_name_val = es.get("distributed_service_name")
+    distributed_world_size_val = es.get("distributed_world_size")
+    distributed_rank_val = es.get("distributed_rank")
+    distributed_control_port_val = es.get("distributed_control_port")
+    distributed_control_bind_host_val = es.get("distributed_control_bind_host")
+    distributed_advertise_addr_val = es.get("distributed_advertise_addr")
+    distributed_auth_token_val = es.get("distributed_auth_token")
+    distributed_step_timeout_s_val = es.get("distributed_step_timeout_s")
+    distributed_connect_timeout_s_val = es.get("distributed_connect_timeout_s")
+    distributed_verify_sampling_digest_val = es.get("distributed_verify_sampling_digest")
 
     sharding_axis_dims_val = es.get("sharding_axis_dims", (1, 1, 1, -1, 1))
     sharding_axis_dims = tuple(sharding_axis_dims_val) if sharding_axis_dims_val is not None else None
@@ -386,6 +398,32 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         silent_mode=False if silent_mode_val is None else bool(silent_mode_val),
         tool_parser=es.get("tool_parser"),
         reasoning_parser=es.get("reasoning_parser"),
+        distributed_mode=False if distributed_mode_val is None else bool(distributed_mode_val),
+        distributed_role="auto" if distributed_role_val is None else str(distributed_role_val),
+        distributed_service_name=distributed_service_name_val,
+        distributed_world_size=(
+            int(distributed_world_size_val) if distributed_world_size_val is not None else None
+        ),
+        distributed_rank=int(distributed_rank_val) if distributed_rank_val is not None else None,
+        distributed_control_port=(
+            int(distributed_control_port_val) if distributed_control_port_val is not None else 19666
+        ),
+        distributed_control_bind_host=(
+            "0.0.0.0" if distributed_control_bind_host_val is None else str(distributed_control_bind_host_val)
+        ),
+        distributed_advertise_addr=distributed_advertise_addr_val,
+        distributed_auth_token=distributed_auth_token_val,
+        distributed_step_timeout_s=(
+            30.0 if distributed_step_timeout_s_val is None else float(distributed_step_timeout_s_val)
+        ),
+        distributed_connect_timeout_s=(
+            15.0 if distributed_connect_timeout_s_val is None else float(distributed_connect_timeout_s_val)
+        ),
+        distributed_verify_sampling_digest=(
+            True
+            if distributed_verify_sampling_digest_val is None
+            else bool(distributed_verify_sampling_digest_val)
+        ),
     )
 
 

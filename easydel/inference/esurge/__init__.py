@@ -109,6 +109,14 @@ from .core import (
     UnitaryCacheCoordinator,
     create_kv_cache_specs_from_config,
 )
+from .distributed import (
+    DistributedController,
+    StepDispatch,
+    compute_sampled_digest,
+    make_config_fingerprint,
+    resolve_distributed_role,
+    resolve_service_hosts,
+)
 from .esurge_engine import CompletionOutput, RequestOutput, eSurge
 from .metrics import (
     CacheMetrics,
@@ -160,6 +168,7 @@ __all__ = (
     "ChunkedLocalAttentionSpec",
     "CompletionOutput",
     "Config",
+    "DistributedController",
     "EngineRequest",
     "EngineRequestStatus",
     "FCFSRequestQueue",
@@ -188,9 +197,11 @@ __all__ = (
     "SingleTypeCacheManager",
     "SlidingWindowManager",
     "SlidingWindowSpec",
+    "StepDispatch",
     "SystemMetrics",
     "UnitaryCacheCoordinator",
     "VisionEncoderCache",
+    "compute_sampled_digest",
     "create_kv_cache_specs_from_config",
     "eSurge",
     "eSurgeApiServer",
@@ -199,6 +210,9 @@ __all__ = (
     "get_metrics_collector",
     "initialize_metrics",
     "log_metrics_summary",
+    "make_config_fingerprint",
+    "resolve_distributed_role",
+    "resolve_service_hosts",
     "start_console_monitor",
     "start_monitoring_server",
     "stop_monitoring",

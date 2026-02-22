@@ -74,6 +74,7 @@ import numpy as np
 
 from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
 from easydel.caching._metadatabuilder import AttentionMetadataBuilder
+from easydel.utils.helpers import check_bool_flag
 
 from ...page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
 from ..execution_types import BatchMetadata
@@ -158,6 +159,7 @@ class BatchMetadataPreparer:
         self._metadata_version = metadata.version
         self._use_slot_mapping = self._metadata_version == "v2"
         self._use_request_distribution = not self._use_slot_mapping
+        self._enable_dp_local_page_path = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
 
         # Ragged paging shapes (compile-stable).
         num_reqs_max_model_len = (
@@ -277,6 +279,8 @@ class BatchMetadataPreparer:
         access non-local page IDs. We fail early with a clear error so allocator/
         scheduler plumbing can be corrected.
         """
+        if not self._enable_dp_local_page_path:
+            return
         dp_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1)))
         if dp_size <= 1 or num_requests <= 0:
             return
@@ -322,7 +326,8 @@ class BatchMetadataPreparer:
                     "Non-DP-local page IDs detected for active request row. "
                     f"req_idx={req_idx} req_shard={req_shard} "
                     f"valid_range=[{page_lo}, {page_hi}) sample_bad_page={int(invalid[0])}. "
-                    "Ensure scheduler/allocator produce per-DP-local block IDs."
+                    "Ensure scheduler/allocator produce per-DP-local block IDs "
+                    "(or run with data-parallel page sharding disabled)."
                 )
 
     def _get_zero_dev(self, *, namespace: str, shape: tuple[int, ...], dtype: np.dtype) -> jax.Array:
@@ -553,7 +558,10 @@ class BatchMetadataPreparer:
         """
 
         max_num_reqs = int(self.max_num_reqs)
-        num_requests = int(np.sum(active_mask_full_cpu[:max_num_reqs]))
+        active_rows = np.flatnonzero(np.asarray(active_mask_full_cpu[:max_num_reqs], dtype=np.bool_))
+        # Preserve highest live row index (+1) so sparse row layouts remain aligned
+        # with page-table row IDs under DP-local page sharding.
+        num_requests = int(active_rows[-1]) + 1 if active_rows.size > 0 else 0
         num_requests = min(num_requests, max_num_reqs)
 
         padded_num_reqs = AttentionMetadataBuilder.compute_padded_num_reqs(

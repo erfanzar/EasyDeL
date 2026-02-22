@@ -129,7 +129,49 @@ class SingleTypeCacheManager(ABC):
         else:
             assert len(new_computed_pages) == 0
 
-    def allocate_new_pages(self, request_id: str, num_tokens: int) -> list[CachePage]:
+    def rollback_new_computed_pages(self, request_id: str, new_computed_pages: list[CachePage]) -> None:
+        """Rollback pages attached by :meth:`save_new_computed_pages`.
+
+        Args:
+            request_id: The request ID.
+            new_computed_pages: Pages that were added for this scheduling
+                attempt and must be detached after allocation failure.
+        """
+        if not new_computed_pages:
+            return
+
+        req_pages = self.req_to_pages.get(request_id)
+        if not req_pages:
+            return
+
+        num_to_remove = len(new_computed_pages)
+        if req_pages[:num_to_remove] == new_computed_pages:
+            del req_pages[:num_to_remove]
+        else:
+            # Fallback for unexpected ordering: remove by identity/equality.
+            for page in new_computed_pages:
+                try:
+                    req_pages.remove(page)
+                except ValueError:
+                    continue
+
+        num_cached = int(self.num_cached_page.get(request_id, 0))
+        if num_cached <= num_to_remove:
+            self.num_cached_page.pop(request_id, None)
+        else:
+            self.num_cached_page[request_id] = num_cached - num_to_remove
+
+        if not req_pages:
+            self.req_to_pages.pop(request_id, None)
+
+    def allocate_new_pages(
+        self,
+        request_id: str,
+        num_tokens: int,
+        *,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
+    ) -> list[CachePage]:
         """
         Allocate new pages for the request to give it at least `num_tokens`
         token slots.
@@ -148,7 +190,11 @@ class SingleTypeCacheManager(ABC):
         if num_new_pages <= 0:
             return []
         else:
-            new_pages = self.page_pool.get_new_pages(num_new_pages)
+            new_pages = self.page_pool.get_new_pages(
+                num_new_pages,
+                dp_shard_hint=dp_shard_hint,
+                data_parallel_size=data_parallel_size,
+            )
             req_pages.extend(new_pages)
             return new_pages
 
@@ -217,6 +263,8 @@ class SingleTypeCacheManager(ABC):
         page_pool: PagePool,
         kv_cache_spec: CacheSpec,
         use_eagle: bool,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
     ) -> tuple[list[CachePage], ...]:
         """
         Get the longest cache hit prefix of the pages that is not longer than
@@ -234,6 +282,9 @@ class SingleTypeCacheManager(ABC):
             page_pool: The page pool.
             kv_cache_spec: The kv cache spec.
             use_eagle: Whether to use eagle.
+            dp_shard_hint: Optional DP shard hint used to constrain cache
+                hits to shard-local page IDs.
+            data_parallel_size: Total number of DP shards.
 
         Returns:
             A list of cached pages with skipped pages replaced by null page
@@ -286,6 +337,8 @@ class FullAttentionManager(SingleTypeCacheManager):
         page_pool: PagePool,
         kv_cache_spec: CacheSpec,
         use_eagle: bool,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
     ) -> tuple[list[CachePage], ...]:
         assert isinstance(kv_cache_spec, FullAttentionSpec | ChunkedLocalAttentionSpec), (
             "FullAttentionManager can only be used for full attention and chunked local attention groups"
@@ -293,7 +346,12 @@ class FullAttentionManager(SingleTypeCacheManager):
         computed_pages: tuple[list[CachePage], ...] = tuple([] for _ in range(len(kv_cache_group_ids)))
         max_num_pages = max_length // kv_cache_spec.page_size
         for _, page_hash in zip(range(max_num_pages), page_hashes, strict=False):
-            if cached_page := page_pool.get_cached_page(page_hash, kv_cache_group_ids):
+            if cached_page := page_pool.get_cached_page(
+                page_hash,
+                kv_cache_group_ids,
+                dp_shard_hint=dp_shard_hint,
+                data_parallel_size=data_parallel_size,
+            ):
                 for computed, cached in zip(computed_pages, cached_page, strict=False):
                     computed.append(cached)
             else:
@@ -383,6 +441,8 @@ class SlidingWindowManager(SingleTypeCacheManager):
         page_pool: PagePool,
         kv_cache_spec: CacheSpec,
         use_eagle: bool,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
     ) -> tuple[list[CachePage], ...]:
         assert isinstance(kv_cache_spec, SlidingWindowSpec), (
             "SlidingWindowManager can only be used for sliding window groups"
@@ -398,7 +458,12 @@ class SlidingWindowManager(SingleTypeCacheManager):
         match_found = False
 
         for i in range(max_num_pages - 1, -1, -1):
-            if cached_page := page_pool.get_cached_page(page_hashes[i], kv_cache_group_ids):
+            if cached_page := page_pool.get_cached_page(
+                page_hashes[i],
+                kv_cache_group_ids,
+                dp_shard_hint=dp_shard_hint,
+                data_parallel_size=data_parallel_size,
+            ):
                 for computed, cached in zip(computed_pages, cached_page, strict=False):
                     computed[i] = cached
                 num_contiguous_pages += 1
@@ -498,6 +563,8 @@ class ChunkedLocalAttentionManager(SingleTypeCacheManager):
         page_pool: PagePool,
         kv_cache_spec: CacheSpec,
         use_eagle: bool,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
     ) -> tuple[list[CachePage], ...]:
         """
         For chunked local attention, we need to find the longest cache hit
@@ -548,7 +615,12 @@ class ChunkedLocalAttentionManager(SingleTypeCacheManager):
         )
         for i in range(local_attention_start_page_idx, max_num_pages):
             page_hash = page_hashes[i]
-            if cached_page := page_pool.get_cached_page(page_hash, kv_cache_group_ids):
+            if cached_page := page_pool.get_cached_page(
+                page_hash,
+                kv_cache_group_ids,
+                dp_shard_hint=dp_shard_hint,
+                data_parallel_size=data_parallel_size,
+            ):
                 for computed, cached in zip(computed_pages, cached_page, strict=False):
                     computed.append(cached)
             else:
@@ -621,6 +693,8 @@ class MambaManager(SingleTypeCacheManager):
         page_pool: PagePool,
         kv_cache_spec: CacheSpec,
         use_eagle: bool,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
     ) -> tuple[list[CachePage], ...]:
         assert isinstance(kv_cache_spec, MambaSpec), "MambaManager can only be used for mamba groups"
 
@@ -652,7 +726,14 @@ class MambaManager(SingleTypeCacheManager):
         """
         return 0
 
-    def allocate_new_pages(self, request_id: str, num_tokens: int) -> list[CachePage]:
+    def allocate_new_pages(
+        self,
+        request_id: str,
+        num_tokens: int,
+        *,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
+    ) -> list[CachePage]:
         """Allocate a single page for Mamba state storage.
 
         Mamba layers always require exactly one page per request to store
@@ -668,7 +749,12 @@ class MambaManager(SingleTypeCacheManager):
         Raises:
             AssertionError: If more than one page would be allocated.
         """
-        new_pages = super().allocate_new_pages(request_id, num_tokens)
+        new_pages = super().allocate_new_pages(
+            request_id,
+            num_tokens,
+            dp_shard_hint=dp_shard_hint,
+            data_parallel_size=data_parallel_size,
+        )
         assert len(self.req_to_pages[request_id]) == 1, "MambaManager should only allocate 1 page for each request."
         return new_pages
 

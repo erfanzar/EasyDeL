@@ -312,6 +312,12 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         for name, esurge in esurge_map.items():
             if not isinstance(esurge, eSurge):
                 raise TypeError(f"Value for key '{name}' must be an instance of eSurge")
+            if getattr(esurge, "distributed_mode", False) and getattr(esurge, "distributed_role", None) == "worker":
+                raise ValueError(
+                    f"Model '{name}' is configured as distributed worker rank "
+                    f"{getattr(esurge, 'distributed_rank', '?')}; only distributed leader rank "
+                    "can run eSurgeApiServer."
+                )
             self.adapters[name] = eSurgeAdapter(esurge, name)
             model_processors[name] = esurge.tokenizer
 

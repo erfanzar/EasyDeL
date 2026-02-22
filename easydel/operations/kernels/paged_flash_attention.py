@@ -33,10 +33,13 @@ from jaxtyping import Array, Float
 
 from easydel.axis import ATTN_DP
 from easydel.caching import OperationsMetadata, RaggedPagesMetadata, UnifiedAttentionCacheView, unwrap_metadata
+from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
 from ..requirements import CacheType, ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
+
+ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
 
 
 def _dp_page_axis(cache_view: UnifiedAttentionCacheView):
@@ -56,7 +59,7 @@ def _localize_block_tables_for_dp_pages(
     Assumes rows are assigned contiguously per DP shard and page IDs are from
     a globally indexed page pool partitioned evenly over DP shards.
     """
-    if dp_size <= 1:
+    if not ENABLE_DP_LOCAL_PAGE_PATH or dp_size <= 1:
         return block_tables
     rows = int(block_tables.shape[0])
     if rows <= 0 or rows % dp_size != 0 or num_pages <= 0 or num_pages % dp_size != 0:
