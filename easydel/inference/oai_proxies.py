@@ -463,6 +463,17 @@ class InferenceApiRouter:
         """
         return openai_params, None
 
+    @staticmethod
+    def _format_metadata_sse(metadata: BaseModel | dict[str, tp.Any] | tp.Any) -> bytes:
+        """Format metadata as a standard SSE event payload."""
+        if hasattr(metadata, "model_dump_json"):
+            payload = metadata.model_dump_json(exclude_unset=True)
+        elif isinstance(metadata, dict):
+            payload = json.dumps(metadata, separators=(",", ":"), ensure_ascii=False)
+        else:
+            payload = json.dumps(metadata, separators=(",", ":"), ensure_ascii=False, default=str)
+        return f"event: metadata\ndata: {payload}\n\n".encode()
+
     async def responses(self, request: ResponsesRequest, raw_request: Request) -> tp.Any:
         """Handle OpenAI Responses API requests.
 
@@ -605,7 +616,7 @@ class InferenceApiRouter:
         try:
             stream = await self.client.chat.completions.create(**params)
             if metadata is not None:
-                yield f"metadata: {metadata.model_dump_json(exclude_unset=True)}\n\n".encode()
+                yield self._format_metadata_sse(metadata)
 
             async for chunk in stream:
                 yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n".encode()
@@ -691,7 +702,7 @@ class InferenceApiRouter:
         try:
             stream = await self.client.completions.create(**params)
             if metadata is not None:
-                yield f"metadata: {metadata.model_dump_json(exclude_unset=True)}\n\n".encode()
+                yield self._format_metadata_sse(metadata)
 
             async for chunk in stream:
                 yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n".encode()
