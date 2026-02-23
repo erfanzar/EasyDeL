@@ -415,6 +415,7 @@ class EngineUtilsMixin:
         *,
         finished: bool,
         skip_special_tokens: bool = False,
+        prompt_context: list[int] | None = None,
     ) -> DetokenizerResult:
         """Decode tokens using the detokenizer worker pipeline.
 
@@ -425,6 +426,7 @@ class EngineUtilsMixin:
             generated_tokens: Full list of generated tokens so far.
             finished: Whether generation is complete (triggers final flush).
             skip_special_tokens: Whether to skip special tokens in output.
+            prompt_context: Last N prompt token IDs for first-token context.
 
         Returns:
             DetokenizerResult with accumulated_text, delta_text, and indices.
@@ -435,6 +437,7 @@ class EngineUtilsMixin:
             tokens_for_decode,
             finished=finished,
             skip_special_tokens=skip_special_tokens,
+            prompt_context=prompt_context,
         )
 
     @staticmethod
