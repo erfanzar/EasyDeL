@@ -152,6 +152,7 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
         *,
         finished: bool,
         skip_special_tokens: bool,
+        prompt_context: list[int] | None = None,
     ) -> DetokenizerResult:
         """Decode tokens incrementally.
 
@@ -160,6 +161,9 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
             generated_tokens: The list of tokens generated so far.
             finished: Whether generation is complete for this request.
             skip_special_tokens: Whether to skip special tokens in the final decode.
+            prompt_context: Last N prompt token IDs for first-token context.
+                SentencePiece tokenizers need preceding context to avoid
+                spurious leading spaces on the first generated token.
 
         Returns:
             DetokenizerResult containing the decoded text.
@@ -167,15 +171,16 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
         Raises:
             RuntimeError: If the worker returns an error.
         """
-        resp = self._request(
-            {
-                "cmd": "decode",
-                "request_id": request_id,
-                "tokens": generated_tokens,
-                "finished": finished,
-                "skip_special_tokens": skip_special_tokens,
-            }
-        )
+        msg = {
+            "cmd": "decode",
+            "request_id": request_id,
+            "tokens": generated_tokens,
+            "finished": finished,
+            "skip_special_tokens": skip_special_tokens,
+        }
+        if prompt_context:
+            msg["prompt_context"] = prompt_context
+        resp = self._request(msg)
         if resp.get("status") != "ok":
             raise RuntimeError(resp.get("message", "Detokenizer worker failed"))
         result_payload = resp["result"]

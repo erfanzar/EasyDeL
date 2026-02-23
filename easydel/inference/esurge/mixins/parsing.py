@@ -332,10 +332,12 @@ class EngineParsingMixin:
                                 or (now - rd.get("last_decode_time", now)) >= self.decode_interval_secs
                             )
                         if should_decode and num_decodable > last_idx:
+                            prompt_ctx = rd.get("prompt_token_ids") if last_idx == 0 else None
                             pipeline_result = self._decode_with_pipeline(
                                 request_id,
                                 decodable_tokens,
                                 finished=False,
+                                prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
                             )
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index
                             rd["last_decode_time"] = now
@@ -428,10 +430,12 @@ class EngineParsingMixin:
                         num_decodable = len(decodable_tokens)
                         last_idx = rd["last_decoded_index"]
                         if num_decodable > last_idx:
+                            prompt_ctx = rd.get("prompt_token_ids") if last_idx == 0 else None
                             pipeline_result = self._decode_with_pipeline(
                                 request_id,
                                 decodable_tokens,
                                 finished=True,
+                                prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
                             )
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index
                             visible_text, visible_delta, stop_hit, stop_reason = self._apply_stop_string_policy(
