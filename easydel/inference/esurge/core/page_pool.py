@@ -29,6 +29,7 @@ Example:
 from collections import defaultdict
 from collections.abc import Iterable
 
+from ..logger import logger
 from ..request import EngineRequest
 from .utils import CachePage, FreeCachePageQueue, PageHash, PageHashWithGroupId, hash_page_tokens
 
@@ -348,14 +349,14 @@ class PagePool:
         """
         num_used_pages = self.num_pages - self.get_num_free_pages()
         if num_used_pages != 1:
-            print(f"Failed to reset prefix cache because some pages ({num_used_pages - 1}) are not freed yet")
+            logger.warning("Failed to reset prefix cache because some pages (%d) are not freed yet", num_used_pages - 1)
             return False
 
         self.cached_page_hash_to_page.clear()
         for page in self.pages:
             page.reset_hash()
 
-        print("Successfully reset prefix cache")
+        logger.info("Successfully reset prefix cache")
         return True
 
     def get_num_free_pages(self) -> int:

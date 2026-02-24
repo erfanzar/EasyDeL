@@ -40,6 +40,7 @@ from .prompt_transforms import (
 from .proximal_policy_optimization_trainer import PPOConfig, PPOTrainer
 from .ray_scaler import RayDistributedTrainer
 from .reward_trainer import RewardConfig, RewardTrainer
+from .self_distillation_policy_optimization import SDPOConfig, SDPOTrainer
 from .supervised_fine_tuning_trainer import SFTConfig, SFTTrainer
 from .trainer import Trainer
 from .training_configurations import TrainingArguments
@@ -82,6 +83,8 @@ __all__ = (
     "RewardConfig",
     "RewardPreprocessTransform",
     "RewardTrainer",
+    "SDPOConfig",
+    "SDPOTrainer",
     "SFTConfig",
     "SFTPreprocessTransform",
     "SFTTrainer",

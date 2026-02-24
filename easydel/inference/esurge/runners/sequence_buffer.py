@@ -561,13 +561,12 @@ class SequenceBuffer:
             Useful for buffer reorganization and optimization.
         """
         old_id_i1, old_id_i2 = self._req_ids[i1], self._req_ids[i2]
+        assert old_id_i1 is not None and old_id_i2 is not None
         self._req_ids[i1], self._req_ids[i2] = old_id_i2, old_id_i1
         self.req_output_token_ids[i1], self.req_output_token_ids[i2] = (
             self.req_output_token_ids[i2],
             self.req_output_token_ids[i1],
         )
-
-        assert old_id_i1 is not None and old_id_i2 is not None
         self.req_id_to_index[old_id_i1] = i2
         self.req_id_to_index[old_id_i2] = i1
 

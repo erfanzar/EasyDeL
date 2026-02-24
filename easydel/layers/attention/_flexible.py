@@ -45,7 +45,7 @@ Example:
 """
 
 import typing as tp
-from enum import Enum
+from enum import StrEnum
 from functools import cached_property, partial
 
 import einops
@@ -111,7 +111,7 @@ def _get_jax_dtype_from_string(dtype_string: str) -> jnp.dtype | str:
     return result
 
 
-class AttentionMechanisms(str, Enum):
+class AttentionMechanisms(StrEnum):
     """Available attention mechanism implementations.
 
     Enumeration of different attention computation strategies,

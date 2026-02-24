@@ -53,7 +53,7 @@ import os
 import time
 import typing as tp
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from http import HTTPStatus
 
 import uvicorn
@@ -69,7 +69,7 @@ if tp.TYPE_CHECKING:
 TIMEOUT_KEEP_ALIVE = 5.0
 
 
-class ServerStatus(str, Enum):
+class ServerStatus(StrEnum):
     """Server status enumeration.
 
     Represents the operational state of an inference proxy server.

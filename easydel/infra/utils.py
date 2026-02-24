@@ -54,7 +54,7 @@ import warnings
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from functools import lru_cache, partial
 
 import jax
@@ -1200,7 +1200,7 @@ class CompilationTracker:
             yield
 
 
-class ActivationType(str, Enum):
+class ActivationType(StrEnum):
     GELU = "gelu"
     RELU = "relu"
     SILU = "silu"
@@ -1238,7 +1238,7 @@ def flop_activation(activation_type: ActivationType, dim: int) -> float:
     return flops_per_element.get(activation_type, 1) * dim
 
 
-class AttnMaskType(str, Enum):
+class AttnMaskType(StrEnum):
     FULL = "ATTN_MASK_FULL"
     SLIDING = "ATTN_MASK_SLIDING"
     CHUNK = "ATTN_MASK_CHUNK"
@@ -1284,7 +1284,7 @@ class AttnMaskDetail:
     bricks: int | None = None
 
 
-class TaskType(str, Enum):
+class TaskType(StrEnum):
     CAUSAL_LM = "causal-language-model"
     VISION_LM = "vision-language-model"
     DIFFUSION_LM = "diffusion-language-model"

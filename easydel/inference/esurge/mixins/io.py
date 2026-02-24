@@ -306,6 +306,8 @@ class EngineIOMixin:
                 if self._max_request_outputs is not None:
                     with self._output_lock:
                         self._track_finished_output(request_id)
+            else:
+                self.abort_request(request_id)
 
     def chat(
         self,
@@ -640,6 +642,8 @@ class EngineIOMixin:
                     if n_samples > 1:
                         for sample_idx in range(n_samples):
                             self._request_events.pop(f"{request_id}-{sample_idx}", None)
+            else:
+                self.abort_request(request_id)
 
     def _wait_for_request(self, request_id: str) -> RequestOutput:
         """Wait for a request to complete and return the output.

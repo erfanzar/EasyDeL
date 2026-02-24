@@ -19,10 +19,10 @@ from __future__ import annotations
 import time
 import typing as tp
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 
-class ApiKeyRole(str, Enum):
+class ApiKeyRole(StrEnum):
     """Role-based access control levels for API keys."""
 
     ADMIN = "admin"  # Full access including key management
@@ -31,7 +31,7 @@ class ApiKeyRole(str, Enum):
     SERVICE = "service"  # Service account with specific permissions
 
 
-class ApiKeyStatus(str, Enum):
+class ApiKeyStatus(StrEnum):
     """API key lifecycle status."""
 
     ACTIVE = "active"

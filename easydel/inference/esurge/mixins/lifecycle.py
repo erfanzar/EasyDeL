@@ -59,8 +59,9 @@ class EngineLifecycleMixin:
             can raise the error immediately.
         """
         # Record the failure so waiting callers can raise immediately.
-        self._scheduler_exception = exc
-        self._scheduler_exception_tb = traceback.format_exc()
+        with self._request_lock:
+            self._scheduler_exception = exc
+            self._scheduler_exception_tb = traceback.format_exc()
 
         # Stop the scheduler and wake up any waiters (generate/stream/chat).
         self._scheduler_running = False
@@ -456,7 +457,7 @@ class EngineLifecycleMixin:
             self._active_requests.clear()
             self._request_outputs.clear()
             self._finished_request_ids.clear()
-        self._request_events.clear()
+            self._request_events.clear()
 
         self.scheduler = Scheduler.from_runner(
             self.runner,

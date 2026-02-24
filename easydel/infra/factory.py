@@ -72,7 +72,7 @@ See Also:
 
 import inspect
 import typing as tp
-from enum import Enum
+from enum import StrEnum
 
 from eformer.pytree import auto_pytree
 
@@ -81,7 +81,7 @@ from .base_module import EasyDeLBaseConfig, EasyDeLBaseModule
 T = tp.TypeVar("T")
 
 
-class ConfigType(str, Enum):
+class ConfigType(StrEnum):
     """Enumeration of configuration types that can be registered in the registry.
 
     This enum defines the categories under which configuration classes can be
@@ -106,7 +106,7 @@ class ConfigType(str, Enum):
     MODULE_CONFIG = "module-config"
 
 
-class TaskType(str, Enum):
+class TaskType(StrEnum):
     """Enumeration of supported model task types in the EasyDeL registry.
 
     This enum categorizes modules by their intended use case, enabling the

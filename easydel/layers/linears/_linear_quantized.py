@@ -381,9 +381,9 @@ def _reconcile_input_k_dim(
     Inside ``shard_map`` the local input slice may not match the local kernel's
     K extent.  This helper reconciles the mismatch:
 
-    * **column-parallel** – kernels keep full K and shard N. Reconstructing K
+    * **column-parallel** - kernels keep full K and shard N. Reconstructing K
       via ``all_gather`` can blow device memory, so it is opt-in.
-    * **row-parallel** – kernels shard K, so replicated inputs are sliced to the
+    * **row-parallel** - kernels shard K, so replicated inputs are sliced to the
       local K chunk via ``dynamic_slice_in_dim``.
     """
     if local_inputs.shape[-1] == local_kernel.shape[0]:

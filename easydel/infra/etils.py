@@ -73,10 +73,10 @@ Example:
 
 import argparse
 import typing as tp
-from enum import Enum
+from enum import StrEnum
 
 
-class EasyDeLOptimizers(str, Enum):
+class EasyDeLOptimizers(StrEnum):
     """Enumeration of available optimizers in the EasyDeL library.
 
     This enum provides a type-safe way to specify which optimizer to use during
@@ -123,7 +123,7 @@ class EasyDeLOptimizers(str, Enum):
     QUAD = "quad"
 
 
-class EasyDeLSchedulers(str, Enum):
+class EasyDeLSchedulers(StrEnum):
     """Enumeration of available learning rate schedulers in EasyDeL.
 
     Learning rate schedulers adjust the learning rate during training to improve
@@ -151,12 +151,12 @@ class EasyDeLSchedulers(str, Enum):
         ...     print("Learning rate scheduling is enabled")
     """
 
-    NONE = None
+    NONE = "none"
     LINEAR = "linear"
     COSINE = "cosine"
 
 
-class EasyDeLGradientCheckPointers(str, Enum):
+class EasyDeLGradientCheckPointers(StrEnum):
     """Enumeration of gradient checkpointing strategies available in EasyDeL.
 
     Gradient checkpointing (also known as activation checkpointing) is a technique
@@ -215,7 +215,7 @@ class EasyDeLGradientCheckPointers(str, Enum):
     SAVE_FROM_BOTH_POLICIES = "save_from_both_policies"
 
 
-class EasyDeLPlatforms(str, Enum):
+class EasyDeLPlatforms(StrEnum):
     """Enumeration of platforms or kernel execution backends supported by EasyDeL.
 
     This enum allows selecting optimized kernel implementations for different
@@ -248,7 +248,7 @@ class EasyDeLPlatforms(str, Enum):
     PALLAS = "pallas"
 
 
-class EasyDeLBackends(str, Enum):
+class EasyDeLBackends(StrEnum):
     """Enumeration of JAX backend types supported by EasyDeL.
 
     Specifies the target hardware device type for JAX computations. This enum

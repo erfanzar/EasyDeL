@@ -51,7 +51,7 @@ Example:
 import time
 import typing as tp
 import uuid
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -616,7 +616,7 @@ class ToolCall(OpenAIBaseModel):
     function: FunctionCall
 
 
-class FunctionCallFormat(str, Enum):
+class FunctionCallFormat(StrEnum):
     """Supported function call formats.
 
     Different models and frameworks use different formats for function calling.

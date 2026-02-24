@@ -178,7 +178,7 @@ class eSurgeAdapter(InferenceEngineAdapter):
         if stream:
             raise NotImplementedError()
         else:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, self.esurge.generate, prompts, sampling_params, None, False)
 
     def count_tokens(self, content: str) -> int:
@@ -1172,7 +1172,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         Returns:
             Formatted prompt string.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self.thread_pool, self._prepare_chat_input, request, esurge)
 
     async def chat_completions(self, request: ChatCompletionRequest, raw_request: Request) -> tp.Any:

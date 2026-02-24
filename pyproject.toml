@@ -91,6 +91,8 @@ profile = [
 	"tb-nightly>=2.21.0a20250820",
 	"xprof-nightly>=2.21.6a20250820",
 ]
+podutils = ["eopod==0.0.35"]
+
 [tool.black]
 line-length = 121
 target-version = ["py311"]

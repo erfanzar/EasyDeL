@@ -63,7 +63,7 @@ All other layers matching this pattern will be considered for quantization.
 """
 
 
-class QuantizationType(str, enum.Enum):
+class QuantizationType(enum.StrEnum):
     """Enumeration of supported quantization data types.
 
     This enum defines all quantization formats available in EasyDeL. Each format

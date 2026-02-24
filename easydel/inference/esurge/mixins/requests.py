@@ -316,7 +316,7 @@ class EngineRequestsMixin:
                 all_stop_ids = set(current_stop_ids)
                 sampling_params._all_stop_token_ids = all_stop_ids
             for eos_id in eos_token_ids:
-                if eos_id not in current_stop_ids:
+                if eos_id not in all_stop_ids:
                     sampling_params.stop_token_ids.append(eos_id)
                     all_stop_ids.add(eos_id)
 
