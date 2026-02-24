@@ -39,7 +39,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from http import HTTPStatus
 
 import uvicorn
@@ -67,7 +67,7 @@ TIMEOUT_KEEP_ALIVE = 5.0
 logger = get_logger("InferenceApiServer")
 
 
-class ServerStatus(str, Enum):
+class ServerStatus(StrEnum):
     """Server status enumeration.
 
     Represents the operational state of an inference server.

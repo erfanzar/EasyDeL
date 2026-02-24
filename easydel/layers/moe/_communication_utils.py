@@ -51,7 +51,7 @@ EP_AUTO_TRESHOLD = int(os.getenv("EP_AUTO_TRESHOLD", 0))
 GMM_PLATFORM = None
 
 
-class MoEMethods(str, enum.Enum):
+class MoEMethods(enum.StrEnum):
     """Enumeration of available MoE execution methods.
 
     This enum defines different strategies for executing Mixture of Experts layers,

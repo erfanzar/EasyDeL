@@ -139,6 +139,8 @@ class CachePage:
         Called when a request releases this page. When ref_cnt reaches 0,
         the page becomes eligible for eviction or reuse.
         """
+        if self.ref_cnt <= 0:
+            raise RuntimeError(f"ref_cnt underflow on page {self.page_id}")
         self.ref_cnt -= 1
 
     @property
@@ -160,7 +162,8 @@ class CachePage:
         Raises:
             AssertionError: If the page already has a hash assigned.
         """
-        assert self.page_hash is None, "The page already has a hash. This should not happen."
+        if self._page_hash is not None:
+            raise RuntimeError("The page already has a hash. This should not happen.")
         self._page_hash = page_hash
 
     def reset_hash(self) -> None:
@@ -431,7 +434,7 @@ def hash_page_tokens(
         The hash value of the page and the token ids in the page.
         The entire tuple is used as the hash key of the page.
     """
-    if not parent_page_hash:
+    if parent_page_hash is None:
         parent_page_hash = NONE_HASH
 
     curr_page_token_ids_tuple = tuple(curr_page_token_ids)

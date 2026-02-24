@@ -710,6 +710,9 @@ cuda = [
 lm-eval = [
     { name = "lm-eval" },
 ]
+podutils = [
+    { name = "eopod" },
+]
 profile = [
     { name = "tb-nightly" },
     { name = "xprof" },
@@ -739,6 +742,7 @@ requires-dist = [
     { name = "ejkernel", specifier = "==0.0.66" },
     { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.66" },
     { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.66" },
+    { name = "eopod", marker = "extra == 'podutils'", specifier = "==0.0.35" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "flax", specifier = "==0.12.3" },
     { name = "gcsfs", specifier = ">=2024.2,<2026" },
@@ -774,7 +778,7 @@ requires-dist = [
     { name = "xprof-nightly", marker = "extra == 'profile'", specifier = ">=2.21.6a20250820" },
     { name = "zstandard", specifier = ">=0.23.0" },
 ]
-provides-extras = ["torch", "cuda", "tpu", "tensorflow", "lm-eval", "profile"]
+provides-extras = ["torch", "cuda", "tpu", "tensorflow", "lm-eval", "profile", "podutils"]
 
 [[package]]
 name = "eformer"
@@ -845,6 +849,21 @@ tpu = [
 ]
 triton = [
     { name = "triton" },
+]
+
+[[package]]
+name = "eopod"
+version = "0.0.35"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "pyyaml" },
+    { name = "rich" },
+    { name = "tpu-info" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/01/7a/bcfc36f7023e1e9e2949d6bd3c1f984b2c887dd9bc307efc01c4b24c0d3e/eopod-0.0.35.tar.gz", hash = "sha256:52bce7c23a38042d6d59421079e1f5a545d7f82fa0b922d9842a816e0436f672", size = 21555, upload-time = "2026-02-12T16:44:05.085Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ac/40/a28f218bc0eb1b14b225c9e7eab4b46721d0e10990bcfdead995364bf2da/eopod-0.0.35-py3-none-any.whl", hash = "sha256:27d9042b82ef47c6595dd9cff8bd7a7c6d916fe7ed1342e1d8e706951e374c96", size = 23169, upload-time = "2026-02-12T16:44:03.809Z" },
 ]
 
 [[package]]
@@ -4342,6 +4361,20 @@ wheels = [
     { url = "https://download.pytorch.org/whl/cpu/torch-2.8.0%2Bcpu-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:af81283ac671f434b1b25c95ba295f270e72db1fad48831eb5e4748ff9840041" },
     { url = "https://download.pytorch.org/whl/cpu/torch-2.8.0%2Bcpu-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:a9dbb6f64f63258bc811e2c0c99640a81e5af93c531ad96e95c5ec777ea46dab" },
     { url = "https://download.pytorch.org/whl/cpu/torch-2.8.0%2Bcpu-cp313-cp313t-win_amd64.whl", hash = "sha256:6d93a7165419bc4b2b907e859ccab0dea5deeab261448ae9a5ec5431f14c0e64" },
+]
+
+[[package]]
+name = "tpu-info"
+version = "0.8.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "packaging" },
+    { name = "protobuf" },
+    { name = "rich" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a5/f7/4032cda671df0bf26f6b4f42168de7fb5983d74806a80d39cd8e4922dabc/tpu_info-0.8.1-py3-none-any.whl", hash = "sha256:9018668cceeb58aa1682563081f846355a2ff7d5b4e729a925233587f60681ee", size = 36915, upload-time = "2025-12-22T15:39:57.853Z" },
 ]
 
 [[package]]

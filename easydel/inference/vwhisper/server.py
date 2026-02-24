@@ -64,7 +64,7 @@ Note:
 import os
 import tempfile
 import typing as tp
-from enum import Enum
+from enum import StrEnum
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -201,7 +201,7 @@ class WhisperModel:
         )
 
 
-class ResponseFormat(str, Enum):
+class ResponseFormat(StrEnum):
     """Supported response formats for transcription API.
 
     This enum defines the output formats supported by the transcription
