@@ -29,15 +29,15 @@ for batch in result:
 
 ## Pipeline Stages
 
-| Stage | Description | Input | Output |
-|-------|-------------|-------|--------|
-| `source()` | Load data from files/Hub | - | dict[name, ShardedDataSource] |
-| `tokenize()` | Apply tokenization | dict[name, Source] | dict[name, TokenizedSource] |
-| `mix()` | Combine multiple datasets | dict[name, Source] | dict["mixed", MixedSource] |
-| `pack()` | Pack into fixed-length | dict[name, Source] | dict[name, PackedSource] |
-| `save()` | Save to disk | dict[name, Source] | dict[name, Source] |
-| `load()` | Create data loaders | dict[name, Source] | dict[name, AsyncDataLoader] |
-| `build()` | Get final iterator | dict[name, Loader] | Iterator |
+| Stage        | Description               | Input              | Output                        |
+| ------------ | ------------------------- | ------------------ | ----------------------------- |
+| `source()`   | Load data from files/Hub  | -                  | dict[name, ShardedDataSource] |
+| `tokenize()` | Apply tokenization        | dict[name, Source] | dict[name, TokenizedSource]   |
+| `mix()`      | Combine multiple datasets | dict[name, Source] | dict["mixed", MixedSource]    |
+| `pack()`     | Pack into fixed-length    | dict[name, Source] | dict[name, PackedSource]      |
+| `save()`     | Save to disk              | dict[name, Source] | dict[name, Source]            |
+| `load()`     | Create data loaders       | dict[name, Source] | dict[name, AsyncDataLoader]   |
+| `build()`    | Get final iterator        | dict[name, Loader] | Iterator                      |
 
 ## PipelineConfig
 
@@ -201,11 +201,11 @@ pipeline.pack(config)
 
 **Packing Strategies:**
 
-| Strategy | Description | Efficiency | Overhead |
-|----------|-------------|------------|----------|
-| `greedy` | Simple concatenation | Medium | Low |
-| `pool` | Multiple packers for better fit | High | Medium |
-| `first_fit` | Bin-packing algorithm | Highest | High |
+| Strategy    | Description                     | Efficiency | Overhead |
+| ----------- | ------------------------------- | ---------- | -------- |
+| `greedy`    | Simple concatenation            | Medium     | Low      |
+| `pool`      | Multiple packers for better fit | High       | Medium   |
+| `first_fit` | Bin-packing algorithm           | Highest    | High     |
 
 ### Save Stage
 

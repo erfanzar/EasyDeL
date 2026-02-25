@@ -1,3 +1,4 @@
+<!-- markdownlint-disable MD033 MD045 MD041 -->
 <div align="center">
  <div style="margin-bottom: 50px;">
   <a href="">
@@ -37,6 +38,7 @@ pip install eopod
 ```
 
 > **Troubleshooting**: If you encounter a "command not found" error, add your local bin to PATH:
+>
 > ```shell
 > echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 > source ~/.bashrc
@@ -48,16 +50,13 @@ Configure `eopod` with your TPU project details:
 eopod configure --project-id YOUR_PROJECT_ID --zone YOUR_ZONE --tpu-name YOUR_TPU_NAME
 ```
 
-### 2. Install Required Dependencies
+### 2. Install EasyDeL
 
-Install the necessary packages for model training and conversion:
+Install EasyDeL with TPU, PyTorch, and pod utilities on all TPU hosts:
 
 ```shell
-# Install required dependencies
-eopod run pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-# Install EasyDeL from the latest source
-eopod run pip install git+https://github.com/erfanzar/easydel
+eopod run pip uninstall torch-xla -y -q
+eopod run pip install -U "easydel[tpu,torch,podutils]"
 ```
 
 ### 3. Set Up Authentication
@@ -77,6 +76,7 @@ eopod run python -m wandb login YOUR_WANDB_TOKEN
 EasyDeL uses a single YAML-driven entrypoint for training and evaluation: `easydel.scripts.elarge`.
 
 > **Tip**: The unified runner has a small CLI and reads the full configuration from YAML:
+>
 > ```shell
 > eopod run python -m easydel.scripts.elarge --help
 > ```

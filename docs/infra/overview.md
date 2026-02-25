@@ -89,13 +89,13 @@ from easydel.infra import register_config, register_module
 
 EasyDeL uses a 5-dimensional sharding scheme:
 
-| Axis | Name | Purpose |
-|------|------|---------|
-| 0 | `dp` | Data Parallelism (batch splitting) |
-| 1 | `fsdp` | Fully Sharded Data Parallelism |
-| 2 | `ep` | Expert Parallelism (for MoE models) |
-| 3 | `tp` | Tensor Parallelism (layer sharding) |
-| 4 | `sp` | Sequence Parallelism |
+| Axis | Name   | Purpose                             |
+| ---- | ------ | ----------------------------------- |
+| 0    | `dp`   | Data Parallelism (batch splitting)  |
+| 1    | `fsdp` | Fully Sharded Data Parallelism      |
+| 2    | `ep`   | Expert Parallelism (for MoE models) |
+| 3    | `tp`   | Tensor Parallelism (layer sharding) |
+| 4    | `sp`   | Sequence Parallelism                |
 
 Default: `sharding_axis_dims=(1, -1, 1, 1, 1)` and `sharding_axis_names=("dp", "fsdp", "ep", "tp", "sp")`
 

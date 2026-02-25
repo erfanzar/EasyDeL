@@ -4,10 +4,10 @@ Streaming enables training on datasets too large to fit in memory. EasyData supp
 
 ## Why Streaming?
 
-| Approach | Memory Usage | Startup Time | Best For |
-|----------|--------------|--------------|----------|
-| Full Load | ~Dataset Size | Slow | Small datasets (<10GB) |
-| Streaming | ~Batch Size | Fast | Large datasets (>10GB) |
+| Approach  | Memory Usage  | Startup Time | Best For               |
+| --------- | ------------- | ------------ | ---------------------- |
+| Full Load | ~Dataset Size | Slow         | Small datasets (<10GB) |
+| Streaming | ~Batch Size   | Fast         | Large datasets (>10GB) |
 
 ## HuggingFace Hub Streaming
 
@@ -214,11 +214,11 @@ loader = AsyncDataLoader(
 
 ### Shuffle Buffer Considerations
 
-| Buffer Size | Memory | Randomization Quality |
-|-------------|--------|----------------------|
-| 1000 | ~10MB | Low (local patterns remain) |
-| 10000 | ~100MB | Medium (good for most cases) |
-| 100000 | ~1GB | High (nearly global shuffle) |
+| Buffer Size | Memory | Randomization Quality        |
+| ----------- | ------ | ---------------------------- |
+| 1000        | ~10MB  | Low (local patterns remain)  |
+| 10000       | ~100MB | Medium (good for most cases) |
+| 100000      | ~1GB   | High (nearly global shuffle) |
 
 ## Resumable Streaming
 

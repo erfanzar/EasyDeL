@@ -4,11 +4,9 @@ This folder contains a small toolchain to discover TPU availability by zone and 
 
 ## What is in this directory
 
-- `update-cluster.py`: Queries Google Cloud TPU APIs and generates one Ray cluster YAML per zone.
+- `generate-cluster-configs.py`: Queries Google Cloud TPU APIs and generates one Ray cluster YAML per zone.
 - `easydel-cluster-template.yaml`: Base template used by the generator.
-- `easydel-*.yaml`: Generated zone-specific cluster configs.
-
-Important: existing `easydel-*.yaml` files in this repo are snapshots generated for a specific project (`my-phd-research-o`). Regenerate them for your own project before running `ray up`.
+- `easydel-*.yaml`: Generated zone-specific cluster configs (local-only, gitignored).
 
 ## Prerequisites
 
@@ -23,7 +21,7 @@ Important: existing `easydel-*.yaml` files in this repo are snapshots generated 
 
 ## Google Cloud authentication (ADC)
 
-`update-cluster.py` uses `google.auth.default()`, so Application Default Credentials (ADC) must be configured.
+`generate-cluster-configs.py` uses `google.auth.default()`, so Application Default Credentials (ADC) must be configured.
 
 ### Local development (interactive)
 
@@ -47,12 +45,12 @@ Quick check:
 python -c "import google.auth; print(google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform']))"
 ```
 
-## Generate cluster YAMLs
+## Generate cluster YAMLs for your own project
 
 From repo root:
 
 ```bash
-uv run --python 3.13 python autoscale/update-cluster.py \
+uv run --python 3.13 python autoscale/generate-cluster-configs.py \
   --project-id YOUR_PROJECT_ID \
   --output-dir autoscale \
   --families v4 v5e v5p v6e \
@@ -68,14 +66,18 @@ Notes:
 
 ## Launch, inspect, and tear down a cluster
 
-Pick one generated config, for example `autoscale/easydel-us-central1-a.yaml`.
+Pick one generated config from your own project output:
 
 ```bash
-uv run --python 3.13 ray up autoscale/easydel-us-central1-a.yaml --no-config-cache
-uv run --python 3.13 ray attach autoscale/easydel-us-central1-a.yaml
-uv run --python 3.13 ray dashboard autoscale/easydel-us-central1-a.yaml --port 8265
-uv run --python 3.13 ray exec autoscale/easydel-us-central1-a.yaml "ray status"
-uv run --python 3.13 ray down autoscale/easydel-us-central1-a.yaml
+CLUSTER_YAML=autoscale/easydel-<YOUR_ZONE>.yaml
+```
+
+```bash
+uv run --python 3.13 ray up "$CLUSTER_YAML" --no-config-cache
+uv run --python 3.13 ray attach "$CLUSTER_YAML"
+uv run --python 3.13 ray dashboard "$CLUSTER_YAML" --port 8265
+uv run --python 3.13 ray exec "$CLUSTER_YAML" "ray status"
+uv run --python 3.13 ray down "$CLUSTER_YAML"
 ```
 
 ## Generated config behavior
@@ -85,7 +87,7 @@ uv run --python 3.13 ray down autoscale/easydel-us-central1-a.yaml
   - `tpu_base_<family>_<size>`
   - `tpu_slice_<family>_<size>`
 - All TPU worker node configs are preemptible (`schedulingConfig.preemptible: true`).
-- Runtime versions are selected per family in `update-cluster.py` (`GENERATION_CONFIGS`).
+- Runtime versions are selected per family in `generate-cluster-configs.py` (`GENERATION_CONFIGS`).
 - Head and worker setup attempt to read a Secret Manager secret named `HF_TOKEN`; failures are ignored (`|| true`).
 
 ## Common custom edits
@@ -110,7 +112,7 @@ gcloud auth application-default login
 Then rerun with explicit project:
 
 ```bash
-uv run --python 3.13 python autoscale/update-cluster.py --project-id YOUR_PROJECT_ID --print-summary
+uv run --python 3.13 python autoscale/generate-cluster-configs.py --project-id YOUR_PROJECT_ID --print-summary
 ```
 
 ### Wrong project used by Ray config

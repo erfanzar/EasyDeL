@@ -53,13 +53,13 @@ mixed = block_mixture_interleave(
 
 **Parameters:**
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `datasets` | dict | Dict mapping names to datasets: `{"code": code_ds, "text": text_ds}` |
-| `weights` | dict or None | Dict mapping names to weights (keys must match), None = equal |
-| `block_size` | int | Number of examples per mixing block |
-| `seed` | int | Random seed for shuffling within blocks |
-| `stop` | str | `"restart"` to loop, `"first_exhausted"` to stop |
+| Parameter    | Type         | Description                                                          |
+| ------------ | ------------ | -------------------------------------------------------------------- |
+| `datasets`   | dict         | Dict mapping names to datasets: `{"code": code_ds, "text": text_ds}` |
+| `weights`    | dict or None | Dict mapping names to weights (keys must match), None = equal        |
+| `block_size` | int          | Number of examples per mixing block                                  |
+| `seed`       | int          | Random seed for shuffling within blocks                              |
+| `stop`       | str          | `"restart"` to loop, `"first_exhausted"` to stop                     |
 
 **How it works:**
 
@@ -95,14 +95,14 @@ for example in mixed.open_shard(mixed.shard_names[0]):
 
 **Parameters:**
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `sources` | dict | Required | Name to ShardedDataSource mapping |
-| `weights` | dict | None | Static weights (None = equal) |
-| `block_size` | int | 1000 | Examples per mixing block |
-| `seed` | int | None | Random seed |
-| `stop_strategy` | str | "restart" | `"restart"`, `"first_exhausted"`, `"all_exhausted"` |
-| `weight_scheduler` | WeightScheduler | None | Dynamic weight scheduler |
+| Parameter          | Type            | Default   | Description                                         |
+| ------------------ | --------------- | --------- | --------------------------------------------------- |
+| `sources`          | dict            | Required  | Name to ShardedDataSource mapping                   |
+| `weights`          | dict            | None      | Static weights (None = equal)                       |
+| `block_size`       | int             | 1000      | Examples per mixing block                           |
+| `seed`             | int             | None      | Random seed                                         |
+| `stop_strategy`    | str             | "restart" | `"restart"`, `"first_exhausted"`, `"all_exhausted"` |
+| `weight_scheduler` | WeightScheduler | None      | Dynamic weight scheduler                            |
 
 ## Dynamic Weight Scheduling
 
@@ -140,11 +140,11 @@ mixed = MixedShardedSource(
 
 ### Interpolation Types
 
-| Type | Description |
-|------|-------------|
-| `"step"` | Jump to new weights at each schedule point |
+| Type       | Description                                  |
+| ---------- | -------------------------------------------- |
+| `"step"`   | Jump to new weights at each schedule point   |
 | `"linear"` | Linearly interpolate between schedule points |
-| `"cosine"` | Smooth cosine annealing between points |
+| `"cosine"` | Smooth cosine annealing between points       |
 
 ### Visualizing Schedule
 
@@ -167,11 +167,11 @@ print(scheduler.get_weights(30000))  # {"code": 0.65, "text": 0.35}
 
 ## Stop Strategies
 
-| Strategy | Behavior |
-|----------|----------|
-| `"restart"` | Loop exhausted datasets (infinite iteration) |
-| `"first_exhausted"` | Stop when any dataset is exhausted |
-| `"all_exhausted"` | Stop when all datasets are exhausted |
+| Strategy            | Behavior                                     |
+| ------------------- | -------------------------------------------- |
+| `"restart"`         | Loop exhausted datasets (infinite iteration) |
+| `"first_exhausted"` | Stop when any dataset is exhausted           |
+| `"all_exhausted"`   | Stop when all datasets are exhausted         |
 
 ```python
 # Infinite training - datasets loop

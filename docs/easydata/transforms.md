@@ -39,14 +39,14 @@ result = transform(example)
 
 **Parameters:**
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `tokenizer` | Any | Required | HuggingFace tokenizer with chat template |
-| `messages_field` | str | `"messages"` | Field containing messages list |
-| `output_field` | str | `"text"` | Field to store formatted text |
-| `tools` | list | None | Tools for function calling templates |
-| `convert_from_value_format` | bool | True | Auto-convert from/value to role/content |
-| `drop_messages` | bool | True | Remove original messages field |
+| Parameter                   | Type | Default      | Description                              |
+| --------------------------- | ---- | ------------ | ---------------------------------------- |
+| `tokenizer`                 | Any  | Required     | HuggingFace tokenizer with chat template |
+| `messages_field`            | str  | `"messages"` | Field containing messages list           |
+| `output_field`              | str  | `"text"`     | Field to store formatted text            |
+| `tools`                     | list | None         | Tools for function calling templates     |
+| `convert_from_value_format` | bool | True         | Auto-convert from/value to role/content  |
+| `drop_messages`             | bool | True         | Remove original messages field           |
 
 ### MaybeApplyChatTemplate
 

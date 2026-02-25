@@ -43,17 +43,17 @@ easydel/data/
 
 ## Quick Links
 
-| Guide | Description |
-|-------|-------------|
-| [Quickstart](quickstart.md) | Get started in 5 minutes |
-| [Data Sources](sources.md) | Loading from files, cloud, HuggingFace |
-| [Transforms](transforms.md) | Tokenization, chat templates, field ops |
-| [Dataset Mixing](mixing.md) | Combining multiple datasets |
-| [Pre-tokenization](pretokenization.md) | Offline tokenization and saving |
-| [Streaming](streaming.md) | Streaming from HF and GCS |
-| [Pipeline API](pipeline.md) | Fluent pipeline DSL reference |
-| [Caching](caching.md) | Multi-layer caching system |
-| [Trainer Integration](trainer_integration.md) | Using with EasyDeL trainers |
+| Guide                                         | Description                             |
+| --------------------------------------------- | --------------------------------------- |
+| [Quickstart](quickstart.md)                   | Get started in 5 minutes                |
+| [Data Sources](sources.md)                    | Loading from files, cloud, HuggingFace  |
+| [Transforms](transforms.md)                   | Tokenization, chat templates, field ops |
+| [Dataset Mixing](mixing.md)                   | Combining multiple datasets             |
+| [Pre-tokenization](pretokenization.md)        | Offline tokenization and saving         |
+| [Streaming](streaming.md)                     | Streaming from HF and GCS               |
+| [Pipeline API](pipeline.md)                   | Fluent pipeline DSL reference           |
+| [Caching](caching.md)                         | Multi-layer caching system              |
+| [Trainer Integration](trainer_integration.md) | Using with EasyDeL trainers             |
 
 ## Two APIs
 

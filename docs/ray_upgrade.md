@@ -16,9 +16,11 @@ This repo pins Ray and Docker build versions to keep TPU/GCP workflows stable. I
 Use `uv` to run the Ray CLI with the repo-pinned environment:
 
 ```bash
-uv run --python 3.13 ray up autoscale/easydel-us-central1-a.yaml --no-config-cache
-uv run --python 3.13 ray attach autoscale/easydel-us-central1-a.yaml
-uv run --python 3.13 ray down autoscale/easydel-us-central1-a.yaml
+uv run --python 3.13 python autoscale/generate-cluster-configs.py --project-id YOUR_PROJECT_ID --output-dir autoscale
+CLUSTER_YAML=autoscale/easydel-<YOUR_ZONE>.yaml
+uv run --python 3.13 ray up "$CLUSTER_YAML" --no-config-cache
+uv run --python 3.13 ray attach "$CLUSTER_YAML"
+uv run --python 3.13 ray down "$CLUSTER_YAML"
 ```
 
 ## Ray Changes That Commonly Affect TPU/GCP Users
@@ -68,4 +70,3 @@ Fix: run Ray commands via `uv run --python 3.13 ray ...` so versions match.
 ### “File … pack-*.pack is very large … consider adding to excludes”
 
 Add `.git/**` (and other large paths) to `runtime_env["excludes"]`, or avoid using `working_dir` uploads when you don’t need them.
-
