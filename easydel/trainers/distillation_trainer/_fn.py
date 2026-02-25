@@ -56,6 +56,7 @@ def distillation_loss(
     student_logits: Array,
     teacher_logits: Array,
     attention_mask: Array | None = None,
+    loss_mask: Array | None = None,
     labels: Array | None = None,
     use_hard_labels: bool = False,
     temperature: float = 4.0,
@@ -75,6 +76,9 @@ def distillation_loss(
             Shape: [batch_size, sequence_length, vocab_size]
         attention_mask (Array | None): Mask indicating valid tokens.
             1 for valid tokens, 0 for padding. Shape: [batch_size, sequence_length]
+        loss_mask (Array | None): Optional task-specific token mask used for loss
+            computation. When provided, this takes priority over attention_mask.
+            Useful for assistant-only objectives where prompt tokens are masked out.
         labels (Array | None): Ground truth labels for supervised loss.
             Shape: [batch_size, sequence_length]
         use_hard_labels (bool): Whether to include supervised loss with hard labels.
@@ -98,8 +102,18 @@ def distillation_loss(
     student_log_probs = jax.nn.log_softmax(student_logits / temperature, axis=-1)
     per_token_kl = -jnp.sum(teacher_probs * student_log_probs, axis=-1)
 
-    if attention_mask is not None:
+    if loss_mask is not None:
+        mask = loss_mask.astype(dtype)
+    elif attention_mask is not None:
         mask = attention_mask.astype(dtype)
+    else:
+        mask = None
+
+    if labels is not None:
+        valid_label_mask = (labels != -100).astype(dtype)
+        mask = valid_label_mask if mask is None else mask * valid_label_mask
+
+    if mask is not None:
         masked_kl = per_token_kl * mask
         normalizer = jnp.maximum(jnp.sum(mask), jnp.array(1.0, dtype=dtype))
         kl_loss = jnp.sum(masked_kl) / normalizer
@@ -109,15 +123,15 @@ def distillation_loss(
     total_loss = alpha * kl_loss
     ce_loss = jnp.array(0.0, dtype=dtype)
     if use_hard_labels and labels is not None:
-        ce_loss = optax.softmax_cross_entropy_with_integer_labels(student_logits, labels)
+        safe_labels = jnp.where(labels == -100, 0, labels)
+        per_token_ce = optax.softmax_cross_entropy_with_integer_labels(student_logits, safe_labels)
 
-        if attention_mask is not None:
-            mask = attention_mask.astype(dtype)
-            ce_loss = ce_loss * mask
+        if mask is not None:
+            ce_loss = per_token_ce * mask
             normalizer = jnp.maximum(jnp.sum(mask), jnp.array(1.0, dtype=dtype))
             ce_loss = jnp.sum(ce_loss) / normalizer
         else:
-            ce_loss = jnp.mean(ce_loss)
+            ce_loss = jnp.mean(per_token_ce)
 
         total_loss += (1 - alpha) * ce_loss
 
@@ -232,10 +246,12 @@ def distillation_step(
         teacher_logits = teacher_outputs.logits
         labels = minibatch.get("labels", None)
         attention_mask = minibatch.get("attention_mask", None)
+        completion_mask = minibatch.get("completion_mask", None)
         total_loss, loss_components = distillation_loss(
             student_logits=student_logits,
             teacher_logits=teacher_logits,
             attention_mask=attention_mask,
+            loss_mask=completion_mask,
             labels=labels,
             use_hard_labels=(labels is not None),
             temperature=temperature,
