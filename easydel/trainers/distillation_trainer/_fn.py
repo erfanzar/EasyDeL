@@ -42,7 +42,14 @@ from jaxtyping import Array
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
-from ..training_utils import make_assertions_and_get_sizes, minibatch_call, update_metrics, update_state_respectfully
+from ..training_utils import (
+    filter_kwargs_for_callable,
+    make_assertions_and_get_sizes,
+    minibatch_call,
+    sanitize_model_call_kwargs,
+    update_metrics,
+    update_state_respectfully,
+)
 
 
 def distillation_loss(
@@ -215,6 +222,9 @@ def distillation_step(
             call_kwargs["output_hidden_states"] = True
         if request_attentions:
             call_kwargs["output_attentions"] = True
+        call_kwargs = filter_kwargs_for_callable(module.__call__, call_kwargs)
+        call_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, call_kwargs)
+        call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         student_outputs = module(**call_kwargs)
         teacher_outputs = teacher_state.model(**call_kwargs)
         teacher_outputs = _stop_gradient_tree(teacher_outputs)

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
 import typing as tp
 import warnings
 
@@ -29,6 +30,41 @@ FAST_COMPILE = check_bool_flag("FAST_COMPILE")
 
 QuantizationMode = tp.Literal["fp8", "int8", "nf4"]
 DEFAULT_NF4_GROUP_SIZE = 64
+
+
+def filter_kwargs_for_callable(
+    callable_obj: tp.Callable[..., tp.Any],
+    kwargs: tp.Mapping[str, tp.Any],
+) -> dict[str, tp.Any]:
+    """Filter kwargs so only parameters accepted by ``callable_obj`` are forwarded.
+
+    This prevents runtime failures when dataset batches carry auxiliary metadata
+    fields (for example preference scores) that a model forward signature does
+    not accept.
+    """
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return dict(kwargs)
+
+    parameters = signature.parameters
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return dict(kwargs)
+
+    accepted_keys = set(parameters.keys())
+    return {key: value for key, value in kwargs.items() if key in accepted_keys}
+
+
+def sanitize_model_call_kwargs(kwargs: tp.Mapping[str, tp.Any]) -> dict[str, tp.Any]:
+    """Normalize model call kwargs to avoid known incompatible combinations.
+
+    Causal LM forwards generally accept either ``input_ids`` or ``inputs_embeds``,
+    but not both at the same time. Prefer token IDs when both are present.
+    """
+    normalized_kwargs = dict(kwargs)
+    if normalized_kwargs.get("input_ids", None) is not None and normalized_kwargs.get("inputs_embeds", None) is not None:
+        normalized_kwargs.pop("inputs_embeds", None)
+    return normalized_kwargs
 
 
 def _ste(x: jax.Array, q: jax.Array) -> jax.Array:
@@ -369,9 +405,21 @@ def minibatch_call(
     if num_accum_steps > 1:
 
         def reshape_to_minibatches(arr):
-            """Reshape the batch into minibatches for accumulation."""
-            batch_shape = (num_accum_steps, minibatch_size, *arr.shape[1:])
-            return jnp.reshape(arr, batch_shape)
+            """Reshape leaves for gradient accumulation.
+
+            Leaves that already carry the batch dimension are split into
+            `(num_accum_steps, minibatch_size, ...)`.
+            Scalar/global leaves are broadcast across accumulation steps so
+            every scanned minibatch receives the same value.
+            """
+            if not hasattr(arr, "shape"):
+                return arr
+            if arr.ndim == 0:
+                return jnp.broadcast_to(arr, (num_accum_steps,))
+            if arr.shape[0] == batch_size:
+                batch_shape = (num_accum_steps, minibatch_size, *arr.shape[1:])
+                return jnp.reshape(arr, batch_shape)
+            return jnp.broadcast_to(arr, (num_accum_steps, *arr.shape))
 
         batch = jax.tree_util.tree_map(reshape_to_minibatches, batch)
 

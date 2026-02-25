@@ -65,6 +65,7 @@ import typing as tp
 
 import jax
 from eformer import common_types
+from eformer.loggings import get_logger
 from ejkernel.modules import blocksparse_attention
 from ejkernel.types import MaskInfo
 from jax import numpy as jnp
@@ -87,6 +88,8 @@ from .vanilla_attention import VanillaAttn
 
 if tp.TYPE_CHECKING:
     pass
+
+logger = get_logger("EasyDeL-BlockSparseAttn")
 
 
 @OperationRegistry.register
@@ -182,17 +185,10 @@ class BlockSparseAttn(OperationImpl):
             An `AttentionOutput` object containing the attention outputs. Attention weights
             are not computed or returned by Splash Attention.
         """
-        query_length: int = query.shape[1]
 
-        # Check dimension compatibility for MLA-style attention
-        query_dim: int = query.shape[-1]
-        key_dim: int = key.shape[-1]
-        value_dim: int = value.shape[-1]
-        dims_incompatible: bool = not (query_dim == key_dim == value_dim)
-
-        if dims_incompatible:
-            vanilla_attn: VanillaAttn = VanillaAttn(self.metadata)
-            fallback_output_1: AttentionOutput = vanilla_attn(
+        def _run_vanilla_fallback() -> AttentionOutput:
+            vanilla_attn = VanillaAttn(self.metadata)
+            return vanilla_attn(
                 query=query,
                 key=key,
                 value=value,
@@ -205,7 +201,34 @@ class BlockSparseAttn(OperationImpl):
                 cache_metadata=cache_metadata,
                 **ignore,
             )
-            return fallback_output_1
+
+        def _extract_block_size(
+            cfg_obj: tp.Any,
+            *field_names: str,
+        ) -> int | None:
+            if cfg_obj is None:
+                return None
+            for field_name in field_names:
+                value = getattr(cfg_obj, field_name, None)
+                if value is None:
+                    continue
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+            return None
+
+        query_length: int = query.shape[1]
+        key_length: int = key.shape[1]
+
+        # Check dimension compatibility for MLA-style attention
+        query_dim: int = query.shape[-1]
+        key_dim: int = key.shape[-1]
+        value_dim: int = value.shape[-1]
+        dims_incompatible: bool = not (query_dim == key_dim == value_dim)
+
+        if dims_incompatible:
+            return _run_vanilla_fallback()
 
         # Check hardware-specific constraints for block sparse attention
         current_backend: str = jax.default_backend()
@@ -218,22 +241,55 @@ class BlockSparseAttn(OperationImpl):
         value_dim_mod_16: int = value_dim % 16
         gpu_constraints_failed: bool = query_dim_mod_16 != 0 or value_dim_mod_16 != 0
 
-        should_fallback: bool = (tpu_constraints_failed and is_tpu) or (gpu_constraints_failed and is_gpu)
+        blocksparse_cfg = self.metadata.get_operation_config("blocksparse")
+        base_cfg = self.metadata.base_config
+        q_block_size = _extract_block_size(
+            blocksparse_cfg,
+            "q_block_size",
+            "block_size_q",
+            "blocksize_q",
+        )
+        if q_block_size is None:
+            q_block_size = _extract_block_size(
+                base_cfg,
+                "q_block_size",
+                "block_size_q",
+                "blocksize_q",
+            )
+        k_block_size = _extract_block_size(
+            blocksparse_cfg,
+            "k_block_size",
+            "block_size_k",
+            "blocksize_k",
+        )
+        if k_block_size is None:
+            k_block_size = _extract_block_size(
+                base_cfg,
+                "k_block_size",
+                "block_size_k",
+                "blocksize_k",
+            )
+        invalid_q_block = q_block_size is not None and q_block_size > 0 and query_length % q_block_size != 0
+        invalid_k_block = k_block_size is not None and k_block_size > 0 and key_length % k_block_size != 0
+        blockshape_constraints_failed = invalid_q_block or invalid_k_block
+
+        should_fallback: bool = (
+            (tpu_constraints_failed and is_tpu)
+            or (gpu_constraints_failed and is_gpu)
+            or blockshape_constraints_failed
+        )
 
         if should_fallback:
-            vanilla_attn_2: VanillaAttn = VanillaAttn(self.metadata)
-            fallback_output_2: AttentionOutput = vanilla_attn_2(
-                query=query,
-                key=key,
-                value=value,
-                mask_info=mask_info,
-                causal=causal,
-                cache_metadata=cache_metadata,
-                softmax_scale=softmax_scale,
-                softmax_aux=softmax_aux,
-                **ignore,
-            )
-            return fallback_output_2
+            if blockshape_constraints_failed:
+                logger.warning(
+                    "Falling back to vanilla attention due to incompatible block-sparse shape "
+                    "(q_seq_len=%s, k_seq_len=%s, q_block_size=%s, k_block_size=%s).",
+                    query_length,
+                    key_length,
+                    q_block_size,
+                    k_block_size,
+                )
+            return _run_vanilla_fallback()
 
         head_dim: int = query.shape[-1]
         softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
@@ -285,29 +341,36 @@ class BlockSparseAttn(OperationImpl):
             preserved_indices=[0, 1],
         )
 
-        outputs_bhtd: Float[Array, "batch num_heads seq_len head_dim"] = blocksparse_attention(
-            query_transposed,
-            key_transposed,
-            value_transposed,
-            softmax_aux,
-            None,
-            mask_info=mask_info,
-            logits_soft_cap=logits_soft_cap,
-            softmax_scale=softmax_scale_computed,
-            sliding_window=sliding_window,
-            causal=causal_computed,
-            fused_backward=fused_backward,
-            cfg=self.metadata.get_operation_config("blocksparse"),
-            mesh=self.metadata.mesh,
-            out_specs=output_sharding,
-            in_specs=(
-                query_sharding,
-                key_sharding,
-                value_sharding,
-                softmax_aux_sharding,
-                PartitionSpec(None),
-            ),
-        )
+        try:
+            outputs_bhtd: Float[Array, "batch num_heads seq_len head_dim"] = blocksparse_attention(
+                query_transposed,
+                key_transposed,
+                value_transposed,
+                softmax_aux,
+                None,
+                mask_info=mask_info,
+                logits_soft_cap=logits_soft_cap,
+                softmax_scale=softmax_scale_computed,
+                sliding_window=sliding_window,
+                causal=causal_computed,
+                fused_backward=fused_backward,
+                cfg=self.metadata.get_operation_config("blocksparse"),
+                mesh=self.metadata.mesh,
+                out_specs=output_sharding,
+                in_specs=(
+                    query_sharding,
+                    key_sharding,
+                    value_sharding,
+                    softmax_aux_sharding,
+                    PartitionSpec(None),
+                ),
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            if "should divide" in msg and ("q_block_size" in msg or "k_block_size" in msg):
+                logger.warning("Falling back to vanilla attention after block-sparse validation error: %s", msg)
+                return _run_vanilla_fallback()
+            raise
 
         # Transpose back from BHTD to BTHD format
         outputs: Float[Array, "batch seq_len num_heads head_dim"] = outputs_bhtd.transpose(0, 2, 1, 3)

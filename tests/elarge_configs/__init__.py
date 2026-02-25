@@ -24,6 +24,7 @@ Configs:
     - dpo.yaml: Direct Preference Optimization
     - orpo.yaml: Odds Ratio Preference Optimization
     - distillation.yaml: Knowledge Distillation
+    - sdpo.yaml: Self-Distillation Policy Optimization
 
 Usage:
     # Dry-run validation of all configs

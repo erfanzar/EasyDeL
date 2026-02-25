@@ -40,7 +40,6 @@ trainer:
   max_length: 512
   max_prompt_length: 256
   max_completion_length: 256
-  max_sequence_length: 512
   save_steps: 1000
   save_total_limit: 1
   log_steps: 1
@@ -50,4 +49,3 @@ trainer:
 actions:
   - validate
   - train
-

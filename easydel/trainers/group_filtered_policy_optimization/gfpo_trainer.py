@@ -17,6 +17,7 @@ from __future__ import annotations
 import typing as tp
 
 import jax
+import numpy as np
 from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -363,7 +364,11 @@ class GFPOTrainer(GRPOTrainer):
                 )
             token_logps_time = token_logps_time_fn()
 
-            completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+            host_completion_ids = np.asarray(jax.device_get(completion_ids), dtype=np.int64)
+            completions_text = self.processing_class.batch_decode(
+                host_completion_ids.tolist(),
+                skip_special_tokens=True,
+            )
             is_conversational = self.train_is_conversational if is_train else self.eval_is_conversational
 
             if is_conversational:

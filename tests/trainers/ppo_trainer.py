@@ -70,7 +70,6 @@ def main() -> None:
             # require multiples of 128).
             "max_completion_length": 128,
             "max_length": 256,
-            "max_sequence_length": None,  # avoid deprecated `max_sequence_length` warnings
             "num_return_sequences": 2,
             "generation_num_return_sequences": 2,
             "use_esurge_generation": True,

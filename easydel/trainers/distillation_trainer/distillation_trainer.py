@@ -24,6 +24,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
 
+from ..prompt_transforms import SFTPreprocessTransform
 from ..trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_utils import resolve_straight_through_emulator
@@ -201,6 +202,28 @@ class DistillationTrainer(Trainer):
             mesh=mesh,
             checkpoint_manager=self.arguments.get_streaming_checkpointer(),
         )
+
+    def _get_preprocess_transform(self) -> SFTPreprocessTransform | None:
+        """Tokenize raw text examples for distillation when needed."""
+        if self._is_pretokenized():
+            return None
+        text_field = getattr(self.arguments, "dataset_text_field", None) or "text"
+        return SFTPreprocessTransform(
+            tokenizer=self.processing_class,
+            max_length=self.arguments.max_length,
+            text_field=text_field,
+            mask_prompt=False,
+        )
+
+    def _is_pretokenized(self) -> bool:
+        """Check whether the source already yields token IDs."""
+        if self._train_source is None:
+            return False
+        try:
+            sample = next(iter(self._train_source.open_shard(self._train_source.shard_names[0])))
+            return "input_ids" in sample
+        except (StopIteration, IndexError):
+            return False
 
     @property
     def _train_shared_fn_extra_args(self) -> tuple[tp.Any]:

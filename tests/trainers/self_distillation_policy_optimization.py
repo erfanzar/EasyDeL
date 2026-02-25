@@ -51,7 +51,7 @@ def main():
         overrides={
             "max_prompt_length": 1024,
             "max_completion_length": 1024,
-            "max_sequence_length": 2048,
+            "max_length": 2048,
             "num_return_sequences": 4,
             "max_feedback_length": 256,
             "distillation_type": "jsd",
@@ -88,7 +88,7 @@ def main_rich_feedback():
         overrides={
             "max_prompt_length": 1024,
             "max_completion_length": 1024,
-            "max_sequence_length": 2048,
+            "max_length": 2048,
             "num_return_sequences": 4,
             "max_feedback_length": 256,
             "distillation_type": "jsd",

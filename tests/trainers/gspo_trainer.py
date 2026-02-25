@@ -58,7 +58,7 @@ def main():
         overrides={
             "max_prompt_length": 512,
             "max_completion_length": 256,
-            "max_sequence_length": 768,
+            "max_length": 768,
             "num_train_epochs": 1,
             "total_batch_size": 2,
         },

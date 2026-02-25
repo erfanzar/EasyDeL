@@ -486,7 +486,9 @@ class SDPOTrainer(GRPOTrainer):
             generation_factor = max(generation_factor, 1)
             ridmask = prompt_mask.repeat(generation_factor, 0)
 
-            completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+            # HF tokenizers expect Python / NumPy token ids; JAX arrays can fail in Rust decode bindings.
+            completion_ids_for_decode = np.asarray(jax.device_get(completion_ids)).tolist()
+            completions_text = self.processing_class.batch_decode(completion_ids_for_decode, skip_special_tokens=True)
             is_conv = self.train_is_conversational if is_train else self.eval_is_conversational
             if is_conv:
                 completions = [[{"role": "assistant", "content": c}] for c in completions_text]

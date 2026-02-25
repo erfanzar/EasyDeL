@@ -116,6 +116,8 @@ def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_ma
             stats = device.memory_stats()
         except Exception:
             continue
+        if not isinstance(stats, dict):
+            continue
         limit = stats.get("bytes_limit") or stats.get("bytes_reservable_limit") or stats.get("bytes_total")
         used_in_use = stats.get("bytes_in_use", 0)
         used_reserved = stats.get("bytes_reserved", 0)
