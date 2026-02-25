@@ -77,4 +77,4 @@ jobs:
           cache-to: type=gha,mode=max
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
-            HARDWARE_TYPE=gpu
+            HARDWARE_TYPE=cuda
