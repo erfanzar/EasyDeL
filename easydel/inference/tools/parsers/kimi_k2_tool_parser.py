@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Tool parser implementation for Kimi K2 models.
+
+This module provides a tool parser specifically designed for Kimi K2 model outputs.
+Kimi K2 uses a hierarchical token-based structure with section and individual call
+delimiters, and encodes function identity in a namespace.function:id format.
+
+The parser handles nested token structures with distinct section-level and
+call-level markers, making it suitable for complex multi-tool scenarios.
+
+Example format:
+    <|tool_calls_section_begin|>
+    <|tool_call_begin|>namespace.function_name:123<|tool_call_argument_begin|>{"arg": "value"}<|tool_call_end|>
+    <|tool_calls_section_end|>
+"""
 
 from __future__ import annotations
 
@@ -36,27 +51,65 @@ logger = get_logger(__name__)
 
 @ToolParserManager.register_module(["kimi_k2"])
 class KimiK2ToolParser(ToolParser):
-    """
-    Tool parser for Kimi K2 models.
+    """Tool parser for Kimi K2 model outputs.
 
-    Handles tool calls with hierarchical token structure:
-    - Tool calls section: <|tool_calls_section_begin|> ... <|tool_calls_section_end|>
-    - Individual calls: <|tool_call_begin|> ... <|tool_call_end|>
-    - Arguments after <|tool_call_argument_begin|>
+    This parser handles the extraction of function/tool calls from Kimi K2 model
+    outputs. Kimi K2 uses a hierarchical token structure with section-level and
+    call-level delimiters, and encodes tool identity in namespace.function:id format.
 
-    Features:
-    - Hierarchical token-based parsing
-    - Tool ID extraction from format: namespace.function:id
-    - Streaming with state tracking for nested structures
-    - Regex patterns for structured extraction
+    The parser handles two levels of nesting:
+    - Section level: <|tool_calls_section_begin|> ... <|tool_calls_section_end|>
+    - Call level: <|tool_call_begin|> ... <|tool_call_end|>
 
-    Format:
-    <|tool_calls_section_begin|>
-    <|tool_call_begin|>namespace.function:123<|tool_call_argument_begin|>{...}<|tool_call_end|>
-    <|tool_calls_section_end|>
+    Tool IDs follow the format: namespace.function_name:numeric_id
+
+    Attributes:
+        current_tool_name_sent: Flag indicating if the current tool name has been sent.
+        prev_tool_call_arr: List of previously parsed tool call dictionaries.
+        current_tool_id: Index of the current tool being processed (-1 means none).
+        streamed_args_for_tool: List of argument strings streamed for each tool.
+        tool_calls_start_token: Section start marker.
+        tool_calls_end_token: Section end marker.
+        tool_call_start_token: Individual call start marker.
+        tool_call_end_token: Individual call end marker.
+        tool_call_regex: Regex for extracting complete tool calls.
+        stream_tool_call_portion_regex: Regex for partial tool call with arguments.
+        stream_tool_call_name_regex: Regex for tool name/id extraction.
+        tool_calls_start_token_id: Token ID for section start.
+        tool_calls_end_token_id: Token ID for section end.
+        tool_call_start_token_id: Token ID for call start.
+        tool_call_end_token_id: Token ID for call end.
+
+    Raises:
+        ValueError: If the tokenizer is not provided.
+        RuntimeError: If required tool call tokens are not in the tokenizer.
+
+    Example:
+        >>> parser = KimiK2ToolParser(tokenizer)
+        >>> result = parser.extract_tool_calls(model_output, request)
+        >>> if result.tools_called:
+        ...     for tool_call in result.tool_calls:
+        ...         print(f"Function: {tool_call.function.name}")
+        ...         print(f"ID: {tool_call.id}")
     """
 
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize the Kimi K2 tool parser.
+
+        Sets up token mappings and regex patterns for parsing Kimi K2 format
+        tool calls. Validates that required section and call delimiter tokens
+        exist in the tokenizer vocabulary.
+
+        Args:
+            tokenizer: A HuggingFace tokenizer instance used for token processing.
+                This tokenizer should be compatible with the Kimi K2 model and
+                must contain the section and call delimiter tokens.
+
+        Raises:
+            ValueError: If the tokenizer is not provided (is None or falsy).
+            RuntimeError: If the tokenizer doesn't contain required tool call
+                section start/end tokens.
+        """
         super().__init__(tokenizer)
         self.current_tool_name_sent: bool = False
         self.prev_tool_call_arr: list[dict] = []
@@ -95,6 +148,27 @@ class KimiK2ToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
+        """Extract tool calls from a complete model output.
+
+        Parses the model output to find and extract function calls in Kimi K2 format.
+        Extracts tool ID (in namespace.function:id format) and JSON arguments from
+        each tool call block.
+
+        Args:
+            model_output: The complete text output from the model to parse.
+            request: The chat completion request that triggered this response.
+
+        Returns:
+            ExtractedToolCallInformation: An object containing:
+                - tools_called: True if valid tool calls were found, False otherwise.
+                - tool_calls: List of ToolCall objects with id, function name, and arguments.
+                - content: Any text content before the tool calls section, or the full
+                    output if no valid tool calls were found.
+
+        Note:
+            The function name is extracted from the tool_call_id by parsing the
+            namespace.function:id format and extracting the function portion.
+        """
         if self.tool_calls_start_token not in model_output:
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
@@ -137,6 +211,38 @@ class KimiK2ToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        """Extract tool calls incrementally during streaming generation.
+
+        Processes tokens as they are generated to progressively extract and emit
+        tool call information. Handles the hierarchical Kimi K2 format with
+        section and call level delimiters.
+
+        The method tracks the number of tool call start/end tokens to determine
+        when new tools begin and when arguments should be streamed.
+
+        Args:
+            previous_text: The accumulated text from all previous tokens.
+            current_text: The complete text including the current delta.
+            delta_text: The new text added in this streaming step.
+            previous_token_ids: Token IDs from all previous generation steps.
+            current_token_ids: All token IDs including the current step.
+            delta_token_ids: The new token IDs added in this step.
+            request: The chat completion request for context.
+
+        Returns:
+            DeltaMessage or None: A delta message containing either:
+                - Content text if outside tool call section.
+                - Tool call name/id when a new tool starts.
+                - Argument deltas as JSON content is streamed.
+                - None if waiting for more tokens or parsing state is ambiguous.
+
+        Note:
+            The streaming logic handles several state transitions:
+            - Detecting entry into tool calls section
+            - Recognizing new tool calls by counting start/end tokens
+            - Incrementally streaming arguments as they appear
+            - Properly closing tool calls when end tokens are seen
+        """
         logger.debug("delta_text: %s", delta_text)
         logger.debug("delta_token_ids: %s", delta_token_ids)
         if self.tool_calls_start_token_id not in current_token_ids:

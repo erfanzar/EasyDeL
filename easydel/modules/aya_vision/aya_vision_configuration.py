@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 import typing
 
 from eformer.loggings import get_logger
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config, registry
@@ -114,16 +115,15 @@ class AyaVisionConfig(EasyDeLBaseConfig):
 
         super().__init__(**kwargs)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Retrieves the combined partition rules from the text and vision configurations.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
 
-        Args:
-            *args: Positional arguments passed to the underlying config partition rule methods.
-            **kwargs: Keyword arguments passed to the underlying config partition rule methods.
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-            Tuple: Combined partition rules from both text and vision models.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        tp = self.text_config.get_partition_rules(*args, **kwargs)
-        vp = self.vision_config.get_partition_rules(*args, **kwargs)
-        return tp + vp
+        return None

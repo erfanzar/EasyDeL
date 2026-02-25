@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""OLMo-3 Pythonic tool parser module.
+
+This module provides the Olmo3PythonicToolParser class for parsing tool calls
+in a Python function call syntax used by OLMo-3 models. The parser uses AST
+parsing to extract function names and keyword arguments.
+
+Example format parsed:
+    <function_calls>
+    func_name(arg1="value1", arg2=123)
+    another_func(param="test")
+    </function_calls>
+
+Or without tags:
+    func_name(arg1="value1")
+"""
 
 from __future__ import annotations
 
@@ -38,12 +54,41 @@ logger = get_logger(__name__)
 
 
 class _UnexpectedAstError(Exception):
+    """Exception raised when AST parsing encounters unexpected structure.
+
+    This exception is used internally to signal parsing failures when
+    the model output does not conform to the expected Python function
+    call syntax.
+    """
+
     pass
 
 
 @ToolParserManager.register_module("olmo3")
 class Olmo3PythonicToolParser(ToolParser):
-    """Parser for OLMo-3 models that emit newline-separated pythonic tool calls."""
+    """Parser for OLMo-3 models that emit newline-separated pythonic tool calls.
+
+    Uses Python's AST module to parse function call syntax, supporting
+    both complete and streaming extraction with argument diffing.
+
+    Features:
+        - AST-based parsing for reliable extraction
+        - Support for various literal types (str, int, float, bool, dict, list)
+        - Streaming with partial syntax completion
+        - Optional function_calls XML wrapper support
+        - Bracket balancing for streaming validation
+
+    Format:
+        <function_calls>
+        func_name(arg1="value", arg2=123)
+        </function_calls>
+
+        Or simply:
+        func_name(arg1="value")
+
+    Attributes:
+        TOOL_CALL_REGEX: Compiled regex for validating tool call format.
+    """
 
     TOOL_CALL_REGEX = re.compile(
         r"\[([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s)?\),\s*)*([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?\)\s*)+\]",
@@ -51,17 +96,47 @@ class Olmo3PythonicToolParser(ToolParser):
     )
 
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize the OLMo-3 Pythonic tool parser.
+
+        Args:
+            tokenizer: The tokenizer instance used for encoding/decoding tokens.
+        """
         super().__init__(tokenizer)
 
     @property
     def current_tool_index(self) -> int:
+        """Get the current tool index being processed.
+
+        Returns:
+            The index of the current tool (same as current_tool_id).
+        """
         return self.current_tool_id
 
     @current_tool_index.setter
     def current_tool_index(self, value: int) -> None:
+        """Set the current tool index.
+
+        Args:
+            value: The new tool index value.
+        """
         self.current_tool_id = value
 
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
+        """Extract tool calls from a complete model output.
+
+        Parses the model output using Python's AST module to extract
+        function calls with their keyword arguments.
+
+        Args:
+            model_output: The complete model output string to parse.
+            request: The chat completion request (unused but required by interface).
+
+        Returns:
+            ExtractedToolCallInformation containing:
+                - tools_called: Whether any tools were called
+                - tool_calls: List of parsed ToolCall objects
+                - content: Original output if no tools found, else None
+        """
         original_model_output = model_output
 
         match = re.search(r"<function_calls>(.*?)</function_calls>", model_output, re.DOTALL)
@@ -98,6 +173,26 @@ class Olmo3PythonicToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        """Extract tool calls from streaming model output.
+
+        Processes incremental output by completing partial Python syntax
+        and parsing with AST. Computes argument diffs for streaming.
+
+        Args:
+            previous_text: The accumulated text from previous chunks.
+            current_text: The current accumulated text including the new delta.
+            delta_text: The new text in this chunk.
+            previous_token_ids: Token IDs from previous chunks.
+            current_token_ids: All token IDs including the new chunk.
+            delta_token_ids: Token IDs for just the new chunk.
+            request: The chat completion request.
+
+        Returns:
+            A DeltaMessage containing either:
+                - content: Regular text if not a tool call
+                - tool_calls: Delta with function name or argument fragments
+                - None if more data needed or parsing incomplete
+        """
         # All tool calls start with <function_calls>, but streaming may see partial tags.
         if not current_text.startswith("<"):
             return DeltaMessage(content=delta_text)
@@ -164,6 +259,21 @@ class Olmo3PythonicToolParser(ToolParser):
 
 
 def _get_parameter_value(val: ast.expr) -> Any:
+    """Extract a Python value from an AST expression node.
+
+    Recursively processes AST nodes to extract literal values including
+    strings, numbers, booleans, None, dicts, and lists.
+
+    Args:
+        val: The AST expression node to extract value from.
+
+    Returns:
+        The Python value represented by the AST node.
+
+    Raises:
+        _UnexpectedAstError: If the node contains non-literal expressions
+            or dict keys that are not constants.
+    """
     if isinstance(val, ast.Constant):
         return val.value
     if isinstance(val, ast.Dict):
@@ -183,6 +293,20 @@ def _get_parameter_value(val: ast.expr) -> Any:
 
 
 def _handle_single_tool(call: ast.Call) -> ToolCall:
+    """Convert an AST Call node to a ToolCall object.
+
+    Extracts the function name and keyword arguments from an AST Call
+    node and creates a corresponding ToolCall.
+
+    Args:
+        call: The AST Call node representing a function call.
+
+    Returns:
+        A ToolCall object with the function name and JSON-encoded arguments.
+
+    Raises:
+        _UnexpectedAstError: If the call's func attribute is not a Name node.
+    """
     if not isinstance(call.func, ast.Name):
         raise _UnexpectedAstError("Invalid tool call name")
     function_name = call.func.id
@@ -195,6 +319,24 @@ def _handle_single_tool(call: ast.Call) -> ToolCall:
 
 
 def _make_valid_python(text: str) -> tuple[str, str] | None:
+    """Complete partial Python syntax to make it parseable.
+
+    Tracks bracket/quote balance and adds closing characters to make
+    the text valid Python syntax for AST parsing.
+
+    Args:
+        text: The partial Python text to complete.
+
+    Returns:
+        A tuple of (completed_text, added_characters) where:
+            - completed_text: The text with closing brackets/quotes added
+            - added_characters: The string of characters that were added
+        Returns None if the text cannot be completed (e.g., incomplete
+        assignment or key).
+
+    Raises:
+        _UnexpectedAstError: If brackets are mismatched.
+    """
     bracket_stack: list[str] = []
     for index, char in enumerate(text):
         if char in {"[", "(", "{"}:
@@ -258,6 +400,23 @@ def _make_valid_python(text: str) -> tuple[str, str] | None:
 def _compute_tool_delta(
     previously_sent_args: str, new_call: ToolCall, index: int, withheld_suffix: str
 ) -> DeltaToolCall | None:
+    """Compute the delta between previously sent and new tool call arguments.
+
+    Calculates what new argument content needs to be streamed based on
+    what was previously sent.
+
+    Args:
+        previously_sent_args: The argument string already sent for this tool.
+        new_call: The new ToolCall with complete arguments.
+        index: The index of this tool call.
+        withheld_suffix: Suffix to remove from new arguments (incomplete syntax).
+
+    Returns:
+        A DeltaToolCall containing:
+            - Full tool call info if this is the first delta
+            - Just the argument diff if arguments have grown
+            - None if there is no new content to send
+    """
     new_call_args = new_call.function.arguments
     if withheld_suffix:
         if new_call_args.endswith(withheld_suffix):

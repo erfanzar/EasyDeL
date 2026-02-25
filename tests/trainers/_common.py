@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -167,7 +167,6 @@ def make_config(
         "log_steps": 1,
         "learning_rate": 8e-6,
         "max_training_steps": MAX_TRAINING_STEP,
-        "max_sequence_length": MAX_TOTAL_LENGTH,
         "save_steps": 1_000,
         "save_total_limit": 1,
         "save_optimizer_state": True,

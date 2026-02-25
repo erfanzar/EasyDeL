@@ -37,19 +37,19 @@ services:
     networks:
       - easydel-network
 
-  # GPU-enabled development environment
-  easydel-gpu-dev:
+  # CUDA-enabled development environment
+  easydel-cuda-dev:
     build:
       context: .
       dockerfile: Dockerfile
       target: development
       args:
         <<: *build-args
-        HARDWARE_TYPE: gpu
+        HARDWARE_TYPE: cuda
       cache_from:
-        - type=registry,ref=ghcr.io/erfanzar/easydel:cache-gpu
-    image: easydel:dev-gpu
-    container_name: easydel-gpu-dev
+        - type=registry,ref=ghcr.io/erfanzar/easydel:cache-cuda
+    image: easydel:dev-cuda
+    container_name: easydel-cuda-dev
     runtime: nvidia
     environment:
       <<: *common-variables
@@ -137,18 +137,18 @@ services:
       - easydel-network
     restart: unless-stopped
 
-  # Production GPU service
-  easydel-gpu:
+  # Production CUDA service
+  easydel-cuda:
     build:
       context: .
       dockerfile: Dockerfile
       target: production
       args:
         <<: *build-args
-        HARDWARE_TYPE: gpu
+        HARDWARE_TYPE: cuda
         VERSION: ${VERSION:-latest}
-    image: easydel:prod-gpu
-    container_name: easydel-gpu
+    image: easydel:prod-cuda
+    container_name: easydel-cuda
     runtime: nvidia
     environment:
       <<: *common-variables

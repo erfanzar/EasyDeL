@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,22 +16,23 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
+from eformer.common_types import Replicated
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array
 
+from easydel.caching import RecurrentCache, RecurrentCacheView
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.caching import RecurrentCache, RecurrentCacheView
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm as FlaxMamba2RMSNorm
-from easydel.layers.operations import OperationMetadata
-from easydel.layers.operations.modules import SSM2Op
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers import RMSNorm as FlaxMamba2RMSNorm
+from easydel.modules._base import BaseCausalLMModule
+from easydel.operations import OperationMetadata
+from easydel.operations.kernels import SSM2Op
 
 from .mamba2_configuration import Mamba2Config as Mamba2Config
 
@@ -190,6 +191,13 @@ class Conv1D(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for convolution parameters."""
+        specs = {"kernel": Replicated}
+        if getattr(self, "use_bias", False) and hasattr(self, "bias"):
+            specs["bias"] = Replicated
+        return specs
 
     def __call__(self, x):
         """Apply 1D convolution.
@@ -434,6 +442,14 @@ class Mamba2Mixer(nn.Module):
             base_config=config,
         )
         self.ssm_op = SSM2Op(metadata)
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for state space parameters."""
+        return {
+            "A_log": Replicated,
+            "D": Replicated,
+            "dt_bias": Replicated,
+        }
 
     def __call__(
         self,
@@ -718,24 +734,26 @@ class Mamba2Model(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embeddings = nn.Embed(
+        self.embeddings = Embed(
             config.vocab_size,
             config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
-            Mamba2Block(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                Mamba2Block(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm_f = FlaxMamba2RMSNorm(
             config.hidden_size,
@@ -979,7 +997,7 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):
         """
         from eformer.escale import PartitionAxis
 
-        from easydel.layers.caching import RecurrentCache, RecurrentCacheConfig
+        from easydel.caching import RecurrentCache, RecurrentCacheConfig
 
         cache_params = kwargs.get("cache_params", None)
         cache_position = kwargs.get("cache_position", None)

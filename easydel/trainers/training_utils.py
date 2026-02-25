@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
 import typing as tp
+import warnings
 
 import jax
 from jax import lax
@@ -27,7 +29,42 @@ SCAN_TRAINER = check_bool_flag("SCAN_TRAINER")
 FAST_COMPILE = check_bool_flag("FAST_COMPILE")
 
 QuantizationMode = tp.Literal["fp8", "int8", "nf4"]
-DEFAULT_NF4_BLOCK_SIZE = 64
+DEFAULT_NF4_GROUP_SIZE = 64
+
+
+def filter_kwargs_for_callable(
+    callable_obj: tp.Callable[..., tp.Any],
+    kwargs: tp.Mapping[str, tp.Any],
+) -> dict[str, tp.Any]:
+    """Filter kwargs so only parameters accepted by ``callable_obj`` are forwarded.
+
+    This prevents runtime failures when dataset batches carry auxiliary metadata
+    fields (for example preference scores) that a model forward signature does
+    not accept.
+    """
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return dict(kwargs)
+
+    parameters = signature.parameters
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return dict(kwargs)
+
+    accepted_keys = set(parameters.keys())
+    return {key: value for key, value in kwargs.items() if key in accepted_keys}
+
+
+def sanitize_model_call_kwargs(kwargs: tp.Mapping[str, tp.Any]) -> dict[str, tp.Any]:
+    """Normalize model call kwargs to avoid known incompatible combinations.
+
+    Causal LM forwards generally accept either ``input_ids`` or ``inputs_embeds``,
+    but not both at the same time. Prefer token IDs when both are present.
+    """
+    normalized_kwargs = dict(kwargs)
+    if normalized_kwargs.get("input_ids", None) is not None and normalized_kwargs.get("inputs_embeds", None) is not None:
+        normalized_kwargs.pop("inputs_embeds", None)
+    return normalized_kwargs
 
 
 def _ste(x: jax.Array, q: jax.Array) -> jax.Array:
@@ -42,19 +79,19 @@ def _quantize_dequantize_int8(x: jax.Array) -> jax.Array:
     return dequantize_int8(q, scale)
 
 
-def _quantize_dequantize_nf4(x: jax.Array, *, block_size: int) -> jax.Array:
+def _quantize_dequantize_nf4(x: jax.Array, *, group_size: int) -> jax.Array:
     from eformer.ops.quantization.quantization_functions import dequantize_nf4, quantize_and_pack_nf4
 
-    if block_size <= 0:
-        raise ValueError(f"`quantization_block` must be > 0 for NF4, got {block_size}.")
+    if group_size <= 0:
+        raise ValueError(f"`quantization_group_size` must be > 0 for NF4, got {group_size}.")
     original_last_dim = x.shape[-1]
-    if original_last_dim % block_size != 0:
-        pad_amount = block_size - (original_last_dim % block_size)
+    if original_last_dim % group_size != 0:
+        pad_amount = group_size - (original_last_dim % group_size)
         pad_width = [(0, 0)] * (x.ndim - 1) + [(0, pad_amount)]
         x = jnp.pad(x, pad_width, mode="constant", constant_values=0)
 
-    packed, absmax = quantize_and_pack_nf4(x, block_size)
-    deq = dequantize_nf4(packed, absmax, block_size)
+    packed, absmax = quantize_and_pack_nf4(x, group_size)
+    deq = dequantize_nf4(packed, absmax, group_size)
     if deq.shape[-1] != original_last_dim:
         deq = deq[..., :original_last_dim]
     return deq
@@ -67,6 +104,8 @@ def _quantize_dequantize_fp8(x: jax.Array) -> jax.Array:
 
 def make_default_tensor_straight_through(
     quantization_mode: QuantizationMode,
+    quantization_group_size: int | None = None,
+    *,
     quantization_block: int | None = None,
 ) -> tp.Callable[[jax.Array], jax.Array]:
     """Create a per-tensor STE quantization function.
@@ -75,21 +114,37 @@ def make_default_tensor_straight_through(
     if the transform is identity (STE).
 
     Notes:
-        - `quantization_block` is used for NF4 block-wise quantization.
+        - `quantization_group_size` is used for NF4 group-wise quantization.
     """
+    if quantization_block is not None:
+        warnings.warn(
+            "`quantization_block` is deprecated; use `quantization_group_size` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        if quantization_group_size is None:
+            quantization_group_size = quantization_block
+        elif quantization_group_size != quantization_block:
+            warnings.warn(
+                f"Both `quantization_group_size` ({quantization_group_size}) and "
+                f"`quantization_block` ({quantization_block}) are set; ignoring `quantization_block`.",
+                FutureWarning,
+                stacklevel=2,
+            )
+
     try:
         from eformer.ops.quantization import straight_through as eformer_straight_through  # type: ignore
     except Exception:  # pragma: no cover
         eformer_straight_through = None
 
-    nf4_block_size: int | None = None
+    nf4_group_size: int | None = None
     if quantization_mode == "nf4":
-        nf4_block_size = DEFAULT_NF4_BLOCK_SIZE if quantization_block is None else int(quantization_block)
+        nf4_group_size = DEFAULT_NF4_GROUP_SIZE if quantization_group_size is None else int(quantization_group_size)
 
     def tensor_straight_through(x: jax.Array) -> jax.Array:
         if not jnp.issubdtype(x.dtype, jnp.floating):
             return x
-        if eformer_straight_through is not None and (quantization_mode != "nf4" or quantization_block is None):
+        if eformer_straight_through is not None and (quantization_mode != "nf4" or quantization_group_size is None):
             try:
                 q = eformer_straight_through(x, method=quantization_mode)
             except TypeError:
@@ -99,8 +154,9 @@ def make_default_tensor_straight_through(
         if quantization_mode == "int8":
             qdq = _quantize_dequantize_int8
         elif quantization_mode == "nf4":
+
             def qdq(y):
-                return _quantize_dequantize_nf4(y, block_size=tp.cast(int, nf4_block_size))
+                return _quantize_dequantize_nf4(y, group_size=tp.cast(int, nf4_group_size))
         elif quantization_mode == "fp8":
             qdq = _quantize_dequantize_fp8
         else:  # pragma: no cover
@@ -113,18 +169,35 @@ def make_default_tensor_straight_through(
 def resolve_straight_through_emulator(
     *,
     quantization_mode: QuantizationMode | None,
-    quantization_block: int | None,
+    quantization_group_size: int | None = None,
     tensor_straight_through: tp.Callable[[jax.Array], jax.Array] | None,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None,
+    quantization_block: int | None = None,
 ) -> tp.Callable[[tp.Any], tp.Any] | None:
     """Resolve the graphstate-level straight-through emulator callable.
 
     Priority:
       1) `straight_through_emulator` (user-provided)
       2) `tensor_straight_through` mapped over graphstate
-      3) default tensor STE built from (`quantization_mode`, `quantization_block`) and mapped over graphstate
+      3) default tensor STE built from (`quantization_mode`, `quantization_group_size`) and mapped over graphstate
       4) None (disabled)
     """
+    if quantization_block is not None:
+        warnings.warn(
+            "`quantization_block` is deprecated; use `quantization_group_size` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        if quantization_group_size is None:
+            quantization_group_size = quantization_block
+        elif quantization_group_size != quantization_block:
+            warnings.warn(
+                f"Both `quantization_group_size` ({quantization_group_size}) and "
+                f"`quantization_block` ({quantization_block}) are set; ignoring `quantization_block`.",
+                FutureWarning,
+                stacklevel=2,
+            )
+
     if straight_through_emulator is not None:
         return straight_through_emulator
 
@@ -134,7 +207,7 @@ def resolve_straight_through_emulator(
     if tensor_straight_through is None:
         tensor_straight_through = make_default_tensor_straight_through(
             quantization_mode,
-            quantization_block=quantization_block,
+            quantization_group_size=quantization_group_size,
         )
 
     def _default_emulator(graphstate: tp.Any) -> tp.Any:
@@ -326,14 +399,27 @@ def minibatch_call(
     num_accum_steps = batch_size // minibatch_size
     if num_accum_steps * minibatch_size != batch_size:
         raise ValueError(
-            f"Batch size ({batch_size}) must be divisible by minibatch_size ({minibatch_size}) for gradient accumulation."
+            f"Batch size ({batch_size}) must be divisible by minibatch_size "
+            f"({minibatch_size}) for gradient accumulation."
         )
     if num_accum_steps > 1:
 
         def reshape_to_minibatches(arr):
-            """Reshape the batch into minibatches for accumulation."""
-            batch_shape = (num_accum_steps, minibatch_size, *arr.shape[1:])
-            return jnp.reshape(arr, batch_shape)
+            """Reshape leaves for gradient accumulation.
+
+            Leaves that already carry the batch dimension are split into
+            `(num_accum_steps, minibatch_size, ...)`.
+            Scalar/global leaves are broadcast across accumulation steps so
+            every scanned minibatch receives the same value.
+            """
+            if not hasattr(arr, "shape"):
+                return arr
+            if arr.ndim == 0:
+                return jnp.broadcast_to(arr, (num_accum_steps,))
+            if arr.shape[0] == batch_size:
+                batch_shape = (num_accum_steps, minibatch_size, *arr.shape[1:])
+                return jnp.reshape(arr, batch_shape)
+            return jnp.broadcast_to(arr, (num_accum_steps, *arr.shape))
 
         batch = jax.tree_util.tree_map(reshape_to_minibatches, batch)
 

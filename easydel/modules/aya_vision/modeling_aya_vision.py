@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,12 +23,7 @@ from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import ModelOutput, VLMCausalLMOutput
-from easydel.infra.utils import ACT2FN
-from easydel.layers.base_modules import BaseVisionLanguageModule
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -36,7 +31,13 @@ from easydel.layers.caching import (
     TransformerCache,
     TransformerMetadata,
 )
-from easydel.layers.linear import RowParallelLinear
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import ModelOutput, VLMCausalLMOutput
+from easydel.infra.utils import ACT2FN
+from easydel.layers import RowParallelLinear
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseVisionLanguageModule
 from easydel.modules.auto.auto_modeling import AutoEasyDeLModel, AutoEasyDeLVisionModel
 
 from .aya_vision_configuration import AyaVisionConfig
@@ -141,7 +142,7 @@ class AyaVisionMultiModalProjector(nn.Module):
             config.get_text_config().hidden_size,
         )
 
-        self.layernorm = nn.LayerNorm(
+        self.layernorm = LayerNorm(
             config.vision_config.hidden_size * (config.downsample_factor**2),
             epsilon=config.adapter_layer_norm_eps,
             dtype=dtype,

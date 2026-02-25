@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,4 +15,11 @@
 """Decoders module for EasyDeL inference.
 
 This module previously contained SmartBytecodeDecoder which has been removed.
+The module is retained for backwards compatibility and potential future
+decoder implementations.
+
+Note:
+    This module currently does not export any classes or functions.
+    Future decoder implementations may be added here for specialized
+    text generation scenarios.
 """

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ from easydel.utils.compiling_utils import ejit
 from ..base_trainer import TrainerConfigureFunctionOutput
 from ..prompt_transforms import ORPOPreprocessTransform
 from ..trainer.trainer import Trainer
+from ..training_utils import resolve_straight_through_emulator
 from ..utils import DPODataCollatorWithPaddingGrain, DPODataCollatorWithPaddingTFDS
 from ._fn import concatenated_forward, orpo_step
 from .orpo_config import ORPOConfig
@@ -182,6 +183,12 @@ class ORPOTrainer(Trainer):
         """Configure and JIT-compile training and evaluation step functions."""
         mesh = self.model.mesh
         empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_group_size=self.arguments.quantization_group_size,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
 
         partial_concatenated_forward = partial(
             concatenated_forward,
@@ -203,9 +210,10 @@ class ORPOTrainer(Trainer):
             self.arguments.loss_config,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
+            straight_through_emulator,
         )
 
-        static_argnums = (2, 3, 4, 5, 6, 7, 8)
+        static_argnums = (2, 3, 4, 5, 6, 7, 8, 9)
 
         sharded_training_step_function = jit(
             orpo_step,
@@ -223,6 +231,7 @@ class ORPOTrainer(Trainer):
             self.arguments.loss_config,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
+            None,
         )
 
         sharded_evaluation_step_function = jit(

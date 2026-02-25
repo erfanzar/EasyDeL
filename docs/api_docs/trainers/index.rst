@@ -15,6 +15,7 @@ easydel.trainers package
    kto_trainer/index
    nash_md_trainer/index
    odds_ratio_preference_optimization_trainer/index
+   proximal_policy_optimization_trainer/index
    ray_scaler/index
    reward_trainer/index
    supervised_fine_tuning_trainer/index

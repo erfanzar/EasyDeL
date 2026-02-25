@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 from ejkernel.types import MaskInfo
 
-from easydel.layers.caching.transformer.cache import _expand_mask_kv_dim
+from easydel.caching.transformer.cache import _expand_mask_kv_dim
 
 
 def test_expand_mask_kv_dim_preserves_padding_mask():

@@ -35,7 +35,7 @@ EasyDeL is designed for maximum performance and flexibility on TPU hardware:
 Use the official setup script to install and configure everything needed on TRC (eopod, virtualenvs, EasyDeL TPU deps, Ray) and run a quick health check.
 
 ```shell
-bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/tpu_setup.sh)
+bash <(curl -sL https://raw.githubusercontent.com/erfanzar/EasyDeL/refs/heads/main/scripts/tpu_setup.sh)
 ```
 
 If `eopod` is not available right away after the script finishes, restart your shell (or `source ~/.bashrc` / `source ~/.zshrc`) to pick up the alias it adds.

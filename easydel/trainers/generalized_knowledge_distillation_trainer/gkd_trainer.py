@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@ from easydel.utils.traversals import deepcopy_model
 
 from ..supervised_fine_tuning_trainer import SFTTrainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
+from ..training_utils import resolve_straight_through_emulator
 from ..utils import DataCollatorForCompletionOnlyLM
 from ._fn import gkd_step
 from .gkd_config import GKDConfig
@@ -146,6 +147,12 @@ class GKDTrainer(SFTTrainer):
         """
         mesh = self.model.mesh
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_group_size=self.arguments.quantization_group_size,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
 
         self._train_shared_fn_static_args = (
             self.arguments.loss_config,
@@ -155,9 +162,10 @@ class GKDTrainer(SFTTrainer):
             True,
             float(self.arguments.beta),
             float(self.arguments.temperature),
+            straight_through_emulator,
         )
 
-        static_argnums = (3, 4, 5, 6, 7, 8, 9)
+        static_argnums = (3, 4, 5, 6, 7, 8, 9, 10)
         sharded_training_step_function = ejit(
             gkd_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
@@ -175,6 +183,7 @@ class GKDTrainer(SFTTrainer):
             False,
             float(self.arguments.beta),
             float(self.arguments.temperature),
+            None,
         )
 
         sharded_evaluation_step_function = ejit(

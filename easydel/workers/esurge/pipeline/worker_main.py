@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,77 +29,111 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
+from collections import OrderedDict
+from collections.abc import Iterable
 
 import zmq
 from transformers import AutoTokenizer
 
 
-class SimpleDecoder:
-    """Simple incremental decoder with UTF-8 error handling.
+class FastIncrementalDecoder:
+    """
+    Incrementally decode token streams while handling malformed UTF‑8
+    (the “�” replacement character).
 
-    This decoder handles incremental token decoding and buffers tokens that
-    may result in malformed UTF-8 sequences until they can be properly decoded.
+    Public API matches the original `SimpleDecoder.decode` method:
 
-    Args:
-        tokenizer: The tokenizer instance to use for decoding.
+        delta, new_buffered_tokens, has_buffer = decoder.decode(
+            tokens,
+            previous_text="",
+            buffered=decoder.buffered,   # mutable list that the decoder updates
+            skip_special_tokens=False,
+        )
     """
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, *, context_window: int = 4):
         self.tokenizer = tokenizer
+        self.context_window = max(0, int(context_window))
 
-    def _decode_tokens(self, tokens, *, skip_special_tokens: bool) -> str:
+    def _decode(self, token_ids: Iterable[int], *, skip_special_tokens: bool) -> str:
+        """Wrapper around `tokenizer.decode` that works with all HF versions."""
         try:
             return self.tokenizer.decode(
-                tokens,
+                list(token_ids),
                 skip_special_tokens=skip_special_tokens,
                 clean_up_tokenization_spaces=False,
             )
         except TypeError:
-            return self.tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
-        except Exception:
-            return ""
+            return self.tokenizer.decode(
+                list(token_ids),
+                skip_special_tokens=skip_special_tokens,
+            )
 
-    def decode(self, tokens, previous_text, buffered_tokens, *, skip_special_tokens: bool):
-        """Decode tokens incrementally, handling UTF-8 boundary issues.
+    def decode(
+        self,
+        new_tokens: Iterable[int],
+        previous_text: str,
+        buffered_tokens: list,
+        *,
+        skip_special_tokens: bool,
+        context_tokens: Iterable[int] | None = None,
+    ) -> tuple[str, list[int], bool]:
+        """
+        Incrementally decode `new_tokens` with optional token context.
 
-        Args:
-            tokens: New tokens to decode.
-            previous_text: Previously decoded text.
-            buffered_tokens: Tokens buffered from previous decode attempts.
+        * We decode ``context_tokens + buffered_tokens + new_tokens`` and
+          subtract the decoded context so tokenizers that need preceding
+          context (e.g., WordPiece) still stream correctly.
+        * If the resulting delta contains the UTF-8 replacement character
+          (“�”), we buffer the tokens and emit nothing to avoid corrupt output.
 
         Returns:
-            A tuple of (delta_text, new_buffered_tokens, has_buffer).
+            delta_text, buffered (the same list that was passed in), has_buffer
         """
-        merged = list(buffered_tokens) + list(tokens)
-        if not merged:
-            return "", [], False
+        del previous_text
+        context = list(context_tokens) if context_tokens else []
+        buffered = list(buffered_tokens)
+        fresh = list(new_tokens)
+        candidate = context + buffered + fresh
 
-        decoded = self._decode_tokens(merged, skip_special_tokens=skip_special_tokens)
+        if not candidate:
+            return "", buffered, bool(buffered)
 
-        if "�" not in decoded:
-            delta = decoded[len(previous_text) :] if previous_text and decoded.startswith(previous_text) else decoded
-            return delta, [], False
+        decoded_candidate = self._decode(candidate, skip_special_tokens=skip_special_tokens)
+        decoded_context = self._decode(context, skip_special_tokens=skip_special_tokens) if context else ""
 
-        # Backtrack by trimming tokens until no malformed chars.
-        remaining = list(merged)
-        new_buffer = []
-        decoded_text = previous_text
+        if decoded_context and not decoded_candidate.startswith(decoded_context):
+            # Fall back to no-context decode if prefix alignment fails.
+            decoded_context = ""
+            decoded_candidate = self._decode(buffered + fresh, skip_special_tokens=skip_special_tokens)
 
-        while remaining:
-            new_buffer.insert(0, remaining.pop())
-            candidate = self._decode_tokens(remaining, skip_special_tokens=skip_special_tokens)
-            if not candidate:
-                continue
-            if "�" not in candidate:
-                decoded_text = candidate
-                break
+        delta = decoded_candidate[len(decoded_context) :]
+        if "�" in delta:
+            return "", buffered + fresh, True
 
-        delta = (
-            decoded_text[len(previous_text) :]
-            if previous_text and decoded_text.startswith(previous_text)
-            else decoded_text
-        )
-        return delta, new_buffer, True
+        return delta, [], False
+
+
+def _compute_suffix_delta(current_text: str, previous_text: str) -> str:
+    """Return the append-only delta from ``previous_text`` to ``current_text``.
+
+    Falls back to suffix-prefix overlap when strict prefix alignment fails to
+    avoid replaying already streamed text.
+    """
+
+    if not current_text:
+        return ""
+    if not previous_text:
+        return current_text
+    if current_text.startswith(previous_text):
+        return current_text[len(previous_text) :]
+
+    max_overlap = min(len(previous_text), len(current_text))
+    for overlap in range(max_overlap, 0, -1):
+        if previous_text.endswith(current_text[:overlap]):
+            return current_text[overlap:]
+    return ""
 
 
 def _tokenizer_worker(endpoint: str, tokenizer_path: str, tokenizer_kwargs: dict) -> None:
@@ -161,25 +195,20 @@ def _detokenizer_worker(
     if "trust_remote_code" not in tokenizer_kwargs.keys():
         tokenizer_kwargs["trust_remote_code"] = os.getenv("ESURGE_WORKER_TRUST_REMOTE_CODE", "1") in ["1", "on", "yes"]
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_kwargs)
-    decoder = SimpleDecoder(tokenizer)
-    eos_token_id = tokenizer.eos_token_id
-    eos_ids = eos_token_id if isinstance(eos_token_id, (list, tuple, set)) else [eos_token_id]
-    eos_set = {int(tid) for tid in eos_ids if tid is not None}
-
-    def _strip_eos(tokens: list[int]) -> list[int]:
-        if not eos_set:
-            return list(tokens)
-        return [tok for tok in tokens if tok not in eos_set]
+    try:
+        context_window = int(os.getenv("ESURGE_DETOKENIZER_CONTEXT_WINDOW", "4"))
+    except ValueError:
+        context_window = 4
+    decoder = FastIncrementalDecoder(tokenizer, context_window=context_window)
 
     ctx = zmq.Context()
     socket = ctx.socket(zmq.REP)
     socket.bind(endpoint)
-    states: dict[str, dict] = {}
+    states: OrderedDict[str, dict] = OrderedDict()
 
-    def _evict():
+    def evict():
         while len(states) > max_states:
-            rid = next(iter(states))
-            states.pop(rid, None)
+            states.popitem(last=False)
 
     try:
         while True:
@@ -190,18 +219,36 @@ def _detokenizer_worker(
                 generated_tokens = message["tokens"]
                 finished = message["finished"]
                 skip_special = message["skip_special_tokens"]
-                generated_tokens = _strip_eos(generated_tokens)
 
-                state = states.setdefault(rid, {"last_index": 0, "previous_text": "", "buffered": []})
+                state = states.setdefault(rid, {"last_index": 0, "previous_text": "", "buffered": [], "prompt_context": None})
+                # Store prompt context on first encounter so callers
+                # only need to send it once.
+                if "prompt_context" not in state or state["prompt_context"] is None:
+                    pc = message.get("prompt_context")
+                    if pc:
+                        state["prompt_context"] = pc
+
                 last_idx = min(state["last_index"], len(generated_tokens))
                 new_tokens = generated_tokens[last_idx:]
-
+                detokstart = time.time()
                 if new_tokens or finished:
+                    buffered = state["buffered"]
+                    emitted_index = max(0, last_idx - len(buffered))
+                    if decoder.context_window:
+                        if emitted_index == 0 and state.get("prompt_context"):
+                            pc = state["prompt_context"]
+                            context_tokens = pc[-decoder.context_window:]
+                        else:
+                            context_start = max(0, emitted_index - decoder.context_window)
+                            context_tokens = generated_tokens[context_start:emitted_index]
+                    else:
+                        context_tokens = []
                     delta, new_buffered, _ = decoder.decode(
                         new_tokens,
                         state["previous_text"],
-                        state["buffered"],
+                        buffered,
                         skip_special_tokens=skip_special,
+                        context_tokens=context_tokens,
                     )
                     state["buffered"] = new_buffered
                     accumulated = state["previous_text"] + delta
@@ -217,12 +264,8 @@ def _detokenizer_worker(
                             )
                         except TypeError:
                             full_decoded = tokenizer.decode(generated_tokens, skip_special_tokens=skip_special)
-                        if full_decoded.startswith(accumulated):
-                            delta = full_decoded[len(accumulated) :]
-                            accumulated = full_decoded
-                        else:
-                            delta = full_decoded
-                            accumulated = full_decoded
+                        delta = _compute_suffix_delta(full_decoded, accumulated)
+                        accumulated = full_decoded
                         states.pop(rid, None)
                     result = {
                         "accumulated_text": accumulated,
@@ -237,8 +280,9 @@ def _detokenizer_worker(
                         "last_decoded_index": state["last_index"],
                         "finished": finished,
                     }
-
-                _evict()
+                detoktook = time.time() - detokstart
+                result["detoktook"] = detoktook
+                evict()
                 socket.send_pyobj({"status": "ok", "result": result})
             elif cmd == "drain":
                 states.clear()

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,31 +14,14 @@
 
 
 import typing
-import typing as tp
 
-from eformer.common_types import (
-    EMPTY,
-    MODE_TRAIN,
-    TP,
-    ColumnWise,
-    DynamicShardingAxes,
-    Replicated,
-    RowWise,
-)
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
-from easydel.layers.moe.utils import get_moe_partition_spec
-from easydel.layers.rotary_embedding import RopeConfig
+from easydel.layers import RopeConfig
 
 DEEPSEEK_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
-
-
-class ExpertTensorParallel(DynamicShardingAxes):
-    """Expert Tensor Parallelism (EPxTP) sharding axes."""
-
-    axes: tp.ClassVar = [TP, EMPTY, EMPTY]
-    mode: tp.ClassVar = MODE_TRAIN
 
 
 @register_config("deepseek_v3")
@@ -146,6 +129,16 @@ class DeepseekV3Config(EasyDeLBaseConfig):
 
     model_type = "deepseek_v3"
     keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
+
+    def __setattr__(self, key, value):
+        # DeepSeek HF remote code expects `rope_scaling=None` for default RoPE.
+        # Newer config normalization can materialize {"type":"default", ...},
+        # which triggers legacy branches that require `factor`.
+        if key == "rope_scaling" and isinstance(value, dict):
+            rope_type = value.get("rope_type", value.get("type"))
+            if rope_type in (None, "default"):
+                value = None
+        super().__setattr__(key, value)
 
     def __init__(
         self,
@@ -292,59 +285,24 @@ class DeepseekV3Config(EasyDeLBaseConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        rope_scaling_value = getattr(self, "rope_scaling", None)
+        if isinstance(rope_scaling_value, dict):
+            rope_type = rope_scaling_value.get("rope_type", rope_scaling_value.get("type"))
+            if rope_type in (None, "default"):
+                object.__setattr__(self, "rope_scaling", None)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/q_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/q_a_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/q_b_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/kv_a_proj_with_mqa/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/kv_b_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"self_attn/(q_a_layernorm|kv_a_layernorm)/kernel", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/gate/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
-            (r"mlp/gate/e_score_correction_bias", pmag.resolve(Replicated)),
-            (
-                r"mlp/experts/(gate_proj|up_proj)/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="column",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (
-                r"mlp/experts/down_proj/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="row",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (r"mlp/shared_experts/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/shared_experts/down_proj/kernel", pmag.resolve(RowWise)),
-            (r".*(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     def _get_rope_config(self) -> RopeConfig:
         """Get RoPE configuration from the instance attributes."""

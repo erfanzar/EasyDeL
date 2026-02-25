@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -84,7 +84,7 @@ MoE Configuration:
 Usage Example:
     ```python
     from easydel import KimiLinearForCausalLM, KimiLinearConfig
-    from easydel.layers.caching.hybrid import FULL_ATTENTION, KDA_LINEAR_ATTENTION
+    from easydel.caching.hybrid import FULL_ATTENTION, KDA_LINEAR_ATTENTION
     import jax.numpy as jnp
 
     # Configure hybrid attention + MoE model

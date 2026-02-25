@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,10 +14,56 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+
+
+def _patch_hf_glm4v_moe_router_logits_output() -> None:
+    """HF compatibility: expose missing router_logits on GLM4V-MoE model output."""
+    try:
+        from transformers.models.glm4v_moe import modeling_glm4v_moe as hf_glm4v_moe
+    except Exception:
+        return
+
+    output_cls = getattr(hf_glm4v_moe, "Glm4vMoeModelOutputWithPast", None)
+    if output_cls is not None and not hasattr(output_cls, "router_logits"):
+        output_cls.router_logits = None
+
+    causal_lm_cls = getattr(hf_glm4v_moe, "Glm4vMoeForConditionalGeneration", None)
+    if causal_lm_cls is not None and not hasattr(causal_lm_cls, "num_experts"):
+        causal_lm_cls.num_experts = property(lambda self: getattr(self.config.text_config, "n_routed_experts", 0))
+    if causal_lm_cls is not None and not hasattr(causal_lm_cls, "num_experts_per_tok"):
+        causal_lm_cls.num_experts_per_tok = property(
+            lambda self: getattr(self.config.text_config, "num_experts_per_tok", 0)
+        )
+
+    load_balancing_loss_func = getattr(hf_glm4v_moe, "load_balancing_loss_func", None)
+    if load_balancing_loss_func is not None and not getattr(
+        load_balancing_loss_func,
+        "_easydel_returns_tensor",
+        False,
+    ):
+        import torch
+
+        def _patched_load_balancing_loss_func(*args, **kwargs):
+            result = load_balancing_loss_func(*args, **kwargs)
+            if isinstance(result, int):
+                attention_mask = kwargs.get("attention_mask")
+                device = getattr(attention_mask, "device", None)
+                if device is None and args:
+                    gate_logits = args[0]
+                    if isinstance(gate_logits, tuple) and gate_logits:
+                        device = getattr(gate_logits[0], "device", None)
+                result = torch.tensor(float(result), device=device)
+            return result
+
+        _patched_load_balancing_loss_func._easydel_returns_tensor = True  # type: ignore[attr-defined]
+        hf_glm4v_moe.load_balancing_loss_func = _patched_load_balancing_loss_func
+
+
+_patch_hf_glm4v_moe_router_logits_output()
 
 
 def _rope_scaling_from_rope_parameters(
@@ -141,28 +187,18 @@ class Glm4vMoeVisionConfig(EasyDeLBaseConfig):
         self.intermediate_size = intermediate_size
         self.initializer_range = initializer_range
 
-    def get_partition_rules(self, *args, **kwargs):
-        pmag = self.partition_manager
-        return (
-            (r"patch_embed/proj/kernel", pmag.resolve(ColumnWise)),
-            (r"patch_embed/proj/bias", pmag.resolve(Replicated)),
-            (r"pos_embed/embedding", pmag.resolve(ColumnWise)),
-            (r"blocks/.*/attn/qkv/kernel", pmag.resolve(ColumnWise)),
-            (r"blocks/.*/attn/qkv/bias", pmag.resolve(Replicated)),
-            (r"blocks/.*/attn/proj/kernel", pmag.resolve(RowWise)),
-            (r"blocks/.*/attn/proj/bias", pmag.resolve(Replicated)),
-            (r"blocks/.*/mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"blocks/.*/mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"blocks/.*/norm(1|2)/scale", pmag.resolve(Replicated)),
-            (r"(post_conv_layernorm|post_layernorm)/scale", pmag.resolve(Replicated)),
-            (r"downsample/kernel", pmag.resolve(ColumnWise)),
-            (r"downsample/bias", pmag.resolve(Replicated)),
-            (r"merger/proj/kernel", pmag.resolve(ColumnWise)),
-            (r"merger/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"merger/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"merger/norm/.*", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
+        """
+        return None
 
 
 @register_config("glm4v_moe_text")
@@ -308,25 +344,18 @@ class Glm4vMoeTextConfig(EasyDeLBaseConfig):
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
-    def get_partition_rules(self, *args, **kwargs):
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"layers/.*/self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"layers/.*/self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"layers/.*/self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"layers/.*/mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"layers/.*/mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"layers/.*/mlp/experts/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"layers/.*/mlp/experts/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"layers/.*/mlp/gate/kernel", pmag.resolve(ColumnWise)),
-            (r"layers/.*/mlp/gate/e_score_correction_bias", pmag.resolve(Replicated)),
-            (r"layers/.*/mlp/shared_experts/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"layers/.*/mlp/shared_experts/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"layers/.*/(input_layernorm|post_attention_layernorm)/scale", pmag.resolve(Replicated)),
-            (r"norm/scale", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
+        """
+        return None
 
 
 @register_config("glm4v_moe")
@@ -425,35 +454,18 @@ class Glm4vMoeConfig(EasyDeLBaseConfig):
     def get_vision_config(self) -> Glm4vMoeVisionConfig:
         return self.vision_config
 
-    def get_partition_rules(self, *args, **kwargs):
-        pmag = self.partition_manager
-        return (
-            (r"model/visual/patch_embed/proj/kernel", pmag.resolve(ColumnWise)),
-            (r"model/visual/patch_embed/proj/bias", pmag.resolve(Replicated)),
-            (r"model/visual/pos_embed/embedding", pmag.resolve(ColumnWise)),
-            (r"model/visual/blocks/.*/attn/qkv/kernel", pmag.resolve(ColumnWise)),
-            (r"model/visual/blocks/.*/attn/proj/kernel", pmag.resolve(RowWise)),
-            (r"model/visual/blocks/.*/mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"model/visual/blocks/.*/mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"model/visual/downsample/kernel", pmag.resolve(ColumnWise)),
-            (r"model/visual/merger/proj/kernel", pmag.resolve(ColumnWise)),
-            (r"model/visual/merger/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"model/visual/merger/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"model/language_model/embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"model/language_model/layers/.*/self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"model/language_model/layers/.*/self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"model/language_model/layers/.*/mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"model/language_model/layers/.*/mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"model/language_model/layers/.*/mlp/experts/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"model/language_model/layers/.*/mlp/experts/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"model/language_model/layers/.*/mlp/gate/kernel", pmag.resolve(ColumnWise)),
-            (r"model/language_model/layers/.*/mlp/shared_experts/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"model/language_model/layers/.*/mlp/shared_experts/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*(norm|layernorm).*", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
+        """
+        return None
 
 
 __all__ = ["Glm4vMoeConfig", "Glm4vMoeTextConfig", "Glm4vMoeVisionConfig"]

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""DeepSeek V3.2 tool parser module for parsing tool calls from DeepSeek V3.2 model outputs.
+
+This module provides the DeepSeekV32ToolParser class which handles the DSML
+(DeepSeek Markup Language) format used by DeepSeek V3.2 models. This format
+uses XML-like tags with explicit parameter typing.
+
+Example tool call format:
+    <｜DSML｜function_calls>
+    <｜DSML｜invoke name="get_weather">
+    <｜DSML｜parameter name="location" string="true">Beijing</｜DSML｜parameter>
+    <｜DSML｜parameter name="date" string="true">2024-01-16</｜DSML｜parameter>
+    </｜DSML｜invoke>
+    </｜DSML｜function_calls>
+"""
 
 from __future__ import annotations
 
@@ -39,19 +54,70 @@ logger = get_logger(__name__)
 
 @ToolParserManager.register_module("deepseek_v32")
 class DeepSeekV32ToolParser(ToolParser):
-    """
-    Example tool call content:
+    """Tool parser for DeepSeek V3.2 models using DSML format.
 
-    <｜DSML｜function_calls>
-    <｜DSML｜invoke name="get_weather">
-    <｜DSML｜parameter name="location" string="true">杭州</｜DSML｜parameter>
-    <｜DSML｜parameter name="date" string="true">2024-01-16</｜DSML｜parameter>
-    </｜DSML｜invoke>
-    ...
-    </｜DSML｜function_calls>
+    This parser handles the DSML (DeepSeek Markup Language) tool call format
+    which uses XML-like tags with explicit parameter typing. The format provides
+    structured representation of function calls with typed parameters.
+
+    Format structure:
+        <｜DSML｜function_calls>
+        <｜DSML｜invoke name="function_name">
+        <｜DSML｜parameter name="param" string="true">value</｜DSML｜parameter>
+        </｜DSML｜invoke>
+        </｜DSML｜function_calls>
+
+    Attributes:
+        prev_tool_call_arr (list[dict]): Previous tool calls for streaming state.
+        dsml_token (str): Base DSML token identifier.
+        dsml_start_check (str): Start pattern for DSML detection.
+        tool_call_start_token (str): Token marking function_calls start.
+        tool_call_end_token (str): Token marking function_calls end.
+        invoke_start_prefix (str): Prefix for invoke tag start.
+        invoke_end_token (str): Token marking invoke end.
+        parameter_prefix (str): Prefix for parameter tag.
+        parameter_end_token (str): Token marking parameter end.
+        current_tool_name_sent (bool): Whether current tool name was sent.
+        current_tool_id (str | None): Current tool call ID.
+        streamed_args_for_tool (list[str]): Streamed arguments per tool.
+        is_tool_call_started (bool): Whether tool call parsing has started.
+        failed_count (int): Count of failed parsing attempts.
+        current_tool_index (int): Index of current tool being processed.
+        invoke_index (int): Index of current invoke block.
+        header_sent (bool): Whether the tool header was sent.
+        current_function_name (str | None): Name of current function.
+        current_param_name (str | None): Name of current parameter.
+        current_param_value (str): Value of current parameter.
+        param_count (int): Count of parameters processed.
+        in_param (bool): Whether currently inside a parameter tag.
+        in_function (bool): Whether currently inside a function invoke.
+        json_started (bool): Whether JSON output has started.
+        json_closed (bool): Whether JSON output has closed.
+        accumulated_params (dict): Accumulated parameter key-value pairs.
+        streaming_request (ChatCompletionRequest | None): Current streaming request.
+        tool_call_complete_regex (re.Pattern): Regex for complete tool calls.
+        invoke_complete_regex (re.Pattern): Regex for complete invoke blocks.
+        parameter_complete_regex (re.Pattern): Regex for complete parameters.
+
+    Example:
+        >>> tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/deepseek-v3.2")
+        >>> parser = DeepSeekV32ToolParser(tokenizer)
+        >>> result = parser.extract_tool_calls(model_output, request)
     """
 
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize the DeepSeek V3.2 tool parser.
+
+        Sets up the DSML token markers, regex patterns, and streaming state
+        variables required for parsing DeepSeek V3.2 tool call format.
+
+        Args:
+            tokenizer: The tokenizer associated with the DeepSeek V3.2 model.
+                Must be a valid tokenizer instance.
+
+        Raises:
+            ValueError: If the tokenizer is not provided.
+        """
         super().__init__(tokenizer)
 
         self.prev_tool_call_arr: list[dict] = []
@@ -104,11 +170,23 @@ class DeepSeekV32ToolParser(ToolParser):
             raise ValueError("The model tokenizer must be passed to the ToolParser constructor during construction.")
 
     def _generate_tool_call_id(self) -> str:
-        """Generate a unique tool call ID."""
+        """Generate a unique tool call ID.
+
+        Creates a unique identifier for a tool call using UUID4,
+        formatted with a 'call_' prefix and 24-character hex suffix.
+
+        Returns:
+            str: A unique tool call ID in format 'call_<24-char-hex>'.
+        """
         return f"call_{uuid.uuid4().hex[:24]}"
 
-    def _reset_streaming_state(self):
-        """Reset all streaming state."""
+    def _reset_streaming_state(self) -> None:
+        """Reset all streaming state variables.
+
+        Clears all internal state used for tracking streaming tool call
+        parsing progress. Should be called at the start of each new
+        streaming session.
+        """
         self.current_tool_index = 0
         self.invoke_index = 0
         self.is_tool_call_started = False
@@ -127,13 +205,50 @@ class DeepSeekV32ToolParser(ToolParser):
         self.prev_tool_call_arr.clear()
 
     def _parse_invoke_params(self, invoke_str: str) -> dict | None:
+        """Parse parameters from an invoke block string.
+
+        Extracts all parameter name-value pairs from the content of an
+        invoke block using regex pattern matching.
+
+        Args:
+            invoke_str: The string content inside an invoke block,
+                containing parameter tags.
+
+        Returns:
+            dict | None: Dictionary mapping parameter names to their
+                string values, or None if parsing fails.
+        """
         param_dict: dict[str, str] = {}
         for param_name, param_val in self.parameter_complete_regex.findall(invoke_str):
             param_dict[param_name] = param_val
         return param_dict
 
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
-        """Extract tool calls from complete model output (non-streaming)."""
+        """Extract tool calls from complete model output (non-streaming).
+
+        Parses the DSML format to extract function invocations and their
+        parameters from the model's response. Converts the XML-like
+        structure into standard tool call format.
+
+        Args:
+            model_output: Complete text output from the model containing
+                potential tool calls in DSML format.
+            request: Original chat completion request with tool definitions.
+                Used for context but not directly accessed in this method.
+
+        Returns:
+            ExtractedToolCallInformation: Contains:
+                - tools_called (bool): True if any tools were found.
+                - tool_calls (list[ToolCall]): List of parsed tool calls
+                  with function names and JSON-serialized arguments.
+                - content (str | None): Text before tool calls, or None.
+
+        Example:
+            >>> output = '<｜DSML｜function_calls><｜DSML｜invoke name="test"><｜DSML｜parameter name="x" string="true">1</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>'
+            >>> result = parser.extract_tool_calls(output, request)
+            >>> result.tools_called
+            True
+        """
         if self.tool_call_start_token not in model_output:
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
@@ -165,7 +280,18 @@ class DeepSeekV32ToolParser(ToolParser):
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
     def _extract_name(self, name_str: str) -> str:
-        """Extract name from quoted string."""
+        """Extract name from a potentially quoted string.
+
+        Removes surrounding quotes (single or double) from a string
+        if present, returning the unquoted content.
+
+        Args:
+            name_str: The string potentially wrapped in quotes.
+
+        Returns:
+            str: The string with surrounding quotes removed, or
+                the original string if no quotes present.
+        """
         name_str = name_str.strip()
         if (name_str.startswith('"') and name_str.endswith('"')) or (
             name_str.startswith("'") and name_str.endswith("'")
@@ -174,13 +300,37 @@ class DeepSeekV32ToolParser(ToolParser):
         return name_str
 
     def _extract_param_name(self, input_str: str) -> str:
-        """Extract param name."""
+        """Extract parameter name from an attribute string.
+
+        Finds the parameter name within a string that may contain
+        attribute definitions like 'name="param_name"'.
+
+        Args:
+            input_str: String containing parameter name definition.
+
+        Returns:
+            str: The extracted parameter name, or the original
+                string if extraction fails.
+        """
         start = input_str.find('"') + 1
         end = input_str.find('"', start)
         return input_str[start:end] if start > 0 and end > start else input_str
 
     def _convert_param_value(self, value: str, param_type: str) -> Any:
-        """Convert parameter value to the correct type."""
+        """Convert parameter value to the correct Python type.
+
+        Converts a string value to the appropriate type based on the
+        parameter type specification from the tool definition.
+
+        Args:
+            value: The string value to convert.
+            param_type: The target type (e.g., "string", "integer",
+                "number", "boolean", "object", "array").
+
+        Returns:
+            Any: The converted value in the appropriate Python type.
+                Falls back to string if conversion fails.
+        """
         if value.lower() == "null":
             return None
 
@@ -221,7 +371,40 @@ class DeepSeekV32ToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
-        """Extract tool calls from streaming model output."""
+        """Extract tool calls from streaming model output.
+
+        Handles incremental parsing of DSML format during streaming
+        generation. Maintains extensive state to track position within
+        the structured DSML format and emit incremental updates.
+
+        The method processes:
+        - Detection of DSML block start
+        - Function invoke header parsing
+        - Parameter extraction and type conversion
+        - JSON fragment streaming
+        - Tool call completion
+
+        Args:
+            previous_text: Text generated up to the previous chunk.
+            current_text: All text generated so far including current chunk.
+            delta_text: New text added in this chunk only.
+            previous_token_ids: Token IDs up to previous chunk (unused).
+            current_token_ids: All token IDs so far (unused).
+            delta_token_ids: New token IDs in this chunk.
+            request: Original chat completion request with tool definitions.
+                Used for parameter type lookups.
+
+        Returns:
+            DeltaMessage | None: A delta message containing:
+                - Tool call with function name on first detection
+                - JSON argument fragments as parameters are parsed
+                - Content text if outside tool call region
+                - None if more data is needed
+
+        Note:
+            This method maintains extensive internal state and should
+            only be called sequentially with proper text accumulation.
+        """
 
         if not previous_text:
             self._reset_streaming_state()

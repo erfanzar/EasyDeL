@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import os
 import typing as tp
-from enum import Enum
+from enum import StrEnum
 
 from eformer.paths import ePath, ePathLike
 from eformer.pytree import auto_pytree, field
@@ -32,7 +32,7 @@ from eformer.pytree import auto_pytree, field
 from easydel.utils.helpers import get_cache_dir
 
 
-class DatasetType(str, Enum):
+class DatasetType(StrEnum):
     """Enumeration of supported dataset file formats.
 
     This enum defines all the file formats that can be automatically

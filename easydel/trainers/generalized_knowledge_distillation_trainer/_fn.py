@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,7 +25,14 @@ from jax.sharding import PartitionSpec
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
-from ..training_utils import make_assertions_and_get_sizes, minibatch_call, update_metrics, update_state_respectfully
+from ..training_utils import (
+    filter_kwargs_for_callable,
+    make_assertions_and_get_sizes,
+    minibatch_call,
+    sanitize_model_call_kwargs,
+    update_metrics,
+    update_state_respectfully,
+)
 
 
 def _stop_gradient_tree(tree):
@@ -131,6 +138,7 @@ def gkd_step(
     is_training: bool = True,
     beta: float = 0.5,
     temperature: float = 1.0,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Execute GKD training or evaluation step.
 
@@ -157,9 +165,14 @@ def gkd_step(
     batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
     def loss_fn(tree, minibatch):
+        if is_training and straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
         module = flax.nnx.merge(student_state.graphdef, tree, student_state.graphother)
         call_kwargs = dict(minibatch)
         labels = call_kwargs.pop("labels", None)
+        call_kwargs = filter_kwargs_for_callable(module.__call__, call_kwargs)
+        call_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, call_kwargs)
+        call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         student_outputs = module(**call_kwargs)
         teacher_outputs = teacher_state.model(**call_kwargs)
         teacher_outputs = _stop_gradient_tree(teacher_outputs)

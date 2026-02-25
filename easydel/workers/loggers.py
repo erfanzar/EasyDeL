@@ -85,9 +85,10 @@ class ColorFormatter(logging.Formatter):
 class eLogger:
     def __init__(self, name: str, level: int | None = None):
         if level is None:
-            level = _LOGGING_LEVELS[os.getenv("LOGGING_LEVEL_ED", "INFO")]
+            env_level = os.getenv("LOGGING_LEVEL_ED", "INFO")
+            level = _LOGGING_LEVELS.get(env_level, _LOGGING_LEVELS["INFO"])
         if isinstance(level, str):
-            level = _LOGGING_LEVELS[level]
+            level = _LOGGING_LEVELS.get(level, _LOGGING_LEVELS["INFO"])
 
         self._name = name
         self._level = level

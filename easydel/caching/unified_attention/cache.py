@@ -1,0 +1,672 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unified attention KV-cache for vLLM-style paged attention.
+
+This module provides a paged KV-cache implementation compatible with
+vLLM-style unified attention kernels. Unlike RaggedPagesCache which
+interleaves K and V, this cache stores keys and values in separate
+tensors for direct compatibility with Triton unified attention kernels.
+
+Key Features:
+    - Separate key_cache and value_cache tensors per layer
+    - Storage layout: [num_blocks, block_size, num_kv_heads, head_dim]
+    - Compatible with ejkernel's Triton UnifiedAttention kernel
+    - Uses v2-style slot mapping for cache updates
+
+Key Components:
+    - UnifiedAttentionCacheConfig: Configuration for cache dimensions
+    - UnifiedAttentionCacheView: Per-layer view with separate K/V tensors
+    - UnifiedAttentionCache: Complete multi-layer cache container
+
+Example:
+    >>> config = UnifiedAttentionCacheConfig.create(
+    ...     mesh=mesh,
+    ...     partition_manager=pm,
+    ...     kvdtype=jnp.bfloat16,
+    ...     num_hidden_layers=32,
+    ...     num_kv_heads=8,
+    ...     max_model_length=8192,
+    ...     head_dim=128
+    ... )
+    >>> cache = UnifiedAttentionCache.init_cache(
+    ...     mesh=mesh,
+    ...     config=config,
+    ...     partition_manager=pm
+    ... )
+"""
+
+from __future__ import annotations
+
+import typing as tp
+
+import jax
+import jax.numpy as jnp
+from eformer import common_types
+from eformer import escale as es
+from eformer.escale import PartitionAxis, PartitionManager
+from eformer.loggings import get_logger
+from eformer.mpric import DTYPE_TO_STRING_MAP
+from eformer.pytree import auto_pytree, field
+from jax.sharding import Mesh
+from jax.sharding import NamedSharding as Ns
+from jaxtyping import Array, Float
+
+from easydel.axis import ATTN_DP
+from easydel.caching.ragged_page.utils import kv_cache_update_jax
+
+from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, unwrap_metadata
+
+if tp.TYPE_CHECKING:
+    from easydel.layers.quantization._quants import EasyQuantizer
+else:
+    EasyQuantizer = object
+
+logger = get_logger(__name__)
+
+EMPTY = common_types.EMPTY
+KV_HEAD = common_types.KV_HEAD
+MODE_PREFILL = common_types.MODE_PREFILL
+
+
+def cdiv(a: int, b: int) -> int:
+    """Ceiling division: compute ceil(a / b) using integer arithmetic.
+
+    Args:
+        a: Numerator.
+        b: Denominator (must be positive).
+
+    Returns:
+        int: Ceiling of a / b.
+    """
+    return (a + b - 1) // b
+
+
+def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_margin: int = 256 << 20) -> int:
+    """Calculate available HBM budget per device for cache allocation.
+
+    Queries device memory statistics and computes usable memory based
+    on utilization target and safety margin.
+
+    Args:
+        util: Target utilization fraction (0.0 to 1.0). Default: 0.9.
+        mode: Calculation mode:
+            - "free": Use fraction of currently free memory
+            - "total": Use fraction of total memory minus current usage
+        safety_margin: Reserved bytes to keep free. Default: 256MB.
+
+    Returns:
+        int: Available bytes for cache allocation per device.
+            Returns 4GB as fallback if device stats unavailable.
+    """
+    budgets: list[int] = []
+    for device in jax.local_devices():
+        try:
+            stats = device.memory_stats()
+        except Exception:
+            continue
+        if not isinstance(stats, dict):
+            continue
+        limit = stats.get("bytes_limit") or stats.get("bytes_reservable_limit") or stats.get("bytes_total")
+        used_in_use = stats.get("bytes_in_use", 0)
+        used_reserved = stats.get("bytes_reserved", 0)
+        used = max(used_in_use, used_reserved)
+        if limit is None:
+            continue
+
+        free = max(0, int(limit) - int(used))
+        if mode == "free":
+            usable = max(0, int(free * float(util)) - safety_margin)
+        else:
+            usable = max(0, int(int(limit) * float(util)) - int(used) - safety_margin)
+        budgets.append(usable)
+
+    return min(budgets) if budgets else 4 * (1024**3)
+
+
+def _previous_power_of_2(n: int) -> int:
+    """Find the largest power of 2 less than or equal to n.
+
+    Args:
+        n: Input integer.
+
+    Returns:
+        int: Largest power of 2 <= n, or 1 if n <= 0.
+    """
+    if n <= 0:
+        return 1
+    return 1 << (n.bit_length() - 1)
+
+
+def _mesh_axis_size(mesh: Mesh, axis: str | tuple[str, ...] | list[str] | None) -> int:
+    """Return product of mesh sizes for a semantic axis mapping."""
+    if axis is None or axis is EMPTY:
+        return 1
+    if isinstance(axis, tuple | list):
+        size = 1
+        for ax in axis:
+            if ax in mesh.shape:
+                size *= int(mesh.shape[ax])
+        return max(1, int(size))
+    return int(mesh.shape[axis]) if axis in mesh.shape else 1
+
+
+def _axis_index(axis: str | tuple[str, ...] | list[str] | None) -> jax.Array:
+    """Return a linearized axis index over one or more mesh axes."""
+    if axis is None:
+        return jnp.int32(0)
+    if isinstance(axis, tuple | list):
+        axes = tuple(str(a) for a in axis if a)
+    else:
+        axes = (str(axis),)
+    if not axes:
+        return jnp.int32(0)
+    idx = jax.lax.axis_index(axes[0]).astype(jnp.int32)
+    for axis_name in axes[1:]:
+        axis_size = jax.lax.psum(jnp.int32(1), axis_name)
+        idx = idx * axis_size + jax.lax.axis_index(axis_name).astype(jnp.int32)
+    return idx
+
+
+@auto_pytree
+class UnifiedAttentionCacheConfig(BaseCacheConfig):
+    """Configuration for vLLM-style unified attention paged KV-cache.
+
+    This configuration defines the storage layout and dimensions for a paged
+    KV-cache compatible with unified attention kernels. Keys and values are
+    stored in separate tensors rather than interleaved.
+
+    Storage layout per layer:
+        - key_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+        - value_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+
+    This matches ejkernel's Triton UnifiedAttention kernel input contract
+    and is designed for high-performance inference with vLLM-style scheduling.
+
+    Attributes:
+        num_hidden_layers (int): Number of transformer layers.
+        max_model_length (int): Maximum sequence length supported.
+        num_kv_heads (int): Number of key-value attention heads.
+        head_dim (int): Dimension of each attention head.
+        hbm_utilization (float): Target HBM utilization fraction. Default: 0.9.
+        data_parallel_size (int): Mesh ``dp`` axis size used for KV page
+            sharding metadata.
+        page_size (int): Number of tokens per cache page/block. Default: 128.
+        num_pages (int): Total number of pages allocated. Auto-computed.
+        max_num_pages_per_req (int): Maximum pages per request. Auto-computed.
+        num_slices_per_kv_cache_update_page (int): Slices per update page for
+            eSurge slot-mapping padding.
+        version (str): Always "v2" for unified attention (uses slot mapping).
+        _kvdtype_str (str): String representation of KV cache dtype.
+
+    Example:
+        >>> config = UnifiedAttentionCacheConfig.create(
+        ...     mesh=mesh,
+        ...     partition_manager=pm,
+        ...     kvdtype=jnp.bfloat16,
+        ...     num_hidden_layers=32,
+        ...     num_kv_heads=8,
+        ...     max_model_length=8192,
+        ...     head_dim=128
+        ... )
+    """
+
+    num_hidden_layers: int = field(pytree_node=False)
+    max_model_length: int = field(pytree_node=False)
+    num_kv_heads: int = field(pytree_node=False)
+    head_dim: int = field(pytree_node=False)
+
+    hbm_utilization: float = field(pytree_node=False, default=0.9)
+    data_parallel_size: int = field(pytree_node=False, default=1)
+    page_size: int = field(pytree_node=False, default=128)
+    num_pages: int = field(pytree_node=False, default=-1)
+    max_num_pages_per_req: int = field(pytree_node=False, default=-1)
+
+    # Used by eSurge's slot-mapping padding logic (v2-style cache updates).
+    num_slices_per_kv_cache_update_page: int = field(pytree_node=False, default=-1)
+
+    # Exposed to keep eSurge metadata builder compatible.
+    version: tp.Literal["v2"] = field(pytree_node=False, default="v2")
+
+    _kvdtype_str: str = field(pytree_node=False, default="bf16")
+
+    @staticmethod
+    def _compute_free_hbm(
+        mesh: Mesh,
+        partition_manager: PartitionManager,
+        hbm_utilization: float,
+    ) -> int:
+        """Compute available HBM for cache allocation across mesh.
+
+        Args:
+            mesh: JAX device mesh.
+            partition_manager: Partition manager with axis configuration.
+            hbm_utilization: Target memory utilization fraction.
+
+        Returns:
+            int: Available bytes used for KV page-pool sizing, scaled by
+                both KV-head and data-parallel page-axis factors.
+        """
+        kv_head_axis = partition_manager.paxis.kv_head_axis
+        kv_head_size = _mesh_axis_size(mesh, kv_head_axis)
+        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
+        page_axis_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
+        available_alloc = budget * kv_head_size * page_axis_size
+        logger.info(f"{kv_head_axis=} {kv_head_size=} {page_axis_size=} {budget=} {available_alloc=} {hbm_utilization=}")
+        return available_alloc
+
+    @classmethod
+    def create(
+        cls,
+        mesh: Mesh,
+        partition_manager: PartitionManager,
+        kvdtype: jnp.dtype,
+        num_hidden_layers: int,
+        num_kv_heads: int,
+        max_model_length: int,
+        head_dim: int,
+        *,
+        hbm_utilization: float = 0.9,
+        page_size: int = 128,
+    ) -> "UnifiedAttentionCacheConfig":
+        """Create a UnifiedAttentionCacheConfig with automatic capacity calculation.
+
+        Computes the number of pages that can fit in available HBM based on
+        device memory statistics and the specified utilization target.
+
+        Args:
+            mesh: JAX device mesh for distributed execution.
+            partition_manager: Manager for tensor partitioning/sharding.
+            kvdtype: Data type for KV cache storage (e.g., jnp.bfloat16).
+            num_hidden_layers: Number of transformer layers.
+            num_kv_heads: Number of key-value attention heads.
+            max_model_length: Maximum supported sequence length.
+            head_dim: Dimension of each attention head.
+            hbm_utilization: Target HBM utilization (0.0-1.0). Default: 0.9.
+            page_size: Tokens per cache page. Default: 128.
+
+        Returns:
+            UnifiedAttentionCacheConfig: Configured cache metadata.
+
+        Raises:
+            ValueError: If any dimension is non-positive.
+        """
+        if num_hidden_layers <= 0:
+            raise ValueError("`num_hidden_layers` must be positive")
+        if num_kv_heads <= 0:
+            raise ValueError("`num_kv_heads` must be positive")
+        if head_dim <= 0:
+            raise ValueError("`head_dim` must be positive")
+        if page_size <= 0:
+            raise ValueError("`page_size` must be positive")
+        if max_model_length <= 0:
+            raise ValueError("`max_model_length` must be positive")
+        data_parallel_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
+        if data_parallel_size > 1:
+            logger.info(f"Scaling KV page budget by data-parallel page axis: {data_parallel_size=}.")
+
+        free = cls._compute_free_hbm(
+            mesh=mesh,
+            partition_manager=partition_manager,
+            hbm_utilization=hbm_utilization,
+        )
+        bytes_av = jnp.finfo(kvdtype).bits // 8
+        # Two tensors (K+V) per layer.
+        page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * head_dim * bytes_av
+        num_pages = int(free) // int(page_bytes)
+        if data_parallel_size > 1:
+            num_pages = (num_pages // data_parallel_size) * data_parallel_size
+        if num_pages <= 0:
+            raise ValueError(
+                "Computed `num_pages` is non-positive; increase `hbm_utilization` or reduce page footprint."
+            )
+        logger.info(
+            f"Creating UnifiedAttentionCacheConfig with {num_pages=} {page_bytes=} "
+            f"sequence_capacity={int((num_pages * page_size) / 1000)}K"
+        )
+
+        # A lightweight heuristic for slot-mapping padding; matches eSurge expectations.
+        page_size_bytes = 2 * page_size * num_kv_heads * head_dim * bytes_av
+        # Keep this conservative; it only affects padding of the update schedule.
+        slices_raw = (16 * 1024 * 1024) // max(1, int(page_size_bytes))
+        num_slices_per_page = min(64, _previous_power_of_2(int(slices_raw)))
+
+        return cls(
+            num_hidden_layers=num_hidden_layers,
+            max_model_length=max_model_length,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            hbm_utilization=hbm_utilization,
+            data_parallel_size=data_parallel_size,
+            page_size=page_size,
+            num_pages=num_pages,
+            max_num_pages_per_req=cdiv(max_model_length, page_size),
+            num_slices_per_kv_cache_update_page=int(num_slices_per_page),
+            _kvdtype_str=DTYPE_TO_STRING_MAP[kvdtype],
+        )
+
+    @property
+    def kvdtype(self) -> jnp.dtype:
+        """Get the JAX dtype for KV cache storage.
+
+        Returns:
+            jnp.dtype: The data type (e.g., jnp.bfloat16).
+        """
+        from eformer.mpric import STRING_TO_DTYPE_MAP
+
+        return STRING_TO_DTYPE_MAP[self._kvdtype_str]
+
+    def get_padded_num_slices(
+        self,
+        num_tokens: int | None = None,
+        max_num_reqs: int | None = None,
+    ) -> int:
+        """Calculate padded slice count for slot mapping.
+
+        Computes a padded slice count that aligns to the slices-per-page
+        boundary for efficient cache updates.
+
+        Args:
+            num_tokens: Token count for batch. Defaults to max_model_length.
+            max_num_reqs: Maximum requests. Defaults to computed max.
+
+        Returns:
+            int: Padded slice count aligned to update page boundary.
+        """
+        if num_tokens is None or num_tokens <= 0:
+            num_tokens = self.max_model_length
+        if max_num_reqs is None or max_num_reqs <= 0:
+            max_num_reqs = self.get_max_num_seqs()
+
+        padded_num_slices = 2 * int(max_num_reqs) + int(num_tokens) // int(self.page_size)
+        padded_num_slices = min(int(padded_num_slices), int(num_tokens))
+
+        slices_per_page = max(1, int(self.num_slices_per_kv_cache_update_page))
+        padded_num_slices = ((padded_num_slices + slices_per_page - 1) // slices_per_page) * slices_per_page
+        return int(padded_num_slices)
+
+    def get_max_num_seqs(self) -> int:
+        """Estimate maximum concurrent sequences based on page budget.
+
+        Uses a heuristic based on page requirements per max-length sequence.
+
+        Returns:
+            int: Estimated maximum concurrent sequences.
+        """
+        # Same heuristic as RaggedPagesCacheConfig.
+        num_page_per_req = cdiv(self.max_model_length, self.page_size)
+        return 1024 * 1024 // 2 // num_page_per_req // 4
+
+
+@auto_pytree
+class UnifiedAttentionCacheView(BaseCacheView):
+    """Per-layer KV-cache view for unified attention.
+
+    Holds separate key and value cache tensors for a single transformer layer.
+    Unlike RaggedPagesCacheView which interleaves K/V, this view stores them
+    separately for direct compatibility with unified attention kernels.
+
+    Attributes:
+        metadata (UnifiedAttentionCacheConfig): Configuration for the cache.
+        layer_index (int): Index of this layer in the model.
+        key_cache (Array): Key cache tensor.
+            Shape: [num_pages, page_size, num_kv_heads, head_dim]
+        value_cache (Array): Value cache tensor.
+            Shape: [num_pages, page_size, num_kv_heads, head_dim]
+        partition_manager (PartitionManager): Manager for tensor sharding.
+    """
+
+    metadata: UnifiedAttentionCacheConfig
+    layer_index: int = field(pytree_node=False)
+
+    key_cache: Float[Array, "num_pages page_size num_kv_heads head_dim"]
+    value_cache: Float[Array, "num_pages page_size num_kv_heads head_dim"]
+
+    partition_manager: PartitionManager = field(
+        pytree_node=False,
+        default_factory=lambda: PartitionManager(PartitionAxis()),
+    )
+
+    @classmethod
+    def init(
+        cls,
+        config: UnifiedAttentionCacheConfig,
+        layer_index: int | None = None,
+        *,
+        mesh: Mesh | None = None,
+        partition_manager: es.PartitionManager | None = None,
+        quantizer: EasyQuantizer | None = None,
+    ) -> "UnifiedAttentionCacheView":
+        """Initialize a UnifiedAttentionCacheView from a cache config.
+
+        Creates separate key and value cache tensors with proper sharding
+        for the unified attention layout.
+
+        Args:
+            config: UnifiedAttentionCacheConfig with cache dimensions.
+            layer_index: Index of this layer in the model. Default: 0.
+            mesh: JAX device mesh for sharding.
+            partition_manager: Partition manager for sharding configuration.
+            quantizer: Optional quantizer to apply to cache tensors.
+
+        Returns:
+            UnifiedAttentionCacheView: Initialized cache view.
+        """
+        if partition_manager is None:
+            partition_manager = PartitionManager(PartitionAxis())
+
+        key_shape = (config.num_pages, config.page_size, config.num_kv_heads, config.head_dim)
+        page_axis = ATTN_DP if config.data_parallel_size > 1 else EMPTY
+        axes = [page_axis, EMPTY, KV_HEAD, EMPTY]
+        sharding_spec = partition_manager.resolve(axes=axes, mode=MODE_PREFILL, shape=key_shape)
+        sharding = Ns(mesh=mesh, spec=sharding_spec)
+
+        with jax.named_scope("easydel-unified-attention-cache-init"):
+            key_cache = jnp.zeros(shape=key_shape, dtype=config.kvdtype, device=sharding)
+            value_cache = jnp.zeros(shape=key_shape, dtype=config.kvdtype, device=sharding)
+
+        if quantizer is not None and callable(quantizer):
+            key_cache = quantizer(key_cache)
+            value_cache = quantizer(value_cache)
+
+        return cls(
+            metadata=config,
+            layer_index=layer_index or 0,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            partition_manager=partition_manager,
+        )
+
+    def concatenate_to_cache(
+        self,
+        key: Float[Array, "batch seq_len num_kv_heads head_dim"],
+        value: Float[Array, "batch seq_len num_kv_heads head_dim"],
+        cache_metadata: tp.Any,
+    ) -> "UnifiedAttentionCacheView":
+        """Update cache with new key-value pairs using slot mapping.
+
+        Writes new KV pairs into the appropriate cache locations based on
+        the v2-style slot mapping. Unlike ragged page cache, keys and values
+        are updated separately in their respective tensors.
+
+        Args:
+            key: New key states to cache.
+                Shape: [batch, seq_len, num_kv_heads, head_dim]
+            value: New value states to cache.
+                Shape: [batch, seq_len, num_kv_heads, head_dim]
+            cache_metadata: Runtime metadata containing slot_mapping and
+                num_kv_update_slices. Must be v2-style metadata.
+
+        Returns:
+            UnifiedAttentionCacheView: Updated cache view with new KV pairs.
+
+        Raises:
+            ValueError: If cache_metadata lacks required v2 fields.
+        """
+        cache_metadata = unwrap_metadata(cache_metadata, "ragged")
+
+        if cache_metadata.slot_mapping is None or cache_metadata.num_kv_update_slices is None:
+            raise ValueError("UnifiedAttentionCacheView requires v2-style `slot_mapping` and `num_kv_update_slices`.")
+
+        # Flatten to `[total_tokens, num_kv_heads, head_dim]`.
+        key_tokens = key.reshape(-1, *key.shape[-2:]).astype(self.key_cache.dtype)
+        value_tokens = value.reshape(-1, *value.shape[-2:]).astype(self.value_cache.dtype)
+        data_parallel_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1)))
+        data_parallel_axis = self.partition_manager.paxis.data_parallel_axis
+        use_shardmap = data_parallel_size > 1
+
+        def _update_pages(
+            new_tokens: Float[Array, "total_tokens num_kv_heads head_dim"],
+            slot_mapping: Array,
+            pages: Float[Array, "num_pages page_size num_kv_heads head_dim"],
+            num_update_slices: Array,
+        ) -> Float[Array, "num_pages page_size num_kv_heads head_dim"]:
+            original_shape = pages.shape
+            pages_flat = pages.reshape(-1, *original_shape[-2:])
+            page_shard_index = jnp.int32(0)
+            if use_shardmap:
+                page_shard_index = _axis_index(data_parallel_axis)
+            pages_flat = kv_cache_update_jax(
+                new_tokens,
+                slot_mapping,
+                pages_flat,
+                num_update_slices,
+                page_size=int(cache_metadata.page_size),
+                page_shard_index=page_shard_index,
+            )
+            return pages_flat.reshape(original_shape)
+
+        if use_shardmap:
+            resolve = self.partition_manager.resolve
+            page_axis = ATTN_DP
+            _update_pages = jax.shard_map(
+                _update_pages,
+                in_specs=(
+                    resolve([EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL, shape=key_tokens.shape),
+                    resolve([EMPTY, EMPTY], mode=MODE_PREFILL, shape=cache_metadata.slot_mapping.shape),
+                    resolve([page_axis, EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL, shape=self.key_cache.shape),
+                    resolve([EMPTY], mode=MODE_PREFILL, shape=cache_metadata.num_kv_update_slices.shape),
+                ),
+                out_specs=resolve([page_axis, EMPTY, KV_HEAD, EMPTY], mode=MODE_PREFILL, shape=self.key_cache.shape),
+                mesh=es.get_incontext_mesh(),
+                check_vma=False,
+            )
+
+        new_key_cache = _update_pages(
+            key_tokens,
+            cache_metadata.slot_mapping,
+            self.key_cache,
+            cache_metadata.num_kv_update_slices,
+        )
+        new_value_cache = _update_pages(
+            value_tokens,
+            cache_metadata.slot_mapping,
+            self.value_cache,
+            cache_metadata.num_kv_update_slices,
+        )
+        return self.replace(key_cache=new_key_cache, value_cache=new_value_cache)
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(layer_index={self.layer_index}, "
+            f"key_cache_shape={getattr(self.key_cache, 'shape', None)}, "
+            f"value_cache_shape={getattr(self.value_cache, 'shape', None)})"
+        )
+
+    __str__ = __repr__
+
+
+@auto_pytree
+class UnifiedAttentionCache(BaseCache):
+    """Complete unified attention KV cache for all model layers.
+
+    Container holding per-layer UnifiedAttentionCacheView instances.
+    Provides methods for initialization and accessing layer-specific views.
+
+    Attributes:
+        views (list): List of UnifiedAttentionCacheView, one per layer.
+
+    Example:
+        >>> cache = UnifiedAttentionCache.init_cache(
+        ...     mesh=mesh,
+        ...     config=config,
+        ...     partition_manager=pm
+        ... )
+        >>> layer_view = cache.views[layer_idx]
+    """
+
+    views: list[UnifiedAttentionCacheView]
+
+    @property
+    def metadata(self) -> UnifiedAttentionCacheConfig | None:
+        """Get the shared cache configuration.
+
+        Returns:
+            UnifiedAttentionCacheConfig or None: Configuration from the last
+                view, or None if views are empty/uninitialized.
+        """
+        if not self.views or self.views[-1] is None:
+            return None
+        return self.views[-1].metadata
+
+    @classmethod
+    def init_cache(
+        cls,
+        *,
+        mesh: Mesh,
+        config: UnifiedAttentionCacheConfig,
+        partition_manager: es.PartitionManager,
+        quantizer: EasyQuantizer | None = None,
+    ) -> "UnifiedAttentionCache":
+        """Initialize the complete cache for all layers.
+
+        Creates a list of UnifiedAttentionCacheView instances, one for each
+        layer specified in the config.
+
+        Args:
+            mesh: JAX device mesh for distributed execution.
+            config: UnifiedAttentionCacheConfig with cache dimensions.
+            partition_manager: Manager for tensor sharding.
+            quantizer: Optional quantizer to apply to cache tensors.
+
+        Returns:
+            UnifiedAttentionCache: Initialized cache with all layer views.
+        """
+        views = [
+            UnifiedAttentionCacheView.init(
+                config=config,
+                layer_index=i,
+                mesh=mesh,
+                partition_manager=partition_manager,
+                quantizer=quantizer,
+            )
+            for i in range(config.num_hidden_layers)
+        ]
+        return cls(views=views)
+
+    @classmethod
+    def init_empty(cls, num_hidden_layers: int, *args, **kwargs) -> "UnifiedAttentionCache":
+        """Create an empty cache with None views for each layer.
+
+        Useful for lazy initialization where views will be populated later.
+
+        Args:
+            num_hidden_layers: Number of layers to allocate slots for.
+            *args: Ignored additional arguments.
+            **kwargs: Ignored additional keyword arguments.
+
+        Returns:
+            UnifiedAttentionCache: Cache with None views for each layer.
+        """
+        return cls(views=[None] * int(num_hidden_layers))

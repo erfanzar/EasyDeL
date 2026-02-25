@@ -1,0 +1,31 @@
+services:
+  easydel-cuda:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HARDWARE_TYPE: cuda
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.13}
+    image: easydel:cuda
+    container_name: easydel-cuda
+    stdin_open: true
+    tty: true
+    privileged: true
+    network_mode: host
+    ipc: host
+    volumes:
+      - .:/workspace
+      - /dev:/dev
+      - /usr/local/cuda:/usr/local/cuda:ro
+      - /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.570.133.20:/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1:ro
+      - /usr/lib/x86_64-linux-gnu/libcuda.so.570.133.20:/usr/lib/x86_64-linux-gnu/libcuda.so.1:ro
+      - /usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.570.133.20:/usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.1:ro
+    devices:
+      - /dev/nvidia0
+      - /dev/nvidiactl
+      - /dev/nvidia-uvm
+      - /dev/nvidia-modeset
+    working_dir: /workspace
+    environment:
+      - JAX_PLATFORM_NAME=cuda
+    command: bash

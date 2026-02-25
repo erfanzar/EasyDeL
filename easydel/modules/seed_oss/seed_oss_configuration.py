@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,8 +15,6 @@
 from __future__ import annotations
 
 import typing as tp
-
-from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -116,9 +114,11 @@ class SeedOssConfig(EasyDeLBaseConfig):
         self.mlp_bias = mlp_bias
         if self.layer_types is None:
             self.layer_types = [
-                "sliding_attention"
-                if (self.use_sliding_window and self.sliding_window is not None and i < self.max_window_layers)
-                else "full_attention"
+                (
+                    "sliding_attention"
+                    if (self.use_sliding_window and self.sliding_window is not None and i < self.max_window_layers)
+                    else "full_attention"
+                )
                 for i in range(self.num_hidden_layers)
             ]
 
@@ -140,32 +140,7 @@ class SeedOssConfig(EasyDeLBaseConfig):
         )
 
     def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, tp.Any], ...]:
-        """
-        Partition rules for optimised sharding.
-
-        Mirrors the standard decoder-only layout:
-            - Embed/lm_head sharded column-wise.
-            - Attention QKV projections column-wise, output row-wise.
-            - MLP gate/up column-wise, down row-wise.
-            - Normalisation parameters replicated.
-        """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"layers.*/self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"layers.*/self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"layers.*/self_attn/(q_proj|k_proj|v_proj)/bias", pmag.resolve(Replicated)),
-            (r"layers.*/self_attn/o_proj/bias", pmag.resolve(Replicated)),
-            (r"layers.*/mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"layers.*/mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"layers.*/mlp/.*_proj/bias", pmag.resolve(Replicated)),
-            (r"layers.*/(input_layernorm|post_attention_layernorm)/kernel", pmag.resolve(Replicated)),
-            (r"norm/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(ColumnWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Return per-layer attention mask settings."""

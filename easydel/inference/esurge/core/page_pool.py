@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,24 +29,50 @@ Example:
 from collections import defaultdict
 from collections.abc import Iterable
 
+from ..logger import logger
 from ..request import EngineRequest
 from .utils import CachePage, FreeCachePageQueue, PageHash, PageHashWithGroupId, hash_page_tokens
 
 
 class PagePool:
-    """PagePool that manages CachePages.
-    It provides methods to allocate, free and cache the kv cache pages. The
-    free_page_queue stores the free pages in eviction order to enable
-    allocation, free, and cache eviction. The cached_page_hash_to_page
-    maps between page hash and cached page to support finding cached pages
-    by their page hash.
+    """Pool manager for KV-cache pages with prefix caching support.
 
-    Args:
-        num_pages: The number of pages in the pool.
-        enable_caching: Whether to enable prefix caching.
+    This class manages a pool of CachePage objects, providing allocation,
+    deallocation, and prefix caching operations. It uses a free page queue
+    ordered by eviction priority (LRU) and maintains a hash-to-page mapping
+    for efficient prefix cache lookups.
+
+    The pool supports:
+    - O(1) page allocation from the free queue
+    - O(1) page deallocation back to the free queue
+    - Prefix caching with hash-based page lookup
+    - Reference counting for shared page management
+    - LRU eviction when the pool is exhausted
+
+    Attributes:
+        num_pages: Total number of pages in the pool.
+        enable_caching: Whether prefix caching is enabled.
+        pages: List of all CachePage objects in the pool.
+        free_page_queue: Queue of free pages ordered by eviction priority.
+        cached_page_hash_to_page: Mapping from page hash to cached pages.
+        null_page: Special placeholder page that is never freed.
+
+    Example:
+        >>> pool = PagePool(num_pages=1000, enable_caching=True)
+        >>> pages = pool.get_new_pages(num_pages=10)
+        >>> pool.free_pages(reversed(pages))  # Free in reverse for LRU order
     """
 
     def __init__(self, num_pages: int, enable_caching: bool):
+        """Initialize the page pool.
+
+        Args:
+            num_pages: Total number of pages to allocate. Must be a positive integer.
+            enable_caching: Whether to enable prefix caching functionality.
+
+        Raises:
+            AssertionError: If num_pages is not a positive integer.
+        """
         assert isinstance(num_pages, int) and num_pages > 0
         self.num_pages = num_pages
         self.enable_caching = enable_caching
@@ -59,7 +85,14 @@ class PagePool:
         self.null_page = self.free_page_queue.popleft()
         self.null_page.is_null = True
 
-    def get_cached_page(self, page_hash: PageHash, kv_cache_group_ids: list[int]) -> list[CachePage] | None:
+    def get_cached_page(
+        self,
+        page_hash: PageHash,
+        kv_cache_group_ids: list[int],
+        *,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
+    ) -> list[CachePage] | None:
         """Get the cached page by the page hash for each group in
         `kv_cache_group_ids`, or None if cache miss for any group.
         If there are duplicated pages, we return the first page in the cache.
@@ -67,17 +100,47 @@ class PagePool:
         Args:
             page_hash: The hash value of the page.
             kv_cache_group_ids: The ids of the KV cache groups.
+            dp_shard_hint: Optional DP shard hint. When provided with
+                `data_parallel_size > 1`, only cached pages in the shard's
+                page-ID range are considered cache hits.
+            data_parallel_size: Total number of DP shards.
 
         Returns:
             The cached pages if exists, or None.
         """
+        use_shard_hint = (
+            dp_shard_hint is not None
+            and data_parallel_size is not None
+            and int(data_parallel_size) > 1
+            and self.num_pages % int(data_parallel_size) == 0
+        )
+        if use_shard_hint:
+            dp_size = int(data_parallel_size)
+            shard_idx = int(dp_shard_hint) % dp_size
+            pages_per_shard = self.num_pages // dp_size
+            page_lo = shard_idx * pages_per_shard
+            page_hi = page_lo + pages_per_shard
+
         cached_pages = []
         for group_id in kv_cache_group_ids:
             cached_pages_one_group = self.cached_page_hash_to_page.get(PageHashWithGroupId(page_hash, group_id))
             if not cached_pages_one_group:
                 return None
-            first_page = next(iter(cached_pages_one_group.values()))
-            cached_pages.append(first_page)
+            if use_shard_hint:
+                shard_page = next(
+                    (
+                        page
+                        for page in cached_pages_one_group.values()
+                        if page_lo <= int(page.page_id) < page_hi
+                    ),
+                    None,
+                )
+                if shard_page is None:
+                    return None
+                cached_pages.append(shard_page)
+            else:
+                first_page = next(iter(cached_pages_one_group.values()))
+                cached_pages.append(first_page)
         return cached_pages
 
     def cache_full_pages(
@@ -150,13 +213,24 @@ class PagePool:
             self.cached_page_hash_to_page[page_hash_with_group_id][blk.page_id] = blk
             prev_page_hash_value = page_hash.hash_value
 
-    def get_new_pages(self, num_pages: int) -> list[CachePage]:
+    def get_new_pages(
+        self,
+        num_pages: int,
+        *,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
+    ) -> list[CachePage]:
         """Get new pages from the free page pool.
 
         Note that we do not check page cache in this function.
 
         Args:
             num_pages: The number of pages to allocate.
+            dp_shard_hint: Optional data-parallel shard hint. When provided
+                with ``data_parallel_size > 1``, allocation is restricted to
+                the page-ID range owned by the hinted shard.
+            data_parallel_size: Total data-parallel shard count for page
+                partitioning.
 
         Returns:
             A list of new page.
@@ -164,7 +238,36 @@ class PagePool:
         if num_pages > self.get_num_free_pages():
             raise ValueError(f"Cannot get {num_pages} free pages from the pool")
 
-        ret: list[CachePage] = self.free_page_queue.popleft_n(num_pages)
+        use_shard_hint = (
+            dp_shard_hint is not None
+            and data_parallel_size is not None
+            and int(data_parallel_size) > 1
+            and self.num_pages % int(data_parallel_size) == 0
+        )
+        if use_shard_hint:
+            dp_size = int(data_parallel_size)
+            shard_idx = int(dp_shard_hint) % dp_size
+            pages_per_shard = self.num_pages // dp_size
+            page_lo = shard_idx * pages_per_shard
+            page_hi = page_lo + pages_per_shard
+
+            selected: list[CachePage] = []
+            for page in self.free_page_queue.get_all_free_pages():
+                if page_lo <= int(page.page_id) < page_hi:
+                    selected.append(page)
+                    if len(selected) >= num_pages:
+                        break
+            if len(selected) >= num_pages:
+                for page in selected:
+                    self.free_page_queue.remove(page)
+                ret = selected
+            else:
+                raise ValueError(
+                    "Insufficient free pages in requested DP shard range: "
+                    f"shard={shard_idx} range=[{page_lo}, {page_hi}) requested={num_pages} found={len(selected)}"
+                )
+        else:
+            ret = self.free_page_queue.popleft_n(num_pages)
 
         if self.enable_caching:
             for page in ret:
@@ -178,15 +281,22 @@ class PagePool:
         return ret
 
     def _maybe_evict_cached_page(self, page: CachePage) -> bool:
-        """
-        If a page is cached in `cached_page_hash_to_page`, we reset its hash
-        metadata and evict it from the cache.
+        """Evict a page from the prefix cache if it is cached.
+
+        Removes the page's hash association and evicts it from the
+        cached_page_hash_to_page mapping. This is called when a cached
+        page is being reallocated for new content.
 
         Args:
-            page: The page to evict.
+            page: The page to potentially evict from the cache.
 
         Returns:
-            True if the page is evicted, False otherwise.
+            True if the page was cached and has been evicted,
+            False if the page was not in the cache.
+
+        Note:
+            This method handles the case where multiple pages may share
+            the same hash (e.g., when a prefix is duplicated across requests).
         """
         page_hash = page.page_hash
         if page_hash is None:
@@ -239,14 +349,14 @@ class PagePool:
         """
         num_used_pages = self.num_pages - self.get_num_free_pages()
         if num_used_pages != 1:
-            print(f"Failed to reset prefix cache because some pages ({num_used_pages - 1}) are not freed yet")
+            logger.warning("Failed to reset prefix cache because some pages (%d) are not freed yet", num_used_pages - 1)
             return False
 
         self.cached_page_hash_to_page.clear()
         for page in self.pages:
             page.reset_hash()
 
-        print("Successfully reset prefix cache")
+        logger.info("Successfully reset prefix cache")
         return True
 
     def get_num_free_pages(self) -> int:

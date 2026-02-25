@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo
@@ -27,6 +28,16 @@ from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
@@ -38,28 +49,20 @@ from easydel.infra.modeling_outputs import (
     VLMCausalLMOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule, BaseVisionLanguageModule
-from easydel.layers.caching import (
-    HybridCache,
-    OperationsMetadata,
-    RaggedPagesCache,
-    RaggedPagesCacheView,
-    RaggedPagesMetadata,
-    TransformerCache,
-    TransformerCacheView,
-    TransformerMetadata,
-)
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.moe import (
+from easydel.layers import (
     BaseMoeModule,
+    ColumnParallelLinear,
     ColumnParallelMoELinear,
+    Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    RowParallelLinear,
     RowParallelMoELinear,
 )
-from easydel.layers.norms import RMSNorm as Llama4TextRMSNorm
+from easydel.layers import RMSNorm as Llama4TextRMSNorm
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule, BaseVisionLanguageModule
 from easydel.utils.compiling_utils import ejit
 
 from .llama4_configuration import Llama4Config, Llama4TextConfig, Llama4VisionConfig
@@ -811,13 +814,7 @@ class Llama4TextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=self.config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
             dtype=dtype,
@@ -825,17 +822,19 @@ class Llama4TextModel(EasyDeLBaseModule):
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             rngs=rngs,
         )
-        self.layers = [
-            Llama4TextDecoderLayer(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(self.config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                Llama4TextDecoderLayer(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(self.config.num_hidden_layers)
+            ]
+        )
         self.norm = Llama4TextRMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -1555,14 +1554,14 @@ class Llama4VisionEncoderLayer(nn.Module):
             rngs=rngs,
         )
 
-        self.input_layernorm = nn.LayerNorm(
+        self.input_layernorm = LayerNorm(
             num_features=config.hidden_size,
             epsilon=0.00001,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.post_attention_layernorm = nn.LayerNorm(
+        self.post_attention_layernorm = LayerNorm(
             num_features=config.hidden_size,
             epsilon=0.00001,
             dtype=dtype,
@@ -1650,17 +1649,19 @@ class Llama4VisionEncoder(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
-        self.layers = [
-            Llama4VisionEncoderLayer(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(self.config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                Llama4VisionEncoderLayer(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(self.config.num_hidden_layers)
+            ]
+        )
 
     def __call__(
         self,
@@ -1858,14 +1859,14 @@ class Llama4VisionModel(EasyDeLBaseModule):
             init_kwargs={"stddev": self.scale},
             key=rngs.params(),
         )
-        self.layernorm_pre = nn.LayerNorm(
+        self.layernorm_pre = LayerNorm(
             num_features=self.hidden_size,
             epsilon=0.00001,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layernorm_post = nn.LayerNorm(
+        self.layernorm_post = LayerNorm(
             num_features=self.hidden_size,
             epsilon=0.00001,
             dtype=dtype,
@@ -1889,6 +1890,13 @@ class Llama4VisionModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.vision_idx = self.config.image_size // self.config.patch_size
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for vision-only parameters."""
+        return {
+            "class_embedding": Replicated,
+            "positional_embedding_vlm": ColumnWise,
+        }
 
     def __call__(
         self,

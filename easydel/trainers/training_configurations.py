@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -236,11 +236,11 @@ class TrainingArguments:
             )
         },
     )
-    quantization_block: int | None = field(
+    quantization_group_size: int | None = field(
         default=None,
         metadata={
             "help": (
-                "Quantization block size for block-wise quantizers (e.g. NF4). If None, the default block size for "
+                "Quantization group size for block-wise quantizers (e.g. NF4). If None, the default group size for "
                 "the selected quantization mode is used."
             )
         },
@@ -278,6 +278,7 @@ class TrainingArguments:
         metadata={"help": "The maximum sequence length."},
     )
     max_sequence_length: InitVar[int | None] = None
+    quantization_block: InitVar[int | None] = None
     max_training_steps: int | None = field(
         default=None,
         metadata={"help": "The maximum number of training steps."},
@@ -637,7 +638,28 @@ class TrainingArguments:
             stacklevel=2,
         )
 
-    def __post_init__(self, max_sequence_length: int | None):
+    def _handle_deprecated_quantization_block(self, quantization_block: int | None) -> None:
+        if quantization_block is None:
+            return
+        warnings.warn(
+            "`quantization_block` is deprecated; use `quantization_group_size` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        if self.quantization_group_size is None:
+            self.quantization_group_size = quantization_block
+            return
+        if self.quantization_group_size == quantization_block:
+            return
+
+        warnings.warn(
+            f"Both `quantization_group_size` ({self.quantization_group_size}) and "
+            f"`quantization_block` ({quantization_block}) are set; ignoring `quantization_block`.",
+            FutureWarning,
+            stacklevel=2,
+        )
+
+    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
         """
         Post-initialization setup and validation.
 
@@ -654,6 +676,7 @@ class TrainingArguments:
             AssertionError: If required conditions are not met
         """
         self._handle_deprecated_max_sequence_length(max_sequence_length)
+        self._handle_deprecated_quantization_block(quantization_block)
         if self.max_length is None:
             self.max_length = 4096
         self._ensure_variables()
@@ -679,6 +702,8 @@ class TrainingArguments:
 
         if self.backend not in AVAILABLE_BACKENDS:
             raise ValueError(f"Backend {self.backend} is not recognized. Available backends: {AVAILABLE_BACKENDS}")
+        if self.quantization_group_size is not None and self.quantization_group_size <= 0:
+            raise ValueError("`quantization_group_size` must be > 0 when specified.")
 
     def _setup_distributed(self):
         """
@@ -1125,12 +1150,14 @@ class TrainingArguments:
                 prefix = ""
             else:
                 prefix = "-" + prefix
+            resolved_model_name = self.model_name if isinstance(self.model_name, str) and self.model_name else "model"
+            safe_model_name = resolved_model_name.lower().replace("/", "-")
             if wandb_name is None:
                 _time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                wandb_name = f"{self.model_name.lower()}-{_time}"
+                wandb_name = f"{safe_model_name}-{_time}"
 
             return wandb.init(
-                project=f"EasyDeL{prefix}-{self.model_name}",
+                project=f"EasyDeL{prefix}-{safe_model_name}",
                 config=self.to_dict(),
                 save_code=True,
                 name=wandb_name,
@@ -1409,6 +1436,13 @@ class TrainingArguments:
         Returns:
             TrainingArguments: A new instance created from the dictionary.
         """
+        data = dict(data)
+        if "quantization_block" in data:
+            if "quantization_group_size" not in data:
+                data["quantization_group_size"] = data["quantization_block"]
+            # Drop deprecated alias for constructor calls built from dictionaries.
+            data.pop("quantization_block", None)
+
         processed_data = {}
         type_hints = tp.get_type_hints(cls)
 
@@ -1469,6 +1503,12 @@ class TrainingArguments:
 
     @classmethod
     def load_from_json(cls, config_dict):
+        config_dict = dict(config_dict)
+        if "quantization_block" in config_dict:
+            if "quantization_group_size" not in config_dict:
+                config_dict["quantization_group_size"] = config_dict["quantization_block"]
+            # Drop deprecated alias for constructor calls built from JSON payloads.
+            config_dict.pop("quantization_block", None)
         if "trainer_config_class" in config_dict.keys():
             import easydel as ed
 
@@ -1529,4 +1569,24 @@ TrainingArguments.max_sequence_length = property(  # type: ignore[attr-defined]
     _get_max_sequence_length,
     _set_max_sequence_length,
     doc="Deprecated alias for `max_length`.",
+)
+
+
+def _get_quantization_block(self: TrainingArguments) -> int | None:
+    return self.quantization_group_size
+
+
+def _set_quantization_block(self: TrainingArguments, value: int | None) -> None:
+    warnings.warn(
+        "`quantization_block` is deprecated; use `quantization_group_size` instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+    self.quantization_group_size = value
+
+
+TrainingArguments.quantization_block = property(  # type: ignore[attr-defined]
+    _get_quantization_block,
+    _set_quantization_block,
+    doc="Deprecated alias for `quantization_group_size`.",
 )

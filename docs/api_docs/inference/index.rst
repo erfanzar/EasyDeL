@@ -6,6 +6,7 @@ easydel.inference package
 
    esurge/index
    evaluations/index
+   reasoning/index
    tools/index
    vwhisper/index
    decoders

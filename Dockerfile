@@ -3,7 +3,7 @@
 # Bases
 ARG HARDWARE_TYPE=cpu
 ARG PYTHON_VERSION=3.13
-FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu22.04 AS gpu-base
+FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu22.04 AS cuda-base
 FROM ubuntu:22.04 AS tpu-base
 FROM python:${PYTHON_VERSION}-slim AS cpu-base
 FROM ghcr.io/astral-sh/uv:latest AS uv
@@ -17,7 +17,7 @@ ARG HARDWARE_TYPE=cpu
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
-# OS deps + Python for Ubuntu-based images (GPU/TPU)
+# OS deps + Python for Ubuntu-based images (CUDA/TPU)
 RUN set -eux; \
     if [[ "$HARDWARE_TYPE" != "cpu" ]]; then \
         apt-get update && \
@@ -57,8 +57,8 @@ COPY easydel ./easydel
 
 # Install project deps
 RUN set -eux; \
-    if [[ "$HARDWARE_TYPE" == "gpu" ]]; then \
-        JAX_PLATFORMS=cpu uv pip install -e ".[gpu,torch,lm_eval,profile]"; \
+    if [[ "$HARDWARE_TYPE" == "cuda" ]]; then \
+        JAX_PLATFORMS=cpu uv pip install -e ".[cuda,torch,lm_eval,profile]"; \
     elif [[ "$HARDWARE_TYPE" == "tpu" ]]; then \
         JAX_PLATFORMS=cpu uv pip install -e ".[tpu,torch,lm_eval,profile]"; \
     else \

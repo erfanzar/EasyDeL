@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -80,12 +80,12 @@ from functools import partial
 import jax
 import numpy
 from eformer import escale as es
-from eformer.jaximus import implicit
 from eformer.loggings import ProgressLogger, get_logger
 from eformer.pytree import key_path_to_str
+from ejkernel.ops import forward_autotune_only
 from jax import numpy as jnp
 
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     RaggedPagesCache,
     RaggedPagesCacheConfig,
@@ -149,11 +149,27 @@ def _compute_sampling_valid_mask(
 ) -> jax.Array:
     """Compute which request slots are valid for sampling.
 
-    A slot is valid if:
-    - it is within the active request range (`i_reqs < num_requests`)
-    - it is marked active (`active_mask_slice`)
-    - it is scheduled (`scheduled_slice != 0`)
-    - it has not finished (`seq_lens_now < req_num_tokens_slice`)
+    Determines which requests should receive sampled tokens based on multiple
+    conditions. A slot is valid for sampling only if all conditions are met.
+
+    Args:
+        i_reqs: Array of request indices [padded_num_reqs].
+        num_requests: Scalar with the actual number of active requests.
+        active_mask_slice: Boolean mask indicating which requests are active.
+        scheduled_slice: Number of tokens scheduled per request (0 = not scheduled).
+        seq_lens_now: Current sequence length for each request.
+        req_num_tokens_slice: Target token count for each request.
+
+    Returns:
+        Boolean mask [padded_num_reqs] where True indicates the request slot
+        should receive a sampled token.
+
+    Note:
+        A slot is valid if:
+        - it is within the active request range (i_reqs < num_requests)
+        - it is marked active (active_mask_slice)
+        - it is scheduled (scheduled_slice != 0)
+        - it has not finished (seq_lens_now < req_num_tokens_slice)
     """
     in_range = i_reqs < num_requests
     scheduled = scheduled_slice.astype(bool)
@@ -162,16 +178,52 @@ def _compute_sampling_valid_mask(
 
 
 def _device_put_tree_with_shardings(tree, shardings_tree):
+    """Place a PyTree on device with per-leaf shardings.
+
+    Args:
+        tree: PyTree to transfer to device.
+        shardings_tree: PyTree with same structure containing shardings.
+
+    Returns:
+        PyTree with all array leaves placed on device with their specified
+        shardings. Non-array leaves are passed through unchanged.
+    """
     return jax.tree_util.tree_map(lambda x, s: jax.device_put(x, s) if hasattr(x, "dtype") else x, tree, shardings_tree)
 
 
 def _device_put_tree_uniform(tree, sharding):
+    """Place a PyTree on device with uniform sharding for all leaves.
+
+    Args:
+        tree: PyTree to transfer to device.
+        sharding: Single sharding to apply to all array leaves.
+
+    Returns:
+        PyTree with all array leaves placed on device with the same sharding.
+    """
     leaves, treedef = jax.tree_util.tree_flatten(tree)
     shardings_tree = jax.tree_util.tree_unflatten(treedef, [sharding] * len(leaves))
     return _device_put_tree_with_shardings(tree, shardings_tree)
 
 
 def _tree_hash(tree):
+    """Compute a hash tree for debugging structure/shape/dtype changes.
+
+    Creates a PyTree with the same structure where each leaf is replaced
+    by a hash string encoding its type, shape, dtype, and sharding.
+
+    Args:
+        tree: PyTree to hash.
+
+    Returns:
+        PyTree with same structure where leaves are hash strings encoding
+        their original type, shape, dtype, and sharding information.
+
+    Note:
+        This is used for debugging recompilation issues by comparing hash
+        trees between compilation and execution to detect structural changes.
+    """
+
     def _map(p, x):
         p = key_path_to_str(p)
         maybe_info = (
@@ -209,6 +261,19 @@ def _tree_hash(tree):
 
 
 def _tree_hash_diff(orgin, new):
+    """Compare two hash trees and print differences.
+
+    Compares hash trees created by _tree_hash() and prints any paths
+    where the hashes differ, helping debug unexpected recompilations.
+
+    Args:
+        orgin: Original hash tree (typically from compilation).
+        new: New hash tree (typically from execution).
+
+    Returns:
+        PyTree of booleans indicating whether each leaf matches.
+    """
+
     def _map(p, t1, t2):
         p = key_path_to_str(p)
         oo = t1 == t2
@@ -300,6 +365,7 @@ class ExecutionManager:
         self,
         model: EasyDeLBaseModule,
         use_aot_forward: bool = True,
+        bind_graphstate_for_aot: bool = False,
         min_input_pad: int = 8,
         max_model_len: int = 2**13,
         max_num_reqs: int = 16,
@@ -311,11 +377,14 @@ class ExecutionManager:
 
         Args:
             model: The EasyDeL model instance.
-            mesh: JAX sharding mesh for distributed execution.
             use_aot_forward: Whether to use Ahead-of-Time (AOT) compilation for model
                 execution. When True (default), functions are pre-compiled for better
                 performance. When False, uses Just-In-Time (JIT) compilation with
                 the graph definition passed as a static argument.
+            bind_graphstate_for_aot: When True (AOT mode), compile model-step
+                executables with graphstate/graphother closed over as compile-time
+                constants. This can improve TPU kernel selection for concrete
+                weights, but may increase compilation/memory pressure. Default: False.
             min_input_pad: Minimum padding for inputs.
             max_model_len: Maximum model sequence length.
             max_num_reqs: Maximum number of requests.
@@ -330,6 +399,7 @@ class ExecutionManager:
         self.mesh = model.mesh
 
         self.use_aot_forward = use_aot_forward
+        self.bind_graphstate_for_aot = bool(bind_graphstate_for_aot)
         self.min_input_pad = min_input_pad
         self.max_model_len = max_model_len
         self.max_num_reqs = max_num_reqs
@@ -387,8 +457,8 @@ class ExecutionManager:
             graphdef=self.graphdef,
             empty_sharding=self._empty_sharding,
             use_aot_forward=self.use_aot_forward,
+            bind_graphstate_for_aot=self.bind_graphstate_for_aot,
             cache_capacity=self._cache_capacity,
-            maybe_implicit=self.maybe_implicit,
         )
         self._sampler_executor = SamplerExecutor(
             model=self.model,
@@ -396,10 +466,19 @@ class ExecutionManager:
             empty_sharding=self._empty_sharding,
             use_aot_forward=self.use_aot_forward,
             cache_capacity=self._cache_capacity,
-            maybe_implicit=self.maybe_implicit,
         )
 
-    def clear_cache(self):
+    def clear_cache(self) -> None:
+        """Clear all cached compiled functions.
+
+        Removes all cached compiled model and sampler functions, forcing
+        recompilation on subsequent calls. Also clears debug hash baselines.
+
+        Note:
+            This is called automatically at the start of compile() when using
+            AOT mode. May be called manually when model weights change
+            significantly or when freeing memory is needed.
+        """
         self._model_executor.clear_cache()
         self._sampler_executor.clear_cache()
         self._debug_baselines.clear()
@@ -451,6 +530,12 @@ class ExecutionManager:
         if graphother is not None:
             shardings = es.extract_shardings(self.graphother, self.mesh)
             self.graphother = _device_put_tree_with_shardings(graphother, shardings)
+
+        # AOT mode may capture graphstate/graphother as compile-time constants.
+        # In that configuration, cached model executables must be rebuilt when
+        # graphs change to avoid stale-weight execution.
+        if self.use_aot_forward and getattr(self._model_executor, "bind_graphstate_for_aot", False):
+            self._model_executor.clear_cache()
 
         # Clear cached baselines so future diagnostics re-hash with new weights.
         self._debug_baselines.clear()
@@ -670,12 +755,32 @@ class ExecutionManager:
         padded_num_reqs: int,
         inputs: StepFunctionInputs,
     ) -> ModelStepOutputs:
-        """Run the compiled model forward step and update `self.kv_pages`."""
+        """Run the compiled model forward step and update self.kv_pages.
 
+        Executes the pre-compiled model step function, computing hidden states
+        and logits while updating the KV cache with new attention states.
+
+        Args:
+            num_tokens: Number of tokens for bucket selection.
+            padded_num_reqs: Padded request count for bucket selection.
+            inputs: Consolidated step function inputs containing kv_pages,
+                batch_metadata, and other required tensors.
+
+        Returns:
+            ModelStepOutputs containing updated kv_pages, hidden_states, and
+            logits.
+
+        Note:
+            This method updates self.kv_pages in-place with the new cache state.
+            The returned outputs.kv_pages is the same reference. The method does
+            not block on completion, allowing the caller to pipeline work like
+            enqueuing sampling before synchronizing.
+        """
         model_fn = self._model_executor.get_compiled(num_tokens=num_tokens, padded_num_reqs=padded_num_reqs)
         # Do not block here: allow the caller to pipeline dependent work
         # (e.g. enqueue sampling) before synchronizing.
-        outputs = model_fn(self.graphstate, self.graphother, inputs.kv_pages, inputs.batch_metadata)
+        with forward_autotune_only():
+            outputs = model_fn(self.graphstate, self.graphother, inputs.kv_pages, inputs.batch_metadata)
         self.kv_pages = outputs.kv_pages
         return outputs
 
@@ -690,8 +795,32 @@ class ExecutionManager:
         logits: jax.Array,
         rng_key: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Run the compiled sampler step (no KV-cache mutation)."""
+        """Run the compiled sampler step (no KV-cache mutation).
 
+        Executes the pre-compiled sampler function, converting model logits
+        into sampled tokens based on sampling parameters in batch_metadata.
+
+        Args:
+            num_tokens: Number of tokens for bucket selection.
+            padded_num_reqs: Padded request count for bucket selection.
+            batch_metadata: Batch metadata containing sampling parameters
+                (temperature, top_k, top_p, min_p).
+            req_num_tokens_full: Target token count per request [max_num_reqs].
+            active_mask_full: Boolean mask for active requests [max_num_reqs].
+            logits: Model output logits [padded_num_reqs, vocab_size].
+            rng_key: JAX random key for stochastic sampling.
+
+        Returns:
+            Tuple of (updated_rng_key, sampled_tokens, valid_mask) where:
+            - updated_rng_key: New RNG key for next step.
+            - sampled_tokens: Generated token IDs [max_num_reqs], -1 for invalid.
+            - valid_mask: Boolean mask indicating valid samples [max_num_reqs].
+
+        Note:
+            This method does not block on completion, allowing the caller to
+            overlap host work while the device executes. The caller should
+            synchronize on the returned arrays when ready to use them.
+        """
         sampler_fn = self._sampler_executor.get_compiled(num_tokens=num_tokens, padded_num_reqs=padded_num_reqs)
         # Keep this non-blocking so the caller can overlap host work while the
         # device enqueues sampling behind the forward pass.
@@ -849,7 +978,26 @@ class ExecutionManager:
         num_computed_tokens_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,
     ) -> tuple[numpy.ndarray, int]:
-        """Rebuild slot_mapping tensor for ragged-page attention v2."""
+        """Compute slot mapping tensor for ragged-page attention v2.
+
+        Delegates to the batch preparer's implementation to build the slot
+        mapping that maps logical token positions to physical KV cache locations.
+
+        Args:
+            num_requests: Number of active requests.
+            scheduled: Number of tokens scheduled per request.
+            num_computed_tokens_cpu: Tokens already computed per request.
+            page_table_cpu: Page table mapping request/page to physical page.
+
+        Returns:
+            Tuple of (slot_mapping, total_pages) where slot_mapping has shape
+            [3, padded_num_slices] and total_pages is the number of pages
+            touched by this batch.
+
+        Note:
+            This is used only for v2 attention (self._use_slot_mapping=True).
+            For v3 attention, request_distribution is used instead.
+        """
         return self._batch_preparer._compute_slot_mapping_v2(
             num_requests=num_requests,
             scheduled=scheduled,
@@ -886,6 +1034,40 @@ class ExecutionManager:
         pixel_values_videos: numpy.ndarray | None = None,
         video_grid_thw: numpy.ndarray | None = None,
     ) -> tuple[BatchMetadata, jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Prepare batch metadata using CPU-first computation.
+
+        Delegates to the batch preparer to build all metadata on CPU and
+        transfer to device in a single consolidated device_put call.
+
+        Args:
+            num_tokens_static: Static token count for bucket selection.
+            scheduled_full_cpu: Tokens scheduled per request (CPU array).
+            active_mask_full_cpu: Boolean mask for active requests (CPU array).
+            input_ids_buf: Device buffer for input token IDs.
+            position_ids_buf: Device buffer for position IDs.
+            token_ids_cpu: All token IDs for all requests (CPU array).
+            num_computed_tokens_cpu: Computed tokens per request (CPU array).
+            temperature_cpu: Temperature per request (CPU array).
+            top_p_cpu: Top-p per request (CPU array).
+            top_k_cpu: Top-k per request (CPU array).
+            min_p_cpu: Min-p per request (CPU array).
+            page_table_cpu: Page table (CPU array).
+            padded_num_reqs_in: Requested padding for request count.
+            page_table_version: Optional version for page table caching.
+            mrope_position_ids_cpu: Optional mRoPE positions for VLMs.
+            prefill_embeds_cpu: Optional prefill embeddings for VLMs.
+            prefill_embeds_mask_cpu: Optional mask for prefill embeddings.
+            visual_pos_masks_cpu: Optional visual position masks.
+            deepstack_visual_embeds_cpu: Optional DeepStack visual embeddings.
+            pixel_values: Optional raw image pixel values.
+            image_grid_thw: Optional image grid shape.
+            pixel_values_videos: Optional raw video pixel values.
+            video_grid_thw: Optional video grid shape.
+
+        Returns:
+            Tuple of (batch_metadata, input_ids_buf, position_ids_buf,
+            scheduled_full_dev, active_mask_full_dev) ready for model execution.
+        """
         return self._batch_preparer.prepare_batch_metadata(
             num_tokens_static=num_tokens_static,
             scheduled_full_cpu=scheduled_full_cpu,
@@ -929,6 +1111,30 @@ class ExecutionManager:
         padded_num_reqs_in: int,
         page_table_version: int | None = None,
     ) -> None:
+        """Start async device transfer for double-buffered batch preparation.
+
+        Initiates an asynchronous device transfer for the next batch's metadata
+        while the current batch is being processed.
+
+        Args:
+            num_tokens_static: Static token count for the next batch.
+            scheduled_full_cpu: Tokens scheduled per request.
+            active_mask_full_cpu: Active request mask.
+            input_ids_buf: Device buffer for input IDs (unused, for API compat).
+            position_ids_buf: Device buffer for positions (unused, for API compat).
+            token_ids_cpu: Token IDs for all requests.
+            num_computed_tokens_cpu: Computed tokens per request.
+            temperature_cpu: Temperature per request.
+            top_p_cpu: Top-p per request.
+            top_k_cpu: Top-k per request.
+            min_p_cpu: Min-p per request.
+            page_table_cpu: Page table for all requests.
+            padded_num_reqs_in: Requested padding for request count.
+            page_table_version: Optional version for page table caching.
+
+        Note:
+            Call get_async_prep_result() to retrieve the prepared metadata.
+        """
         self._batch_preparer.start_async_prep(
             num_tokens_static=num_tokens_static,
             scheduled_full_cpu=scheduled_full_cpu,
@@ -955,6 +1161,18 @@ class ExecutionManager:
         ]
         | None
     ):
+        """Retrieve results from a previously started async batch preparation.
+
+        Completes an async prep operation started by start_async_prep().
+
+        Returns:
+            If an async prep was pending, returns a tuple of:
+            - (batch_metadata, input_ids_buf, position_ids_buf,
+               scheduled_full_dev, active_mask_full_dev)
+            - Metadata dict with timing and configuration information
+
+            If no async prep was pending, returns None.
+        """
         return self._batch_preparer.get_async_prep_result()
 
     def get_compiled_key(self, num_tokens: int, padded_num_reqs: int):
@@ -1113,13 +1331,3 @@ class ExecutionManager:
         )
 
         return [self.graphdef, self.graphstate, self.graphother, inputs]
-
-    @property
-    def maybe_implicit(self):
-        def no_implicit(fn):
-            return fn
-
-        if self.model.is_quantized:
-            return implicit
-
-        return no_implicit

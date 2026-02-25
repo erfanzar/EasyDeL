@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -469,7 +469,7 @@ def refine_graphs(*graphs: dict) -> nnx.State:
     return nnx.merge_state(*_state_creators)
 
 
-def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
+def merge_state_and_tree(tree: dict, state: nnx.State, *, silence: bool = False) -> nnx.State:
     """
     Attaches a parameter tree to an nnx state.
 
@@ -488,6 +488,7 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
     Args:
         tree: The parameter tree to attach.
         state: The nnx state to attach the tree to.
+        silence: Suppress missing-parameter warnings.
 
     Returns:
         nnx.State: The updated nnx state with the attached parameter tree.
@@ -503,7 +504,7 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
         tree_values = tree.get(keys, None)
         if tree_values is not None:
             params[keys].value = tree_values
-        else:
+        elif not silence:
             if keys[-1] != "bias":
                 _path = ".".join([str(k) for k in keys])
                 logger.info(f"a parameter's missing at {_path}, please double check.")
@@ -517,7 +518,7 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
     return state
 
 
-def merge_model_and_tree(model: M, tree: dict) -> M:
+def merge_model_and_tree(model: M, tree: dict, *, silence: bool = False) -> M:
     """
     Attaches a parameter tree to an nnx model.
 
@@ -536,12 +537,13 @@ def merge_model_and_tree(model: M, tree: dict) -> M:
     Args:
         tree: The parameter tree to attach.
         model: The nnx model to attach the tree to.
+        silence: Suppress missing-parameter warnings.
 
     Returns:
         nnx.Module: The updated nnx model with the attached parameter tree.
     """
     graphdef, graphstate = nnx.split(model)
-    graphstate = merge_state_and_tree(tree=tree, state=graphstate)
+    graphstate = merge_state_and_tree(tree=tree, state=graphstate, silence=silence)
     return nnx.merge(graphdef, graphstate)
 
 

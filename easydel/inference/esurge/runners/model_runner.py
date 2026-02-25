@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -69,7 +69,7 @@ import numpy as np
 from eformer.loggings import get_logger
 from jax import numpy as jnp
 
-from easydel.layers.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
+from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
 
 from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
@@ -185,13 +185,33 @@ class eSurgeRunner:
         max_num_seqs: int = 16,
         max_num_seq_buckets: list[int] | None = None,
         use_aot_forward: bool = True,
+        bind_graphstate_for_aot: bool = False,
         verbose: bool = False,
         enable_overlap_execution: bool = False,
         enable_sampler_metrics: bool = False,
     ):
+        """Initialize the model runner.
+
+        Args:
+            model: EasyDeL model instance.
+            hbm_utilization: Target cache-memory utilization ratio.
+            page_size: KV page size used by cache metadata.
+            max_model_len: Maximum sequence length.
+            min_input_pad: Minimum request-count bucket.
+            min_token_pad: Optional minimum token bucket size.
+            max_num_seqs: Maximum concurrent sequences.
+            max_num_seq_buckets: Optional explicit request-count buckets.
+            use_aot_forward: Whether to use AOT compilation.
+            bind_graphstate_for_aot: Whether model-step AOT executables
+                capture graphstate/graphother as compile-time constants.
+                Default: False.
+            verbose: Enable verbose execution logs.
+            enable_overlap_execution: Enable overlap execution path.
+            enable_sampler_metrics: Enable sampler-side metrics.
+        """
+        self.model = model.esurge_compatible_model
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
         logger.debug(f"Configuration: {hbm_utilization=}, {page_size=}")
-        self.model = model.esurge_compatible_model
 
         backend = jax.default_backend()
         attn_mechanism = getattr(self.model.config.get_text_config(), "attn_mechanism", None)
@@ -199,6 +219,11 @@ class eSurgeRunner:
             logger.warning(
                 "GPU backend detected: `unified_attention` is preferred for eSurge inference; "
                 f"got attn_mechanism={attn_mechanism!r}."
+            )
+        elif backend != "gpu" and attn_mechanism == "paged_flash_attention":
+            logger.warning(
+                "Paged flash attention is CUDA-only; falling back to non-CUDA backends may fail. "
+                f"got backend={backend!r}."
             )
         elif backend == "tpu" and attn_mechanism == "unified_attention":
             logger.warning(
@@ -211,7 +236,10 @@ class eSurgeRunner:
                 f"got attn_mechanism={attn_mechanism!r}."
             )
 
-        if getattr(self.model.config.get_text_config(), "attn_mechanism", None) == "unified_attention":
+        if getattr(self.model.config.get_text_config(), "attn_mechanism", None) in (
+            "unified_attention",
+            "paged_flash_attention",
+        ):
             self.metadata = self.model.create_unified_attention_cache_config(
                 hbm_utilization=hbm_utilization,
                 page_size=page_size,
@@ -245,6 +273,7 @@ class eSurgeRunner:
         self.executor_manager = ExecutionManager(
             model=self.model,
             use_aot_forward=use_aot_forward,
+            bind_graphstate_for_aot=bind_graphstate_for_aot,
             min_input_pad=self.min_input_pad,
             max_model_len=max_model_len,
             max_num_reqs=self.max_num_reqs,
@@ -269,10 +298,20 @@ class eSurgeRunner:
 
     @property
     def mesh(self):
+        """Get the JAX sharding mesh from the model.
+
+        Returns:
+            The JAX mesh used for distributed execution.
+        """
         return self.model.mesh
 
     @property
     def _empty_sharding(self):
+        """Get empty sharding for replicated arrays.
+
+        Returns:
+            NamedSharding with empty PartitionSpec for fully replicated arrays.
+        """
         return jax.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
 
     @staticmethod
@@ -311,6 +350,16 @@ class eSurgeRunner:
 
     @staticmethod
     def _get_request_paddings(min_bucket: int, max_bucket: int) -> list[int]:
+        """Generate request count buckets using exponential growth.
+
+        Args:
+            min_bucket: Minimum bucket size.
+            max_bucket: Maximum bucket size (must be included).
+
+        Returns:
+            List of bucket sizes from min_bucket to max_bucket,
+            doubling at each step.
+        """
         min_bucket = max(1, min(min_bucket, max_bucket))
         buckets: list[int] = []
         current = min_bucket
@@ -327,6 +376,16 @@ class eSurgeRunner:
         max_num_seqs: int,
         min_input_pad: int,
     ) -> list[int]:
+        """Initialize sequence count buckets for compilation.
+
+        Args:
+            user_buckets: Optional user-provided bucket sizes.
+            max_num_seqs: Maximum number of sequences.
+            min_input_pad: Minimum input padding.
+
+        Returns:
+            Sorted list of bucket sizes, always including max_num_seqs.
+        """
         if user_buckets:
             buckets = sorted({int(b) for b in user_buckets if 0 < int(b) <= max_num_seqs})
         else:
@@ -404,6 +463,26 @@ class eSurgeRunner:
         num_tokens_static: int,
         uses_mrope_model: bool,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, list[np.ndarray] | None]:
+        """Get or create cached CPU buffers for VLM prefill data.
+
+        Retrieves pre-allocated CPU buffers for VLM embedding overrides,
+        keyed by num_tokens_static to avoid repeated allocations while
+        keeping the step function input shape stable.
+
+        Args:
+            num_tokens_static: Token count bucket size for buffer sizing.
+            uses_mrope_model: Whether the model uses mRoPE positions.
+
+        Returns:
+            Tuple of (prefill_embeds_cpu, prefill_embeds_mask_cpu,
+            mrope_position_ids_cpu, visual_pos_masks_cpu,
+            deepstack_visual_embeds_cpu) where optional arrays are
+            None if not applicable.
+
+        Side Effects:
+            - Creates and caches buffers in self._vlm_cpu_buffers.
+            - Clears masks/position buffers each call (filled by caller).
+        """
         num_tokens_static = int(num_tokens_static)
         cached = self._vlm_cpu_buffers.get(num_tokens_static)
         if cached is None:
@@ -463,6 +542,23 @@ class eSurgeRunner:
         precompile_allowed_mask: bool = False,
         allowed_max: int = 512,
     ) -> None:
+        """Precompile JIT helper kernels for various input configurations.
+
+        Compiles auxiliary JIT functions (pack_prompts, build_sampling_arrays,
+        fill_slice, swap_rows, move_row, build_allowed_mask) for different
+        request and prompt length combinations to avoid runtime compilation.
+
+        Args:
+            reqs_padds: List of request count bucket sizes to compile.
+            prompt_len_buckets: List of prompt length bucket sizes to compile.
+            precompile_allowed_mask: Whether to compile allowed mask kernel.
+            allowed_max: Maximum allowed token count for constrained decoding.
+
+        Note:
+            Compilation failures are logged at debug level and skipped,
+            allowing partial precompilation when some configurations are
+            not supported by the underlying kernels.
+        """
         logger.info("Precompiling eSurgeRunner helper kernels")
 
         B = self.max_num_reqs
@@ -772,11 +868,37 @@ class eSurgeRunner:
             This method is called at the beginning of each execution cycle
             to ensure the runner's state matches the scheduler's decisions.
         """
+        dp_size = int(getattr(self.metadata, "data_parallel_size", 1) or 1)
+        use_dp_local_rows = (
+            dp_size > 1
+            and int(self.sequence_buffer.max_num_reqs) > 0
+            and int(self.sequence_buffer.max_num_reqs) % dp_size == 0
+        )
+        rows_per_shard = int(self.sequence_buffer.max_num_reqs) // dp_size if use_dp_local_rows else 0
+        pages_per_shard = int(getattr(self.metadata, "num_pages", 0) or 0) // dp_size if use_dp_local_rows else 0
+
+        def infer_req_shard(page_ids: tuple[list[int], ...]) -> int | None:
+            if not use_dp_local_rows or pages_per_shard <= 0:
+                return None
+            inferred: int | None = None
+            for group_ids in page_ids:
+                for pid in group_ids:
+                    # 0 is reserved for null/padding page in page pool.
+                    if int(pid) <= 0:
+                        continue
+                    shard = min(int(pid) // pages_per_shard, dp_size - 1)
+                    if inferred is None:
+                        inferred = shard
+                    elif inferred != shard:
+                        return None
+            return inferred
+
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
 
         # 2) Remove finished from sequence buffer (functional)
         removed_req_indices: list[int] = []
+        removed_req_index_by_id: dict[str, int] = {}
         for req_id in scheduler_output.finished_req_ids:
             req_index = self.sequence_buffer.remove_request(req_id)
             if req_index is not None:
@@ -790,6 +912,7 @@ class eSurgeRunner:
             req_index = self.sequence_buffer.remove_request(req_id)
             if req_index is not None:
                 removed_req_indices.append(req_index)
+                removed_req_index_by_id[req_id] = req_index
 
         # 4) Add new requests to tracking
         req_ids_to_add: list[str] = []
@@ -862,18 +985,73 @@ class eSurgeRunner:
             self.sequence_buffer.page_table.append_rows_batch(pages_per_req, indices)
 
         # 6) Add new / reinserted requests
-        # Sort in reverse order and pop() to get highest indices first (avoid reusing index 0/1)
-        # This prevents KV cache corruption from repeatedly reusing low indices
-        removed_req_indices = sorted(removed_req_indices, reverse=True)
+        # Prefer stable index reuse (same request index when possible), and under
+        # DP-local page sharding, try to keep request rows in the shard range that
+        # matches their current page IDs.
+        removed_pool = set(removed_req_indices)
+
+        def _find_reuse_index_in_shard(shard_idx: int) -> int | None:
+            if not use_dp_local_rows:
+                return None
+            lo = int(shard_idx) * rows_per_shard
+            hi = lo + rows_per_shard
+
+            shard_removed = [ix for ix in removed_pool if lo <= int(ix) < hi]
+            if shard_removed:
+                return max(shard_removed)
+
+            req_slots = self.sequence_buffer.req_ids
+            for ix in range(lo, hi):
+                if ix >= len(req_slots) or req_slots[ix] is None:
+                    return ix
+            return None
+
         for req_id in req_ids_to_add:
             req_state = self.requests[req_id]
-            # Pop() from reverse-sorted list gives highest index first
-            reuse_index = removed_req_indices.pop() if removed_req_indices else None
+            reuse_index = removed_req_index_by_id.pop(req_id, None)
+            if reuse_index is not None and reuse_index not in removed_pool:
+                reuse_index = None
+
+            target_shard = infer_req_shard(req_state.page_ids)
+            if target_shard is not None and use_dp_local_rows:
+                lo = target_shard * rows_per_shard
+                hi = lo + rows_per_shard
+
+                if reuse_index is not None and not (lo <= int(reuse_index) < hi):
+                    logger.warning(
+                        "Dropping out-of-shard row reuse for req %s: reuse_index=%s target_shard=%s range=[%s,%s).",
+                        req_id,
+                        reuse_index,
+                        target_shard,
+                        lo,
+                        hi,
+                    )
+                    reuse_index = None
+
+                if reuse_index is None:
+                    reuse_index = _find_reuse_index_in_shard(target_shard)
+
+                # Preserve DP-local block-table invariants: a request that already
+                # owns shard-local pages must never be inserted into a different
+                # row shard. If no row is available in this shard, surface a hard
+                # error so scheduler/accounting can be fixed.
+                if reuse_index is None:
+                    raise RuntimeError(
+                        "No free sequence row available in target DP shard for request insertion. "
+                        f"req_id={req_id} shard={target_shard} rows_per_shard={rows_per_shard} "
+                        f"removed_pool_size={len(removed_pool)}."
+                    )
+
+            if reuse_index is None and removed_pool:
+                reuse_index = max(removed_pool)
+
+            if reuse_index is not None:
+                removed_pool.discard(reuse_index)
             self.sequence_buffer.add_request(req_state, reuse_index)
 
         # 7) Condense to remove holes
-        if removed_req_indices:
-            self.sequence_buffer.condense(removed_req_indices)
+        if removed_pool and not use_dp_local_rows:
+            self.sequence_buffer.condense(sorted(removed_pool))
 
         # Drop cached VLM prompt helpers once prefill is complete to free host RAM.
         for req_state in self.requests.values():
@@ -994,7 +1172,19 @@ class eSurgeRunner:
         return placeholder_req_id_to_index
 
     def _reorder_decode_first(self, scheduler_output: SchedulerOutput) -> None:
-        """Reorder active requests so decode tokens are placed first."""
+        """Reorder active requests so decode requests are placed first.
+
+        Partitions the request buffer so all decode requests (single token,
+        with computed tokens > 0) appear before prefill requests. This ordering
+        matches the TPU runner behavior and enables optimized v3 attention
+        with request distribution.
+
+        Args:
+            scheduler_output: Used to determine scheduled tokens per request.
+
+        Side Effects:
+            - Modifies sequence_buffer ordering via swap_states().
+        """
         i, j = 0, self.sequence_buffer.num_reqs - 1
         while i < j:
             i_req_id = self.sequence_buffer.req_ids[i]
@@ -1066,13 +1256,15 @@ class eSurgeRunner:
         prev_async_time = time.time() - prev_async_start
 
         # Align ordering with TPU runner: decode requests first.
-        if self.sequence_buffer.num_reqs > 1:
+        dp_size = int(getattr(self.metadata, "data_parallel_size", 1) or 1)
+        if self.sequence_buffer.num_reqs > 1 and dp_size <= 1:
             self._reorder_decode_first(scheduler_output)
 
         if not scheduler_output.total_num_scheduled_tokens:
             return ModelRunnerOutput(
                 req_ids=[],
                 req_id_to_index={},
+                req_id_to_row_index={},
                 sampled_token_ids=[],
                 spec_token_ids=None,
                 logprobs=None,
@@ -1113,9 +1305,9 @@ class eSurgeRunner:
         )
         uses_mrope_model = model_uses_mrope(self.model)
 
-        while start_index < self.sequence_buffer.num_reqs:
+        while start_index < self.sequence_buffer.num_slots:
             host_start = time.time()
-            num_reqs_total = self.sequence_buffer.num_reqs
+            num_reqs_total = self.sequence_buffer.num_slots
             scheduled_list: list[int] = []
             req_ids_window = []
             for i in range(start_index, min(num_reqs_total, start_index + self.num_reqs_max_model_len)):
@@ -1129,7 +1321,8 @@ class eSurgeRunner:
 
             num_reqs = len(scheduled_list)
             if num_reqs == 0:
-                break
+                start_index += self.num_reqs_max_model_len
+                continue
             end_index = start_index + num_reqs
 
             total_scheduled = sum(scheduled_list)
@@ -1201,7 +1394,7 @@ class eSurgeRunner:
                         continue
 
                     req_state = self.requests.get(rid)
-                    start_tok = int(self.sequence_buffer.num_computed_tokens[req_idx])
+                    start_tok = int(self.sequence_buffer.num_computed_tokens[start_index + req_idx])
                     end_tok = start_tok + n
 
                     if uses_mrope_model and mrope_position_ids_cpu is not None:
@@ -1276,6 +1469,46 @@ class eSurgeRunner:
             # Get page table as CPU array (already on CPU, no transfer needed)
             page_table_cpu = self.sequence_buffer.page_table[0].get_cpu_tensor()
             page_table_version = getattr(self.sequence_buffer.page_table[0], "cpu_version", None)
+
+            # Preflight check: surface req_id + row details for DP-local page mismatches.
+            if dp_size > 1:
+                total_pages = int(getattr(self.metadata, "num_pages", 0) or 0)
+                page_size = max(1, int(getattr(self.metadata, "page_size", 1)))
+                if total_pages > 0 and total_pages % dp_size == 0 and self.num_reqs_max_model_len % dp_size == 0:
+                    rows_per_shard = self.num_reqs_max_model_len // dp_size
+                    pages_per_shard = total_pages // dp_size
+                    for local_req_idx in range(num_reqs):
+                        seq_len = int(self.sequence_buffer.num_computed_tokens[start_index + local_req_idx]) + int(
+                            scheduled_list[local_req_idx]
+                        )
+                        if seq_len <= 0:
+                            continue
+                        page_cnt = min((seq_len + page_size - 1) // page_size, int(page_table_cpu.shape[1]))
+                        row = np.asarray(page_table_cpu[start_index + local_req_idx, :page_cnt], dtype=np.int32)
+                        row = row[row != 0]
+                        if row.size == 0:
+                            continue
+                        global_req_idx = start_index + local_req_idx
+                        req_shard = min(global_req_idx // rows_per_shard, dp_size - 1)
+                        page_lo = req_shard * pages_per_shard
+                        page_hi = page_lo + pages_per_shard
+                        invalid = row[(row < page_lo) | (row >= page_hi)]
+                        if invalid.size:
+                            req_id_dbg = req_ids_window[local_req_idx]
+                            logger.error(
+                                "Pre-execute DP-local mismatch: row=%s req_id=%s req_shard=%s range=[%s, %s) "
+                                "sample_bad_page=%s pages_preview=%s scheduled=%s computed=%s",
+                                local_req_idx,
+                                req_id_dbg,
+                                req_shard,
+                                page_lo,
+                                page_hi,
+                                int(invalid[0]),
+                                row[:8].tolist(),
+                                int(scheduled_list[local_req_idx]),
+                                int(self.sequence_buffer.num_computed_tokens[start_index + local_req_idx]),
+                            )
+                            break
             total_runner_host_time += time.time() - host_start
             step_start = time.time()
             (
@@ -1449,6 +1682,12 @@ class eSurgeRunner:
             f"total={total_time * 1e3:.2f}ms"
         )
 
+        req_id_to_row_index = {
+            rid: int(req_idx)
+            for rid in req_ids_all
+            if (req_idx := self.sequence_buffer.req_id_to_index.get(rid)) is not None
+        }
+
         # Handle async scheduling return
         if scheduler_output.async_scheduling:
             # Set placeholders for current batch
@@ -1475,6 +1714,7 @@ class eSurgeRunner:
             return ModelRunnerOutput(
                 req_ids=req_ids_all,
                 req_id_to_index=req_id_to_out_index,
+                req_id_to_row_index=req_id_to_row_index,
                 sampled_token_ids=[],  # Empty, will be filled in next iteration
                 spec_token_ids=None,
                 logprobs=None,
@@ -1489,6 +1729,7 @@ class eSurgeRunner:
         return ModelRunnerOutput(
             req_ids=req_ids_all,
             req_id_to_index=req_id_to_out_index,
+            req_id_to_row_index=req_id_to_row_index,
             sampled_token_ids=sampled_token_ids_all,
             spec_token_ids=None,
             logprobs=None,
@@ -1499,6 +1740,24 @@ class eSurgeRunner:
         )
 
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
+        """Execute the model synchronously on scheduled requests.
+
+        Main public entry point for model execution. Delegates to the internal
+        implementation which handles state synchronization, batch processing,
+        and token generation.
+
+        Args:
+            scheduler_output: Output from the scheduler containing requests to
+                process, tokens to generate per request, and lifecycle information.
+
+        Returns:
+            ModelRunnerOutput containing request IDs, sampled tokens, and optional
+            log probabilities and timing information.
+
+        Note:
+            This is the synchronous version. For async execution that allows
+            overlapping with scheduling, use execute_model_async() instead.
+        """
         return self._execute_model_impl(scheduler_output)
 
     def execute_model_async(self, scheduler_output: SchedulerOutput) -> Future[ModelRunnerOutput]:

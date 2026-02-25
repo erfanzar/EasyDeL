@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -54,11 +54,12 @@ import warnings
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from functools import lru_cache, partial
 
 import jax
 import jax.extend
+import jax.numpy as jnp
 import jax.tree_util
 import numpy as np
 from eformer.escale import with_sharding_constraint
@@ -69,8 +70,7 @@ from flax import nnx as nn
 from jaxtyping import Array, DTypeLike, PRNGKeyArray
 from tqdm.auto import tqdm
 
-from easydel.layers.linear import ParallelLinear
-from easydel.layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer
+from easydel.layers import EasyQuantizer, ParallelLinear, QuantizationConfig
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
@@ -345,16 +345,14 @@ def block_wise_ffn(remat_ffn: tp.Callable, inputs: jax.Array, chunk_size: int) -
         if generating:
             return remat_ffn(inputs)
         else:
-            return rearrange(
-                jax.lax.scan(
-                    f=lambda carry, idx: (carry.at[:, idx].set(remat_ffn(carry[:, idx])), None),
-                    init=rearrange(inputs, "b (c n) d -> b c n d", c=chunk_size),
-                    xs=jax.numpy.arange(chunk_size),
-                    length=chunk_size,
-                    unroll=True,
-                )[0],
-                "b c n d -> b (c n) d",
+            inputs_chunked = rearrange(inputs, "b (c n) d -> c b n d", n=chunk_size)
+            _, outputs = jax.lax.scan(
+                f=lambda carry, x: (carry, remat_ffn(x)),
+                init=jnp.array(0, dtype=jnp.int32),
+                xs=inputs_chunked,
+                unroll=True,
             )
+            return rearrange(outputs, "c b n d -> b (c n) d")
     except Exception as e:
         raise EasyDeLBlockWiseFFNError(
             "You Are using BlockWise FFN from near-infinite-context length paper and you might be passing "
@@ -384,7 +382,7 @@ def quantize_linear_layers(
     model: nn.Module,
     /,
     *,
-    quantization_config: EasyDeLQuantizationConfig | None = None,
+    quantization_config: QuantizationConfig | None = None,
     verbose: bool = True,
 ) -> nn.Module:
     """
@@ -392,7 +390,7 @@ def quantize_linear_layers(
 
     Args:
         model: The model to quantize.
-        quantization_config: Quantization config specifying dtype, block_size, and pattern.
+        quantization_config: Quantization config specifying dtype, group_size, and pattern.
         verbose: Whether to use tqdm for logging.
 
     Returns:
@@ -402,7 +400,7 @@ def quantize_linear_layers(
         return model
 
     quantizer = EasyQuantizer(quantization_config=quantization_config)
-    return quantizer.quantize_linears(model, verbose=verbose)
+    return quantizer.apply_quantization(model, verbose=verbose)
 
 
 def apply_lora_to_layers(
@@ -563,8 +561,21 @@ def apply_sparsity_to_params(
     }.get(sparsify_module, None)
     assert sparser is not None, f"unkown type of sparser {sparsify_module}"
 
+    def _path_to_str(path):
+        path_keys = []
+        for key in path:
+            if hasattr(key, "key"):
+                path_keys.append(str(key.key))
+            elif hasattr(key, "name"):
+                path_keys.append(str(key.name))
+            elif hasattr(key, "idx"):
+                path_keys.append(str(key.idx))
+            else:
+                path_keys.append(str(key))
+        return ".".join(path_keys)
+
     def filter_params(path, array):
-        layer_name = ".".join(path[0].key)
+        layer_name = _path_to_str(path)
         if layer_name.endswith("kernel") and 4 > array.ndim > 1:
             array = sparser.fromdense(array)
         return array
@@ -577,7 +588,7 @@ def apply_sparsity_to_params(
     ) as pbar:
 
         def _with_progress(path, array):
-            pbar.set_postfix_str(".".join(path[0].key))
+            pbar.set_postfix_str(_path_to_str(path))
             result = filter_params(path, array)
             pbar.update(1)
             return result
@@ -610,7 +621,7 @@ def extract_static_parameters(module):
         "mode",
     ]
     obj = getattr(module, "__call__", None)  # noqa
-    if isinstance(obj, types.FunctionType | types.MethodType):
+    if isinstance(obj, (types.FunctionType, types.MethodType)):
         static_args = ()
         signature = inspect.signature(obj)
         for idx, (param_name, _param) in enumerate(signature.parameters.items()):
@@ -715,7 +726,7 @@ def auto_remat(
         if len(modules) == 1:
             return modules[0]
         return modules
-    if isinstance(policy, str | EasyDeLGradientCheckPointers):
+    if isinstance(policy, (str, EasyDeLGradientCheckPointers)):
         policy = get_gradient_checkpoint_policy(policy, save_names, exclude_names)
     elif not callable(policy):
         raise ValueError(f"Invalid policy type: {type(policy)}")
@@ -1189,7 +1200,7 @@ class CompilationTracker:
             yield
 
 
-class ActivationType(str, Enum):
+class ActivationType(StrEnum):
     GELU = "gelu"
     RELU = "relu"
     SILU = "silu"
@@ -1227,7 +1238,7 @@ def flop_activation(activation_type: ActivationType, dim: int) -> float:
     return flops_per_element.get(activation_type, 1) * dim
 
 
-class AttnMaskType(str, Enum):
+class AttnMaskType(StrEnum):
     FULL = "ATTN_MASK_FULL"
     SLIDING = "ATTN_MASK_SLIDING"
     CHUNK = "ATTN_MASK_CHUNK"
@@ -1273,7 +1284,7 @@ class AttnMaskDetail:
     bricks: int | None = None
 
 
-class TaskType(str, Enum):
+class TaskType(StrEnum):
     CAUSAL_LM = "causal-language-model"
     VISION_LM = "vision-language-model"
     DIFFUSION_LM = "diffusion-language-model"

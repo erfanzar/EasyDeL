@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -188,26 +188,31 @@ class InternLM2Config(EasyDeLBaseConfig):
             bits=bits,
             **kwargs,
         )
+        # Keep legacy InternLM2 remote-code expectation:
+        # `rope_scaling` is a property alias to `rope_parameters` in transformers>=5.
+        # InternLM2 remote-code expects either:
+        #   - None
+        #   - {"type": ..., "factor": ...}
+        if rope_scaling is None:
+            object.__setattr__(self, "rope_parameters", None)
+        elif isinstance(rope_scaling, dict):
+            legacy_rope_scaling = dict(rope_scaling)
+            if "rope_type" in legacy_rope_scaling and "type" not in legacy_rope_scaling:
+                legacy_rope_scaling["type"] = legacy_rope_scaling["rope_type"]
+            object.__setattr__(self, "rope_parameters", legacy_rope_scaling)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"tok_embeddings/embedding", pmag.resolve(ColumnWise)),
-            (r"attention/wqkv/kernel", pmag.resolve(ColumnWise)),
-            (r"attention/wo/kernel", pmag.resolve(RowWise)),
-            (r"feed_forward/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
-            (r"feed_forward/w2/kernel", pmag.resolve(RowWise)),
-            (r".*/(attention_norm|ffn_norm|norm)/kernel", pmag.resolve(Replicated)),
-            (r"output/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*/(wqkv|wo|w1|w3|w2|output|score)/bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     @property
     def granted_freq_max_position_embedding(self) -> int:

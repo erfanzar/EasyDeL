@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,6 +24,16 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
@@ -34,27 +44,18 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
-from easydel.layers.caching import (
-    HybridCache,
-    OperationsMetadata,
-    RaggedPagesCache,
-    RaggedPagesCacheView,
-    RaggedPagesMetadata,
-    TransformerCache,
-    TransformerCacheView,
-    TransformerMetadata,
-)
-from easydel.layers.linear import ColumnParallelLinear
-from easydel.layers.moe import (
+from easydel.layers import (
     BaseMoeModule,
+    ColumnParallelLinear,
     ColumnParallelMoELinear,
+    Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    RMSNorm,
     RowParallelMoELinear,
 )
-from easydel.layers.norms import RMSNorm
+from easydel.layers.attention import UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .mixtral_configuration import MixtralConfig as MixtralConfig
 
@@ -114,16 +115,19 @@ class MixtralMoEMlp(nn.Module):
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
             "splits": [
-                {"name": "w1.kernel", "spliter": lambda x: x[..., : x.shape[-1] // 2]},
-                {"name": "w3.kernel", "spliter": lambda x: x[..., x.shape[-1] // 2 :]},
+                {"name": "w1.kernel", "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2)},
+                {"name": "w3.kernel", "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2)},
             ],
-            "inverse_spliter": lambda torch, gate, up: torch.stack((gate, up), dim=-1).flatten(-2),
+            "inverse_spliter": lambda torch, gate, up: torch.cat(
+                (gate.transpose(-1, -2), up.transpose(-1, -2)),
+                dim=1,
+            ),
         },
         "down_proj$": {
             "splits": [
-                {"name": "w2.kernel", "spliter": lambda x: x},
+                {"name": "w2.kernel", "spliter": lambda x: x.swapaxes(-1, -2)},
             ],
-            "inverse_spliter": lambda x: x,
+            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
         },
     }
 
@@ -306,6 +310,35 @@ class MixtralDecoderLayer(nn.Module):
     networks, using RMS normalization and residual connections.
     """
 
+    # Accept HF MoE tensor naming (`mlp.*`) directly during state-dict conversion
+    # so conversion does not depend on test-only key remaps.
+    reform_param: typing.ClassVar = {
+        "mlp.gate.weight$": {
+            "splits": [{"name": "block_sparse_moe.gate.kernel", "spliter": lambda x: x.swapaxes(-1, -2)}],
+            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
+        },
+        "mlp.experts.gate_up_proj$": {
+            "splits": [
+                {
+                    "name": "block_sparse_moe.experts.w1.kernel",
+                    "spliter": lambda x: x[:, : x.shape[1] // 2, :].swapaxes(-1, -2),
+                },
+                {
+                    "name": "block_sparse_moe.experts.w3.kernel",
+                    "spliter": lambda x: x[:, x.shape[1] // 2 :, :].swapaxes(-1, -2),
+                },
+            ],
+            "inverse_spliter": lambda torch, gate, up: torch.cat(
+                (gate.transpose(-1, -2), up.transpose(-1, -2)),
+                dim=1,
+            ),
+        },
+        "mlp.experts.down_proj$": {
+            "splits": [{"name": "block_sparse_moe.experts.w2.kernel", "spliter": lambda x: x.swapaxes(-1, -2)}],
+            "inverse_spliter": lambda x: x.swapaxes(-1, -2),
+        },
+    }
+
     def __init__(
         self,
         config: MixtralConfig,
@@ -457,7 +490,7 @@ class MixtralModel(EasyDeLBaseModule):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
-        embed_tokens (nn.Embed): Embedding layer for input tokens.
+        embed_tokens (Embed): Embedding layer for input tokens.
         layers (tp.List[MixtralDecoderLayer]): List of decoder layers.
         norm (RMSNorm): Final layer normalization.
         gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
@@ -489,13 +522,7 @@ class MixtralModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             config.vocab_size,
             config.hidden_size,
             dtype=dtype,
@@ -503,17 +530,19 @@ class MixtralModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
-            MixtralDecoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-                layer_idx=idx,
-            )
-            for idx in range(config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                MixtralDecoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                    layer_idx=idx,
+                )
+                for idx in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(
             dim=config.hidden_size,

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -64,6 +64,12 @@ from jax import numpy as jnp
 from jaxtyping import Array
 from transformers.generation.configuration_utils import GenerationConfig
 
+from easydel.caching import (
+    RaggedPagesCache,
+    RaggedPagesCacheConfig,
+    UnifiedAttentionCache,
+    UnifiedAttentionCacheConfig,
+)
 from easydel.inference.logits_process import (
     ForcedBOSTokenLogitsProcessor,
     ForcedEOSTokenLogitsProcessor,
@@ -77,12 +83,6 @@ from easydel.inference.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
-from easydel.layers.caching import (
-    RaggedPagesCache,
-    RaggedPagesCacheConfig,
-    UnifiedAttentionCache,
-    UnifiedAttentionCacheConfig,
-)
 
 from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutput
@@ -90,8 +90,8 @@ from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutpu
 if tp.TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
+    from easydel.caching import OperationsMetadata
     from easydel.inference.sampling_params import SamplingParams
-    from easydel.layers.caching import OperationsMetadata
 
 logger = get_logger(__name__)
 
@@ -167,6 +167,23 @@ class BeamSearchState:
 
 
 def _safepick(config, pickname):
+    """Safely retrieve an attribute from a config, falling back to text_config.
+
+    This utility function attempts to get an attribute from the given config object.
+    If the attribute is None or doesn't exist, it tries to retrieve it from the
+    config's text_config attribute (if present), which is common in multimodal models.
+
+    Args:
+        config: The configuration object to retrieve the attribute from.
+        pickname: The name of the attribute to retrieve.
+
+    Returns:
+        The attribute value if found, None otherwise.
+
+    Example:
+        >>> vocab_size = _safepick(model_config, "vocab_size")
+        >>> # If model_config.vocab_size is None, tries model_config.text_config.vocab_size
+    """
     vari = getattr(config, pickname, None)
     if vari is None and hasattr(config, "text_config"):
         vari = getattr(config.text_config, pickname, None)
@@ -174,6 +191,48 @@ def _safepick(config, pickname):
 
 
 class EasyGenerationMixin:
+    """Mixin class providing text generation capabilities for EasyDeL models.
+
+    This mixin adds comprehensive text generation functionality to model classes,
+    supporting multiple generation strategies including greedy search, sampling,
+    and beam search. It provides integration with HuggingFace's GenerationConfig
+    and includes specialized support for the eSurge high-performance inference engine.
+
+    The mixin handles:
+    - KV cache initialization and management for efficient autoregressive generation
+    - Multiple cache types: TransformerCache, HybridCache, RaggedPagesCache, UnifiedAttentionCache
+    - Logits processing and warping (temperature, top-k, top-p, etc.)
+    - Generation constraints (min/max length, forced tokens, n-gram repetition)
+    - Encoder-decoder model support
+    - eSurge continuous-batching inference engine integration
+
+    Attributes:
+        config_class: The configuration class type for this model.
+        config: The model's configuration instance.
+        base_model_prefix: The prefix used for the base model in state dicts.
+        _model_task: Optional task identifier for the model.
+        _model_type: Optional model type identifier.
+
+    Example:
+        >>> # Model class inherits from EasyGenerationMixin
+        >>> class MyModel(EasyGenerationMixin, nn.Module):
+        ...     pass
+        >>>
+        >>> # Generate text using the model
+        >>> output = model.generate(
+        ...     input_ids=input_ids,
+        ...     max_length=100,
+        ...     temperature=0.8,
+        ...     top_p=0.95,
+        ...     do_sample=True
+        ... )
+        >>> print(output.sequences)
+
+    Note:
+        This mixin expects the model to have a `__call__` method that accepts
+        `input_ids` and returns logits, as well as a `config` attribute.
+    """
+
     config_class: type[EasyDeLBaseConfig]
     config: EasyDeLBaseConfig
     base_model_prefix: str
@@ -252,7 +311,36 @@ class EasyGenerationMixin:
         hbm_utilization: float | None = None,
         max_model_length: int | None = None,
     ) -> UnifiedAttentionCache:
-        """Initialize and return the unified-attention paged KV cache tensors."""
+        """Initialize and return the unified-attention paged KV cache tensors.
+
+        Creates a UnifiedAttentionCache for use with vLLM-style unified attention
+        kernels. The cache layout matches ejkernel's Triton UnifiedAttention kernel:
+        `[num_blocks, block_size, num_kv_heads, head_dim]` for both K and V.
+
+        This method either uses a pre-existing UnifiedAttentionCacheConfig or creates
+        one using the provided parameters.
+
+        Args:
+            config: Optional pre-configured cache config. If provided, other
+                arguments are ignored.
+            page_size: Number of tokens per page. Required if config is None.
+            hbm_utilization: Target HBM memory utilization (0.0-1.0). Required
+                if config is None.
+            max_model_length: Maximum sequence length. Required if config is None.
+
+        Returns:
+            UnifiedAttentionCache: Initialized cache with allocated tensors.
+
+        Raises:
+            AssertionError: If config is None and required parameters are missing.
+
+        Example:
+            >>> cache = model.init_unified_attention_cache(
+            ...     page_size=128,
+            ...     hbm_utilization=0.9,
+            ...     max_model_length=4096
+            ... )
+        """
         text_config = self.config.get_text_config()
         if config is None:
             assert page_size is not None, "if your not passing config you should pass `page_size`"
@@ -303,7 +391,7 @@ class EasyGenerationMixin:
         Returns:
             TransformerCache or HybridCache depending on the model type.
         """
-        from easydel.layers.caching import TransformerCache
+        from easydel.caching import TransformerCache
 
         text_config = self.config.get_text_config()
         cache_type = self.get_inference_cache_type()
@@ -378,7 +466,7 @@ class EasyGenerationMixin:
         Returns:
             TransformerCacheConfig configured for the model.
         """
-        from easydel.layers.caching import TransformerCacheConfig
+        from easydel.caching import TransformerCacheConfig
 
         text_config = self.config.get_text_config()
 
@@ -464,7 +552,7 @@ class EasyGenerationMixin:
         Raises:
             ValueError: If intermediate_size cannot be inferred for certain architectures.
         """
-        from easydel.layers.caching import RecurrentCacheConfig
+        from easydel.caching import RecurrentCacheConfig
 
         text_config = self.config.get_text_config()
 
@@ -650,7 +738,7 @@ class EasyGenerationMixin:
         Raises:
             ValueError: If num_heads cannot be inferred from the model configuration.
         """
-        from easydel.layers.caching import KDACacheConfig
+        from easydel.caching import KDACacheConfig
 
         text_config = self.config.get_text_config()
 
@@ -699,7 +787,7 @@ class EasyGenerationMixin:
             LightningCacheConfig: Cache configuration for Lightning Attention layers.
         """
 
-        from easydel.layers.caching import LightningCacheConfig
+        from easydel.caching import LightningCacheConfig
 
         text_config = self.config.get_text_config()
 
@@ -759,7 +847,7 @@ class EasyGenerationMixin:
         Returns:
             RaggedPagesCacheConfig: Cache configuration for paged attention.
         """
-        from easydel.layers.caching import RaggedPagesCacheConfig
+        from easydel.caching import RaggedPagesCacheConfig
 
         text_config = self.config.get_text_config()
 
@@ -809,7 +897,7 @@ class EasyGenerationMixin:
         This cache layout matches ejkernel's Triton UnifiedAttention kernel:
         `[num_blocks, block_size, num_kv_heads, head_dim]` for both K and V.
         """
-        from easydel.layers.caching import UnifiedAttentionCacheConfig
+        from easydel.caching import UnifiedAttentionCacheConfig
 
         text_config = self.config.get_text_config()
 
@@ -827,7 +915,6 @@ class EasyGenerationMixin:
                 head_dim = hidden_size // num_heads
 
         num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
-
         return UnifiedAttentionCacheConfig.create(
             mesh=text_config.mesh,
             partition_manager=text_config.partition_manager,
@@ -851,7 +938,41 @@ class EasyGenerationMixin:
         ragged_config=None,
         unified_config=None,
     ):
-        from easydel.layers.caching import (
+        """Initialize cache configurations for each layer based on operation types.
+
+        This method creates a list of cache configurations, one per layer, based on
+        the cache view type determined by `get_operations_cache_view()`. Each layer
+        gets the appropriate config type for its operation (attention, recurrent, etc.).
+
+        Args:
+            batch_size: Batch size for inference.
+            max_length: Maximum sequence length.
+            page_size: Page size for RaggedPagesCache. Defaults to 128.
+            hbm_utilization: HBM utilization for paged caches. Defaults to 0.9.
+            dtype: Data type for cache tensors. If None, uses model's kvdtype.
+            ragged_config: Optional pre-configured RaggedPagesCacheConfig. If None
+                and needed, one will be created.
+            unified_config: Optional pre-configured UnifiedAttentionCacheConfig.
+                If None and needed, one will be created.
+
+        Returns:
+            list: List of cache configurations, one per layer. Each element is either
+                a single config or a tuple (transformer_config, recurrent_config)
+                for parallel hybrid layers.
+
+        Raises:
+            TypeError: If provided config has wrong type.
+            ValueError: If cache view class is unknown or missing for a layer.
+
+        Example:
+            >>> configs = model.init_operations_cache_config(
+            ...     batch_size=8,
+            ...     max_length=2048,
+            ... )
+            >>> # configs[0] might be TransformerCacheConfig
+            >>> # configs[3] might be RecurrentCacheConfig
+        """
+        from easydel.caching import (
             KDACacheView,
             LightningCacheView,
             ParallelHybridCacheView,
@@ -877,7 +998,7 @@ class EasyGenerationMixin:
         needs_unified = any(view_class is UnifiedAttentionCacheView for view_class in cache_view_mapping.values())
 
         if needs_ragged:
-            from easydel.layers.caching import RaggedPagesCacheConfig
+            from easydel.caching import RaggedPagesCacheConfig
 
             if ragged_config is not None and not isinstance(ragged_config, RaggedPagesCacheConfig):
                 raise TypeError(f"`ragged_config` must be a RaggedPagesCacheConfig, got {type(ragged_config)}")
@@ -889,7 +1010,7 @@ class EasyGenerationMixin:
             )
 
         if needs_unified:
-            from easydel.layers.caching import UnifiedAttentionCacheConfig
+            from easydel.caching import UnifiedAttentionCacheConfig
 
             if unified_config is not None and not isinstance(unified_config, UnifiedAttentionCacheConfig):
                 raise TypeError(f"`unified_config` must be a UnifiedAttentionCacheConfig, got {type(unified_config)}")
@@ -984,7 +1105,7 @@ class EasyGenerationMixin:
             >>> # cache.views[0] might be RecurrentCacheView (for linear attention layer)
             >>> # cache.views[3] might be TransformerCacheView (for full attention layer)
         """
-        from easydel.layers.caching import (
+        from easydel.caching import (
             HybridCache,
             KDACacheView,
             LightningCacheView,
@@ -1153,7 +1274,7 @@ class EasyGenerationMixin:
             ...     pages_tables=..., context_lens=...
             ... )
         """
-        from easydel.layers.caching import OperationsMetadata
+        from easydel.caching import OperationsMetadata
 
         # Check if ragged pages metadata is requested
         if pages_tables is not None and context_lens is not None:
@@ -1184,7 +1305,7 @@ class EasyGenerationMixin:
         Returns:
             type: The EasyQuantizer class.
         """
-        from easydel.layers.quantization.quantizers import EasyQuantizer
+        from easydel.layers.quantization._quants import EasyQuantizer
 
         return EasyQuantizer
 
@@ -1209,9 +1330,23 @@ class EasyGenerationMixin:
 
     @staticmethod
     def compute_prefill_length_from_mask(mask) -> Array:
-        """
-        Calculates the number of padding tokens at the beginning of each sequence
-        from a 0/1 or boolean mask.
+        """Calculate the number of leading padding tokens from an attention mask.
+
+        This is similar to `compute_prefill_length` but works directly with an
+        attention mask where 1 indicates valid tokens and 0 indicates padding.
+
+        Args:
+            mask: Attention mask array of shape (batch_size, sequence_length).
+                Values should be 0 for padding, 1 (or True) for valid tokens.
+
+        Returns:
+            Array: Shape (batch_size,) containing the count of leading padding
+                tokens for each sequence.
+
+        Example:
+            >>> mask = jnp.array([[0, 0, 1, 1, 1], [0, 1, 1, 1, 1]])
+            >>> prefill_len = EasyGenerationMixin.compute_prefill_length_from_mask(mask)
+            >>> # prefill_len = [2, 1]
         """
         mask = mask.astype(jnp.bool_)
         return jnp.sum(jnp.cumsum(mask, axis=-1) == 0, axis=-1)
@@ -1353,6 +1488,21 @@ class EasyGenerationMixin:
         max_length: int,
         make_causal: bool,
     ) -> MaskInfo:
+        """Pad or truncate MaskInfo segment IDs to a target maximum length.
+
+        This method ensures that the MaskInfo's segment IDs have the correct
+        dimensions for cache operations during generation. It pads with zeros
+        if the current length is less than max_length, or truncates if longer.
+
+        Args:
+            mask_info: The MaskInfo object to pad/truncate.
+            max_length: The target length for segment IDs.
+            make_causal: Whether to apply causal masking after padding.
+
+        Returns:
+            MaskInfo: A new MaskInfo with padded/truncated segment IDs and
+                optionally applied causal mask.
+        """
         # Ensure we have segment ids; prefer seg-ids to avoid stale masks
         if mask_info.q_segment_ids is None or mask_info.kv_segment_ids is None:
             mask_info = mask_info.materialize_segment_ids()
@@ -1784,6 +1934,17 @@ class EasyGenerationMixin:
         model_kwargs = generation_config.update(**kwargs)
         self._validate_model_kwargs(model_kwargs.copy())
 
+        # Newer Transformers may leave generation fields as None by default.
+        # Normalize to the canonical greedy defaults expected by this mixin.
+        if generation_config.do_sample is None:
+            generation_config.do_sample = False
+        if generation_config.num_beams is None:
+            generation_config.num_beams = 1
+        if generation_config.num_beam_groups is None:
+            generation_config.num_beam_groups = 1
+        if generation_config.num_return_sequences is None:
+            generation_config.num_return_sequences = 1
+
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
 
         # set init values
@@ -1954,9 +2115,22 @@ class EasyGenerationMixin:
         self,
         generation_config: GenerationConfig,
     ) -> LogitsProcessorList:
-        """
-        This class returns a [`LogitsProcessorList`] list object that contains all relevant [`LogitsWarper`]
-        instances used for multinomial sampling.
+        """Build a LogitsProcessorList containing warpers for multinomial sampling.
+
+        This method constructs the chain of logits warpers based on the generation
+        configuration. Warpers modify the probability distribution for sampling,
+        including temperature scaling, top-k filtering, and top-p (nucleus) sampling.
+
+        Args:
+            generation_config: The generation configuration containing warper settings.
+
+        Returns:
+            LogitsProcessorList: List of logits warpers to apply during sampling.
+                May include TemperatureLogitsWarper, TopKLogitsWarper, and/or
+                TopPLogitsWarper depending on the configuration.
+
+        Note:
+            Warpers are applied in order: temperature -> top_k -> top_p.
         """
         warpers = LogitsProcessorList()
 
@@ -1975,9 +2149,27 @@ class EasyGenerationMixin:
         input_ids_seq_length: int,
         logits_processor: LogitsProcessorList | None,
     ) -> LogitsProcessorList:
-        """
-        This class returns a [`LogitsProcessorList`] list object that contains all relevant [`LogitsProcessor`]
-        instances used to modify the scores of the language model head.
+        """Build a LogitsProcessorList with all processors for generation.
+
+        Constructs the chain of logits processors based on generation configuration.
+        Processors can enforce constraints like minimum length, forced tokens,
+        suppressed tokens, and n-gram repetition penalties.
+
+        Args:
+            generation_config: The generation configuration with processor settings.
+            input_ids_seq_length: Length of the input sequence, used to calculate
+                positions for forced tokens and begin suppress tokens.
+            logits_processor: Optional custom processors to merge with default ones.
+
+        Returns:
+            LogitsProcessorList: Combined list of default and custom processors.
+
+        Raises:
+            ValueError: If a custom processor duplicates a default processor type.
+
+        Note:
+            Processors are applied in order: min_length -> forced_bos -> forced_eos
+            -> suppress_tokens -> begin_suppress -> force_tokens -> no_repeat_ngram.
         """
         processors = LogitsProcessorList()
 
@@ -2025,6 +2217,23 @@ class EasyGenerationMixin:
         default_list: LogitsProcessorList,
         custom_list: LogitsProcessorList,
     ) -> LogitsProcessorList:
+        """Merge default and custom logits processor lists with conflict detection.
+
+        Ensures that custom processors don't duplicate default processors of the
+        same type, which could lead to unexpected behavior (e.g., applying
+        temperature twice).
+
+        Args:
+            default_list: The default processors created from generation config.
+            custom_list: User-provided custom processors.
+
+        Returns:
+            LogitsProcessorList: Merged list with custom processors appended
+                to default processors.
+
+        Raises:
+            ValueError: If a custom processor has the same type as a default one.
+        """
         if len(custom_list) == 0:
             return default_list
         for default in default_list:
@@ -2051,6 +2260,38 @@ class EasyGenerationMixin:
         trace: bool = True,
         model_kwargs: dict[str, Array] | None = None,
     ):
+        """Perform greedy decoding to generate token sequences.
+
+        In greedy search, the token with the highest probability is selected at
+        each step. This is deterministic and fast but may not produce the most
+        globally optimal sequences.
+
+        Args:
+            input_ids: Initial input token IDs of shape (batch_size, seq_length).
+            max_length: Maximum length of generated sequences. Defaults to
+                generation_config.max_length.
+            pad_token_id: Token ID used for padding. Defaults to
+                generation_config.pad_token_id.
+            eos_token_id: End-of-sequence token ID(s). Generation stops when this
+                token is generated. Can be int or list of ints. Defaults to
+                generation_config.eos_token_id.
+            logits_processor: Optional processors to apply to logits at each step.
+            trace: If True, uses JAX's traced while_loop for efficiency. If False,
+                uses Python loop for debugging. Defaults to True.
+            model_kwargs: Additional keyword arguments passed to the model.
+
+        Returns:
+            GreedySearchOutput: Object containing the generated sequences.
+
+        Example:
+            >>> output = model._greedy_search(
+            ...     input_ids=tokens,
+            ...     max_length=50,
+            ...     pad_token_id=0,
+            ...     eos_token_id=2
+            ... )
+            >>> print(output.sequences)
+        """
         max_length = max_length if max_length is not None else self.generation_config.max_length
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
@@ -2083,14 +2324,22 @@ class EasyGenerationMixin:
         )
 
         def greedy_search_cond_fn(state):
-            """state termination condition fn."""
+            """Check if greedy search should continue.
+
+            Returns True if generation should continue, False to stop.
+            Stops when max_length is reached or all sequences have finished.
+            """
             has_reached_max_length = state.cur_len == max_length
             all_sequence_finished = jnp.all(state.is_sent_finished)
             finish_generation = jnp.logical_or(has_reached_max_length, all_sequence_finished)
             return ~finish_generation
 
         def greedy_search_body_fn(state):
-            """state update fn."""
+            """Perform one step of greedy decoding.
+
+            Runs the model, selects the highest probability token,
+            updates sequences and finished flags.
+            """
             call_kwargs = dict(state.model_kwargs)
             running_len = state.running_token.shape[1]
             for mask_key in ("attention_mask", "decoder_attention_mask"):
@@ -2152,6 +2401,43 @@ class EasyGenerationMixin:
         trace: bool = True,
         model_kwargs: dict[str, Array] | None = None,
     ):
+        """Perform sampling-based decoding to generate token sequences.
+
+        In sampling, tokens are randomly selected from the probability distribution
+        (after applying warpers like temperature, top-k, top-p). This produces more
+        diverse and creative outputs compared to greedy search.
+
+        Args:
+            input_ids: Initial input token IDs of shape (batch_size, seq_length).
+            max_length: Maximum length of generated sequences. Defaults to
+                generation_config.max_length.
+            pad_token_id: Token ID used for padding. Defaults to
+                generation_config.pad_token_id.
+            eos_token_id: End-of-sequence token ID(s). Generation stops when this
+                token is generated. Can be int or list of ints. Defaults to
+                generation_config.eos_token_id.
+            prng_key: JAX PRNG key for random sampling. Defaults to PRNGKey(0).
+            logits_processor: Optional processors to apply to logits (constraints).
+            logits_warper: Optional warpers to apply to logits (temperature, top-k, etc.).
+            trace: If True, uses JAX's traced while_loop. If False, uses Python
+                loop for debugging. Defaults to True.
+            model_kwargs: Additional keyword arguments passed to the model.
+
+        Returns:
+            SampleOutput: Object containing the generated sequences.
+
+        Example:
+            >>> output = model._sample(
+            ...     input_ids=tokens,
+            ...     max_length=100,
+            ...     prng_key=jax.random.PRNGKey(42),
+            ...     logits_warper=LogitsProcessorList([
+            ...         TemperatureLogitsWarper(0.8),
+            ...         TopPLogitsWarper(0.95)
+            ...     ])
+            ... )
+            >>> print(output.sequences)
+        """
         # init values
         max_length = max_length if max_length is not None else self.generation_config.max_length
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
@@ -2184,14 +2470,22 @@ class EasyGenerationMixin:
         )
 
         def sample_search_cond_fn(state):
-            """state termination condition fn."""
+            """Check if sampling should continue.
+
+            Returns True if generation should continue, False to stop.
+            Stops when max_length is reached or all sequences have finished.
+            """
             has_reached_max_length = state.cur_len == max_length
             all_sequence_finished = jnp.all(state.is_sent_finished)
             finish_generation = jnp.logical_or(has_reached_max_length, all_sequence_finished)
             return ~finish_generation
 
         def sample_search_body_fn(state):
-            """state update fn."""
+            """Perform one step of sampling-based decoding.
+
+            Runs the model, applies warpers, samples from the distribution,
+            updates sequences and finished flags, and advances PRNG state.
+            """
             prng_key, prng_key_next = jax.random.split(state.prng_key)
 
             call_kwargs = dict(state.model_kwargs)
@@ -2264,19 +2558,86 @@ class EasyGenerationMixin:
         num_return_sequences: int | None = None,
         model_kwargs: dict[str, Array] | None = None,
     ):
-        """
-        This beam search function is heavily inspired by Flax's official example:
+        """Perform beam search decoding to generate token sequences.
+
+        Beam search maintains multiple candidate sequences (beams) at each step,
+        keeping the top-k highest scoring partial sequences. This explores more
+        of the sequence space than greedy search while remaining computationally
+        tractable.
+
+        This implementation is inspired by Flax's official beam search example:
         https://github.com/google/flax/blob/main/examples/wmt/decode.py
+
+        Args:
+            input_ids: Initial input token IDs of shape (batch_size, num_beams, seq_length).
+                The input should already be expanded for beam search.
+            max_length: Maximum length of generated sequences. Defaults to
+                generation_config.max_length.
+            pad_token_id: Token ID used for padding. Defaults to
+                generation_config.pad_token_id.
+            eos_token_id: End-of-sequence token ID(s). Beams are considered finished
+                when this token is generated. Defaults to generation_config.eos_token_id.
+            length_penalty: Exponential penalty to sequence length. Values > 1.0
+                favor longer sequences; < 1.0 favor shorter. Defaults to
+                generation_config.length_penalty.
+            early_stopping: Controls when beam search stops:
+                - True: Stop when num_beams complete sentences are found
+                - False: Apply heuristic to stop when unlikely to find better
+                - "never": Only stop at max_length
+                Defaults to generation_config.early_stopping.
+            logits_processor: Optional processors to apply to log probabilities.
+            trace: If True, uses JAX's traced while_loop. If False, uses Python
+                loop for debugging. Defaults to True.
+            num_return_sequences: Number of best sequences to return per batch item.
+                Must be <= num_beams. Defaults to generation_config.num_return_sequences.
+            model_kwargs: Additional keyword arguments passed to the model.
+
+        Returns:
+            BeamSearchOutput: Object containing:
+                - sequences: Generated sequences of shape (batch_size * num_return_sequences, max_length)
+                - scores: Log probability scores of shape (batch_size * num_return_sequences,)
+
+        Example:
+            >>> # Expand input for beam search
+            >>> expanded_input = model._expand_to_num_beams(input_ids, num_beams=4)
+            >>> output = model._beam_search(
+            ...     input_ids=expanded_input,
+            ...     max_length=50,
+            ...     length_penalty=1.2,
+            ...     early_stopping=True,
+            ...     num_return_sequences=2
+            ... )
+            >>> print(output.sequences.shape)  # (batch_size * 2, max_length)
         """
 
         def flatten_beam_dim(tensor):
-            """Flattens the first two dimensions of a non-scalar array."""
+            """Flatten batch and beam dimensions into a single dimension.
+
+            Converts shape (batch_size, num_beams, ...) to (batch_size * num_beams, ...).
+            Scalar tensors (e.g., cache indices) are returned unchanged.
+
+            Args:
+                tensor: Array with at least 2 dimensions, or a scalar.
+
+            Returns:
+                Array with batch and beam dims merged, or unchanged scalar.
+            """
             # ignore scalars (e.g. cache index)
             if tensor.ndim == 0:
                 return tensor
             return tensor.reshape((tensor.shape[0] * tensor.shape[1], *tensor.shape[2:]))
 
         def flatten_mask_info(mi: MaskInfo, batch_size, num_beams):
+            """Flatten MaskInfo arrays for flattened beam dimension processing.
+
+            Args:
+                mi: MaskInfo object with arrays to flatten.
+                batch_size: Original batch size.
+                num_beams: Number of beams.
+
+            Returns:
+                MaskInfo with flattened arrays.
+            """
             return jax.tree_util.tree_map(
                 lambda t: t.reshape((batch_size * num_beams, *t.shape[2:]))
                 if isinstance(t, jax.Array) and t.ndim >= 2
@@ -2285,15 +2646,38 @@ class EasyGenerationMixin:
             )
 
         def unflatten_beam_dim(tensor, batch_size, num_beams):
-            """Unflattens the first, flat batch*beam dimension of a non-scalar array."""
+            """Restore separate batch and beam dimensions from flattened array.
+
+            Converts shape (batch_size * num_beams, ...) to (batch_size, num_beams, ...).
+            Scalar tensors are returned unchanged.
+
+            Args:
+                tensor: Array with merged batch/beam dimension, or scalar.
+                batch_size: Target batch size.
+                num_beams: Target number of beams.
+
+            Returns:
+                Array with separate batch and beam dims, or unchanged scalar.
+            """
             # ignore scalars (e.g. cache index)
             if tensor.ndim == 0:
                 return tensor
             return tensor.reshape((batch_size, num_beams, *tensor.shape[1:]))
 
         def gather_beams(nested, beam_indices, batch_size, new_num_beams):
-            """
-            Gathers the beam slices indexed by beam_indices into new beam array.
+            """Gather beam slices from nested structure using beam indices.
+
+            Reorders beams according to the provided indices, used for selecting
+            the top-k beams after scoring.
+
+            Args:
+                nested: Pytree of arrays with beam dimension.
+                beam_indices: Indices of beams to gather, shape (batch_size, new_num_beams).
+                batch_size: Batch size.
+                new_num_beams: Number of beams to gather (may differ from original).
+
+            Returns:
+                Pytree with same structure, containing gathered beams.
             """
             batch_indices = jnp.reshape(
                 jnp.arange(batch_size * new_num_beams) // new_num_beams,
@@ -2370,7 +2754,13 @@ class EasyGenerationMixin:
         )
 
         def beam_search_cond_fn(state):
-            """beam search state termination condition fn."""
+            """Check if beam search should continue.
+
+            Returns True if generation should continue, considering:
+            - Whether max_length has been reached
+            - Whether all beams have finished (if early_stopping=True)
+            - Whether the best running beam could potentially beat finished beams
+            """
             not_max_length_yet = state.cur_len < max_length
 
             if early_stopping == "never" and length_penalty > 0.0:
@@ -2391,7 +2781,19 @@ class EasyGenerationMixin:
             return not_max_length_yet & still_open_beam & improvement_still_possible
 
         def beam_search_body_fn(state, input_ids_length=1):
-            """beam search state update fn."""
+            """Perform one step of beam search decoding.
+
+            Runs the model for all beams, computes log probabilities, selects
+            top 2*num_beams candidates, then narrows to num_beams best running
+            sequences while tracking finished sequences separately.
+
+            Args:
+                state: Current BeamSearchState.
+                input_ids_length: Length of input tokens to process (for prefill).
+
+            Returns:
+                Updated BeamSearchState with next token predictions.
+            """
 
             input_token = flatten_beam_dim(
                 lax.dynamic_slice(
@@ -2516,6 +2918,7 @@ class EasyGenerationMixin:
             "ragged_page_attention_v2",
             "ragged_page_attention_v3",
             "unified_attention",
+            "paged_flash_attention",
         ]:
             gdef = self.new_graphdef(attn_mechanism="ragged_page_attention_v3", recursive_update=True)
         return gdef
@@ -2548,6 +2951,7 @@ class EasyGenerationMixin:
             "ragged_page_attention_v2",
             "ragged_page_attention_v3",
             "unified_attention",
+            "paged_flash_attention",
         ]:
             return self
 
@@ -3092,4 +3496,7 @@ class EasyGenerationMixin:
         )
 
 
-_ESURGE_MAP_CACHE = {}
+# Global cache for eSurge engine instances.
+# Keys are hash strings combining model hash and configuration hash.
+# Values are eSurge engine instances that can be reused across calls.
+_ESURGE_MAP_CACHE: dict[str, tp.Any] = {}

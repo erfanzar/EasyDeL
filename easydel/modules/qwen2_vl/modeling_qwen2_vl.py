@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,16 @@ from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
@@ -36,21 +46,10 @@ from easydel.infra.modeling_outputs import (
     VLMCausalLMOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers.attention import FlexibleAttentionModule
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseVisionLanguageModule
-from easydel.layers.caching import (
-    HybridCache,
-    OperationsMetadata,
-    RaggedPagesCache,
-    RaggedPagesCacheView,
-    RaggedPagesMetadata,
-    TransformerCache,
-    TransformerCacheView,
-    TransformerMetadata,
-)
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseVisionLanguageModule
 
 from .qwen2_vl_configuration import Qwen2VLConfig, Qwen2VLTextConfig, Qwen2VLVisionConfig
 
@@ -519,34 +518,36 @@ class Qwen2VLPatchMerger(nn.Module):
         super().__init__()
         self.dtype = dtype
         self.hidden_size = context_dim * (spatial_merge_size**2)
-        self.ln_q = nn.LayerNorm(
+        self.ln_q = LayerNorm(
             context_dim,
             epsilon=1e-6,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.mlp = [
-            ColumnParallelLinear(
-                self.hidden_size,
-                self.hidden_size,
-                use_bias=True,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            ),
-            partial(nn.gelu, approximate=False),
-            RowParallelLinear(
-                self.hidden_size,
-                dim,
-                use_bias=True,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            ),
-        ]
+        self.mlp = nn.List(
+            [
+                ColumnParallelLinear(
+                    self.hidden_size,
+                    self.hidden_size,
+                    use_bias=True,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                ),
+                partial(nn.gelu, approximate=False),
+                RowParallelLinear(
+                    self.hidden_size,
+                    dim,
+                    use_bias=True,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                ),
+            ]
+        )
 
     def __call__(self, x: Array) -> Array:
         """Merge and project patches.
@@ -831,14 +832,14 @@ class Qwen2VLVisionBlock(nn.Module):
             rngs (nn.Rngs): Random number generator state.
         """
         super().__init__()
-        self.norm1 = nn.LayerNorm(
+        self.norm1 = LayerNorm(
             config.embed_dim,
             epsilon=1e-6,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.norm2 = nn.LayerNorm(
+        self.norm2 = LayerNorm(
             config.embed_dim,
             epsilon=1e-6,
             dtype=dtype,
@@ -1269,17 +1270,19 @@ class Qwen2VLVisionTransformer(EasyDeLBaseModule):
         head_dim = config.embed_dim // config.num_heads
         self._head_dim_ro = head_dim // 2
 
-        self.blocks = [
-            Qwen2VLVisionBlock(
-                config=config,
-                layer_idx=idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for idx in range(config.depth)
-        ]
+        self.blocks = nn.List(
+            [
+                Qwen2VLVisionBlock(
+                    config=config,
+                    layer_idx=idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for idx in range(config.depth)
+            ]
+        )
 
         self.merger = Qwen2VLPatchMerger(
             dim=config.hidden_size,
@@ -1473,13 +1476,7 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
             dtype=dtype,
@@ -1488,17 +1485,19 @@ class Qwen2VLTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
-            Qwen2VLDecoderLayer(
-                config=config,
-                layer_idx=idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for idx in range(self.config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                Qwen2VLDecoderLayer(
+                    config=config,
+                    layer_idx=idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for idx in range(self.config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -2077,7 +2076,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
         """Get the token embedding layer.
 
         Returns:
-            nn.Embed: The token embedding layer from the language model.
+            Embed: The token embedding layer from the language model.
         """
         return self.base_model.get_embedding()
 

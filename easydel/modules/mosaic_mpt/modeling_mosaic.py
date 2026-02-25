@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,14 +26,7 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import auto_remat
-from easydel.layers.attention import FlexibleAttentionModule
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -43,7 +36,14 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
+from easydel.infra.utils import auto_remat
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseCausalLMModule
 
 from .mosaic_configuration import MptConfig as MptConfig
 
@@ -402,9 +402,9 @@ class MptBlock(nn.Module):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
-        norm_1 (nn.LayerNorm): Layer normalization before the attention layer.
+        norm_1 (LayerNorm): Layer normalization before the attention layer.
         attn (MptAttention): The self-attention module.
-        norm_2 (nn.LayerNorm): Layer normalization before the MLP layer.
+        norm_2 (LayerNorm): Layer normalization before the MLP layer.
         ffn (MptMLP): The feed-forward (MLP) module.
         resid_attn_dropout (nn.Dropout): Dropout applied after the attention layer's residual connection.
     """
@@ -443,7 +443,7 @@ class MptBlock(nn.Module):
             exclude_names=config.gradient_checkpointing_targets,
         )
 
-        self.norm_1 = nn.LayerNorm(
+        self.norm_1 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             dtype=dtype,
@@ -460,7 +460,7 @@ class MptBlock(nn.Module):
             layer_idx=layer_idx,
         )
 
-        self.norm_2 = nn.LayerNorm(
+        self.norm_2 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_epsilon,
             dtype=dtype,
@@ -595,10 +595,10 @@ class MptModel(EasyDeLBaseModule):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
-        wte (nn.Embed): Token embedding layer.
+        wte (Embed): Token embedding layer.
         emb_drop (nn.Dropout): Dropout layer applied after embeddings.
         blocks (tp.List[MptBlock]): List of transformer blocks.
-        norm_f (nn.LayerNorm): Final layer normalization.
+        norm_f (LayerNorm): Final layer normalization.
         alibi (Array, optional): Precomputed ALiBi tensor if using ALiBi.
     """
 
@@ -627,7 +627,7 @@ class MptModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.wte = nn.Embed(
+        self.wte = Embed(
             num_embeddings=config.vocab_size,
             features=config.d_model,
             rngs=rngs,
@@ -635,19 +635,21 @@ class MptModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
         )
 
-        self.blocks = [
-            MptBlock(
-                config=config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.n_layers)
-        ]
+        self.blocks = nn.List(
+            [
+                MptBlock(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.n_layers)
+            ]
+        )
 
-        self.norm_f = nn.LayerNorm(
+        self.norm_f = LayerNorm(
             config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,

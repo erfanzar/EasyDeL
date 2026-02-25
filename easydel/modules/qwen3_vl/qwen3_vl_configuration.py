@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ implementation, with proper separation of vision and text configurations.
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -252,36 +252,15 @@ class Qwen3VLConfig(EasyDeLBaseConfig):
         """
         return self.text_config
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Get partition rules for model parallelism."""
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (r".*(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"visual/patch_embed/proj/kernel", pmag.resolve(ColumnWise)),
-            (r"attn/qkv/kernel", pmag.resolve(ColumnWise)),
-            (r"attn/qkv/bias", pmag.resolve(Replicated)),
-            (r"attn/proj/kernel", pmag.resolve(RowWise)),
-            (r"attn/proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/fc1/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/fc1/bias", pmag.resolve(Replicated)),
-            (r"mlp/fc2/kernel", pmag.resolve(RowWise)),
-            (r"mlp/fc2/bias", pmag.resolve(Replicated)),
-            (r"norm(1|2)/scale", pmag.resolve(Replicated)),
-            (r"norm(1|2)/bias", pmag.resolve(Replicated)),
-            (r"ln_q/scale", pmag.resolve(Replicated)),
-            (r"ln_q/bias", pmag.resolve(Replicated)),
-            (r"mlp/0/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/0/bias", pmag.resolve(Replicated)),
-            (r"mlp/2/kernel", pmag.resolve(RowWise)),
-            (r"mlp/2/bias", pmag.resolve(Replicated)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
+        """
+        return None

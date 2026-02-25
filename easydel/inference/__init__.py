@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,21 +23,26 @@ Key Components:
     - OpenAI API compatibility layer for seamless integration
 
 Example:
-    Running an OpenAI-compatible API server:
+    Running an OpenAI-compatible API server::
 
-    >>> from easydel.inference import eSurgeApiServer, eSurge
-    >>> surge = eSurge(...)
-    >>> server = eSurgeApiServer(surge)
-    >>> server.run(host="0.0.0.0", port=8000)
+        >>> from easydel.inference import eSurgeApiServer, eSurge
+        >>> surge = eSurge(...)
+        >>> server = eSurgeApiServer(surge)
+        >>> server.run(host="0.0.0.0", port=8000)
 
 Attributes:
-    FunctionCallFormat: Enum defining function call formatting styles
-    FunctionCallFormatter: Utility for formatting function calls in prompts
-    InferenceApiRouter: FastAPI router for OpenAI API compatibility
-    JitableSamplingParams: JAX-compatible sampling parameters
-    SamplingParams: High-level sampling configuration
-    vWhisperInference: Speech recognition engine
-    vWhisperInferenceConfig: Configuration for vWhisper
+    EngineRequest: Request object for inference engine operations.
+    EngineRequestStatus: Enum representing the status of an engine request.
+    InferenceApiRouter: FastAPI router for OpenAI API compatibility.
+    JitableSamplingParams: JAX-compatible sampling parameters for JIT compilation.
+    SamplingParams: High-level sampling configuration for text generation.
+    ToolParser: Parser for extracting tool/function calls from model outputs.
+    ToolParserManager: Manager for handling multiple tool parsers.
+    eSurge: Main inference engine class for running language models.
+    eSurgeApiServer: OpenAI-compatible API server for eSurge.
+    eSurgeRunner: Low-level runner for eSurge inference operations.
+    vWhisperInference: Speech recognition inference engine.
+    vWhisperInferenceConfig: Configuration for vWhisper inference.
 """
 
 from .esurge import EngineRequest, EngineRequestStatus, eSurge, eSurgeApiServer, eSurgeRunner

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,11 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-"""Utility functions for ELM configuration handling.
+"""Utility functions for ELM (EasyDeL Large Model) configuration handling.
 
 This module provides utility functions for configuration manipulation,
-type coercion, and file I/O operations for the ELM system.
+type coercion, and file I/O operations for the ELM system. It includes
+functions for:
+
+- Pruning None values from nested data structures
+- Converting configuration objects to dictionaries
+- Deep merging dictionaries
+- Coercing dtype and precision specifications to JAX types
+- Normalizing task type specifications
+- Saving and loading ELM configurations to/from JSON files
+
+The utilities in this module are designed to facilitate flexible configuration
+handling while maintaining type safety and consistency across the ELM system.
+
+Typical usage example:
+
+    >>> from easydel.infra.elarge_model.utils import (
+    ...     coerce_dtype,
+    ...     load_elm_config,
+    ...     save_elm_config,
+    ... )
+    >>> # Load a configuration
+    >>> config = load_elm_config("config.json")
+    >>> # Coerce a dtype string
+    >>> dtype = coerce_dtype("bf16")
 """
 
 from __future__ import annotations
@@ -40,38 +62,67 @@ logger = get_logger(__name__)
 def prune_nones(obj: Any) -> Any:
     """Recursively remove None values from nested data structures.
 
+    This function traverses nested dictionaries, lists, and tuples,
+    removing any key-value pairs where the value is None. The structure
+    of lists and tuples is preserved, but None values within them are
+    kept (only dict None values are removed).
+
     Args:
-        obj: Object to prune (dict, list, tuple, or any value)
+        obj: The object to prune. Can be a dict, list, tuple, or any
+            other value. Dicts will have None values removed, while
+            lists and tuples will be recursively processed but retain
+            their None values.
 
     Returns:
-        Object with None values removed from dicts and preserved structure
+        The pruned object with the same type as the input:
+        - For dicts: A new dict with None values removed and nested
+          structures recursively pruned.
+        - For lists/tuples: A new list/tuple with nested structures
+          recursively pruned (None values in sequences are preserved).
+        - For other types: The original value unchanged.
 
     Example:
         >>> data = {"a": 1, "b": None, "c": {"d": 2, "e": None}}
         >>> prune_nones(data)
         {'a': 1, 'c': {'d': 2}}
+
+        >>> nested = {"x": [1, None, {"y": None, "z": 3}]}
+        >>> prune_nones(nested)
+        {'x': [1, None, {'z': 3}]}
+
+    Note:
+        This function creates new objects rather than modifying in place,
+        making it safe to use with shared references.
     """
     if isinstance(obj, dict):
         return {k: prune_nones(v) for k, v in obj.items() if v is not None}
-    if isinstance(obj, list | tuple):
+    if isinstance(obj, (list, tuple)):
         t = type(obj)
         return t(prune_nones(v) for v in obj)
     return obj
 
 
 def as_map(cfg: Any) -> dict[str, Any]:
-    """Convert configuration object to dictionary.
+    """Convert a configuration object to a dictionary representation.
 
-    Supports dataclasses and Mapping types, pruning None values from dataclasses.
+    This function provides a unified interface for converting various
+    configuration object types to dictionaries. It supports dataclasses
+    and Mapping types, with automatic pruning of None values for
+    dataclass conversions.
 
     Args:
-        cfg: Configuration object (dataclass or Mapping)
+        cfg: The configuration object to convert. Must be either:
+            - A dataclass instance: Will be converted using `asdict()`
+              with None values pruned from the result.
+            - A Mapping instance (dict, OrderedDict, etc.): Will be
+              converted to a plain dict.
 
     Returns:
-        Dictionary representation of the configuration
+        A dictionary representation of the configuration. For dataclasses,
+        None values are automatically removed from the result.
 
     Raises:
-        TypeError: If cfg is not a dataclass or Mapping
+        TypeError: If cfg is neither a dataclass nor a Mapping type.
 
     Example:
         >>> from dataclasses import dataclass
@@ -81,6 +132,13 @@ def as_map(cfg: Any) -> dict[str, Any]:
         ...     optional: str | None = None
         >>> as_map(Config())
         {'value': 1}
+
+        >>> as_map({"key": "value", "count": 42})
+        {'key': 'value', 'count': 42}
+
+    Note:
+        For Mapping types, None values are NOT pruned. Only dataclass
+        conversions have automatic None pruning applied.
     """
     if is_dataclass(cfg):
         return cast(dict[str, Any], prune_nones(asdict(cfg)))
@@ -90,23 +148,39 @@ def as_map(cfg: Any) -> dict[str, Any]:
 
 
 def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
-    """Deep merge two dictionaries, with overlay values taking precedence.
+    """Deep merge two dictionaries with overlay values taking precedence.
 
-    Recursively merges nested dictionaries. Non-dict values in overlay
-    replace corresponding values in base.
+    Recursively merges nested dictionaries, where values from the overlay
+    dictionary take precedence over values in the base dictionary. When
+    both base and overlay have dict values for the same key, they are
+    merged recursively. For non-dict values, overlay values replace
+    base values.
 
     Args:
-        base: Base dictionary
-        overlay: Dictionary to merge into base
+        base: The base dictionary containing default values. This
+            dictionary is not modified.
+        overlay: The overlay dictionary containing values that should
+            take precedence. This dictionary is not modified.
 
     Returns:
-        New dictionary with merged values
+        A new dictionary containing the merged result. The original
+        dictionaries are not modified.
 
     Example:
         >>> base = {"a": 1, "b": {"c": 2, "d": 3}}
         >>> overlay = {"b": {"c": 20, "e": 4}, "f": 5}
         >>> deep_merge(base, overlay)
         {'a': 1, 'b': {'c': 20, 'd': 3, 'e': 4}, 'f': 5}
+
+        >>> # Non-dict values are replaced entirely
+        >>> deep_merge({"x": [1, 2]}, {"x": [3, 4, 5]})
+        {'x': [3, 4, 5]}
+
+    Note:
+        - Lists and other non-dict iterables are NOT merged; they are
+          replaced entirely by the overlay value.
+        - The function creates a shallow copy at each level, so nested
+          mutable objects may still be shared with the input dicts.
     """
     out = dict(base)
     for k, v in overlay.items():
@@ -118,24 +192,46 @@ def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
 
 
 def coerce_dtype(x: DTypeLike | None) -> jnp.dtype:
-    """Convert dtype-like value to JAX dtype.
+    """Convert a dtype-like specification to a JAX numpy dtype.
 
-    Supports string representations (e.g., "bf16", "fp32"), JAX dtypes,
-    and various FP8 formats. Returns float32 as default.
+    This function provides flexible dtype conversion, supporting various
+    string representations, JAX dtypes, and special FP8 format names.
+    It handles common abbreviations and aliases used in deep learning
+    frameworks.
 
     Args:
-        x: Dtype specification (string, jnp.dtype, or None)
+        x: The dtype specification to convert. Can be:
+            - None: Returns jnp.float32 as the default.
+            - A jnp.dtype: Returned as-is after validation.
+            - A string: Parsed to find the matching dtype. Supports:
+              - Standard names: "float32", "bfloat16", "float16", etc.
+              - Abbreviations: "bf16", "fp16", "fp32", "f32", etc.
+              - FP8 formats: "fp8", "fp8_e4m3", "nvfp8", "mxfp8", etc.
 
     Returns:
-        JAX dtype object
+        The corresponding JAX numpy dtype. If the input cannot be
+        recognized, returns jnp.float32 as a fallback.
 
     Example:
         >>> coerce_dtype("bf16")
         dtype('bfloat16')
+
         >>> coerce_dtype("fp8_e4m3")
         dtype('float8_e4m3')
+
         >>> coerce_dtype(None)
         dtype('float32')
+
+        >>> coerce_dtype(jnp.float16)
+        dtype('float16')
+
+    Note:
+        The function is case-insensitive for string inputs. Unrecognized
+        strings will silently fall back to float32 rather than raising
+        an error.
+
+    See Also:
+        - `coerce_precision`: For converting precision specifications.
     """
     if x is None:
         return jnp.float32
@@ -144,6 +240,9 @@ def coerce_dtype(x: DTypeLike | None) -> jnp.dtype:
     except Exception:
         s = str(x).lower()
         fp8 = {
+            "nvfp8": jnp.float8_e4m3,
+            "mxfp8": jnp.float8_e5m2,
+            "mxfp4": jnp.float4_e2m1fn,
             "fp8": jnp.float8_e5m2,
             "float8": jnp.float8_e5m2,
             "fp8_e4m3": jnp.float8_e4m3,
@@ -173,19 +272,45 @@ def coerce_dtype(x: DTypeLike | None) -> jnp.dtype:
 
 
 def coerce_precision(p: PrecisionLike) -> jax.lax.Precision | None:
-    """Convert precision-like value to JAX Precision.
+    """Convert a precision-like specification to a JAX Precision enum.
+
+    This function provides flexible precision conversion for JAX
+    operations, supporting string representations and the native
+    JAX Precision enum values.
 
     Args:
-        p: Precision specification (string, jax.lax.Precision, or None)
+        p: The precision specification to convert. Can be:
+            - None: Returns None (no precision constraint).
+            - A jax.lax.Precision: Returned as-is.
+            - A string: Parsed case-insensitively. Valid values are:
+              - "DEFAULT": Standard precision (fastest).
+              - "HIGH": Higher precision accumulation.
+              - "HIGHEST": Maximum precision (slowest).
 
     Returns:
-        JAX Precision object or None
+        The corresponding JAX Precision enum value, or None if the
+        input is None. Unrecognized strings default to Precision.DEFAULT.
 
     Example:
         >>> coerce_precision("HIGH")
         <Precision.HIGH: 1>
+
         >>> coerce_precision(None)
         None
+
+        >>> coerce_precision(jax.lax.Precision.HIGHEST)
+        <Precision.HIGHEST: 2>
+
+        >>> coerce_precision("default")
+        <Precision.DEFAULT: 0>
+
+    Note:
+        The string comparison is case-insensitive. Invalid string values
+        will silently fall back to Precision.DEFAULT rather than raising
+        an error.
+
+    See Also:
+        - `coerce_dtype`: For converting dtype specifications.
     """
     if p is None:
         return None
@@ -210,24 +335,66 @@ TASK_ALIASES: dict[str, TaskType] = {
     "sequence_classification": TaskType.SEQUENCE_CLASSIFICATION,
     "base": TaskType.BASE_MODULE,
 }
+"""Mapping of task type string aliases to TaskType enum values.
+
+This dictionary provides case-insensitive lookup for common task type
+names and their abbreviations, enabling flexible task specification
+in configuration files and APIs.
+
+Keys use underscores and lowercase for normalized lookup. Supported
+aliases include:
+    - "causal_lm", "lm": Causal language modeling
+    - "seq2seq", "sequence_to_sequence": Sequence-to-sequence tasks
+    - "speech_seq2seq": Speech-to-text sequence tasks
+    - "image_text_to_text": Vision-language tasks
+    - "zero_shot_image_classification": Zero-shot image classification
+    - "diffusion_lm": Diffusion-based language models
+    - "sequence_classification": Text classification tasks
+    - "base": Base module without task-specific heads
+"""
 
 
 def normalize_task(t: TaskType | str | None) -> TaskType | None:
-    """Normalize task type specification to TaskType enum.
+    """Normalize a task type specification to a TaskType enum value.
 
-    Handles string aliases, case variations, and hyphen/underscore differences.
+    This function converts various task type representations to the
+    canonical TaskType enum, handling string aliases, case variations,
+    and hyphen/underscore differences for flexible configuration.
 
     Args:
-        t: Task type specification (TaskType, string alias, or None)
+        t: The task type specification to normalize. Can be:
+            - None: Returns None.
+            - A TaskType enum: Returned as-is.
+            - A string: Normalized and looked up in TASK_ALIASES.
+              Strings are lowercased, stripped, and hyphens are
+              converted to underscores before lookup.
 
     Returns:
-        Normalized TaskType or None if not recognized
+        The corresponding TaskType enum value, or None if the input
+        is None or the string is not recognized in TASK_ALIASES.
 
     Example:
         >>> normalize_task("causal-lm")
         <TaskType.CAUSAL_LM: 'causal_lm'>
+
         >>> normalize_task("LM")
         <TaskType.CAUSAL_LM: 'causal_lm'>
+
+        >>> normalize_task(TaskType.SEQUENCE_TO_SEQUENCE)
+        <TaskType.SEQUENCE_TO_SEQUENCE: 'sequence_to_sequence'>
+
+        >>> normalize_task(None)
+        None
+
+        >>> normalize_task("unknown_task")
+        None
+
+    Note:
+        Unrecognized task strings return None rather than raising an
+        error, allowing callers to provide default handling.
+
+    See Also:
+        - `TASK_ALIASES`: The mapping used for string lookups.
     """
     if t is None:
         return None
@@ -236,16 +403,43 @@ def normalize_task(t: TaskType | str | None) -> TaskType | None:
     return TASK_ALIASES.get(str(t).strip().lower().replace("-", "_"))
 
 
-def save_elm_config(config: ELMConfig | Mapping[str, Any], json_file_path: str | os.PathLike | ePathLike) -> None:
+def save_elm_config(
+    config: ELMConfig | Mapping[str, Any],
+    json_file_path: str | os.PathLike | ePathLike,
+) -> None:
     """Save an ELMConfig to a JSON file.
 
+    This function serializes an ELM configuration to a JSON file,
+    automatically creating parent directories if they do not exist.
+    The configuration is normalized before saving to ensure consistency.
+
     Args:
-        config: The ELMConfig or config dict to save
-        json_file_path: Path to the JSON file where the config will be saved
+        config: The configuration to save. Can be either:
+            - An ELMConfig dataclass instance.
+            - A Mapping (dict) with configuration values.
+            The configuration will be normalized before serialization.
+        json_file_path: The path where the JSON file will be saved.
+            Can be a string path, os.PathLike, or ePathLike object.
+            Parent directories are created automatically if needed.
 
     Example:
+        >>> from easydel.infra.elarge_model.types import ELMConfig
         >>> config = {"model": {"name_or_path": "meta-llama/Llama-2-7b"}}
-        >>> save_elm_config(config, "my_config.json")
+        >>> save_elm_config(config, "configs/my_config.json")
+
+        >>> # Using ELMConfig dataclass
+        >>> elm_config = ELMConfig(model=ModelConfig(...))
+        >>> save_elm_config(elm_config, "/path/to/config.json")
+
+    Note:
+        - The JSON output is formatted with 2-space indentation for
+          readability.
+        - Unicode characters are preserved (ensure_ascii=False).
+        - Existing files at the target path will be overwritten.
+
+    See Also:
+        - `load_elm_config`: For loading configurations from JSON files.
+        - `normalize`: For details on configuration normalization.
     """
     from .normalizer import normalize
 
@@ -258,15 +452,40 @@ def save_elm_config(config: ELMConfig | Mapping[str, Any], json_file_path: str |
 def load_elm_config(json_file_path: str | os.PathLike | ePathLike) -> ELMConfig:
     """Load an ELMConfig from a JSON file.
 
+    This function reads a JSON configuration file and returns a
+    normalized ELMConfig object. The loaded configuration is validated
+    and normalized to ensure all required fields are present and
+    properly typed.
+
     Args:
-        json_file_path: Path to the JSON file to load
+        json_file_path: The path to the JSON configuration file.
+            Can be a string path, os.PathLike, or ePathLike object.
+            The file must exist and contain valid JSON.
 
     Returns:
-        ELMConfig: The loaded and normalized configuration
+        An ELMConfig dataclass instance populated with the loaded
+        and normalized configuration values.
+
+    Raises:
+        FileNotFoundError: If the specified JSON file does not exist.
+        json.JSONDecodeError: If the file contains invalid JSON.
 
     Example:
-        >>> config = load_elm_config("my_config.json")
+        >>> config = load_elm_config("configs/my_config.json")
+        >>> print(config.model.name_or_path)
+        'meta-llama/Llama-2-7b'
+
+        >>> # Build a model from loaded config
+        >>> config = load_elm_config("/path/to/config.json")
         >>> model = build_model(config)
+
+    Note:
+        The file is read with UTF-8 encoding. The loaded configuration
+        is normalized, which may add default values for missing fields.
+
+    See Also:
+        - `save_elm_config`: For saving configurations to JSON files.
+        - `normalize`: For details on configuration normalization.
     """
     from .normalizer import normalize
 

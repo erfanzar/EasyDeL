@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -353,10 +353,15 @@ class AutoShardAndGatherFunctions:
         Returns:
             A tuple containing the shard and gather functions.
         """
-        if partition_rules is None:
-            partition_rules = config.get_partition_rules(True)
         _, module = get_modules_by_type(config.model_type, model_task)
         model = module.lazy_init(config=config, rngs=flax.nnx.Rngs(0))
+        if partition_rules is None:
+            try:
+                partition_rules = config.get_partition_rules(True)
+            except Exception:
+                partition_rules = None
+        if partition_rules is None:
+            partition_rules = model.resolve_shardings_automatically()
 
         partition_specs = match_partition_rules(partition_rules, model.graphtree_shape)
 

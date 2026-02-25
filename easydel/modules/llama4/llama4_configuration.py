@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,76 +15,57 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
 from eformer.loggings import get_logger
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
-from easydel.layers.moe.utils import get_moe_partition_spec
 
 logger = get_logger(__name__)
 
 
+def _patch_hf_llama4_pooler_output() -> None:
+    """HF compatibility: ensure Llama4 image features expose `pooler_output`."""
+    try:
+        from transformers.modeling_outputs import BaseModelOutputWithPooling
+        from transformers.models.llama4 import modeling_llama4 as hf_llama4
+    except Exception:
+        return
+
+    llama4_cls = getattr(hf_llama4, "Llama4ForConditionalGeneration", None)
+    if llama4_cls is None:
+        return
+
+    original_get_image_features = getattr(llama4_cls, "get_image_features", None)
+    if original_get_image_features is None or getattr(original_get_image_features, "_easydel_pooler_patch", False):
+        return
+
+    def _patched_get_image_features(self, *args, **kwargs):
+        outputs = original_get_image_features(self, *args, **kwargs)
+        if hasattr(outputs, "pooler_output"):
+            return outputs
+
+        last_hidden_state = getattr(outputs, "last_hidden_state", None)
+        if last_hidden_state is None and isinstance(outputs, tuple) and len(outputs) > 0:
+            last_hidden_state = outputs[0]
+        if last_hidden_state is None:
+            return outputs
+
+        return BaseModelOutputWithPooling(
+            last_hidden_state=last_hidden_state,
+            pooler_output=last_hidden_state,
+            hidden_states=getattr(outputs, "hidden_states", None),
+            attentions=getattr(outputs, "attentions", None),
+        )
+
+    _patched_get_image_features._easydel_pooler_patch = True  # type: ignore[attr-defined]
+    llama4_cls.get_image_features = _patched_get_image_features
+
+
+_patch_hf_llama4_pooler_output()
+
+
 def _get_partition_rules(self, *args, **kwargs):
-    """
-    Get the partition rules for the model.
-    Returns:
-        `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
-    """
-    pmag = self.partition_manager
-
-    kws = dict(
-        fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-        sp_is_ep_bound=self.sp_is_ep_bound,
-        module_view=True,
-        tensors_are_expert=self.use_expert_tensor_mode,
-        partition_manager=self.partition_manager,
-    )
-
-    eck = get_moe_partition_spec(direction="column", is_bias=False, **kws)
-    erk = get_moe_partition_spec(direction="row", is_bias=False, **kws)
-
-    return (
-        (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-        (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-        (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-        (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-        (r"self_attn/qk_norm/scale", pmag.resolve(Replicated)),
-        (r"feed_forward/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-        (r"feed_forward/down_proj/kernel", pmag.resolve(RowWise)),
-        (r"feed_forward/router/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
-        (r"feed_forward/experts/gate_up_proj", eck),
-        (r"feed_forward/experts/down_proj", erk),
-        (
-            r"feed_forward/shared_expert/(gate_proj|up_proj)/kernel",
-            pmag.resolve(ColumnWise),
-        ),
-        (r"feed_forward/shared_expert/down_proj/kernel", pmag.resolve(RowWise)),
-        (
-            r"(input_layernorm|post_attention_layernorm|pre_feedforward_layernorm|post_feedforward_layernorm|norm)/kernel",
-            pmag.resolve(Replicated),
-        ),
-        (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-        (r"patch_embedding/linear/kernel", pmag.resolve(ColumnWise)),
-        (r"class_embedding", pmag.resolve(Replicated)),
-        (r"positional_embedding_vlm", pmag.resolve(ColumnWise)),
-        (r"(layernorm_pre|layernorm_post)/scale", pmag.resolve(Replicated)),
-        (r"(layernorm_pre|layernorm_post)/bias", pmag.resolve(Replicated)),
-        (r"model/layers/\d+/self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-        (r"model/layers/\d+/self_attn/.*proj/bias", pmag.resolve(Replicated)),
-        (r"model/layers/\d+/mlp/fc1/kernel", pmag.resolve(ColumnWise)),
-        (r"model/layers/\d+/mlp/fc2/kernel", pmag.resolve(RowWise)),
-        (r"model/layers/\d+/mlp/fc(1|2)/bias", pmag.resolve(Replicated)),
-        (r"vision_adapter/mlp/fc1/kernel", pmag.resolve(ColumnWise)),
-        (r"vision_adapter/mlp/fc2/kernel", pmag.resolve(RowWise)),
-        (r"vision_adapter/mlp/fc(1|2)/bias", pmag.resolve(Replicated)),
-        (r"multi_modal_projector/linear_1/kernel", pmag.resolve(ColumnWise)),
-        (r"multi_modal_projector/linear_1/bias", pmag.resolve(Replicated)),
-        (r"score/kernel", pmag.resolve(RowWise)),
-        (r"score/bias", pmag.resolve(Replicated)),
-        (r".*bias", pmag.resolve(Replicated)),
-        (r".*", pmag.resolve(Replicated)),
-    )
+    return None
 
 
 @register_config("llama4_vision_model")

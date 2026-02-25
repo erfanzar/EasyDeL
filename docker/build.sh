@@ -42,7 +42,7 @@ check_buildx() {
 print_usage() {
     echo "Usage: $0 [HARDWARE_TYPE] [TARGET] [OPTIONS]"
     echo ""
-    echo "HARDWARE_TYPE: cpu, gpu, tpu (default: cpu)"
+    echo "HARDWARE_TYPE: cpu, cuda, tpu (default: cpu)"
     echo "TARGET: production, development, test (default: production)"
     echo ""
     echo "Options:"
@@ -97,7 +97,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Validate hardware type
-if [[ ! "$HARDWARE_TYPE" =~ ^(cpu|gpu|tpu)$ ]]; then
+if [[ ! "$HARDWARE_TYPE" =~ ^(cpu|cuda|tpu)$ ]]; then
     echo -e "${RED}Invalid hardware type: $HARDWARE_TYPE${NC}"
     print_usage
     exit 1
@@ -186,8 +186,8 @@ echo ""
 case $TARGET in
     development)
         echo "  docker run -it --rm -v \$(pwd):/app ${FULL_TAG} bash"
-        if [ "$HARDWARE_TYPE" = "gpu" ]; then
-            echo "  # With GPU support:"
+        if [ "$HARDWARE_TYPE" = "cuda" ]; then
+            echo "  # With CUDA support:"
             echo "  docker run -it --rm --gpus all -v \$(pwd):/app ${FULL_TAG} bash"
         fi
         ;;
@@ -196,8 +196,8 @@ case $TARGET in
         ;;
     production)
         echo "  docker run --rm ${FULL_TAG}"
-        if [ "$HARDWARE_TYPE" = "gpu" ]; then
-            echo "  # With GPU support:"
+        if [ "$HARDWARE_TYPE" = "cuda" ]; then
+            echo "  # With CUDA support:"
             echo "  docker run --rm --gpus all ${FULL_TAG}"
         fi
         ;;

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -70,7 +70,6 @@ def main() -> None:
             # require multiples of 128).
             "max_completion_length": 128,
             "max_length": 256,
-            "max_sequence_length": None,  # avoid deprecated `max_sequence_length` warnings
             "num_return_sequences": 2,
             "generation_num_return_sequences": 2,
             "use_esurge_generation": True,

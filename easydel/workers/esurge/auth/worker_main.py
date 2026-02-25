@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -246,11 +246,16 @@ def main():
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--require-api-key", action="store_true")
     parser.add_argument("--admin-key", default=None)
-    parser.add_argument("--enable-audit-logging", action="store_true", default=True)
+    audit_group = parser.add_mutually_exclusive_group()
+    audit_group.add_argument("--enable-audit-logging", dest="enable_audit_logging", action="store_true")
+    audit_group.add_argument("--disable-audit-logging", dest="enable_audit_logging", action="store_false")
     parser.add_argument("--max-audit-entries", type=int, default=10000)
     parser.add_argument("--storage-dir", default=None)
-    parser.add_argument("--enable-persistence", action="store_true", default=True)
+    persistence_group = parser.add_mutually_exclusive_group()
+    persistence_group.add_argument("--enable-persistence", dest="enable_persistence", action="store_true")
+    persistence_group.add_argument("--disable-persistence", dest="enable_persistence", action="store_false")
     parser.add_argument("--auto-save-interval", type=float, default=60.0)
+    parser.set_defaults(enable_audit_logging=True, enable_persistence=True)
     args = parser.parse_args()
 
     # Disable JAX initialization

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,4 +25,3 @@ from .ppo_config import PPOConfig
 from .ppo_trainer import PPOTrainer
 
 __all__ = ("PPOConfig", "PPOTrainer")
-

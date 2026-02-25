@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,9 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Main scheduler implementation for the eSurge inference engine.
+
+This module provides the core Scheduler class that manages request batching,
+KV cache allocation, and scheduling decisions for the inference engine.
+
+The scheduler is responsible for:
+    - Managing waiting and running request queues
+    - Allocating KV cache pages to requests
+    - Deciding which requests to include in each batch
+    - Handling request preemption when resources are constrained
+    - Processing model outputs and updating request states
+
+Classes:
+    Scheduler: Main request scheduler implementation.
+
+Example:
+    Creating a scheduler from configuration::
+
+        >>> from easydel.inference.esurge.config import Config, SchedulerConfig, CacheConfig
+        >>> from easydel.inference.esurge.scheduler import Scheduler
+        >>>
+        >>> config = Config(
+        ...     scheduler_config=SchedulerConfig(
+        ...         max_num_seqs=16,
+        ...         max_num_batched_tokens=2048,
+        ...         max_model_len=8192
+        ...     ),
+        ...     cache_config=CacheConfig(
+        ...         num_pages=1000,
+        ...         page_size=16
+        ...     )
+        ... )
+        >>> scheduler = Scheduler(config=config, kv_cache_config=kv_cache_config)
+
+    Creating from an eSurgeRunner (recommended)::
+
+        >>> scheduler = Scheduler.from_runner(
+        ...     runner=runner,
+        ...     enable_prefix_caching=True
+        ... )
+"""
+
 from __future__ import annotations
 
 import itertools
+import time
 import typing
 from collections import defaultdict
 from collections.abc import Iterable
@@ -41,6 +84,53 @@ logger = get_logger("eSurgeScheduler")
 
 
 class Scheduler(SchedulerInterface):
+    """Main request scheduler for the eSurge inference engine.
+
+    The Scheduler manages the lifecycle of inference requests, from receiving
+    them to completion. It handles batching, KV cache allocation, preemption,
+    and coordinates with the model runner.
+
+    Key responsibilities:
+        - Managing waiting and running request queues
+        - Allocating and freeing KV cache pages
+        - Making scheduling decisions respecting token budgets
+        - Handling request preemption under memory pressure
+        - Processing model outputs and detecting completion
+
+    The scheduling algorithm:
+        1. Process running requests first (decode phase)
+        2. Allocate tokens for each running request up to budget
+        3. Preempt requests if memory is insufficient
+        4. Schedule waiting requests (prefill phase) if budget remains
+        5. Return batch information for model runner
+
+    Attributes:
+        config: The complete engine configuration.
+        scheduler_config: Scheduler-specific configuration.
+        cache_config: KV cache configuration.
+        kv_cache_config: KV cache groups configuration.
+        max_num_running_reqs: Maximum concurrent requests.
+        max_num_scheduled_tokens: Maximum tokens per batch.
+        max_model_len: Maximum sequence length.
+        page_size: Tokens per KV cache page.
+        requests: Dictionary mapping request_id to EngineRequest.
+        policy: The scheduling policy (FCFS or PRIORITY).
+        waiting: Queue of waiting requests.
+        running: List of currently running requests.
+        finished_req_ids: Set of recently finished request IDs.
+        kv_cache_manager: Manager for KV cache allocation.
+        use_eagle: Whether EAGLE speculative decoding is enabled.
+        num_spec_tokens: Number of speculative tokens.
+        max_num_seq_buckets: Bucket sizes for batch optimization.
+
+    Example:
+        >>> scheduler = Scheduler(config=config, kv_cache_config=kv_cache_config)
+        >>> scheduler.add_request(request)
+        >>> output = scheduler.schedule()
+        >>> # ... run model ...
+        >>> results = scheduler.update_from_output(output, model_output)
+    """
+
     def __init__(
         self,
         config: Config,
@@ -48,6 +138,33 @@ class Scheduler(SchedulerInterface):
         include_finished_set: bool = False,
         max_num_seq_buckets: list[int] | None = None,
     ) -> None:
+        """Initialize the Scheduler with configuration.
+
+        Sets up the scheduler with the provided configuration, initializing
+        request queues, KV cache manager, and scheduling parameters.
+
+        Args:
+            config: Complete engine configuration containing scheduler_config,
+                cache_config, and optionally speculative_config.
+            kv_cache_config: Configuration for KV cache groups including
+                num_pages and kv_cache_groups specifications.
+            include_finished_set: If True, track finished request IDs per
+                client for multi-client scenarios. Defaults to False.
+            max_num_seq_buckets: Optional list of bucket sizes for batch
+                optimization. If None, uses values from scheduler_config
+                or defaults to [max_num_seqs].
+
+        Raises:
+            ValueError: If an unknown scheduling policy is specified.
+            AssertionError: If num_pages is not positive.
+
+        Example:
+            >>> scheduler = Scheduler(
+            ...     config=config,
+            ...     kv_cache_config=kv_cache_config,
+            ...     include_finished_set=True  # For multi-client
+            ... )
+        """
         self.config = config
         self.scheduler_config = config.scheduler_config
         self.cache_config = config.cache_config
@@ -58,6 +175,7 @@ class Scheduler(SchedulerInterface):
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
         self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_model_len = self.scheduler_config.max_model_len
+        self.data_parallel_size = 1
         num_pages = self.cache_config.num_pages
         assert num_pages is not None and num_pages > 0
 
@@ -83,6 +201,9 @@ class Scheduler(SchedulerInterface):
 
         self.waiting = create_request_queue(self.policy)
         self.running: list[EngineRequest] = []
+        # Maintained from model-runner outputs; used to keep DP-shard hints
+        # aligned with actual sequence-buffer row placement.
+        self.req_id_to_row_index: dict[str, int] = {}
 
         self.finished_req_ids: set[str] = set()
 
@@ -116,6 +237,15 @@ class Scheduler(SchedulerInterface):
         self.max_num_seq_buckets = buckets
         self._current_seq_bucket = self._select_seq_bucket(0)
 
+    def _dp_shard_hint_for_row(self, row_index: int) -> int | None:
+        """Compute a DP shard hint for a logical request row index."""
+        dp_size = int(getattr(self, "data_parallel_size", 1))
+        if dp_size <= 1:
+            return None
+        rows_cap = max(1, int(self.max_num_seq_buckets[-1]))
+        rows_per_shard = max(1, rows_cap // dp_size)
+        return min(max(int(row_index), 0) // rows_per_shard, dp_size - 1)
+
     @classmethod
     def from_runner(
         cls,
@@ -125,13 +255,29 @@ class Scheduler(SchedulerInterface):
     ) -> Scheduler:
         """Create a Scheduler instance from an eSurgeRunner.
 
-        This method automatically detects the model's attention types (full, sliding window,
-        chunked) from the model config and creates appropriate cache specifications.
+        This factory method automatically detects the model's attention types
+        (full, sliding window, chunked) from the model config and creates
+        appropriate cache specifications. This is the recommended way to
+        create a Scheduler for most use cases.
 
         Args:
-            runner: The eSurgeRunner instance.
-            max_num_batched_tokens: Maximum tokens per batch. Defaults to max_model_len.
-            enable_prefix_caching: Enable prefix caching for faster inference.
+            runner: The eSurgeRunner instance containing model and metadata.
+                Must have metadata with page_size, num_kv_heads, head_dim,
+                num_pages, and kvdtype attributes.
+            max_num_batched_tokens: Maximum tokens per batch. If None,
+                defaults to runner.max_model_len.
+            enable_prefix_caching: Whether to enable prefix caching for
+                faster inference on repeated prefixes. Defaults to True.
+
+        Returns:
+            Scheduler: A configured Scheduler instance ready for use.
+
+        Example:
+            >>> scheduler = Scheduler.from_runner(
+            ...     runner=runner,
+            ...     max_num_batched_tokens=4096,
+            ...     enable_prefix_caching=True
+            ... )
         """
         from ..config import CacheConfig, SchedulerConfig
         from ..core.interface import create_kv_cache_specs_from_config
@@ -151,7 +297,7 @@ class Scheduler(SchedulerInterface):
             use_mla=False,
         )
 
-        return Scheduler(
+        scheduler = Scheduler(
             config=Config(
                 scheduler_config=SchedulerConfig(
                     max_num_seqs=runner.max_num_seqs,
@@ -167,8 +313,22 @@ class Scheduler(SchedulerInterface):
             ),
             kv_cache_config=CacheGroupsConfig(num_pages=metadata.num_pages, kv_cache_groups=kv_cache_groups),
         )
+        scheduler.data_parallel_size = int(getattr(metadata, "data_parallel_size", 1) or 1)
+        return scheduler
 
     def _select_seq_bucket(self, num_reqs: int) -> int:
+        """Select the appropriate sequence bucket for the given request count.
+
+        Buckets allow for more efficient memory allocation by pre-allocating
+        buffers for common batch sizes.
+
+        Args:
+            num_reqs: The number of requests to find a bucket for.
+
+        Returns:
+            int: The smallest bucket size that can accommodate num_reqs,
+                or the largest bucket if num_reqs exceeds all buckets.
+        """
         if num_reqs <= 0:
             return self.max_num_seq_buckets[0]
         for bucket in self.max_num_seq_buckets:
@@ -177,13 +337,49 @@ class Scheduler(SchedulerInterface):
         return self.max_num_seq_buckets[-1]
 
     def _ensure_capacity(self, desired_running: int) -> bool:
+        """Ensure capacity for the desired number of running requests.
+
+        Updates the current sequence bucket and checks if the desired
+        number of running requests can be accommodated.
+
+        Args:
+            desired_running: The desired number of running requests.
+
+        Returns:
+            bool: True if the desired number fits within the selected bucket,
+                False otherwise.
+        """
         bucket = self._select_seq_bucket(desired_running)
         self._current_seq_bucket = bucket
         return desired_running <= bucket
 
     def schedule(self) -> SchedulerOutput:
-        import time
+        """Schedule requests for the next forward pass.
 
+        This is the main scheduling method that decides which requests to
+        process and how many tokens for each. It handles both running
+        requests (decode phase) and waiting requests (prefill phase).
+
+        The scheduling algorithm:
+            1. Initialize token budget from cache manager
+            2. Process running requests, allocating tokens up to budget
+            3. Preempt requests if memory allocation fails
+            4. If no preemptions, schedule waiting requests with remaining budget
+            5. Build and return SchedulerOutput with batch information
+
+        Returns:
+            SchedulerOutput: Contains all information needed by the model
+                runner to execute the batch, including:
+                - scheduled_new_reqs: New requests being scheduled
+                - scheduled_cached_reqs: Continuing requests
+                - num_scheduled_tokens: Token counts per request
+                - total_num_scheduled_tokens: Total batch tokens
+                - suggested_bucket: Optimal batch size hint
+
+        Note:
+            This method also records metrics for monitoring scheduler
+            performance and cache utilization.
+        """
         schedule_start_time = time.time()
         scheduled_new_reqs: list[EngineRequest] = []
         scheduled_resumed_reqs: list[EngineRequest] = []
@@ -196,6 +392,66 @@ class Scheduler(SchedulerInterface):
             token_budget = self._token_budget_manager.begin_cycle(self.kv_cache_manager, len(self.running))
         else:
             token_budget = self.max_num_scheduled_tokens
+
+        dp_size = max(1, int(getattr(self, "data_parallel_size", 1) or 1))
+        num_pages = int(getattr(self.cache_config, "num_pages", 0) or 0)
+        use_dp_local_shard_hints = (
+            dp_size > 1
+            and int(self.max_num_running_reqs) > 0
+            and int(self.max_num_running_reqs) % dp_size == 0
+            and num_pages > 0
+            and num_pages % dp_size == 0
+        )
+        rows_per_shard = int(self.max_num_running_reqs) // dp_size if use_dp_local_shard_hints else 0
+        pages_per_shard = num_pages // dp_size if use_dp_local_shard_hints else 0
+        planned_shard_counts: list[int] | None = [0] * dp_size if use_dp_local_shard_hints else None
+
+        def _row_to_dp_shard(row_index: int | None) -> int | None:
+            if not use_dp_local_shard_hints or row_index is None:
+                return None
+            return min(max(int(row_index), 0) // rows_per_shard, dp_size - 1)
+
+        def _infer_dp_shard_from_pages(request: EngineRequest) -> int | None:
+            if not use_dp_local_shard_hints:
+                return None
+            inferred: int | None = None
+            for group_page_ids in self.kv_cache_manager.get_page_ids(request.request_id):
+                for page_id in group_page_ids:
+                    pid = int(page_id)
+                    # 0 is reserved as the null page.
+                    if pid <= 0:
+                        continue
+                    shard = min(pid // pages_per_shard, dp_size - 1)
+                    if inferred is None:
+                        inferred = shard
+                    elif inferred != shard:
+                        return None
+            return inferred
+
+        def _pick_dp_shard_hint(request: EngineRequest) -> int | None:
+            if not use_dp_local_shard_hints:
+                return None
+            assert planned_shard_counts is not None
+
+            page_shard = _infer_dp_shard_from_pages(request)
+            if page_shard is not None and planned_shard_counts[page_shard] < rows_per_shard:
+                return page_shard
+
+            mapped_shard = _row_to_dp_shard(self.req_id_to_row_index.get(request.request_id))
+            if mapped_shard is not None and planned_shard_counts[mapped_shard] < rows_per_shard:
+                return mapped_shard
+
+            candidate_shards = [sid for sid, cnt in enumerate(planned_shard_counts) if cnt < rows_per_shard]
+            if not candidate_shards:
+                return None
+            # Keep per-shard occupancy balanced to avoid overfilling one DP row range.
+            return min(candidate_shards, key=lambda sid: (planned_shard_counts[sid], sid))
+
+        def _reserve_dp_shard(shard_hint: int | None) -> None:
+            if not use_dp_local_shard_hints or shard_hint is None:
+                return
+            assert planned_shard_counts is not None
+            planned_shard_counts[shard_hint] += 1
 
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
@@ -219,8 +475,20 @@ class Scheduler(SchedulerInterface):
             max_preemption_attempts = len(self.running) + 1  # Allow one full cycle plus one
 
             while True:
+                row_shard_hint = _pick_dp_shard_hint(request)
+                if use_dp_local_shard_hints and row_shard_hint is None:
+                    logger.warning(
+                        "No DP shard capacity available while scheduling running request %s. Deferring.",
+                        request.request_id,
+                    )
+                    can_schedule = False
+                    break
                 new_pages = self.kv_cache_manager.allocate_slots(
-                    request, num_new_tokens, num_lookahead_tokens=self.num_lookahead_tokens
+                    request,
+                    num_new_tokens,
+                    num_lookahead_tokens=self.num_lookahead_tokens,
+                    dp_shard_hint=row_shard_hint,
+                    data_parallel_size=self.data_parallel_size,
                 )
                 if new_pages is None:
                     preemption_attempts += 1
@@ -259,6 +527,7 @@ class Scheduler(SchedulerInterface):
             assert new_pages is not None
 
             scheduled_running_reqs.append(request)
+            _reserve_dp_shard(row_shard_hint)
             req_to_new_page_ids[request.request_id] = new_pages.get_page_ids()
             num_scheduled_tokens[request.request_id] = num_new_tokens
             if self._token_budget_manager:
@@ -276,9 +545,7 @@ class Scheduler(SchedulerInterface):
                 if num_scheduled_spec_tokens > 0:
                     del request.spec_token_ids[num_scheduled_spec_tokens:]
                     scheduled_spec_decode_tokens[request.request_id] = request.spec_token_ids
-
         skipped_waiting_requests = create_request_queue(self.policy)
-
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if not self._ensure_capacity(len(self.running) + 1):
@@ -300,9 +567,16 @@ class Scheduler(SchedulerInterface):
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
+                row_shard_hint = _pick_dp_shard_hint(request)
+                if use_dp_local_shard_hints and row_shard_hint is None:
+                    break
 
                 if request.num_computed_tokens == 0:
-                    new_computed_pages, num_new_local_computed_tokens = self.kv_cache_manager.get_computed_pages(request)
+                    new_computed_pages, num_new_local_computed_tokens = self.kv_cache_manager.get_computed_pages(
+                        request,
+                        dp_shard_hint=row_shard_hint,
+                        data_parallel_size=self.data_parallel_size,
+                    )
 
                     num_computed_tokens = num_new_local_computed_tokens + num_external_computed_tokens
 
@@ -340,7 +614,6 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
-
                 new_pages = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens + num_external_computed_tokens,
@@ -348,6 +621,8 @@ class Scheduler(SchedulerInterface):
                     new_computed_pages,
                     num_lookahead_tokens=self.num_lookahead_tokens,
                     delay_cache_pages=load_kv_async,
+                    dp_shard_hint=row_shard_hint,
+                    data_parallel_size=self.data_parallel_size,
                 )
                 if new_pages is None:
                     break
@@ -366,6 +641,7 @@ class Scheduler(SchedulerInterface):
                     scheduled_resumed_reqs.append(request)
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
+                _reserve_dp_shard(row_shard_hint)
 
                 req_to_new_page_ids[request.request_id] = self.kv_cache_manager.get_page_ids(request.request_id)
                 if self._token_budget_manager:
@@ -386,6 +662,14 @@ class Scheduler(SchedulerInterface):
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
 
+        # Keep row-index affinity for requests that were preempted and resumed in
+        # the same schedule step; drop stale mapping only for preempted requests
+        # that are not scheduled this step.
+        if preempted_reqs:
+            for preempted_req in preempted_reqs:
+                if preempted_req.request_id not in num_scheduled_tokens:
+                    self.req_id_to_row_index.pop(preempted_req.request_id, None)
+
         self._ensure_capacity(len(self.running))
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
@@ -396,6 +680,7 @@ class Scheduler(SchedulerInterface):
 
         num_common_prefix_pages = [0] * len(self.kv_cache_config.kv_cache_groups)
         scheduled_req_count = len(num_scheduled_tokens)
+
         if scheduled_req_count > 0:
             if scheduled_running_reqs:
                 representative_req = scheduled_running_reqs[0]
@@ -410,9 +695,11 @@ class Scheduler(SchedulerInterface):
                 num_common_prefix_pages = self.kv_cache_manager.get_num_common_prefix_pages(
                     representative_req, scheduled_req_count
                 )
+
         new_reqs_data = [
             NewRequestData.from_request(req, req_to_new_page_ids[req.request_id]) for req in scheduled_new_reqs
         ]
+
         cached_reqs_data = self._make_cached_request_data(
             scheduled_running_reqs,
             scheduled_resumed_reqs,
@@ -420,6 +707,7 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens,
             req_to_new_page_ids,
         )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -431,9 +719,7 @@ class Scheduler(SchedulerInterface):
             suggested_bucket=self._current_seq_bucket,  # Hint for runner's buffer selection
             async_scheduling=self.scheduler_config.async_scheduling,  # Pass async config to runner
         )
-
         self._update_after_schedule(scheduler_output)
-
         # Log scheduler metrics
         schedule_time = time.time() - schedule_start_time
         metrics_collector = get_metrics_collector()
@@ -464,6 +750,20 @@ class Scheduler(SchedulerInterface):
         return scheduler_output
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        """Update internal state after scheduling completes.
+
+        This method is called at the end of schedule() to update request
+        states based on the scheduling decisions made. It updates the
+        num_computed_tokens for each scheduled request.
+
+        Args:
+            scheduler_output: The scheduling output containing information
+                about scheduled requests and token counts.
+
+        Side Effects:
+            - Updates num_computed_tokens for each scheduled request
+            - Clears finished_req_ids set for next iteration
+        """
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
@@ -479,6 +779,22 @@ class Scheduler(SchedulerInterface):
         spec_decode_tokens: dict[str, list[int]],
         req_to_new_page_ids: dict[str, tuple[list[int], ...]],
     ) -> CachedRequestData:
+        """Build CachedRequestData from running and resumed requests.
+
+        Constructs the batched data structure for requests that are
+        continuing execution (not new).
+
+        Args:
+            running_reqs: List of requests that were already running.
+            resumed_reqs: List of requests resumed from preemption.
+            num_scheduled_tokens: Dict mapping request ID to scheduled tokens.
+            spec_decode_tokens: Dict mapping request ID to speculative tokens.
+            req_to_new_page_ids: Dict mapping request ID to new page IDs.
+
+        Returns:
+            CachedRequestData: Batched data for cached requests containing
+                request IDs, token IDs, page IDs, and computed token counts.
+        """
         req_ids: list[str] = []
         new_token_ids: list[list[int]] = []
         new_page_ids: list[tuple[list[int], ...]] = []
@@ -509,6 +825,21 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        """Update scheduler state based on model runner output.
+
+        Processes the tokens generated by the model, updates request states,
+        checks for completion, and prepares outputs for clients.
+
+        Args:
+            scheduler_output: The scheduling decision that was executed.
+            model_runner_output: Output from the model runner containing
+                sampled tokens, logprobs, and other metadata.
+
+        Returns:
+            dict[int, EngineCoreOutputs]: Mapping from client index to
+                EngineCoreOutputs containing per-request outputs. Each
+                output includes new tokens, finish reason, and metadata.
+        """
         sampled_token_ids = model_runner_output.sampled_token_ids
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
@@ -524,8 +855,27 @@ class Scheduler(SchedulerInterface):
             if request is None:
                 continue
 
-            req_index = model_runner_output.req_id_to_index[req_id]
-            generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
+            out_index = model_runner_output.req_id_to_index.get(req_id)
+            if out_index is None:
+                logger.warning(
+                    "Skipping scheduler output for request %s: missing req_id_to_index entry in model output.",
+                    req_id,
+                )
+                continue
+            row_index_map = model_runner_output.req_id_to_row_index
+            row_index = row_index_map.get(req_id) if row_index_map is not None else out_index
+            if row_index is not None:
+                self.req_id_to_row_index[req_id] = int(row_index)
+
+            if sampled_token_ids and (out_index < 0 or out_index >= len(sampled_token_ids)):
+                logger.warning(
+                    "Skipping scheduler output for request %s: req_index=%s out of sampled_token_ids range=%s.",
+                    req_id,
+                    out_index,
+                    len(sampled_token_ids),
+                )
+                continue
+            generated_token_ids = sampled_token_ids[out_index] if sampled_token_ids else []
             stopped = False
             new_token_ids = generated_token_ids
             status_before_stop = request.status
@@ -579,6 +929,19 @@ class Scheduler(SchedulerInterface):
         request: EngineRequest,
         new_token_ids: list[int],
     ) -> tuple[list[int], bool]:
+        """Update a request with newly generated tokens.
+
+        Appends generated tokens to the request and checks for stop conditions.
+
+        Args:
+            request: The request to update.
+            new_token_ids: List of newly generated token IDs.
+
+        Returns:
+            tuple[list[int], bool]: A tuple containing:
+                - new_token_ids: Tokens to return (may be truncated if stopped)
+                - stopped: True if request hit a stop condition
+        """
         stopped = False
         for num_new, output_token_id in enumerate(new_token_ids, 1):
             request.append_output_token_ids(output_token_id)
@@ -590,10 +953,22 @@ class Scheduler(SchedulerInterface):
         return new_token_ids, stopped
 
     def get_request_counts(self) -> tuple[int, int]:
-        """Returns (num_running_reqs, num_waiting_reqs)."""
+        """Get the counts of running and waiting requests.
+
+        Returns:
+            tuple[int, int]: A tuple of (num_running_reqs, num_waiting_reqs).
+        """
         return len(self.running), len(self.waiting)
 
     def add_request(self, request: EngineRequest) -> None:
+        """Add a new request to the scheduler.
+
+        The request is added to the waiting queue and registered in the
+        requests dictionary.
+
+        Args:
+            request: The engine request to add. Must have a unique request_id.
+        """
         self.waiting.add_request(request)
         self.requests[request.request_id] = request
 
@@ -602,10 +977,16 @@ class Scheduler(SchedulerInterface):
         request_ids: str | Iterable[str],
         finished_status: EngineRequestStatus,
     ) -> None:
-        """Handles the finish signal from outside the scheduler.
+        """Mark requests as finished from external signal.
 
-        For example, the API server can abort a request when the client
-        disconnects.
+        Handles finish signals from outside the scheduler, such as client
+        disconnection or stop string detection.
+
+        Args:
+            request_ids: A single request ID or iterable of request IDs
+                to finish.
+            finished_status: The finished status to assign. Must be a
+                finished status (e.g., FINISHED_ABORTED).
         """
         assert EngineRequestStatus.is_finished(finished_status)
         if isinstance(request_ids, str):
@@ -637,7 +1018,15 @@ class Scheduler(SchedulerInterface):
             request.status = finished_status
             self._free_request(request)
 
-    def _free_request(self, request: EngineRequest):
+    def _free_request(self, request: EngineRequest) -> None:
+        """Free resources associated with a finished request.
+
+        Records the request as finished and frees its KV cache pages.
+
+        Args:
+            request: The finished request to free. Must have is_finished()
+                return True.
+        """
         assert request.is_finished()
 
         request_id = request.request_id
@@ -647,19 +1036,51 @@ class Scheduler(SchedulerInterface):
 
         self._free_pages(request)
 
-    def _free_pages(self, request: EngineRequest):
+    def _free_pages(self, request: EngineRequest) -> None:
+        """Free KV cache pages for a finished request.
+
+        Releases all KV cache resources and removes the request from
+        the requests dictionary.
+
+        Args:
+            request: The finished request whose pages should be freed.
+        """
         assert request.is_finished()
         self.kv_cache_manager.free(request)
         self.kv_cache_manager.free_page_hashes(request)
+        self.req_id_to_row_index.pop(request.request_id, None)
         del self.requests[request.request_id]
 
     def get_num_unfinished_requests(self) -> int:
+        """Get the total number of unfinished requests.
+
+        Returns:
+            int: Count of waiting plus running requests.
+        """
         return len(self.waiting) + len(self.running)
 
     def has_finished_requests(self) -> bool:
+        """Check if there are finished requests pending notification.
+
+        Returns:
+            bool: True if finished_req_ids is non-empty.
+        """
         return len(self.finished_req_ids) > 0
 
     def reset_prefix_cache(self) -> bool:
+        """Reset the prefix cache.
+
+        Clears all cached prefix entries from the KV cache.
+
+        Returns:
+            bool: True if reset was successful.
+        """
         return self.kv_cache_manager.reset_prefix_cache()
 
-    def shutdown(self) -> None: ...
+    def shutdown(self) -> None:
+        """Shutdown the scheduler.
+
+        Performs cleanup operations. Currently a no-op but may be extended
+        for resource cleanup in future versions.
+        """
+        ...

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 
 import jax
 from eformer import common_types
+from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -24,6 +25,16 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
@@ -38,25 +49,16 @@ from easydel.infra.modeling_outputs import (
     TokenClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.base_modules import (
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import (
     BaseCausalLMModule,
     BaseQuestionAnsweringModule,
     BaseSequenceClassificationModule,
     BaseTaskModule,
     BaseTokenClassificationModule,
 )
-from easydel.layers.caching import (
-    HybridCache,
-    OperationsMetadata,
-    RaggedPagesCache,
-    RaggedPagesCacheView,
-    RaggedPagesMetadata,
-    TransformerCache,
-    TransformerCacheView,
-    TransformerMetadata,
-)
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from .roberta_configuration import RobertaConfig as RobertaConfig
 
@@ -73,10 +75,10 @@ class RobertaEmbeddings(nn.Module):
         dtype (jnp.dtype): Data type for computations. Defaults to jnp.float32.
         param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
         precision (lax.Precision): Precision setting for JAX operations.
-        word_embeddings (nn.Embed): Token embedding layer.
-        position_embeddings (nn.Embed): Position embedding layer.
-        token_type_embeddings (nn.Embed): Token type (segment) embedding layer.
-        LayerNorm (nn.LayerNorm): Layer normalization applied after embedding sum.
+        word_embeddings (Embed): Token embedding layer.
+        position_embeddings (Embed): Position embedding layer.
+        token_type_embeddings (Embed): Token type (segment) embedding layer.
+        LayerNorm (LayerNorm): Layer normalization applied after embedding sum.
         dropout (nn.Dropout): Dropout layer for regularization.
     """
 
@@ -93,7 +95,7 @@ class RobertaEmbeddings(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.word_embeddings = nn.Embed(
+        self.word_embeddings = Embed(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -101,7 +103,7 @@ class RobertaEmbeddings(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.position_embeddings = nn.Embed(
+        self.position_embeddings = Embed(
             num_embeddings=self.config.max_position_embeddings,
             features=self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -109,7 +111,7 @@ class RobertaEmbeddings(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.token_type_embeddings = nn.Embed(
+        self.token_type_embeddings = Embed(
             num_embeddings=self.config.type_vocab_size,
             features=self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -117,7 +119,7 @@ class RobertaEmbeddings(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.LayerNorm = nn.LayerNorm(
+        self.LayerNorm = LayerNorm(
             self.config.hidden_size,
             epsilon=self.config.layer_norm_eps,
             param_dtype=param_dtype,
@@ -380,7 +382,7 @@ class RobertaSelfOutput(nn.Module):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (lax.Precision): Precision setting for JAX operations.
         dense (RowParallelLinear): Dense projection layer.
-        LayerNorm (nn.LayerNorm): Layer normalization for residual connection.
+        LayerNorm (LayerNorm): Layer normalization for residual connection.
         dropout (nn.Dropout): Dropout layer for regularization.
     """
 
@@ -406,7 +408,7 @@ class RobertaSelfOutput(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.LayerNorm = nn.LayerNorm(
+        self.LayerNorm = LayerNorm(
             self.config.hidden_size,
             epsilon=self.config.layer_norm_eps,
             dtype=dtype,
@@ -598,7 +600,7 @@ class RobertaOutput(nn.Module):
         precision (lax.Precision): Precision setting for JAX operations.
         dense (RowParallelLinear): Dense layer projecting back to hidden size.
         dropout (nn.Dropout): Dropout layer for regularization.
-        LayerNorm (nn.LayerNorm): Layer normalization for residual connection.
+        LayerNorm (LayerNorm): Layer normalization for residual connection.
     """
 
     def __init__(
@@ -627,7 +629,7 @@ class RobertaOutput(nn.Module):
             rate=self.config.hidden_dropout_prob,
             rngs=rngs,
         )
-        self.LayerNorm = nn.LayerNorm(
+        self.LayerNorm = LayerNorm(
             self.config.hidden_size,
             epsilon=self.config.layer_norm_eps,
             dtype=dtype,
@@ -829,16 +831,18 @@ class RobertaEncoder(nn.Module):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layer = [
-            block(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for _ in range(config.num_hidden_layers)
-        ]
+        self.layer = nn.List(
+            [
+                block(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
 
     def __call__(
         self,
@@ -1008,7 +1012,7 @@ class RobertaLMHead(nn.Module):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (lax.Precision): Precision setting for JAX operations.
         dense (RowParallelLinear): Dense transformation layer.
-        layer_norm (nn.LayerNorm): Layer normalization.
+        layer_norm (LayerNorm): Layer normalization.
         decoder (RowParallelLinear): Projection layer to vocabulary size.
         bias (ArrayParam): Output bias for vocabulary predictions.
     """
@@ -1035,7 +1039,7 @@ class RobertaLMHead(nn.Module):
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             rngs=rngs,
         )
-        self.layer_norm = nn.LayerNorm(
+        self.layer_norm = LayerNorm(
             self.config.hidden_size,
             epsilon=self.config.layer_norm_eps,
             dtype=dtype,
@@ -1058,6 +1062,10 @@ class RobertaLMHead(nn.Module):
             init_method="zeros",
             key=rngs.params(),
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for LM head bias."""
+        return {"bias": Replicated}
 
     def __call__(self, hidden_states, shared_embedding=None):
         """Forward pass of the RobertaLMHead.

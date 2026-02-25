@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "easydel"
-version = "0.2.0.4"
+version = "0.3.0"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
 readme = "README.md"
@@ -29,15 +29,15 @@ classifiers = [
 	"Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-	"jax>=0.8.2",
-	"jaxlib>=0.8.2",
+	"jax>=0.9.0",
+	"jaxlib>=0.9.0",
 	"ray[default]==2.53.0",
-	"eformer==0.0.90",
-	"ejkernel==0.0.50",
+	"eformer==0.0.98",
+	"ejkernel==0.0.66",
 	"einops~=0.8.0",
-	"transformers~=4.57.3",
+	"transformers~=5.0.0",
 	"sentencepiece>=0.2.0",
-	"flax==0.11.2",
+	"flax==0.12.3",
 	"fastapi>=0.115.2",
 	"wandb>=0.22.2",
 	"uvloop==0.21.0",
@@ -77,20 +77,22 @@ where = ["."]
 
 [project.optional-dependencies]
 torch = ["torch==2.8.0", "tensorboard>=2.19.0"]
-gpu = [
-	"jax[cuda12]>=0.8.2",
+cuda = [
+	"jax[cuda13]>=0.9.0",
 	"torch==2.8.0",
 	"tensorboard>=2.19.0",
-	"ejkernel[gpu,triton]==0.0.50",
+	"ejkernel[cuda,triton]==0.0.66",
 ]
-tpu = ["jax[tpu]>=0.8.2", "tensorboard>=2.19.0", "ejkernel[tpu]==0.0.50"]
+tpu = ["jax[tpu]>=0.9.0", "tensorboard>=2.19.0", "ejkernel[tpu]==0.0.66"]
 tensorflow = ["tensorflow~=2.19.0", "tensorflow-datasets~=4.9.9"]
-lm_eval = ["lm_eval~=0.4.9.1"]
+lm_eval = ["lm_eval~=0.4.11"]
 profile = [
 	"xprof>=2.20.6",
 	"tb-nightly>=2.21.0a20250820",
 	"xprof-nightly>=2.21.6a20250820",
 ]
+podutils = ["eopod==0.0.35"]
+
 [tool.black]
 line-length = 121
 target-version = ["py311"]
@@ -169,11 +171,11 @@ filterwarnings = ["ignore::DeprecationWarning"]
 [tool.uv]
 conflicts = [
 	[
-		{ extra = "gpu" },
+		{ extra = "cuda" },
 		{ extra = "tpu" },
 	],
 	[
-		{ extra = "gpu" },
+		{ extra = "cuda" },
 		{ extra = "torch" },
 	],
 ]

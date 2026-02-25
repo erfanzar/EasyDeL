@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import typing as tp
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -60,32 +60,18 @@ class MoonViTConfig(EasyDeLBaseConfig):
         self.intermediate_size = intermediate_size
         self.merge_kernel_size = tuple(merge_kernel_size)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Get partition rules for MoonViT vision tower.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-            Tuple of partition rules for distributing MoonViT parameters.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"patch_embed/proj/kernel", pmag.resolve(ColumnWise)),
-            (r"patch_embed/proj/bias", pmag.resolve(Replicated)),
-            (r"patch_embed/pos_emb/kernel", pmag.resolve(Replicated)),
-            (r"blocks/\d+/wqkv/kernel", pmag.resolve(ColumnWise)),
-            (r"blocks/\d+/wqkv/bias", pmag.resolve(Replicated)),
-            (r"blocks/\d+/wo/kernel", pmag.resolve(RowWise)),
-            (r"blocks/\d+/wo/bias", pmag.resolve(Replicated)),
-            (r"blocks/\d+/mlp/fc0/kernel", pmag.resolve(ColumnWise)),
-            (r"blocks/\d+/mlp/fc0/bias", pmag.resolve(Replicated)),
-            (r"blocks/\d+/mlp/fc1/kernel", pmag.resolve(RowWise)),
-            (r"blocks/\d+/mlp/fc1/bias", pmag.resolve(Replicated)),
-            (r"blocks/\d+/(norm0|norm1)/scale", pmag.resolve(Replicated)),
-            (r"blocks/\d+/(norm0|norm1)/bias", pmag.resolve(Replicated)),
-            (r"final_layernorm/scale", pmag.resolve(Replicated)),
-            (r"final_layernorm/bias", pmag.resolve(Replicated)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
 
 @register_config("kimi_vl")
@@ -133,36 +119,18 @@ class KimiVLConfig(EasyDeLBaseConfig):
     def get_text_config(self, decoder: bool = True) -> DeepseekV3Config:
         return self.text_config
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Get partition rules for the full KimiVL model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
 
-        Combines partition rules from text_config (DeepSeek-V3) and vision_config (MoonViT),
-        plus rules for the multi-modal projector.
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-            Tuple of partition rules for distributing all model parameters.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        tp_rules = (
-            self.text_config.get_partition_rules(*args, **kwargs)
-            if hasattr(self.text_config, "get_partition_rules")
-            else ()
-        )
-        vp_rules = (
-            self.vision_config.get_partition_rules(*args, **kwargs)
-            if hasattr(self.vision_config, "get_partition_rules")
-            else ()
-        )
-        projector_rules = (
-            (r"vision_tower/.*", pmag.resolve(Replicated)),
-            (r"multi_modal_projector/pre_norm/scale", pmag.resolve(Replicated)),
-            (r"multi_modal_projector/pre_norm/bias", pmag.resolve(Replicated)),
-            (r"multi_modal_projector/linear_1/kernel", pmag.resolve(ColumnWise)),
-            (r"multi_modal_projector/linear_1/bias", pmag.resolve(Replicated)),
-            (r"multi_modal_projector/linear_2/kernel", pmag.resolve(RowWise)),
-            (r"multi_modal_projector/linear_2/bias", pmag.resolve(Replicated)),
-        )
-        return projector_rules + tp_rules + vp_rules
+        return None
 
 
 __all__ = ["KimiVLConfig", "MoonViTConfig"]

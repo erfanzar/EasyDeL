@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,44 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Core vWhisper inference engine implementation.
+
+This module provides the main vWhisperInference class for performing
+speech-to-text transcription and translation using Whisper models
+optimized for JAX/XLA execution.
+
+Classes:
+    vWhisperInference: Main inference engine for Whisper models.
+
+Example:
+    Basic usage::
+
+        >>> from easydel.inference.vwhisper import (
+        ...     vWhisperInference,
+        ...     vWhisperInferenceConfig
+        ... )
+        >>> from transformers import WhisperProcessor, WhisperTokenizer
+        >>> import easydel as ed
+        >>>
+        >>> # Load model and components
+        >>> model = ed.AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
+        ...     "openai/whisper-base"
+        ... )
+        >>> tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-base")
+        >>> processor = WhisperProcessor.from_pretrained("openai/whisper-base")
+        >>>
+        >>> # Create inference engine
+        >>> engine = vWhisperInference(
+        ...     model=model,
+        ...     tokenizer=tokenizer,
+        ...     processor=processor
+        ... )
+        >>>
+        >>> # Transcribe audio
+        >>> result = engine.generate("audio.mp3", language="en")
+        >>> print(result["text"])
+"""
 
 from __future__ import annotations
 
@@ -35,48 +73,101 @@ if tp.TYPE_CHECKING:
 
 @Registry.register("serve", "vwhisper")
 class vWhisperInference:
-    """Speech-to-text inference engine using Whisper models.
+    """High-performance speech-to-text inference engine using Whisper models.
 
-    vWhisperInference provides a high-performance pipeline for transcribing
-    and translating audio using OpenAI's Whisper models, optimized for JAX.
-    It supports long-form audio processing with automatic chunking and
-    can generate timestamps for subtitle creation.
+    vWhisperInference provides a complete pipeline for transcribing and
+    translating audio using OpenAI's Whisper models, optimized for JAX/XLA
+    execution. It handles audio preprocessing, chunking for long-form audio,
+    batch processing, and output post-processing with optional timestamps.
+
+    The engine supports multiple input formats including file paths, URLs,
+    raw bytes, and numpy arrays. Long audio is automatically split into
+    overlapping chunks that are processed in batches for efficiency.
 
     Features:
-        - Audio transcription in multiple languages
-        - Translation to English
-        - Timestamp generation for subtitles
-        - Long-form audio processing with chunking
-        - Batch processing for efficiency
-        - JAX/XLA acceleration
+        - Multi-format audio input (files, URLs, bytes, numpy arrays)
+        - Automatic long-form audio chunking with configurable overlap
+        - Batch processing for improved throughput
+        - Timestamp generation for subtitle creation
+        - Multi-language transcription support
+        - Audio-to-English translation
+        - JIT-compiled generation for optimal performance
 
     Attributes:
-        model: The Whisper model for conditional generation
-        tokenizer: Tokenizer for text processing
-        processor: Audio processor for feature extraction
-        inference_config: Configuration settings
-        dtype: Data type for computations
-        graphdef: Model graph definition
-        graphstate: Model state
-
-    Args:
-        model: Fine-tuned Whisper model for inference.
-        tokenizer: Whisper tokenizer.
-        processor: Whisper processor for audio processing.
-        inference_config: Optional configuration settings.
-        dtype: Data type for JAX computations (default: float32).
+        model (WhisperForConditionalGeneration): The Whisper model for
+            conditional generation.
+        tokenizer (WhisperTokenizer): Tokenizer for converting between
+            text and token IDs.
+        processor (WhisperProcessor): Processor containing the feature
+            extractor for audio preprocessing.
+        feature_extractor: The feature extractor component from the
+            processor, used for converting audio to mel spectrograms.
+        inference_config (vWhisperInferenceConfig): Configuration settings
+            controlling batch size, max length, and other parameters.
+        generation_config (GenerationConfig): Generation configuration
+            from the model or inference config.
+        dtype: JAX data type for model computations.
+        graphdef: Flax NNX graph definition for the model.
+        graphstate: Flax NNX graph state containing model parameters.
+        max_length (int): Maximum sequence length for generation.
+        generate_function: The JIT-compiled generation function.
 
     Example:
-        >>> engine = vWhisperInference(
-        ...     model=whisper_model,
-        ...     tokenizer=tokenizer,
-        ...     processor=processor
-        ... )
-        >>> result = engine.transcribe(
-        ...     "audio.mp3",
-        ...     language="en"
-        ... )
-        >>> print(result["text"])
+        Basic transcription::
+
+            >>> engine = vWhisperInference(
+            ...     model=whisper_model,
+            ...     tokenizer=tokenizer,
+            ...     processor=processor
+            ... )
+            >>> result = engine.generate("speech.mp3")
+            >>> print(result["text"])
+
+        Transcription with timestamps::
+
+            >>> result = engine.generate(
+            ...     "lecture.mp3",
+            ...     language="en",
+            ...     return_timestamps=True
+            ... )
+            >>> for chunk in result.get("chunks", []):
+            ...     print(f"[{chunk['timestamp']}] {chunk['text']}")
+
+        Translation to English::
+
+            >>> result = engine.generate(
+            ...     "french_speech.mp3",
+            ...     task="translate"
+            ... )
+            >>> print(result["text"])  # English translation
+
+        Processing audio from URL::
+
+            >>> result = engine.generate(
+            ...     "https://example.com/audio.wav",
+            ...     batch_size=4
+            ... )
+
+        Using numpy array input::
+
+            >>> import numpy as np
+            >>> audio = np.random.randn(16000 * 30)  # 30 seconds at 16kHz
+            >>> result = engine.generate(
+            ...     {"array": audio, "sampling_rate": 16000}
+            ... )
+
+    Note:
+        - The engine is registered with the EasyDeL Registry under
+          ("serve", "vwhisper") for automatic discovery.
+        - First call to generate() may be slow due to JIT compilation;
+          subsequent calls will be faster.
+        - For optimal performance, use batch_size > 1 when processing
+          long audio files.
+        - The engine expects single-channel (mono) audio input.
+
+    See Also:
+        vWhisperInferenceConfig: Configuration class for inference settings.
+        WhisperModel: Singleton wrapper for API server usage.
     """
 
     def __init__(
@@ -87,14 +178,59 @@ class vWhisperInference:
         inference_config: vWhisperInferenceConfig | None = None,
         dtype: jax.typing.DTypeLike = jnp.float32,
     ):
-        """Initialize vWhisperInference engine.
+        """Initialize the vWhisperInference engine.
+
+        Sets up the inference pipeline by storing model components,
+        extracting the graph definition and state for JIT compilation,
+        and configuring generation parameters.
 
         Args:
-            model: Whisper model for conditional generation.
-            tokenizer: Tokenizer for text processing.
-            processor: Processor for audio feature extraction.
-            inference_config: Configuration for inference behavior.
-            dtype: JAX data type for computations.
+            model (WhisperForConditionalGeneration): A loaded Whisper model
+                for conditional generation. Should be an EasyDeL-compatible
+                Whisper model instance.
+            tokenizer (WhisperTokenizer): Hugging Face Whisper tokenizer
+                for encoding/decoding text. Used for converting generated
+                token IDs back to text.
+            processor (WhisperProcessor): Hugging Face Whisper processor
+                containing the feature extractor for audio preprocessing.
+                Converts raw audio to mel spectrogram features.
+            inference_config (vWhisperInferenceConfig | None, optional):
+                Configuration object controlling inference behavior.
+                If None, a default configuration is created.
+                Defaults to None.
+            dtype (jax.typing.DTypeLike, optional): JAX data type for
+                model computations. Common choices are jnp.float32,
+                jnp.float16, or jnp.bfloat16. Defaults to jnp.float32.
+
+        Example:
+            Basic initialization::
+
+                >>> engine = vWhisperInference(
+                ...     model=whisper_model,
+                ...     tokenizer=tokenizer,
+                ...     processor=processor
+                ... )
+
+            With custom configuration::
+
+                >>> config = vWhisperInferenceConfig(
+                ...     batch_size=8,
+                ...     max_length=448,
+                ...     language="en"
+                ... )
+                >>> engine = vWhisperInference(
+                ...     model=whisper_model,
+                ...     tokenizer=tokenizer,
+                ...     processor=processor,
+                ...     inference_config=config,
+                ...     dtype=jnp.bfloat16
+                ... )
+
+        Note:
+            - The model is split into graphdef and graphstate using
+              Flax NNX's split function for JIT compilation compatibility.
+            - If inference_config provides a generation_config, it takes
+              precedence over the model's built-in generation_config.
         """
         if inference_config is None:
             inference_config = vWhisperInferenceConfig()
@@ -120,18 +256,36 @@ class vWhisperInference:
         task: str | None = None,
         return_timestamps: bool = False,
     ) -> jax.Array:
-        """Generate text from audio features.
+        """Generate token sequences from processed audio features.
 
-        Internal method for generating sequences from processed audio.
+        Internal method that performs the core generation step, converting
+        mel spectrogram features into token sequences using the Whisper
+        model's decoder.
 
         Args:
-            input_features: Processed audio features.
-            language: Source language code.
-            task: Task type ('transcribe' or 'translate').
-            return_timestamps: Whether to generate timestamps.
+            input_features (jax.Array): Processed audio features as mel
+                spectrograms with shape (batch_size, num_mel_bins, seq_len).
+                These should be pre-processed by the feature extractor.
+            language (str | None, optional): Language code for the input
+                audio (e.g., "en", "fr", "de"). Used to set the language
+                token in the decoder input. If None, language detection
+                may be performed. Defaults to None.
+            task (str | None, optional): Task to perform:
+                - "transcribe": Transcribe in the source language
+                - "translate": Translate to English
+                If None, defaults to "transcribe". Defaults to None.
+            return_timestamps (bool, optional): Whether to generate
+                timestamp tokens for word/segment timing. Defaults to False.
 
         Returns:
-            Generated token sequences.
+            jax.Array: Generated token sequences with shape
+                (batch_size, max_length). Includes special tokens for
+                language, task, and optionally timestamps.
+
+        Note:
+            This method calls the JIT-compiled _compiled_generate function
+            for efficient execution. The forced_decoder_ids are constructed
+            from language and task tokens.
         """
         forced_decoder_ids = dict(
             get_decoder_input_ids(
@@ -159,22 +313,49 @@ class vWhisperInference:
         stride_length_s: float | list[float] | None = None,
         batch_size: int | None = None,
     ):
-        """Process audio input into model-ready features.
+        """Process and chunk audio input for model consumption.
 
-        Handles various audio input formats and performs chunking
-        for long-form audio processing.
+        Handles various audio input formats and splits long audio into
+        overlapping chunks suitable for batch processing. Each chunk
+        is converted to mel spectrogram features.
 
         Args:
-            audio_input: Audio data (file path, bytes, or array).
-            chunk_length_s: Length of audio chunks in seconds.
-            stride_length_s: Overlap between chunks in seconds.
-            batch_size: Number of chunks to process together.
+            audio_input (str | bytes | np.ndarray | dict): Audio input in
+                one of the following formats:
+                - str: Path to local audio file or URL
+                - bytes: Raw audio data (any ffmpeg-supported format)
+                - np.ndarray: Raw audio samples (1D array)
+                - dict: Dictionary with "array" and "sampling_rate" keys
+            chunk_length_s (float, optional): Length of each audio chunk
+                in seconds. Whisper models are trained on 30-second
+                segments, so this is the recommended value.
+                Defaults to 30.0.
+            stride_length_s (float | list[float] | None, optional):
+                Overlap between adjacent chunks in seconds. Can be:
+                - float: Same stride on both sides
+                - list[float]: [left_stride, right_stride]
+                - None: Defaults to chunk_length_s / 6
+                Defaults to None.
+            batch_size (int | None, optional): Number of chunks to yield
+                per batch. If None, uses the value from inference_config.
+                Defaults to None.
 
         Yields:
-            Processed audio features ready for model input.
+            dict: A dictionary containing:
+                - "input_features": Mel spectrogram features for the batch
+                - "stride": List of (chunk_len, left_stride, right_stride)
+                  tuples for each chunk
+                - Additional keys from the feature extractor
 
         Raises:
-            ValueError: If chunk length is less than stride length.
+            ValueError: If chunk_length_s is less than the total stride
+                length (stride_left + stride_right).
+
+        Note:
+            - For audio shorter than chunk_length_s, a single batch is
+              yielded without chunking.
+            - The stride ensures smooth transitions when merging
+              transcriptions from adjacent chunks.
         """
         audio_array, stride = process_audio_input(
             audio_input=audio_input,
@@ -219,15 +400,34 @@ class vWhisperInference:
         return_timestamps: bool | None = None,
         return_language: str | None = None,
     ):
-        """Process model outputs into final transcription.
+        """Convert raw model outputs to formatted transcription results.
 
-        Converts raw model outputs into formatted text with optional
-        timestamps and language information.
+        Post-processes the generated token sequences, applying the
+        tokenizer's ASR decoding logic to produce final text output
+        with optional timestamps.
 
         Args:
-            model_outputs: Raw outputs from the model.
-            return_timestamps: Whether to include timestamps.
-            return_language: Language code to include in output.
+            model_outputs (list): List of dictionaries containing:
+                - "tokens": Generated token sequences
+                - "stride": Optional stride information for chunk merging
+            return_timestamps (bool | None, optional): Whether to include
+                timestamps in the output. Timestamps are formatted as
+                (start_time, end_time) tuples. Defaults to None.
+            return_language (str | None, optional): Language code to
+                include in the output metadata. Defaults to None.
+
+        Returns:
+            dict: A dictionary containing:
+                - "text" (str): The transcribed/translated text
+                - "chunks" (list, optional): If return_timestamps is True,
+                  a list of dictionaries with "text" and "timestamp" keys
+                - Additional metadata from the tokenizer decoder
+
+        Note:
+            - The stride information is converted from samples to seconds
+              for proper timestamp calculation.
+            - The tokenizer's _decode_asr method handles merging overlapping
+              chunks and aligning timestamps.
         """
         model_outputs = [
             dict(zip(output, t, strict=False)) for output in model_outputs for t in zip(*output.values(), strict=False)
@@ -259,6 +459,34 @@ class vWhisperInference:
         task: str | None = None,
         return_timestamps: bool = False,
     ):
+        """Process a single batch of audio chunks through the model.
+
+        Handles padding for incomplete batches and runs generation on
+        the input features.
+
+        Args:
+            model_inputs (dict[str, tp.Any]): Dictionary containing:
+                - "input_features": Audio features to process
+                - "stride": Optional stride information
+            batch_size (int): Expected batch size. If the actual batch
+                is smaller, zero-padding is applied.
+            language (str | None, optional): Language code for transcription.
+                Defaults to None.
+            task (str | None, optional): Task to perform ("transcribe" or
+                "translate"). Defaults to None.
+            return_timestamps (bool, optional): Whether to generate
+                timestamp tokens. Defaults to False.
+
+        Returns:
+            dict: A dictionary containing:
+                - "tokens": Generated token sequences with shape
+                  (actual_batch_size, 1, seq_len)
+                - "stride": Stride information if provided in inputs
+
+        Note:
+            Padding is removed after generation to return only the
+            valid outputs for the actual input batch size.
+        """
         input_features = model_inputs.pop("input_features")
         input_batch_size = input_features.shape[0]
         if input_batch_size != batch_size:
@@ -287,30 +515,78 @@ class vWhisperInference:
         task: str | None = None,
         return_timestamps: bool | None = None,
     ):
-        """
-        Transcribe or translate audio input.
+        """Transcribe or translate audio input to text.
+
+        Main entry point for audio transcription and translation. Handles
+        the complete pipeline from audio input to formatted text output,
+        including chunking, batch processing, and post-processing.
 
         Args:
-            audio_input (`tp.Union[str, bytes, np.ndarray, tp.Dict[str, tp.Union[np.ndarray, int]]]`):
-                Input audio. Can be a local file path, URL, bytes, numpy array, or a dictionary
-                containing the array and sampling rate.
-            chunk_length_s (`float`, *optional*, defaults to 30.0):
-                Length of audio chunks in seconds.
-            stride_length_s (`float` or `list[float]`, *optional*):
-                Stride length for chunking audio, in seconds.  Defaults to `chunk_length_s / 6`.
-            batch_size (`int`, *optional*):
-                Batch size for processing. Defaults to the `batch_size` in `inference_config`.
-            language (`str`, *optional*):
-                Language of the input audio. Defaults to the `language` in `inference_config`.
-            task (`str`, *optional*):
-                Task to perform (e.g., "transcribe", "translate"). Defaults to the `task` in `inference_config`.
-            return_timestamps (`bool`, *optional*):
-                Whether to return timestamps with the transcription.
-                    Defaults to the `return_timestamps` in `inference_config`.
+            audio_input (str | bytes | np.ndarray | dict): Input audio in
+                one of the following formats:
+                - str: Local file path or URL to audio file
+                - bytes: Raw audio data (any ffmpeg-supported format)
+                - np.ndarray: Audio samples as 1D numpy array
+                - dict: Dictionary with keys:
+                    - "array": Audio samples (np.ndarray)
+                    - "sampling_rate": Sample rate (int)
+            chunk_length_s (float, optional): Length of audio chunks in
+                seconds. Whisper is optimized for 30-second chunks.
+                Defaults to 30.0.
+            stride_length_s (float | list[float] | None, optional):
+                Overlap between chunks in seconds for smooth merging.
+                Can be a single value or [left, right] list.
+                Defaults to chunk_length_s / 6 if None.
+            batch_size (int | None, optional): Number of chunks to process
+                simultaneously. Larger values increase throughput but
+                use more memory. Defaults to inference_config.batch_size.
+            language (str | None, optional): Language code of the audio
+                (e.g., "en", "fr", "de", "ja"). If None, may be auto-detected
+                by the model. Defaults to inference_config.language.
+            task (str | None, optional): Task to perform:
+                - "transcribe": Transcribe in source language
+                - "translate": Translate to English
+                Defaults to inference_config.task.
+            return_timestamps (bool | None, optional): Whether to include
+                word/segment timestamps in output. Useful for subtitles.
+                Defaults to inference_config.return_timestamps.
 
         Returns:
-            `dict`: A dictionary containing the transcribed text ("text") and optionally other information
-            like timestamps or detected language.
+            dict: A dictionary containing:
+                - "text" (str): The transcribed or translated text
+                - "chunks" (list, optional): If return_timestamps is True,
+                  list of dicts with "text" and "timestamp" keys
+
+        Example:
+            Simple transcription::
+
+                >>> result = engine.generate("audio.mp3")
+                >>> print(result["text"])
+
+            Transcription with language and timestamps::
+
+                >>> result = engine.generate(
+                ...     "speech.wav",
+                ...     language="en",
+                ...     return_timestamps=True
+                ... )
+                >>> print(result["text"])
+                >>> for chunk in result.get("chunks", []):
+                ...     start, end = chunk["timestamp"]
+                ...     print(f"[{start:.2f}s - {end:.2f}s] {chunk['text']}")
+
+            Translation with custom batch size::
+
+                >>> result = engine.generate(
+                ...     "german_speech.mp3",
+                ...     task="translate",
+                ...     batch_size=8
+                ... )
+
+        Note:
+            - First call may be slow due to JIT compilation
+            - For optimal performance with long audio, increase batch_size
+            - The engine expects mono audio; stereo will cause errors
         """
         batch_size = batch_size if batch_size is not None else self.inference_config.batch_size
         language = language if language is not None else self.inference_config.language

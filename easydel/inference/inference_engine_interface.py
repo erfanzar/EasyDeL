@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import traceback
 import typing as tp
 import uuid
 from abc import ABC, abstractmethod
@@ -38,7 +39,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from http import HTTPStatus
 
 import uvicorn
@@ -53,6 +54,7 @@ from .openai_api_modules import (
     ChatCompletionResponse,
     CompletionRequest,
     CompletionResponse,
+    DeltaMessage,
     FunctionCallFormat,
     ResponsesRequest,
 )
@@ -65,7 +67,7 @@ TIMEOUT_KEEP_ALIVE = 5.0
 logger = get_logger("InferenceApiServer")
 
 
-class ServerStatus(str, Enum):
+class ServerStatus(StrEnum):
     """Server status enumeration.
 
     Represents the operational state of an inference server.
@@ -604,7 +606,17 @@ class BaseInferenceApiServer(ABC):
         resolved_tools = []
         if request.tools is not None:
             for tool in request.tools:
-                resolved_tools.append(tool.function.model_dump())
+                tool_payload: dict[str, tp.Any] | None = None
+                if hasattr(tool, "function") and hasattr(tool.function, "model_dump"):
+                    candidate = tool.function.model_dump()
+                    if isinstance(candidate, dict):
+                        tool_payload = candidate
+                elif isinstance(tool, dict):
+                    function_payload = tool.get("function")
+                    if isinstance(function_payload, dict):
+                        tool_payload = function_payload
+                if tool_payload is not None:
+                    resolved_tools.append(tool_payload)
         if len(resolved_tools) == 0:
             return None
         return resolved_tools
@@ -626,12 +638,29 @@ class BaseInferenceApiServer(ABC):
         """
 
         current_text = current_text or ""
+        previous_text = previous_text or ""
+        fallback_delta = fallback_delta or ""
 
         if current_text.startswith(previous_text):
+            # If accumulated text did not grow, emit nothing. Replaying fallback
+            # deltas here can duplicate previously streamed content.
             delta_text = current_text[len(previous_text) :]
-            if not delta_text:
-                delta_text = fallback_delta or ""
         else:
+            if not current_text and previous_text and not fallback_delta:
+                # Some tool parsers retroactively strip protocol markup, causing
+                # content snapshots to collapse to empty. Treat this as a
+                # no-op delta instead of warning every token tick.
+                return ""
+            max_overlap = min(len(previous_text), len(current_text))
+            for overlap in range(max_overlap, 0, -1):
+                if previous_text.endswith(current_text[:overlap]):
+                    return current_text[overlap:]
+            if len(current_text) < len(previous_text):
+                # Parser normalization can rewrite previous snapshots into a
+                # shorter canonical form. Suppress warnings in this benign case.
+                if fallback_delta and not previous_text.endswith(fallback_delta):
+                    return fallback_delta
+                return ""
             if previous_text:
                 logger.warning(
                     "Accumulated text doesn't start with previous text. "
@@ -682,6 +711,7 @@ class BaseInferenceApiServer(ABC):
                 for output in stream_fn():
                     asyncio.run_coroutine_threadsafe(queue.put(("data", output)), loop).result()
             except Exception as exc:
+                exc.__stream_producer_traceback__ = traceback.format_exc()
                 asyncio.run_coroutine_threadsafe(queue.put(("error", exc)), loop).result()
             finally:
                 asyncio.run_coroutine_threadsafe(queue.put(("end", None)), loop).result()
@@ -712,12 +742,51 @@ class BaseInferenceApiServer(ABC):
             store.popitem(last=False)
 
     @staticmethod
-    def _conversation_from_messages(messages: list[dict[str, tp.Any]], assistant_text: str) -> list[dict[str, tp.Any]]:
+    def _conversation_from_messages(
+        messages: list[dict[str, tp.Any]],
+        assistant_turn: str | dict[str, tp.Any],
+    ) -> list[dict[str, tp.Any]]:
         """Create conversation items (excluding ``instructions``) for storage."""
 
         history = list(messages)
-        history.append({"role": "assistant", "content": assistant_text})
+        if isinstance(assistant_turn, dict):
+            history.append(assistant_turn)
+        else:
+            history.append({"role": "assistant", "content": assistant_turn})
         return history
+
+    @staticmethod
+    def _responses_reasoning_summary_requested(payload: dict[str, tp.Any]) -> bool:
+        """Return True when reasoning summaries should be emitted in output items.
+
+        Behavior is default-on for local OpenAI-mock parity goals and can be
+        explicitly disabled using ``reasoning=False`` or
+        ``reasoning.summary`` values like ``"none"``/``false``.
+        """
+
+        include = payload.get("include")
+        if isinstance(include, list):
+            for entry in include:
+                if not isinstance(entry, str):
+                    continue
+                normalized = entry.strip().lower()
+                if normalized == "reasoning" or normalized.startswith("reasoning.summary"):
+                    return True
+
+        reasoning = payload.get("reasoning")
+        if isinstance(reasoning, bool):
+            return reasoning
+        if isinstance(reasoning, dict):
+            summary = reasoning.get("summary")
+            if summary is None:
+                return True
+            if isinstance(summary, bool):
+                return summary
+            if isinstance(summary, str):
+                normalized = summary.strip().lower()
+                return normalized not in {"", "none", "off", "disabled", "false", "0", "null"}
+            return summary is not None
+        return True
 
     @staticmethod
     def _responses_payload_to_messages(
@@ -749,6 +818,42 @@ class BaseInferenceApiServer(ABC):
             elif isinstance(input_value, list):
                 if all(isinstance(item, dict) and "role" in item for item in input_value):
                     messages.extend(tp.cast(list[dict[str, tp.Any]], input_value))
+                elif all(isinstance(item, dict) and "type" in item for item in input_value):
+                    for item in tp.cast(list[dict[str, tp.Any]], input_value):
+                        item_type = str(item.get("type", "")).strip().lower()
+                        if item_type == "message":
+                            role = item.get("role")
+                            role_value = str(role).strip() if isinstance(role, str) and role.strip() else "user"
+                            messages.append({"role": role_value, "content": item.get("content", "")})
+                            continue
+
+                        if item_type == "function_call_output":
+                            call_id = item.get("call_id") or item.get("tool_call_id") or item.get("id")
+                            output_value = item.get("output")
+                            if output_value is None:
+                                output_value = item.get("content")
+
+                            if isinstance(output_value, (dict, list)):
+                                output_text = json.dumps(output_value, ensure_ascii=False)
+                            elif output_value is None:
+                                output_text = ""
+                            else:
+                                output_text = str(output_value)
+
+                            tool_msg: dict[str, tp.Any] = {"role": "tool", "content": output_text}
+                            if call_id is not None:
+                                tool_msg["tool_call_id"] = str(call_id)
+                            messages.append(tool_msg)
+                            continue
+
+                        if item_type in {"input_text", "output_text", "text"}:
+                            text_value = item.get("text")
+                            if text_value is None:
+                                text_value = item.get("content", "")
+                            messages.append({"role": "user", "content": str(text_value)})
+                            continue
+
+                        messages.append({"role": "user", "content": item})
                 else:
                     messages.append({"role": "user", "content": input_value})
             elif input_value is not None:
@@ -761,9 +866,12 @@ class BaseInferenceApiServer(ABC):
             normalized_parts: list[dict[str, tp.Any]] = []
             for part in content:
                 if not isinstance(part, dict):
+                    normalized_parts.append({"type": "text", "text": str(part)})
                     continue
                 part_type = part.get("type")
-                if part_type == "input_text":
+                if part_type in {"input_text", "output_text"}:
+                    normalized_parts.append({"type": "text", "text": part.get("text", part.get("content", ""))})
+                elif part_type == "text":
                     normalized_parts.append({"type": "text", "text": part.get("text", "")})
                 elif part_type == "input_image":
                     image_url = part.get("image_url") or part.get("image") or part.get("url")
@@ -893,7 +1001,126 @@ class BaseInferenceApiServer(ABC):
         )
 
     @staticmethod
+    def _build_responses_reasoning_item(reasoning_text: str) -> dict[str, tp.Any]:
+        return {
+            "id": f"rs_{uuid.uuid4().hex}",
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reasoning_text}],
+        }
+
+    @staticmethod
+    def _build_responses_function_call_items(tool_calls: list[tp.Any] | None) -> list[dict[str, tp.Any]]:
+        if not tool_calls:
+            return []
+
+        items: list[dict[str, tp.Any]] = []
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                continue
+
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+
+            arguments = function.get("arguments", "")
+            if isinstance(arguments, (dict, list)):
+                arguments_text = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+            else:
+                arguments_text = "" if arguments is None else str(arguments)
+
+            call_id = tool_call.get("id") or tool_call.get("call_id")
+            if not isinstance(call_id, str) or not call_id:
+                call_id = f"call_{uuid.uuid4().hex}"
+
+            items.append(
+                {
+                    "id": f"fc_{uuid.uuid4().hex}",
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments_text,
+                    "status": "completed",
+                }
+            )
+        return items
+
+    @staticmethod
+    def _build_responses_message_item(output_text: str) -> dict[str, tp.Any]:
+        return {
+            "id": f"msg_{uuid.uuid4().hex}",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "annotations": [], "logprobs": [], "text": output_text}],
+            "status": "completed",
+        }
+
+    @classmethod
+    def _build_responses_output_items(
+        cls,
+        *,
+        output_text: str,
+        tool_calls: list[tp.Any] | None = None,
+        reasoning_text: str | None = None,
+        include_reasoning_summary: bool = False,
+    ) -> list[dict[str, tp.Any]]:
+        items: list[dict[str, tp.Any]] = []
+        if include_reasoning_summary and isinstance(reasoning_text, str) and reasoning_text.strip():
+            items.append(cls._build_responses_reasoning_item(reasoning_text))
+        items.extend(cls._build_responses_function_call_items(tool_calls))
+        items.append(cls._build_responses_message_item(output_text))
+        return items
+
+    @staticmethod
+    def _responses_assistant_message_from_output_items(
+        output_items: list[dict[str, tp.Any]],
+    ) -> dict[str, tp.Any]:
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, tp.Any]] = []
+
+        for item in output_items:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+
+            if item_type == "message":
+                content = item.get("content")
+                if isinstance(content, list):
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "output_text":
+                            text_parts.append(str(part.get("text", "")))
+                elif isinstance(content, str):
+                    text_parts.append(content)
+                continue
+
+            if item_type == "function_call":
+                call_id = item.get("call_id")
+                name = item.get("name")
+                arguments = item.get("arguments", "")
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                if not isinstance(call_id, str) or not call_id:
+                    call_id = f"call_{uuid.uuid4().hex}"
+                tool_calls.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments if isinstance(arguments, str) else ""},
+                    }
+                )
+
+        assistant_message: dict[str, tp.Any] = {"role": "assistant", "content": "".join(text_parts)}
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
+        return assistant_message
+
+    @classmethod
     def _build_responses_object(
+        cls,
         *,
         response_id: str,
         model: str,
@@ -901,16 +1128,18 @@ class BaseInferenceApiServer(ABC):
         prompt_tokens: int,
         completion_tokens: int,
         tool_calls: list[tp.Any] | None = None,
+        reasoning_text: str | None = None,
+        include_reasoning_summary: bool = False,
+        output_items: list[dict[str, tp.Any]] | None = None,
     ) -> dict[str, tp.Any]:
         created_at = int(time.time())
-        message: dict[str, tp.Any] = {
-            "id": f"msg_{uuid.uuid4().hex}",
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": output_text}],
-        }
-        if tool_calls:
-            message["tool_calls"] = tool_calls
+        if output_items is None:
+            output_items = cls._build_responses_output_items(
+                output_text=output_text,
+                tool_calls=tool_calls,
+                reasoning_text=reasoning_text,
+                include_reasoning_summary=include_reasoning_summary,
+            )
 
         return {
             "id": response_id,
@@ -918,7 +1147,7 @@ class BaseInferenceApiServer(ABC):
             "created_at": created_at,
             "model": model,
             "status": "completed",
-            "output": [message],
+            "output": output_items,
             "usage": {
                 "input_tokens": int(prompt_tokens),
                 "output_tokens": int(completion_tokens),
@@ -932,15 +1161,63 @@ class BaseInferenceApiServer(ABC):
             return None
         if not isinstance(tool_calls, list):
             return None
-        serialized: list[tp.Any] = []
+        serialized: list[dict[str, tp.Any]] = []
         for call in tool_calls:
             if hasattr(call, "model_dump"):
-                serialized.append(call.model_dump(exclude_unset=True, exclude_none=True))
+                payload = call.model_dump(exclude_unset=True, exclude_none=True)
+                if isinstance(payload, dict):
+                    serialized.append(payload)
             elif isinstance(call, dict):
                 serialized.append(call)
+        return serialized or None
+
+    @classmethod
+    def _coerce_stream_delta_message(
+        cls,
+        delta_message: tp.Any,
+        *,
+        fallback_text: str = "",
+        default_role: str | None = None,
+    ) -> DeltaMessage | None:
+        """Normalize parser/engine streaming deltas into a safe DeltaMessage."""
+
+        if delta_message is None:
+            return None
+
+        normalized: DeltaMessage | None = None
+        if isinstance(delta_message, DeltaMessage):
+            normalized = delta_message
+        elif isinstance(delta_message, str):
+            normalized = DeltaMessage(content=delta_message)
+        elif isinstance(delta_message, dict):
+            try:
+                normalized = DeltaMessage(**delta_message)
+            except Exception:
+                normalized = None
+        elif hasattr(delta_message, "model_dump"):
+            payload = delta_message.model_dump(exclude_unset=True, exclude_none=True)
+            if isinstance(payload, dict):
+                try:
+                    normalized = DeltaMessage(**payload)
+                except Exception:
+                    normalized = None
+
+        if normalized is None:
+            if fallback_text:
+                normalized = DeltaMessage(content=fallback_text)
             else:
-                serialized.append(call)
-        return serialized
+                return None
+
+        if default_role and not normalized.role:
+            normalized.role = default_role
+
+        if normalized.content is not None and not isinstance(normalized.content, (str, list)):
+            normalized.content = str(normalized.content)
+        if isinstance(normalized.content, list):
+            normalized.content = [part for part in normalized.content if isinstance(part, dict)] or None
+
+        normalized.tool_calls = cls._jsonify_tool_calls(normalized.tool_calls)
+        return normalized
 
     @staticmethod
     def _sse_event(event: str, payload: dict[str, tp.Any]) -> str:

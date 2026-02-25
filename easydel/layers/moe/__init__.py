@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,12 +24,6 @@ Core Components
 **Base Classes:**
     - `BaseMoeModule`: Abstract base class for MoE implementations with routing,
       permutation, metrics computation, and distributed execution utilities.
-
-**Linear Layers:**
-    - `ParallelMoELinear`: Batched per-expert linear transformation layer with support
-      for ragged/grouped matrix multiplication
-    - `RowParallelMoELinear`: Row-parallel variant (input dimension partitioned)
-    - `ColumnParallelMoELinear`: Column-parallel variant (output dimension partitioned)
 
 **Enumerations:**
     - `MoEMethods`: Execution methods (FUSED_MOE, STANDARD_MOE, DENSE_MOE)
@@ -99,7 +93,7 @@ Example Usage
 
 **Basic MoE Layer:**
 
-    >>> from easydel.layers.moe import (
+    >>> from easydel.layers import (
     ...     BaseMoeModule,
     ...     MoEMethods,
     ...     MoeRoutingStrategy,
@@ -134,7 +128,7 @@ Example Usage
 
 **Custom Routing with Hooks:**
 
-    >>> from easydel.layers.moe import MoeFusedHooks
+    >>> from easydel.layers import MoeFusedHooks
     >>>
     >>> # Define custom weight refinement
     >>> def temperature_scaling(weights):
@@ -187,9 +181,7 @@ matmul kernel. On GPUs, both FUSED_MOE and STANDARD_MOE work well, with FUSED_MO
 providing better performance for large expert counts.
 """
 
-from .linear import ColumnParallelMoELinear, ParallelMoELinear, RowParallelMoELinear
-from .moe import BaseMoeModule
-from .utils import (
+from ._communication_utils import (
     MoeFusedHooks,
     MoeLoadBalancingStrategy,
     MoEMethods,
@@ -197,16 +189,14 @@ from .utils import (
     MoeRoutingStrategy,
     get_moe_partition_spec,
 )
+from ._moe_module import BaseMoeModule
 
 __all__ = (
     "BaseMoeModule",
-    "ColumnParallelMoELinear",
     "MoEMethods",
     "MoeFusedHooks",
     "MoeLoadBalancingStrategy",
     "MoeMetrics",
     "MoeRoutingStrategy",
-    "ParallelMoELinear",
-    "RowParallelMoELinear",
     "get_moe_partition_spec",
 )

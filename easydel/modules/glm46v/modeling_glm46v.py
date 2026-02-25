@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,10 +21,7 @@ from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import VLMCausalLMOutput
-from easydel.layers.base_modules import BaseVisionLanguageModule
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -32,6 +29,9 @@ from easydel.layers.caching import (
     TransformerCache,
     TransformerMetadata,
 )
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import VLMCausalLMOutput
+from easydel.modules._base import BaseVisionLanguageModule
 from easydel.modules.glm4v.modeling_glm4v import Glm4vModel
 
 from .glm46v_configuration import Glm46VConfig

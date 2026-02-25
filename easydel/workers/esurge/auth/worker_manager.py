@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -175,12 +175,16 @@ class AuthWorkerManager:
             cmd.extend(["--admin-key", self._admin_key])
         if self._enable_audit_logging:
             cmd.append("--enable-audit-logging")
+        else:
+            cmd.append("--disable-audit-logging")
         if self._max_audit_entries:
             cmd.extend(["--max-audit-entries", str(self._max_audit_entries)])
         if self._storage_dir:
             cmd.extend(["--storage-dir", self._storage_dir])
         if self._enable_persistence:
             cmd.append("--enable-persistence")
+        else:
+            cmd.append("--disable-persistence")
         if self._auto_save_interval:
             cmd.extend(["--auto-save-interval", str(self._auto_save_interval)])
 

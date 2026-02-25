@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from eformer.escale import PartitionAxis, PartitionManager
 
-from easydel.layers.caching.ragged_page import RaggedPagesCache, RaggedPagesCacheConfig, RaggedPagesMetadata
+from easydel.caching.ragged_page import RaggedPagesCache, RaggedPagesCacheConfig, RaggedPagesMetadata
 
 
 def test_kv_cache_write():

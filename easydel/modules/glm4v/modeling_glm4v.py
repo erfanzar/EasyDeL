@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,16 @@ from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
@@ -36,21 +46,10 @@ from easydel.infra.modeling_outputs import (
     VLMCausalLMOutput,
 )
 from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers.attention import FlexibleAttentionModule
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseVisionLanguageModule
-from easydel.layers.caching import (
-    HybridCache,
-    OperationsMetadata,
-    RaggedPagesCache,
-    RaggedPagesCacheView,
-    RaggedPagesMetadata,
-    TransformerCache,
-    TransformerCacheView,
-    TransformerMetadata,
-)
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseVisionLanguageModule
 
 from .glm4v_configuration import Glm4vConfig, Glm4vTextConfig, Glm4vVisionConfig
 
@@ -533,7 +532,7 @@ class Glm4vVisionPatchMerger(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.norm = nn.LayerNorm(dim, epsilon=1e-6, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.norm = LayerNorm(dim, epsilon=1e-6, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
         self.act1 = jax.nn.gelu
         self.act = ACT2FN[hidden_act]
         self.gate_proj = ColumnParallelLinear(
@@ -647,7 +646,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         )
 
         num_positions = int((config.image_size // config.patch_size) ** 2)
-        self.pos_embed = nn.Embed(
+        self.pos_embed = Embed(
             num_embeddings=num_positions,
             features=config.hidden_size,
             dtype=dtype,
@@ -669,17 +668,19 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         head_dim = config.hidden_size // config.num_heads
         self._head_dim_ro = (head_dim // 2) // 2
 
-        self.blocks = [
-            Glm4vVisionBlock(
-                config,
-                layer_idx=idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for idx in range(config.depth)
-        ]
+        self.blocks = nn.List(
+            [
+                Glm4vVisionBlock(
+                    config,
+                    layer_idx=idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for idx in range(config.depth)
+            ]
+        )
 
         self.downsample = nn.Conv(
             in_features=config.hidden_size,
@@ -1241,7 +1242,7 @@ class Glm4vTextModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embed_tokens = nn.Embed(
+        self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
@@ -1249,17 +1250,19 @@ class Glm4vTextModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
-            Glm4vTextDecoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-                layer_idx=i,
-            )
-            for i in range(config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                Glm4vTextDecoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                    layer_idx=i,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
 
     def __call__(
@@ -1408,7 +1411,7 @@ class Glm4vTextModel(EasyDeLBaseModule):
         """Return the token embedding layer.
 
         Returns:
-            nn.Embed: The token embedding layer.
+            Embed: The token embedding layer.
         """
         return self.embed_tokens
 
@@ -1470,7 +1473,7 @@ class Glm4vModel(EasyDeLBaseModule):
         """Return the input token embedding layer.
 
         Returns:
-            nn.Embed: The token embedding layer from the language model.
+            Embed: The token embedding layer from the language model.
         """
         return self.language_model.get_embedding()
 
@@ -1927,7 +1930,7 @@ class Glm4vModel(EasyDeLBaseModule):
         """Return the token embedding layer.
 
         Returns:
-            nn.Embed: The token embedding layer from the language model.
+            Embed: The token embedding layer from the language model.
         """
         return self.language_model.embed_tokens
 

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,25 +34,14 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
-from easydel.infra.modeling_outputs import (
-    AttentionLayerOutput,
-    DecoderLayerOutput,
-    MoeCausalLMOutput,
-    MoeModelOutput,
-)
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     KDACacheView,
     KDAMetadata,
@@ -64,16 +53,30 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.moe import (
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
+from easydel.infra.modeling_outputs import (
+    AttentionLayerOutput,
+    DecoderLayerOutput,
+    MoeCausalLMOutput,
+    MoeModelOutput,
+)
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
+from easydel.layers import (
     BaseMoeModule,
+    ColumnParallelLinear,
     ColumnParallelMoELinear,
+    Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    RowParallelLinear,
     RowParallelMoELinear,
 )
-from easydel.layers.operations import OperationMetadata
-from easydel.layers.operations.modules import KDAOutput, KernelDeltaAttnOp, fused_kda_gate
+from easydel.layers.attention import UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule
+from easydel.operations import OperationMetadata
+from easydel.operations.kernels import KDAOutput, KernelDeltaAttnOp, fused_kda_gate
 
 from .kimi_linear_configuration import KimiLinearConfig
 
@@ -137,6 +140,10 @@ class KimiRMSNorm(nn.Module):
             KimiRMSNorm.kernel_init(rngs.params(), (hidden_size,), param_dtype),
         )
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for normalization parameters."""
+        return {"kernel": Replicated}
+
     def __call__(self, hidden_states: Float[Array, "... hidden_size"]) -> Float[Array, "... hidden_size"]:
         """Apply RMSNorm normalization.
 
@@ -192,6 +199,10 @@ class KimiRMSNormGated(nn.Module):
         self.kernel = nn.Param(
             KimiRMSNormGated.kernel_init(rngs.params(), (hidden_size,), param_dtype),
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for normalization parameters."""
+        return {"kernel": Replicated}
 
     def __call__(
         self,
@@ -363,6 +374,13 @@ class KimiMoEGate(nn.Module):
             init_kwargs={"value": 0.0},
             key=rngs.params(),
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for router parameters."""
+        return {
+            "kernel": ColumnWise,
+            "e_score_correction_bias": Replicated,
+        }
 
     def __call__(self, hidden_states: Float[Array, "tokens hidden_dim"]):
         """Route tokens to experts.
@@ -1071,6 +1089,13 @@ class KimiDeltaAttention(nn.Module):
         )
         self.kda_op = KernelDeltaAttnOp(metadata)
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for decay parameters."""
+        return {
+            "A_log": Replicated,
+            "dt_bias": Replicated,
+        }
+
     def _apply_conv_with_state(
         self,
         x: Float[Array, "batch seq_len dim"],
@@ -1460,14 +1485,7 @@ class KimiLinearModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             config.vocab_size,
             config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
@@ -1476,17 +1494,19 @@ class KimiLinearModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
-            KimiDecoderLayer(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                KimiDecoderLayer(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = KimiRMSNorm(
             config.hidden_size,
@@ -1661,7 +1681,7 @@ class KimiLinearModel(EasyDeLBaseModule):
         """Return the token embedding layer.
 
         Returns:
-            nn.Embed: The token embedding layer.
+            Embed: The token embedding layer.
         """
         return self.embed_tokens
 

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -43,7 +43,14 @@ from jaxtyping import Array
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics, dynamic_cross_entropy_loss
 
-from ..training_utils import make_assertions_and_get_sizes, minibatch_call, update_metrics, update_state_respectfully
+from ..training_utils import (
+    filter_kwargs_for_callable,
+    make_assertions_and_get_sizes,
+    minibatch_call,
+    sanitize_model_call_kwargs,
+    update_metrics,
+    update_state_respectfully,
+)
 
 
 def concatenated_forward(
@@ -100,11 +107,33 @@ def concatenated_forward(
     )
 
     # Forward pass through the model.
-    all_logits = state.model(
-        input_ids=concatenated_batch["concatenated_input_ids"],
-        attention_mask=concatenated_batch["concatenated_attention_mask"],
+    call_kwargs = {
+        "input_ids": concatenated_batch["concatenated_input_ids"],
+        "attention_mask": concatenated_batch["concatenated_attention_mask"],
         **model_kwargs,
-    ).logits
+    }
+    call_kwargs = filter_kwargs_for_callable(state.model.__call__, call_kwargs)
+    call_kwargs = sanitize_model_call_kwargs(call_kwargs)
+    all_logits = state.model(**call_kwargs).logits
+
+    effective_labels = concatenated_batch["concatenated_labels"]
+    if is_encoder_decoder and effective_labels.shape != all_logits.shape[:-1]:
+        candidate_labels = call_kwargs.get("labels")
+        if candidate_labels is None:
+            candidate_labels = call_kwargs.get("decoder_input_ids")
+        if candidate_labels is None:
+            candidate_labels = call_kwargs.get("input_ids")
+        if candidate_labels is not None and candidate_labels.shape == all_logits.shape[:-1]:
+            effective_labels = candidate_labels
+        else:
+            target_seq_len = all_logits.shape[1]
+            current_seq_len = effective_labels.shape[1]
+            if current_seq_len >= target_seq_len:
+                effective_labels = effective_labels[:, :target_seq_len]
+            else:
+                pad_shape = (effective_labels.shape[0], target_seq_len - current_seq_len)
+                pad_values = jnp.full(pad_shape, label_pad_token_id, dtype=effective_labels.dtype)
+                effective_labels = jnp.concatenate((effective_labels, pad_values), axis=1)
 
     def cross_entropy_loss(logits, labels):
         """
@@ -131,7 +160,7 @@ def concatenated_forward(
 
     # Set labels for computing loss.
     if is_encoder_decoder:
-        labels = concatenated_batch["concatenated_labels"]
+        labels = effective_labels
     else:
         labels = concatenated_batch["concatenated_input_ids"]
         attention_mask = concatenated_batch["concatenated_attention_mask"]
@@ -146,7 +175,7 @@ def concatenated_forward(
     # Compute log probabilities for the entire batch.
     all_log_probs = get_batch_logps(
         all_logits,
-        concatenated_batch["concatenated_labels"],
+        effective_labels,
         average_log_prob=True,
         is_encoder_decoder=is_encoder_decoder,
         label_pad_token_id=label_pad_token_id,
@@ -311,6 +340,7 @@ def orpo_step(
     loss_config: LossConfig | None = None,
     partition_spec: PartitionSpec | None = None,
     gradient_accumulation_steps: int = 1,
+    straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """
     Performs a single training or evaluation step for the ORPO method.
@@ -365,6 +395,8 @@ def orpo_step(
             tp.Tuple[Array, LossMetrics]: The computed loss and a LossMetrics object containing
             additional metrics.
         """
+        if mode == "train" and straight_through_emulator is not None:
+            tree = straight_through_emulator(tree)
         (
             mean_chosen_logits,
             mean_rejected_logits,

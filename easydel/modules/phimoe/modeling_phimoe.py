@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,13 +24,7 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -40,8 +34,14 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm as RMSNorm
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput, DecoderLayerOutput
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers import RMSNorm as RMSNorm
+from easydel.layers.attention import UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule
 
 from .phimoe_configuration import PhiMoeConfig
 
@@ -149,6 +149,14 @@ class PhiMoEAttention(UnifiedAttention):
             rngs (nn.Rngs): Random number generator state.
             layer_idx (int): Index of this layer in the model.
         """
+        # PhiMoE router decisions are highly sensitive to attention noise.
+        # Keep attention computations in model dtype (fp32 in tests) to align
+        # routing with HF and avoid cascading top-k expert mismatches.
+        if getattr(config, "attn_dtype", None) is not None:
+            config.attn_dtype = dtype
+        if getattr(config, "attn_softmax_dtype", None) is not None:
+            config.attn_softmax_dtype = dtype
+
         super().__init__(
             config=config,
             dtype=dtype,
@@ -213,16 +221,18 @@ class PhiMoeSparseMoeBlock(nn.Module):
             kernel_init=nn.initializers.normal(),
         )
 
-        self.experts = [
-            PhiMoEBlockSparseTop2MLP(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_local_experts)
-        ]
+        self.experts = nn.List(
+            [
+                PhiMoEBlockSparseTop2MLP(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_local_experts)
+            ]
+        )
 
     def __call__(
         self,
@@ -288,6 +298,21 @@ class PhiMoeSparseMoeBlock(nn.Module):
                 routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)),
                 axis=-1,
             )
+        # HF compatibility: Phimoe router returns a dense expert-weight matrix
+        # by scattering top-k multipliers into expert columns. The current HF
+        # expert block then indexes this dense matrix by top-k *position* (0/1)
+        # rather than expert id. Reproduce this behavior for strict parity.
+        routing_weights_dense = jnp.zeros(
+            (routing_weights.shape[0], self.config.num_local_experts),
+            dtype=routing_weights.dtype,
+        )
+        token_indices = jnp.arange(routing_weights.shape[0])
+        for topk_pos in range(selected_experts.shape[-1]):
+            routing_weights_dense = routing_weights_dense.at[
+                token_indices,
+                selected_experts[:, topk_pos],
+            ].set(routing_weights[:, topk_pos])
+
         final_hidden_state = jnp.zeros_like(hidden_states)
         for index in range(self.config.num_local_experts):
             expert_layer_output = (
@@ -299,7 +324,13 @@ class PhiMoeSparseMoeBlock(nn.Module):
                 if self.config.use_scan_mlp
                 else self.experts[index](hidden_states)
             )
-            expert_weight = jnp.sum((selected_experts == index) * routing_weights, axis=-1)
+            expert_weight = jnp.zeros((hidden_states.shape[0],), dtype=routing_weights.dtype)
+            for topk_pos in range(selected_experts.shape[-1]):
+                expert_weight = expert_weight + jnp.where(
+                    selected_experts[:, topk_pos] == index,
+                    routing_weights_dense[:, topk_pos],
+                    0.0,
+                )
             expert_layer_output_exp = expert_layer_output * expert_weight[:, None]
             final_hidden_state += checkpoint_name(expert_layer_output_exp, "moe_expert_output")
         final_hidden_state = final_hidden_state.reshape(batch_size, sequence_length, hidden_dim)
@@ -338,6 +369,42 @@ class PhiMoeDecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
+
+        gate_up_splits = []
+        down_splits = []
+        for expert_idx in range(config.num_local_experts):
+            gate_up_splits.append(
+                {
+                    "name": f"block_sparse_moe.experts.{expert_idx}.w1.kernel",
+                    "spliter": (lambda x, idx=expert_idx: x[idx, : x.shape[1] // 2, :].swapaxes(-1, -2)),
+                }
+            )
+            gate_up_splits.append(
+                {
+                    "name": f"block_sparse_moe.experts.{expert_idx}.w3.kernel",
+                    "spliter": (lambda x, idx=expert_idx: x[idx, x.shape[1] // 2 :, :].swapaxes(-1, -2)),
+                }
+            )
+            down_splits.append(
+                {
+                    "name": f"block_sparse_moe.experts.{expert_idx}.w2.kernel",
+                    "spliter": (lambda x, idx=expert_idx: x[idx].swapaxes(-1, -2)),
+                }
+            )
+
+        # Accept HF PhiMoE MoE naming (`mlp.*`) directly during state-dict conversion.
+        # HF stores expert projections as consolidated tensors over experts:
+        # - mlp.experts.gate_up_proj: [num_experts, 2 * intermediate, hidden]
+        # - mlp.experts.down_proj:    [num_experts, hidden, intermediate]
+        # while EasyDeL stores per-expert w1/w2/w3 modules.
+        self.reform_param = {
+            "mlp.router.weight$": {
+                "splits": [{"name": "block_sparse_moe.gate.kernel", "spliter": lambda x: x.swapaxes(-1, -2)}]
+            },
+            "mlp.experts.gate_up_proj$": {"splits": gate_up_splits},
+            "mlp.experts.down_proj$": {"splits": down_splits},
+        }
+
         attn_block = PhiMoEAttention
         mlp_block = PhiMoeSparseMoeBlock
         attn_block, mlp_block = auto_remat(
@@ -363,21 +430,19 @@ class PhiMoeDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.input_layernorm = nn.LayerNorm(
-            config.hidden_size,
-            epsilon=config.rms_norm_eps,
+        self.input_layernorm = RMSNorm(
+            dim=config.hidden_size,
+            eps=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=True,
             rngs=rngs,
         )
 
-        self.post_attention_layernorm = nn.LayerNorm(
-            config.hidden_size,
-            epsilon=config.rms_norm_eps,
+        self.post_attention_layernorm = RMSNorm(
+            dim=config.hidden_size,
+            eps=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=True,
             rngs=rngs,
         )
 
@@ -498,13 +563,7 @@ class PhiMoeModel(EasyDeLBaseModule):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             config.vocab_size,
             config.hidden_size,
             dtype=dtype,
@@ -513,23 +572,24 @@ class PhiMoeModel(EasyDeLBaseModule):
         )
 
         self.embed_dropout = nn.Dropout(config.embd_pdrop)
-        self.layers = [
-            PhiMoeDecoderLayer(
-                config=config,
-                layer_idx=idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for idx in range(self.config.num_hidden_layers)
-        ]
-        self.norm = nn.LayerNorm(
-            config.hidden_size,
-            epsilon=config.rms_norm_eps,
+        self.layers = nn.List(
+            [
+                PhiMoeDecoderLayer(
+                    config=config,
+                    layer_idx=idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for idx in range(self.config.num_hidden_layers)
+            ]
+        )
+        self.norm = RMSNorm(
+            dim=config.hidden_size,
+            eps=config.rms_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
-            use_bias=True,
             rngs=rngs,
         )
 
@@ -545,6 +605,7 @@ class PhiMoeModel(EasyDeLBaseModule):
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        output_router_logits: bool | None = None,
     ) -> BaseModelOutput:
         """Forward pass through the PhiMoE base model.
 
@@ -632,6 +693,7 @@ class PhiMoeModel(EasyDeLBaseModule):
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
+                output_router_logits=bool(output_router_logits),
                 frequencies=self.frequencies,
             )
             hidden_states = layer_outputs.hidden_states
@@ -741,6 +803,7 @@ class PhiMoeForCausalLM(BaseCausalLMModule[PhiMoeModel, PhiMoeConfig]):
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
+        output_router_logits: bool | None = None,
     ) -> CausalLMOutput:
         """Forward pass through the PhiMoE causal language model.
 
@@ -781,6 +844,7 @@ class PhiMoeForCausalLM(BaseCausalLMModule[PhiMoeModel, PhiMoeConfig]):
             past_key_values=past_key_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
             cache_metadata=cache_metadata,
             inputs_embeds=inputs_embeds,
         )

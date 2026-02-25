@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,8 +24,10 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
 
+from ..prompt_transforms import SFTPreprocessTransform
 from ..trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
+from ..training_utils import resolve_straight_through_emulator
 from ..utils import DataCollatorForCompletionOnlyLM
 from ._fn import distillation_step
 from .distillation_config import DistillationConfig
@@ -131,6 +133,12 @@ class DistillationTrainer(Trainer):
 
         hidden_layers = self.arguments.hidden_state_layers
         attention_layers = self.arguments.attention_layers
+        straight_through_emulator = resolve_straight_through_emulator(
+            quantization_mode=self.arguments.quantization_mode,
+            quantization_group_size=self.arguments.quantization_group_size,
+            tensor_straight_through=self.arguments.tensor_straight_through,
+            straight_through_emulator=self.arguments.straight_through_emulator,
+        )
 
         self._train_shared_fn_static_args = (
             self.arguments.loss_config,
@@ -146,9 +154,10 @@ class DistillationTrainer(Trainer):
             float(self.arguments.attention_loss_weight),
             attention_layers,
             bool(self.arguments.attention_normalize),
+            straight_through_emulator,
         )
 
-        static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+        static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
         sharded_training_step_function = ejit(
             distillation_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
@@ -171,6 +180,7 @@ class DistillationTrainer(Trainer):
             float(self.arguments.attention_loss_weight),
             attention_layers,
             bool(self.arguments.attention_normalize),
+            None,
         )
 
         sharded_evaluation_step_function = ejit(
@@ -192,6 +202,28 @@ class DistillationTrainer(Trainer):
             mesh=mesh,
             checkpoint_manager=self.arguments.get_streaming_checkpointer(),
         )
+
+    def _get_preprocess_transform(self) -> SFTPreprocessTransform | None:
+        """Tokenize raw text examples for distillation when needed."""
+        if self._is_pretokenized():
+            return None
+        text_field = getattr(self.arguments, "dataset_text_field", None) or "text"
+        return SFTPreprocessTransform(
+            tokenizer=self.processing_class,
+            max_length=self.arguments.max_length,
+            text_field=text_field,
+            mask_prompt=False,
+        )
+
+    def _is_pretokenized(self) -> bool:
+        """Check whether the source already yields token IDs."""
+        if self._train_source is None:
+            return False
+        try:
+            sample = next(iter(self._train_source.open_shard(self._train_source.shard_names[0])))
+            return "input_ids" in sample
+        except (StopIteration, IndexError):
+            return False
 
     @property
     def _train_shared_fn_extra_args(self) -> tuple[tp.Any]:
