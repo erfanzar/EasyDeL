@@ -21,6 +21,7 @@ tests in tests/trainers/.
 
 Configs:
     - sft.yaml: Supervised Fine-Tuning
+    - sft_qat_ste.yaml: Supervised Fine-Tuning with QAT+STE (NF4)
     - dpo.yaml: Direct Preference Optimization
     - orpo.yaml: Odds Ratio Preference Optimization
     - distillation.yaml: Knowledge Distillation

@@ -22,7 +22,7 @@ work with a unified data interface.
 from __future__ import annotations
 
 import typing as tp
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 
 from ..core.protocols import ShardedDataSource, ShardInfo
 
@@ -85,6 +85,20 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
             # Fallback: check if it has __len__
             return not hasattr(dataset, "__len__")
 
+    @staticmethod
+    def _to_example(value: tp.Any) -> dict[str, tp.Any]:
+        """Normalize a dataset element to a plain dictionary example."""
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, Mapping):
+            return dict(value)
+        if hasattr(value, "items"):
+            try:
+                return dict(value.items())
+            except Exception:
+                pass
+        raise TypeError(f"Expected mapping-like dataset row, got {type(value).__name__}")
+
     @property
     def shard_names(self) -> Sequence[str]:
         """Return shard names. HF datasets are treated as single shard."""
@@ -105,11 +119,12 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
         """
         if self._is_iterable:
             # IterableDataset - just iterate
-            yield from self._dataset
+            for example in self._dataset:
+                yield self._to_example(example)
         else:
             # Regular Dataset - index access
             for i in range(len(self._dataset)):
-                yield self._dataset[i]
+                yield self._to_example(self._dataset[i])
 
     def open_shard_at_row(self, shard_name: str, row: int) -> Iterator[dict]:
         """Open shard starting at a specific row.
@@ -125,11 +140,11 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
             # IterableDataset - skip rows
             for i, example in enumerate(self._dataset):
                 if i >= row:
-                    yield example
+                    yield self._to_example(example)
         else:
             # Regular Dataset - direct indexing
             for i in range(row, len(self._dataset)):
-                yield self._dataset[i]
+                yield self._to_example(self._dataset[i])
 
     def get_shard_info(self, shard_name: str) -> ShardInfo | None:
         """Get metadata about the shard.

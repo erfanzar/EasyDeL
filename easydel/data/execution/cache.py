@@ -34,9 +34,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, DatasetDict, IterableDataset
 
-    DatasetLike = Dataset | IterableDataset
+    DatasetLike = Dataset | IterableDataset | DatasetDict
 
 
 @dataclass

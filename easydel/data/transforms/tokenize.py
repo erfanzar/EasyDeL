@@ -112,7 +112,7 @@ class TokenizerManager:
             add_special_tokens=config.add_special_tokens,
             return_attention_mask=config.return_attention_mask,
         )
-        return dict(result)
+        return tp.cast(dict[str, list[int]], dict(result))
 
     def tokenize_batch(
         self,
@@ -138,7 +138,7 @@ class TokenizerManager:
             add_special_tokens=config.add_special_tokens,
             return_attention_mask=config.return_attention_mask,
         )
-        return dict(result)
+        return tp.cast(dict[str, list[list[int]]], dict(result))
 
 
 class TokenizedShardedSource(ShardedDataSource[dict]):

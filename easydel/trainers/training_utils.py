@@ -28,8 +28,22 @@ from easydel.utils.helpers import check_bool_flag
 SCAN_TRAINER = check_bool_flag("SCAN_TRAINER")
 FAST_COMPILE = check_bool_flag("FAST_COMPILE")
 
-QuantizationMode = tp.Literal["fp8", "int8", "nf4"]
-DEFAULT_NF4_GROUP_SIZE = 64
+QuantizationMode = tp.Literal[
+    "nf4",
+    "affine",
+    "mxfp8",
+    "nvfp8",
+    "mxfp4",
+    "nvfp4",
+]
+AFFINE_SUPPORTED_BITS = frozenset({2, 3, 4, 5, 6, 7, 8})
+FIXED_QUANTIZATION_BITS_BY_MODE: dict[QuantizationMode, int] = {
+    "nf4": 4,
+    "mxfp4": 4,
+    "nvfp4": 4,
+    "mxfp8": 8,
+    "nvfp8": 8,
+}
 
 
 def filter_kwargs_for_callable(
@@ -72,39 +86,10 @@ def _ste(x: jax.Array, q: jax.Array) -> jax.Array:
     return x + lax.stop_gradient(q - x)
 
 
-def _quantize_dequantize_int8(x: jax.Array) -> jax.Array:
-    from eformer.ops.quantization.quantization_functions import dequantize_int8, quantize_int8
-
-    q, scale = quantize_int8(x)
-    return dequantize_int8(q, scale)
-
-
-def _quantize_dequantize_nf4(x: jax.Array, *, group_size: int) -> jax.Array:
-    from eformer.ops.quantization.quantization_functions import dequantize_nf4, quantize_and_pack_nf4
-
-    if group_size <= 0:
-        raise ValueError(f"`quantization_group_size` must be > 0 for NF4, got {group_size}.")
-    original_last_dim = x.shape[-1]
-    if original_last_dim % group_size != 0:
-        pad_amount = group_size - (original_last_dim % group_size)
-        pad_width = [(0, 0)] * (x.ndim - 1) + [(0, pad_amount)]
-        x = jnp.pad(x, pad_width, mode="constant", constant_values=0)
-
-    packed, absmax = quantize_and_pack_nf4(x, group_size)
-    deq = dequantize_nf4(packed, absmax, group_size)
-    if deq.shape[-1] != original_last_dim:
-        deq = deq[..., :original_last_dim]
-    return deq
-
-
-def _quantize_dequantize_fp8(x: jax.Array) -> jax.Array:
-    # FP8 simulation via cast; STE is applied by the caller.
-    return x.astype(jnp.float8_e4m3fn).astype(x.dtype)
-
-
 def make_default_tensor_straight_through(
     quantization_mode: QuantizationMode,
     quantization_group_size: int | None = None,
+    quantization_bits: int | None = None,
     *,
     quantization_block: int | None = None,
 ) -> tp.Callable[[jax.Array], jax.Array]:
@@ -114,7 +99,8 @@ def make_default_tensor_straight_through(
     if the transform is identity (STE).
 
     Notes:
-        - `quantization_group_size` is used for NF4 group-wise quantization.
+        - `quantization_group_size` controls group-wise quantization where relevant.
+        - `quantization_bits` controls bit-width for configurable formats (for example `affine`).
     """
     if quantization_block is not None:
         warnings.warn(
@@ -132,36 +118,73 @@ def make_default_tensor_straight_through(
                 stacklevel=2,
             )
 
-    try:
-        from eformer.ops.quantization import straight_through as eformer_straight_through  # type: ignore
-    except Exception:  # pragma: no cover
-        eformer_straight_through = None
+    if quantization_bits is not None:
+        quantization_bits = int(quantization_bits)
+        if quantization_bits <= 0:
+            raise ValueError(f"`quantization_bits` must be > 0 when specified, got {quantization_bits}.")
+        if quantization_mode == "affine" and quantization_bits not in AFFINE_SUPPORTED_BITS:
+            bits_values = ", ".join(str(v) for v in sorted(AFFINE_SUPPORTED_BITS))
+            raise ValueError(
+                f"`quantization_bits` for `affine` must be one of {{{bits_values}}}, got {quantization_bits}."
+            )
+        required_bits = FIXED_QUANTIZATION_BITS_BY_MODE.get(quantization_mode, None)
+        if required_bits is not None and quantization_bits != required_bits:
+            raise ValueError(
+                f"`quantization_bits` for `{quantization_mode}` must be {required_bits}, got {quantization_bits}."
+            )
 
-    nf4_group_size: int | None = None
-    if quantization_mode == "nf4":
-        nf4_group_size = DEFAULT_NF4_GROUP_SIZE if quantization_group_size is None else int(quantization_group_size)
+    from ejkernel.quantization import dequantize as ej_dequantize
+    from ejkernel.quantization import quantize as ej_quantize
+
+    from easydel.layers.quantization import QuantizationConfig
+    from easydel.layers.quantization._configs import resolve_ejkernel_quant_params
+
+    quantization_config = QuantizationConfig(
+        dtype=quantization_mode,
+        group_size=quantization_group_size,
+        bits=quantization_bits,
+    )
+    mode, group_size, bits, needs_biases = resolve_ejkernel_quant_params(quantization_config)
+
+    def _quantize_dequantize(y: jax.Array) -> jax.Array:
+        input_dtype = y.dtype
+        if y.ndim == 0:
+            # Scalar leaves can appear in graphstate pytrees; keep them unchanged.
+            return y.astype(input_dtype)
+        was_vector = y.ndim == 1
+        if was_vector:
+            # ejkernel quantize expects rank >= 2.
+            y = y[None, :]
+        original_last_dim = y.shape[-1]
+        if original_last_dim % group_size != 0:
+            pad_amount = group_size - (original_last_dim % group_size)
+            pad_width = [(0, 0)] * (y.ndim - 1) + [(0, pad_amount)]
+            y = jnp.pad(y, pad_width, mode="constant", constant_values=0)
+
+        if needs_biases:
+            wq, scales, biases = ej_quantize(y, group_size=group_size, bits=bits, mode=mode, axis="col")
+        else:
+            wq, scales = ej_quantize(y, group_size=group_size, bits=bits, mode=mode, axis="col")
+            biases = None
+        dequantized = ej_dequantize(
+            wq,
+            scales,
+            biases,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+            axis="col",
+        )
+        if dequantized.shape[-1] != original_last_dim:
+            dequantized = dequantized[..., :original_last_dim]
+        if was_vector:
+            dequantized = jnp.squeeze(dequantized, axis=0)
+        return dequantized.astype(input_dtype)
 
     def tensor_straight_through(x: jax.Array) -> jax.Array:
         if not jnp.issubdtype(x.dtype, jnp.floating):
             return x
-        if eformer_straight_through is not None and (quantization_mode != "nf4" or quantization_group_size is None):
-            try:
-                q = eformer_straight_through(x, method=quantization_mode)
-            except TypeError:
-                q = eformer_straight_through(x, quantization_mode)
-            return _ste(x, q)
-
-        if quantization_mode == "int8":
-            qdq = _quantize_dequantize_int8
-        elif quantization_mode == "nf4":
-
-            def qdq(y):
-                return _quantize_dequantize_nf4(y, group_size=tp.cast(int, nf4_group_size))
-        elif quantization_mode == "fp8":
-            qdq = _quantize_dequantize_fp8
-        else:  # pragma: no cover
-            raise ValueError(f"Unsupported `quantization_mode`: {quantization_mode!r}.")
-        return _ste(x, qdq(x))
+        return _ste(x, _quantize_dequantize(x))
 
     return tensor_straight_through
 
@@ -170,6 +193,7 @@ def resolve_straight_through_emulator(
     *,
     quantization_mode: QuantizationMode | None,
     quantization_group_size: int | None = None,
+    quantization_bits: int | None = None,
     tensor_straight_through: tp.Callable[[jax.Array], jax.Array] | None,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None,
     quantization_block: int | None = None,
@@ -179,7 +203,8 @@ def resolve_straight_through_emulator(
     Priority:
       1) `straight_through_emulator` (user-provided)
       2) `tensor_straight_through` mapped over graphstate
-      3) default tensor STE built from (`quantization_mode`, `quantization_group_size`) and mapped over graphstate
+      3) default tensor STE built from (`quantization_mode`, `quantization_group_size`, `quantization_bits`) and
+         mapped over graphstate
       4) None (disabled)
     """
     if quantization_block is not None:
@@ -208,6 +233,7 @@ def resolve_straight_through_emulator(
         tensor_straight_through = make_default_tensor_straight_through(
             quantization_mode,
             quantization_group_size=quantization_group_size,
+            quantization_bits=quantization_bits,
         )
 
     def _default_emulator(graphstate: tp.Any) -> tp.Any:

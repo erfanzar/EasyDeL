@@ -44,7 +44,6 @@ from easydel.layers.quantization._quants import QuantizationConfig
 
 from .defaults import DEFAULTS
 from .types import ELMConfig
-from .utils import as_map, coerce_dtype, deep_merge, normalize_task
 
 
 def resolve_task(cfg: ELMConfig) -> TaskType:
@@ -74,7 +73,8 @@ def resolve_task(cfg: ELMConfig) -> TaskType:
         >>> cfg = {"model": {"name_or_path": "bert-base-uncased"}}
         >>> task = resolve_task(cfg)  # Will attempt to infer from HF config
     """
-    task = normalize_task(cfg["model"].get("task"))
+    utils_mod = __import__("easydel.infra.elarge_model.utils", fromlist=["normalize_task"])
+    task = utils_mod.normalize_task(cfg["model"].get("task"))
     if task is None or task == TaskType.AUTO_BIND:
         model_name = cfg["model"].get("name_or_path")
         if model_name:
@@ -129,10 +129,11 @@ def normalize(cfg: ELMConfig | Mapping[str, Any]) -> ELMConfig:
         >>> normalized["loader"]["dtype"]
         'float32'
     """
-    raw = as_map(cfg)
+    utils_mod = __import__("easydel.infra.elarge_model.utils", fromlist=["as_map", "deep_merge"])
+    raw = utils_mod.as_map(cfg)
     if "model" not in raw or "name_or_path" not in raw["model"]:
         raise ValueError("Config must include model.name_or_path")
-    merged = deep_merge(DEFAULTS, raw)
+    merged = utils_mod.deep_merge(DEFAULTS, raw)
 
     vals = dict(merged.get("base_config", {}).get("values", {}) or {})
     if merged.get("esurge", {}).get("max_model_len") is None:
@@ -140,7 +141,7 @@ def normalize(cfg: ELMConfig | Mapping[str, Any]) -> ELMConfig:
         if mlen is not None:
             merged.setdefault("esurge", {})["max_model_len"] = int(mlen)
 
-    return cast(ELMConfig, merged)
+    return cast(ELMConfig, cast(object, merged))
 
 
 def materialize_base_config(cfg: ELMConfig, prefer: tp.Literal["base", "sections"] = "base") -> EasyDeLBaseConfigDict:
@@ -193,6 +194,9 @@ def materialize_base_config(cfg: ELMConfig, prefer: tp.Literal["base", "sections
         >>> # Using sections preference
         >>> base_cfg = materialize_base_config(cfg, prefer="sections")
     """
+    utils_mod = __import__("easydel.infra.elarge_model.utils", fromlist=["coerce_dtype"])
+    coerce_dtype = utils_mod.coerce_dtype
+
     cfg = normalize(cfg)
     raw_base = dict(cfg.get("base_config", {}).get("values", {}) or {})
 
@@ -252,8 +256,9 @@ def materialize_base_config(cfg: ELMConfig, prefer: tp.Literal["base", "sections
 
     base.setdefault("hardware_abstraction", True)
 
-    if esurge.get("max_model_len") is not None:
-        mlen = int(esurge["max_model_len"])
+    max_model_len = esurge.get("max_model_len")
+    if max_model_len is not None:
+        mlen = int(max_model_len)
         set_maybe("mask_max_position_embeddings", mlen)
         set_maybe("freq_max_position_embeddings", mlen)
 
@@ -261,7 +266,7 @@ def materialize_base_config(cfg: ELMConfig, prefer: tp.Literal["base", "sections
     op_configs = cfg.get("base_config", {}).get("operation_configs")
     set_maybe("operation_configs", op_configs)
 
-    return cast(EasyDeLBaseConfigDict, base)
+    return cast(EasyDeLBaseConfigDict, cast(object, base))
 
 
 def validate(cfg_like: ELMConfig | Mapping[str, Any]) -> None:

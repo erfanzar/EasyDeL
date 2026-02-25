@@ -112,6 +112,7 @@ class TestElargeDryRun:
         "config_name",
         [
             "sft.yaml",
+            "sft_qat_ste.yaml",
             "dpo.yaml",
             "orpo.yaml",
             "distillation.yaml",
@@ -147,6 +148,12 @@ class TestElargeTraining:
         """Test SFT training via YAML config."""
         result = run_elarge_config("sft.yaml")
         assert result.returncode == 0, f"SFT training failed:\n{result.stderr or result.stdout}"
+
+    @pytest.mark.slow
+    def test_sft_qat_ste(self):
+        """Test SFT QAT+STE training via YAML config."""
+        result = run_elarge_config("sft_qat_ste.yaml")
+        assert result.returncode == 0, f"SFT QAT+STE training failed:\n{result.stderr or result.stdout}"
 
     @pytest.mark.slow
     def test_dpo(self):
@@ -189,6 +196,7 @@ if __name__ == "__main__":
 
     configs = {
         "sft": "sft.yaml",
+        "sft_qat_ste": "sft_qat_ste.yaml",
         "dpo": "dpo.yaml",
         "orpo": "orpo.yaml",
         "distillation": "distillation.yaml",

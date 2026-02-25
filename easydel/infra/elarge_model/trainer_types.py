@@ -60,7 +60,7 @@ Note:
 from __future__ import annotations
 
 import warnings
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict, cast
 
 _TRAINER_TYPE_ALIASES: dict[str, str] = {
     "nash_md": "nash-md",
@@ -286,6 +286,11 @@ class BaseTrainerCfg(TypedDict, total=False):
         performance_mode: Whether to enable performance optimizations.
         track_memory: Whether to track memory usage. Can be bool or float threshold.
         low_mem_usage: Whether to enable low memory usage optimizations.
+        quantization_mode: QAT/STE quantization mode for forward-pass emulation.
+        quantization_group_size: Group size for group-wise quantizers.
+        quantization_bits: Bit-width for configurable quantizers (e.g. affine).
+        tensor_straight_through: Optional per-tensor STE transform callable.
+        straight_through_emulator: Optional graphstate-level STE transform callable.
         model_name: Name of the model being trained.
         model_parameters: Dictionary of model configuration parameters.
         frozen_parameters: Regex pattern for parameters to freeze during training.
@@ -316,6 +321,7 @@ class BaseTrainerCfg(TypedDict, total=False):
         generation_preview_print: Whether to print generation preview to console.
         generation_log_to_wandb: Whether to log generation preview to WandB.
         use_esurge_generation: Whether to use eSurge for optimized generation.
+        esurge_use_tqdm: Whether to show tqdm progress for eSurge generation.
         esurge_hbm_utilization: HBM utilization target for eSurge.
         esurge_max_num_seqs: Maximum concurrent sequences for eSurge.
         esurge_min_input_pad: Minimum input padding for eSurge.
@@ -431,6 +437,11 @@ class BaseTrainerCfg(TypedDict, total=False):
     performance_mode: NotRequired[bool]
     track_memory: NotRequired[bool | float]
     low_mem_usage: NotRequired[bool]
+    quantization_mode: NotRequired[Literal["nf4", "affine", "mxfp8", "nvfp8", "mxfp4", "nvfp4"] | None]
+    quantization_group_size: NotRequired[int | None]
+    quantization_bits: NotRequired[int | None]
+    tensor_straight_through: NotRequired[Any | None]
+    straight_through_emulator: NotRequired[Any | None]
 
     model_name: NotRequired[str | None]
     model_parameters: NotRequired[dict | None]
@@ -468,6 +479,7 @@ class BaseTrainerCfg(TypedDict, total=False):
 
     # eSurge integration for generation
     use_esurge_generation: NotRequired[bool]
+    esurge_use_tqdm: NotRequired[bool]
     esurge_hbm_utilization: NotRequired[float | None]
     esurge_max_num_seqs: NotRequired[int | None]
     esurge_min_input_pad: NotRequired[int | None]
@@ -1639,7 +1651,7 @@ def normalize_trainer_config(config: dict[str, Any]) -> TrainerConfig:
 
         config["loss_config"] = LossConfig(**config["loss_config"])
 
-    return config
+    return cast(TrainerConfig, cast(object, config))
 
 
 def get_trainer_class(trainer_type: str):
