@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,14 +25,7 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat
-from easydel.layers.attention import FlexibleAttentionModule
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -42,7 +35,14 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
+from easydel.infra.utils import ACT2FN, auto_remat
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseCausalLMModule
 
 from .gpt_neox_configuration import GPTNeoXConfig as GPTNeoXConfig
 
@@ -268,8 +268,8 @@ class GPTNeoXBlock(nn.Module):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         use_parallel_residual (bool): Whether to use parallel residual connections.
-        input_layernorm (nn.LayerNorm): Layer normalization before attention.
-        post_attention_layernorm (nn.LayerNorm): Layer normalization before MLP.
+        input_layernorm (LayerNorm): Layer normalization before attention.
+        post_attention_layernorm (LayerNorm): Layer normalization before MLP.
         attention (GPTNeoXAttention): Self-attention module.
         mlp (GPTNeoXMlp): Feed-forward network module.
     """
@@ -311,14 +311,14 @@ class GPTNeoXBlock(nn.Module):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.input_layernorm = nn.LayerNorm(
+        self.input_layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.post_attention_layernorm = nn.LayerNorm(
+        self.post_attention_layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -421,10 +421,10 @@ class GPTNeoXModel(EasyDeLBaseModule):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        embed_in (nn.Embed): Token embedding layer.
+        embed_in (Embed): Token embedding layer.
         emb_dropout (nn.Dropout): Dropout applied after embeddings.
         layers (list[GPTNeoXBlock]): List of transformer blocks.
-        final_layer_norm (nn.LayerNorm): Final layer normalization.
+        final_layer_norm (LayerNorm): Final layer normalization.
     """
 
     def __init__(
@@ -452,7 +452,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embed_in = nn.Embed(
+        self.embed_in = Embed(
             self.config.vocab_size,
             self.config.hidden_size,
             dtype=dtype,
@@ -460,18 +460,20 @@ class GPTNeoXModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.emb_dropout = nn.Dropout(config.hidden_dropout, rngs=rngs)
-        self.layers = [
-            GPTNeoXBlock(
-                config=config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(config.num_hidden_layers)
-        ]
-        self.final_layer_norm = nn.LayerNorm(
+        self.layers = nn.List(
+            [
+                GPTNeoXBlock(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
+        self.final_layer_norm = LayerNorm(
             config.hidden_size,
             epsilon=self.config.layer_norm_eps,
             dtype=self.dtype,

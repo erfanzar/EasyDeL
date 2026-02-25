@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -58,6 +58,7 @@ import contextlib
 import gc
 import json
 import os
+import re
 import tempfile
 import typing as tp
 import warnings
@@ -77,14 +78,35 @@ from huggingface_hub import CommitOperationAdd, create_branch, create_commit
 from huggingface_hub.utils import HfHubHTTPError
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from transformers.utils.generic import working_or_temp_dir
+
+try:
+    from transformers.utils.generic import working_or_temp_dir
+except ImportError:  # transformers>=5 removed helper
+    import shutil
+    import tempfile
+    from contextlib import contextmanager
+
+    @contextmanager
+    def working_or_temp_dir(working_dir: str | os.PathLike | None = None, use_temp_dir: bool = False):
+        if use_temp_dir or working_dir is None:
+            temp_dir = tempfile.mkdtemp()
+            try:
+                yield temp_dir
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        else:
+            os.makedirs(working_dir, exist_ok=True)
+            yield working_dir
+
+
 from transformers.utils.hub import PushToHubMixin
 
-from easydel.layers.quantization import EasyDeLQuantizationConfig
+from easydel.layers import QuantizationConfig
 from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
 from easydel.utils.traversals import flatten_dict, is_flatten, merge_model_and_tree, string_key_to_int, unflatten_dict
 
-from ..base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
+from ..base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict, is_remote_url
+from ..base_config import download_url as _download_url
 from ..etils import EasyDeLBackends, EasyDeLPlatforms
 
 if tp.TYPE_CHECKING:
@@ -142,6 +164,84 @@ class StreamingCheckpointInfo:
     resolve_shard: tp.Callable[[str, str | None], str]
 
 
+def _save_generation_config(generation_config: tp.Any, save_directory: ePathLike) -> None:
+    """Persist generation config with EasyDeL path handling (local and remote filesystems)."""
+    if generation_config is None:
+        return
+
+    output_path = ePath(save_directory) / GENERATION_CONFIG_NAME
+    try:
+        if isinstance(generation_config, dict):
+            output_path.write_text(json.dumps(generation_config, indent=2, sort_keys=True))
+            return
+        if hasattr(generation_config, "to_json_string"):
+            output_path.write_text(generation_config.to_json_string(use_diff=False))
+            return
+        if hasattr(generation_config, "to_dict"):
+            output_path.write_text(json.dumps(generation_config.to_dict(), indent=2, sort_keys=True))
+            return
+        generation_config.save_pretrained(str(save_directory))
+    except Exception:
+        logger.warning(
+            "Failed to save generation config at %s via EasyDeL writer; trying transformers save_pretrained.",
+            output_path,
+            exc_info=True,
+        )
+        generation_config.save_pretrained(str(save_directory))
+
+
+def _load_generation_config(
+    pretrained_model_name_or_path: str | os.PathLike,
+    *,
+    subfolder: str = "",
+    trust_remote_code: bool | None = None,
+    log_missing: bool = False,
+    **hf_kwargs,
+):
+    """Load generation config with ePath-first lookup (supports GCS paths)."""
+    from transformers import GenerationConfig
+
+    model_path = ePath(str(pretrained_model_name_or_path))
+    normalized_subfolder = str(subfolder or "").strip("/")
+    candidates: list[ePath] = []  # type:ignore
+    if normalized_subfolder:
+        candidates.append(model_path / normalized_subfolder / GENERATION_CONFIG_NAME)
+    candidates.append(model_path / GENERATION_CONFIG_NAME)
+
+    for candidate in candidates:
+        try:
+            if not candidate.exists():
+                continue
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return GenerationConfig.from_dict(payload)
+            logger.warning("Invalid generation config payload at %s (expected JSON object).", candidate)
+        except Exception:
+            logger.warning(
+                "Failed to load generation config from %s; falling back to transformers loader.",
+                candidate,
+                exc_info=True,
+            )
+
+    loader_kwargs = dict(hf_kwargs)
+    if normalized_subfolder:
+        loader_kwargs["subfolder"] = normalized_subfolder
+    elif "subfolder" in loader_kwargs:
+        loader_kwargs.pop("subfolder")
+    if trust_remote_code is not None:
+        loader_kwargs["trust_remote_code"] = trust_remote_code
+
+    try:
+        return GenerationConfig.from_pretrained(str(pretrained_model_name_or_path), **loader_kwargs)
+    except OSError:
+        if log_missing:
+            logger.warning(
+                "generation_config.json not found for '%s'; falling back to model-config defaults.",
+                pretrained_model_name_or_path,
+            )
+        return None
+
+
 def _parse_torch_load_options(kwargs: dict[str, tp.Any]) -> TorchLoadOptions:
     """Parse torch_load_mode related kwargs and return a TorchLoadOptions struct."""
     torch_load_mode = str(kwargs.pop("torch_load_mode", "full")).lower()
@@ -176,6 +276,24 @@ def _parse_torch_load_options(kwargs: dict[str, tp.Any]) -> TorchLoadOptions:
         streaming_tmp_dir=torch_streaming_tmp_dir,
         hub_kwargs=hub_kwargs,
     )
+
+
+def _normalize_quantization_config(
+    quantization_config: QuantizationConfig | dict[str, tp.Any] | None,
+) -> QuantizationConfig | None:
+    if quantization_config is None:
+        return None
+    if isinstance(quantization_config, QuantizationConfig):
+        return quantization_config
+    if isinstance(quantization_config, dict):
+        return QuantizationConfig(**quantization_config)
+    return quantization_config
+
+
+def _strip_trailing_separators(path: str) -> str:
+    while path.endswith("/") or path.endswith("\\"):
+        path = path[:-1]
+    return path
 
 
 class EasyBridgeMixin(PushToHubMixin):
@@ -249,7 +367,7 @@ class EasyBridgeMixin(PushToHubMixin):
 
         if self.can_generate() and hasattr(self, "generation_config"):
             if self.generation_config is not None:
-                self.generation_config.save_pretrained(str(save_directory))
+                _save_generation_config(self.generation_config, save_directory)
 
         state = nn.split(self, nn.Param, ...)[1]  # NOTE: This one here ignores LoRA Params...
         if gather_fns is None:
@@ -496,9 +614,9 @@ class EasyBridgeMixin(PushToHubMixin):
         param_dtype: jnp.dtype,
         mesh: jax.sharding.Mesh,
         shard_fns: dict[tp.Callable] | None,
-        quantization_config: EasyDeLQuantizationConfig | None,
-        quantize_tensors: bool,
-        vebose: bool,
+        quantization_config: QuantizationConfig | None,
+        apply_quantization: bool,
+        verbose: bool,
     ) -> EasyDeLBaseModule:
         """Loads model weights from a checkpoint file.
 
@@ -510,49 +628,75 @@ class EasyBridgeMixin(PushToHubMixin):
             mesh (jax.sharding.Mesh): The JAX mesh for distributed sharding.
             shard_fns (dict[Callable] | None): Custom shard functions for loading checkpoint.
                 Defaults to None.
-            quantization_config (EasyDeLQuantizationConfig | None): Quantization configuration
+            quantization_config (QuantizationConfig | None): Quantization configuration
                 for loading. Pass None to disable quantization.
-            quantize_tensors (bool): Whether to quantize tensors during loading.
-            vebose (bool): Whether to print verbose messages during loading.
+            apply_quantization (bool): Whether to apply module-level quantization
+                during loading.
+            verbose (bool): Whether to print verbose messages during loading.
 
         Returns:
             EasyDeLBaseModule: The model with loaded parameters.
         """
-        callback = None
-        if quantize_tensors and quantization_config is not None:
-            from easydel.layers.quantization.quantizers import EasyQuantizer
-
-            quantizer = EasyQuantizer(quantization_config=quantization_config)
-            if quantize_tensors:
-
-                def callback(x, p):
-                    if shard_fns is not None:
-                        key_get = p
-                        if isinstance(p, str):
-                            key_get = tuple(p.split("."))
-                        callable_fn = shard_fns.get(key_get)
-                        if callable_fn is not None:
-                            x = callable_fn(x)
-                    return quantizer(x, p)
-
-        if callback is None:
-
-            def callback(x, p):
-                if shard_fns is not None:
-                    key_get = p
-                    if isinstance(p, str):
-                        key_get = tuple(p.split("."))
-                    callable_fn = shard_fns.get(key_get)
-                    if callable_fn is not None:
-                        x = callable_fn(x)
-                return x
+        quantized_checkpoint = False
+        modules_quantized_on_load = False
+        kernel_map: dict[tuple, tuple[tuple, tuple, tuple]] = {}
+        quantization_config = _normalize_quantization_config(quantization_config)
 
         extraargs = {}
+        itwas_tensorstore = False
         if resolved_archive_file:
             if str(resolved_archive_file).endswith(TENSORSTORE_INDEX_NAME):
-                resolved_archive_file = str(resolved_archive_file)[: -len(TENSORSTORE_INDEX_NAME)]
-            else:
-                extraargs["callback"] = callback
+                resolved_archive_file = _strip_trailing_separators(
+                    str(resolved_archive_file)[: -len(TENSORSTORE_INDEX_NAME)]
+                )
+                itwas_tensorstore = True
+
+        quantizer_for_modules = None
+        if itwas_tensorstore and apply_quantization:
+            if quantization_config is None:
+                quantization_config = _normalize_quantization_config(getattr(model.config, "quantization_config", None))
+            if quantization_config is None:
+                from easydel.layers import QuantizationConfig as _QConfig
+                from easydel.layers import QuantizationType as _QType
+
+                quantization_config = _QConfig(dtype=_QType.INT8)
+                logger.warning(
+                    "apply_quantization was requested but no quantization_config was provided; "
+                    "defaulting to INT8. Pass quantization_config to control quantization type."
+                )
+
+            from easydel.layers.quantization._quants import EasyQuantizer
+            from easydel.utils.traversals import iter_module_search
+
+            quantizer_for_modules = EasyQuantizer(quantization_config=quantization_config)
+            pattern_str = quantizer_for_modules.pattern
+            pattern = re.compile(pattern_str) if pattern_str is not None else None
+            for path, module in iter_module_search(model, nn.Module):
+                if not hasattr(module, "to_quantized") or not callable(module.to_quantized):
+                    continue
+                path_str = ".".join([str(p) for p in path])
+                if pattern is not None and not pattern.search(path_str):
+                    continue
+                kernel_key = (*path, "kernel")
+                kernel_map[kernel_key] = ((*path, "quant_kernel"), (*path, "quant_scales"), (*path, "quant_biases"))
+
+        def _apply_shard_fn(x, p):
+            if shard_fns is not None:
+                key_get = p
+                if isinstance(p, str):
+                    key_get = tuple(p.split("."))
+                callable_fn = shard_fns.get(key_get)
+                if callable_fn is not None:
+                    x = callable_fn(x)
+            return x
+
+        def callback(x, p):
+            return _apply_shard_fn(x, p)
+
+        if resolved_archive_file:
+            extraargs["callback"] = callback
+            if itwas_tensorstore and apply_quantization:
+                extraargs["chunk_size"] = 32
             state, _ = Checkpointer(
                 base_path=str(resolved_archive_file),
                 save_interval=None,
@@ -560,7 +704,7 @@ class EasyBridgeMixin(PushToHubMixin):
             ).load_pytree(
                 mesh=mesh,
                 dtype=param_dtype,  # legacy
-                partition_rules=model.config.get_partition_rules(),
+                partition_rules=model._get_partition_rules(None),
                 prefix="model",
                 discover_latest=True,
                 discover_raise=False,
@@ -575,15 +719,102 @@ class EasyBridgeMixin(PushToHubMixin):
             state = flatten_dict(state)
             state = string_key_to_int(state)
 
+            has_quantized_keys = any(
+                isinstance(k, tuple) and k and str(k[-1]).startswith("quant_") for k in state.keys()
+            )
+            if has_quantized_keys:
+                quantized_checkpoint = True
+                if quantization_config is None:
+                    quantization_config = _normalize_quantization_config(
+                        getattr(model.config, "quantization_config", None)
+                    )
+                if quantization_config is None:
+                    from easydel.layers import QuantizationConfig as _QConfig
+                    from easydel.layers import QuantizationType as _QType
+
+                    quantization_config = _QConfig(dtype=_QType.INT8)
+                    logger.warning(
+                        "Quantized checkpoint detected but no quantization_config was provided; "
+                        "defaulting to INT8. Pass quantization_config to ensure correct behavior."
+                    )
+                model = model.quantize(
+                    quantization_config=quantization_config,
+                    apply_quantization=True,
+                    verbose=verbose,
+                    raise_error=False,
+                )
+            elif itwas_tensorstore and apply_quantization:
+                if quantization_config is None:
+                    quantization_config = _normalize_quantization_config(
+                        getattr(model.config, "quantization_config", None)
+                    )
+                if quantization_config is None:
+                    from easydel.layers import QuantizationConfig as _QConfig
+                    from easydel.layers import QuantizationType as _QType
+
+                    quantization_config = _QConfig(dtype=_QType.INT8)
+                    logger.warning(
+                        "apply_quantization was requested but no quantization_config was provided; "
+                        "defaulting to INT8. Pass quantization_config to control quantization type."
+                    )
+                from ejkernel.callib import ejit
+                from ejkernel.quantization import prepack_quantized_weights
+
+                prepack_quantized_weights = ejit(
+                    prepack_quantized_weights,
+                    static_argnames=["group_size", "bits", "mode", "transpose"],
+                )
+                from easydel.layers.quantization._configs import resolve_ejkernel_quant_params
+
+                if kernel_map:
+                    if quantizer_for_modules is None:
+                        from easydel.layers.quantization._quants import EasyQuantizer
+
+                        quantizer_for_modules = EasyQuantizer(quantization_config=quantization_config)
+                    model = quantizer_for_modules.apply_quantization(model, verbose=verbose)
+                    modules_quantized_on_load = True
+
+                    for kernel_key, (quant_kernel_key, quant_scales_key, quant_biases_key) in kernel_map.items():
+                        if kernel_key not in state:
+                            continue
+                        kernel_value = state.pop(kernel_key)
+                        mode, group_size, bits, needs_biases = resolve_ejkernel_quant_params(quantization_config)
+                        if needs_biases:
+                            quant_kernel, quant_scales, quant_biases = prepack_quantized_weights(
+                                kernel_value,
+                                group_size=group_size,
+                                bits=bits,
+                                mode=mode,
+                                transpose=False,
+                            )
+                        else:
+                            quant_kernel, quant_scales = prepack_quantized_weights(
+                                kernel_value,
+                                group_size=group_size,
+                                bits=bits,
+                                mode=mode,
+                                transpose=False,
+                            )
+                            quant_biases = None
+                        state[quant_kernel_key] = quant_kernel
+                        state[quant_scales_key] = quant_scales
+                        state[quant_biases_key] = quant_biases
+                        if hasattr(quant_kernel, "block_until_ready"):
+                            quant_kernel.block_until_ready()
+                        del kernel_value
+
             required_params = set(flatten_dict(model.graphtree_params_shape))
             unexpected_keys = set(state.keys()) - required_params
-            if any([k[-1].startswith("quant_") for k in state.keys()]):
-                model = model.quantize(quantization_config=quantization_config, verbose=vebose)
             for unexpected_key in unexpected_keys:
                 del state[unexpected_key]
 
             def _convert(x):
-                if hasattr(x, "astype") and getattr(x, "dtype", None) != param_dtype:
+                if not hasattr(x, "astype"):
+                    return x
+                dtype = getattr(x, "dtype", None)
+                if dtype is None:
+                    return x
+                if jnp.issubdtype(dtype, jnp.inexact) and dtype != param_dtype:
                     return x.astype(param_dtype)
                 return x
 
@@ -593,7 +824,10 @@ class EasyBridgeMixin(PushToHubMixin):
             if isinstance(state, dict):
                 for k in list(state.keys()):
                     v = state[k]
-                    new_v = _convert(v)
+                    if isinstance(k, tuple) and k and str(k[-1]) == "quant_kernel":
+                        new_v = v
+                    else:
+                        new_v = _convert(v)
                     state[k] = new_v
                     # JAX is async; force completion so the old buffer can be freed
                     # before converting the next leaf to reduce peak memory.
@@ -603,7 +837,8 @@ class EasyBridgeMixin(PushToHubMixin):
             else:
                 state = jax.tree_util.tree_map(_convert, state)
 
-            return merge_model_and_tree(model=model, tree=unflatten_dict(state))
+            silence_merge = quantized_checkpoint or modules_quantized_on_load
+            return merge_model_and_tree(model=model, tree=unflatten_dict(state), silence=silence_merge)
 
         else:
             return model
@@ -634,9 +869,8 @@ class EasyBridgeMixin(PushToHubMixin):
         local_files_only: bool = False,
         token: str | bool | None = None,
         revision: str = "main",
-        vebose: bool = True,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
-        quantize_tensors: bool = True,
+        quantization_config: QuantizationConfig | None = None,
+        apply_quantization: bool = False,
         **kwargs,
     ):
         """Loads an EasyDeL model from a pretrained model or path.
@@ -679,10 +913,10 @@ class EasyBridgeMixin(PushToHubMixin):
             token (str | bool | None): HuggingFace Hub authentication token. Defaults to None.
             revision (str): The specific model version to use (branch, tag, or commit).
                 Defaults to "main".
-            vebose (bool): Legacy parameter for verbose output. Defaults to True.
-            quantization_config (EasyDeLQuantizationConfig | None): Quantization configuration
+            verbose (bool): Legacy parameter for verbose output. Defaults to True.
+            quantization_config (QuantizationConfig | None): Quantization configuration
                 for loading. Pass None to disable. Defaults to None.
-            quantize_tensors (bool): Whether to quantize tensors during loading. Defaults to True.
+            apply_quantization (bool): Whether to apply module-level quantization. Defaults to False.
             **kwargs: Additional keyword arguments (e.g., proxies, trust_remote_code, subfolder).
 
         Returns:
@@ -691,9 +925,11 @@ class EasyBridgeMixin(PushToHubMixin):
 
         from huggingface_hub import HfApi
         from transformers import GenerationConfig
-        from transformers.utils import download_url as _download_url
-        from transformers.utils import is_offline_mode as _is_offline_mode
-        from transformers.utils import is_remote_url as _is_remote_url
+
+        try:
+            from transformers.utils import is_offline_mode as _is_offline_mode
+        except ImportError:  # transformers>=5 moved to utils.hub
+            from transformers.utils.hub import is_offline_mode as _is_offline_mode
 
         from easydel.modules.auto.auto_configuration import (
             AutoEasyDeLConfig,
@@ -745,6 +981,10 @@ class EasyBridgeMixin(PushToHubMixin):
             platform=platform,
             **config_kwargs,
         )
+        if quantization_config is None:
+            quantization_config = _normalize_quantization_config(getattr(config, "quantization_config", None))
+        else:
+            quantization_config = _normalize_quantization_config(quantization_config)
 
         if commit_hash is None:
             commit_hash = getattr(config, "_commit_hash", None)
@@ -797,7 +1037,7 @@ class EasyBridgeMixin(PushToHubMixin):
                         is_local = True
 
                 if not is_local:
-                    if _is_remote_url(pretrained_model_name_or_path):
+                    if is_remote_url(pretrained_model_name_or_path):
                         filename = pretrained_model_name_or_path
                         resolved_archive_file = _download_url(pretrained_model_name_or_path)
                     else:
@@ -881,33 +1121,35 @@ class EasyBridgeMixin(PushToHubMixin):
             model.mesh,
             shard_fns,
             quantization_config,
-            quantize_tensors,
-            vebose,
+            apply_quantization,
+            verbose,
         )
-
-        if not quantize_tensors and quantization_config is not None:
-            model = model.quantize(
-                quantization_config=quantization_config,
-                quantize_tensors=quantize_tensors,
-                verbose=vebose,
-            )
+        model = model.quantize(
+            quantization_config=quantization_config,
+            apply_quantization=apply_quantization,
+            verbose=verbose,
+            raise_error=False,
+        )
         if model.can_generate():
-            try:
-                model.generation_config = GenerationConfig.from_pretrained(
-                    pretrained_model_name_or_path,
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    proxies=proxies,
-                    local_files_only=local_files_only,
-                    token=token,
-                    revision=revision,
-                    subfolder=subfolder,
-                    _from_auto=from_auto_class,
-                    _from_pipeline=from_pipeline,
-                    **kwargs,
-                )
-            except OSError:
-                logger.info("Generation config file not found, using a generation config created from the model config.")
+            model.generation_config = _load_generation_config(
+                pretrained_model_name_or_path,
+                cache_dir=cache_dir,
+                force_download=force_download,
+                proxies=proxies,
+                local_files_only=local_files_only,
+                token=token,
+                revision=revision,
+                subfolder=subfolder,
+                _from_auto=from_auto_class,
+                _from_pipeline=from_pipeline,
+                log_missing=True,
+                **kwargs,
+            )
+            if model.generation_config is None:
+                try:
+                    model.generation_config = GenerationConfig.from_model_config(model.config)
+                except Exception:
+                    logger.debug("Failed to build fallback generation config from model.config", exc_info=True)
         if auto_shard_model:
             # double check to make sure weights are correct or just a simple non-op.
             model = model.shard_model(partition_rules=partition_rules)
@@ -931,8 +1173,8 @@ class EasyBridgeMixin(PushToHubMixin):
         config_kwargs: EasyDeLBaseConfigDict | None = None,
         auto_shard_model: bool = True,
         partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
-        quantize_tensors: bool = True,
+        quantization_config: QuantizationConfig | None = None,
+        apply_quantization: bool = False,
         verbose: bool = True,
         **kwargs,
     ):
@@ -968,9 +1210,9 @@ class EasyBridgeMixin(PushToHubMixin):
             auto_shard_model (bool): Whether to automatically shard the model. Defaults to True.
             partition_rules (tuple[tuple[str, PartitionSpec], ...] | None): Custom partitioning
                 rules for sharding. Defaults to None.
-            quantization_config (EasyDeLQuantizationConfig | None): Quantization configuration.
+            quantization_config (QuantizationConfig | None): Quantization configuration.
                 Pass None to disable. Defaults to None.
-            quantize_tensors (bool): Whether to quantize tensors during loading. Defaults to True.
+            apply_quantization (bool): Whether to apply module-level quantization. Defaults to False.
             verbose (bool): Whether to print verbose messages. Defaults to True.
             **kwargs: Additional keyword arguments including:
                 - torch_load_mode (str): "full" or "streaming". Defaults to "streaming".
@@ -987,7 +1229,6 @@ class EasyBridgeMixin(PushToHubMixin):
         """
         from transformers import AutoConfig
 
-        from easydel.layers.quantization.quantizers import EasyQuantizer
         from easydel.modules.auto.auto_configuration import AutoShardAndGatherFunctions, get_modules_by_type
 
         try:
@@ -1091,21 +1332,8 @@ class EasyBridgeMixin(PushToHubMixin):
         logger.debug("converting huggingface-model to easydel-model.")
         uses_tie_word_embedding = getattr(hf_config, "tie_word_embeddings", False)
 
-        quantizer = EasyQuantizer(quantization_config=quantization_config)
         callback = None
         passed_shard_fns = shard_fns
-        if quantize_tensors and quantization_config is not None:
-            passed_shard_fns = None
-
-            def callback(x, p):
-                if shard_fns is not None:
-                    key_get = p
-                    if isinstance(p, str):
-                        key_get = tuple(p.split("."))
-                    callable_fn = shard_fns.get(key_get)
-                    if callable_fn is not None:
-                        x = callable_fn(x)
-                return quantizer(x, p)
 
         if load_options.mode == "full":
             params = model.pure_transform_fn(
@@ -1143,12 +1371,13 @@ class EasyBridgeMixin(PushToHubMixin):
         logger.debug("merging model and parameters pytree.")
         model = merge_model_and_tree(model=model, tree=params)
         logger.debug("model and parameters pytree merged.")
-        if quantization_config is not None and not quantize_tensors:
-            logger.debug("quantizing model.")
-            model = model.quantize(
-                quantization_config=quantization_config,
-                verbose=verbose,
-            )
+
+        model = model.quantize(
+            quantization_config=quantization_config,
+            apply_quantization=apply_quantization,
+            raise_error=False,
+        )
+
         logger.debug("returning model.")
         return model
 
@@ -1183,8 +1412,6 @@ class EasyBridgeMixin(PushToHubMixin):
             FileNotFoundError: If no valid PyTorch checkpoint files can be found.
             ValueError: If the shard index file is invalid (missing weight_map).
         """
-        from transformers import GenerationConfig
-
         logger.debug(f"Resolving checkpoint files (streaming) for {pretrained_model_name_or_path}")
 
         ckpt_weight_format: tp.Literal["safetensors", "bin"] | None = None
@@ -1316,10 +1543,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 ckpt_filename_to_path[WEIGHTS_NAME] = resolved_single_file
 
         ed_config = config_class.from_pretrained(pretrained_model_name_or_path, **hub_kwargs)
-        try:
-            generation_config = GenerationConfig.from_pretrained(pretrained_model_name_or_path, **hub_kwargs)
-        except Exception:
-            generation_config = None
+        generation_config = _load_generation_config(pretrained_model_name_or_path, **hub_kwargs)
 
         return StreamingCheckpointInfo(
             ckpt_weight_format=ckpt_weight_format,
@@ -1781,7 +2005,7 @@ class EasyBridgeMixin(PushToHubMixin):
         from huggingface_hub.errors import EntryNotFoundError
         from jax.experimental.array_serialization import serialization as jax_ser
         from jax.experimental.array_serialization import tensorstore_impl as ts_impl
-        from transformers import AutoConfig, GenerationConfig
+        from transformers import AutoConfig
 
         from easydel.modules.auto.auto_configuration import get_modules_by_type
         from easydel.utils.parameters_transformation import StateDictConverter, TensorConverter
@@ -1827,15 +2051,11 @@ class EasyBridgeMixin(PushToHubMixin):
         model_type: str = hf_config.model_type
         ed_config_cls, module = get_modules_by_type(model_type, task_type=cls._model_task)
 
-        generation_config = None
-        try:
-            generation_config = GenerationConfig.from_pretrained(
-                pretrained_model_name_or_path,
-                trust_remote_code=trust_remote_code,
-                **hub_kwargs,
-            )
-        except Exception:
-            generation_config = None
+        generation_config = _load_generation_config(
+            pretrained_model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **hub_kwargs,
+        )
 
         ed_config: EasyDeLBaseConfig = ed_config_cls.from_pretrained(
             pretrained_model_name_or_path,
@@ -1881,6 +2101,8 @@ class EasyBridgeMixin(PushToHubMixin):
                 partition_rules = ed_config.get_partition_rules(True)
             except Exception:
                 partition_rules = None
+        if partition_rules is None:
+            partition_rules = model.resolve_shardings_automatically()
         spec_map: dict[tuple, PartitionSpec] = {}
         if partition_rules is not None:
             try:
@@ -2134,7 +2356,7 @@ class EasyBridgeMixin(PushToHubMixin):
             config_to_save.architectures = [module.__name__]
             config_to_save.save_pretrained(str(save_root))
             if generation_config is not None:
-                generation_config.save_pretrained(str(save_root))
+                _save_generation_config(generation_config, save_root)
 
         _save_configs()
 

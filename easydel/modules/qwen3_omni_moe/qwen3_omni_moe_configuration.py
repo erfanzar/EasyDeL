@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,22 +26,14 @@ The model consists of three main components:
 
 import typing
 
-from eformer.common_types import EMPTY, MODE_TRAIN, TP, ColumnWise, DynamicShardingAxes, Replicated, RowWise
 from eformer.loggings import get_logger
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
-from easydel.layers.moe.utils import get_moe_partition_spec
 
 logger = get_logger(__name__)
-
-
-class ExpertTensorParallel(DynamicShardingAxes):
-    """Expert Tensor Parallelism (EPxTP) sharding axes."""
-
-    axes: typing.ClassVar = [TP, EMPTY, EMPTY]
-    mode: typing.ClassVar = MODE_TRAIN
 
 
 @register_config("qwen3_omni_moe_audio_encoder")
@@ -297,9 +289,11 @@ class Qwen3OmniMoeTextConfig(EasyDeLBaseConfig):
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [
-                "sliding_attention"
-                if self.sliding_window is not None and i >= self.max_window_layers
-                else "full_attention"
+                (
+                    "sliding_attention"
+                    if self.sliding_window is not None and i >= self.max_window_layers
+                    else "full_attention"
+                )
                 for i in range(self.num_hidden_layers)
             ]
 
@@ -403,57 +397,18 @@ class Qwen3OmniMoeThinkerConfig(EasyDeLBaseConfig):
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Get partition rules for model parallelism."""
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"self_attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/gate/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
-            (r"mlp/gate/bias", pmag.resolve(Replicated)),
-            (
-                r"mlp/experts/(gate_proj|up_proj)/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="column",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (
-                r"mlp/experts/down_proj/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="row",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (r"mlp/experts/.*bias", pmag.resolve(Replicated)),
-            (r".*norm.*/kernel", pmag.resolve(Replicated)),
-            (r"attn/(qkv|proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"attn/.*bias", pmag.resolve(Replicated)),
-            (r"mlp/(fc1|fc2)/kernel", pmag.resolve(ColumnWise)),
-            (r".*norm.*/kernel", pmag.resolve(Replicated)),
-            (r"self_attn/(k_proj|v_proj|q_proj|out_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/.*bias", pmag.resolve(Replicated)),
-            (r"fc(1|2)/kernel", pmag.resolve(ColumnWise)),
-            (r".*norm.*/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
+        """
+        return None
 
 
 @register_config("qwen3_omni_moe_talker_code_predictor")
@@ -743,49 +698,18 @@ class Qwen3OmniMoeTalkerConfig(EasyDeLBaseConfig):
         self.speaker_id = speaker_id
         self.spatial_merge_size = spatial_merge_size
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Get partition rules for Talker model parallelism."""
-        pmag = self.partition_manager
-        return (
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"self_attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/gate/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
-            (
-                r"mlp/experts/(gate_proj|up_proj)/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="column",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (
-                r"mlp/experts/down_proj/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="row",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (r"mlp/shared_expert/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/shared_expert/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/shared_expert_gate/kernel", pmag.resolve(Replicated)),
-            (r".*norm.*/kernel", pmag.resolve(Replicated)),
-            (r"codec_head/kernel", pmag.resolve(ColumnWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
+        """
+        return None
 
 
 @register_config("qwen3_omni_moe_code2wav")
@@ -870,22 +794,18 @@ class Qwen3OmniMoeCode2WavConfig(EasyDeLBaseConfig):
         """All layers use sliding attention."""
         return ["sliding_attention"] * self.num_hidden_layers
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Get partition rules for Code2Wav model parallelism."""
-        pmag = self.partition_manager
-        return (
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r".*conv.*/kernel", pmag.resolve(Replicated)),
-            (r".*conv.*/bias", pmag.resolve(Replicated)),
-            (r".*norm.*/kernel", pmag.resolve(Replicated)),
-            (r".*layer_scale/scale", pmag.resolve(Replicated)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
+        """
+        return None
 
 
 @register_config("qwen3_omni_moe")
@@ -975,32 +895,18 @@ class Qwen3OmniMoeConfig(EasyDeLBaseConfig):
         """Get the text configuration from thinker."""
         return self.thinker_config.get_text_config(decoder)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Get partition rules for model parallelism.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
 
-        Combines partition rules from child configs (thinker, talker, code2wav)
-        with appropriate prefixes for the full model hierarchy.
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-
-        # Get rules from child configs and prefix them
-        thinker_rules = self.thinker_config.get_partition_rules(*args, **kwargs)
-        talker_rules = self.talker_config.get_partition_rules(*args, **kwargs)
-        code2wav_rules = self.code2wav_config.get_partition_rules(*args, **kwargs)
-
-        # Combine all rules with top-level rules first, then child rules, then fallback
-        return (
-            # Top-level embeddings and heads
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            # Child config rules (prefixed)
-            *thinker_rules,
-            *talker_rules,
-            *code2wav_rules,
-            # Fallback rules
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
 
 __all__ = [

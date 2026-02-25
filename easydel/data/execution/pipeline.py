@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -529,7 +529,12 @@ def build_dataset(mixture: DatasetMixture) -> "DS":
                 try:
                     out = {_target: ex[_content_field]}
                 except KeyError as e:
-                    raise KeyError(f"Missing content field '{_content_field}'. Available keys: {list(ex.keys())}") from e
+                    # Preference-style datasets can intentionally omit a plain
+                    # content field (they carry chosen/rejected pairs instead).
+                    if "chosen" in ex and "rejected" in ex:
+                        out = dict(ex)
+                    else:
+                        raise KeyError(f"Missing content field '{_content_field}'. Available keys: {list(ex.keys())}") from e
                 for f in _addl:
                     if f in ex:
                         out[f] = ex[f]

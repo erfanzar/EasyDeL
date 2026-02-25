@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,8 +26,10 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..training_utils import (
+    filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
     minibatch_call,
+    sanitize_model_call_kwargs,
     update_metrics,
     update_state_respectfully,
 )
@@ -135,13 +137,16 @@ def concatenated_forward(
         model_kwargs["image_sizes"] = batch["image_sizes"]
 
     if is_encoder_decoder:
-        outputs = model(
-            input_ids=prompt_input_ids,
-            attention_mask=prompt_attention_mask,
-            decoder_input_ids=batch.get("completion_decoder_input_ids"),
-            labels=completion_labels,
+        call_kwargs = {
+            "input_ids": prompt_input_ids,
+            "attention_mask": prompt_attention_mask,
+            "decoder_input_ids": batch.get("completion_decoder_input_ids"),
+            "labels": completion_labels,
             **model_kwargs,
-        )
+        }
+        call_kwargs = filter_kwargs_for_callable(model.__call__, call_kwargs)
+        call_kwargs = sanitize_model_call_kwargs(call_kwargs)
+        outputs = model(**call_kwargs)
         logits = outputs.logits
         loss_mask = completion_attention_mask.astype(bool)
     else:
@@ -159,8 +164,14 @@ def concatenated_forward(
                 completion_labels = completion_labels[:, :max_length]
             else:
                 raise ValueError(f"Unsupported truncation mode: {truncation_mode}")
-
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, **model_kwargs)
+        call_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            **model_kwargs,
+        }
+        call_kwargs = filter_kwargs_for_callable(model.__call__, call_kwargs)
+        call_kwargs = sanitize_model_call_kwargs(call_kwargs)
+        outputs = model(**call_kwargs)
         logits = outputs.logits
 
         logits_shifted = logits[:, :-1, :]

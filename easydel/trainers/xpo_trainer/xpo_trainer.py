@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -178,7 +178,7 @@ class XPOTrainer(GRPOTrainer):
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
-            quantization_block=self.arguments.quantization_block,
+            quantization_group_size=self.arguments.quantization_group_size,
             tensor_straight_through=self.arguments.tensor_straight_through,
             straight_through_emulator=self.arguments.straight_through_emulator,
         )
@@ -287,7 +287,7 @@ class XPOTrainer(GRPOTrainer):
                     texts = [p + c for p, c in zip(prompt_texts, completion_texts, strict=False)]
                     tokenized = reward_processing_class(
                         texts,
-                        return_tensors="jax",
+                        return_tensors="np",
                         padding="max_length",
                         padding_side="right",
                         add_special_tokens=False,

@@ -65,7 +65,7 @@ def main():
 
     ids = tokenizer.apply_chat_template(
         messages,
-        return_tensors="jax",
+        return_tensors="np",
         return_dict=True,
         max_length=max_model_len // 2,
         padding="max_length",

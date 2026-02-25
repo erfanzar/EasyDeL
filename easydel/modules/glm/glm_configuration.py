@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -143,31 +143,15 @@ class GlmConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the Llama model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            # Column-wise Sharding (split output dimensions)
-            (r".*attn/.*(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            # QKV Projections
-            (r".*mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            # MLP Up-Projections
-            (r".*embed_tokens/embedding", pmag.resolve(ColumnWise)),  # Token Embeddings
-            (r".*embed_vision/embedding", pmag.resolve(ColumnWise)),  # Vision Embeddings
-            (r".*lm_head/kernel", pmag.resolve(ColumnWise)),  # Language Model Head
-            (r".*vision_head/kernel", pmag.resolve(ColumnWise)),  # Vision Model Head
-            # Row-wise Sharding (split input dimensions)
-            (r".*attn/o_proj/kernel", pmag.resolve(RowWise)),  # Attention Output
-            (r".*mlp/down_proj/kernel", pmag.resolve(RowWise)),  # MLP Down-Projection
-            (r".*score/kernel", pmag.resolve(RowWise)),  # Sequence Classifier Head
-            # Replicated Parameters
-            (r".*bias", pmag.resolve(Replicated)),  # All biases
-            (r".*layernorm/scale", pmag.resolve(Replicated)),  # LayerNorm scales
-            (r".*rms_norm/scale", pmag.resolve(Replicated)),  # RMSNorm scales
-            (r".*norm/scale", pmag.resolve(Replicated)),  # Final LayerNorm scale
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

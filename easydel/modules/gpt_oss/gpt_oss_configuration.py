@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,11 +23,10 @@ The configuration includes custom sharding specifications for MoE components and
 comprehensive model hyperparameters.
 """
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
-from easydel.layers.moe.utils import get_moe_partition_spec
 
 
 @register_config("gpt_oss")
@@ -142,64 +141,18 @@ class GptOssConfig(EasyDeLBaseConfig):
         self.mlp_activations_limit = mlp_activations_limit
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Get the partition rules for distributed training of GPT-OSS model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
 
-        Returns partition specifications for different parameter groups to enable
-        efficient model parallelism. The rules specify how to shard parameters
-        across devices for:
-        - Embeddings: Column-wise sharding
-        - Attention: Column-wise for QKV, row-wise for output projection
-        - MoE: Custom expert-parallel sharding for expert parameters
-        - Normalization: Replicated across devices
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-            tuple: Partition rules as (regex_pattern, PartitionSpec) pairs
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-
-        kws = dict(
-            fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-            sp_is_ep_bound=self.sp_is_ep_bound,
-            module_view=True,
-            tensors_are_expert=self.use_expert_tensor_mode,
-            partition_manager=self.partition_manager,
-        )
-
-        eck = get_moe_partition_spec(direction="column", is_bias=False, **kws)
-        erk = get_moe_partition_spec(direction="row", is_bias=False, **kws)
-
-        ecb = get_moe_partition_spec(direction="column", is_bias=True, **kws)
-        erb = get_moe_partition_spec(direction="row", is_bias=True, **kws)
-
-        return (
-            (r".*embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r".*self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r".*self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r".*self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r".*mlp/gate/kernel",
-                pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise),
-            ),
-            (r".*mlp/gate/bias", pmag.resolve(Replicated)),
-            # Legacy paths (original HuggingFace parameter names)
-            (r".*mlp/experts/gate_up_proj$", eck),
-            (r".*mlp/experts/down_proj$", erk),
-            (r".*mlp/experts/gate_up_proj_bias$", ecb),
-            (r".*mlp/experts/down_proj_bias$", erb),
-            # New split paths (after reform_param transformation)
-            (r".*mlp/experts/(gate_proj|up_proj)/kernel", eck),
-            (r".*mlp/experts/down_proj/kernel", erk),
-            (r".*mlp/experts/(gate_proj|up_proj)/bias", ecb),
-            (r".*mlp/experts/down_proj/bias", erb),
-            (r".*layernorm/scale", pmag.resolve(Replicated)),
-            (r".*rms_norm/scale", pmag.resolve(Replicated)),
-            (r".*norm/scale", pmag.resolve(Replicated)),
-            (r".*lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r".*score/kernel", pmag.resolve(ColumnWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
 
 __all__ = ["GptOssConfig"]

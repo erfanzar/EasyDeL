@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Hermes model tool call parser.
+
+This module provides a tool call parser for NousResearch Hermes models and
+similar architectures that use XML-style delimiters (`<tool_call>` and
+`</tool_call>`) for function calling. The parser extracts JSON content from
+within these XML-style tags.
+
+The parser includes sophisticated handling for multi-token delimiters,
+ensuring accurate boundary detection when the start/end tags are split
+across multiple streaming tokens.
+
+Example:
+    >>> from easydel.inference.tools.parsers.hermes_tool_parser import HermesToolParser
+    >>> parser = HermesToolParser(tokenizer)
+    >>> result = parser.extract_tool_calls(
+    ...     '<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>',
+    ...     request
+    ... )
+    >>> result.tools_called
+    True
+
+Supported Format:
+    <tool_call>{"name": "function_name", "arguments": {...}}</tool_call>
+
+See Also:
+    - NousResearch Hermes models documentation
+"""
 
 from __future__ import annotations
 

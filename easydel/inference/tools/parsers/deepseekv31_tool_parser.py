@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""DeepSeek V3.1 tool parser module for parsing tool calls from DeepSeek V3.1 model outputs.
+
+This module provides the DeepSeekV31ToolParser class which handles the updated
+tool call format used by DeepSeek V3.1 models. The format is similar to V3 but
+uses a simplified structure without the tool type field.
+
+Example tool call format:
+    <｜tool▁calls▁begin｜>
+    <｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"location": "Beijing"}<｜tool▁call▁end｜>
+    <｜tool▁calls▁end｜>
+"""
 
 from __future__ import annotations
 
@@ -37,7 +49,55 @@ logger = get_logger(__name__)
 
 @ToolParserManager.register_module("deepseek_v31")
 class DeepSeekV31ToolParser(ToolParser):
+    """Tool parser for DeepSeek V3.1 models.
+
+    This parser handles the updated tool call format used by DeepSeek V3.1 models.
+    Unlike V3, this format directly uses function name and arguments without
+    an explicit tool type field.
+
+    The format structure:
+    - Tool calls wrapped in <｜tool▁calls▁begin｜> and <｜tool▁calls▁end｜>
+    - Individual calls wrapped in <｜tool▁call▁begin｜> and <｜tool▁call▁end｜>
+    - Function name and arguments separated by <｜tool▁sep｜>
+
+    Attributes:
+        current_tool_name_sent (bool): Tracks if tool name has been sent in streaming.
+        prev_tool_call_arr (list[dict]): Previous tool calls for comparison in streaming.
+        current_tool_id (int): Index of current tool being processed.
+        streamed_args_for_tool (list[str]): Arguments streamed so far for each tool.
+        tool_calls_start_token (str): Token marking start of tool calls section.
+        tool_calls_end_token (str): Token marking end of tool calls section.
+        tool_call_start_token (str): Token marking start of individual tool call.
+        tool_call_end_token (str): Token marking end of individual tool call.
+        tool_call_regex (re.Pattern): Regex pattern for parsing complete tool calls.
+        stream_tool_call_portion_regex (re.Pattern): Regex for parsing streaming portions.
+        stream_tool_call_name_regex (re.Pattern): Regex for extracting tool names.
+        tool_calls_start_token_id (int | None): Token ID for tool calls start marker.
+        tool_calls_end_token_id (int | None): Token ID for tool calls end marker.
+        tool_call_start_token_id (int | None): Token ID for individual call start.
+        tool_call_end_token_id (int | None): Token ID for individual call end.
+
+    Example:
+        >>> tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/deepseek-v3.1")
+        >>> parser = DeepSeekV31ToolParser(tokenizer)
+        >>> result = parser.extract_tool_calls(model_output, request)
+    """
+
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize the DeepSeek V3.1 tool parser.
+
+        Sets up the token markers, regex patterns, and token IDs required for
+        parsing DeepSeek V3.1 tool call format.
+
+        Args:
+            tokenizer: The tokenizer associated with the DeepSeek V3.1 model.
+                Must contain the special tool call tokens in its vocabulary.
+
+        Raises:
+            ValueError: If the tokenizer is not provided.
+            RuntimeError: If the tool call start/end tokens cannot be found
+                in the tokenizer vocabulary.
+        """
         super().__init__(tokenizer)
 
         self.current_tool_name_sent: bool = False
@@ -79,6 +139,32 @@ class DeepSeekV31ToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
+        """Extract tool calls from complete model output.
+
+        Parses the DeepSeek V3.1 format to extract function names and arguments
+        from the model's response. Uses regex pattern matching to identify
+        tool call boundaries and extract the function details.
+
+        Args:
+            model_output: Complete text output from the model containing
+                potential tool calls in DeepSeek V3.1 format.
+            request: Original chat completion request with tool definitions.
+                Used for context but not directly accessed in parsing.
+
+        Returns:
+            ExtractedToolCallInformation: Contains the following fields:
+                - tools_called (bool): True if any tools were invoked.
+                - tool_calls (list[ToolCall]): List of parsed tool calls with
+                  function names and argument strings.
+                - content (str | None): Text content before tool calls, or
+                  None if no content precedes the tool calls.
+
+        Example:
+            >>> output = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"NYC\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+            >>> result = parser.extract_tool_calls(output, request)
+            >>> result.tools_called
+            True
+        """
         if self.tool_calls_start_token not in model_output:
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
@@ -112,6 +198,38 @@ class DeepSeekV31ToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        """Extract tool calls from streaming model output.
+
+        Handles incremental parsing of DeepSeek V3.1 tool call format during
+        streaming generation. Tracks state across chunks to identify tool
+        boundaries and progressively emit argument content.
+
+        The method handles several streaming scenarios:
+        - Starting a new tool call (detecting start token)
+        - Updating an existing tool call (accumulating arguments)
+        - Closing a tool call (detecting end token)
+        - Passing through regular content tokens
+
+        Args:
+            previous_text: Text generated up to the previous chunk.
+            current_text: All text generated so far including current chunk.
+            delta_text: New text added in this chunk only.
+            previous_token_ids: Sequence of token IDs up to previous chunk.
+            current_token_ids: Sequence of all token IDs generated so far.
+            delta_token_ids: Sequence of new token IDs in this chunk.
+            request: Original chat completion request with tool definitions.
+
+        Returns:
+            DeltaMessage | None: A delta message containing:
+                - Tool call information (name, arguments) for streaming updates
+                - Content text if not in a tool call
+                - None if more data is needed before emitting
+
+        Note:
+            This method maintains internal state across calls including
+            current_tool_id, current_tool_name_sent, prev_tool_call_arr,
+            and streamed_args_for_tool.
+        """
         logger.debug("delta_text: %s", delta_text)
         logger.debug("delta_token_ids: %s", delta_token_ids)
 

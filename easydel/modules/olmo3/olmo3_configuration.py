@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -223,11 +223,17 @@ class Olmo3Config(EasyDeLBaseConfig):
         if self.rope_scaling is None:
             return
 
-        if not isinstance(self.rope_scaling, dict) or len(self.rope_scaling) != 2:
+        if not isinstance(self.rope_scaling, dict):
             raise ValueError(
                 f"`rope_scaling` must be a dictionary with two fields, `type` and `factor`, got {self.rope_scaling}"
             )
-        rope_scaling_type = self.rope_scaling.get("type", None)
+
+        rope_scaling_type = self.rope_scaling.get("type", self.rope_scaling.get("rope_type"))
+        # Base config compatibility can inject a default rope payload; treat it as no scaling.
+        if rope_scaling_type in (None, "default"):
+            self.rope_scaling = None
+            return
+
         rope_scaling_factor = self.rope_scaling.get("factor", None)
         if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic"]:
             raise ValueError(
@@ -254,49 +260,15 @@ class Olmo3Config(EasyDeLBaseConfig):
             if layer_type not in valid_types:
                 raise ValueError(f"`layer_types[{idx}]` must be one of {valid_types}, got '{layer_type}'")
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Get the partition rules for distributed training of the OLMo3 model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
 
-        This method defines how model parameters should be partitioned across devices
-        for tensor parallelism, following the same patterns as OLMo2.
-
-        Args:
-            *args: Additional positional arguments (unused).
-            **kwargs: Additional keyword arguments (unused).
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
 
         Returns:
-            tuple: A tuple of tuples, where each inner tuple contains:
-                - str: Regular expression pattern matching parameter names
-                - PartitionSpec: Specification for how to partition the parameter
-
-        Note:
-            The partition rules are identical to OLMo2, as sliding window attention
-            doesn't change the parameter structure, only the attention computation pattern.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"self_attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (
-                r".*/(post_attention_layernorm|post_feedforward_layernorm|norm)/kernel",
-                pmag.resolve(Replicated),
-            ),
-            (
-                r".*/(post_attention_layernorm|post_feedforward_layernorm|norm)/scale",
-                pmag.resolve(Replicated),
-            ),
-            (
-                r".*/(post_attention_layernorm|post_feedforward_layernorm|norm)/bias",
-                pmag.resolve(Replicated),
-            ),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

@@ -138,13 +138,13 @@ sharding:
 ```yaml
 quantization:
   platform: triton  # or jax, pallas
-  quantize_tensors: true
+  apply_quantization: true
   kv_cache:
     quantization_method: 8bit
-    block_size: 128
+    group_size: 128
   model:
     quantization_method: nf4
-    block_size: 64
+    group_size: 64
 ```
 
 **Methods:** `nf4`, `8bit`, `a8bit`, `a8q`, `a4q`
@@ -468,7 +468,7 @@ sharding:
 quantization:
   model:
     quantization_method: nf4
-    block_size: 64
+    group_size: 64
 
 mixture:
   informs:
@@ -606,7 +606,7 @@ elm = (
     eLargeModel.from_pretrained("model-name")
     .set_dtype(dtype="bf16", param_dtype="bf16")
     .set_sharding(axis_dims=(1, -1, 1, 1, 1))
-    .set_quantization(method="nf4", block_size=64)
+    .set_quantization(method="nf4", group_size=64)
     .set_operation_configs(attn_mechanism="flash")
     .set_esurge(max_model_len=4096, enable_prefix_caching=True)
     .set_mixture(batch_size=32, pack_tokens=True)

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,12 +19,23 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import ColumnWise, RowWise
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
@@ -36,22 +47,45 @@ from easydel.infra.modeling_outputs import (
     SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers.attention import FlexibleAttentionModule
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
-from easydel.layers.caching import (
-    HybridCache,
-    OperationsMetadata,
-    RaggedPagesCache,
-    RaggedPagesCacheView,
-    RaggedPagesMetadata,
-    TransformerCache,
-    TransformerCacheView,
-    TransformerMetadata,
-)
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .dbrx_configuration import DbrxConfig
+
+
+def _patch_hf_dbrx_aux_loss_return_type() -> None:
+    """Patch HF DBRX aux-loss helper to always return a tensor.
+
+    Some transformers builds return Python `0` when router logits are unavailable.
+    Their `DbrxForCausalLM.forward` then calls `.to(...)` on that value and crashes.
+    """
+    try:
+        import torch
+        from transformers.models.dbrx import modeling_dbrx as hf_dbrx
+    except Exception:
+        return
+
+    base_fn = getattr(hf_dbrx, "load_balancing_loss_func", None)
+    if base_fn is None or getattr(base_fn, "_ed_tensor_return_patch", False):
+        return
+
+    def _patched_load_balancing_loss_func(*args, **kwargs):
+        out = base_fn(*args, **kwargs)
+        if hasattr(out, "to"):
+            return out
+        device = None
+        gate_logits = kwargs.get("gate_logits", args[0] if len(args) > 0 else None)
+        if isinstance(gate_logits, tuple) and len(gate_logits) > 0:
+            device = getattr(gate_logits[0], "device", None)
+        return torch.tensor(float(out), device=device)
+
+    _patched_load_balancing_loss_func._ed_tensor_return_patch = True
+    hf_dbrx.load_balancing_loss_func = _patched_load_balancing_loss_func
+
+
+_patch_hf_dbrx_aux_loss_return_type()
 
 
 class DbrxAttention(UnifiedAttention):
@@ -304,9 +338,9 @@ class DbrxNormAttentionNorm(nn.Module):
         dtype (jnp.dtype): Data type for computations.
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
-        norm_1 (nn.LayerNorm): Pre-attention layer normalization.
+        norm_1 (LayerNorm): Pre-attention layer normalization.
         attn (DbrxAttention): DBRX attention module.
-        norm_2 (nn.LayerNorm): Post-attention layer normalization.
+        norm_2 (LayerNorm): Post-attention layer normalization.
         dropout (nn.Dropout): Dropout layer for regularization.
     """
 
@@ -338,7 +372,7 @@ class DbrxNormAttentionNorm(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        self.norm_1 = nn.LayerNorm(
+        self.norm_1 = LayerNorm(
             self.config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -353,7 +387,7 @@ class DbrxNormAttentionNorm(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.norm_2 = nn.LayerNorm(
+        self.norm_2 = LayerNorm(
             self.config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -482,6 +516,9 @@ class DbrxExpertGLU(nn.Module):
         self.w2 = ArrayParam.bound(shape=shape, dtype=self.param_dtype, init_method="normal", key=rngs.params())
         self.activation_fn = ACT2FN[self.config.ffn_config.ffn_act_fn["name"]]
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        return {"w1": ColumnWise, "v1": ColumnWise, "w2": RowWise}
+
     def __call__(self, x: Array, expert_idx: int) -> Array:
         """Apply the gated linear unit transformation for a specific expert.
 
@@ -504,21 +541,23 @@ class DbrxExpertGLU(nn.Module):
         expert_v1 = checkpoint_name(self.v1.value.reshape(expert_shape)[expert_idx], name="moe_expert_v1")
         expert_w2 = checkpoint_name(self.w2.value.reshape(expert_shape)[expert_idx], name="moe_expert_w2")
 
+        # Match HF DBRX expert projection orientation:
+        # gate/up use raw expert matrices and down uses transposed expert_w2.
         x1 = jnp.matmul(
             x,
-            jnp.expand_dims(expert_w1.T, 0),
+            jnp.expand_dims(expert_w1, 0),
             precision=self.precision,
         )
         x2 = jnp.matmul(
             x,
-            jnp.expand_dims(expert_v1.T, 0),
+            jnp.expand_dims(expert_v1, 0),
             precision=self.precision,
         )
         x1 = self.activation_fn(x1)
         x1 = x1 * x2
         x1 = jnp.matmul(
             x1,
-            jnp.expand_dims(expert_w2, 0),
+            jnp.expand_dims(expert_w2.T, 0),
             precision=self.precision,
         )
         return x1
@@ -574,7 +613,6 @@ class DbrxExperts(nn.Module):
     def __call__(
         self,
         x: Array,
-        weights: Array,
         top_weights: Array,
         top_experts: Array,
     ):
@@ -585,7 +623,6 @@ class DbrxExperts(nn.Module):
 
         Args:
             x (Array): Input tensor of shape (batch_size, sequence_length, hidden_dim).
-            weights (Array): Full routing weights for all experts.
             top_weights (Array): Top-k routing weights for selected experts.
             top_experts (Array): Indices of top-k selected experts.
 
@@ -653,12 +690,13 @@ class DbrxRouter(nn.Module):
         self.moe_normalize_expert_weights = self.config.ffn_config.moe_normalize_expert_weights
         self.uniform_expert_assignment = self.config.ffn_config.uniform_expert_assignment
 
-        self.layer = ColumnParallelLinear(
+        self.layer = nn.Linear(
             config.hidden_size,
             self.moe_num_experts,
             use_bias=False,
             dtype=dtype,
             param_dtype=param_dtype,
+            kernel_init=jax.nn.initializers.normal(config.initializer_range),
             precision=precision,
             rngs=rngs,
         )
@@ -697,43 +735,49 @@ class DbrxRouter(nn.Module):
 
         Returns:
             tuple[Array, Array, Array]: A tuple containing:
-                - weights: Full routing weights for all experts (batch, seq_len, num_experts).
+                - router_logits: Raw router logits for all experts (batch, seq_len, num_experts).
                 - top_weights: Weights for selected experts (batch, seq_len, top_k).
                 - top_experts: Indices of selected experts (batch, seq_len, top_k).
         """
         if not deterministic and self.moe_jitter_eps is not None:
             x = x * self.jitter(x)
 
-        weights = self.layer(x.astype(jnp.promote_types(self.dtype, jnp.float32)))
-        weights = jax.nn.softmax(weights.astype(jnp.promote_types(self.dtype, jnp.float32)))
-        top_weights, top_experts = jax.lax.top_k(weights, self.moe_top_k)
+        batch_size, sequence_length, hidden_dim = x.shape
+        x_flat = x.reshape(-1, hidden_dim).astype(jnp.promote_types(self.dtype, jnp.float32))
 
-        if self.moe_normalize_expert_weights:
-            top_weights = top_weights / jnp.linalg.norm(
-                top_weights,
-                ord=int(self.moe_normalize_expert_weights),
-                axis=-1,
-                keepdims=True,
-            )
+        router_logits_flat = self.layer(x_flat)
+        routing_weights_flat = jax.nn.softmax(
+            router_logits_flat.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1
+        )
+        top_weights_flat, top_experts_flat = jax.lax.top_k(routing_weights_flat, self.moe_top_k)
+
+        if self.moe_normalize_expert_weights is not None:
+            norm_order = float(self.moe_normalize_expert_weights)
+            if norm_order == 1.0:
+                denom = jnp.sum(top_weights_flat, axis=-1, keepdims=True)
+            else:
+                denom = jnp.linalg.norm(top_weights_flat, ord=norm_order, axis=-1, keepdims=True)
+            top_weights_flat = top_weights_flat / denom
 
         if self.uniform_expert_assignment:
-            top_experts = jax.lax.stop_gradient(
+            top_experts_flat = jax.lax.stop_gradient(
                 (
                     jnp.arange(
                         0,
                         jnp.prod(
-                            jnp.asarray(top_experts.shape, dtype=jnp.int32),
+                            jnp.asarray(top_experts_flat.shape, dtype=jnp.int32),
                             dtype=jnp.int32,
                         ),
-                        dtype=top_experts.dtype,
+                        dtype=top_experts_flat.dtype,
                     )
                     % self.moe_num_experts
-                ).reshape(top_experts.shape)
+                ).reshape(top_experts_flat.shape)
             )
 
-        weights = weights.astype(x.dtype)
-        top_weights = top_weights.astype(x.dtype)
-        return weights, top_weights, top_experts
+        router_logits = router_logits_flat.reshape(batch_size, sequence_length, self.moe_num_experts)
+        top_weights = top_weights_flat.reshape(batch_size, sequence_length, self.moe_top_k)
+        top_experts = top_experts_flat.reshape(batch_size, sequence_length, self.moe_top_k)
+        return router_logits, top_weights, top_experts
 
 
 class DbrxFFN(nn.Module):
@@ -804,22 +848,22 @@ class DbrxFFN(nn.Module):
         Returns:
             tuple[Array, Array]: A tuple containing:
                 - Output hidden states after MoE processing (batch, seq_len, hidden_dim).
-                - Router logits for auxiliary loss computation (batch, seq_len, num_experts).
+                - Raw router logits for auxiliary loss computation (batch, seq_len, num_experts).
         """
         x = apply_logical_sharding(
             x,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        weights, top_weights, top_experts = self.router(x)
-        weights = checkpoint_name(weights, name="moe_router_logits")
-        out = checkpoint_name(self.experts(x, weights, top_weights, top_experts), name="moe_expert_output")
+        router_logits, top_weights, top_experts = self.router(x)
+        router_logits = checkpoint_name(router_logits, name="moe_router_logits")
+        out = checkpoint_name(self.experts(x, top_weights, top_experts), name="moe_expert_output")
         out = apply_logical_sharding(
             out,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        return out, weights
+        return out, router_logits
 
 
 class DbrxBlock(nn.Module):
@@ -969,9 +1013,9 @@ class DbrxModel(EasyDeLBaseModule):
         padding_idx (int | None): Token ID used for padding.
         vocab_size (int): Size of the vocabulary.
         emb_pdrop (float): Embedding dropout probability.
-        wte (nn.Embed): Token embedding layer.
+        wte (Embed): Token embedding layer.
         blocks (list[DbrxBlock]): List of decoder blocks.
-        norm_f (nn.LayerNorm): Final layer normalization.
+        norm_f (LayerNorm): Final layer normalization.
     """
 
     def __init__(
@@ -1003,25 +1047,27 @@ class DbrxModel(EasyDeLBaseModule):
         self.vocab_size = self.config.vocab_size
         self.emb_pdrop = self.config.emb_pdrop
 
-        self.wte = nn.Embed(
+        self.wte = Embed(
             self.config.vocab_size,
             self.config.d_model,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.blocks = [
-            DbrxBlock(
-                config=config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.n_layers)
-        ]
-        self.norm_f = nn.LayerNorm(
+        self.blocks = nn.List(
+            [
+                DbrxBlock(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.n_layers)
+            ]
+        )
+        self.norm_f = LayerNorm(
             self.config.hidden_size,
             use_bias=False,
             dtype=dtype,
@@ -1327,7 +1373,8 @@ class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):
             top_k=self.config.ffn_config.moe_top_k,
             attention_mask=attention_mask,
         )
-        return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
+        coef = self.config.router_aux_loss_coef if self.config.router_aux_loss_coef is not None else 1.0
+        return aux_loss * coef
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=DbrxConfig, model_type="dbrx")

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,19 +25,7 @@ from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-    BaseModelOutput,
-    CausalLMOutput,
-    DecoderLayerOutput,
-    SequenceClassifierOutput,
-)
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers.attention import FlexibleAttentionModule
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -47,8 +35,18 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import (
+    BaseModelOutput,
+    CausalLMOutput,
+    DecoderLayerOutput,
+    SequenceClassifierOutput,
+)
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .internlm2_configuration import InternLM2Config
 
@@ -394,7 +392,7 @@ class InternLM2Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.tok_embeddings = nn.Embed(
+        self.tok_embeddings = Embed(
             config.vocab_size,
             config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
@@ -402,17 +400,19 @@ class InternLM2Model(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
-            InternLM2Block(
-                config=config,
-                layer_idx=i,
-                rngs=rngs,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-            )
-            for i in range(config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                InternLM2Block(
+                    config=config,
+                    layer_idx=i,
+                    rngs=rngs,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,

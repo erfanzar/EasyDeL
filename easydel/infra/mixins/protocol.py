@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -83,8 +83,7 @@ from jax import numpy as jnp
 from jax.sharding import Mesh
 from jaxtyping import Array, Bool, Float, Int, Shaped
 
-from easydel.layers.linear import ParallelLinear
-from easydel.layers.quantization import EasyDeLQuantizationConfig
+from easydel.layers import ParallelLinear, QuantizationConfig
 
 from ..base_config import EasyDeLBaseConfig
 from ..loss_utils import LossConfig, LossMetrics
@@ -143,8 +142,7 @@ RecurrentState = list[Float[Array, "..."]]
 if tp.TYPE_CHECKING:
     from transformers import PreTrainedModel
 
-    from easydel.infra.base_state import EasyDeLState
-    from easydel.layers.caching import (
+    from easydel.caching import (
         HybridCache,
         OperationsMetadata,
         RaggedPagesCache,
@@ -153,11 +151,33 @@ if tp.TYPE_CHECKING:
         TransformerCache,
         TransformerMetadata,
     )
+    from easydel.infra.base_state import EasyDeLState
 
 
 def return_type_adjuster(
     original_return_type: type[_T],
 ) -> tp.Callable[[tp.Callable[..., nn.Module]], tp.Callable[..., _T]]:
+    """Decorator factory to adjust return type annotations for type checking.
+
+    This decorator is used to cast the return type of a function that returns
+    an nn.Module to a more specific type for improved type checking support
+    in IDEs and static analysis tools.
+
+    Args:
+        original_return_type: The desired return type to cast to.
+
+    Returns:
+        A decorator that wraps a function and casts its return value to the
+        specified type.
+
+    Example:
+        >>> @return_type_adjuster(MyModelClass)
+        ... def load_model(config) -> nn.Module:
+        ...     return MyModelClass(config)
+        ...
+        >>> model = load_model(config)  # Type checker sees MyModelClass
+    """
+
     def decorator(func: tp.Callable[..., nn.Module]) -> tp.Callable[..., _T]:
         def wrapper(*args: tp.Any, **kwargs: tp.Any) -> _T:
             return tp.cast(_T, func(*args, **kwargs))
@@ -168,7 +188,29 @@ def return_type_adjuster(
 
 
 def get_module_repr(module: nn.Module) -> str:
-    """Get a string representation of module parameters."""
+    """Get a string representation of module parameters.
+
+    Creates a human-readable string representation of a Flax NNX module,
+    showing key parameters like input/output features for linear layers,
+    dropout rates, embedding dimensions, and normalization epsilon values.
+
+    Args:
+        module: The Flax NNX module to represent.
+
+    Returns:
+        A formatted string representation of the module. The format depends
+        on the module type:
+        - ParallelLinear: "Linear(in_features=X, out_features=Y, bias=Z)"
+        - Dropout: "Dropout(p=X)"
+        - Embed: "Embedding(num_embeddings, embedding_dim)"
+        - Modules with eps: "ModuleName(shape, eps=X)"
+        - Other modules: Just the class name
+
+    Example:
+        >>> linear = ParallelLinear(in_features=512, out_features=1024)
+        >>> get_module_repr(linear)
+        'Linear(in_features=512, out_features=1024, bias=False)'
+    """
     module_name = type(module).__name__
 
     if isinstance(module, ParallelLinear):
@@ -307,8 +349,78 @@ def prettify_nnx(
 
 
 class BaseModuleProtocol(metaclass=ABCMeta):
-    """
-    Protocol defining the common interface for EasyDeL modules.
+    """Protocol defining the common interface for EasyDeL modules.
+
+    This abstract base class defines the complete interface that all EasyDeL
+    model implementations must adhere to. It combines functionality from the
+    base module, bridge functionality (EasyBridgeMixin), and generation
+    capabilities (EasyGenerationMixin).
+
+    The protocol ensures consistency across different model architectures and
+    provides comprehensive type hints for IDE support and static type checking.
+    It supports a wide variety of model types including:
+
+    - Causal Language Models (decoder-only)
+    - Encoder-only models (BERT-style)
+    - Encoder-Decoder models (T5, BART-style)
+    - Vision models (ViT, CLIP)
+    - Vision-Language models (LLaVA, Qwen-VL)
+    - Mixture of Experts (MoE) models
+    - Audio models (Whisper)
+    - State Space Models (Mamba, RWKV)
+
+    Attributes:
+        config_class: The configuration class type for this model.
+        config: The model's configuration instance.
+        base_model_prefix: String prefix used for identifying the base model
+            in state dictionaries.
+        _model_task: Optional string identifying the model's task type.
+        _model_type: Optional string identifying the model architecture type.
+
+    The protocol defines several categories of methods:
+
+    Forward Pass Methods:
+        - __call__: Multiple overloaded signatures for different model types
+        - mesh_call: Execute forward pass within the model's mesh context
+        - compute_loss: Compute loss for training
+
+    Parameter Management:
+        - shard_model: Distribute parameters across devices
+        - gather_model: Collect distributed parameters
+        - quantize: Apply quantization to model weights
+        - apply_lora_to_layers: Add LoRA adapters
+        - merge_lora_params/split_lora_params: Manage LoRA parameters
+
+    Serialization:
+        - save_pretrained: Save model to disk
+        - push_to_hub: Upload to Hugging Face Hub
+        - from_pretrained: Load from disk or Hub
+        - to_state: Convert to EasyDeLState
+        - to_torch: Convert to PyTorch model
+
+    Generation:
+        - generate: Autoregressive text generation
+        - init_cache: Initialize KV cache
+        - init_ragged_pages: Initialize paged attention cache
+        - prepare_inputs_for_generation: Setup generation inputs
+        - update_inputs_for_generation: Update inputs between steps
+
+    Example:
+        >>> from easydel import AutoEasyDeLModelForCausalLM
+        >>>
+        >>> # Load a model (implements BaseModuleProtocol)
+        >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(
+        ...     "meta-llama/Llama-2-7b-hf"
+        ... )
+        >>>
+        >>> # Use the forward pass
+        >>> outputs = model(input_ids=input_ids, attention_mask=mask)
+        >>>
+        >>> # Generate text
+        >>> generated = model.generate(input_ids, max_length=100)
+        >>>
+        >>> # Shard across devices
+        >>> model.shard_model()
     """
 
     config_class: type[EasyDeLBaseConfig]
@@ -2855,31 +2967,94 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
     @abstractmethod
     def to_dtype(self: Self, dtype) -> Self:
-        """Converts Model paramters to given dtype"""
+        """Convert model parameters to the specified data type.
+
+        Args:
+            dtype: The target JAX dtype to convert parameters to
+                (e.g., jnp.float16, jnp.bfloat16, jnp.float32).
+
+        Returns:
+            Self: The model with parameters converted to the specified dtype.
+        """
 
     @abstractmethod
     def half(self, change_runtime_dtype: bool = True):
-        """Converts Model paramters to float16."""
+        """Convert model parameters to float16 (half precision).
+
+        Args:
+            change_runtime_dtype: If True, also updates the runtime dtype
+                configuration. Defaults to True.
+
+        Returns:
+            The model with parameters converted to float16.
+        """
 
     @abstractmethod
     def float(self, change_runtime_dtype: bool = True):
-        """Converts Model paramters to float32."""
+        """Convert model parameters to float32 (full precision).
+
+        Args:
+            change_runtime_dtype: If True, also updates the runtime dtype
+                configuration. Defaults to True.
+
+        Returns:
+            The model with parameters converted to float32.
+        """
 
     @abstractmethod
     def _reformat_dtype(self, dtype):
-        """Converts Model paramters to given data type."""
+        """Internal method to convert model parameters to a given data type.
+
+        This is an internal implementation detail used by to_dtype, half,
+        and float methods.
+
+        Args:
+            dtype: The target JAX dtype to convert parameters to.
+
+        Returns:
+            The model with reformatted parameters.
+        """
 
     @abstractmethod
     def _get_mesh(self, mesh: Mesh | None = None) -> Mesh:
-        """Retrieves the mesh, either from the provided argument or the config."""
+        """Retrieve the JAX mesh for distributed computation.
+
+        Gets the mesh either from the provided argument or from the model's
+        configuration if no mesh is provided.
+
+        Args:
+            mesh: Optional mesh to use. If None, uses the mesh from config.
+
+        Returns:
+            Mesh: The JAX sharding mesh to use for distributed operations.
+        """
 
     @abstractmethod
     def _get_partition_rules(self, partition_rules: PartitionLike) -> PartitionLike:
-        """Retrieves the partition rules from input or the config"""
+        """Retrieve partition rules for model sharding.
+
+        Gets the partition rules either from the provided argument or from
+        the model's configuration if no rules are provided.
+
+        Args:
+            partition_rules: Optional partition rules to use. If None,
+                uses the rules from config.
+
+        Returns:
+            PartitionLike: The partition rules for sharding model parameters.
+        """
 
     @abstractmethod
     def _apply_sharding_fns(self, sharding_fns: tp.Mapping[str, tp.Callable]):
-        """Applies sharding functions to the model's state."""
+        """Apply sharding functions to the model's state.
+
+        Internal method that applies a mapping of sharding functions to
+        transform the model's parameters for distributed execution.
+
+        Args:
+            sharding_fns: A mapping from parameter names to sharding functions
+                that define how each parameter should be distributed.
+        """
 
     @abstractmethod
     def shard_model(
@@ -2926,15 +3101,15 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     @abstractmethod
     def quantize(
         self: Self,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
-        quantize_tensors: bool = True,
+        quantization_config: QuantizationConfig | None = None,
+        apply_quantization: bool = True,
         verbose: bool | None = None,
     ):
         """Quantizes the model's linear layers.
 
         Args:
             quantization_config: Quantization configuration. Pass None to use default INT8.
-            quantize_tensors: Whether to quantize tensors directly.
+            apply_quantization: Whether to apply quantization to modules.
             verbose: Whether to print verbose output.
 
         Returns:
@@ -2943,27 +3118,76 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
     @abstractmethod
     def to_state(self) -> EasyDeLState:
-        """converts current model to a EasyDeLState"""
+        """Convert the current model to an EasyDeLState object.
+
+        Creates a state object that encapsulates the model's parameters,
+        configuration, and other metadata in a format suitable for
+        checkpointing and distributed training.
+
+        Returns:
+            EasyDeLState: A state object containing the model's parameters
+            and configuration.
+        """
 
     @abstractmethod
     def to_torch(self) -> PreTrainedModel:
-        """converts current model to a huggingface torch model"""
+        """Convert the current EasyDeL model to a HuggingFace PyTorch model.
+
+        Transforms the JAX/Flax model parameters into their PyTorch equivalents
+        and returns a compatible HuggingFace PreTrainedModel instance.
+
+        Returns:
+            PreTrainedModel: The equivalent HuggingFace PyTorch model with
+            converted weights.
+        """
         ...
 
     @abstractmethod
     def prepare_inputs_for_call(self, **kwargs):
-        """update inputs for calling model"""
+        """Prepare and validate inputs before calling the model.
+
+        This method processes and validates keyword arguments before they
+        are passed to the model's forward method. It may add default values,
+        reshape tensors, or perform other preprocessing.
+
+        Args:
+            **kwargs: Input keyword arguments for the model forward pass.
+
+        Returns:
+            A dictionary of processed inputs ready for the model call.
+        """
         ...
 
     @abstractmethod
     def get_static_arguments(self) -> tuple:
-        """return static arguments kwargs for `jax.jit` / `ejit`"""
+        """Get static arguments for JIT compilation.
+
+        Returns a tuple of argument names that should be treated as static
+        during JAX JIT compilation (jax.jit or ejit). Static arguments
+        are traced separately for each unique value.
+
+        Returns:
+            tuple: Names of arguments that should be static during JIT.
+        """
         ...
 
     @classmethod
     @abstractmethod
     def lazy_init(cls: type[Self], *args, **kwargs) -> Self:
-        """initialize the base class with nnx.eval_shape carefully"""
+        """Initialize the model lazily using nnx.eval_shape.
+
+        Creates a model instance without actually allocating memory for
+        parameters. This is useful for determining model structure and
+        memory requirements before full initialization.
+
+        Args:
+            *args: Positional arguments for model initialization.
+            **kwargs: Keyword arguments for model initialization.
+
+        Returns:
+            Self: A lazily initialized model instance where parameters
+            are represented by shape/dtype metadata rather than actual arrays.
+        """
         ...
 
     @abstractmethod
@@ -2974,54 +3198,134 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         verbose: bool = False,
         rngs: nn.Rngs | None = None,
     ) -> Self:
-        """Apply LoRA (Low-Rank Adaptation) to specified linear layers within a model."""
+        """Apply LoRA (Low-Rank Adaptation) to specified linear layers.
+
+        LoRA enables efficient fine-tuning by adding low-rank decomposition
+        matrices to linear layers while keeping the original weights frozen.
+
+        Args:
+            lora_rank: The rank of the low-rank decomposition matrices.
+                Higher ranks allow more expressive adaptations but use more
+                memory.
+            lora_pattern: Optional regex pattern to match layer names for
+                LoRA application. If None, applies to default layers
+                (typically attention projections).
+            verbose: If True, prints information about which layers are
+                being modified.
+            rngs: Optional Flax random number generators for initializing
+                LoRA parameters.
+
+        Returns:
+            Self: The model with LoRA layers applied.
+        """
         ...
 
     @abstractmethod
     def merge_lora_params(self: Self, pytree: dict) -> Self:
-        """
-        Merge LoRA (Low-Rank Adaptation) parameters into the base model parameters.
+        """Merge LoRA parameters into the base model parameters.
+
+        Combines the low-rank adaptation matrices with the original weights
+        to produce a single set of weights that incorporate the LoRA
+        adaptations.
+
+        Args:
+            pytree: A dictionary containing the LoRA parameters to merge.
+
+        Returns:
+            Self: The model with LoRA parameters merged into base weights.
         """
         ...
 
     @abstractmethod
     def split_lora_params(self: Self) -> dict:
-        """
-        Split LoRA (Low-Rank Adaptation) parameters from the base model parameters.
+        """Split LoRA parameters from the base model parameters.
+
+        Extracts the LoRA adaptation matrices from the model, returning
+        them as a separate dictionary. This is useful for saving only
+        the LoRA weights.
+
+        Returns:
+            dict: A dictionary containing only the LoRA parameters.
         """
         ...
 
     @abstractmethod
     def unwrap_lora_to_layers(self, verbose: bool = False):
-        """UnWrap LoRA (Low-Rank Adaptation) from specified linear layers within a model."""
+        """Remove LoRA adapters from linear layers within the model.
+
+        Unwraps LoRA layers by either merging the adaptations into base
+        weights or discarding them, restoring the original linear layer
+        structure.
+
+        Args:
+            verbose: If True, prints information about which layers are
+                being unwrapped.
+        """
         ...
 
     @property
     @abstractmethod
     def transform_fn(self) -> tp.Callable:
-        """generate transform function for converting torch to easydel module."""
+        """Get the transform function for converting PyTorch to EasyDeL module.
+
+        Returns a function that transforms PyTorch state dictionaries
+        to the format expected by this EasyDeL model.
+
+        Returns:
+            Callable: A function that takes PyTorch weights and returns
+            EasyDeL-compatible parameters.
+        """
         ...
 
     @property
     @abstractmethod
     def pure_transform_fn(self) -> tp.Callable:
-        """generates a pure transform function for converting torch to easydel module."""
+        """Get a pure transform function for PyTorch to EasyDeL conversion.
+
+        Similar to transform_fn but returns a pure function without side
+        effects, suitable for use with JAX transformations.
+
+        Returns:
+            Callable: A pure function for weight transformation.
+        """
         ...
 
     @property
     @abstractmethod
     def params_sharding(self) -> dict:
-        """return the sharding of the model parameters"""
+        """Get the sharding specification for model parameters.
+
+        Returns a dictionary mapping parameter paths to their sharding
+        specifications, describing how parameters are distributed across
+        devices.
+
+        Returns:
+            dict: A dictionary mapping parameter names to sharding specs.
+        """
         ...
 
     @abstractmethod
     def merge_params(self, tree):
-        """merge state to the current model"""
+        """Merge a parameter tree into the current model.
+
+        Updates the model's parameters with values from the provided
+        parameter tree.
+
+        Args:
+            tree: A pytree of parameters to merge into the model.
+        """
         ...
 
     @abstractmethod
     def split_params(self):
-        """split the model parameters"""
+        """Split the model into its parameter tree.
+
+        Extracts the model's parameters as a pytree structure that can
+        be manipulated independently of the model object.
+
+        Returns:
+            The model's parameters as a pytree.
+        """
         ...
 
     @abstractmethod
@@ -3029,17 +3333,44 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         self,
         params_dict: dict,
     ) -> dict:
-        """Splits the model parameters from a dictionary into separate state components."""
+        """Split model parameters from a dictionary into state components.
+
+        Takes a flat parameter dictionary and organizes it into separate
+        state components (trainable params, non-trainable state, etc.).
+
+        Args:
+            params_dict: A dictionary of model parameters.
+
+        Returns:
+            dict: A dictionary with parameters organized by state type.
+        """
 
     @abstractmethod
     def merge_params_dict(self, params_dict: dict):
-        """
-        Merges the model parameters from a dictionary into the current model.
+        """Merge model parameters from a dictionary into the current model.
+
+        Takes a dictionary of parameters and updates the model's internal
+        state with these values.
+
+        Args:
+            params_dict: A dictionary of parameters to merge.
         """
 
     @abstractmethod
     def _flop(self, *args, **kwargs) -> float | None:
-        """Calculates the FLOP (Floating Point Operations) from JaxPr."""
+        """Calculate the FLOP count from JaxPr.
+
+        Estimates the number of floating point operations required for
+        a forward pass through the model.
+
+        Args:
+            *args: Positional arguments for the forward pass.
+            **kwargs: Keyword arguments for the forward pass.
+
+        Returns:
+            float or None: The estimated FLOP count, or None if calculation
+            is not possible.
+        """
         ...
 
     @abstractmethod
@@ -3265,14 +3596,51 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         """
         ...
 
-    def __str__(self):
+    def __str__(self) -> str:
+        """Return a human-readable string representation of the model.
+
+        Returns:
+            str: A formatted string showing the model's structure and layers,
+            prefixed with "EasyDeL-".
+        """
         return printify_nnx(self)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Return a detailed string representation of the model.
+
+        Returns:
+            str: A formatted string showing the model's structure and layers,
+            prefixed with "EasyDeL-".
+        """
         return printify_nnx(self)
 
 
-def printify_nnx(model):
+def printify_nnx(model: nn.Module) -> str:
+    """Create a printable string representation of an EasyDeL NNX module.
+
+    This function wraps prettify_nnx to create a standardized string
+    representation prefixed with "EasyDeL-". It handles edge cases
+    gracefully by returning a fallback string if the module cannot
+    be properly formatted.
+
+    Args:
+        model: The Flax NNX module to create a string representation for.
+
+    Returns:
+        A string representation of the model prefixed with "EasyDeL-".
+        If the model cannot be formatted (e.g., it's a partition object
+        without proper attributes), returns "EasyDeL-Partitions".
+
+    Example:
+        >>> model = LlamaForCausalLM(config)
+        >>> print(printify_nnx(model))
+        EasyDeL-LlamaForCausalLM(
+          (model): LlamaModel(
+            (embed_tokens): Embedding(32000, 4096)
+            ...
+          )
+        )
+    """
     try:
         return "EasyDeL-" + prettify_nnx(model)
     except AttributeError:

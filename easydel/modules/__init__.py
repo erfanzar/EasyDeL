@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -50,6 +50,7 @@ from . import (
     glm,
     glm4,
     glm4_moe,
+    glm4_moe_lite,
     glm4v,
     glm4v_moe,
     glm46v,
@@ -122,6 +123,7 @@ __all__ = (
     "glm",
     "glm4",
     "glm4_moe",
+    "glm4_moe_lite",
     "glm4v",
     "glm4v_moe",
     "glm46v",

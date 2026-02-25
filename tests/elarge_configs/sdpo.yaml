@@ -1,0 +1,63 @@
+# SDPO (Self-Distillation Policy Optimization) test config
+# Mirrors tests/trainers/self_distillation_policy_optimization.py
+# Note: Requires `reward_model` because YAML cannot supply python reward functions.
+
+model:
+  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+
+reward_model:
+  name_or_path: Ray2333/Gemma-2B-rewardmodel-baseline
+  task: sequence-classification
+  extra_kwargs:
+    num_labels: 1
+
+loader:
+  dtype: bf16
+  param_dtype: bf16
+  trust_remote_code: true
+
+sharding:
+  axis_dims: [1, -1, 1, 1, 1]
+  auto_shard_model: true
+
+base_config:
+  values:
+    freq_max_position_embeddings: 512
+    mask_max_position_embeddings: 512
+    attn_mechanism: auto
+    attn_dtype: bf16
+    gradient_checkpointing: ""
+
+mixture:
+  informs:
+    - type: trl-lib/ultrafeedback_binarized
+      split: "train"
+  batch_size: 2
+  streaming: false
+
+trainer:
+  trainer_type: sdpo
+  learning_rate: 8.0e-6
+  num_train_epochs: 1
+  total_batch_size: 2
+  gradient_accumulation_steps: 2
+  max_training_steps: 8
+  max_prompt_length: 256
+  max_completion_length: 128
+  max_length: 384
+  max_feedback_length: 96
+  distillation_type: jsd
+  beta: 0.0
+  num_return_sequences: 1
+  num_generations: 1
+  generation_num_return_sequences: 1
+  use_esurge_generation: false
+  save_steps: 1000
+  save_total_limit: 1
+  log_steps: 1
+  shuffle_train_dataset: false
+  save_directory: ./tmp-files/elarge-tests/sdpo
+
+actions:
+  - validate
+  - train

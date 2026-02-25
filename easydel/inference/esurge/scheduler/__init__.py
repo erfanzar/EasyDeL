@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,44 +12,61 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Request scheduling components for the eSurge engine.
+"""Request scheduling components for the eSurge inference engine.
 
 This module provides the scheduling infrastructure for managing and batching
 inference requests. It includes request queues, scheduling algorithms, and
 output structures.
 
+The scheduler module is responsible for:
+    - Managing request queues with different scheduling policies (FCFS, Priority)
+    - Allocating KV cache pages to requests
+    - Batching requests for efficient GPU utilization
+    - Handling request preemption when resources are constrained
+    - Managing async token generation for improved throughput
+
 Classes:
-    Scheduler: Main request scheduler
-    AsyncScheduler: Async scheduler with placeholder-based token sampling
-    SchedulerInterface: Abstract scheduler interface
-    RequestQueue: Abstract request queue
-    FCFSRequestQueue: First-come-first-served queue
-    PriorityRequestQueue: Priority-based queue
-    SchedulerOutput: Output from scheduling decisions
-    NewRequestData: Data for new requests
-    CachedRequestData: Data for cached requests
+    Scheduler: Main request scheduler that handles batching and resource allocation.
+    AsyncScheduler: Async scheduler with placeholder-based token sampling for
+        overlapping execution.
+    SchedulerInterface: Abstract base class defining the scheduler interface.
+    RequestQueue: Abstract base class for request queue implementations.
+    FCFSRequestQueue: First-come-first-served queue implementation.
+    PriorityRequestQueue: Priority-based queue with heap-based ordering.
+    SchedulerOutput: Data class containing the output of a scheduling decision.
+    NewRequestData: Data class for new requests being scheduled.
+    CachedRequestData: Data class for cached/running requests being scheduled.
+    TokenBudgetManager: Utility for managing token budgets based on KV cache capacity.
 
 Example:
-    >>> from easydel.inference.esurge.scheduler import Scheduler
-    >>> from easydel.inference.esurge.config import SchedulerConfig
-    >>>
-    >>> config = SchedulerConfig(
-    ...     max_num_seqs=16,
-    ...     max_num_batched_tokens=2048,
-    ...     max_model_len=8192
-    ... )
-    >>> scheduler = Scheduler(config)
-    >>> output = scheduler.schedule()
-    >>>
-    >>> # For async scheduling:
-    >>> config_async = SchedulerConfig(
-    ...     max_num_seqs=16,
-    ...     max_num_batched_tokens=2048,
-    ...     max_model_len=8192,
-    ...     async_scheduling=True
-    ... )
-    >>> async_scheduler = AsyncScheduler(config_async)
-    >>> output = async_scheduler.schedule()
+    Basic scheduler usage::
+
+        >>> from easydel.inference.esurge.scheduler import Scheduler
+        >>> from easydel.inference.esurge.config import SchedulerConfig
+        >>>
+        >>> config = SchedulerConfig(
+        ...     max_num_seqs=16,
+        ...     max_num_batched_tokens=2048,
+        ...     max_model_len=8192
+        ... )
+        >>> scheduler = Scheduler(config)
+        >>> output = scheduler.schedule()
+
+    For async scheduling with improved throughput::
+
+        >>> config_async = SchedulerConfig(
+        ...     max_num_seqs=16,
+        ...     max_num_batched_tokens=2048,
+        ...     max_model_len=8192,
+        ...     async_scheduling=True
+        ... )
+        >>> async_scheduler = AsyncScheduler(config_async)
+        >>> output = async_scheduler.schedule()
+
+Note:
+    The scheduler should be created using the appropriate configuration and
+    KV cache configuration. For most use cases, creating a Scheduler from
+    an eSurgeRunner using ``Scheduler.from_runner()`` is recommended.
 """
 
 from .async_scheduler import AsyncScheduler
@@ -69,4 +86,5 @@ __all__ = (
     "Scheduler",
     "SchedulerInterface",
     "SchedulerOutput",
+    "TokenBudgetManager",
 )

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ from __future__ import annotations
 import typing as tp
 
 import jax
+import numpy as np
 from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -363,7 +364,11 @@ class GFPOTrainer(GRPOTrainer):
                 )
             token_logps_time = token_logps_time_fn()
 
-            completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+            host_completion_ids = np.asarray(jax.device_get(completion_ids), dtype=np.int64)
+            completions_text = self.processing_class.batch_decode(
+                host_completion_ids.tolist(),
+                skip_special_tokens=True,
+            )
             is_conversational = self.train_is_conversational if is_train else self.eval_is_conversational
 
             if is_conversational:
@@ -396,7 +401,7 @@ class GFPOTrainer(GRPOTrainer):
                             dict(
                                 reward_processing_class(
                                     texts,
-                                    return_tensors="jax",
+                                    return_tensors="np",
                                     padding="max_length",
                                     padding_side="right",
                                     add_special_tokens=False,

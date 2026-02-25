@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -166,8 +166,13 @@ def grpo_step(
             minibatch["advantages"],
         )
 
-        input_ids = jnp.concatenate([prompt_ids.repeat(num_generations, 0), completion_ids], axis=1)
-        attention_mask = jnp.concatenate([prompt_mask.repeat(num_generations, 0), completion_mask], axis=1)
+        # Use runtime batch shapes so filtered-group trainers (e.g. GFPO) can
+        # train with a different effective generation count than sampling-time.
+        effective_num_generations = completion_ids.shape[0] // max(prompt_ids.shape[0], 1)
+        effective_num_generations = max(effective_num_generations, 1)
+
+        input_ids = jnp.concatenate([prompt_ids.repeat(effective_num_generations, 0), completion_ids], axis=1)
+        attention_mask = jnp.concatenate([prompt_mask.repeat(effective_num_generations, 0), completion_mask], axis=1)
         prompt_len = prompt_ids.shape[-1]
 
         per_token_logps, entropies = get_per_token_logps_and_entropies(

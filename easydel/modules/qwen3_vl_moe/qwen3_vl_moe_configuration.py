@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,22 +20,14 @@ from Qwen3-VL with Mixture of Experts (MoE) architecture from Qwen3-MoE.
 
 import typing
 
-from eformer.common_types import EMPTY, MODE_TRAIN, TP, ColumnWise, DynamicShardingAxes, Replicated, RowWise
 from eformer.loggings import get_logger
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
-from easydel.layers.moe.utils import get_moe_partition_spec
 
 logger = get_logger(__name__)
-
-
-class ExpertTensorParallel(DynamicShardingAxes):
-    """Expert Tensor Parallelism (EPxTP) sharding axes."""
-
-    axes: typing.ClassVar = [TP, EMPTY, EMPTY]
-    mode: typing.ClassVar = MODE_TRAIN
 
 
 @register_config("qwen3_vl_moe_vision")
@@ -211,9 +203,11 @@ class Qwen3VLMoeTextConfig(EasyDeLBaseConfig):
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [
-                "sliding_attention"
-                if self.sliding_window is not None and i >= self.max_window_layers
-                else "full_attention"
+                (
+                    "sliding_attention"
+                    if self.sliding_window is not None and i >= self.max_window_layers
+                    else "full_attention"
+                )
                 for i in range(self.num_hidden_layers)
             ]
 
@@ -291,67 +285,18 @@ class Qwen3VLMoeConfig(EasyDeLBaseConfig):
         """
         return self.text_config
 
-    def get_partition_rules(self, *args, **kwargs):
-        """Get partition rules for model parallelism combining vision and MoE sharding."""
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"self_attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/gate/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
-            (r"mlp/gate/bias", pmag.resolve(Replicated)),
-            (
-                r"mlp/experts/(gate_proj|up_proj)/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="column",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (
-                r"mlp/experts/down_proj/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="row",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (r"mlp/experts/.*bias", pmag.resolve(Replicated)),
-            (r".*(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"visual/patch_embed/proj/kernel", pmag.resolve(ColumnWise)),
-            (r"visual/.*/attn/qkv/kernel", pmag.resolve(ColumnWise)),
-            (r"visual/.*/attn/qkv/bias", pmag.resolve(Replicated)),
-            (r"visual/.*/attn/proj/kernel", pmag.resolve(RowWise)),
-            (r"visual/.*/attn/proj/bias", pmag.resolve(Replicated)),
-            (r"visual/.*/mlp/fc1/kernel", pmag.resolve(ColumnWise)),
-            (r"visual/.*/mlp/fc1/bias", pmag.resolve(Replicated)),
-            (r"visual/.*/mlp/fc2/kernel", pmag.resolve(RowWise)),
-            (r"visual/.*/mlp/fc2/bias", pmag.resolve(Replicated)),
-            (r"visual/.*/norm(1|2)/scale", pmag.resolve(Replicated)),
-            (r"visual/.*/norm(1|2)/bias", pmag.resolve(Replicated)),
-            (r"visual/merger/ln_q/scale", pmag.resolve(Replicated)),
-            (r"visual/merger/ln_q/bias", pmag.resolve(Replicated)),
-            (r"visual/merger/mlp/0/kernel", pmag.resolve(ColumnWise)),
-            (r"visual/merger/mlp/0/bias", pmag.resolve(Replicated)),
-            (r"visual/merger/mlp/2/kernel", pmag.resolve(RowWise)),
-            (r"visual/merger/mlp/2/bias", pmag.resolve(Replicated)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
+        """
+        return None
 
 
 __all__ = [

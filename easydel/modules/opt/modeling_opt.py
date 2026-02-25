@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -42,13 +43,7 @@ from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -58,7 +53,14 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
+from easydel.infra.utils import ACT2FN, ArrayParam
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseCausalLMModule
 
 from .opt_configuration import OPTConfig
 
@@ -275,10 +277,10 @@ class OPTDecoderLayer(nn.Module):
         do_layer_norm_before (bool): Whether to apply layer normalization before the attention/FFN blocks.
         dropout_layer (nn.Dropout): Dropout layer applied to the hidden states.
         activation_fn (callable): The activation function used in the FFN.
-        self_attn_layer_norm (nn.LayerNorm): Layer normalization applied before the self-attention module.
+        self_attn_layer_norm (LayerNorm): Layer normalization applied before the self-attention module.
         fc1 (ParallelLinear): The first linear layer of the FFN.
         fc2 (ParallelLinear): The second linear layer (output) of the FFN.
-        final_layer_norm (nn.LayerNorm): Layer normalization applied before the FFN module.
+        final_layer_norm (LayerNorm): Layer normalization applied before the FFN module.
     """
 
     def __init__(
@@ -321,7 +323,7 @@ class OPTDecoderLayer(nn.Module):
         self.dropout_layer = nn.Dropout(rate=self.config.dropout, rngs=rngs)
         self.activation_fn = ACT2FN[self.config.activation_function]
 
-        self.self_attn_layer_norm = nn.LayerNorm(
+        self.self_attn_layer_norm = LayerNorm(
             self.embed_dim,
             dtype=self.dtype,
             param_dtype=param_dtype,
@@ -346,7 +348,7 @@ class OPTDecoderLayer(nn.Module):
             kernel_init=nn.initializers.normal(config.init_std),
             rngs=rngs,
         )
-        self.final_layer_norm = nn.LayerNorm(
+        self.final_layer_norm = LayerNorm(
             self.embed_dim,
             dtype=self.dtype,
             param_dtype=param_dtype,
@@ -501,6 +503,9 @@ class OPTLearnedPositionalEmbedding(nn.Module):
                 key=rngs.params(),
             )
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        return {"kernel": Replicated}
+
     def __call__(self, inputs: Array) -> Array:
         """Apply learned positional embeddings with offset.
 
@@ -512,7 +517,7 @@ class OPTLearnedPositionalEmbedding(nn.Module):
         """
         # Add offset to inputs and lookup embeddings
         indices = inputs + self.offset
-        # Use take for embedding lookup, matching nn.Embed behavior
+        # Use take for embedding lookup, matching Embed behavior
         embedded = jnp.take(self.kernel.value, indices, axis=0)
         # Cast to output dtype if needed
         if self.dtype != self.param_dtype:
@@ -535,13 +540,13 @@ class OPTDecoder(EasyDeLBaseModule):
         padding_idx (int): Index of the padding token.
         max_target_positions (int): Maximum sequence length the model can handle.
         embed_scale (float): Scaling factor for embeddings (usually 1.0).
-        embed_tokens (nn.Embed): Token embedding layer.
+        embed_tokens (Embed): Token embedding layer.
         embed_positions (OPTLearnedPositionalEmbedding): Positional embedding layer.
         project_out (ColumnParallelLinear, optional): Optional linear projection layer after embeddings.
         project_in (ColumnParallelLinear, optional): Optional linear projection layer before embeddings.
         layers (tp.List[OPTDecoderLayer]): List of OPT decoder layers.
         dropout_layer (nn.Dropout): Dropout layer applied after embeddings.
-        final_layer_norm (nn.LayerNorm, optional): Optional final layer normalization.
+        final_layer_norm (LayerNorm, optional): Optional final layer normalization.
         gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
     """
 
@@ -581,13 +586,7 @@ class OPTDecoder(EasyDeLBaseModule):
         self.padding_idx = self.config.pad_token_id
         self.max_target_positions = self.config.max_position_embeddings
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             config.vocab_size,
             config.word_embed_proj_dim,
             embedding_init=nn.initializers.normal(config.init_std),
@@ -597,9 +596,9 @@ class OPTDecoder(EasyDeLBaseModule):
         )
 
         self.position_offset = offset
-        # Use `nn.Embed` directly so HF -> EasyDeL conversion treats this as an embedding
+        # Use `Embed` directly so HF -> EasyDeL conversion treats this as an embedding
         # (no weight transpose) and maps `*.weight` -> `*.embedding`.
-        self.embed_positions = nn.Embed(
+        self.embed_positions = Embed(
             self.config.max_position_embeddings + offset,
             embed_dim,
             embedding_init=nn.initializers.normal(config.init_std),
@@ -633,7 +632,7 @@ class OPTDecoder(EasyDeLBaseModule):
             self.project_out = None
 
         if self.config.do_layer_norm_before and not self.config._remove_final_layer_norm:
-            self.final_layer_norm = nn.LayerNorm(
+            self.final_layer_norm = LayerNorm(
                 self.config.hidden_size,
                 dtype=self.dtype,
                 param_dtype=param_dtype,
@@ -643,16 +642,18 @@ class OPTDecoder(EasyDeLBaseModule):
         else:
             self.final_layer_norm = None
 
-        self.layers = [
-            OPTDecoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                OPTDecoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
     def __call__(
         self,
@@ -913,7 +914,7 @@ class OPTModel(EasyDeLBaseModule):
         """Gets the input embeddings from the model.
 
         Returns:
-            nn.Embed: The token embedding layer used by the decoder.
+            Embed: The token embedding layer used by the decoder.
         """
         return self.decoder.embed_tokens
 

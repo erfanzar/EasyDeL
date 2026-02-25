@@ -4,6 +4,5 @@ easydel.layers.moe package
 .. toctree::
    :maxdepth: 2
 
-   linear
-   moe
-   utils
+   _communication_utils
+   _moe_module

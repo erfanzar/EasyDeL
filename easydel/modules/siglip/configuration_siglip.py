@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 
 import typing
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
 from eformer.loggings import get_logger
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -25,57 +24,7 @@ logger = get_logger(__name__)
 
 
 def _get_partition_rules(self, *args, **kwargs):
-    """
-    Get the partition rules for the model.
-    Returns:
-        `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
-    """
-    pmag = self.partition_manager
-    return (
-        (r"embeddings/token_embedding/embedding", pmag.resolve(ColumnWise)),
-        (r"embeddings/position_embedding/embedding", pmag.resolve(Replicated)),
-        (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-        (r"self_attn/out_proj/kernel", pmag.resolve(RowWise)),
-        (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-        (r"mlp/fc1/kernel", pmag.resolve(ColumnWise)),
-        (r"mlp/fc2/kernel", pmag.resolve(RowWise)),
-        (r"mlp/fc(1|2)/bias", pmag.resolve(Replicated)),
-        (r"(layer_norm1|layer_norm2)/scale", pmag.resolve(Replicated)),
-        (r"(layer_norm1|layer_norm2)/bias", pmag.resolve(Replicated)),
-        (r"final_layer_norm/scale", pmag.resolve(Replicated)),
-        (r"final_layer_norm/bias", pmag.resolve(Replicated)),
-        (r"head/kernel", pmag.resolve(ColumnWise)),
-        (r"head/bias", pmag.resolve(Replicated)),
-        (r"embeddings/patch_embedding/kernel", pmag.resolve(ColumnWise)),
-        (r"embeddings/patch_embedding/bias", pmag.resolve(Replicated)),
-        (r"embeddings/position_embedding/embedding", pmag.resolve(ColumnWise)),
-        (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-        (r"self_attn/out_proj/kernel", pmag.resolve(RowWise)),
-        (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-        (r"mlp/fc1/kernel", pmag.resolve(ColumnWise)),
-        (r"mlp/fc2/kernel", pmag.resolve(RowWise)),
-        (r"mlp/fc(1|2)/bias", pmag.resolve(Replicated)),
-        (r"(layer_norm1|layer_norm2)/scale", pmag.resolve(Replicated)),
-        (r"(layer_norm1|layer_norm2)/bias", pmag.resolve(Replicated)),
-        (r"post_layernorm/scale", pmag.resolve(Replicated)),
-        (r"post_layernorm/bias", pmag.resolve(Replicated)),
-        (r"head/probe", pmag.resolve(Replicated)),
-        (r"head/attention/in_proj_weight", pmag.resolve(ColumnWise)),
-        (r"head/attention/in_proj_bias", pmag.resolve(Replicated)),
-        (r"head/attention/out_proj/kernel", pmag.resolve(RowWise)),
-        (r"head/attention/out_proj/bias", pmag.resolve(Replicated)),
-        (r"head/layernorm/scale", pmag.resolve(Replicated)),
-        (r"head/layernorm/bias", pmag.resolve(Replicated)),
-        (r"head/mlp/fc1/kernel", pmag.resolve(ColumnWise)),
-        (r"head/mlp/fc2/kernel", pmag.resolve(RowWise)),
-        (r"head/mlp/fc(1|2)/bias", pmag.resolve(Replicated)),
-        (r"logit_scale", pmag.resolve(Replicated)),
-        (r"logit_bias", pmag.resolve(Replicated)),
-        (r"classifier/kernel", pmag.resolve(RowWise)),
-        (r"classifier/bias", pmag.resolve(Replicated)),
-        (r".*bias", pmag.resolve(Replicated)),
-        (r".*", pmag.resolve(Replicated)),
-    )
+    return None
 
 
 @register_config("siglip_text_model")

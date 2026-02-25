@@ -1,12 +1,12 @@
 # EasyDeL Docker Setup
 
-This directory contains Docker configurations for running EasyDeL with different hardware accelerators (CPU, GPU, TPU).
+This directory contains Docker configurations for running EasyDeL with different hardware accelerators (CPU, CUDA, TPU).
 
 ## Prerequisites
 
-### For GPU Support
+### For CUDA Support
 
-- NVIDIA GPU with CUDA 12.8 support
+- NVIDIA CUDA-capable hardware (CUDA 12.8)
 - NVIDIA drivers installed on host system
 - Docker installed
 
@@ -17,14 +17,14 @@ This directory contains Docker configurations for running EasyDeL with different
 
 ## Building Docker Images
 
-### Build for GPU (CUDA 12.8)
+### Build for CUDA (12.8)
 
 ```bash
 # Using the build script
-./docker/build.sh gpu
+./docker/build.sh cuda
 
 # Or directly with docker
-sudo docker build --build-arg HARDWARE_TYPE=gpu -t easydel:gpu-cuda12.8 .
+sudo docker build --build-arg HARDWARE_TYPE=cuda -t easydel:cuda .
 ```
 
 ### Build for TPU
@@ -49,19 +49,19 @@ sudo docker build --build-arg HARDWARE_TYPE=cpu -t easydel:cpu .
 
 ## Running Containers
 
-### GPU Container
+### CUDA Container
 
 #### Using Docker Compose
 
 ```bash
-# Start GPU container with all necessary mounts
-docker compose -f docker-compose.gpu.yml up
+# Start CUDA container with all necessary mounts
+docker compose -f docker-compose.cuda.yml up
 
 # Run in detached mode
-docker compose -f docker-compose.gpu.yml up -d
+docker compose -f docker-compose.cuda.yml up -d
 
 # Execute commands in running container
-docker compose -f docker-compose.gpu.yml exec easydel-gpu python your_script.py
+docker compose -f docker-compose.cuda.yml exec easydel-cuda python your_script.py
 ```
 
 #### Using Docker Run
@@ -69,21 +69,21 @@ docker compose -f docker-compose.gpu.yml exec easydel-gpu python your_script.py
 ```bash
 # Sanity Check
 
-docker compose -f docker-compose.gpu.yml exec easydel-gpu python -c "import jax; print('Devices:', jax.devices())"
+docker compose -f docker-compose.cuda.yml exec easydel-cuda python -c "import jax; print('Devices:', jax.devices())"
 
-# Basic GPU container
+# Basic CUDA container
 docker run --gpus all -it --rm \
     -v $(pwd):/workspace \
-    easydel:gpu-cuda12.8
+    easydel:cuda
 
-# With all GPU capabilities
+# With all CUDA capabilities
 docker run --gpus all --privileged \
     --network host \
     --ipc host \
     -v $(pwd):/workspace \
     -v /dev:/dev \
     -v /usr/local/cuda:/usr/local/cuda:ro \
-    easydel:gpu-cuda12.8
+    easydel:cuda
 ```
 
 ### TPU Container
@@ -136,12 +136,12 @@ For development work with additional tools:
 
 ```bash
 # Build development image
-docker build --target development --build-arg HARDWARE_TYPE=gpu -t easydel:dev-gpu .
+docker build --target development --build-arg HARDWARE_TYPE=cuda -t easydel:dev-cuda .
 
 # Run with development tools
 docker run --gpus all -it --rm \
     -v $(pwd):/workspace \
-    easydel:dev-gpu bash
+    easydel:dev-cuda bash
 ```
 
 ## Testing
@@ -150,10 +150,10 @@ Run tests in containerized environment:
 
 ```bash
 # Build test image
-docker build --target test --build-arg HARDWARE_TYPE=gpu -t easydel:test-gpu .
+docker build --target test --build-arg HARDWARE_TYPE=cuda -t easydel:test-cuda .
 
 # Run tests
-docker run --gpus all --rm easydel:test-gpu
+docker run --gpus all --rm easydel:test-cuda
 ```
 
 ## Multi-Stage Build Targets
@@ -167,11 +167,11 @@ The Dockerfile supports multiple build stages:
 
 ## Hardware-Specific Features
 
-### GPU Features
+### CUDA Features
 
 - CUDA 12.8 with cuDNN support
 - Automatic CUDA library detection
-- JAX GPU backend configured
+- JAX backend configured for CUDA devices
 - PyTorch with CUDA support
 
 ### TPU Features
@@ -183,11 +183,11 @@ The Dockerfile supports multiple build stages:
 
 ## Troubleshooting
 
-### GPU Not Detected
+### CUDA Not Detected
 
 1. Ensure NVIDIA drivers are installed: `nvidia-smi`
-2. Check Docker GPU support: `docker run --gpus all nvidia/cuda:12.8.0-base nvidia-smi`
-3. Verify JAX can see GPU:
+2. Check Docker CUDA support: `docker run --gpus all nvidia/cuda:12.8.0-base nvidia-smi`
+3. Verify JAX can see CUDA devices:
 
    ```python
    import jax
@@ -211,7 +211,7 @@ To speed up builds, the Dockerfile uses BuildKit cache mounts. Enable BuildKit:
 
 ```bash
 export DOCKER_BUILDKIT=1
-docker build --build-arg HARDWARE_TYPE=gpu -t easydel:gpu-cuda12.8 .
+docker build --build-arg HARDWARE_TYPE=cuda -t easydel:cuda .
 ```
 
 ## Environment Variables
@@ -219,11 +219,11 @@ docker build --build-arg HARDWARE_TYPE=gpu -t easydel:gpu-cuda12.8 .
 ### Common
 
 - `PYTHONUNBUFFERED=1`: Ensures Python output is not buffered
-- `HARDWARE_TYPE`: Set to `cpu`, `gpu`, or `tpu`
+- `HARDWARE_TYPE`: Set to `cpu`, `cuda`, or `tpu`
 
-### GPU-Specific
+### CUDA-Specific
 
-- `CUDA_VISIBLE_DEVICES`: Control which GPUs are visible
+- `CUDA_VISIBLE_DEVICES`: Control which CUDA devices are visible
 - `JAX_CUDA_VERSION`: Override CUDA version for JAX
 
 ### TPU-Specific
@@ -234,11 +234,11 @@ docker build --build-arg HARDWARE_TYPE=gpu -t easydel:gpu-cuda12.8 .
 
 ## Quick Start Examples
 
-### Train a Model on GPU
+### Train a Model on CUDA
 
 ```bash
-docker compose -f docker-compose.gpu.yml run --rm easydel-gpu \
-    python train.py --config configs/gpu_training.yaml
+docker compose -f docker-compose.cuda.yml run --rm easydel-cuda \
+    python train.py --config configs/training.yaml
 ```
 
 ### Run Inference on TPU
@@ -251,11 +251,11 @@ docker compose -f docker-compose.tpu.yml run --rm easydel-tpu \
 ### Interactive Development
 
 ```bash
-# GPU development
+# CUDA development
 docker run --gpus all -it --rm \
     -v $(pwd):/workspace \
     -p 8888:8888 \
-    easydel:dev-gpu \
+    easydel:dev-cuda \
     jupyter lab --ip=0.0.0.0 --allow-root
 
 # TPU development
@@ -269,8 +269,8 @@ docker run -it --rm \
 
 ## Notes
 
-- The GPU image requires CUDA 12.8 compatible hardware
+- The CUDA image requires CUDA 12.8 compatible hardware
 - TPU support requires Google Cloud credentials and TPU access
 - Images default to Python 3.13 (override with `PYTHON_VERSION`, e.g. `PYTHON_VERSION=3.12 ./docker/build.sh cpu`)
 - Ray is pinned to 2.53.0 (`ray[default,gcp]` installed in Docker images)
-- Dependencies are installed with `uv` (`JAX_PLATFORMS=cpu` is set during GPU/TPU builds to avoid backend detection at build time)
+- Dependencies are installed with `uv` (`JAX_PLATFORMS=cpu` is set during CUDA/TPU builds to avoid backend detection at build time)

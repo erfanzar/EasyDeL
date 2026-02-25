@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -141,7 +141,31 @@ class UpdateApiKeyRequest(BaseModel):
 
 
 class ApiKeyResponse(BaseModel):
-    """Response model for API key operations."""
+    """Response model for API key operations.
+
+    This model standardizes the structure of API key information returned
+    from admin endpoints. It includes both identification metadata and
+    usage statistics while omitting sensitive configuration details.
+
+    The `key` field is only populated during key creation or rotation
+    operations. In all other contexts, only the `key_prefix` is available
+    for identification purposes.
+
+    Attributes:
+        key: Raw API key secret (only returned on creation/rotation).
+        key_id: Unique identifier for the key record.
+        key_prefix: First few characters of the key for display purposes.
+        name: Human-readable name assigned to the key.
+        description: Optional description of the key's purpose.
+        role: Access control role (admin, user, service).
+        status: Current key status (active, suspended, revoked, expired).
+        created_at: Unix timestamp when the key was created.
+        expires_at: Unix timestamp when the key expires, or None if no expiration.
+        last_used_at: Unix timestamp of the last request using this key.
+        total_requests: Cumulative count of requests made with this key.
+        total_tokens: Cumulative count of tokens processed with this key.
+        message: Optional status message about the operation.
+    """
 
     key: str | None = Field(None, description="Raw API key (only returned on creation)")
     key_id: str
@@ -308,8 +332,27 @@ class AuthEndpointsMixin:
         """
         self._require_admin_role(raw_request)
 
-        role_filter = ApiKeyRole(role) if role else None
-        status_filter = ApiKeyStatus(status) if status else None
+        role_filter = None
+        if role is not None:
+            try:
+                role_filter = ApiKeyRole(role)
+            except ValueError as exc:
+                allowed_roles = ", ".join(item.value for item in ApiKeyRole)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid role filter: {role!r}. Allowed values: {allowed_roles}",
+                ) from exc
+
+        status_filter = None
+        if status is not None:
+            try:
+                status_filter = ApiKeyStatus(status)
+            except ValueError as exc:
+                allowed_statuses = ", ".join(item.value for item in ApiKeyStatus)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid status filter: {status!r}. Allowed values: {allowed_statuses}",
+                ) from exc
 
         keys = self.auth_manager.list_keys(role=role_filter, status=status_filter)
 
@@ -361,92 +404,133 @@ class AuthEndpointsMixin:
                 JSONResponse with updated key details.
         """
         self._require_admin_role(raw_request)
+        existing = self.auth_manager.get_key_by_id(key_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail=f"API key not found: {key_id}")
+
+        provided_fields = set(request.model_fields_set)
 
         # Build configuration objects if any fields are set
         rate_limits = None
-        if any(
-            [
-                request.requests_per_minute,
-                request.requests_per_hour,
-                request.requests_per_day,
-                request.tokens_per_minute,
-                request.tokens_per_hour,
-                request.tokens_per_day,
-            ]
-        ):
+        rate_limit_fields = {
+            "requests_per_minute",
+            "requests_per_hour",
+            "requests_per_day",
+            "tokens_per_minute",
+            "tokens_per_hour",
+            "tokens_per_day",
+        }
+        if provided_fields.intersection(rate_limit_fields):
             rate_limits = RateLimitConfig(
-                requests_per_minute=request.requests_per_minute,
-                requests_per_hour=request.requests_per_hour,
-                requests_per_day=request.requests_per_day,
-                tokens_per_minute=request.tokens_per_minute,
-                tokens_per_hour=request.tokens_per_hour,
-                tokens_per_day=request.tokens_per_day,
+                requests_per_minute=(
+                    request.requests_per_minute
+                    if "requests_per_minute" in provided_fields
+                    else existing.rate_limits.requests_per_minute
+                ),
+                requests_per_hour=(
+                    request.requests_per_hour
+                    if "requests_per_hour" in provided_fields
+                    else existing.rate_limits.requests_per_hour
+                ),
+                requests_per_day=(
+                    request.requests_per_day
+                    if "requests_per_day" in provided_fields
+                    else existing.rate_limits.requests_per_day
+                ),
+                tokens_per_minute=(
+                    request.tokens_per_minute
+                    if "tokens_per_minute" in provided_fields
+                    else existing.rate_limits.tokens_per_minute
+                ),
+                tokens_per_hour=(
+                    request.tokens_per_hour
+                    if "tokens_per_hour" in provided_fields
+                    else existing.rate_limits.tokens_per_hour
+                ),
+                tokens_per_day=(
+                    request.tokens_per_day
+                    if "tokens_per_day" in provided_fields
+                    else existing.rate_limits.tokens_per_day
+                ),
             )
 
         quota = None
-        if any(
-            [
-                request.max_total_tokens,
-                request.max_total_requests,
-                request.monthly_token_limit,
-                request.monthly_request_limit,
-            ]
-        ):
+        quota_fields = {
+            "max_total_tokens",
+            "max_total_requests",
+            "monthly_token_limit",
+            "monthly_request_limit",
+        }
+        if provided_fields.intersection(quota_fields):
             quota = QuotaConfig(
-                max_total_tokens=request.max_total_tokens,
-                max_total_requests=request.max_total_requests,
-                monthly_token_limit=request.monthly_token_limit,
-                monthly_request_limit=request.monthly_request_limit,
+                max_total_tokens=(
+                    request.max_total_tokens
+                    if "max_total_tokens" in provided_fields
+                    else existing.quota.max_total_tokens
+                ),
+                max_total_requests=(
+                    request.max_total_requests
+                    if "max_total_requests" in provided_fields
+                    else existing.quota.max_total_requests
+                ),
+                monthly_token_limit=(
+                    request.monthly_token_limit
+                    if "monthly_token_limit" in provided_fields
+                    else existing.quota.monthly_token_limit
+                ),
+                monthly_request_limit=(
+                    request.monthly_request_limit
+                    if "monthly_request_limit" in provided_fields
+                    else existing.quota.monthly_request_limit
+                ),
             )
 
         permissions = None
-        if any(
-            [
-                request.allowed_models is not None,
-                request.allowed_endpoints is not None,
-                request.allowed_ip_addresses is not None,
-                request.blocked_ip_addresses is not None,
-                request.enable_streaming is not None,
-                request.enable_function_calling is not None,
-                request.max_tokens_per_request is not None,
-            ]
-        ):
-            # Get existing permissions and update
-            existing = self.auth_manager.get_key_by_id(key_id)
-            if existing:
-                permissions = ApiKeyPermissions(
-                    allowed_models=request.allowed_models
-                    if request.allowed_models is not None
-                    else existing.permissions.allowed_models,
-                    allowed_endpoints=(
-                        request.allowed_endpoints
-                        if request.allowed_endpoints is not None
-                        else existing.permissions.allowed_endpoints
-                    ),
-                    allowed_ip_addresses=(
-                        request.allowed_ip_addresses
-                        if request.allowed_ip_addresses is not None
-                        else existing.permissions.allowed_ip_addresses
-                    ),
-                    blocked_ip_addresses=(
-                        request.blocked_ip_addresses
-                        if request.blocked_ip_addresses is not None
-                        else existing.permissions.blocked_ip_addresses
-                    ),
-                    enable_streaming=request.enable_streaming
-                    if request.enable_streaming is not None
-                    else existing.permissions.enable_streaming,
-                    enable_function_calling=(
-                        request.enable_function_calling
-                        if request.enable_function_calling is not None
-                        else existing.permissions.enable_function_calling
-                    ),
-                    max_tokens_per_request=(
-                        request.max_tokens_per_request
-                        if request.max_tokens_per_request is not None
-                        else existing.permissions.max_tokens_per_request
-                    ),
-                )
+        permission_fields = {
+            "allowed_models",
+            "allowed_endpoints",
+            "allowed_ip_addresses",
+            "blocked_ip_addresses",
+            "enable_streaming",
+            "enable_function_calling",
+            "max_tokens_per_request",
+        }
+        if provided_fields.intersection(permission_fields):
+            permissions = ApiKeyPermissions(
+                allowed_models=(
+                    request.allowed_models if "allowed_models" in provided_fields else existing.permissions.allowed_models
+                ),
+                allowed_endpoints=(
+                    request.allowed_endpoints
+                    if "allowed_endpoints" in provided_fields
+                    else existing.permissions.allowed_endpoints
+                ),
+                allowed_ip_addresses=(
+                    request.allowed_ip_addresses
+                    if "allowed_ip_addresses" in provided_fields
+                    else existing.permissions.allowed_ip_addresses
+                ),
+                blocked_ip_addresses=(
+                    request.blocked_ip_addresses
+                    if "blocked_ip_addresses" in provided_fields
+                    else existing.permissions.blocked_ip_addresses
+                ),
+                enable_streaming=(
+                    request.enable_streaming
+                    if "enable_streaming" in provided_fields
+                    else existing.permissions.enable_streaming
+                ),
+                enable_function_calling=(
+                    request.enable_function_calling
+                    if "enable_function_calling" in provided_fields
+                    else existing.permissions.enable_function_calling
+                ),
+                max_tokens_per_request=(
+                    request.max_tokens_per_request
+                    if "max_tokens_per_request" in provided_fields
+                    else existing.permissions.max_tokens_per_request
+                ),
+            )
 
         # Get the admin's key for audit trail
         admin_key = getattr(raw_request.state, "api_key", None)

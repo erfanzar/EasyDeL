@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,9 +19,47 @@ execution manager's step function, consolidating long parameter lists into
 clean PyTree-compatible structures that support automatic sharding and
 enable better type safety.
 
+The structures in this module are designed to be:
+    - Immutable (frozen) for JIT compatibility and safety
+    - PyTree-compatible for automatic JAX transformations
+    - Memory-efficient through packed arrays to reduce transfer overhead
+    - Self-documenting with comprehensive attribute descriptions
+
 Key structures:
-    - StepFunctionInputs: Consolidated inputs for step execution
-    - StepFunctionOutputs: Consolidated outputs from step execution
+    MinimalDeviceState: Minimal state for sampler updates (token_ids, num_tokens).
+    BatchMetadata: Precomputed batch layout tensors with packed storage.
+    ModelStepOutputs: Pure model forward pass outputs (cache, hidden, logits).
+    StepFunctionInputs: Consolidated inputs for fused step execution.
+    StepFunctionOutputs: Consolidated outputs from fused step execution.
+
+Architecture Notes:
+    The module uses array packing to minimize host-device transfer overhead.
+    Instead of many small arrays (high latency), related values are packed
+    into dense 2D arrays:
+
+    - packed_qsl_seqlens: [2, max_num_reqs+1] for query_start_loc and seq_lens
+    - packed_i32_padded: [3, padded_num_reqs] for scheduled, logits_indices, top_k
+    - packed_f32_padded: [3, padded_num_reqs] for temperature, top_p, min_p
+    - packed_misc_i32: [5] for num_requests, padded_num_reqs, request_distribution
+
+    Properties provide unpacking for convenient access while maintaining
+    transfer efficiency.
+
+Example:
+    >>> # Create step inputs
+    >>> inputs = StepFunctionInputs(
+    ...     kv_pages=cache,
+    ...     scheduled_full=scheduled,
+    ...     req_num_tokens_full=req_tokens,
+    ...     active_mask_full=active_mask,
+    ...     rng_key=rng_key,
+    ...     batch_metadata=batch_metadata,
+    ... )
+    >>>
+    >>> # Execute step and unpack outputs
+    >>> outputs = step_fn(inputs)
+    >>> new_tokens = outputs.out_tokens
+    >>> updated_cache = outputs.kv_pages
 """
 
 from __future__ import annotations
@@ -31,7 +69,7 @@ import typing
 import jax
 from eformer.pytree import auto_pytree
 
-from easydel.layers.caching import HybridCache, RaggedPagesCache, UnifiedAttentionCache
+from easydel.caching import HybridCache, RaggedPagesCache, UnifiedAttentionCache
 
 if typing.TYPE_CHECKING:
     pass
@@ -41,12 +79,32 @@ if typing.TYPE_CHECKING:
 class MinimalDeviceState:
     """Minimal device state for sampler updates only.
 
-    Contains only the fields that must be updated on device during sampling.
-    All other metadata stays on CPU in SequenceBuffer as NumPy arrays.
+    This structure contains only the fields that must be updated on device
+    during the sampling phase of token generation. By keeping this minimal,
+    we reduce host-device transfer overhead and maintain most metadata as
+    CPU-resident NumPy arrays in the SequenceBuffer.
+
+    The MinimalDeviceState is designed to be part of the step function's
+    input/output PyTree, enabling efficient JAX transformations while
+    minimizing the data that needs to cross the host-device boundary.
 
     Attributes:
-        token_ids: Token IDs buffer [max_num_reqs, max_model_len] for sampler updates.
-        num_tokens: Total token count per request [max_num_reqs] for sampler increments.
+        token_ids (jax.Array): Token IDs buffer with shape [max_num_reqs, max_model_len].
+            Contains all tokens (prompt + generated) for each request. Updated
+            by the sampler to append newly generated tokens.
+        num_tokens (jax.Array): Total token count per request with shape [max_num_reqs].
+            Tracks the current sequence length for each request, incremented
+            after successful token generation.
+
+    Note:
+        This class is frozen (immutable) for JIT safety. Updates create new
+        instances rather than modifying in place.
+
+    Example:
+        >>> state = MinimalDeviceState(
+        ...     token_ids=jnp.zeros((32, 2048), dtype=jnp.int32),
+        ...     num_tokens=jnp.zeros((32,), dtype=jnp.int32),
+        ... )
     """
 
     token_ids: jax.Array
@@ -118,53 +176,164 @@ class BatchMetadata:
 
     @property
     def query_start_loc(self) -> jax.Array:
+        """Get cumulative query start locations for each request.
+
+        Returns:
+            jax.Array: Cumulative start indices with shape [max_num_reqs+1].
+                Element i contains the starting index in the packed token buffer
+                where request i's tokens begin. The last element contains the
+                total number of tokens across all requests.
+        """
         return self.packed_qsl_seqlens[0]
 
     @property
     def seq_lens(self) -> jax.Array:
-        # Packed row is padded to `max_num_reqs+1` to share a single buffer with query_start_loc.
+        """Get current sequence lengths for each request.
+
+        Returns:
+            jax.Array: Sequence lengths with shape [max_num_reqs]. Each element
+                contains the total number of tokens (prompt + generated) for
+                the corresponding request after this step completes.
+
+        Note:
+            The packed row is padded to `max_num_reqs+1` to share a single
+            buffer with query_start_loc, so we slice off the last element.
+        """
         return self.packed_qsl_seqlens[1, :-1]
 
     @property
     def scheduled(self) -> jax.Array:
+        """Get number of tokens scheduled for each request in this step.
+
+        Returns:
+            jax.Array: Scheduled token counts with shape [padded_num_reqs].
+                Indicates how many tokens from each request are being processed
+                in this step. Zero means the request is not participating.
+        """
         return self.packed_i32_padded[0]
 
     @property
     def logits_indices(self) -> jax.Array:
+        """Get indices for extracting logits from hidden states.
+
+        Returns:
+            jax.Array: Logits indices with shape [padded_num_reqs]. For each
+                request, this is the index of the last token in the packed
+                batch, which is used to extract logits for next-token prediction.
+        """
         return self.packed_i32_padded[1]
 
     @property
     def top_k(self) -> jax.Array:
+        """Get top-k sampling parameters for each request.
+
+        Returns:
+            jax.Array: Top-k values with shape [padded_num_reqs]. Zero means
+                no top-k filtering is applied for that request.
+        """
         return self.packed_i32_padded[2]
 
     @property
     def temperature(self) -> jax.Array:
+        """Get temperature sampling parameters for each request.
+
+        Returns:
+            jax.Array: Temperature values with shape [padded_num_reqs]. Values
+                <= 0 indicate greedy sampling. Higher values increase randomness.
+        """
         return self.packed_f32_padded[0]
 
     @property
     def top_p(self) -> jax.Array:
+        """Get top-p (nucleus) sampling parameters for each request.
+
+        Returns:
+            jax.Array: Top-p values with shape [padded_num_reqs]. Values of 1.0
+                indicate no nucleus filtering. Lower values restrict sampling
+                to tokens with highest cumulative probability.
+        """
         return self.packed_f32_padded[1]
 
     @property
     def min_p(self) -> jax.Array:
+        """Get min-p sampling parameters for each request.
+
+        Returns:
+            jax.Array: Min-p threshold values with shape [padded_num_reqs].
+                Filters out tokens with probability below this fraction of
+                the maximum token probability.
+        """
         return self.packed_f32_padded[2]
 
     @property
     def num_requests(self) -> jax.Array:
+        """Get the actual number of active requests (unpadded).
+
+        Returns:
+            jax.Array: Scalar containing the number of active requests in
+                this batch, excluding padding.
+        """
         return self.packed_misc_i32[0]
 
     @property
     def padded_num_reqs(self) -> jax.Array:
+        """Get the padded number of requests for compilation efficiency.
+
+        Returns:
+            jax.Array: Scalar containing the padded request count. This is
+                typically a power of 2 to reduce the number of unique
+                compiled function variants.
+        """
         return self.packed_misc_i32[1]
 
     @property
     def request_distribution(self) -> jax.Array:
+        """Get request distribution for v3 attention kernel optimization.
+
+        Returns:
+            jax.Array: Distribution triple [decode_count, chunked_prefill_end, total].
+                Used by ragged page attention v3 to optimize memory access patterns
+                based on whether requests are in decode or prefill phase.
+        """
         return self.packed_misc_i32[2:5]
 
 
 @auto_pytree(frozen=True)
 class ModelStepOutputs:
-    """Outputs returned from the pure model forward pass."""
+    """Outputs returned from the pure model forward pass.
+
+    This frozen PyTree structure encapsulates all outputs from a single
+    model forward step. It separates the model computation from sampling,
+    allowing the caller to perform additional processing (e.g., logprob
+    computation) before sampling.
+
+    Attributes:
+        kv_pages (HybridCache | RaggedPagesCache | UnifiedAttentionCache):
+            Updated key-value cache pages containing newly computed attention
+            states. The cache type depends on the configured attention mechanism
+            (v2 uses RaggedPagesCache, v3 uses RaggedPagesCache with request
+            distribution, unified uses UnifiedAttentionCache).
+        hidden_states (jax.Array): Final layer hidden states with shape
+            [num_tokens, hidden_dim]. These are the raw transformer outputs
+            before the language model head projection, useful for tasks
+            requiring access to token representations.
+        logits (jax.Array): Vocabulary logits with shape [padded_num_reqs, vocab_size].
+            Output from the language model head applied to the last token
+            position of each request. These are unfiltered probability
+            distributions ready for sampling.
+
+    Note:
+        The structure is frozen for immutability and JIT safety. Output tensors
+        maintain device placement from inputs. The logits are extracted only
+        for the last token position of each request (using logits_indices from
+        BatchMetadata) to minimize computation.
+
+    Example:
+        >>> outputs = model_step_fn(graphstate, graphother, kv_pages, metadata)
+        >>> new_cache = outputs.kv_pages
+        >>> logits_for_sampling = outputs.logits
+        >>> hidden_for_analysis = outputs.hidden_states
+    """
 
     kv_pages: HybridCache | RaggedPagesCache | UnifiedAttentionCache
     hidden_states: jax.Array
@@ -217,7 +386,17 @@ class StepFunctionInputs:
     batch_metadata: BatchMetadata
 
     def print_status(self) -> None:
-        """Print the shapes of all fields in this StepFunctionInputs structure."""
+        """Print the shapes of all fields in this StepFunctionInputs structure.
+
+        Outputs a formatted summary of all array shapes in this input structure,
+        useful for debugging compilation issues or verifying input dimensions.
+        The output includes sections for MinimalDeviceState, Paged KV Cache,
+        Request Arrays, BatchMetadata, and optional VLM data.
+
+        Note:
+            This method accesses device arrays and should not be called in
+            performance-critical code paths. It's intended for debugging only.
+        """
         lines = []
 
         lines.append("StepFunctionInputs Status")

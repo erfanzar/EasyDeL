@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,13 +24,31 @@ Key Features:
     - Flexible request scheduling (FCFS, priority-based)
     - Prefix caching for improved efficiency
     - Continuous batching support
+    - Vision-language model support with multimodal processing
+    - Prometheus metrics integration for monitoring
+    - Rich console monitoring with real-time metrics display
 
 Components:
-    Config: Main configuration classes
+    Config: Main configuration classes for scheduler and cache
     CacheCoordinator: KV cache coordination and management
     Scheduler: Request scheduling and batching
     eSurgeRunner: Model execution runner
     eSurge: Main engine interface
+
+Classes:
+    eSurge: High-level engine interface for text generation.
+    Config: Unified configuration combining scheduler and cache settings.
+    SchedulerConfig: Configuration for request scheduling behavior.
+    CacheConfig: Configuration for KV cache management.
+    RequestOutput: Container for generation results and metrics.
+    CompletionOutput: Individual completion within a request.
+    EngineRequest: Internal request tracking object.
+    EngineRequestStatus: Enumeration of request lifecycle states.
+    Scheduler: Request scheduler with batching support.
+    SchedulerOutput: Output from scheduler decisions.
+    eSurgeRunner: Model execution and forward pass runner.
+    CacheCoordinator: KV cache allocation and management.
+    MetricsCollector: Centralized metrics collection system.
 
 Example:
     >>> from easydel.inference.esurge import (
@@ -39,6 +57,8 @@ Example:
     ...     SchedulerConfig,
     ...     CacheConfig
     ... )
+    >>>
+    >>> # Create configuration
     >>> config = Config(
     ...     scheduler_config=SchedulerConfig(
     ...         max_num_seqs=16,
@@ -51,10 +71,18 @@ Example:
     ...         enable_prefix_caching=True
     ...     )
     ... )
-    >>> engine = eSurge(config=config)
+    >>>
+    >>> # Initialize and use the engine
+    >>> engine = eSurge(model="model-name", max_model_len=8192)
+    >>> engine.initiate()
+    >>>
+    >>> # Generate text with streaming
+    >>> for output in engine.stream("Tell me about AI"):
+    ...     print(output.delta_text, end="", flush=True)
 
 Note:
     eSurge is experimental and APIs may change in future versions.
+    For production use, ensure thorough testing and monitoring.
 """
 
 from .config import CacheConfig, Config, SchedulerConfig
@@ -80,6 +108,14 @@ from .core import (
     SlidingWindowSpec,
     UnitaryCacheCoordinator,
     create_kv_cache_specs_from_config,
+)
+from .distributed import (
+    DistributedController,
+    StepDispatch,
+    compute_sampled_digest,
+    make_config_fingerprint,
+    resolve_distributed_role,
+    resolve_service_hosts,
 )
 from .esurge_engine import CompletionOutput, RequestOutput, eSurge
 from .metrics import (
@@ -132,6 +168,7 @@ __all__ = (
     "ChunkedLocalAttentionSpec",
     "CompletionOutput",
     "Config",
+    "DistributedController",
     "EngineRequest",
     "EngineRequestStatus",
     "FCFSRequestQueue",
@@ -160,9 +197,11 @@ __all__ = (
     "SingleTypeCacheManager",
     "SlidingWindowManager",
     "SlidingWindowSpec",
+    "StepDispatch",
     "SystemMetrics",
     "UnitaryCacheCoordinator",
     "VisionEncoderCache",
+    "compute_sampled_digest",
     "create_kv_cache_specs_from_config",
     "eSurge",
     "eSurgeApiServer",
@@ -171,6 +210,9 @@ __all__ = (
     "get_metrics_collector",
     "initialize_metrics",
     "log_metrics_summary",
+    "make_config_fingerprint",
+    "resolve_distributed_role",
+    "resolve_service_hosts",
     "start_console_monitor",
     "start_monitoring_server",
     "stop_monitoring",

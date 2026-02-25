@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -207,6 +207,7 @@ EASYDEL_TRAINER_README_TEMPLATE = """
     "cuda_flash_attn2": "CUDA_FLASH_ATTN2",
     "paged": "RAGGED_PAGE_ATTENTION_V3", "paged_attn": "RAGGED_PAGE_ATTENTION_V3", "paged_attention": "RAGGED_PAGE_ATTENTION_V3",
     "page_attention": "PAGED_ATTENTION",
+    "paged_flash_attention": "PAGED_FLASH_ATTENTION",
     "ragged_page_attention_v3": "RAGGED_PAGE_ATTENTION_V3", "ragged_page_attention_v2": "RAGGED_PAGE_ATTENTION_V2",
     "unified_attention": "UNIFIED_ATTENTION",
     "autoregressive_decodeattn": "REGRESSIVE_DECODE", "autoregressive_decode": "REGRESSIVE_DECODE"

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,52 +12,78 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EasyDeL Layers Module.
+"""EasyDeL Layers Module — pure NN building blocks.
 
-Provides optimized neural network layers and components for building
-deep learning models in JAX/Flax. Includes advanced attention mechanisms,
-efficient caching systems, quantization support, and various layer types.
-
-Key Components:
-    - Linear and parallel linear layers with sharding support
-    - Multiple attention mechanisms (Flash, Ring, Paged, etc.)
-    - Advanced caching systems for transformers and state-space models
-    - Quantization layers (8-bit, NF4)
-    - Normalization layers (RMSNorm, LayerNorm)
-    - Mixture of Experts (MoE) layers
-    - Rotary position embeddings (RoPE)
+This module provides optimized neural network layers and components for building
+deep learning models in JAX/Flax.
 
 Submodules:
-    attention: Various attention implementations
-    attention_operator: Low-level attention operators
-    caching: KV-cache and state caching systems
-    linear: Linear and parallel linear layers
-    moe: Mixture of Experts layers
-    norms: Normalization layers
-    ops: Custom operations (GLA, Lightning attention)
-    quantization: Quantized layer implementations
-    rotary_embedding: RoPE and position embeddings
-
-Example:
-    >>> from easydel.layers.norms import RMSNorm
-    >>> from easydel.layers.linear import ParallelLinear
-    >>> from easydel.layers.attention import FlashAttention
-    >>>
-    >>> # Create a parallel linear layer
-    >>> linear = ParallelLinear(
-    ...     features=768,
-    ...     use_bias=False,
-    ...     dtype=jnp.bfloat16
-    ... )
-    >>>
-    >>> # Use Flash Attention
-    >>> attn = FlashAttention(
-    ...     num_heads=12,
-    ...     head_dim=64
-    ... )
-
-Note:
-    This module provides the building blocks for constructing
-    efficient neural networks with support for distributed training,
-    mixed precision, and hardware acceleration.
+    attention: FlexibleAttentionModule, UnifiedAttention, AttentionMechanisms
+    linears: ParallelLinear, ColumnParallelLinear, RowParallelLinear, quantized/MoE variants
+    norms: RMSNorm, LayerNorm
+    embeddings: Embed
+    moe: BaseMoeModule, routing strategies
+    quantization: QuantizationConfig, EasyQuantizer
+    rotary: RotaryEmbedding and variants, RopeConfig
 """
+
+from .embeddings import Embed
+from .linears import (
+    ColumnParallelLinear,
+    ColumnParallelLinearQuantized,
+    ColumnParallelMoELinear,
+    ParallelLinear,
+    ParallelLinearQuantized,
+    ParallelMoELinear,
+    RowParallelLinear,
+    RowParallelLinearQuantized,
+    RowParallelMoELinear,
+)
+from .moe import (
+    BaseMoeModule,
+    MoeFusedHooks,
+    MoeLoadBalancingStrategy,
+    MoEMethods,
+    MoeMetrics,
+    MoeRoutingStrategy,
+    get_moe_partition_spec,
+)
+from .norms import RMSNorm
+from .quantization import (
+    EasyDeLQuantizationConfig,
+    EasyQuantizer,
+    QuantizationConfig,
+    QuantizationType,
+    quantize,
+    straight_through,
+    straight_through_1bit,
+    straight_through_8bit,
+    straight_through_mxfp4,
+    straight_through_mxfp8,
+    straight_through_nf4,
+    straight_through_nvfp8,
+)
+from .rotary import (
+    DeepseekScalingRotaryEmbedding,
+    DynamicNTKScalingRotaryEmbedding,
+    LinearScalingRotaryEmbedding,
+    Llama3RotaryEmbedding,
+    MultiModalRotaryEmbedding,
+    Phi3LongRoPEScaledRotaryEmbedding,
+    RopeConfig,
+    RotaryEmbedding,
+    YaRNScalingRotaryEmbedding,
+    compute_basic_frequencies,
+    compute_basic_inv_frequencies,
+    compute_deepseek_frequencies,
+    compute_dynamic_frequencies,
+    compute_linear_frequencies,
+    compute_llama3_frequencies,
+    compute_llama3_inv_frequencies,
+    compute_phi3_frequencies,
+    compute_yarn_frequencies,
+    compute_yarn_inv_frequencies,
+    get_frequencies,
+    get_inv_frequencies,
+    get_rope,
+)

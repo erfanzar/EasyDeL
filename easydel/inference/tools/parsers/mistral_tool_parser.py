@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Mistral model tool call parser.
+
+This module provides a specialized tool call parser for Mistral AI models
+(7B Instruct v0.3 and later). The parser handles Mistral's specific tool call
+format which uses the [TOOL_CALLS] token followed by a JSON array of function
+calls.
+
+The parser is designed to work with the mistral_common library and the
+tool_chat_template_mistral.jinja template. It supports automatic tool ID
+generation and is compatible with different Mistral tokenizer versions.
+
+Example:
+    >>> from easydel.inference.tools.parsers.mistral_tool_parser import MistralToolParser
+    >>> parser = MistralToolParser(tokenizer)
+    >>> result = parser.extract_tool_calls(
+    ...     '[TOOL_CALLS][{"name": "search", "arguments": {"q": "test"}}]',
+    ...     request
+    ... )
+    >>> result.tools_called
+    True
+
+See Also:
+    - https://github.com/mistralai/mistral-common/ - Mistral Common library
+"""
+
 from __future__ import annotations
 
 import json
@@ -48,44 +73,159 @@ ALPHANUMERIC = ascii_letters + digits
 
 
 class MistralToolCall(ToolCall):
+    """A specialized ToolCall class for Mistral models with auto-generated IDs.
+
+    Extends the base ToolCall class to provide automatic 9-character alphanumeric
+    ID generation, which is the format expected by Mistral's tool calling system.
+
+    Attributes:
+        id (str): A 9-character alphanumeric identifier, automatically generated
+            if not provided. This ID format is specific to Mistral's requirements.
+
+    Example:
+        >>> call = MistralToolCall(
+        ...     type="function",
+        ...     function=FunctionCall(name="search", arguments='{"q": "test"}')
+        ... )
+        >>> len(call.id)
+        9
+        >>> call.id.isalnum()
+        True
+    """
+
     id: str = Field(default_factory=lambda: MistralToolCall.generate_random_id())
 
     @staticmethod
-    def generate_random_id():
+    def generate_random_id() -> str:
+        """Generate a random 9-character alphanumeric ID.
+
+        Creates a unique identifier suitable for Mistral tool calls by randomly
+        selecting 9 characters from the alphanumeric character set.
+
+        Returns:
+            str: A 9-character string containing only letters (a-z, A-Z) and
+                digits (0-9).
+
+        Example:
+            >>> id = MistralToolCall.generate_random_id()
+            >>> len(id)
+            9
+            >>> id.isalnum()
+            True
+        """
         return "".join(choices(ALPHANUMERIC, k=9))
 
     @staticmethod
     def is_valid_id(id: str) -> bool:  # noqa
+        """Validate whether a string is a valid Mistral tool call ID.
+
+        Checks if the provided ID matches Mistral's expected format: exactly
+        9 alphanumeric characters.
+
+        Args:
+            id (str): The ID string to validate.
+
+        Returns:
+            bool: True if the ID is exactly 9 alphanumeric characters,
+                False otherwise.
+
+        Example:
+            >>> MistralToolCall.is_valid_id("abc123XYZ")
+            True
+            >>> MistralToolCall.is_valid_id("short")
+            False
+            >>> MistralToolCall.is_valid_id("has-dash!")
+            False
+        """
         return id.isalnum() and len(id) == 9
 
 
 def _is_fn_name_regex_support(model_tokenizer: AnyTokenizer) -> bool:
+    """Check if the tokenizer supports regex-based function name extraction.
+
+    Determines whether the provided tokenizer is a Mistral tokenizer with
+    version 11 or higher, which enables enhanced regex-based function name
+    parsing capabilities.
+
+    Args:
+        model_tokenizer (AnyTokenizer): The tokenizer instance to check.
+            Can be any tokenizer type, but only MistralTokenizer v11+
+            will return True.
+
+    Returns:
+        bool: True if the tokenizer is a MistralTokenizer with version >= 11,
+            False otherwise (including when mistral_common is not installed).
+    """
     return MistralTokenizer and isinstance(model_tokenizer, MistralTokenizer) and model_tokenizer.version >= 11
 
 
 @ToolParserManager.register_module("mistral")
 class MistralToolParser(ToolParser):
-    """
-    Tool call parser for Mistral models (7B Instruct v0.3+).
+    """Tool call parser for Mistral models (7B Instruct v0.3+).
+
+    This parser is designed specifically for Mistral AI models and handles their
+    unique tool call format which uses the [TOOL_CALLS] token followed by a JSON
+    array of function calls. It is compatible with both the mistral_common library
+    tokenizers and standard HuggingFace tokenizers.
 
     Designed for use with:
-    - [`mistral_common`](https://github.com/mistralai/mistral-common/)
-    - the examples/tool_chat_template_mistral.jinja template
+        - `mistral_common <https://github.com/mistralai/mistral-common/>`_
+        - The examples/tool_chat_template_mistral.jinja template
 
-    Handles Mistral's specific tool call format with [TOOL_CALLS] token
-    and JSON array of function calls. Supports both standard JSON parsing
-    and regex-based parsing for function names with v11+ tokenizers.
+    Supported Formats:
+        - Standard JSON array: `[TOOL_CALLS][{"name": "func", "arguments": {...}}]`
+        - Multiple calls: `[TOOL_CALLS][{"name": "func1", ...}, {"name": "func2", ...}]`
+        - Regex pattern (v11+): `function_name{...}` without outer array
 
     Features:
-    - Automatic tool ID generation (9-character alphanumeric)
-    - Support for multiple tool calls in single response
-    - Streaming with incremental argument parsing
-    - Compatibility with different Mistral tokenizer versions
+        - Automatic 9-character alphanumeric tool ID generation
+        - Support for multiple tool calls in a single response
+        - Streaming with incremental argument parsing
+        - Compatibility with different Mistral tokenizer versions
+        - Regex-based function name extraction for v11+ tokenizers
 
-    Used when --enable-auto-tool-choice --tool-call-parser mistral are set.
+    Attributes:
+        bot_token (str): The special token "[TOOL_CALLS]" marking tool call sections.
+        bot_token_id (int | None): The token ID for bot_token in the vocabulary.
+        tool_call_regex (re.Pattern): Pattern for extracting JSON array tool calls.
+        fn_name_regex (re.Pattern | None): Pattern for function name extraction
+            (only available with MistralTokenizer v11+).
+        prev_tool_call_arr (list[dict]): Previous tool calls for streaming diff.
+        current_tool_id (int): Index of current tool being processed.
+        current_tool_name_sent (bool): Whether function name was sent in stream.
+        streamed_args_for_tool (list[str]): Accumulated arguments per tool.
+
+    Example:
+        >>> parser = MistralToolParser(tokenizer)
+        >>> result = parser.extract_tool_calls(
+        ...     '[TOOL_CALLS][{"name": "search", "arguments": {"q": "test"}}]',
+        ...     request
+        ... )
+        >>> result.tools_called
+        True
+        >>> result.tool_calls[0].function.name
+        'search'
+
+    Raises:
+        RuntimeError: If the [TOOL_CALLS] token is not found in the tokenizer
+            vocabulary during initialization.
+
+    Note:
+        Use with --enable-auto-tool-choice --tool-call-parser mistral.
     """
 
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize the Mistral tool parser.
+
+        Args:
+            tokenizer (AnyTokenizer): The tokenizer instance for the Mistral model.
+                Can be either a MistralTokenizer from mistral_common or a standard
+                HuggingFace tokenizer.
+
+        Raises:
+            RuntimeError: If the [TOOL_CALLS] token cannot be found in the
+                tokenizer's vocabulary.
+        """
         super().__init__(tokenizer)
 
         if MistralTokenizer and not isinstance(self.model_tokenizer, MistralTokenizer):
@@ -107,6 +247,29 @@ class MistralToolParser(ToolParser):
             raise RuntimeError("Mistral Tool Parser could not locate the tool call token in the tokenizer!")
 
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
+        """Adjust the chat completion request for Mistral tool parsing compatibility.
+
+        Modifies the request to ensure special tokens are preserved during decoding
+        when using a non-Mistral tokenizer with tool calling enabled. This is
+        necessary because the [TOOL_CALLS] token must be visible in the output
+        for proper parsing.
+
+        Args:
+            request (ChatCompletionRequest): The original chat completion request
+                to potentially modify.
+
+        Returns:
+            ChatCompletionRequest: The adjusted request with skip_special_tokens
+                set to False if tools are enabled and a non-Mistral tokenizer
+                is being used.
+
+        Note:
+            This adjustment is only applied when:
+            - mistral_common is available
+            - The tokenizer is NOT a MistralTokenizer
+            - Tools are defined in the request
+            - tool_choice is not set to "none"
+        """
         if (
             MistralTokenizer
             and not isinstance(self.model_tokenizer, MistralTokenizer)
@@ -122,23 +285,42 @@ class MistralToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
-        """
-        Extract tool calls from complete Mistral model response.
+        """Extract tool calls from a complete Mistral model response.
 
-        Parses the [TOOL_CALLS] token followed by JSON array or
-        function call patterns. Handles both standard JSON format
-        and regex-based extraction for newer tokenizer versions.
+        Parses the model output to find the [TOOL_CALLS] token and extract
+        the following JSON array or function call patterns. The method supports
+        both standard JSON format parsing and regex-based extraction for newer
+        tokenizer versions (v11+).
 
         Args:
-            model_output: Complete model output with tool calls
-            request: Original request (unused)
+            model_output (str): The complete text output from the Mistral model,
+                expected to contain the [TOOL_CALLS] token followed by JSON.
+            request (ChatCompletionRequest): The original chat completion request.
+                Currently unused but included for API consistency.
 
         Returns:
-            Extracted tool information with MistralToolCall objects
+            ExtractedToolCallInformation: An object containing:
+                - tools_called (bool): True if valid tool calls were extracted.
+                - tool_calls (list[MistralToolCall]): List of MistralToolCall
+                  objects with auto-generated IDs.
+                - content (str | None): Text content before the [TOOL_CALLS]
+                  token, or None if there was no preceding content.
+
+        Example:
+            >>> result = parser.extract_tool_calls(
+            ...     'Let me search. [TOOL_CALLS][{"name": "search", "arguments": {}}]',
+            ...     request
+            ... )
+            >>> result.tools_called
+            True
+            >>> result.content
+            'Let me search. '
+            >>> result.tool_calls[0].function.name
+            'search'
 
         Note:
-            Tool call arguments should avoid quotes as parser may
-            need to replace single quotes with double quotes.
+            For regex-based parsing (v11+ tokenizers), the format is:
+            `function_name{arguments}` rather than a JSON array.
         """
 
         if self.bot_token not in model_output:
@@ -194,6 +376,44 @@ class MistralToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        """Extract tool calls incrementally during streaming generation.
+
+        Processes streaming Mistral model output to extract tool calls as they
+        are being generated. Handles the [TOOL_CALLS] token detection and
+        incrementally parses the following JSON array to emit function names
+        and argument updates.
+
+        Args:
+            previous_text (str): The accumulated text before this delta.
+            current_text (str): The accumulated text including this delta.
+            delta_text (str): The new text generated in this streaming chunk.
+            previous_token_ids (Sequence[int]): Token IDs before this delta.
+            current_token_ids (Sequence[int]): Token IDs including this delta.
+            delta_token_ids (Sequence[int]): New token IDs in this chunk.
+            request (ChatCompletionRequest): The original chat completion request.
+
+        Returns:
+            DeltaMessage | None: A delta message containing either:
+                - Content text if no tool call token has been seen yet.
+                - None if only the [TOOL_CALLS] token was received (waiting for JSON).
+                - Tool call name update when a new function name is parsed.
+                - Tool call arguments update with incremental argument text.
+                - None if parsing failed or more tokens are needed.
+
+        Note:
+            This method maintains state across calls via instance attributes:
+            - prev_tool_call_arr: Tracks previous tool call state for diff.
+            - current_tool_id: Index of current tool being streamed.
+            - current_tool_name_sent: Whether function name has been emitted.
+            - streamed_args_for_tool: Accumulated arguments per tool.
+
+            The method performs special handling for quotes in delta_text,
+            replacing single quotes with double quotes for JSON compatibility.
+
+        Warning:
+            Due to quote handling, tool call arguments should ideally avoid
+            single quotes to prevent parsing ambiguities.
+        """
         if self.bot_token not in current_text:
             return DeltaMessage(content=delta_text)
 

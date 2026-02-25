@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -66,10 +66,14 @@ if typing.TYPE_CHECKING:
 
     from easydel.data.core.protocols import ShardedDataSource
     from easydel.inference import eSurge
+    from easydel.inference.reasoning.abstract_reasoning import ReasoningParserName
+    from easydel.inference.tools.abstract_tool import ToolParserName
     from easydel.trainers import Trainer
 
     from .types import TextDatasetInformCfg, VisualDatasetInformCfg
 logger = get_logger("eLargeModel")
+_ESURGE_UNSET = object()
+_QUANT_UNSET = object()
 
 
 class BuildTrainerKws(typing.TypedDict, total=False):
@@ -83,7 +87,8 @@ class BuildTrainerKws(typing.TypedDict, total=False):
         reference_model: Reference model for DPO/preference optimization
         reward_model: Reward model for GRPO training
         teacher_model: Teacher model for distillation training
-        reward_funcs: Custom reward functions for GRPO
+        reward_funcs: Custom reward functions for GRPO/SDPO/PPO-style trainers
+        feedback_func: Optional textual feedback callback for SDPO
     """
 
     data_collator: NotRequired[typing.Callable]
@@ -94,6 +99,7 @@ class BuildTrainerKws(typing.TypedDict, total=False):
     reward_model: NotRequired[EasyDeLBaseModule | None]
     teacher_model: NotRequired[EasyDeLBaseModule | None]
     reward_funcs: NotRequired[Any | None]
+    feedback_func: NotRequired[typing.Callable | None]
 
 
 class eLargeModel:
@@ -152,7 +158,7 @@ class eLargeModel:
         """
         if config is None:
             self._config = normalize({"model": {"name_or_path": ""}})
-        elif isinstance(config, str | os.PathLike) or hasattr(config, "__fspath__"):
+        elif isinstance(config, (str, os.PathLike)) or hasattr(config, "__fspath__"):
             self._config = load_elm_config(config)
         else:
             self._config = normalize(config)
@@ -180,6 +186,34 @@ class eLargeModel:
         a `config`/`elarge_model`/`elm` key. If the YAML file also contains a
         top-level `actions` key (e.g. used by `easydel.scripts.elarge`), that key
         is ignored when loading the ELM configuration.
+
+        Args:
+            yaml_path: Path to the YAML configuration file. Can be a string path,
+                os.PathLike, or ePathLike object.
+
+        Returns:
+            eLargeModel instance configured from the YAML file.
+
+        Raises:
+            ImportError: If PyYAML is not installed.
+            FileNotFoundError: If the YAML file does not exist.
+            TypeError: If the YAML root or config is not a dict/mapping.
+
+        Example:
+            >>> # YAML file with direct config:
+            >>> # model:
+            >>> #   name_or_path: meta-llama/Llama-2-7b
+            >>> # loader:
+            >>> #   dtype: bf16
+            >>> elm = eLargeModel.from_yaml("config.yaml")
+            >>>
+            >>> # YAML file with wrapped config:
+            >>> # config:
+            >>> #   model:
+            >>> #     name_or_path: meta-llama/Llama-2-7b
+            >>> # actions:
+            >>> #   - train
+            >>> elm = eLargeModel.from_yaml("pipeline.yaml")
         """
         try:
             import yaml  # type: ignore
@@ -459,7 +493,10 @@ class eLargeModel:
     def set_quantization(
         self,
         method: str | None = None,
-        block_size: int = 128,
+        group_size: int = 128,
+        use_qmm_best_config: bool = False,
+        qmm_platform_override: str | None | object = _QUANT_UNSET,
+        qmm_tpu_path_override: str | None | object = _QUANT_UNSET,
         **kwargs,
     ) -> eLargeModel:
         """Configure quantization settings.
@@ -469,8 +506,14 @@ class eLargeModel:
 
         Args:
             method: Quantization method.
-            block_size: Quantization block size (default: 128).
-                Smaller blocks = better accuracy but more overhead.
+            group_size: Quantization group size (default: 128).
+                Smaller groups = better accuracy but more overhead.
+            use_qmm_best_config: Whether quantized linear kernels should request
+                ejkernel tuned block configs by default.
+            qmm_platform_override: Optional explicit quantized-matmul platform
+                override. Pass None to clear a previous value.
+            qmm_tpu_path_override: Optional explicit TPU quantized-matmul path
+                override. Pass None to clear a previous value.
             **kwargs: Additional quantization options:
                 - platform: Target platform ("cpu", "cuda", "tpu")
                 - compute_dtype: Dtype for computation (e.g., "fp16")
@@ -480,13 +523,18 @@ class eLargeModel:
             Self for method chaining
 
         Example:
-            >>> elm.set_quantization("nf4", block_size=64)
+            >>> elm.set_quantization("nf4", group_size=64)
             >>> elm.set_quantization("a8bit")
         """
         quant = self._config.setdefault("quantization", {})
         if method is not None:
             quant["method"] = method
-        quant["block_size"] = block_size
+        quant["group_size"] = group_size
+        quant["use_qmm_best_config"] = bool(use_qmm_best_config)
+        if qmm_platform_override is not _QUANT_UNSET:
+            quant["qmm_platform_override"] = qmm_platform_override
+        if qmm_tpu_path_override is not _QUANT_UNSET:
+            quant["qmm_tpu_path_override"] = qmm_tpu_path_override
         quant.update(kwargs)
         return self
 
@@ -511,6 +559,7 @@ class eLargeModel:
                 - "ragged_page_attention_v2": Ragged page attention v2
                 - "ragged_page_attention_v3": Ragged page attention v3
                 - "unified_attention": Unified paged attention (vLLM-style)
+                - "paged_flash_attention": Paged FlashAttention (CUDA)
                 - "sdpa": Scaled dot product attention
                 - "vanilla": Vanilla attention
             **kwargs: Individual operation configs as keyword arguments.
@@ -546,6 +595,9 @@ class eLargeModel:
         max_model_len: int | None = None,
         max_num_seqs: int = 16,
         hbm_utilization: float = 0.85,
+        bind_graphstate_for_aot: bool | object = _ESURGE_UNSET,
+        tool_parser: ToolParserName | None | object = _ESURGE_UNSET,
+        reasoning_parser: ReasoningParserName | None | object = _ESURGE_UNSET,
         **kwargs,
     ) -> eLargeModel:
         """Configure eSurge inference settings.
@@ -560,11 +612,39 @@ class eLargeModel:
                 Higher values increase throughput but require more memory.
             hbm_utilization: HBM memory utilization ratio (0.0-1.0).
                 Controls how much device memory to use for KV cache.
+            bind_graphstate_for_aot: Optional override for AOT model-step
+                compilation behavior. When True, compiled model-step variants
+                capture graphstate/graphother as compile-time constants.
+                When omitted, keeps the current value (default config is False).
+            tool_parser: Tool parser name to use for automatic function-call
+                extraction. Pass None to clear a previously configured parser.
+            reasoning_parser: Reasoning parser name to use for separating
+                reasoning content from final response content. Pass None to
+                clear a previously configured parser.
             **kwargs: Additional eSurge options:
                 - page_size: PagedAttention page size (default: 128)
+                - data_parallelism_axis: Mesh axis used for KV-cache data-parallel
+                  page sharding (default: "dp", set "ep" for expert-axis DP)
+                - distributed_mode: Enable lockstep multi-host serving where
+                  rank 0 is leader and other ranks are worker executors.
+                - distributed_role: "auto" (default), "leader", or "worker".
+                - distributed_service_name: DNS service name used to discover
+                  all hosts in fixed world-size mode.
+                - distributed_world_size: Expected number of hosts.
+                - distributed_rank: Optional explicit rank override.
+                - distributed_control_port: ZMQ control-plane port (default: 19666).
+                - distributed_auth_token: Shared secret required for control RPC.
                 - enable_prefix_caching: Enable prefix caching optimization
                 - kv_cache_dtype: Dtype for KV cache (None = auto)
                 - decoding_engine: "ring" or "triton" (default: auto)
+                - tool_parser: Name of tool-call parser for automatic function-call
+                  extraction (e.g., "hermes", "mistral", "llama3_json").
+                  See ``ToolParserManager`` for available parsers.
+                - reasoning_parser: Name of reasoning parser for extracting
+                  chain-of-thought content (e.g., "deepseek_r1", "qwen3", "mistral").
+                  See ``ReasoningParserManager`` for available parsers.
+                - extra_stops: Global stop strings (e.g., ["<|user|>"]) merged
+                  into request SamplingParams.stop at runtime.
 
         Returns:
             Self for method chaining
@@ -583,6 +663,12 @@ class eLargeModel:
         esurge["max_num_seqs"] = max_num_seqs
         esurge["hbm_utilization"] = hbm_utilization
         esurge.update(kwargs)
+        if bind_graphstate_for_aot is not _ESURGE_UNSET:
+            esurge["bind_graphstate_for_aot"] = bool(bind_graphstate_for_aot)
+        if tool_parser is not _ESURGE_UNSET:
+            esurge["tool_parser"] = tool_parser
+        if reasoning_parser is not _ESURGE_UNSET:
+            esurge["reasoning_parser"] = reasoning_parser
         return self
 
     def set_mixture(
@@ -795,18 +881,51 @@ class eLargeModel:
         save_elm_config(self._config, json_path)
 
     def to_yaml(self, yaml_path: str | os.PathLike | ePathLike) -> None:
-        """Save configuration to a YAML file."""
+        """Save configuration to a YAML file.
+
+        Exports the current configuration to a YAML file that can be loaded
+        later with from_yaml() or shared with others. The YAML format is often
+        more human-readable than JSON for complex configurations.
+
+        Args:
+            yaml_path: Path where the YAML configuration file will be saved.
+                Will create parent directories if they don't exist.
+
+        Raises:
+            ImportError: If PyYAML is not installed.
+            TypeError: If any configuration value is not YAML serializable.
+
+        Example:
+            >>> elm.to_yaml("config.yaml")
+            >>> # Later or on another machine:
+            >>> elm2 = eLargeModel.from_yaml("config.yaml")
+        """
         try:
             import yaml  # type: ignore
         except ImportError as e:
             raise ImportError("PyYAML is required for YAML configs. Install with: pip install pyyaml") from e
 
         def to_yamlable(obj: Any) -> Any:
-            if obj is None or isinstance(obj, str | int | float | bool):
+            """Convert an object to a YAML-serializable form.
+
+            Recursively processes the object, converting dicts, lists, enums,
+            PathLike objects, and objects with to_dict() methods into basic
+            Python types that can be serialized to YAML.
+
+            Args:
+                obj: Any Python object to convert.
+
+            Returns:
+                A YAML-serializable representation of the object.
+
+            Raises:
+                TypeError: If the object cannot be converted to a YAML-serializable form.
+            """
+            if obj is None or isinstance(obj, (str, int, float, bool)):
                 return obj
             if isinstance(obj, dict):
                 return {str(k): to_yamlable(v) for k, v in obj.items()}
-            if isinstance(obj, list | tuple | set):
+            if isinstance(obj, (list, tuple, set)):
                 return [to_yamlable(v) for v in obj]
             if hasattr(obj, "to_dict") and callable(obj.to_dict):
                 return to_yamlable(obj.to_dict())
@@ -1142,6 +1261,7 @@ class eLargeModel:
                 - "dpo": Direct Preference Optimization
                 - "orpo": Odds Ratio Preference Optimization
                 - "grpo": Group Relative Policy Optimization
+                - "sdpo": Self-Distillation Policy Optimization
                 - "reward": Reward model training
                 - "distillation": Knowledge distillation
                 - "base": Basic trainer for custom training loops
@@ -1336,10 +1456,12 @@ class eLargeModel:
             eval_dataset: Evaluation dataset for validation metrics.
             reference_model: Reference model for DPO/ORPO. If None, builds from
                 reference_model configuration if present.
-            reward_model: Reward model for GRPO. If None, builds from config.
+            reward_model: Reward model for GRPO/SDPO/PPO-style trainers.
+                If None, builds from config.
             teacher_model: Teacher model for distillation. If None, builds from
                 teacher_model configuration if present.
-            reward_funcs: Custom reward functions for GRPO. Alternative to reward_model.
+            reward_funcs: Custom reward functions for GRPO/SDPO/PPO-style trainers.
+                Alternative to reward_model.
             base_state_class: Custom EasyDeLState class for model state management.
             args_class: Custom TrainingArguments class. Auto-selected if None.
             trainer_class: Custom Trainer class. Auto-selected if None.
@@ -1458,15 +1580,33 @@ class eLargeModel:
             trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
             trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
 
-        elif trainer_type == "ppo":
+        elif trainer_type == "sdpo":
             if reward_funcs is None and reward_model is None:
                 reward_model = self.build_reward_model()
 
             resolved_reward = reward_funcs if reward_funcs is not None else reward_model
             if resolved_reward is None:
                 raise ValueError(
-                    "ppo training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
+                    "sdpo training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
                 )
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = resolved_reward
+            trainer_kwargs["feedback_func"] = kwargs.get("feedback_func", None)
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+
+        elif trainer_type == "ppo":
+            if reward_funcs is None and reward_model is None:
+                reward_model = self.build_reward_model()
+
+            resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if resolved_reward is None:
+                raise ValueError("ppo training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg).")
 
             trainer_kwargs["arguments"] = training_args
             trainer_kwargs["model"] = model
@@ -1561,7 +1701,13 @@ class eLargeModel:
 
         for key, value in kwargs.items():
             if key not in trainer_kwargs and value is not None:
-                if key not in ["data_collator", "formatting_func", "reward_processing_classes", "data_tokenize_fn"]:
+                if key not in [
+                    "data_collator",
+                    "formatting_func",
+                    "reward_processing_classes",
+                    "data_tokenize_fn",
+                    "feedback_func",
+                ]:
                     trainer_kwargs[key] = value
 
         return trainer_class(**trainer_kwargs)
@@ -1664,6 +1810,9 @@ class eLargeModel:
         max_new_tokens = eval_config.pop("max_new_tokens", 2048)
         temperature = eval_config.pop("temperature", 0.0)
         top_p = eval_config.pop("top_p", 0.95)
+        include_path = eval_config.pop("include_path", None)
+        include_defaults = bool(eval_config.pop("include_defaults", True))
+        task_manager = eval_config.pop("task_manager", None)
 
         eval_adapter = None
         engine_instance = None
@@ -1717,6 +1866,16 @@ class eLargeModel:
         if eval_adapter is None:
             raise RuntimeError("Failed to create evaluation adapter")
 
+        if task_manager is None and (include_path is not None or not include_defaults):
+            from lm_eval.tasks import TaskManager  # type:ignore
+
+            task_manager = TaskManager(
+                verbosity=eval_config.get("verbosity"),
+                include_path=include_path,
+                include_defaults=include_defaults,
+                metadata=eval_config.get("metadata"),
+            )
+
         try:
             logger.info(f"Starting evaluation on tasks: {tasks}")
             logger.info(f"Using {engine if isinstance(engine, str) else type(engine).__name__} engine")
@@ -1728,6 +1887,7 @@ class eLargeModel:
                 num_fewshot=num_fewshot,
                 batch_size=batch_size,
                 device="cpu",
+                task_manager=task_manager,
                 **eval_config,
             )
 
@@ -1740,7 +1900,7 @@ class eLargeModel:
             for task, metrics in results.get("results", {}).items():
                 logger.info(f"{task}:")
                 for metric, value in metrics.items():
-                    if isinstance(value, int | float):
+                    if isinstance(value, (int, float)):
                         logger.info(f"  {metric}: {value:.4f}" if isinstance(value, float) else f"  {metric}: {value}")
 
             return results
@@ -1779,7 +1939,14 @@ class eLargeModel:
         w = 53  # inner width (content area)
 
         def _fmt(val: Any) -> str:
-            """Format a value for display, handling enums and special types."""
+            """Format a value for display, handling enums and special types.
+
+            Args:
+                val: Any value to format for display.
+
+            Returns:
+                A string representation suitable for the configuration display.
+            """
             if val is None:
                 return "none"
             if hasattr(val, "value"):
@@ -1789,11 +1956,22 @@ class eLargeModel:
             return str(val)
 
         def _line(content: str) -> str:
-            """Create a padded line within the box."""
+            """Create a padded line within the box.
+
+            Args:
+                content: The text content to display in the line.
+
+            Returns:
+                A formatted line string with box-drawing characters.
+            """
             return f"║ {content:<{w}}║"
 
         def _sep() -> str:
-            """Create a separator line."""
+            """Create a separator line within the box.
+
+            Returns:
+                A horizontal separator line using box-drawing characters.
+            """
             return f"╟{'─' * (w + 1)}╢"
 
         lines = []
@@ -1835,7 +2013,7 @@ class eLargeModel:
         # Quantization
         quant = self._config.get("quantization", {})
         if quant.get("method"):
-            lines.append(_line(f"▸ quant: {quant['method']} (block:{quant.get('block_size', 128)})"))
+            lines.append(_line(f"▸ quant: {quant['method']} (group:{quant.get('group_size', 128)})"))
 
         # eSurge
         esurge = self._config.get("esurge", {})

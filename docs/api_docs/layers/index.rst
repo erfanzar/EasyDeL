@@ -4,14 +4,10 @@ easydel.layers package
 .. toctree::
    :maxdepth: 2
 
-   base_modules/index
-   caching/index
+   attention/index
+   embeddings/index
+   linears/index
    moe/index
-   operations/index
+   norms/index
    quantization/index
-   attention
-   attention_unified
-   decoder_base
-   linear
-   norms
-   rotary_embedding
+   rotary/index

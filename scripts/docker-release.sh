@@ -1,6 +1,6 @@
 #!/bin/bash
 # Convenience script to build and release Docker images using pre-commit
-# Usage: ./scripts/docker-release.sh [--push] [--hardware cpu|gpu|tpu|all]
+# Usage: ./scripts/docker-release.sh [--push] [--hardware cpu|cuda|tpu|all]
 
 # Pass all arguments to the docker-build-push script via environment variables
 export DOCKER_BUILD=1

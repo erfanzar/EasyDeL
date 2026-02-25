@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ Configs:
     - dpo.yaml: Direct Preference Optimization
     - orpo.yaml: Odds Ratio Preference Optimization
     - distillation.yaml: Knowledge Distillation
+    - sdpo.yaml: Self-Distillation Policy Optimization
 
 Usage:
     # Dry-run validation of all configs

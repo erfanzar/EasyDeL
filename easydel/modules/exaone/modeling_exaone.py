@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,13 +26,7 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule, BaseSequenceClassificationModule
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -42,8 +36,14 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.layers import ColumnParallelLinear, Embed, RMSNorm
+from easydel.layers.attention import UnifiedAttention
+from easydel.layers.linears._linear import RowParallelLinear
+from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
 
 from .exaone_configuration import ExaoneConfig
 
@@ -85,9 +85,18 @@ class ExaoneGatedMLP(nn.Module):
             precision=precision,
             kernel_init=nn.initializers.normal(),
         )
+
+        row_linear = functools.partial(
+            RowParallelLinear,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=nn.initializers.normal(),
+        )
         self.c_fc_0 = linear(config.hidden_size, config.intermediate_size, rngs=rngs)
         self.c_fc_1 = linear(config.hidden_size, config.intermediate_size, rngs=rngs)
-        self.c_proj = linear(config.intermediate_size, config.hidden_size, rngs=rngs)
+        self.c_proj = row_linear(config.intermediate_size, config.hidden_size, rngs=rngs)
         self.act_fn = ACT2FN[config.activation_function]
 
     def __call__(
@@ -454,7 +463,7 @@ class ExaoneModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.wte = nn.Embed(
+        self.wte = Embed(
             self.config.vocab_size,
             self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -465,17 +474,19 @@ class ExaoneModel(EasyDeLBaseModule):
 
         self.drop = nn.Dropout(self.config.embed_dropout, rngs=rngs)
 
-        self.h = [
-            ExaoneDecoderLayer(
-                config=config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_hidden_layers)
-        ]
+        self.h = nn.List(
+            [
+                ExaoneDecoderLayer(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_hidden_layers)
+            ]
+        )
         self.ln_f = RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.layer_norm_epsilon,

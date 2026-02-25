@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -77,8 +77,8 @@ class NashMDConfig(GRPOConfig):
         },
     )
 
-    def __post_init__(self, max_sequence_length: int | None):
-        super().__post_init__(max_sequence_length=max_sequence_length)
+    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+        super().__post_init__(max_sequence_length=max_sequence_length, quantization_block=quantization_block)
         if isinstance(self.mixture_coef, Sequence) and len(self.mixture_coef) == 1:
             self.mixture_coef = self.mixture_coef[0]
         if isinstance(self.beta, Sequence) and len(self.beta) == 1:

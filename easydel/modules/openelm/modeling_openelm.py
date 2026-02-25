@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,13 +25,7 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -41,8 +35,13 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, DecoderLayerOutput
+from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
+from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers.attention import UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule
 
 from .openelm_configuration import OpenELMConfig, make_divisible
 
@@ -630,7 +629,7 @@ class OpenELMModel(EasyDeLBaseModule):
         param_dtype (jnp.dtype): Data type for parameters.
         precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
         rngs (nn.Rngs): Random number generators.
-        token_embeddings (nn.Embed): Embedding layer for input tokens.
+        token_embeddings (Embed): Embedding layer for input tokens.
         layers (tp.List[OpenELMDecoderLayer]): List of decoder layers.
         norm (RMSNorm): Final layer normalization.
         gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
@@ -661,7 +660,7 @@ class OpenELMModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.token_embeddings = nn.Embed(
+        self.token_embeddings = Embed(
             config.vocab_size,
             config.model_dim,
             dtype=dtype,
@@ -669,17 +668,19 @@ class OpenELMModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
-            OpenELMDecoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                layer_idx=i,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_transformer_layers)
-        ]
+        self.layers = nn.List(
+            [
+                OpenELMDecoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    layer_idx=i,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_transformer_layers)
+            ]
+        )
         self.norm = RMSNorm(
             config.model_dim,
             dtype=self.dtype,

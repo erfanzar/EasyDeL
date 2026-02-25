@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,13 +23,13 @@ from eformer.paths import ePath
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.infra.base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
+from easydel.infra.base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict, is_remote_url
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
 from easydel.infra.factory import TaskType, registry
 from easydel.infra.mixins.bridge import TENSORSTORE_INDEX_NAME
-from easydel.layers.quantization import EasyDeLQuantizationConfig
+from easydel.layers import QuantizationConfig
 
 SAFETENSOR_INDEX_NAME = "tensorstore_index.json"
 MODEL_INDEX_NAME = "model_structure.json"
@@ -97,8 +97,8 @@ class BaseAutoEasyModel:
         config_kwargs: EasyDeLBaseConfigDict | None = None,
         auto_shard_model: bool = True,
         partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
-        quantize_tensors: bool = True,
+        quantization_config: QuantizationConfig | None = None,
+        apply_quantization: bool = False,
         verbose: bool = True,
         from_torch: bool | None = None,
         **kwargs,
@@ -122,7 +122,7 @@ class BaseAutoEasyModel:
             auto_shard_model: Whether to automatically shard the model parameters.
             partition_rules: Custom partition rules for parameter sharding.
             quantization_config: Quantization configuration. Pass None to disable.
-            quantize_tensors: Whether to quantize tensors during loading.
+            apply_quantization: Whether to apply module-level quantization.
             from_torch: Whether to load the model from transformers-pytorch.
             **kwargs: Additional keyword arguments.
 
@@ -158,7 +158,7 @@ class BaseAutoEasyModel:
                 auto_shard_model=auto_shard_model,
                 partition_rules=partition_rules,
                 quantization_config=quantization_config,
-                quantize_tensors=quantize_tensors,
+                apply_quantization=apply_quantization,
                 verbose=verbose,
                 **kwargs,
             )
@@ -181,7 +181,7 @@ class BaseAutoEasyModel:
                 auto_shard_model=auto_shard_model,
                 partition_rules=partition_rules,
                 quantization_config=quantization_config,
-                quantize_tensors=quantize_tensors,
+                apply_quantization=apply_quantization,
                 verbose=verbose,
                 **kwargs,
             )
@@ -204,8 +204,8 @@ class BaseAutoEasyModel:
         config_kwargs: EasyDeLBaseConfigDict | None = None,
         auto_shard_model: bool = True,
         partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
-        quantize_tensors: bool = True,
+        quantization_config: QuantizationConfig | None = None,
+        apply_quantization: bool = False,
         verbose: bool = True,
         **kwargs,
     ):
@@ -236,7 +236,7 @@ class BaseAutoEasyModel:
             partition_rules (tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]], optional): Custom partition rules.
                 Defaults to None.
             quantization_config: Quantization configuration. Pass None to disable.
-            quantize_tensors (bool): Whether to quantize tensors. Defaults to True.
+            apply_quantization (bool): Whether to apply module-level quantization. Defaults to False.
             verbose (bool): Enable verbose logging. Defaults to True.
             **kwargs: Additional keyword arguments passed to the underlying `EasyDeLBaseModule.from_pretrained`.
 
@@ -264,7 +264,7 @@ class BaseAutoEasyModel:
             auto_shard_model=auto_shard_model,
             partition_rules=partition_rules,
             quantization_config=quantization_config,
-            quantize_tensors=quantize_tensors,
+            apply_quantization=apply_quantization,
             verbose=verbose,
             **kwargs,
         )
@@ -287,8 +287,8 @@ class BaseAutoEasyModel:
         config_kwargs: EasyDeLBaseConfigDict | None = None,
         auto_shard_model: bool = True,
         partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
-        quantize_tensors: bool = True,
+        quantization_config: QuantizationConfig | None = None,
+        apply_quantization: bool = False,
         verbose: bool = True,
         **kwargs,
     ):
@@ -319,7 +319,7 @@ class BaseAutoEasyModel:
             partition_rules (tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]], optional): Custom partition rules.
                 Defaults to None.
             quantization_config: Quantization configuration. Pass None to disable.
-            quantize_tensors (bool): Whether to quantize tensors. Defaults to True.
+            apply_quantization (bool): Whether to apply module-level quantization. Defaults to False.
             verbose (bool): Enable verbose logging. Defaults to True.
             **kwargs: Additional keyword arguments passed to the underlying `EasyDeLBaseModule._from_torch_pretrained`.
 
@@ -347,7 +347,7 @@ class BaseAutoEasyModel:
             auto_shard_model=auto_shard_model,
             partition_rules=partition_rules,
             quantization_config=quantization_config,
-            quantize_tensors=quantize_tensors,
+            apply_quantization=apply_quantization,
             verbose=verbose,
             **kwargs,
         )
@@ -379,7 +379,6 @@ class BaseAutoEasyModel:
             bool: True if it's an EasyDeL checkpoint, False otherwise.
         """
         from transformers.utils import cached_file as _cached_file
-        from transformers.utils import is_remote_url as _is_remote_url
 
         proxies = None
         subfolder = ""
@@ -403,7 +402,7 @@ class BaseAutoEasyModel:
 
         elif (ePath(subfolder) / epath).is_file():
             ...
-        elif _is_remote_url(pretrained_model_name_or_path):
+        elif is_remote_url(pretrained_model_name_or_path):
             ...
         else:
             try:
@@ -498,7 +497,7 @@ class BaseAutoEasyState:
         config_kwargs: EasyDeLBaseConfigDict | None = None,
         auto_shard_model: bool = True,
         partition_rules: tuple[tuple[str, PartitionSpec], ...] | None = None,
-        quantization_config: EasyDeLQuantizationConfig | None = None,
+        quantization_config: QuantizationConfig | None = None,
         from_torch: bool | None = None,
         **kwargs,
     ) -> EasyDeLState:

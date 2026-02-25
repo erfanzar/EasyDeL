@@ -2,7 +2,7 @@
 # Mirrors tests/trainers/binary_classifier_optimization_trainer.py
 
 model:
-  name_or_path: Qwen/Qwen3-4B
+  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
 
 loader:
   dtype: bf16
@@ -15,8 +15,8 @@ sharding:
 
 base_config:
   values:
-    freq_max_position_embeddings: 2048
-    mask_max_position_embeddings: 2048
+    freq_max_position_embeddings: 512
+    mask_max_position_embeddings: 512
     attn_mechanism: auto
     attn_dtype: bf16
     gradient_checkpointing: ""
@@ -34,11 +34,11 @@ trainer:
   learning_rate: 1e-5
   num_train_epochs: 1
   total_batch_size: 4
-  gradient_accumulation_steps: 64
+  gradient_accumulation_steps: 2
   max_training_steps: 8
-  max_length: 2048
-  max_prompt_length: 1024
-  max_completion_length: 1024 
+  max_length: 512
+  max_prompt_length: 256
+  max_completion_length: 256
   save_steps: 1000
   save_total_limit: 1
   log_steps: 1

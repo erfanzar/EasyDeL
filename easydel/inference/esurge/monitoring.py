@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""eSurge Monitoring and Observability System."""
+"""eSurge Monitoring and Observability System.
+
+This module provides comprehensive monitoring capabilities for the eSurge engine,
+including Prometheus metrics export for production monitoring and a Rich-based
+console monitor for development and debugging.
+
+Classes:
+    PrometheusMetrics: Prometheus metrics exporter with standard metrics.
+    RichConsoleMonitor: Rich console-based live monitoring dashboard.
+    eSurgeMonitoringServer: Combined monitoring server for metrics and visualization.
+
+Functions:
+    start_monitoring_server: Start the global monitoring server.
+    start_console_monitor: Start the global console monitor.
+    stop_monitoring: Stop all monitoring services.
+
+Constants:
+    PROMETHEUS_AVAILABLE: Whether prometheus_client is installed.
+    RICH_AVAILABLE: Whether rich library is installed.
+
+Example:
+    >>> from easydel.inference.esurge.monitoring import (
+    ...     start_monitoring_server,
+    ...     stop_monitoring
+    ... )
+    >>>
+    >>> # Start monitoring with Prometheus endpoint
+    >>> server = start_monitoring_server(prometheus_port=8000)
+    >>> print("Metrics at http://localhost:8000/metrics")
+    >>>
+    >>> # Later, stop monitoring
+    >>> stop_monitoring()
+
+Note:
+    For production monitoring, use Prometheus with Grafana dashboards.
+    The console monitor is intended for development and debugging.
+"""
 
 from __future__ import annotations
 
@@ -43,13 +79,65 @@ from .metrics import MetricsCollector, get_metrics_collector
 
 
 class PrometheusMetrics:
-    """Prometheus metrics exporter for eSurge."""
+    """Prometheus metrics exporter for eSurge.
+
+    Provides standard Prometheus metrics for monitoring eSurge engine
+    performance, including request latency, throughput, scheduler stats,
+    and cache utilization.
+
+    Metrics exported:
+        - esurge_requests_total: Total request count by status
+        - esurge_request_duration_seconds: Request latency histogram
+        - esurge_time_to_first_token_seconds: TTFT histogram
+        - esurge_tokens_generated_total: Total tokens generated
+        - esurge_tokens_per_second: Current throughput gauge
+        - esurge_waiting_requests: Requests in queue
+        - esurge_running_requests: Active requests
+        - esurge_scheduled_tokens: Tokens in current batch
+        - esurge_preempted_requests_total: Preemption count
+        - esurge_schedule_duration_seconds: Scheduler latency
+        - esurge_model_execution_duration_seconds: Model forward pass time
+        - esurge_batch_size: Current batch size
+        - esurge_cache_pages_total: Total cache pages
+        - esurge_cache_pages_used: Used cache pages
+        - esurge_cache_hit_rate: Cache hit ratio
+
+    Attributes:
+        prefix: Prefix for all metric names.
+        requests_total: Counter for total requests by status.
+        request_duration: Histogram for request latency.
+        time_to_first_token: Histogram for TTFT.
+        tokens_generated_total: Counter for generated tokens.
+        tokens_per_second: Gauge for current throughput.
+        waiting_requests: Gauge for queue depth.
+        running_requests: Gauge for active requests.
+        scheduled_tokens: Gauge for batch token count.
+        preempted_requests_total: Counter for preemptions.
+        schedule_duration: Histogram for scheduler latency.
+        model_execution_duration: Histogram for model latency.
+        batch_size: Gauge for batch size.
+        cache_pages_total: Gauge for total cache pages.
+        cache_pages_used: Gauge for used cache pages.
+        cache_hit_rate: Gauge for cache hit ratio.
+        system_info: Info metric for system metadata.
+
+    Example:
+        >>> metrics = PrometheusMetrics(prefix="myapp_")
+        >>> metrics.tokens_per_second.set(150.0)
+        >>> metrics.requests_total.labels(status="completed").inc()
+
+    Raises:
+        ImportError: If prometheus_client is not installed.
+    """
 
     def __init__(self, prefix: str = "esurge_"):
         """Initialize Prometheus metrics.
 
         Args:
-            prefix: Prefix for all metric names
+            prefix: Prefix for all metric names. Defaults to "esurge_".
+
+        Raises:
+            ImportError: If prometheus_client is not available.
         """
         if not PROMETHEUS_AVAILABLE:
             raise ImportError("prometheus_client not available. Install with: pip install prometheus-client")
@@ -112,7 +200,17 @@ class PrometheusMetrics:
         self.system_info = Info(f"{prefix}system_info", "System information")
 
     def update_from_metrics_collector(self, collector: MetricsCollector) -> None:
-        """Update Prometheus metrics from the metrics collector."""
+        """Update Prometheus metrics from the metrics collector.
+
+        Fetches the latest metrics from the MetricsCollector and updates
+        all Prometheus gauges, counters, and histograms accordingly.
+
+        Args:
+            collector: MetricsCollector instance to read metrics from.
+
+        Note:
+            This method is thread-safe and acquires the collector's lock.
+        """
         system_metrics = collector.get_system_metrics()
 
         # Update system-level metrics
@@ -160,13 +258,40 @@ class PrometheusMetrics:
 
 
 class RichConsoleMonitor:
-    """Rich console-based live monitoring for eSurge."""
+    """Rich console-based live monitoring for eSurge.
+
+    Provides a terminal-based dashboard with real-time metrics display
+    using the Rich library. Shows system metrics, scheduler status,
+    model runner performance, cache utilization, and recent requests.
+
+    The monitor runs in a background thread and updates the display
+    at a configurable refresh rate.
+
+    Attributes:
+        console: Rich Console instance for rendering.
+        refresh_rate: Update interval in seconds.
+        running: Whether the monitor is currently running.
+        layout: Rich Layout for organizing the display.
+
+    Example:
+        >>> monitor = RichConsoleMonitor(refresh_rate=1.0)
+        >>> monitor.start()  # Blocks until Ctrl+C
+        >>> # Or run in background:
+        >>> monitor.running = True
+        >>> monitor._thread.start()
+
+    Raises:
+        ImportError: If rich library is not installed.
+    """
 
     def __init__(self, refresh_rate: float = 1.0):
         """Initialize console monitor.
 
         Args:
-            refresh_rate: Update rate in seconds
+            refresh_rate: Update rate in seconds. Defaults to 1.0.
+
+        Raises:
+            ImportError: If rich is not available.
         """
         if not RICH_AVAILABLE:
             raise ImportError("rich not available. Install with: pip install rich")
@@ -183,7 +308,14 @@ class RichConsoleMonitor:
         self.layout["main"].split_row(Layout(name="left"), Layout(name="right"))
 
     def _create_system_metrics_table(self, collector: MetricsCollector) -> Table:
-        """Create system metrics table."""
+        """Create system metrics table.
+
+        Args:
+            collector: MetricsCollector to read metrics from.
+
+        Returns:
+            Rich Table with system-level metrics.
+        """
         table = Table(title="System Metrics", show_header=True)
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="green")
@@ -201,7 +333,14 @@ class RichConsoleMonitor:
         return table
 
     def _create_scheduler_metrics_table(self, collector: MetricsCollector) -> Table:
-        """Create scheduler metrics table."""
+        """Create scheduler metrics table.
+
+        Args:
+            collector: MetricsCollector to read metrics from.
+
+        Returns:
+            Rich Table with scheduler statistics.
+        """
         table = Table(title="Scheduler Status", show_header=True)
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="yellow")
@@ -220,7 +359,14 @@ class RichConsoleMonitor:
         return table
 
     def _create_runner_metrics_table(self, collector: MetricsCollector) -> Table:
-        """Create runner metrics table."""
+        """Create runner metrics table.
+
+        Args:
+            collector: MetricsCollector to read metrics from.
+
+        Returns:
+            Rich Table with model runner performance.
+        """
         table = Table(title="Model Runner", show_header=True)
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="magenta")
@@ -238,7 +384,14 @@ class RichConsoleMonitor:
         return table
 
     def _create_cache_metrics_table(self, collector: MetricsCollector) -> Table:
-        """Create cache metrics table."""
+        """Create cache metrics table.
+
+        Args:
+            collector: MetricsCollector to read metrics from.
+
+        Returns:
+            Rich Table with cache utilization statistics.
+        """
         table = Table(title="Cache Status", show_header=True)
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="blue")
@@ -258,7 +411,14 @@ class RichConsoleMonitor:
         return table
 
     def _create_recent_requests_table(self, collector: MetricsCollector) -> Table:
-        """Create recent requests table."""
+        """Create recent requests table.
+
+        Args:
+            collector: MetricsCollector to read metrics from.
+
+        Returns:
+            Rich Table with the 5 most recent request summaries.
+        """
         table = Table(title="Recent Requests", show_header=True)
         table.add_column("Request ID", style="dim")
         table.add_column("Status", style="bold")
@@ -270,7 +430,7 @@ class RichConsoleMonitor:
             recent = list(collector.completed_requests)[-5:]  # Last 5 requests
 
             for req in recent:
-                status = "✓" if not req.error else "✗"
+                status = "v" if not req.error else "x"
                 status_style = "green" if not req.error else "red"
 
                 table.add_row(
@@ -284,15 +444,19 @@ class RichConsoleMonitor:
         return table
 
     def _update_layout(self) -> None:
-        """Update the layout with current metrics."""
+        """Update the layout with current metrics.
+
+        Fetches metrics from the global collector and rebuilds all
+        display tables.
+        """
         collector = get_metrics_collector()
         if not collector:
-            self.layout["header"].update(Panel("❌ No metrics collector initialized", style="red"))
+            self.layout["header"].update(Panel("No metrics collector initialized", style="red"))
             return
 
         # Header
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        self.layout["header"].update(Panel(f"🚀 eSurge Live Monitor - {timestamp}", style="bold blue"))
+        self.layout["header"].update(Panel(f"eSurge Live Monitor - {timestamp}", style="bold blue"))
 
         # Left column
         left_layout = Layout()
@@ -314,7 +478,11 @@ class RichConsoleMonitor:
         self.layout["footer"].update(Panel("Press Ctrl+C to stop monitoring", style="dim"))
 
     def start(self) -> None:
-        """Start the live console monitor."""
+        """Start the live console monitor.
+
+        Starts a background thread that continuously updates the display.
+        Blocks the main thread until Ctrl+C is pressed.
+        """
         if self.running:
             return
 
@@ -338,14 +506,37 @@ class RichConsoleMonitor:
             self.stop()
 
     def stop(self) -> None:
-        """Stop the console monitor."""
+        """Stop the console monitor.
+
+        Signals the background thread to stop and waits for it to finish.
+        """
         self.running = False
         if self._thread:
             self._thread.join(timeout=1.0)
 
 
 class eSurgeMonitoringServer:
-    """Monitoring server for Prometheus export and console monitoring."""
+    """Monitoring server for Prometheus export and console monitoring.
+
+    Provides a unified interface for starting Prometheus metrics export
+    and optionally a console-based monitoring display.
+
+    Attributes:
+        prometheus_port: Port for the Prometheus HTTP endpoint.
+        dashboard_port: Deprecated, kept for compatibility.
+        update_interval: Interval between metrics updates.
+        prometheus_metrics: PrometheusMetrics instance if available.
+        running: Whether the server is currently running.
+
+    Example:
+        >>> server = eSurgeMonitoringServer(
+        ...     prometheus_port=8000,
+        ...     update_interval=1.0
+        ... )
+        >>> server.start()
+        >>> # Metrics available at http://localhost:8000/metrics
+        >>> server.stop()
+    """
 
     def __init__(
         self,
@@ -375,7 +566,11 @@ class eSurgeMonitoringServer:
         self._update_thread: threading.Thread | None = None
 
     def _update_metrics_loop(self) -> None:
-        """Background thread to update Prometheus metrics."""
+        """Background thread to update Prometheus metrics.
+
+        Continuously polls the MetricsCollector and updates Prometheus
+        metrics at the configured interval.
+        """
         while self.running:
             try:
                 collector = get_metrics_collector()
@@ -387,7 +582,10 @@ class eSurgeMonitoringServer:
                 time.sleep(self.update_interval)
 
     def start_prometheus_server(self) -> None:
-        """Start Prometheus metrics server."""
+        """Start Prometheus metrics server.
+
+        Starts the HTTP server for Prometheus scraping on the configured port.
+        """
         if not PROMETHEUS_AVAILABLE:
             logging.warning("Prometheus client not available, skipping Prometheus server")
             return
@@ -397,7 +595,11 @@ class eSurgeMonitoringServer:
         logging.info(f"Metrics available at: http://localhost:{self.prometheus_port}/metrics")
 
     def start(self) -> None:
-        """Start the monitoring server."""
+        """Start the monitoring server.
+
+        Starts both the Prometheus HTTP server and the background
+        metrics update thread.
+        """
         if self.running:
             return
 
@@ -413,7 +615,10 @@ class eSurgeMonitoringServer:
         logging.info("eSurge monitoring server started")
 
     def stop(self) -> None:
-        """Stop the monitoring server."""
+        """Stop the monitoring server.
+
+        Signals the update thread to stop and waits for it to finish.
+        """
         self.running = False
         if self._update_thread:
             self._update_thread.join(timeout=1.0)
@@ -431,7 +636,23 @@ def start_monitoring_server(
     dashboard_port: int | None = None,
     update_interval: float = 1.0,
 ) -> eSurgeMonitoringServer:
-    """Start the global monitoring server."""
+    """Start the global monitoring server.
+
+    Creates and starts the monitoring server singleton. Subsequent calls
+    return the existing instance.
+
+    Args:
+        prometheus_port: Port for Prometheus metrics endpoint.
+        dashboard_port: Deprecated; retained for compatibility (ignored).
+        update_interval: Update interval in seconds.
+
+    Returns:
+        The eSurgeMonitoringServer instance.
+
+    Example:
+        >>> server = start_monitoring_server(prometheus_port=9090)
+        >>> print(f"Metrics at http://localhost:9090/metrics")
+    """
     global _monitoring_server
 
     if _monitoring_server is None:
@@ -446,7 +667,21 @@ def start_monitoring_server(
 
 
 def start_console_monitor(refresh_rate: float = 1.0) -> RichConsoleMonitor:
-    """Start the global console monitor."""
+    """Start the global console monitor.
+
+    Creates and starts the console monitor singleton. Subsequent calls
+    return the existing instance.
+
+    Args:
+        refresh_rate: Display refresh rate in seconds.
+
+    Returns:
+        The RichConsoleMonitor instance.
+
+    Example:
+        >>> monitor = start_console_monitor(refresh_rate=0.5)
+        >>> # Press Ctrl+C to stop
+    """
     global _console_monitor
 
     if _console_monitor is None:
@@ -457,7 +692,16 @@ def start_console_monitor(refresh_rate: float = 1.0) -> RichConsoleMonitor:
 
 
 def stop_monitoring() -> None:
-    """Stop all monitoring services."""
+    """Stop all monitoring services.
+
+    Stops both the monitoring server and console monitor if they are running,
+    and clears the global instances.
+
+    Example:
+        >>> start_monitoring_server()
+        >>> # ... do work ...
+        >>> stop_monitoring()  # Cleanup
+    """
     global _monitoring_server, _console_monitor
 
     if _monitoring_server:

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -101,9 +101,9 @@ class GFPOConfig(GRPOConfig):
         },
     )
 
-    def __post_init__(self, max_sequence_length: int | None):
+    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
         """Post initialization to validate GFPO-specific parameters."""
-        super().__post_init__(max_sequence_length=max_sequence_length)
+        super().__post_init__(max_sequence_length=max_sequence_length, quantization_block=quantization_block)
 
         if self.num_remains_in_group is not None:
             if self.num_remains_in_group < 2:

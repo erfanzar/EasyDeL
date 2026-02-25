@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ from typing import ClassVar
 
 import jax
 from eformer import common_types
+from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
@@ -27,6 +28,16 @@ from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
+from easydel.caching import (
+    HybridCache,
+    OperationsMetadata,
+    RaggedPagesCache,
+    RaggedPagesCacheView,
+    RaggedPagesMetadata,
+    TransformerCache,
+    TransformerCacheView,
+    TransformerMetadata,
+)
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
@@ -37,29 +48,20 @@ from easydel.infra.modeling_outputs import (
     MoeModelOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers.attention import FlexibleAttentionModule
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.caching import (
-    HybridCache,
-    OperationsMetadata,
-    RaggedPagesCache,
-    RaggedPagesCacheView,
-    RaggedPagesMetadata,
-    TransformerCache,
-    TransformerCacheView,
-    TransformerMetadata,
-)
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.moe import (
+from easydel.layers import (
     BaseMoeModule,
+    ColumnParallelLinear,
     ColumnParallelMoELinear,
+    Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    RMSNorm,
+    RowParallelLinear,
     RowParallelMoELinear,
 )
-from easydel.layers.norms import RMSNorm
-from easydel.layers.rotary_embedding import yarn_get_mscale
+from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
+from easydel.layers.rotary import yarn_get_mscale
+from easydel.modules._base import BaseCausalLMModule
 
 from .deepseek_configuration import DeepseekV2Config
 
@@ -323,51 +325,37 @@ class MoEGate(nn.Module):
         )
         self.dp = nn.Dropout(0, rngs=rngs)
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        kernel_spec = Replicated if self.config.use_expert_tensor_mode else ColumnWise
+        return {"kernel": kernel_spec}
+
     def __call__(
         self, hidden_states: Float[Array, "batch seq_len hidden_dim"]
     ) -> Float[Array, "batch seq_len hidden_dim"]:
-        """Compute expert routing weights for input tokens.
+        """Compute pre-softmax router logits for input tokens.
 
         Args:
             hidden_states: Input tensor [batch * seq_len, hidden_dim]
 
         Returns:
-            Top-k expert weights for each token [batch * seq_len, top_k]
+            Router logits for each token [batch * seq_len, n_routed_experts]
         """
-        seu, _ = hidden_states.shape
-        logits = jax.lax.batch_matmul(
-            hidden_states.astype(jnp.float32),
-            self.kernel.value.astype(jnp.float32),
-            precision=self.precision,
+        kernel = self.kernel.value.astype(jnp.float32)
+        if kernel.shape[0] == hidden_states.shape[-1]:
+            proj_kernel = kernel
+        elif kernel.shape[1] == hidden_states.shape[-1]:
+            proj_kernel = kernel.T
+        else:
+            raise ValueError(f"Unexpected gate kernel shape {kernel.shape} for hidden size {hidden_states.shape[-1]}.")
+
+        return checkpoint_name(
+            jnp.matmul(
+                hidden_states.astype(jnp.float32),
+                proj_kernel,
+                precision=self.precision,
+            ),
+            "moe_router_logits",
         )
-        if self.scoring_func == "softmax":
-            scores = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
-        else:
-            raise NotImplementedError(f"insupportable scoring function for MoE gating: {self.scoring_func}")
-
-        if self.topk_method == "gready":
-            topk_weight, _ = jax.lax.top_k(scores, k=self.top_k)
-        elif self.topk_method == "group_limited_greedy":
-            group_scores = scores.reshape(seu, self.n_group, -1).max(axis=-1)  # [n, n_group]
-            top_k_indices = lax.top_k(group_scores, self.topk_group)[1]  # [n, topk_group]
-
-            group_mask = jnp.zeros_like(group_scores)  # [n, n_group]
-            n_indices = jnp.arange(group_mask.shape[0])[:, None]
-            group_mask = group_mask.at[n_indices, top_k_indices].set(1)  # [n, n_group]
-
-            score_mask = jnp.repeat(group_mask[:, :, None], self.n_routed_experts // self.n_group, axis=2)
-            score_mask = score_mask.reshape(seu, -1)
-            masked_scores = jnp.where(score_mask, scores, 0.0)
-            topk_weight, _ = lax.top_k(masked_scores, self.top_k)
-        else:
-            raise ValueError()
-        if self.top_k > 1 and self.norm_topk_prob:
-            denominator = jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20
-            topk_weight = topk_weight / denominator
-        else:
-            topk_weight = topk_weight * self.routed_scaling_factor
-
-        return topk_weight
 
 
 class DeepseekV2MoE(BaseMoeModule):
@@ -438,6 +426,58 @@ class DeepseekV2MoE(BaseMoeModule):
                 intermediate_size=intermediate_size,
                 rngs=rngs,
             )
+        self.moe_hooks = self.moe_hooks.replace(
+            normalize_gate_logits=lambda x: x,
+            select_hook=functools.partial(
+                self._select_experts_static,
+                topk_method=config.topk_method,
+                n_group=config.n_group,
+                topk_group=config.topk_group,
+                n_routed_experts=config.n_routed_experts,
+                norm_topk_prob=config.norm_topk_prob,
+                routed_scaling_factor=config.routed_scaling_factor,
+            ),
+        )
+
+    @staticmethod
+    def _select_experts_static(
+        gate_logits: Array,
+        pre_bias_logits: Array | None,
+        k: int,
+        *,
+        topk_method: str,
+        n_group: int,
+        topk_group: int,
+        n_routed_experts: int,
+        norm_topk_prob: bool,
+        routed_scaling_factor: float,
+    ) -> tuple[Array, Array]:
+        del pre_bias_logits
+        scores = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1)
+
+        if topk_method in {"gready", "greedy"}:
+            topk_weight, topk_idx = jax.lax.top_k(scores, k=k)
+        elif topk_method == "group_limited_greedy":
+            token_count = scores.shape[0]
+            group_scores = scores.reshape(token_count, n_group, n_routed_experts // n_group).max(axis=-1)
+            selected_groups = lax.top_k(group_scores, min(topk_group, n_group))[1]
+
+            group_mask = jnp.zeros_like(group_scores)
+            row_idx = jnp.arange(token_count)[:, None]
+            group_mask = group_mask.at[row_idx, selected_groups].set(1.0)
+
+            score_mask = jnp.repeat(group_mask[:, :, None], n_routed_experts // n_group, axis=2).reshape(token_count, -1)
+            masked_scores = jnp.where(score_mask > 0, scores, 0.0)
+            topk_weight, topk_idx = lax.top_k(masked_scores, k=k)
+        else:
+            raise ValueError(f"Unsupported top-k method: {topk_method}")
+
+        if k > 1 and norm_topk_prob:
+            denominator = jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20
+            topk_weight = topk_weight / denominator
+
+        topk_weight = topk_weight * routed_scaling_factor
+        return topk_weight, topk_idx
 
     def __call__(self, hidden_states: Array):
         """Process tokens through MoE experts with routing.
@@ -899,13 +939,7 @@ class DeepseekV2Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             self.config.vocab_size,
             self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -914,17 +948,19 @@ class DeepseekV2Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
-            DeepseekV2DecoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                layer_idx=i,
-                rngs=rngs,
-            )
-            for i in range(self.config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                DeepseekV2DecoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    layer_idx=i,
+                    rngs=rngs,
+                )
+                for i in range(self.config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -1255,7 +1291,7 @@ class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config
         Returns:
             TransformerCacheConfig: Configuration object for MLA-compatible transformer cache.
         """
-        from easydel.layers.caching import TransformerCacheConfig
+        from easydel.caching import TransformerCacheConfig
 
         config = self.config
 
@@ -1298,8 +1334,8 @@ class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config
         Returns:
             RaggedPagesCacheConfig: Configuration object for MLA-compatible paged cache.
         """
+        from easydel.caching import RaggedPagesCacheConfig
         from easydel.layers.attention import AttentionMechanisms
-        from easydel.layers.caching import RaggedPagesCacheConfig
 
         config = self.config
         text_config = config.get_text_config()

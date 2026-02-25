@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Jamba tool parser for tool calls with XML-style tokens.
+
+This module provides a tool call parser designed for Jamba models that
+generate tool calls wrapped in <tool_calls> and </tool_calls> tokens.
+The parser handles JSON arrays of function calls within these delimiters.
+
+Example format:
+    <tool_calls>[{"name": "func", "arguments": {...}}]</tool_calls>
+
+Features:
+    - Token-based boundary detection
+    - JSON array parsing with regex fallback
+    - Streaming with partial JSON support
+    - Automatic special token configuration
+    - Validates tokenizer compatibility (rejects MistralTokenizer)
+"""
+
 from __future__ import annotations
 
 import json
@@ -44,24 +62,48 @@ logger = get_logger(__name__)
 
 @ToolParserManager.register_module("jamba")
 class JambaToolParser(ToolParser):
-    """
-    Tool parser for Jamba models.
+    """Tool parser for Jamba models.
 
     Handles tool calls wrapped in <tool_calls> and </tool_calls> tokens.
     Validates tokenizer compatibility (not Mistral) and parses JSON arrays
     of function calls.
 
     Features:
-    - Token-based boundary detection
-    - JSON array parsing with regex fallback
-    - Streaming with partial JSON support
-    - Automatic special token configuration
+        - Token-based boundary detection
+        - JSON array parsing with regex fallback
+        - Streaming with partial JSON support
+        - Automatic special token configuration
 
     Format:
-    <tool_calls>[{"name": "func", "arguments": {...}}]</tool_calls>
+        <tool_calls>[{"name": "func", "arguments": {...}}]</tool_calls>
+
+    Attributes:
+        tool_calls_start_token: The opening token for tool calls section.
+        tool_calls_end_token: The closing token for tool calls section.
+        tool_calls_regex: Compiled regex for extracting tool call content.
+        tool_calls_start_token_id: Token ID for the start token.
+        tool_calls_end_token_id: Token ID for the end token.
+
+    Raises:
+        ValueError: If a MistralTokenizer is detected or tokenizer is None.
+        RuntimeError: If start/end tokens cannot be found in vocabulary.
     """
 
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize the JambaToolParser.
+
+        Sets up the parser with tool call tokens and validates the tokenizer
+        is compatible (not a MistralTokenizer).
+
+        Args:
+            tokenizer: The tokenizer associated with the Jamba model.
+                Must not be a MistralTokenizer.
+
+        Raises:
+            ValueError: If tokenizer is a MistralTokenizer or is None.
+            RuntimeError: If tool call start/end tokens are not found
+                in the tokenizer vocabulary.
+        """
         super().__init__(tokenizer)
         from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 
@@ -86,11 +128,41 @@ class JambaToolParser(ToolParser):
             raise RuntimeError("Jamba Tool parser could not locate tool calls start/end tokens in the tokenizer!")
 
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
+        """Adjust the request settings for Jamba tool parsing.
+
+        Modifies the request to ensure special tokens are not skipped
+        when tools are enabled, as the tool_calls tokens are required
+        for proper tool call detection.
+
+        Args:
+            request: The chat completion request to adjust.
+
+        Returns:
+            The modified request with skip_special_tokens set to False
+            when tools are enabled and tool_choice is not 'none'.
+        """
         if request.tools and request.tool_choice != "none":
             request.skip_special_tokens = False
         return request
 
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
+        """Extract tool calls from a complete model response.
+
+        Parses the model output to identify and extract tool calls wrapped
+        in <tool_calls> and </tool_calls> tokens. Expects a JSON array
+        of tool call objects within the delimiters.
+
+        Args:
+            model_output: The complete text output from the model.
+            request: The chat completion request for context.
+
+        Returns:
+            ExtractedToolCallInformation containing:
+                - tools_called: True if valid tool calls were found
+                - tool_calls: List of ToolCall objects extracted
+                - content: Text content before the tool calls, or full
+                    content if no tools were called
+        """
         if self.tool_calls_start_token not in model_output:
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
@@ -131,6 +203,28 @@ class JambaToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        """Extract tool calls incrementally during streaming.
+
+        Processes streaming output token by token, parsing partial JSON
+        to extract tool call information as it becomes available. Handles
+        multi-tool scenarios and tracks argument deltas.
+
+        Args:
+            previous_text: Text accumulated before this delta.
+            current_text: Complete text including the current delta.
+            delta_text: The new text added in this streaming chunk.
+            previous_token_ids: Token IDs before this delta.
+            current_token_ids: All token IDs including current delta.
+            delta_token_ids: Token IDs in the current delta.
+            request: The chat completion request for context.
+
+        Returns:
+            DeltaMessage containing either:
+                - content: Regular text content if no tool call detected
+                - tool_calls: Tool call deltas if parsing tool calls
+            Returns None if more tokens are needed or if the start token
+            is the only content in the delta.
+        """
         if self.tool_calls_start_token not in current_text:
             return DeltaMessage(content=delta_text)
 

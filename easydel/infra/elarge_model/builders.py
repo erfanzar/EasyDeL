@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,11 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 """Builder functions for creating models and inference engines from ELM configurations.
 
 This module provides high-level functions to build EasyDeL models and eSurge inference
-engines from ELM configuration dictionaries.
+engines from ELM (EasyDeL Large Model) configuration dictionaries. It serves as the
+primary interface for instantiating models, inference engines, and data pipelines
+from declarative configuration files.
+
+The module supports:
+    - Building EasyDeL models for various tasks (CausalLM, Seq2Seq, Vision-Language, etc.)
+    - Creating eSurge inference engines with optimized serving configurations
+    - Constructing data pipelines with dataset mixing, tokenization, and packing
+    - Converting ELM configurations to kwargs for downstream APIs
+
+Key Functions:
+    - build_model: Creates an EasyDeL model from configuration
+    - build_esurge: Creates an eSurge inference engine
+    - build_dataset: Creates a dataset from mixture configuration
+    - build_tokenized_dataset: End-to-end dataset tokenization pipeline
+    - build_sharded_source: Creates efficient ShardedDataSource for streaming
+
+Example:
+    >>> from easydel.infra.elarge_model import builders
+    >>> cfg = {
+    ...     "model": {"name_or_path": "meta-llama/Llama-2-7b", "task": "causal_lm"},
+    ...     "loader": {"dtype": "bf16"},
+    ...     "esurge": {"max_model_len": 4096}
+    ... }
+    >>> model = builders.build_model(cfg)
+    >>> engine = builders.build_esurge(cfg, model=model)
 """
 
 from __future__ import annotations
@@ -37,7 +61,7 @@ from eformer.common_types import NOT_GIVEN
 from easydel.inference.esurge.esurge_engine import DEFAULT_DETOKENIZER_MAX_STATES
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType
-from easydel.layers.quantization.quantizers import EasyDeLQuantizationConfig
+from easydel.layers.quantization._quants import QuantizationConfig
 from easydel.modules.auto import (
     AutoEasyDeLAnyToAnyModel,
     AutoEasyDeLModel,
@@ -58,23 +82,45 @@ from .utils import coerce_dtype, coerce_precision
 def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     """Convert ELM configuration to kwargs for model.from_pretrained() calls.
 
-    Extracts and transforms configuration values from various sections into
-    the format expected by EasyDeL's from_pretrained methods.
+    Extracts and transforms configuration values from various sections of an ELM
+    configuration dictionary into the format expected by EasyDeL's from_pretrained
+    methods. This function handles the conversion of loader settings, sharding
+    configurations, platform options, and quantization parameters.
+
+    The function processes the following configuration sections:
+        - model: Model identifier and extra kwargs
+        - loader: Device, dtype, precision settings
+        - sharding: Axis dimensions, partition rules, auto-sharding
+        - platform: Backend and platform specifications
+        - quantization: Model quantization configuration
 
     Args:
-        cfg_like: ELM configuration dictionary or mapping
+        cfg_like: ELM configuration dictionary or any mapping-like object containing
+            the model, loader, sharding, platform, and quantization sections.
+            Will be normalized before processing.
 
     Returns:
-        Dictionary of keyword arguments for from_pretrained() methods
+        Dictionary of keyword arguments suitable for passing to
+        AutoEasyDeLModel*.from_pretrained() methods. Contains keys such as:
+            - pretrained_model_name_or_path: Model identifier
+            - device: Target device
+            - dtype: Model data type
+            - sharding_axis_dims: Tuple of axis dimensions
+            - quantization_config: Optional QuantizationConfig instance
+            - And other model loading parameters
 
     Example:
         >>> cfg = {
         ...     "model": {"name_or_path": "meta-llama/Llama-2-7b"},
-        ...     "loader": {"dtype": "bf16"},
+        ...     "loader": {"dtype": "bf16", "from_torch": True},
         ...     "sharding": {"axis_dims": (1, 1, 1, -1, 1)}
         ... }
         >>> kwargs = to_from_pretrained_kwargs(cfg)
         >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(**kwargs)
+
+    Note:
+        The function automatically removes certain keys from config_kwargs
+        (partition_axis, backend, platform) as they are handled separately.
     """
     cfg = normalize(cfg_like)
     model = cfg["model"]
@@ -90,7 +136,7 @@ def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[s
     config_kwargs.pop("platform", None)
     quant_model = quant.get("model")
     if quant_model is not None:
-        quant_model = EasyDeLQuantizationConfig(**quant_model)
+        quant_model = QuantizationConfig(**quant_model)
     return dict(
         pretrained_model_name_or_path=model["name_or_path"],
         device=loader.get("device"),
@@ -108,7 +154,7 @@ def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[s
         auto_shard_model=bool(sharding.get("auto_shard_model", True)),
         partition_rules=sharding.get("partition_rules"),
         quantization_config=quant_model,
-        quantize_tensors=bool(quant.get("quantize_tensors", False)),
+        apply_quantization=bool(quant.get("apply_quantization", False)),
         verbose=bool(loader.get("verbose", True)),
         from_torch=loader.get("from_torch"),
         trust_remote_code=loader.get("trust_remote_code", False),
@@ -120,21 +166,45 @@ def build_model(cfg_like: ELMConfig | Mapping[str, Any]) -> EasyDeLBaseModule:
     """Build an EasyDeL model from ELM configuration.
 
     Automatically selects the appropriate model class based on the task type
-    specified in the configuration.
+    specified in the configuration and loads the model with all specified
+    settings (sharding, quantization, dtype, etc.).
+
+    Supported task types:
+        - CAUSAL_LM: Decoder-only language models (e.g., LLaMA, GPT)
+        - SEQUENCE_TO_SEQUENCE: Encoder-decoder models (e.g., T5, BART)
+        - SPEECH_SEQUENCE_TO_SEQUENCE: Speech-to-text models (e.g., Whisper)
+        - IMAGE_TEXT_TO_TEXT: Vision-language models (e.g., LLaVA)
+        - ZERO_SHOT_IMAGE_CLASSIFICATION: Image classification models (e.g., CLIP)
+        - DIFFUSION_LM: Diffusion-based models
+        - SEQUENCE_CLASSIFICATION: Text classification models
+        - ANY_TO_ANY: Multimodal models with flexible I/O
+        - BASE: Base model without task-specific head
 
     Args:
-        cfg_like: ELM configuration dictionary or mapping
+        cfg_like: ELM configuration dictionary or mapping containing at minimum
+            a 'model' section with 'name_or_path'. The 'task' field determines
+            which Auto class is used for loading.
 
     Returns:
-        EasyDeLBaseModule: The loaded model instance
+        The loaded EasyDeL model instance, typed as EasyDeLBaseModule but
+        actually an instance of the task-specific model class.
 
     Example:
         >>> cfg = {
-        ...     "model": {"name_or_path": "meta-llama/Llama-2-7b", "task": "causal_lm"},
-        ...     "loader": {"dtype": "bf16"}
+        ...     "model": {
+        ...         "name_or_path": "meta-llama/Llama-2-7b-hf",
+        ...         "task": "causal_lm"
+        ...     },
+        ...     "loader": {"dtype": "bf16"},
+        ...     "sharding": {"axis_dims": (1, 1, 1, -1, 1)}
         ... }
         >>> model = build_model(cfg)
-        >>>
+        >>> print(type(model).__name__)
+        'LlamaForCausalLM'
+
+    See Also:
+        to_from_pretrained_kwargs: For details on configuration processing.
+        resolve_task: For task type resolution logic.
     """
     kw = to_from_pretrained_kwargs(cfg_like)
     task = resolve_task(normalize(cfg_like))
@@ -160,23 +230,51 @@ def build_model(cfg_like: ELMConfig | Mapping[str, Any]) -> EasyDeLBaseModule:
 def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     """Convert ELM configuration to kwargs for eSurge initialization.
 
-    Extracts eSurge-specific configuration values and infers defaults from
-    base configuration when needed.
+    Extracts eSurge-specific configuration values from the 'esurge' section
+    and infers defaults from base configuration when needed. This function
+    handles all eSurge engine parameters including memory management,
+    batching, caching, and execution settings.
+
+    The function processes numerous eSurge parameters with sensible defaults:
+        - Memory: hbm_utilization, page_size
+        - Batching: max_num_seqs, max_num_batched_tokens, min_input_pad
+        - Caching: enable_prefix_caching, destroy_pages_on_pause
+        - Execution: compile_runner, overlap_execution, use_aot_forward,
+          bind_graphstate_for_aot
+        - Truncation: auto_truncate_prompt, truncate_mode, strict_context
+        - Tokenization: detokenizer_max_states, extra_eos_token_ids, extra_stops
+        - Parsing: tool_parser, reasoning_parser
 
     Args:
-        cfg_like: ELM configuration dictionary or mapping
+        cfg_like: ELM configuration dictionary or mapping. The function
+            primarily uses the 'esurge' section but also reads from
+            'base_config.values' for selected defaults (for example
+            max_model_len).
 
     Returns:
-        Dictionary of keyword arguments for eSurge initialization
+        Dictionary of keyword arguments for eSurge initialization containing
+        all engine configuration parameters. See eSurge documentation for
+        complete parameter descriptions.
 
     Example:
         >>> cfg = {
         ...     "model": {"name_or_path": "meta-llama/Llama-2-7b"},
-        ...     "esurge": {"max_model_len": 4096, "max_num_seqs": 32}
+        ...     "esurge": {
+        ...         "max_model_len": 4096,
+        ...         "max_num_seqs": 32,
+        ...         "hbm_utilization": 0.9,
+        ...         "enable_prefix_caching": True
+        ...     }
         ... }
         >>> kwargs = to_esurge_kwargs(cfg)
         >>> kwargs["max_model_len"]
         4096
+        >>> kwargs["enable_prefix_caching"]
+        True
+
+    Note:
+        max_model_len is inferred from base_config values (mask_max_position_embeddings
+        or freq_max_position_embeddings) if not explicitly specified, defaulting to 8192.
     """
     cfg = normalize(cfg_like)
     es = cfg.get("esurge", {})
@@ -194,6 +292,7 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     page_size_val = es.get("page_size")
     hbm_utilization_val = es.get("hbm_utilization")
     use_aot_forward_val = es.get("use_aot_forward")
+    bind_graphstate_for_aot_val = es.get("bind_graphstate_for_aot")
     enable_prefix_caching_val = es.get("enable_prefix_caching")
     auto_shard_model_val = es.get("auto_shard_model")
     compile_runner_val = es.get("compile_runner")
@@ -206,6 +305,18 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     decode_truncated_prompt_val = es.get("decode_truncated_prompt")
     destroy_pages_on_pause_val = es.get("destroy_pages_on_pause")
     silent_mode_val = es.get("silent_mode")
+    distributed_mode_val = es.get("distributed_mode")
+    distributed_role_val = es.get("distributed_role")
+    distributed_service_name_val = es.get("distributed_service_name")
+    distributed_world_size_val = es.get("distributed_world_size")
+    distributed_rank_val = es.get("distributed_rank")
+    distributed_control_port_val = es.get("distributed_control_port")
+    distributed_control_bind_host_val = es.get("distributed_control_bind_host")
+    distributed_advertise_addr_val = es.get("distributed_advertise_addr")
+    distributed_auth_token_val = es.get("distributed_auth_token")
+    distributed_step_timeout_s_val = es.get("distributed_step_timeout_s")
+    distributed_connect_timeout_s_val = es.get("distributed_connect_timeout_s")
+    distributed_verify_sampling_digest_val = es.get("distributed_verify_sampling_digest")
 
     sharding_axis_dims_val = es.get("sharding_axis_dims", (1, 1, 1, -1, 1))
     sharding_axis_dims = tuple(sharding_axis_dims_val) if sharding_axis_dims_val is not None else None
@@ -222,12 +333,27 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     if detokenizer_max_states is not None:
         detokenizer_max_states = int(detokenizer_max_states)
 
+    idle_reset_seconds = es.get("idle_reset_seconds")
+    if idle_reset_seconds is not None:
+        idle_reset_seconds = float(idle_reset_seconds)
+    idle_reset_min_interval = float(es.get("idle_reset_min_interval", 60.0))
+
     extra_eos_token_ids = es.get("extra_eos_token_ids")
     if extra_eos_token_ids is not None:
         extra_eos_token_ids = list(extra_eos_token_ids)
 
+    extra_stops = es.get("extra_stops")
+    if extra_stops is not None and not isinstance(extra_stops, str):
+        if isinstance(extra_stops, (list, tuple, set)):
+            extra_stops = list(extra_stops)
+        else:
+            extra_stops = [str(extra_stops)]
+
     runner_verbose = bool(es.get("runner_verbose", es.get("verbose", False)))
     truncate_mode = es.get("truncate_mode", "left")
+    data_parallelism_axis_val = es.get("data_parallelism_axis")
+    if data_parallelism_axis_val is None:
+        data_parallelism_axis_val = "dp"
 
     max_num_seq_buckets = None
     if max_num_seq_buckets_val is not None:
@@ -243,6 +369,7 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         hbm_utilization=float(hbm_utilization_val) if hbm_utilization_val is not None else 0.85,
         page_size=int(page_size_val) if page_size_val is not None else 128,
         use_aot_forward=True if use_aot_forward_val is None else bool(use_aot_forward_val),
+        bind_graphstate_for_aot=False if bind_graphstate_for_aot_val is None else bool(bind_graphstate_for_aot_val),
         enable_prefix_caching=True if enable_prefix_caching_val is None else bool(enable_prefix_caching_val),
         auto_shard_model=True if auto_shard_model_val is None else bool(auto_shard_model_val),
         sharding_axis_dims=sharding_axis_dims,
@@ -250,6 +377,7 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         runner_verbose=runner_verbose,
         overlap_execution=False if overlap_execution_val is None else bool(overlap_execution_val),
         sampler_metrics=False if sampler_metrics_val is None else bool(sampler_metrics_val),
+        data_parallelism_axis=str(data_parallelism_axis_val),
         esurge_name=es.get("esurge_name"),
         reserve_tokens=reserve_tokens,
         auto_truncate_prompt=True if auto_truncate_prompt_val is None else bool(auto_truncate_prompt_val),
@@ -260,36 +388,94 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         decode_truncated_prompt=True if decode_truncated_prompt_val is None else bool(decode_truncated_prompt_val),
         destroy_pages_on_pause=True if destroy_pages_on_pause_val is None else bool(destroy_pages_on_pause_val),
         detokenizer_max_states=detokenizer_max_states,
+        idle_reset_seconds=idle_reset_seconds,
+        idle_reset_min_interval=idle_reset_min_interval,
         tokenizer_endpoint=es.get("tokenizer_endpoint"),
         detokenizer_endpoint=es.get("detokenizer_endpoint"),
         sampling_params_callback=es.get("sampling_params_callback"),
         extra_eos_token_ids=extra_eos_token_ids,
+        extra_stops=extra_stops,
         silent_mode=False if silent_mode_val is None else bool(silent_mode_val),
+        tool_parser=es.get("tool_parser"),
+        reasoning_parser=es.get("reasoning_parser"),
+        distributed_mode=False if distributed_mode_val is None else bool(distributed_mode_val),
+        distributed_role="auto" if distributed_role_val is None else str(distributed_role_val),
+        distributed_service_name=distributed_service_name_val,
+        distributed_world_size=(
+            int(distributed_world_size_val) if distributed_world_size_val is not None else None
+        ),
+        distributed_rank=int(distributed_rank_val) if distributed_rank_val is not None else None,
+        distributed_control_port=(
+            int(distributed_control_port_val) if distributed_control_port_val is not None else 19666
+        ),
+        distributed_control_bind_host=(
+            "0.0.0.0" if distributed_control_bind_host_val is None else str(distributed_control_bind_host_val)
+        ),
+        distributed_advertise_addr=distributed_advertise_addr_val,
+        distributed_auth_token=distributed_auth_token_val,
+        distributed_step_timeout_s=(
+            30.0 if distributed_step_timeout_s_val is None else float(distributed_step_timeout_s_val)
+        ),
+        distributed_connect_timeout_s=(
+            15.0 if distributed_connect_timeout_s_val is None else float(distributed_connect_timeout_s_val)
+        ),
+        distributed_verify_sampling_digest=(
+            True
+            if distributed_verify_sampling_digest_val is None
+            else bool(distributed_verify_sampling_digest_val)
+        ),
     )
 
 
 def build_esurge(cfg_like: ELMConfig | Mapping[str, Any], model: EasyDeLBaseModule | None = None):
     """Build an eSurge inference engine from ELM configuration.
 
-    Creates an eSurge instance with the model, tokenizer, and inference
-    configuration specified in the ELM config.
+    Creates an eSurge instance with the model, tokenizer/processor, and inference
+    configuration specified in the ELM config. This is the primary entry point
+    for setting up high-performance inference serving.
+
+    The function handles:
+        - Model loading (if not provided)
+        - Processor/tokenizer loading with fallback logic for VLMs
+        - eSurge engine initialization with all configuration parameters
+
+    For vision-language models (VLMs), the function attempts to load a full
+    processor first, falling back to a tokenizer-only configuration if the
+    processor is unavailable.
 
     Args:
-        cfg_like: ELM configuration dictionary or mapping
+        cfg_like: ELM configuration dictionary or mapping containing model,
+            loader, and esurge sections.
+        model: Optional pre-loaded EasyDeL model. If None, the model will be
+            built using build_model(). Useful for reusing an already-loaded
+            model or for custom model initialization.
 
     Returns:
-        eSurge: Configured eSurge inference engine
+        eSurge: Configured eSurge inference engine ready for generation.
 
     Raises:
-        NotImplementedError: If the task type is not supported by eSurge
+        NotImplementedError: If the task type is not supported by eSurge.
+            Supported tasks are: CAUSAL_LM, IMAGE_TEXT_TO_TEXT, ANY_TO_ANY,
+            and VISION_LM.
 
     Example:
         >>> cfg = {
         ...     "model": {"name_or_path": "meta-llama/Llama-2-7b"},
-        ...     "esurge": {"max_model_len": 4096, "max_num_seqs": 32}
+        ...     "loader": {"dtype": "bf16"},
+        ...     "esurge": {
+        ...         "max_model_len": 4096,
+        ...         "max_num_seqs": 32,
+        ...         "enable_prefix_caching": True
+        ...     }
         ... }
         >>> engine = build_esurge(cfg)
-        >>>
+        >>> # Use with pre-loaded model
+        >>> model = build_model(cfg)
+        >>> engine = build_esurge(cfg, model=model)
+
+    See Also:
+        build_model: For model loading details.
+        to_esurge_kwargs: For eSurge parameter processing.
     """
     from transformers import AutoProcessor, AutoTokenizer
 
@@ -338,21 +524,42 @@ def build_esurge(cfg_like: ELMConfig | Mapping[str, Any], model: EasyDeLBaseModu
 def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     """Convert ELM configuration to kwargs for DatasetMixture creation.
 
-    Transforms the mixture configuration section into the format expected
-    by the DatasetMixture and DataManager classes. Supports all modern
-    features including token packing and block-deterministic mixing.
+    Transforms the 'mixture' configuration section into the format expected
+    by the DatasetMixture and DataManager classes. This function supports all
+    modern data loading features including token packing, block-deterministic
+    mixing, streaming, and cloud storage.
+
+    The function processes:
+        - Dataset informs (TextDatasetInform, VisualDatasetInform)
+        - Streaming and caching settings
+        - Token packing configuration
+        - Block mixture settings for deterministic mixing
+        - Shuffle and prefetch settings
 
     Args:
-        cfg_like: ELM configuration dictionary or mapping
+        cfg_like: ELM configuration dictionary or mapping containing a 'mixture'
+            section with dataset configurations.
 
     Returns:
-        Dictionary of keyword arguments for DatasetMixture initialization
+        Dictionary of keyword arguments for DatasetMixture initialization.
+        Returns an empty dict if no mixture configuration is present.
+        Contains keys such as:
+            - informs: List of TextDatasetInform/VisualDatasetInform
+            - cache_dir: Cache directory path
+            - streaming: Whether to use streaming mode
+            - batch_size: Batch size for iteration
+            - pack_tokens: Whether to enable token packing
+            - block_mixture: Whether to use block-deterministic mixing
 
     Example:
         >>> cfg = {
         ...     "mixture": {
         ...         "informs": [
-        ...             {"type": "json", "data_files": "train.json", "content_field": "text"}
+        ...             {
+        ...                 "type": "json",
+        ...                 "data_files": "train.json",
+        ...                 "content_field": "text"
+        ...             }
         ...         ],
         ...         "batch_size": 32,
         ...         "block_mixture": True,
@@ -362,6 +569,10 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
         ... }
         >>> kwargs = to_data_mixture_kwargs(cfg)
         >>> mixture = DatasetMixture(**kwargs)
+
+    Note:
+        Visual datasets are detected by the presence of a 'pixel_field' key
+        in the inform configuration.
     """
     from easydel.data import TextDatasetInform, VisualDatasetInform
 
@@ -482,27 +693,49 @@ def build_dataset(cfg_like: ELMConfig | Mapping[str, Any]) -> Dataset | Iterable
     """Build a dataset from ELM configuration with data mixture.
 
     Creates a unified dataset from the mixture configuration using the
-    new DatasetMixture.build() method. Supports all modern features including
-    token packing, block-deterministic mixing, and streaming.
+    DatasetMixture.build() method. This function supports all modern data
+    loading features including token packing, block-deterministic mixing,
+    streaming, and multiple data sources.
+
+    The function uses DatasetMixture internally, which handles:
+        - Loading from multiple data sources (JSON, Parquet, HuggingFace, etc.)
+        - Mixing datasets with optional weights
+        - Token packing for efficient training
+        - Streaming for large datasets
 
     Args:
-        cfg_like: ELM configuration dictionary or mapping
+        cfg_like: ELM configuration dictionary or mapping containing a 'mixture'
+            section with at least one inform configuration.
 
     Returns:
-        Dataset or IterableDataset: The loaded and processed dataset
+        The built dataset as either:
+            - Dataset: If streaming=False
+            - IterableDataset: If streaming=True
+            - None: If no mixture configuration is present
 
     Example:
         >>> cfg = {
         ...     "mixture": {
         ...         "informs": [
-        ...             {"type": "json", "data_files": "data.json", "content_field": "text"}
+        ...             {
+        ...                 "type": "json",
+        ...                 "data_files": "data.json",
+        ...                 "content_field": "text"
+        ...             }
         ...         ],
+        ...         "streaming": True,
         ...         "block_mixture": True,
         ...         "pack_tokens": True,
         ...         "pack_seq_length": 2048
         ...     }
         ... }
         >>> dataset = build_dataset(cfg)
+        >>> for batch in dataset:
+        ...     process(batch)
+
+    See Also:
+        to_data_mixture_kwargs: For configuration processing details.
+        build_sharded_source: For ShardedDataSource-based loading.
     """
     from easydel.data import DatasetMixture
 
@@ -535,29 +768,57 @@ def tokenize_dataset(
 ) -> Dataset | IterableDataset:
     """Tokenize a dataset using the provided tokenizer.
 
+    Applies tokenization to a HuggingFace Dataset or IterableDataset, converting
+    text fields to token IDs. Supports both batched and single-example processing
+    with configurable padding, truncation, and special token handling.
+
+    The function handles both streaming and non-streaming datasets appropriately,
+    using different map() parameters for each case.
+
     Args:
-        dataset: HuggingFace Dataset or IterableDataset to tokenize
-        tokenizer: HuggingFace tokenizer instance
-        text_field: Field name containing text to tokenize (default: "text")
-        output_field: Field name for tokenized output (default: "tokens")
-        max_length: Maximum sequence length (default: 2048)
-        truncation: Whether to truncate sequences (default: True)
-        padding: Padding strategy (default: False)
-        add_special_tokens: Add special tokens like BOS/EOS (default: True)
-        return_attention_mask: Return attention masks (default: True)
-        num_proc: Number of processes for parallel tokenization (default: None)
-        batched: Process examples in batches (default: True)
-        batch_size: Batch size for batched processing (default: 1000)
-        remove_columns: Columns to remove after tokenization (default: None)
-        keep_in_memory: Keep processed dataset in memory (default: False)
+        dataset: HuggingFace Dataset or IterableDataset to tokenize.
+        tokenizer: HuggingFace tokenizer instance (PreTrainedTokenizerBase).
+        text_field: Name of the field containing text to tokenize.
+            Defaults to "text".
+        output_field: Name of the field for tokenized output (input_ids).
+            Defaults to "tokens".
+        max_length: Maximum sequence length after tokenization.
+            Defaults to 2048.
+        truncation: Whether to truncate sequences exceeding max_length.
+            Defaults to True.
+        padding: Padding strategy. Can be False (no padding), True (pad to
+            max_length), or "max_length"/"longest". Defaults to False.
+        add_special_tokens: Whether to add special tokens (BOS, EOS, etc.).
+            Defaults to True.
+        return_attention_mask: Whether to return attention masks.
+            Defaults to True.
+        num_proc: Number of processes for parallel tokenization.
+            Only applies to non-streaming datasets. Defaults to None (single process).
+        batched: Whether to process examples in batches. Defaults to True.
+        batch_size: Batch size for batched processing. Defaults to 1000.
+        remove_columns: List of column names to remove after tokenization.
+            If None, removes all original columns. Defaults to None.
+        keep_in_memory: Whether to keep the processed dataset in memory.
+            Only applies to non-streaming datasets. Defaults to False.
 
     Returns:
-        Tokenized dataset with token IDs in the output_field
+        Tokenized dataset with token IDs in the output_field and optionally
+        attention_mask field. Same type as input (Dataset or IterableDataset).
 
     Example:
         >>> from transformers import AutoTokenizer
-        >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b")
-        >>> tokenized = tokenize_dataset(dataset, tokenizer, text_field="content")
+        >>> from datasets import load_dataset
+        >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+        >>> dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+        >>> tokenized = tokenize_dataset(
+        ...     dataset,
+        ...     tokenizer,
+        ...     text_field="text",
+        ...     max_length=2048,
+        ...     num_proc=4
+        ... )
+        >>> print(tokenized[0].keys())
+        dict_keys(['tokens', 'attention_mask'])
     """
     from easydel.data.utils import is_streaming
 
@@ -622,27 +883,60 @@ def save_dataset(
 ) -> str:
     """Save a dataset to disk or HuggingFace Hub.
 
+    Persists a HuggingFace Dataset to disk in various formats or pushes it to
+    the HuggingFace Hub. Handles streaming datasets by materializing them first.
+    Supports multiple output formats with configurable compression.
+
+    Supported formats:
+        - parquet: Columnar format, good for analytics (default)
+        - arrow: Apache Arrow format, fast for HuggingFace operations
+        - json/jsonl: JSON or JSON Lines format, human-readable
+
     Args:
-        dataset: HuggingFace Dataset to save
-        output_path: Path to save the dataset
-        format: Output format - "parquet", "arrow", "json", "jsonl" (default: "parquet")
-        num_shards: Number of shards (default: None, auto-detect)
-        compression: Compression algorithm (default: "snappy")
-        max_shard_size: Maximum shard size (default: "500MB")
-        overwrite: Whether to overwrite existing files (default: False)
-        push_to_hub: Push to HuggingFace Hub (default: False)
-        hub_repo_id: Hub repository ID (required if push_to_hub=True)
-        hub_private: Make Hub repo private (default: False)
-        hub_token: HuggingFace token (default: None)
+        dataset: HuggingFace Dataset or IterableDataset to save. Streaming
+            datasets will be materialized before saving.
+        output_path: Path to save the dataset. A directory will be created.
+        format: Output format - "parquet", "arrow", "json", or "jsonl".
+            Defaults to "parquet".
+        num_shards: Number of shards for arrow format. Defaults to None
+            (auto-detect based on dataset size).
+        compression: Compression algorithm for parquet format. Options include
+            "snappy", "gzip", "lz4", "zstd", or None. Defaults to "snappy".
+        max_shard_size: Maximum shard size for arrow format. Can be string
+            like "500MB" or integer bytes. Defaults to "500MB".
+        overwrite: Whether to overwrite existing files at output_path.
+            Defaults to False.
+        push_to_hub: Whether to push the dataset to HuggingFace Hub.
+            Defaults to False.
+        hub_repo_id: HuggingFace Hub repository ID (e.g., "username/dataset-name").
+            Required if push_to_hub=True.
+        hub_private: Whether to make the Hub repository private.
+            Defaults to False.
+        hub_token: HuggingFace API token for authentication. Uses cached
+            token if None. Defaults to None.
 
     Returns:
-        Path to saved dataset or Hub URL if pushed
+        Path to the saved dataset directory, or Hub URL if pushed to Hub
+        (e.g., "https://huggingface.co/datasets/username/dataset-name").
+
+    Raises:
+        FileExistsError: If output_path exists and overwrite=False.
+        ValueError: If format is not supported or hub_repo_id is missing
+            when push_to_hub=True.
 
     Example:
+        >>> # Save locally
         >>> save_dataset(tokenized_dataset, "output/tokenized", format="parquet")
-        >>> # Or push to hub
-        >>> save_dataset(tokenized_dataset, "output/tokenized",
-        ...              push_to_hub=True, hub_repo_id="username/my-dataset")
+        'output/tokenized'
+        >>> # Push to Hub
+        >>> url = save_dataset(
+        ...     tokenized_dataset,
+        ...     "output/tokenized",
+        ...     push_to_hub=True,
+        ...     hub_repo_id="myuser/my-tokenized-dataset"
+        ... )
+        >>> print(url)
+        'https://huggingface.co/datasets/myuser/my-tokenized-dataset'
     """
     import os
 
@@ -698,26 +992,45 @@ def build_tokenized_dataset(
 ) -> Dataset | IterableDataset | tuple[Dataset | IterableDataset, str]:
     """Build, tokenize, and optionally save a dataset from ELM configuration.
 
-    This is the main entry point for the tokenization pipeline. It:
-    1. Loads the dataset from the mixture configuration
-    2. Tokenizes using the specified tokenizer
-    3. Optionally saves to disk or HuggingFace Hub
+    This is the main entry point for the complete tokenization pipeline. It
+    orchestrates the full workflow of loading datasets from the mixture
+    configuration, applying tokenization with the specified tokenizer, and
+    optionally persisting the results to disk or HuggingFace Hub.
+
+    Pipeline steps:
+        1. Load the dataset from mixture configuration
+        2. Load the tokenizer (from config or model)
+        3. Apply tokenization with configured parameters
+        4. Optionally save to disk or push to Hub
 
     Args:
-        cfg_like: ELM configuration dictionary or mapping
-        save: Whether to save the tokenized dataset (default: True)
+        cfg_like: ELM configuration dictionary or mapping containing:
+            - model: Model configuration with name_or_path or tokenizer
+            - mixture: Dataset mixture configuration with:
+                - informs: List of dataset configurations
+                - tokenization: Tokenization parameters (optional)
+                - save: Save parameters (optional)
+        save: Whether to save the tokenized dataset. If True and save config
+            is present, the dataset will be saved. Defaults to True.
 
     Returns:
-        Tuple of (tokenized_dataset, save_path) if save=True, else tokenized_dataset
+        If save=True and save config is present:
+            Tuple of (tokenized_dataset, save_path)
+        Otherwise:
+            Just the tokenized_dataset
+
+    Raises:
+        ValueError: If mixture.informs is missing, tokenizer is not specified,
+            or save.output_path is missing when save=True.
 
     Example:
         >>> cfg = {
-        ...     "model": {"name_or_path": "meta-llama/Llama-2-7b"},
+        ...     "model": {"name_or_path": "meta-llama/Llama-2-7b-hf"},
         ...     "mixture": {
         ...         "informs": [
         ...             {"type": "json", "data_files": "data.json", "content_field": "text"}
         ...         ],
-        ...         "streaming": False,  # Must be False for saving
+        ...         "streaming": False,  # Required for saving
         ...         "tokenization": {
         ...             "max_length": 2048,
         ...             "text_field": "text",
@@ -726,11 +1039,23 @@ def build_tokenized_dataset(
         ...         },
         ...         "save": {
         ...             "output_path": "tokenized_data",
-        ...             "format": "parquet"
+        ...             "format": "parquet",
+        ...             "push_to_hub": True,
+        ...             "hub_repo_id": "myuser/tokenized-data"
         ...         }
         ...     }
         ... }
         >>> dataset, path = build_tokenized_dataset(cfg)
+
+    Note:
+        When save=True, streaming is automatically disabled to allow
+        dataset persistence. The function will override the streaming
+        setting in the configuration.
+
+    See Also:
+        build_dataset: For dataset loading without tokenization.
+        tokenize_dataset: For tokenization details.
+        save_dataset: For save format options.
     """
     from transformers import AutoTokenizer
 
@@ -814,26 +1139,40 @@ def build_tokenized_dataset(
 def _extract_dataset_name(inform_cfg: Mapping[str, Any], fallback_index: int = 0) -> str:
     """Extract a meaningful dataset name from inform configuration.
 
-    Uses the following priority:
-    1. Explicit 'name' field if provided
-    2. HuggingFace repo name from 'data_files' (e.g., "LDJnr/Puffin" -> "Puffin")
-    3. GCS/S3/cloud path - extract bucket or meaningful path segment
-    4. File/directory name from 'data_files' path
-    5. Fallback to "dataset_{index}"
+    Analyzes the inform configuration to derive a human-readable dataset name
+    for use in mixed dataset sources. Uses a priority-based approach to find
+    the most meaningful identifier.
+
+    Name extraction priority:
+        1. Explicit 'name' field if provided
+        2. HuggingFace repo name from 'data_files' (e.g., "LDJnr/Puffin" -> "Puffin")
+        3. Cloud path meaningful segment (gs://, s3://, az://, hf://)
+        4. File/directory name from local path
+        5. Fallback to "dataset_{index}"
 
     Args:
-        inform_cfg: Dataset inform configuration dictionary.
-        fallback_index: Index to use in fallback name.
+        inform_cfg: Dataset inform configuration dictionary containing at least
+            'data_files' or 'type' field.
+        fallback_index: Index to use in fallback name when no meaningful name
+            can be extracted. Defaults to 0.
 
     Returns:
-        Extracted dataset name string.
+        Extracted dataset name string suitable for use as a dictionary key
+        or display name.
 
     Examples:
-        - "LDJnr/Puffin" -> "Puffin"
-        - "gs://my-bucket/datasets/alpaca/*.parquet" -> "alpaca"
-        - "s3://bucket/data/train.json" -> "train"
-        - "/local/path/to/data.parquet" -> "data"
-        - "hf://datasets/tatsu-lab/alpaca" -> "alpaca"
+        >>> _extract_dataset_name({"data_files": "LDJnr/Puffin"})
+        'Puffin'
+        >>> _extract_dataset_name({"data_files": "gs://my-bucket/datasets/alpaca/*.parquet"})
+        'alpaca'
+        >>> _extract_dataset_name({"data_files": "s3://bucket/data/train.json"})
+        'train'
+        >>> _extract_dataset_name({"data_files": "/local/path/to/data.parquet"})
+        'data'
+        >>> _extract_dataset_name({"name": "my_dataset"})
+        'my_dataset'
+        >>> _extract_dataset_name({}, fallback_index=3)
+        'dataset_3'
     """
     import os
     import re
@@ -924,18 +1263,46 @@ def _create_source_from_inform(
 ) -> "ShardedDataSource":
     """Create a ShardedDataSource from an inform configuration.
 
-    Maps the inform config to the appropriate ShardedDataSource type
-    based on the dataset type (JSON, Parquet, Arrow, CSV, HF, etc.).
+    Maps the inform configuration to the appropriate ShardedDataSource subclass
+    based on the dataset type. Handles file expansion for glob patterns and
+    automatic type inference from file extensions.
+
+    Supported data source types:
+        - json/jsonl: JSON or JSON Lines files
+        - parquet: Apache Parquet files
+        - arrow: Apache Arrow files
+        - csv/tsv: CSV or TSV files
+        - txt/text: Plain text files (one document per line)
+        - huggingface/hf: HuggingFace datasets
 
     Args:
-        inform_cfg: Dataset inform configuration dictionary.
-        mixture_cfg: Parent mixture configuration dictionary.
+        inform_cfg: Dataset inform configuration dictionary containing:
+            - data_files: Path, glob pattern, or HuggingFace dataset ID
+            - type: Optional source type (inferred from extension if not provided)
+            - split: Dataset split to use (default: "train")
+            - dataset_split_name: HuggingFace subset/configuration name
+            - streaming: Whether to use streaming (for HuggingFace)
+        mixture_cfg: Parent mixture configuration dictionary for inheriting
+            global settings like cache_dir and streaming defaults.
 
     Returns:
-        ShardedDataSource: The created data source.
+        ShardedDataSource: The created data source appropriate for the file type.
+            One of: JsonShardedSource, ParquetShardedSource, ArrowShardedSource,
+            CsvShardedSource, TextShardedSource, or HuggingFaceShardedSource.
 
     Raises:
-        ValueError: If the dataset type is not supported.
+        ValueError: If data_files is missing, no files match the pattern,
+            or the dataset type is not supported.
+        TypeError: If data_files is not a string for HuggingFace datasets.
+        FileNotFoundError: If local files cannot be found (may fallback to
+            HuggingFace if type not specified).
+
+    Example:
+        >>> inform = {"type": "parquet", "data_files": "data/*.parquet"}
+        >>> mixture = {"cache_dir": "/tmp/cache"}
+        >>> source = _create_source_from_inform(inform, mixture)
+        >>> print(type(source).__name__)
+        'ParquetShardedSource'
     """
     from easydel.data.sources import (
         ArrowShardedSource,
@@ -1045,36 +1412,69 @@ def _create_source_from_inform(
 def build_sharded_source(cfg_like: ELMConfig | Mapping[str, Any]) -> "ShardedDataSource | None":
     """Build a ShardedDataSource from ELM configuration.
 
-    Uses the new ShardedDataSource architecture for efficient streaming
-    and lazy transforms. Supports mixing, packing, and field transforms.
+    Creates a unified ShardedDataSource using the new streaming-first architecture
+    for efficient data loading. This approach provides lazy transforms, efficient
+    memory usage, and deterministic mixing for distributed training.
 
-    This function creates a unified ShardedDataSource from the mixture
-    configuration, optionally applying:
-    - Field renaming via transforms
-    - Dataset mixing via MixedShardedSource
-    - Sequence packing via PackedShardedSource
+    The function supports:
+        - Multiple data sources with automatic mixing
+        - Field renaming via transforms
+        - Format callbacks for custom preprocessing
+        - Token packing for efficient sequence utilization
+        - Block-deterministic mixing for reproducibility
+
+    This is the recommended approach for large-scale training as it provides:
+        - Memory-efficient streaming without loading full datasets
+        - Shard-based parallelism for distributed data loading
+        - Lazy transforms applied on-the-fly
+        - Deterministic shuffling within and across shards
 
     Args:
-        cfg_like: ELM configuration dictionary or mapping containing
-            a 'mixture' section with dataset configurations.
+        cfg_like: ELM configuration dictionary or mapping containing a 'mixture'
+            section with dataset configurations. Key options include:
+            - informs: List of dataset configurations
+            - text_target_field: Target field name for text content
+            - mixture_weights: Optional weights for mixing sources
+            - mixture_block_size: Block size for deterministic mixing
+            - pack_tokens: Whether to enable token packing
+            - pack_seq_length: Target sequence length for packing
 
     Returns:
-        ShardedDataSource if mixture is configured, None otherwise.
+        ShardedDataSource if mixture is configured with at least one inform,
+        None otherwise. The returned source may be:
+            - A single source if only one inform
+            - MixedShardedSource if multiple informs
+            - PackedShardedSource wrapper if pack_tokens is enabled
 
     Example:
         >>> cfg = {
         ...     "mixture": {
         ...         "informs": [
-        ...             {"type": "json", "data_files": "data.json", "content_field": "text"}
+        ...             {
+        ...                 "type": "json",
+        ...                 "data_files": "data.json",
+        ...                 "content_field": "text"
+        ...             },
+        ...             {
+        ...                 "type": "hf",
+        ...                 "data_files": "tatsu-lab/alpaca",
+        ...                 "content_field": "text"
+        ...             }
         ...         ],
         ...         "use_sharded_source": True,
+        ...         "mixture_weights": [0.7, 0.3],
         ...         "pack_tokens": True,
         ...         "pack_seq_length": 2048
         ...     }
         ... }
         >>> source = build_sharded_source(cfg)
-        >>> for batch in source.open_shard(source.shard_names[0]):
-        ...     process(batch)
+        >>> for shard_name in source.shard_names[:2]:
+        ...     for batch in source.open_shard(shard_name):
+        ...         process(batch)
+
+    See Also:
+        build_dataset: For HuggingFace Dataset-based loading.
+        _create_source_from_inform: For individual source creation.
     """
     from easydel.data.transforms import (
         MapTransform,

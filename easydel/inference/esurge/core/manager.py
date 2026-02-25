@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Cache management for KV-cache allocation and prefix caching.
+
+This module provides the main CacheManager class that handles KV-cache
+allocation, deallocation, and prefix caching for efficient inference.
+It acts as the high-level interface between the scheduler and the underlying
+cache coordinator.
+
+Classes:
+    CachePages: Allocation result wrapper for cache pages.
+    CacheManager: Main cache management interface.
+
+Example:
+    >>> manager = CacheManager(
+    ...     num_pages=1000,
+    ...     kv_cache_groups=cache_groups,
+    ...     max_model_len=4096,
+    ...     enable_caching=True
+    ... )
+    >>> pages = manager.allocate_slots(request, num_new_tokens=10)
+    >>> manager.free(request)
+"""
+
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -23,40 +45,130 @@ from .utils import CachePage, PageHash, hash_request_tokens, init_none_hash
 
 @dataclass
 class CachePages:
-    """
-    The allocation result of CacheManager, work as the interface between
-    Scheduler and CacheManager, to hide CacheManager's internal data
-    structure from the Scheduler.
+    """Allocation result container for cache pages.
+
+    This dataclass wraps the allocation result from CacheManager, providing
+    an interface between the Scheduler and CacheManager to hide internal
+    data structures from the Scheduler.
+
+    Attributes:
+        pages: A tuple of lists where each list contains CachePage objects
+            for a specific KV cache group. The outer tuple corresponds to
+            different KV cache groups (e.g., full attention vs sliding window).
+
+    Example:
+        >>> cache_pages = manager.allocate_slots(request, num_new_tokens=10)
+        >>> page_ids = cache_pages.get_page_ids()
+        >>> print(page_ids)  # ((1, 2, 3), (4, 5, 6))
     """
 
     pages: tuple[list[CachePage], ...]
 
     def __add__(self, other: "CachePages") -> "CachePages":
-        """Adds two CachePages instances."""
+        """Concatenate two CachePages instances.
+
+        Combines the pages from two CachePages instances by concatenating
+        the page lists for each corresponding KV cache group.
+
+        Args:
+            other: Another CachePages instance to add.
+
+        Returns:
+            A new CachePages instance with concatenated page lists.
+
+        Example:
+            >>> combined = cache_pages1 + cache_pages2
+        """
         return CachePages(tuple(blk1 + blk2 for blk1, blk2 in zip(self.pages, other.pages, strict=False)))
 
     def get_page_ids(self) -> tuple[list[int], ...]:
-        """
-        Converts the CachePages instance to page_ids.
+        """Convert CachePages to page IDs.
+
+        Extracts the page IDs from all CachePage objects, organized by
+        KV cache group.
 
         Returns:
-            tuple[list[int], ...]: A tuple of lists where
-            * the outer tuple corresponds to KV cache groups
-            * each inner list contains the page_ids of the pages in that group
+            A tuple of lists where the outer tuple corresponds to KV cache
+            groups and each inner list contains the page_ids of the pages
+            in that group.
+
+        Example:
+            >>> page_ids = cache_pages.get_page_ids()
+            >>> print(page_ids)  # ((1, 2, 3), (4, 5, 6))
         """
         return tuple([blk.page_id for blk in group] for group in self.pages)
 
     def get_unhashed_page_ids(self) -> list[int]:
-        """Get page_ids of unhashed pages from CachePages instance."""
+        """Get page IDs of pages without computed hashes.
+
+        Returns the IDs of pages that haven't been hashed yet, which are
+        typically newly allocated pages that haven't been filled with tokens.
+
+        Returns:
+            A list of page IDs for unhashed pages.
+
+        Raises:
+            AssertionError: If there is more than one KV cache group.
+
+        Note:
+            This method only supports single-group configurations.
+        """
         assert len(self.pages) == 1, "Only one group is supported"
         return [page.page_id for page in self.pages[0] if page.page_hash is None]
 
     def new_empty(self) -> "CachePages":
-        """Creates a new CachePages instance with no pages."""
+        """Create an empty CachePages instance with the same structure.
+
+        Creates a new CachePages instance with empty page lists for each
+        KV cache group, preserving the number of groups.
+
+        Returns:
+            A new CachePages instance with no pages but the same group count.
+        """
         return CachePages(tuple([] for _ in range(len(self.pages))))
 
 
 class CacheManager:
+    """High-level KV-cache manager for inference requests.
+
+    This class provides the main interface for managing KV-cache allocation,
+    deallocation, and prefix caching. It coordinates between the scheduler
+    and the underlying cache coordinator to efficiently manage memory for
+    multiple concurrent requests.
+
+    The CacheManager supports:
+    - Prefix caching for reusing computed KV states across requests
+    - Multiple KV cache groups for hybrid attention patterns
+    - EAGLE speculative decoding support
+    - Automatic page eviction using LRU policy
+
+    Attributes:
+        num_pages: Total number of pages in the cache pool.
+        kv_cache_groups: List of cache group specifications.
+        max_model_len: Maximum sequence length supported.
+        enable_caching: Whether prefix caching is enabled.
+        use_eagle: Whether EAGLE speculative decoding is enabled.
+        page_size: Number of tokens per page (if caching enabled).
+        coordinator: The underlying cache coordinator.
+        page_pool: The page pool managed by the coordinator.
+        req_to_page_hashes: Mapping from request IDs to their page hashes.
+
+    Example:
+        >>> manager = CacheManager(
+        ...     num_pages=1000,
+        ...     kv_cache_groups=cache_groups,
+        ...     max_model_len=4096,
+        ...     enable_caching=True,
+        ...     use_eagle=False
+        ... )
+        >>> # Get cached pages for a request
+        >>> computed_pages, num_computed = manager.get_computed_pages(request)
+        >>> # Allocate new pages
+        >>> new_pages = manager.allocate_slots(request, num_new_tokens=10)
+        >>> # Free pages when done
+        >>> manager.free(request)
+    """
+
     def __init__(
         self,
         num_pages: int,
@@ -65,6 +177,18 @@ class CacheManager:
         enable_caching: bool = True,
         use_eagle: bool = False,
     ) -> None:
+        """Initialize the CacheManager.
+
+        Args:
+            num_pages: Total number of pages to allocate in the cache pool.
+            kv_cache_groups: List of CacheGroupSpec defining the cache
+                configuration for each attention type.
+            max_model_len: Maximum sequence length the model supports.
+            enable_caching: Whether to enable prefix caching. Defaults to True.
+                If no cache groups are provided, this is automatically disabled.
+            use_eagle: Whether EAGLE speculative decoding is enabled.
+                Defaults to False.
+        """
         self.num_pages = num_pages
         self.kv_cache_groups = kv_cache_groups
         self.max_model_len = max_model_len
@@ -100,12 +224,21 @@ class CacheManager:
         """
         return self.page_pool.get_usage()
 
-    def get_computed_pages(self, request: EngineRequest) -> tuple[CachePages, int]:
+    def get_computed_pages(
+        self,
+        request: EngineRequest,
+        *,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
+    ) -> tuple[CachePages, int]:
         """Get the computed (cached) pages for the request.
         Note that the computed pages must be full.
 
         Args:
             request: The request to get the computed pages.
+            dp_shard_hint: Optional request shard hint used to select
+                shard-local prefix cache pages.
+            data_parallel_size: Total data-parallel shard count.
 
         Returns:
             A tuple containing:
@@ -126,10 +259,46 @@ class CacheManager:
 
         max_cache_hit_length = request.num_tokens - 1
         computed_pages, num_new_computed_tokens = self.coordinator.find_longest_cache_hit(
-            page_hashes, max_cache_hit_length
+            page_hashes,
+            max_cache_hit_length,
+            dp_shard_hint=dp_shard_hint,
+            data_parallel_size=data_parallel_size,
         )
 
         return CachePages(computed_pages), num_new_computed_tokens
+
+    def _infer_dp_shard_from_pages(
+        self,
+        pages: tuple[list[CachePage], ...],
+        *,
+        data_parallel_size: int | None,
+    ) -> int | None:
+        """Infer a consistent DP shard from already-attached pages.
+
+        Returns ``None`` when shard inference is not possible (e.g. single-DP,
+        uneven page partitioning, no pages, or mixed-shard pages).
+        """
+        dp_size = int(data_parallel_size or 1)
+        if dp_size <= 1:
+            return None
+        if self.num_pages <= 0 or self.num_pages % dp_size != 0:
+            return None
+
+        pages_per_shard = self.num_pages // dp_size
+        inferred_shard: int | None = None
+        for group_pages in pages:
+            for page in group_pages:
+                if page.is_null:
+                    continue
+                page_id = int(page.page_id)
+                if page_id < 0:
+                    continue
+                shard = min(page_id // pages_per_shard, dp_size - 1)
+                if inferred_shard is None:
+                    inferred_shard = shard
+                elif inferred_shard != shard:
+                    return None
+        return inferred_shard
 
     def allocate_slots(
         self,
@@ -139,6 +308,8 @@ class CacheManager:
         new_computed_pages: CachePages | None = None,
         num_lookahead_tokens: int = 0,
         delay_cache_pages: bool = False,
+        dp_shard_hint: int | None = None,
+        data_parallel_size: int | None = None,
     ) -> CachePages | None:
         """Add slots for a request with new tokens to append.
 
@@ -157,6 +328,12 @@ class CacheManager:
             delay_cache_pages: Whether to skip caching the pages. This is
                 used by P/D when allocating pages used in a KV transfer
                 which will complete in a future step.
+            dp_shard_hint: Optional request shard hint for DP-local page
+                allocation. When provided with ``data_parallel_size > 1``,
+                new pages are preferentially allocated from that shard's
+                page-ID range.
+            data_parallel_size: Total data-parallel shard count for
+                ``dp_shard_hint`` interpretation.
 
         Pages layout:
         ```
@@ -204,7 +381,28 @@ class CacheManager:
 
         self.coordinator.save_new_computed_pages(request.request_id, new_computed_page_list)
 
-        new_pages = self.coordinator.allocate_new_pages(request.request_id, num_tokens_need_slot)
+        effective_dp_shard_hint = dp_shard_hint
+        if data_parallel_size is not None and int(data_parallel_size) > 1:
+            inferred_shard = self._infer_dp_shard_from_pages(
+                self.coordinator.get_pages(request.request_id),
+                data_parallel_size=data_parallel_size,
+            )
+            if inferred_shard is not None:
+                effective_dp_shard_hint = inferred_shard
+
+        try:
+            new_pages = self.coordinator.allocate_new_pages(
+                request.request_id,
+                num_tokens_need_slot,
+                dp_shard_hint=effective_dp_shard_hint,
+                data_parallel_size=data_parallel_size,
+            )
+        except ValueError:
+            self.coordinator.rollback_new_computed_pages(request.request_id, new_computed_page_list)
+            if self.enable_caching:
+                for computed_group_pages in new_computed_page_list:
+                    self.page_pool.free_pages(computed_group_pages)
+            return None
 
         if not self.enable_caching or delay_cache_pages:
             return CachePages(new_pages)
@@ -229,13 +427,21 @@ class CacheManager:
         self.coordinator.free(request.request_id)
 
     def reset_prefix_cache(self) -> bool:
-        """Reset prefix cache. This function may be used in RLHF
-        flows to invalidate prefix caching after the weights are updated,
-        or used for resetting prefix caching status for benchmarking.
+        """Reset the prefix cache to invalidate all cached prefixes.
+
+        This method clears all cached page hashes, forcing future requests
+        to recompute their KV states. Useful in scenarios like:
+        - RLHF training where model weights are updated between rounds
+        - Benchmarking to ensure cold-start performance measurement
+        - Cache invalidation after model parameter changes
 
         Returns:
-            bool: True if the prefix cache is successfully reset,
-            False otherwise.
+            True if the prefix cache was successfully reset, False if
+            there are still pages in use that couldn't be freed.
+
+        Note:
+            This operation will fail if any pages are still allocated
+            to active requests. Ensure all requests are freed first.
         """
         if not self.page_pool.reset_prefix_cache():
             return False
@@ -293,15 +499,39 @@ class CacheManager:
         self.req_to_page_hashes.pop(request.request_id, None)
 
     def get_page_ids(self, request_id: str) -> tuple[list[int], ...]:
-        """Get the page ids of a request."""
+        """Get the page IDs allocated to a request.
+
+        Args:
+            request_id: The unique identifier of the request.
+
+        Returns:
+            A tuple of lists containing page IDs for each KV cache group.
+        """
         return CachePages(self.coordinator.get_pages(request_id)).get_page_ids()
 
     def cache_pages(self, request: EngineRequest, num_computed_tokens: int) -> None:
-        """Cache the pages for the request, if enabled."""
+        """Cache the pages for a request to enable prefix reuse.
+
+        Updates the page hash metadata for the request's pages, making them
+        available for prefix cache hits by future requests with matching
+        token prefixes.
+
+        Args:
+            request: The request whose pages should be cached.
+            num_computed_tokens: The number of tokens that have been computed
+                and should be cached.
+
+        Note:
+            This is a no-op if prefix caching is disabled.
+        """
         if self.enable_caching:
             page_hashes = self.req_to_page_hashes[request.request_id]
             self.coordinator.cache_pages(request, page_hashes, num_computed_tokens)
 
     def create_empty_page_list(self) -> CachePages:
-        """Creates a new CachePages instance with no pages."""
+        """Create an empty CachePages instance for the current configuration.
+
+        Returns:
+            A CachePages instance with empty page lists for each KV cache group.
+        """
         return CachePages(tuple([] for _ in range(self.num_kv_cache_groups)))

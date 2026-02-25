@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
+from eformer.common_types import Replicated
 from eformer.pytree import auto_pytree
 from einops import repeat
 from ejkernel.types import MaskInfo
@@ -27,16 +28,16 @@ from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array
 
+from easydel.caching import RecurrentCache, RecurrentCacheConfig, RecurrentCacheView
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.caching import RecurrentCache, RecurrentCacheConfig, RecurrentCacheView
-from easydel.layers.linear import ColumnParallelLinear
-from easydel.layers.norms import RMSNorm as MambaRMSNorm
-from easydel.layers.operations import OperationMetadata
-from easydel.layers.operations.modules import SSM1Op
+from easydel.layers import ColumnParallelLinear, Embed
+from easydel.layers import RMSNorm as MambaRMSNorm
+from easydel.modules._base import BaseCausalLMModule
+from easydel.operations import OperationMetadata
+from easydel.operations.kernels import SSM1Op
 
 from .mamba_configuration import MambaConfig as MambaConfig
 
@@ -161,6 +162,13 @@ class MambaConv1D(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for convolution parameters."""
+        specs = {"kernel": Replicated}
+        if getattr(self, "use_bias", False) and hasattr(self, "bias"):
+            specs["bias"] = Replicated
+        return specs
 
     def __call__(self, x: Array) -> Array:
         """Apply 1D convolution to input tensor.
@@ -345,6 +353,13 @@ class MambaMixer(nn.Module):
             base_config=config,
         )
         self.ssm_op = SSM1Op(metadata)
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for state space parameters."""
+        return {
+            "A_log": Replicated,
+            "D": Replicated,
+        }
 
     def __call__(
         self,
@@ -597,24 +612,26 @@ class MambaModel(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.embeddings = nn.Embed(
+        self.embeddings = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.layers = [
-            MambaBlock(
-                config=config,
-                layer_idx=layer_idx,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for layer_idx in range(config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                MambaBlock(
+                    config=config,
+                    layer_idx=layer_idx,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
         self.norm_f = MambaRMSNorm(
             config.hidden_size,
             eps=config.layer_norm_epsilon,
@@ -895,7 +912,7 @@ class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):
         """
         from eformer.escale import PartitionAxis
 
-        from easydel.layers.caching import RecurrentCache
+        from easydel.caching import RecurrentCache
 
         cache = kwargs.get("cache", None)
         attention_mask = kwargs.get("attention_mask", None)

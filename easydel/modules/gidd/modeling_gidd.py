@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi) and @dvruette.
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi) and @dvruette.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,18 +32,14 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
-from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
-from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn
-from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import (
+from easydel.caching import (
     HybridCache,
     OperationsMetadata,
     RaggedPagesCache,
@@ -53,7 +49,12 @@ from easydel.layers.caching import (
     TransformerCacheView,
     TransformerMetadata,
 )
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import AttentionLayerOutput, BaseModelOutput, CausalLMOutput, DecoderLayerOutput
+from easydel.infra.utils import ArrayParam, auto_remat, block_wise_ffn
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 
 from .gidd_configuration import GiddConfig
 
@@ -246,6 +247,11 @@ class GiddAttention(AttentionModule):
             softmax_scale=1.0 if self.use_qk_norm else 1.0 / self.head_dim**0.5,
             dropout_prob=0.0,
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        if isinstance(self.qk_scale, ArrayParam):
+            return {"qk_scale": Replicated}
+        return {}
 
     @jax.named_scope("gidd-flax-attention-concatenate")
     def concatenate(
@@ -665,13 +671,7 @@ class GiddModel(EasyDeLBaseModule):
         # Calculate residual scale factor
         self.resid_scale = config.resid_scale / config.num_hidden_layers
 
-        embed_block = auto_remat(
-            nn.Embed,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.embed_tokens = embed_block(
+        self.embed_tokens = Embed(
             num_embeddings=self.config.vocab_size,
             features=self.config.hidden_size,
             dtype=dtype,
@@ -680,17 +680,19 @@ class GiddModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.layers = [
-            GiddLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-                resid_scale=self.resid_scale,
-            )
-            for _ in range(self.config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                GiddLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                    resid_scale=self.resid_scale,
+                )
+                for _ in range(self.config.num_hidden_layers)
+            ]
+        )
 
         self.norm = GiddRMSNorm(config=config, dtype=dtype, param_dtype=param_dtype)
 
@@ -865,7 +867,7 @@ class GiddModel(EasyDeLBaseModule):
         """Returns the embedding layer of the module.
 
         Returns:
-            nn.Embed: The token embedding layer.
+            Embed: The token embedding layer.
         """
         return self.embed_tokens
 
@@ -1052,6 +1054,6 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         """Returns the embedding layer of the module.
 
         Returns:
-            nn.Embed: The token embedding layer from the base model.
+            Embed: The token embedding layer from the base model.
         """
         return self.model.embed_tokens

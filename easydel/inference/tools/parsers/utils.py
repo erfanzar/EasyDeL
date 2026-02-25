@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,11 +14,32 @@
 
 """Compatibility shim for vLLM-style imports.
 
-vLLM keeps tool parsing helpers under `tool_parsers/utils.py`.
-EasyDeL keeps them under `easydel.inference.tools.utils`.
+This module provides a compatibility layer for vLLM-style imports, allowing code
+ported from vLLM to work seamlessly with EasyDeL's internal structure.
 
-This module re-exports EasyDeL's utilities to make it easier to keep
-ported parsers aligned with upstream vLLM implementations.
+vLLM keeps tool parsing helpers under `tool_parsers/utils.py`, while EasyDeL
+keeps them under `easydel.inference.tools.utils`. This module re-exports
+EasyDeL's utilities to maintain API compatibility with vLLM's layout.
+
+Re-exported Functions:
+    consume_space: Skip whitespace characters in a string starting from an index.
+    extract_intermediate_diff: Extract the difference between two JSON strings.
+    find_all_indices: Find all occurrences of a substring within a string.
+    find_common_prefix: Find the common prefix between two strings.
+    find_common_suffix: Find the common suffix between two strings.
+    is_complete_json: Check if a string represents complete, valid JSON.
+    partial_json_loads: Parse potentially incomplete JSON with configurable options.
+
+Example:
+    >>> from easydel.inference.tools.parsers.utils import is_complete_json
+    >>> is_complete_json('{"key": "value"}')
+    True
+    >>> is_complete_json('{"key": ')
+    False
+
+Note:
+    This module exists primarily for compatibility. For new code, consider
+    importing directly from `easydel.inference.tools.utils`.
 """
 
 from __future__ import annotations

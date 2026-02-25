@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo
@@ -36,9 +37,10 @@ from easydel.infra.modeling_outputs import (
     ModelOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam
+from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
-from easydel.layers.base_modules import BaseImageClassificationModule
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
+from easydel.layers.norms import LayerNorm
+from easydel.modules._base import BaseImageClassificationModule
 
 from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionConfig
 
@@ -114,7 +116,7 @@ class SiglipVisionEmbeddings(nn.Module):
         self.patch_size = config.patch_size
         self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches
-        self.position_embedding = nn.Embed(
+        self.position_embedding = Embed(
             self.num_positions,
             self.embed_dim,
             dtype=dtype,
@@ -227,7 +229,7 @@ class SiglipTextEmbeddings(nn.Module):
         """
         embed_dim = config.hidden_size
 
-        self.token_embedding = nn.Embed(
+        self.token_embedding = Embed(
             config.vocab_size,
             embed_dim,
             embedding_init=jax.nn.initializers.normal(),
@@ -235,7 +237,7 @@ class SiglipTextEmbeddings(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.position_embedding = nn.Embed(
+        self.position_embedding = Embed(
             config.max_position_embeddings,
             embed_dim,
             embedding_init=jax.nn.initializers.normal(),
@@ -521,7 +523,7 @@ class SiglipEncoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.layer_norm1 = nn.LayerNorm(
+        self.layer_norm1 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -535,7 +537,7 @@ class SiglipEncoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.layer_norm2 = nn.LayerNorm(
+        self.layer_norm2 = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -612,16 +614,18 @@ class SiglipEncoder(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        self.layers = [
-            SiglipEncoderLayer(
-                config=config,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for _ in range(config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                SiglipEncoderLayer(
+                    config=config,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
 
     def __call__(
         self,
@@ -721,7 +725,7 @@ class SiglipTextTransformer(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.final_layer_norm = nn.LayerNorm(
+        self.final_layer_norm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -984,7 +988,7 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
             precision=precision,
             rngs=rngs,
         )
-        self.post_layernorm = nn.LayerNorm(
+        self.post_layernorm = LayerNorm(
             embed_dim,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -1145,6 +1149,13 @@ class MultiheadAttention(nn.Module):
             rngs=rngs,
         )
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for custom attention parameters."""
+        return {
+            "in_proj_weight": ColumnWise,
+            "in_proj_bias": Replicated,
+        }
+
     def __call__(
         self,
         query: Array,
@@ -1227,8 +1238,7 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-
-        self.layernorm = nn.LayerNorm(
+        self.layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
             dtype=dtype,
@@ -1242,6 +1252,10 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
             precision=precision,
             rngs=rngs,
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for attention pooling parameters."""
+        return {"probe": Replicated}
 
     def __call__(self, hidden_state):
         """Apply attention pooling over patch representations.
@@ -1440,6 +1454,13 @@ class SiglipModel(EasyDeLBaseModule):
             init_method="normal",
             key=rngs.param(),
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for logit scaling parameters."""
+        return {
+            "logit_scale": Replicated,
+            "logit_bias": Replicated,
+        }
 
     def get_text_features(
         self,

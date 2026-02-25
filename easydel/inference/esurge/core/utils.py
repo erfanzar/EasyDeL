@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Utility classes and functions for KV-cache management.
+
+This module provides the foundational data structures and utility functions
+for managing KV-cache pages in the eSurge inference engine. It includes
+page metadata classes, hash computation utilities, and a doubly-linked list
+implementation for efficient free page management.
+
+Classes:
+    PageHash: Named tuple representing a page's hash value and token contents.
+    PageHashWithGroupId: Named tuple combining PageHash with KV cache group ID.
+    CachePage: Dataclass representing a single cache page's metadata.
+    FreeCachePageQueue: Doubly-linked list for O(1) free page operations.
+
+Functions:
+    init_none_hash: Initialize the global hash seed for prefix caching.
+    hash_page_tokens: Compute hash for a single page's token contents.
+    hash_request_tokens: Compute hashes for all pages in a request.
+
+Example:
+    >>> init_none_hash()
+    >>> page_hash = hash_page_tokens(hash, None, (1, 2, 3, 4))
+    >>> print(page_hash.hash_value)
+"""
+
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -20,10 +45,23 @@ from ..request import EngineRequest
 
 
 class PageHash(NamedTuple):
-    """Hash value of a page (int), the token IDs in the page, and extra keys.
-    We keep a tuple of token IDs and extra keys to reduce the likelihood of
-    hash collisions when the hash value is the same. By using SHA256 however,
-    hash collisions are practically impossible.
+    """Hash representation of a cache page for prefix caching.
+
+    This named tuple stores the hash value of a page along with the original
+    token IDs and any extra keys (e.g., multimodal content hashes). The full
+    tuple is used as the cache key to minimize hash collision probability.
+
+    Attributes:
+        hash_value: Integer hash computed from parent hash, tokens, and extra keys.
+        token_ids: Tuple of token IDs contained in this page.
+        extra_keys: Optional additional keys for the hash (e.g., image hashes
+            for vision-language models). Defaults to None.
+
+    Note:
+        While the hash_value alone could identify pages, we keep the full
+        token_ids and extra_keys to verify matches and handle the extremely
+        rare case of hash collisions. Using SHA256-based hashing makes
+        collisions practically impossible.
     """
 
     hash_value: int
@@ -32,16 +70,53 @@ class PageHash(NamedTuple):
 
 
 class PageHashWithGroupId(NamedTuple):
+    """Page hash combined with its KV cache group identifier.
+
+    This named tuple associates a PageHash with the KV cache group it belongs to,
+    enabling correct page lookup in hybrid models with multiple attention types.
+
+    Attributes:
+        page_hash: The PageHash containing the hash value and token IDs.
+        group_id: The index of the KV cache group this page belongs to.
+    """
+
     page_hash: PageHash
     group_id: int
 
     def get_hash_value(self) -> int:
+        """Get the underlying hash value.
+
+        Returns:
+            The integer hash value from the contained PageHash.
+        """
         return self.page_hash.hash_value
 
 
 @dataclass
 class CachePage:
-    """KV-cache page metadata."""
+    """Metadata container for a single KV-cache page.
+
+    This dataclass tracks all metadata associated with a cache page, including
+    its reference count for garbage collection, hash for prefix caching, and
+    linked list pointers for efficient free queue management.
+
+    Attributes:
+        page_id: Unique identifier for this page in the page pool.
+        ref_cnt: Number of active references to this page. When 0, the page
+            can be evicted or reused.
+        _page_hash: Private storage for the page's hash (use page_hash property).
+        prev_free_page: Pointer to previous page in free list (if free).
+        next_free_page: Pointer to next page in free list (if free).
+        is_null: Whether this is a special null/placeholder page that should
+            never be freed or evicted.
+
+    Example:
+        >>> page = CachePage(page_id=0)
+        >>> page.incr_ref()
+        >>> print(page.ref_cnt)  # 1
+        >>> page.decr_ref()
+        >>> print(page.ref_cnt)  # 0
+    """
 
     page_id: int
     ref_cnt: int = 0
@@ -50,26 +125,61 @@ class CachePage:
     next_free_page: Optional["CachePage"] = None
     is_null: bool = False
 
-    def incr_ref(self):
+    def incr_ref(self) -> None:
+        """Increment the reference count by 1.
+
+        Called when a new request starts using this page, either through
+        allocation or prefix cache hit.
+        """
         self.ref_cnt += 1
 
-    def decr_ref(self):
+    def decr_ref(self) -> None:
+        """Decrement the reference count by 1.
+
+        Called when a request releases this page. When ref_cnt reaches 0,
+        the page becomes eligible for eviction or reuse.
+        """
+        if self.ref_cnt <= 0:
+            raise RuntimeError(f"ref_cnt underflow on page {self.page_id}")
         self.ref_cnt -= 1
 
     @property
     def page_hash(self) -> PageHashWithGroupId | None:
+        """Get the page's hash for prefix caching.
+
+        Returns:
+            The PageHashWithGroupId if the page has been hashed, None otherwise.
+        """
         return self._page_hash
 
     @page_hash.setter
-    def page_hash(self, page_hash: PageHashWithGroupId):
-        assert self.page_hash is None, "The page already has a hash. This should not happen."
+    def page_hash(self, page_hash: PageHashWithGroupId) -> None:
+        """Set the page's hash for prefix caching.
+
+        Args:
+            page_hash: The hash to associate with this page.
+
+        Raises:
+            AssertionError: If the page already has a hash assigned.
+        """
+        if self._page_hash is not None:
+            raise RuntimeError("The page already has a hash. This should not happen.")
         self._page_hash = page_hash
 
-    def reset_hash(self):
-        """Reset the page hash when the page is evicted."""
+    def reset_hash(self) -> None:
+        """Clear the page hash when the page is evicted.
+
+        Called during page eviction to remove the hash association,
+        allowing the page to be reused for new content.
+        """
         self._page_hash = None
 
     def __repr__(self) -> str:
+        """Return a detailed string representation of the page.
+
+        Returns:
+            String showing page_id, ref_cnt, hash, and linked list neighbors.
+        """
         prev_page_id = self.prev_free_page.page_id if self.prev_free_page else None
         next_page_id = self.next_free_page.page_id if self.next_free_page else None
         return (
@@ -82,28 +192,45 @@ class CachePage:
 
 
 class FreeCachePageQueue:
-    """This class organizes a list of CachePage objects to a doubly linked
-    list of free pages. We implement this class instead of using Python
-    builtin deque to support removing a page in the middle of the queue
-    in O(1) time. To close the performance gap to the builtin deque which is
-    implemented in C++, this class does not allocate any Python objects when
-    manipulating the linked list. Instead, this class manipulates the
-    prev_free_page and next_free_page attributes of the given pages.
+    """Doubly-linked list for O(1) free page queue operations.
 
-    The queue is ordered by page ID in the beginning. When a page is allocated
-    and then freed, it will be appended back with the eviction order:
-    1. The least recent used page is at the front (LRU).
-    2. If two pages have the same last accessed time (allocated by the
-       same sequence), the one with more hash tokens (the tail of a page
-       chain) is at the front.
-    Note that we maintain this order by reversing the page order when free
-    pages of a request. This operation is outside of this class.
+    This class manages a doubly-linked list of free CachePage objects,
+    enabling O(1) time complexity for all queue operations including
+    removal from the middle. Unlike Python's builtin deque, this
+    implementation manipulates the prev_free_page and next_free_page
+    attributes directly on CachePage objects, avoiding allocation overhead.
 
-    Args:
-        pages: A list of CachePage objects.
+    The queue maintains LRU (Least Recently Used) eviction order:
+    1. Least recently used pages are at the front (evicted first).
+    2. For pages freed simultaneously (same request), pages with more
+       hash tokens (chain tails) are ordered earlier.
+
+    Note:
+        The LRU order is maintained by the caller reversing pages before
+        calling append_n() when freeing a request's pages.
+
+    Attributes:
+        num_free_pages: Current count of free pages in the queue.
+        fake_free_list_head: Sentinel node marking the start of the list.
+        fake_free_list_tail: Sentinel node marking the end of the list.
+
+    Example:
+        >>> pages = [CachePage(i) for i in range(10)]
+        >>> queue = FreeCachePageQueue(pages)
+        >>> page = queue.popleft()  # Get first free page
+        >>> queue.append(page)  # Return it to the end
     """
 
     def __init__(self, pages: list[CachePage]) -> None:
+        """Initialize the free page queue with a list of pages.
+
+        Creates the doubly-linked list structure from the given pages,
+        initially ordered by their position in the input list.
+
+        Args:
+            pages: List of CachePage objects to initialize the queue with.
+                All pages will be linked in the order provided.
+        """
         self.num_free_pages = len(pages)
 
         for i in range(self.num_free_pages):
@@ -255,9 +382,30 @@ class FreeCachePageQueue:
 
 
 NONE_HASH: int
+"""Global hash value used as the parent hash for the first page in a sequence."""
 
 
-def init_none_hash():
+def init_none_hash() -> None:
+    """Initialize the global NONE_HASH used for prefix caching.
+
+    This function sets up the base hash value used as the "parent" hash for
+    the first page in any token sequence. The hash is deterministic when
+    PYTHONHASHSEED environment variable is set, enabling reproducible
+    prefix cache behavior across runs.
+
+    The NONE_HASH is used in hash_page_tokens when computing the hash for
+    the first page of a request (where there is no parent page).
+
+    Note:
+        This function must be called once during initialization before
+        any prefix caching operations. The CacheManager calls this
+        automatically during construction.
+
+    Environment Variables:
+        PYTHONHASHSEED: If set, uses this as the seed for deterministic
+            hashing. If not set or set to None, generates a random hash
+            from 32 bytes of os.urandom().
+    """
     global NONE_HASH
 
     hash_seed = int(os.getenv("PYTHONHASHSEED", "1524618910112"))
@@ -286,7 +434,7 @@ def hash_page_tokens(
         The hash value of the page and the token ids in the page.
         The entire tuple is used as the hash key of the page.
     """
-    if not parent_page_hash:
+    if parent_page_hash is None:
         parent_page_hash = NONE_HASH
 
     curr_page_token_ids_tuple = tuple(curr_page_token_ids)
@@ -298,15 +446,32 @@ def hash_page_tokens(
 
 
 def hash_request_tokens(hash_function: Any, page_size: int, request: EngineRequest) -> list[PageHash]:
-    """Computes hash values of a chain of pages given a sequence of
-    token IDs. The hash value is used for prefix caching.
+    """Compute hash values for all complete pages in a request's token sequence.
+
+    This function computes a chain of PageHash values for prefix caching,
+    where each page's hash depends on its parent page's hash, creating
+    a content-addressable chain. Only complete pages (with exactly
+    page_size tokens) are hashed.
+
+    For vision-language models, multimodal content is included in the
+    hash computation to prevent incorrect cache hits when different
+    images produce the same token IDs.
 
     Args:
-        page_size: The size of each page.
-        request: The request object.
+        hash_function: The hash function to use (typically Python's builtin hash).
+        page_size: Number of tokens per page.
+        request: The EngineRequest containing token IDs and optional
+            multimodal features.
 
     Returns:
-        The list of computed hash values.
+        List of PageHash objects, one for each complete page in the request.
+        Partial pages at the end are not included.
+
+    Example:
+        >>> # For a request with 100 tokens and page_size=16
+        >>> hashes = hash_request_tokens(hash, 16, request)
+        >>> len(hashes)  # 6 complete pages (96 tokens)
+        6
     """
     token_ids = request.all_token_ids
 

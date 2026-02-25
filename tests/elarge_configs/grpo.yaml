@@ -44,7 +44,7 @@ trainer:
   max_training_steps: 1024
   max_prompt_length: 512
   max_completion_length: 256
-  max_sequence_length: 768
+  max_length: 768
   num_return_sequences: 4
   save_steps: 1000
   save_total_limit: 1

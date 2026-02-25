@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,11 +20,13 @@ import typing as tp
 import jax
 import jax.numpy as jnp
 from eformer import common_types
+from eformer.common_types import Replicated
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float
 
+from easydel.caching import HybridCache, HybridCacheView, OperationsMetadata
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
@@ -33,14 +35,11 @@ from easydel.infra.modeling_outputs import (
     DecoderLayerOutput,
 )
 from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
-from easydel.layers.attention import MaskInfo
-from easydel.layers.attention_unified import UnifiedAttention
-from easydel.layers.base_modules import BaseCausalLMModule
-from easydel.layers.caching import HybridCache, HybridCacheView, OperationsMetadata
-from easydel.layers.linear import ColumnParallelLinear, RowParallelLinear
-from easydel.layers.norms import RMSNorm
-from easydel.layers.operations import OperationMetadata
-from easydel.layers.operations.modules import SSM2Op
+from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
+from easydel.layers.attention import MaskInfo, UnifiedAttention
+from easydel.modules._base import BaseCausalLMModule
+from easydel.operations import OperationMetadata
+from easydel.operations.kernels import SSM2Op
 
 from .falcon_h1_configuration import FalconH1Config
 
@@ -270,6 +269,13 @@ class Conv1D(nn.Module):
                 key=rngs.params(),
             )
 
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for convolution parameters."""
+        specs = {"kernel": Replicated}
+        if getattr(self, "use_bias", False) and hasattr(self, "bias"):
+            specs["bias"] = Replicated
+        return specs
+
     def __call__(self, x: Array) -> Array:
         """Apply 1D convolution to the input.
 
@@ -349,6 +355,10 @@ class FalconH1RMSNormGated(nn.Module):
             init_method="ones",
             key=rngs.params(),
         )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for normalization parameters."""
+        return {"kernel": Replicated}
 
     def __call__(self, hidden_states: Array, gate: Array | None = None) -> Array:
         """Apply grouped RMS normalization with optional SiLU gating.
@@ -545,6 +555,14 @@ class FalconH1Mixer(nn.Module):
             base_config=config,
         )
         self.ssm_op = SSM2Op(metadata)
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for state space parameters."""
+        return {
+            "dt_bias": Replicated,
+            "A_log": Replicated,
+            "D": Replicated,
+        }
 
     def __call__(
         self,
@@ -1010,7 +1028,7 @@ class FalconH1Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
-        self.embed_tokens = nn.Embed(
+        self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
@@ -1024,17 +1042,19 @@ class FalconH1Model(EasyDeLBaseModule):
             save_names=config.gradient_checkpointing_targets,
             exclude_names=config.gradient_checkpointing_targets,
         )
-        self.layers = [
-            layer_block(
-                config=config,
-                layer_idx=i,
-                dtype=dtype,
-                param_dtype=param_dtype,
-                precision=precision,
-                rngs=rngs,
-            )
-            for i in range(config.num_hidden_layers)
-        ]
+        self.layers = nn.List(
+            [
+                layer_block(
+                    config=config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
         self.final_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, param_dtype=param_dtype, rngs=rngs
@@ -1196,7 +1216,7 @@ class FalconH1Model(EasyDeLBaseModule):
         """Return the token embedding layer of the model.
 
         Returns:
-            nn.Embed: Token embedding layer.
+            Embed: Token embedding layer.
         """
         return self.embed_tokens
 
@@ -1457,6 +1477,6 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):
         """Return the token embedding layer of the underlying model.
 
         Returns:
-            nn.Embed: Token embedding layer from the base FalconH1Model.
+            Embed: Token embedding layer from the base FalconH1Model.
         """
         return self.model.get_embedding()

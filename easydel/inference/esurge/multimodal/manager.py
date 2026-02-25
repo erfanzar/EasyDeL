@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,16 +14,68 @@
 
 """Multimodal processing manager for vision-language models.
 
-This module provides the MultiModalManager class for handling image and video
-preprocessing, resolution bucketing, and integration with vision-language models.
+This module provides the MultiModalManager class, the central component for
+handling image and video preprocessing in the eSurge inference engine. It
+manages resolution bucketing, integration with HuggingFace processors, and
+coordination with the vision encoder cache.
+
+The manager is designed to work with various VLM architectures:
+    - GLM4V/GLM46V models (flat-patch vision towers)
+    - Qwen2-VL/Qwen3-VL models (flat-patch with spatial merge)
+    - Standard CLIP-based VLMs
+
+Key Features:
+    Resolution Bucketing:
+        Images are resized to predefined resolution buckets to minimize JAX
+        recompilation. This trades off some image quality for significantly
+        improved inference throughput in production settings.
+
+    Flat-Patch Support:
+        For models like GLM and Qwen that use flattened patch representations,
+        the manager handles spatiotemporal patchification with proper grid
+        alignment for spatial merge operations.
+
+    HuggingFace Integration:
+        Seamlessly integrates with HuggingFace AutoProcessor instances for
+        tokenization and preprocessing, with fallback paths for models that
+        don't have full processor support.
+
+    Message Parsing:
+        Extracts images and videos from OpenAI-style chat messages, supporting
+        various formats including PIL images, file paths, and data URLs.
 
 Classes:
-    MultiModalManager: Manages vision data processing and caching
+    MultiModalManager: Central manager for vision data processing and caching.
+
+Module Constants:
+    CLIP_IMAGE_MEAN: Mean values for CLIP-style image normalization.
+    CLIP_IMAGE_STD: Standard deviation values for CLIP-style normalization.
+    DEFAULT_RESOLUTION_BUCKETS: Default list of (H, W) resolution tuples.
 
 Example:
-    >>> manager = MultiModalManager(processor=processor)
-    >>> pixel_values, grid_thw = manager.process_images([image])
-    >>> prompt_ids = manager.tokenize_multimodal(messages)
+    Basic usage::
+
+        >>> from easydel.inference.esurge.multimodal import MultiModalManager
+        >>> from transformers import AutoProcessor
+        >>>
+        >>> processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B")
+        >>> manager = MultiModalManager(processor=processor, model=model)
+        >>>
+        >>> # Process images with automatic resolution bucketing
+        >>> pixel_values, grid_thw = manager.process_images([image1, image2])
+        >>>
+        >>> # Extract media from OpenAI-style messages
+        >>> images, videos = manager.extract_media_from_messages(messages)
+        >>>
+        >>> # Tokenize with proper placeholder insertion
+        >>> token_ids = manager.tokenize_multimodal(
+        ...     messages, images=images, image_grid_thw=grid_thw
+        ... )
+
+See Also:
+    VisionEncoderCache: Cache used internally for vision encoder outputs
+    MultiModalFeature: Features created by process_images_to_features()
+    BatchedMultiModalInputs: Batched outputs from multiple features
 """
 
 from __future__ import annotations
@@ -41,11 +93,18 @@ if TYPE_CHECKING:
     pass
 
 
+# CLIP-style normalization constants used by GLM/Qwen vision towers.
+# These values are the ImageNet-derived mean and std used by OpenAI CLIP.
 CLIP_IMAGE_MEAN = np.asarray([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
+"""np.ndarray: Per-channel mean values for CLIP image normalization (RGB order)."""
+
 CLIP_IMAGE_STD = np.asarray([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+"""np.ndarray: Per-channel standard deviation values for CLIP image normalization (RGB order)."""
 
 
-# Default resolution buckets for compilation efficiency
+# Default resolution buckets for compilation efficiency.
+# Images are resized to the nearest bucket to minimize JAX recompilation
+# while maintaining reasonable image quality across common input sizes.
 DEFAULT_RESOLUTION_BUCKETS = [
     (32, 32),
     (64, 64),
@@ -55,6 +114,7 @@ DEFAULT_RESOLUTION_BUCKETS = [
     (768, 768),
     (1024, 1024),
 ]
+"""list[tuple[int, int]]: Default (height, width) resolution buckets for image resizing."""
 
 
 class MultiModalManager:
@@ -87,12 +147,36 @@ class MultiModalManager:
     ):
         """Initialize MultiModalManager.
 
+        Creates a new manager instance configured for the given processor
+        and model. The manager will use resolution bucketing to minimize
+        JAX recompilation and optionally cache vision encoder outputs.
+
         Args:
-            processor: HuggingFace processor (AutoProcessor) for the VLM.
-            resolution_buckets: List of (H, W) resolution tuples for bucketing.
-                Defaults to [(384, 384), (512, 512), (768, 768), (1024, 1024)].
-            cache_capacity_mb: Vision encoder cache capacity in MB.
-            enable_cache: Whether to enable vision encoder output caching.
+            processor (Any | None): HuggingFace processor (AutoProcessor) for
+                the VLM. Used for tokenization and image preprocessing. Can be
+                None if only using fallback preprocessing paths.
+            model (Any | None): The VLM model instance. Used to access vision
+                config for flat-patch models. Can be None if processor handles
+                all preprocessing. Defaults to None.
+            resolution_buckets (list[tuple[int, int]] | None): List of (H, W)
+                resolution tuples for image bucketing. Images are resized to
+                the bucket with total pixels closest to the original. If None,
+                uses DEFAULT_RESOLUTION_BUCKETS.
+            cache_capacity_mb (int): Maximum capacity for the vision encoder
+                cache in megabytes. Defaults to 1024 MB (1 GB).
+            enable_cache (bool): Whether to enable vision encoder output
+                caching. Set to False to disable caching (e.g., for debugging
+                or memory-constrained environments). Defaults to True.
+
+        Example:
+            >>> from transformers import AutoProcessor
+            >>> processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B")
+            >>> manager = MultiModalManager(
+            ...     processor=processor,
+            ...     model=model,
+            ...     cache_capacity_mb=2048,
+            ...     enable_cache=True
+            ... )
         """
         self.processor = processor
         self.model = model
@@ -124,6 +208,20 @@ class MultiModalManager:
 
     @staticmethod
     def _align_dim_to_multiple(dim: int, multiple: int) -> int:
+        """Align a dimension to the nearest multiple.
+
+        Rounds a dimension value to the nearest multiple of the given value,
+        preferring to round up on ties. This ensures spatial dimensions are
+        compatible with patch-based vision architectures.
+
+        Args:
+            dim (int): The dimension value to align.
+            multiple (int): The multiple to align to.
+
+        Returns:
+            int: The aligned dimension, always >= 1 and divisible by multiple
+                (when multiple > 1).
+        """
         dim = int(dim)
         multiple = int(multiple)
         if multiple <= 1:
@@ -138,8 +236,17 @@ class MultiModalManager:
     def _get_resize_buckets_for_model(self) -> list[tuple[int, int]]:
         """Return effective resize buckets for the current model/processor.
 
-        For flat-patch VLMs, buckets are aligned to `patch_size * spatial_merge_size`
-        to keep `(grid_h, grid_w)` divisible by `spatial_merge_size`.
+        Computes the final set of resolution buckets to use, taking into
+        account model-specific requirements. For flat-patch VLMs, buckets
+        are aligned to `patch_size * spatial_merge_size` to ensure
+        `(grid_h, grid_w)` are divisible by `spatial_merge_size`.
+
+        Also adds the model's configured image_size to the bucket list if
+        available from the vision config.
+
+        Returns:
+            list[tuple[int, int]]: Sorted, deduplicated list of (height, width)
+                resolution buckets aligned to model requirements.
         """
         buckets: list[tuple[int, int]] = []
         for h, w in self.resolution_buckets:
@@ -171,6 +278,19 @@ class MultiModalManager:
         return buckets
 
     def _resize_to_buckets(self, image: Image.Image, buckets: list[tuple[int, int]]) -> Image.Image:
+        """Resize image to the nearest resolution bucket.
+
+        Selects the bucket with total pixel count closest to the original
+        image and resizes using LANCZOS interpolation for quality.
+
+        Args:
+            image (Image.Image): PIL Image to resize.
+            buckets (list[tuple[int, int]]): List of (height, width) buckets.
+
+        Returns:
+            Image.Image: Resized image at bucket resolution, or original
+                if already at a bucket size.
+        """
         w, h = image.size
         original_pixels = h * w
         target_h, target_w = min(buckets, key=lambda b: abs(b[0] * b[1] - original_pixels))
@@ -179,6 +299,19 @@ class MultiModalManager:
         return image.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
     def _token_str_for_id(self, tokenizer: Any, token_id: int | None) -> str | None:
+        """Convert a token ID to its string representation.
+
+        Tries multiple methods to convert the token ID: first using
+        convert_ids_to_tokens(), then falling back to decode().
+
+        Args:
+            tokenizer (Any): Tokenizer instance with convert_ids_to_tokens
+                or decode methods.
+            token_id (int | None): Token ID to convert.
+
+        Returns:
+            str | None: Token string if conversion succeeded, None otherwise.
+        """
         if token_id is None:
             return None
         token_id = int(token_id)
@@ -204,7 +337,20 @@ class MultiModalManager:
         return None
 
     def _placeholder_text(self, cfg: Any, tokenizer: Any, kind: str) -> str | None:
-        """Build a textual placeholder sequence for an image/video item."""
+        """Build a textual placeholder sequence for an image/video item.
+
+        Constructs the special token sequence (e.g., <|image_start|><|image|><|image_end|>)
+        used to represent multimodal content in the tokenized prompt.
+
+        Args:
+            cfg (Any): Model config with token ID attributes.
+            tokenizer (Any): Tokenizer for converting IDs to strings.
+            kind (str): Either "image" or "video".
+
+        Returns:
+            str | None: Placeholder string like "<start><token><end>", or None
+                if required token IDs are not available in the config.
+        """
         if kind == "image":
             token_id = getattr(cfg, "image_token_id", None)
             start_id = getattr(cfg, "image_start_token_id", None) or getattr(cfg, "vision_start_token_id", None)
@@ -230,9 +376,19 @@ class MultiModalManager:
     def _normalize_messages_for_chat_template(self, messages: list[dict], cfg: Any, tokenizer: Any) -> list[dict]:
         """Convert OpenAI-style multimodal content into template-friendly text.
 
-        Many tokenizer chat templates don't understand OpenAI-style content arrays.
-        For those, we convert each message `content=[{type:...}, ...]` into a
-        plain string containing the correct special tokens.
+        Many tokenizer chat templates don't understand OpenAI-style content arrays
+        with structured items like {"type": "image", ...}. This method converts
+        each message's content array into a plain string containing the correct
+        special tokens for the model.
+
+        Args:
+            messages (list[dict]): OpenAI-style messages with content arrays.
+            cfg (Any): Model config with token ID attributes.
+            tokenizer (Any): Tokenizer for converting IDs to strings.
+
+        Returns:
+            list[dict]: Messages with content converted to plain strings
+                containing appropriate placeholder tokens.
         """
         image_placeholder = self._placeholder_text(cfg, tokenizer, "image")
         video_placeholder = self._placeholder_text(cfg, tokenizer, "video")
@@ -276,6 +432,15 @@ class MultiModalManager:
         return out
 
     def _get_vision_config(self) -> Any | None:
+        """Get the vision config from the model.
+
+        Attempts to retrieve the vision configuration using multiple
+        strategies: first trying get_vision_config() method, then
+        falling back to vision_config attribute.
+
+        Returns:
+            Any | None: Vision config object if available, None otherwise.
+        """
         if self.model is None:
             return None
         cfg = getattr(self.model, "config", None)
@@ -293,7 +458,13 @@ class MultiModalManager:
 
         HuggingFace ProcessorMixin instances often expose the tokenizer on a
         `.tokenizer` attribute, while tokenizer-only flows pass a
-        PreTrainedTokenizerBase directly.
+        PreTrainedTokenizerBase directly. This method handles both cases.
+
+        Returns:
+            Any: A tokenizer object that supports apply_chat_template().
+
+        Raises:
+            ValueError: If processor is not configured.
         """
         if self.processor is None:
             raise ValueError("Processor not configured for tokenization")
@@ -311,6 +482,11 @@ class MultiModalManager:
 
         GLM4V/GLM46V and Qwen VL models in EasyDeL expect `pixel_values` shaped
         as flattened spatio-temporal patches: [num_patches_total, patch_features].
+        This method checks the model_type to determine if flat-patch format
+        is expected.
+
+        Returns:
+            bool: True if the model expects flat-patch inputs, False otherwise.
         """
         if self.model is None:
             return False
@@ -335,8 +511,17 @@ class MultiModalManager:
 
         Some vision towers (GLM/Qwen) require grid height/width to be divisible
         by `spatial_merge_size`. When upstream preprocessing produces odd grids,
-        we pad the last row/col of patches to the nearest divisible size and
-        update `grid_thw` accordingly.
+        this method pads the last row/col of patches to the nearest divisible
+        size and updates `grid_thw` accordingly.
+
+        Args:
+            pixel_values (np.ndarray): Flat patches with shape [num_patches, patch_dim].
+            grid_thw (np.ndarray): Grid info with shape [num_images, 3], each row (T, H, W).
+            spatial_merge_size (int): The spatial merge factor requiring divisibility.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: Padded pixel_values and updated grid_thw.
+                Returns inputs unchanged if no padding is needed.
         """
         spatial_merge_size = int(spatial_merge_size or 1)
         if spatial_merge_size <= 1:
@@ -404,7 +589,29 @@ class MultiModalManager:
         temporal_patch_size: int,
         spatial_merge_size: int = 1,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Convert frames into flattened patches for GLM/Qwen-style vision towers."""
+        """Convert frames into flattened patches for GLM/Qwen-style vision towers.
+
+        Performs spatiotemporal patchification: divides video frames into
+        3D patches (temporal x height x width) and flattens them into the
+        format expected by flat-patch vision encoders.
+
+        Args:
+            frames (np.ndarray): Video frames with shape [T, H, W, C] where
+                T is number of frames, H/W are spatial dimensions, C=3 (RGB).
+            patch_size (int): Spatial patch size (typically 14).
+            temporal_patch_size (int): Temporal patch size (typically 2).
+            spatial_merge_size (int): Spatial merge factor for grid alignment.
+                Defaults to 1 (no alignment requirement).
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]:
+                - flat: Flattened patches [num_patches, C * temporal * patch * patch]
+                - grid_thw: Grid shape [t_groups, grid_h, grid_w]
+
+        Raises:
+            ValueError: If frames don't have expected 4D shape [T, H, W, C]
+                or if C != 3, or if patch sizes are invalid.
+        """
         if frames.ndim != 4:
             raise ValueError(f"Expected frames with shape [T,H,W,C], got {frames.shape}.")
         t_total, height, width, channels = frames.shape
@@ -454,7 +661,20 @@ class MultiModalManager:
         return flat, grid_thw
 
     def _normalize_rgb(self, rgb: np.ndarray) -> np.ndarray:
-        """CLIP-style normalization used by GLM/Qwen vision towers."""
+        """Apply CLIP-style normalization to RGB values.
+
+        Normalizes pixel values from [0, 255] to the standardized range
+        expected by CLIP-based vision encoders using ImageNet-derived
+        mean and standard deviation values.
+
+        Args:
+            rgb (np.ndarray): RGB image or video frames with values in [0, 255].
+                Can be any shape as long as the last dimension is 3 (RGB).
+
+        Returns:
+            np.ndarray: Normalized float32 array with approximately zero mean
+                and unit variance per channel.
+        """
         if rgb.dtype != np.float32:
             rgb = rgb.astype(np.float32)
         rgb = rgb / 255.0
@@ -468,14 +688,30 @@ class MultiModalManager:
         """Process images with resolution bucketing.
 
         Resizes images to bucket resolutions and processes them using
-        the configured processor.
+        the configured processor. For flat-patch models without processor
+        support, falls back to manual patchification.
 
         Args:
-            images: List of PIL Images to process.
+            images (list[Image.Image] | None): List of PIL Images to process.
+                Can be None or empty, in which case (None, None) is returned.
 
         Returns:
-            Tuple of (pixel_values, image_grid_thw) numpy arrays.
-            Returns (None, None) if images is None or empty.
+            tuple[np.ndarray | None, np.ndarray | None]: A tuple containing:
+                - pixel_values: Processed pixel values. Shape depends on model:
+                  - Flat-patch: [total_patches, patch_dim]
+                  - Standard: [num_images, C, H, W]
+                - image_grid_thw: Grid shapes [num_images, 3] for flat-patch
+                  models, or None for standard models.
+
+        Raises:
+            ValueError: If processor doesn't support image preprocessing and
+                the model doesn't expose a flat-patch vision interface for
+                fallback processing.
+
+        Example:
+            >>> pixel_values, grid_thw = manager.process_images([img1, img2])
+            >>> if pixel_values is not None:
+            ...     print(f"Processed {len(images)} images")
         """
         if not images:
             return None, None
@@ -564,14 +800,30 @@ class MultiModalManager:
         """Process videos with spatial resolution bucketing.
 
         Resizes video frames to bucket resolutions and processes them
-        using the configured processor.
+        using the configured processor. For flat-patch models without
+        processor support, falls back to manual spatiotemporal patchification.
 
         Args:
-            videos: List of video arrays with shape (T, H, W, C).
+            videos (list[np.ndarray] | None): List of video arrays, each with
+                shape (T, H, W, C) where T is frame count, H/W are spatial
+                dimensions, and C=3 (RGB). Can be None or empty.
 
         Returns:
-            Tuple of (pixel_values_videos, video_grid_thw) numpy arrays.
-            Returns (None, None) if videos is None or empty.
+            tuple[np.ndarray | None, np.ndarray | None]: A tuple containing:
+                - pixel_values_videos: Processed pixel values. Shape depends on model:
+                  - Flat-patch: [total_patches, patch_dim]
+                  - Standard: [num_videos, T, C, H, W]
+                - video_grid_thw: Grid shapes [num_videos, 3] for flat-patch
+                  models (T=temporal groups), or None for standard models.
+
+        Raises:
+            ValueError: If processor doesn't support video preprocessing and
+                the model doesn't expose a flat-patch vision interface for
+                fallback processing, or if video arrays have wrong shape.
+
+        Example:
+            >>> video = np.random.rand(16, 224, 224, 3).astype(np.uint8)
+            >>> pixel_values, grid_thw = manager.process_videos([video])
         """
         if not videos:
             return None, None
@@ -789,15 +1041,45 @@ class MultiModalManager:
         """Tokenize multimodal messages with placeholder insertion.
 
         Uses the processor's chat template to convert messages to token IDs,
-        inserting appropriate placeholder tokens for images and videos.
+        inserting appropriate placeholder tokens for images and videos. The
+        number of placeholder tokens is determined by the grid_thw arrays
+        for flat-patch models.
+
+        For flat-patch VLMs with pre-computed grid_thw, uses a tokenizer-only
+        fallback to ensure placeholder counts match the actual processed
+        pixel values.
 
         Args:
-            messages: OpenAI-style messages list.
-            images: Preprocessed images (optional, extracts from messages if None).
-            videos: Preprocessed videos (optional, extracts from messages if None).
+            messages (list[dict]): OpenAI-style messages list with content
+                arrays that may include image/video/text items.
+            images (list[Image.Image] | None): Preprocessed images. If None,
+                images are extracted from messages. Defaults to None.
+            videos (list[np.ndarray] | None): Preprocessed videos. If None,
+                videos are extracted from messages. Defaults to None.
+            image_grid_thw (np.ndarray | None): Pre-computed grid shapes for
+                images, used to determine placeholder counts. Shape [N, 3].
+                Defaults to None.
+            video_grid_thw (np.ndarray | None): Pre-computed grid shapes for
+                videos, used to determine placeholder counts. Shape [N, 3].
+                Defaults to None.
 
         Returns:
-            List of token IDs with image/video placeholders inserted.
+            list[int]: List of token IDs with image/video placeholders
+                properly expanded to match the vision encoder output size.
+
+        Raises:
+            ValueError: If tokenizer-only fallback is needed but model is
+                not provided, or if placeholder patterns are not found in
+                the tokenized output for all media items.
+
+        Example:
+            >>> token_ids = manager.tokenize_multimodal(
+            ...     messages=[{"role": "user", "content": [
+            ...         {"type": "image", "image": img},
+            ...         {"type": "text", "text": "Describe this image"}
+            ...     ]}],
+            ...     image_grid_thw=grid_thw
+            ... )
         """
         if images is None and videos is None:
             images, videos = self.extract_media_from_messages(messages)
@@ -949,7 +1231,16 @@ class MultiModalManager:
         return out
 
     def clear_cache(self) -> None:
-        """Clear the vision encoder cache."""
+        """Clear the vision encoder cache.
+
+        Removes all cached vision encoder outputs and resets cache statistics.
+        Has no effect if caching is disabled.
+
+        Example:
+            >>> manager.clear_cache()
+            >>> stats = manager.get_cache_stats()
+            >>> assert stats['num_entries'] == 0 if stats else True
+        """
         if self.cache is not None:
             self.cache.clear()
 
@@ -961,14 +1252,27 @@ class MultiModalManager:
         """Process images and create MultiModalFeature objects.
 
         Processes images with resolution bucketing and creates feature objects
-        with content-based hashing for cache lookups.
+        with content-based hashing for cache lookups. Each image becomes a
+        separate MultiModalFeature with its own hash and pixel values.
+
+        For flat-patch models, properly slices the concatenated pixel_values
+        using the grid_thw information to create per-image features.
 
         Args:
-            images: List of PIL Images to process.
-            request_idx: Index of the request in a batch.
+            images (list[Image.Image] | None): List of PIL Images to process.
+                Can be None or empty, in which case an empty list is returned.
+            request_idx (int): Index of the request in a batch. Used for
+                tracking which request each feature belongs to. Defaults to 0.
 
         Returns:
-            List of MultiModalFeature objects with pixel values and hashes.
+            list[MultiModalFeature]: List of feature objects, one per input
+                image. Each feature has pixel_values, grid_thw (if applicable),
+                mm_hash for caching, and the request_idx.
+
+        Example:
+            >>> features = manager.process_images_to_features([img1, img2], request_idx=0)
+            >>> for feat in features:
+            ...     print(f"Hash: {feat.mm_hash}, Shape: {feat.pixel_values.shape}")
         """
         if not images:
             return []
@@ -1023,14 +1327,28 @@ class MultiModalManager:
         """Process videos and create MultiModalFeature objects.
 
         Processes videos with resolution bucketing and creates feature objects
-        with content-based hashing for cache lookups.
+        with content-based hashing for cache lookups. Each video becomes a
+        separate MultiModalFeature with its own hash and pixel values.
+
+        For flat-patch models, properly slices the concatenated pixel_values
+        using the grid_thw information to create per-video features.
 
         Args:
-            videos: List of video arrays with shape (T, H, W, C).
-            request_idx: Index of the request in a batch.
+            videos (list[np.ndarray] | None): List of video arrays, each with
+                shape (T, H, W, C). Can be None or empty, in which case an
+                empty list is returned.
+            request_idx (int): Index of the request in a batch. Used for
+                tracking which request each feature belongs to. Defaults to 0.
 
         Returns:
-            List of MultiModalFeature objects with pixel values and hashes.
+            list[MultiModalFeature]: List of feature objects, one per input
+                video. Each feature has pixel_values, grid_thw (if applicable),
+                mm_hash for caching, and the request_idx.
+
+        Example:
+            >>> video = np.random.rand(16, 224, 224, 3).astype(np.uint8)
+            >>> features = manager.process_videos_to_features([video], request_idx=1)
+            >>> print(f"Created {len(features)} video features")
         """
         if not videos:
             return []
@@ -1080,8 +1398,24 @@ class MultiModalManager:
     def get_cache_stats(self) -> dict | None:
         """Get vision encoder cache statistics.
 
+        Retrieves performance metrics from the internal vision encoder cache,
+        including hit rate, memory usage, and entry count.
+
         Returns:
-            Dictionary with cache stats or None if cache is disabled.
+            dict | None: Dictionary with cache statistics if caching is
+                enabled, None if caching is disabled. When enabled, contains:
+                - hits (int): Number of cache hits
+                - misses (int): Number of cache misses
+                - hit_rate (float): Ratio of hits to total lookups (0.0-1.0)
+                - size_mb (float): Current cache size in megabytes
+                - num_entries (int): Number of cached entries
+                - capacity_mb (float): Maximum cache capacity in megabytes
+
+        Example:
+            >>> stats = manager.get_cache_stats()
+            >>> if stats:
+            ...     print(f"Cache hit rate: {stats['hit_rate']:.1%}")
+            ...     print(f"Memory usage: {stats['size_mb']:.1f} MB")
         """
         if self.cache is not None:
             return self.cache.get_stats()

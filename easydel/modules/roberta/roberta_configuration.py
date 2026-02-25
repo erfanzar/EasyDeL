@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from eformer.common_types import ColumnWise, Replicated, RowWise
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -122,33 +122,15 @@ class RobertaConfig(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the RoBERTa model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embeddings/word_embeddings/embedding", pmag.resolve(ColumnWise)),
-            (r"embeddings/position_embeddings/embedding", pmag.resolve(Replicated)),
-            (r"embeddings/token_type_embeddings/embedding", pmag.resolve(Replicated)),
-            (r"attention/self/(query|key|value)/kernel", pmag.resolve(ColumnWise)),
-            (r"attention/output/dense/kernel", pmag.resolve(RowWise)),
-            (r"intermediate/dense/kernel", pmag.resolve(ColumnWise)),
-            (r"output/dense/kernel", pmag.resolve(RowWise)),
-            (r"pooler/dense/kernel", pmag.resolve(ColumnWise)),
-            (r"lm_head/dense/kernel", pmag.resolve(ColumnWise)),
-            (r"lm_head/decoder/kernel", pmag.resolve(ColumnWise)),
-            (r"classifier/dense/kernel", pmag.resolve(ColumnWise)),
-            (r"classifier/out_proj/kernel", pmag.resolve(RowWise)),
-            (r"qa_outputs/kernel", pmag.resolve(RowWise)),
-            (r".*LayerNorm/scale", pmag.resolve(Replicated)),
-            (r".*LayerNorm/bias", pmag.resolve(Replicated)),
-            (
-                r".*/(query|key|value|dense|fc1|fc2|c_attn|q_attn|c_proj|c_fc|lm_head|classifier|qa_outputs)/bias",
-                pmag.resolve(Replicated),
-            ),
-            (r"lm_head/bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None

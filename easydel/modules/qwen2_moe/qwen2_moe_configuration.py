@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,30 +13,12 @@
 # limitations under the License.
 
 
-import typing as tp
-
-from eformer.common_types import (
-    EMPTY,
-    MODE_TRAIN,
-    TP,
-    ColumnWise,
-    DynamicShardingAxes,
-    Replicated,
-    RowWise,
-)
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
-from easydel.layers.moe.utils import get_moe_partition_spec
-
-
-class ExpertTensorParallel(DynamicShardingAxes):
-    """Expert Tensor Parallelism (EPxTP) sharding axes."""
-
-    axes: tp.ClassVar = [TP, EMPTY, EMPTY]
-    mode: tp.ClassVar = MODE_TRAIN
 
 
 @register_config("qwen2_moe")
@@ -214,67 +196,27 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [
-                "sliding_attention"
-                if self.sliding_window is not None and i >= self.max_window_layers
-                else "full_attention"
+                (
+                    "sliding_attention"
+                    if self.sliding_window is not None and i >= self.max_window_layers
+                    else "full_attention"
+                )
                 for i in range(self.num_hidden_layers)
             ]
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
-    def get_partition_rules(self, *args, **kwargs):
-        """
-        Get the partition rules for the model.
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
         Returns:
-            `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
         """
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/(q_proj|k_proj|v_proj)/bias", pmag.resolve(Replicated)),
-            (r"self_attn/o_proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/gate/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
-            (r"mlp/gate/bias", pmag.resolve(Replicated)),
-            (
-                r"mlp/experts/(gate_proj|up_proj)/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="column",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (
-                r"mlp/experts/down_proj/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="row",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (r"mlp/experts/.*bias", pmag.resolve(Replicated)),
-            (r"mlp/shared_expert/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/shared_expert/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/shared_expert/.*bias", pmag.resolve(Replicated)),
-            (r"mlp/shared_expert_gate/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/shared_expert_gate/bias", pmag.resolve(Replicated)),
-            (r".*/(input_layernorm|post_attention_layernorm|norm)/kernel", pmag.resolve(Replicated)),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+        return None
 
     @property
     def granted_freq_max_position_embedding(self) -> int:

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,29 +13,11 @@
 # limitations under the License.
 
 
-import typing as tp
-
-from eformer.common_types import (
-    EMPTY,
-    MODE_TRAIN,
-    TP,
-    ColumnWise,
-    DynamicShardingAxes,
-    Replicated,
-    RowWise,
-)
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
-from easydel.layers.moe.utils import get_moe_partition_spec
-from easydel.layers.rotary_embedding import RopeConfig
-
-
-class ExpertTensorParallel(DynamicShardingAxes):
-    """Expert Tensor Parallelism (EPxTP) sharding axes."""
-
-    axes: tp.ClassVar = [TP, EMPTY, EMPTY]
-    mode: tp.ClassVar = MODE_TRAIN
+from easydel.layers import RopeConfig
 
 
 @register_config("xerxes2")
@@ -156,6 +138,8 @@ class Xerxes2Config(EasyDeLBaseConfig):
         self.vhead_dim = vhead_dim
         self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
         self.hidden_act = hidden_act if hidden_act is not None else "silu"
+        if rope_scaling is None:
+            rope_scaling = {"type": "linear", "factor": 1.0}
         self.rope_scaling = rope_scaling
         self.layer_types = layer_types
         if self.layer_types is None:
@@ -169,70 +153,18 @@ class Xerxes2Config(EasyDeLBaseConfig):
             **kwargs,
         )
 
-    def get_partition_rules(self, *args, **kwargs):
-        pmag = self.partition_manager
-        return (
-            (r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
-            (r"self_attn/qa_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/qb_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/qc_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/kv_mqa_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/kvi_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
-            (r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
-            (r"self_attn/(qa_norm|kv_norm)/scale", pmag.resolve(Replicated)),
-            (r"self_attn/(qa_norm|kv_norm)/bias", pmag.resolve(Replicated)),
-            (r"mlp/gate_up_proj/kernel", pmag.resolve(ColumnWise)),
-            (r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
-            (r"mlp/.*proj/bias", pmag.resolve(Replicated)),
-            (r"mlp/gate/kernel", pmag.resolve(Replicated if self.use_expert_tensor_mode else ColumnWise)),
-            (r"mlp/gate/bias", pmag.resolve(Replicated)),
-            (
-                r"mlp/experts/gate_proj/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="column",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (
-                r"mlp/experts/up_proj/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="column",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (
-                r"mlp/experts/down_proj/kernel",
-                get_moe_partition_spec(
-                    partition_manager=self.partition_manager,
-                    direction="row",
-                    tensors_are_expert=self.use_expert_tensor_mode,
-                    is_bias=False,
-                    fsdp_is_ep_bound=self.fsdp_is_ep_bound,
-                    sp_is_ep_bound=self.sp_is_ep_bound,
-                    module_view=True,
-                ),
-            ),
-            (r"mlp/experts/.*/bias", pmag.resolve(Replicated)),
-            (
-                r".*/(input_layernorm|post_attention_layernorm|pre_feedforward_layernorm|post_feedforward_layernorm|norm)/kernel",
-                pmag.resolve(Replicated),
-            ),
-            (r"lm_head/kernel", pmag.resolve(ColumnWise)),
-            (r"score/kernel", pmag.resolve(RowWise)),
-            (r".*bias", pmag.resolve(Replicated)),
-            (r".*", pmag.resolve(Replicated)),
-        )
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Returns partition rules for model sharding.
+
+        Providing explicit partition rules is preferred over automatic sharding resolution,
+        as it gives full control over parameter distribution across the device mesh.
+        Returns ``None`` by default, which triggers automatic sharding via
+        module-level ``craft_sharding`` hooks.
+
+        Returns:
+            Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
+        """
+        return None
 
     def _get_rope_config(self) -> RopeConfig:
         """Get RoPE configuration from the instance attributes."""

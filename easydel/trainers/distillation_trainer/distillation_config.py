@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -129,12 +129,12 @@ class DistillationConfig(TrainingArguments):
         },
     )
 
-    def __post_init__(self, max_sequence_length: int | None):
+    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
         if self.hidden_state_layers is not None:
             self.hidden_state_layers = tuple(int(i) for i in self.hidden_state_layers)
         if self.attention_layers is not None:
             self.attention_layers = tuple(int(i) for i in self.attention_layers)
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=max_sequence_length)
+            super().__post_init__(max_sequence_length=max_sequence_length, quantization_block=quantization_block)
 
     __hash__ = hash_fn

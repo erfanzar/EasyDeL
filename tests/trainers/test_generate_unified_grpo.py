@@ -50,7 +50,7 @@ def test_generate_unified_matches_prompt_ids():
         overrides={
             "max_prompt_length": 128,
             "max_completion_length": 32,
-            "max_sequence_length": 200,
+            "max_length": 200,
             "num_return_sequences": 8,
             "use_esurge_generation": True,
             "generation_max_new_tokens": 16,

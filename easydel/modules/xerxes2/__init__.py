@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -66,7 +66,7 @@ Default Configuration (Xerxes2 Base):
 Usage Example:
     ```python
     from easydel import Xerxes2Config, Xerxes2ForCausalLM
-    from easydel.layers.rotary_embedding import RopeConfig
+    from easydel.layers import RopeConfig
     import jax.numpy as jnp
     from flax import nnx as nn
 
@@ -109,7 +109,6 @@ Available Classes:
     - Xerxes2Config: Configuration class for Xerxes2 models
     - Xerxes2Model: Base Xerxes2 transformer model
     - Xerxes2ForCausalLM: Xerxes2 with causal language modeling head
-    - ExpertTensorParallel: Specialized sharding axes for MoE experts
 
 Advanced Features:
     - Expert Tensor Parallelism: EPxTP sharding strategy for efficient expert distribution
