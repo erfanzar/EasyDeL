@@ -19,6 +19,8 @@ sharding_test.py
 cluster.yaml
 exprimental.py
 autoscale/cluster.yaml
+autoscale/easydel-*.yaml
+!autoscale/easydel-cluster-template.yaml
 memory_log_dir/
 wandb
 .ruff_cache/*

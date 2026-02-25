@@ -161,12 +161,12 @@ if cache.contains("key"):  # Also checks expiry
 
 ### Compression Options
 
-| Compression | Speed | Ratio | Use Case |
-|-------------|-------|-------|----------|
-| `none` | Fastest | 1.0x | SSDs, small data |
-| `gzip` | Slow | ~3x | Maximum compatibility |
-| `lz4` | Fast | ~2x | Balanced (recommended) |
-| `zstd` | Medium | ~3.5x | Best ratio |
+| Compression | Speed   | Ratio | Use Case               |
+| ----------- | ------- | ----- | ---------------------- |
+| `none`      | Fastest | 1.0x  | SSDs, small data       |
+| `gzip`      | Slow    | ~3x   | Maximum compatibility  |
+| `lz4`       | Fast    | ~2x   | Balanced (recommended) |
+| `zstd`      | Medium  | ~3.5x | Best ratio             |
 
 ## Dataset Cache
 

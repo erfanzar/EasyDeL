@@ -37,6 +37,7 @@ python -m easydel.scripts.elarge config.yaml --dry-run
 ### YAML Structure
 
 A YAML configuration file has two main parts:
+
 1. **Configuration** - Model, sharding, data, and trainer settings
 2. **Actions** - Sequential operations to execute
 
@@ -61,16 +62,16 @@ actions:
 
 ### Available Actions
 
-| Action | Description | Parameters |
-|--------|-------------|------------|
-| `validate` | Validate configuration before execution | None |
-| `train` | Run training with configured trainer | None |
-| `eval` | Run evaluation with lm-evaluation-harness | `tasks`, `engine`, `num_fewshot`, `output_path`, `print_results` |
-| `serve` / `server` | Start OpenAI-compatible API server | `host`, `port`, `log_level`, etc. |
-| `print` / `show` | Print eLargeModel summary | None |
-| `dump_config` / `config` | Print normalized configuration | None |
-| `to_json` / `save_json` | Save config to JSON file | `path` or string path |
-| `to_yaml` / `save_yaml` | Save config to YAML file | `path` or string path |
+| Action                   | Description                               | Parameters                                                       |
+| ------------------------ | ----------------------------------------- | ---------------------------------------------------------------- |
+| `validate`               | Validate configuration before execution   | None                                                             |
+| `train`                  | Run training with configured trainer      | None                                                             |
+| `eval`                   | Run evaluation with lm-evaluation-harness | `tasks`, `engine`, `num_fewshot`, `output_path`, `print_results` |
+| `serve` / `server`       | Start OpenAI-compatible API server        | `host`, `port`, `log_level`, etc.                                |
+| `print` / `show`         | Print eLargeModel summary                 | None                                                             |
+| `dump_config` / `config` | Print normalized configuration            | None                                                             |
+| `to_json` / `save_json`  | Save config to JSON file                  | `path` or string path                                            |
+| `to_yaml` / `save_yaml`  | Save config to YAML file                  | `path` or string path                                            |
 
 ---
 
@@ -128,6 +129,7 @@ sharding:
 ```
 
 **Common configurations:**
+
 - `[1, -1, 1, 1, 1]` - Full FSDP sharding
 - `[1, 4, 1, 2, 1]` - 4-way FSDP + 2-way tensor parallel
 - `[2, -1, 1, 1, 1]` - 2-way data parallel + FSDP
@@ -526,7 +528,7 @@ actions:
 
 ## Python API
 
-### Basic Usage
+### Basic Usage elarge
 
 ```python
 from easydel.infra import eLargeModel
@@ -675,20 +677,21 @@ elm.clear_cache()
 
 ## Trainer Types
 
-| Type | Description | Key Parameters |
-|------|-------------|----------------|
-| `sft` | Supervised Fine-Tuning | `learning_rate`, `num_train_epochs` |
-| `dpo` | Direct Preference Optimization | `beta`, `label_smoothing` |
-| `orpo` | Odds Ratio Preference Optimization | `beta`, `lambda_orpo` |
-| `grpo` | Group Relative Policy Optimization | `group_size`, `kl_coef` |
-| `reward` | Reward Model Training | - |
-| `distillation` | Knowledge Distillation | `alpha`, `temperature` |
+| Type           | Description                        | Key Parameters                      |
+| -------------- | ---------------------------------- | ----------------------------------- |
+| `sft`          | Supervised Fine-Tuning             | `learning_rate`, `num_train_epochs` |
+| `dpo`          | Direct Preference Optimization     | `beta`, `label_smoothing`           |
+| `orpo`         | Odds Ratio Preference Optimization | `beta`, `lambda_orpo`               |
+| `grpo`         | Group Relative Policy Optimization | `group_size`, `kl_coef`             |
+| `reward`       | Reward Model Training              | -                                   |
+| `distillation` | Knowledge Distillation             | `alpha`, `temperature`              |
 
 ---
 
 ## Best Practices
 
 1. **Always validate before execution:**
+
    ```yaml
    actions:
      - validate  # First action
@@ -696,11 +699,13 @@ elm.clear_cache()
    ```
 
 2. **Use dry-run for debugging:**
+
    ```bash
    python -m easydel.scripts.elarge config.yaml --dry-run
    ```
 
 3. **Save configurations for reproducibility:**
+
    ```yaml
    actions:
      - to_yaml: ./saved_config.yaml
@@ -708,6 +713,7 @@ elm.clear_cache()
    ```
 
 4. **Start with smaller test runs:**
+
    ```yaml
    trainer:
      num_train_epochs: 1
@@ -715,6 +721,7 @@ elm.clear_cache()
    ```
 
 5. **Use appropriate sharding for your hardware:**
+
    ```yaml
    # Single GPU/TPU
    sharding:
@@ -730,6 +737,7 @@ elm.clear_cache()
    ```
 
 6. **Enable token packing for efficiency:**
+
    ```yaml
    mixture:
      pack_tokens: true

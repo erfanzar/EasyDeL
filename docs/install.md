@@ -8,9 +8,7 @@ To install EasyDeL in a Kaggle or Colab environment, follow these steps:
 
 ```shell
 pip uninstall torch-xla -y -q  # Remove pre-installed torch-xla (for TPUs)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu -qU  # Install PyTorch for model conversion
-pip install git+https://github.com/erfanzar/easydel -qU  # Install EasyDeL from the latest source
-pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -qU  # Install JAX for TPUs
+pip install -U "easydel[tpu,torch,podutils]"  # Install EasyDeL with TPU + PyTorch + podutils extras
 ```
 
 ### Configuring TPU Hosts for Multi-Host or Multi-Slice Usage
@@ -41,9 +39,8 @@ eopod configure --project-id YOUR_PROJECT_ID --zone YOUR_ZONE --tpu-name YOUR_TP
 Use `eopod` to install the necessary packages on all TPU slices:
 
 ```shell
-eopod run pip install torch --index-url https://download.pytorch.org/whl/cpu -qU  # Required for model conversion
-eopod run pip install git+https://github.com/erfanzar/easydel -qU  # Install EasyDeL from the latest source
-eopod run pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -qU  # Install JAX for TPUs
+eopod run pip uninstall torch-xla -y -q
+eopod run pip install -U "easydel[tpu,torch,podutils]"
 ```
 
 ## Using EasyDeL with Ray
@@ -60,8 +57,10 @@ EasyDeL pins Ray to a known-good version to avoid cluster/CLI mismatches:
 If you use Ray autoscaler (`ray up/attach/down`), run the CLI with the same pinned version:
 
 ```shell
-uv run --python 3.13 ray up autoscale/easydel-us-central1-a.yaml --no-config-cache
-uv run --python 3.13 ray attach autoscale/easydel-us-central1-a.yaml
+uv run --python 3.13 python autoscale/generate-cluster-configs.py --project-id YOUR_PROJECT_ID --output-dir autoscale
+CLUSTER_YAML=autoscale/easydel-<YOUR_ZONE>.yaml
+uv run --python 3.13 ray up "$CLUSTER_YAML" --no-config-cache
+uv run --python 3.13 ray attach "$CLUSTER_YAML"
 ```
 
 Notes:

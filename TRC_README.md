@@ -1,4 +1,3 @@
-
 <!-- markdownlint-disable MD033 MD045 MD041 -->
 <div align="center">
  <div style="margin-bottom: 50px;">

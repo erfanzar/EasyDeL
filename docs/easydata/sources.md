@@ -4,15 +4,15 @@ EasyData supports loading data from multiple sources with a unified `ShardedData
 
 ## Supported Formats
 
-| Format | Class | Extensions | Cloud Support |
-|--------|-------|------------|---------------|
-| Parquet | `ParquetShardedSource` | `.parquet`, `.pq` | GCS, S3, HTTP |
-| JSON/JSONL | `JsonShardedSource` | `.json`, `.jsonl` | GCS, S3, HTTP |
-| Arrow IPC | `ArrowShardedSource` | `.arrow` | GCS, S3, HTTP |
-| CSV | `CsvShardedSource` | `.csv` | GCS, S3, HTTP |
-| Plain Text | `TextShardedSource` | `.txt` | GCS, S3, HTTP |
-| HuggingFace Hub | `HuggingFaceShardedSource` | - | Native |
-| HF Dataset | `HFDatasetShardedSource` | - | - |
+| Format          | Class                      | Extensions        | Cloud Support |
+| --------------- | -------------------------- | ----------------- | ------------- |
+| Parquet         | `ParquetShardedSource`     | `.parquet`, `.pq` | GCS, S3, HTTP |
+| JSON/JSONL      | `JsonShardedSource`        | `.json`, `.jsonl` | GCS, S3, HTTP |
+| Arrow IPC       | `ArrowShardedSource`       | `.arrow`          | GCS, S3, HTTP |
+| CSV             | `CsvShardedSource`         | `.csv`            | GCS, S3, HTTP |
+| Plain Text      | `TextShardedSource`        | `.txt`            | GCS, S3, HTTP |
+| HuggingFace Hub | `HuggingFaceShardedSource` | -                 | Native        |
+| HF Dataset      | `HFDatasetShardedSource`   | -                 | -             |
 
 ## ParquetShardedSource
 
@@ -91,13 +91,15 @@ for shard in source.shard_names:
 ### JSON vs JSONL
 
 **JSONL** (recommended for large datasets):
-```jsonl
+
+```json
 {"text": "First example"}
 {"text": "Second example"}
 {"text": "Third example"}
 ```
 
 **JSON array** (simpler but loads entire file):
+
 ```json
 [
   {"text": "First example"},
