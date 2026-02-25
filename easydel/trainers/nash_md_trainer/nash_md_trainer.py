@@ -178,6 +178,7 @@ class NashMDTrainer(GRPOTrainer):
         straight_through_emulator = resolve_straight_through_emulator(
             quantization_mode=self.arguments.quantization_mode,
             quantization_group_size=self.arguments.quantization_group_size,
+            quantization_bits=self.arguments.quantization_bits,
             tensor_straight_through=self.arguments.tensor_straight_through,
             straight_through_emulator=self.arguments.straight_through_emulator,
         )

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import typing as tp
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from ..core.protocols import ShardedDataSource, ShardInfo
@@ -84,6 +85,20 @@ def _detect_format(files: list[str]) -> str:
                 else:
                     return "arrow"
     return "arrow"  # Default
+
+
+def _coerce_example(example: tp.Any) -> dict[str, tp.Any]:
+    """Normalize dataset rows to dictionary examples."""
+    if isinstance(example, dict):
+        return example
+    if isinstance(example, Mapping):
+        return dict(example)
+    if hasattr(example, "items"):
+        try:
+            return dict(example.items())
+        except Exception:
+            pass
+    raise TypeError(f"Expected mapping-like dataset row, got {type(example).__name__}")
 
 
 def expand_data_files(data_files: str | os.PathLike | list[str | os.PathLike]) -> list[str]:
@@ -571,7 +586,8 @@ class HuggingFaceShardedSource(ShardedDataSource[dict]):
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
         """Open the HuggingFace dataset shard."""
         ds = self._load_dataset()
-        yield from ds
+        for example in ds:
+            yield _coerce_example(example)
 
     def open_shard_at_row(self, shard_name: str, row: int) -> "Iterator[dict]":
         """Open the HuggingFace dataset starting at a specific row."""
@@ -580,10 +596,12 @@ class HuggingFaceShardedSource(ShardedDataSource[dict]):
             it = iter(ds)
             for _ in range(row):
                 next(it, None)
-            yield from it
+            for example in it:
+                yield _coerce_example(example)
         else:
             # Non-streaming: use select
-            yield from ds.select(range(row, len(ds)))
+            for example in ds.select(range(row, len(ds))):
+                yield _coerce_example(example)
 
     def __len__(self) -> int:
         """Return number of examples in the dataset.

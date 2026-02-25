@@ -50,9 +50,11 @@ if tp.TYPE_CHECKING:
     from collections.abc import Iterator
 
     from datasets import Dataset as DS
+    from datasets import IterableDataset as IDS
 
 
 logger = logging.getLogger(__name__)
+PipelineDataValue = ShardedDataSource | AsyncDataLoader
 
 
 class Pipeline:
@@ -85,7 +87,7 @@ class Pipeline:
         """
         self._config = config
         self._context = PipelineContext(config=config, seed=config.seed)
-        self._data: dict[str, ShardedDataSource] | None = None
+        self._data: dict[str, PipelineDataValue] | None = None
         self._stages: list[str] = []
 
     @classmethod
@@ -149,10 +151,11 @@ class Pipeline:
             Self for chaining.
         """
         self._ensure_data()
+        data = tp.cast(dict[str, ShardedDataSource], self._data)
 
         stage_config = config or self._config.tokenize
         stage = TokenizeStage(stage_config)
-        self._data = stage.process(self._data, self._context)
+        self._data = stage.process(data, self._context)
         self._stages.append("tokenize")
         return self
 
@@ -168,15 +171,16 @@ class Pipeline:
             Self for chaining.
         """
         self._ensure_data()
+        data = tp.cast(dict[str, ShardedDataSource], self._data)
 
-        if len(self._data) <= 1:
+        if len(data) <= 1:
             logger.info("Only one dataset, skipping mix stage")
             self._stages.append("mix")
             return self
 
         stage_config = config or self._config.mix
         stage = MixStage(stage_config)
-        self._data = stage.process(self._data, self._context)
+        self._data = stage.process(data, self._context)
         self._stages.append("mix")
         return self
 
@@ -192,10 +196,11 @@ class Pipeline:
             Self for chaining.
         """
         self._ensure_data()
+        data = tp.cast(dict[str, ShardedDataSource], self._data)
 
         stage_config = config or self._config.pack
         stage = PackStage(stage_config)
-        self._data = stage.process(self._data, self._context)
+        self._data = stage.process(data, self._context)
         self._stages.append("pack")
         return self
 
@@ -211,10 +216,11 @@ class Pipeline:
             Self for chaining.
         """
         self._ensure_data()
+        data = tp.cast(dict[str, ShardedDataSource], self._data)
 
         stage_config = config or self._config.save
         stage = SaveStage(stage_config)
-        self._data = stage.process(self._data, self._context)
+        self._data = stage.process(data, self._context)
         self._stages.append("save")
         return self
 
@@ -228,14 +234,15 @@ class Pipeline:
             Self for chaining.
         """
         self._ensure_data()
+        data = tp.cast(dict[str, ShardedDataSource], self._data)
 
         stage_config = config or self._config.load
         stage = LoadStage(stage_config)
-        self._data = stage.process(self._data, self._context)
+        self._data = stage.process(data, self._context)
         self._stages.append("load")
         return self
 
-    def build(self) -> "Iterator[dict] | AsyncDataLoader":
+    def build(self) -> "ShardedDataSource | Iterator[dict] | AsyncDataLoader":
         """Build and return the final data iterator.
 
         Returns:
@@ -436,7 +443,7 @@ def pretokenize(
     return stats
 
 
-def build_dataset(mixture: DatasetMixture) -> "DS":
+def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
     """Build a unified dataset from a DatasetMixture configuration.
 
     This is the main entry point for creating datasets. It handles loading
@@ -534,7 +541,9 @@ def build_dataset(mixture: DatasetMixture) -> "DS":
                     if "chosen" in ex and "rejected" in ex:
                         out = dict(ex)
                     else:
-                        raise KeyError(f"Missing content field '{_content_field}'. Available keys: {list(ex.keys())}") from e
+                        raise KeyError(
+                            f"Missing content field '{_content_field}'. Available keys: {list(ex.keys())}"
+                        ) from e
                 for f in _addl:
                     if f in ex:
                         out[f] = ex[f]

@@ -70,9 +70,8 @@ class TransformedShardedSource(ShardedDataSource[dict]):
         Yields:
             Transformed examples (filtered examples are skipped).
         """
-        is_expand = getattr(self._transform, "is_expand", False)
         for example in self._source.open_shard(shard_name):
-            if is_expand:
+            if isinstance(self._transform, ExpandTransform):
                 # ExpandTransform: yields multiple examples
                 yield from self._transform(example)
             else:
@@ -94,9 +93,8 @@ class TransformedShardedSource(ShardedDataSource[dict]):
         Yields:
             Transformed examples (filtered examples are skipped).
         """
-        is_expand = getattr(self._transform, "is_expand", False)
         for example in self._source.open_shard_at_row(shard_name, row):
-            if is_expand:
+            if isinstance(self._transform, ExpandTransform):
                 # ExpandTransform: yields multiple examples
                 yield from self._transform(example)
             else:

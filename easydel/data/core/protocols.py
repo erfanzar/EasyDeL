@@ -23,6 +23,7 @@ This module defines the base interfaces for:
 
 from __future__ import annotations
 
+import importlib
 import typing as tp
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
@@ -158,9 +159,16 @@ class ShardedDataSource(ABC, Generic[T_co]):
         Returns:
             TransformedShardedSource with filter applied.
         """
-        from ..transforms import FilterTransform, TransformedShardedSource
+        filter_ops = importlib.import_module("easydel.data.transforms.filter_ops")
+        source_mod = importlib.import_module("easydel.data.transforms.source")
+        filter_transform = filter_ops.FilterTransform
+        transformed_source = source_mod.TransformedShardedSource
 
-        return TransformedShardedSource(self, FilterTransform(predicate))
+        transformed = transformed_source(
+            tp.cast("ShardedDataSource[dict[str, Any]]", self),
+            filter_transform(tp.cast(tp.Callable[[dict[str, Any]], bool], predicate)),
+        )
+        return tp.cast("ShardedDataSource[T_co]", transformed)
 
     def __len__(self) -> int:
         """Return total number of examples across all shards.
@@ -182,9 +190,9 @@ class ShardedDataSource(ABC, Generic[T_co]):
         Returns:
             TransformedShardedSource with transform applied.
         """
-        from ..transforms import TransformedShardedSource
-
-        return TransformedShardedSource(self, transform)
+        source_mod = importlib.import_module("easydel.data.transforms.source")
+        transformed_source = source_mod.TransformedShardedSource
+        return transformed_source(tp.cast("ShardedDataSource[dict[str, Any]]", self), transform)
 
     def rename_fields(
         self,
@@ -198,9 +206,14 @@ class ShardedDataSource(ABC, Generic[T_co]):
         Returns:
             TransformedShardedSource with rename applied.
         """
-        from ..transforms import RenameFields, TransformedShardedSource
-
-        return TransformedShardedSource(self, RenameFields(mapping))
+        field_ops = importlib.import_module("easydel.data.transforms.field_ops")
+        source_mod = importlib.import_module("easydel.data.transforms.source")
+        rename_fields = field_ops.RenameFields
+        transformed_source = source_mod.TransformedShardedSource
+        return transformed_source(
+            tp.cast("ShardedDataSource[dict[str, Any]]", self),
+            rename_fields(mapping),
+        )
 
     def select_fields(
         self,
@@ -214,9 +227,14 @@ class ShardedDataSource(ABC, Generic[T_co]):
         Returns:
             TransformedShardedSource with selection applied.
         """
-        from ..transforms import SelectFields, TransformedShardedSource
-
-        return TransformedShardedSource(self, SelectFields(fields))
+        field_ops = importlib.import_module("easydel.data.transforms.field_ops")
+        source_mod = importlib.import_module("easydel.data.transforms.source")
+        select_fields = field_ops.SelectFields
+        transformed_source = source_mod.TransformedShardedSource
+        return transformed_source(
+            tp.cast("ShardedDataSource[dict[str, Any]]", self),
+            select_fields(fields),
+        )
 
     def drop_fields(
         self,
@@ -230,9 +248,14 @@ class ShardedDataSource(ABC, Generic[T_co]):
         Returns:
             TransformedShardedSource with drop applied.
         """
-        from ..transforms import DropFields, TransformedShardedSource
-
-        return TransformedShardedSource(self, DropFields(fields))
+        field_ops = importlib.import_module("easydel.data.transforms.field_ops")
+        source_mod = importlib.import_module("easydel.data.transforms.source")
+        drop_fields = field_ops.DropFields
+        transformed_source = source_mod.TransformedShardedSource
+        return transformed_source(
+            tp.cast("ShardedDataSource[dict[str, Any]]", self),
+            drop_fields(fields),
+        )
 
     def apply_chat_template(
         self,
@@ -252,15 +275,18 @@ class ShardedDataSource(ABC, Generic[T_co]):
         Returns:
             TransformedShardedSource with chat template applied.
         """
-        from ..transforms import ChatTemplateTransform, TransformedShardedSource
+        chat_template_mod = importlib.import_module("easydel.data.transforms.chat_template")
+        source_mod = importlib.import_module("easydel.data.transforms.source")
+        chat_template_transform = chat_template_mod.ChatTemplateTransform
+        transformed_source = source_mod.TransformedShardedSource
 
-        transform = ChatTemplateTransform(
+        transform = chat_template_transform(
             tokenizer=tokenizer,
             messages_field=messages_field,
             output_field=output_field,
             **kwargs,
         )
-        return TransformedShardedSource(self, transform)
+        return transformed_source(tp.cast("ShardedDataSource[dict[str, Any]]", self), transform)
 
 
 class MappedShardedDataSource(ShardedDataSource[T], Generic[T]):

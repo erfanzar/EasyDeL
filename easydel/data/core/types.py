@@ -368,9 +368,8 @@ class DatasetMixture:
             >>> for batch in dataset:
             ...     process(batch)
         """
-        from ..execution.pipeline import build_dataset
-
-        return build_dataset(self)
+        pipeline_mod = __import__("easydel.data.execution.pipeline", fromlist=["build_dataset"])
+        return pipeline_mod.build_dataset(self)
 
 
 class DatasetLoadError(Exception):

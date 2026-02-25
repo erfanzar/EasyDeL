@@ -68,7 +68,24 @@ else:
 MetricsType = dict[str, float | list | tuple | np.ndarray | Array | Tensor]
 logger = get_logger(__name__)
 
-QuantizationMode = tp.Literal["fp8", "int8", "nf4"]
+QuantizationMode = tp.Literal[
+    "nf4",
+    "affine",
+    "mxfp8",
+    "nvfp8",
+    "mxfp4",
+    "nvfp4",
+]
+STE_QAT_QUANTIZATION_MODES: tuple[QuantizationMode, ...] = tp.get_args(QuantizationMode)
+STE_QAT_QUANTIZATION_MODES_DOC = ", ".join(f"'{mode}'" for mode in STE_QAT_QUANTIZATION_MODES)
+AFFINE_SUPPORTED_BITS = frozenset({2, 3, 4, 5, 6, 7, 8})
+FIXED_QUANTIZATION_BITS_BY_MODE: dict[QuantizationMode, int] = {
+    "nf4": 4,
+    "mxfp4": 4,
+    "nvfp4": 4,
+    "mxfp8": 8,
+    "nvfp8": 8,
+}
 
 
 def get_safe_arr(xs):
@@ -229,7 +246,8 @@ class TrainingArguments:
         default=None,
         metadata={
             "help": (
-                "Quantization mode for quantization-aware training (QAT). Supported values: 'fp8', 'int8', 'nf4'. "
+                "Quantization mode for quantization-aware training (QAT). "
+                f"Supported values: {STE_QAT_QUANTIZATION_MODES_DOC}. "
                 "When set (or when a straight-through callable is provided), trainers can apply a straight-through "
                 "estimator (STE) transform to `state.graphstate` for the forward pass without permanently modifying "
                 "the stored parameters."
@@ -240,8 +258,18 @@ class TrainingArguments:
         default=None,
         metadata={
             "help": (
-                "Quantization group size for block-wise quantizers (e.g. NF4). If None, the default group size for "
-                "the selected quantization mode is used."
+                "Quantization group size for group-wise quantizers (e.g. NF4/AFFINE/MXFP*/NVFP*). "
+                "If None, the default group size for the selected quantization mode is used."
+            )
+        },
+    )
+    quantization_bits: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Quantization bit-width for QAT/STE quantizers. For `affine`, supported bits are 2..8. "
+                "For fixed-width formats (`nf4`, `mxfp4`, `nvfp4`, `mxfp8`, `nvfp8`), when provided it must "
+                "match the format width."
             )
         },
     )
@@ -250,8 +278,8 @@ class TrainingArguments:
         metadata={
             "help": (
                 "Per-tensor straight-through transform used for QAT (e.g. tensor -> quantize(mode) -> dequantize "
-                "with identity gradients). If `straight_through_emulator` is not provided, this can be mapped over "
-                "`state.graphstate` via `jax.tree_util.tree_map`."
+                "with identity gradients). If `straight_through_emulator` is not provided, this callable can be "
+                "mapped over `state.graphstate` via `jax.tree_util.tree_map`."
             )
         },
     )
@@ -704,6 +732,22 @@ class TrainingArguments:
             raise ValueError(f"Backend {self.backend} is not recognized. Available backends: {AVAILABLE_BACKENDS}")
         if self.quantization_group_size is not None and self.quantization_group_size <= 0:
             raise ValueError("`quantization_group_size` must be > 0 when specified.")
+        if self.quantization_bits is not None and self.quantization_bits <= 0:
+            raise ValueError("`quantization_bits` must be > 0 when specified.")
+        if self.quantization_mode == "affine" and self.quantization_bits is not None:
+            if self.quantization_bits not in AFFINE_SUPPORTED_BITS:
+                bits_values = ", ".join(str(v) for v in sorted(AFFINE_SUPPORTED_BITS))
+                raise ValueError(
+                    f"`quantization_bits` for `affine` must be one of {{{bits_values}}}, "
+                    f"got {self.quantization_bits}."
+                )
+        if self.quantization_mode in FIXED_QUANTIZATION_BITS_BY_MODE and self.quantization_bits is not None:
+            expected_bits = FIXED_QUANTIZATION_BITS_BY_MODE[self.quantization_mode]
+            if self.quantization_bits != expected_bits:
+                raise ValueError(
+                    f"`quantization_bits` for `{self.quantization_mode}` must be {expected_bits}, "
+                    f"got {self.quantization_bits}."
+                )
 
     def _setup_distributed(self):
         """
@@ -826,6 +870,8 @@ class TrainingArguments:
         self.clip_grad = _coerce_float(self.clip_grad)
         self.warmup_steps = _coerce_int(self.warmup_steps)
         self.gradient_accumulation_steps = _coerce_int(self.gradient_accumulation_steps)
+        self.quantization_group_size = _coerce_int(self.quantization_group_size)
+        self.quantization_bits = _coerce_int(self.quantization_bits)
 
         for name in ("learning_rate", "weight_decay"):
             value = getattr(self, name, None)
@@ -854,6 +900,25 @@ class TrainingArguments:
             raise TypeError(
                 "`gradient_accumulation_steps` must be an int, got "
                 f"{type(self.gradient_accumulation_steps).__name__}: {self.gradient_accumulation_steps!r}"
+            )
+        if self.quantization_group_size is not None and not isinstance(self.quantization_group_size, (int, np.integer)):
+            raise TypeError(
+                "`quantization_group_size` must be an int when provided, got "
+                f"{type(self.quantization_group_size).__name__}: {self.quantization_group_size!r}"
+            )
+        if self.quantization_bits is not None and not isinstance(self.quantization_bits, (int, np.integer)):
+            raise TypeError(
+                "`quantization_bits` must be an int when provided, got "
+                f"{type(self.quantization_bits).__name__}: {self.quantization_bits!r}"
+            )
+
+        if isinstance(self.quantization_mode, str):
+            quantization_mode = self.quantization_mode.strip().lower()
+            self.quantization_mode = tp.cast(QuantizationMode | None, quantization_mode or None)
+        if self.quantization_mode is not None and self.quantization_mode not in STE_QAT_QUANTIZATION_MODES:
+            raise ValueError(
+                "`quantization_mode` must be one of "
+                f"{STE_QAT_QUANTIZATION_MODES_DOC}, got {self.quantization_mode!r}."
             )
 
         if isinstance(self.step_partition_spec, str):

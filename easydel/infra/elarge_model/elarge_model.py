@@ -443,8 +443,9 @@ class eLargeModel:
         Example:
             >>> elm.set_dtype("bf16")  # Use bfloat16 for training/inference
         """
-        self._config.setdefault("loader", {})["dtype"] = dtype
-        self._config["loader"]["param_dtype"] = dtype
+        loader_cfg = self._config.setdefault("loader", {})
+        loader_cfg["dtype"] = dtype
+        loader_cfg["param_dtype"] = dtype
         return self
 
     def set_sharding(
@@ -997,7 +998,7 @@ class eLargeModel:
         """
         return to_esurge_kwargs(self._config)
 
-    def get_base_config(self, prefer: str = "base") -> dict[str, Any]:
+    def get_base_config(self, prefer: str = "base") -> Mapping[str, Any]:
         """Get materialized base configuration.
 
         Resolves the configuration hierarchy, materializing shared base
@@ -1304,7 +1305,7 @@ class eLargeModel:
         trainer_cfg.update(kwargs)
         return self
 
-    def get_trainer_config(self) -> dict[str, Any]:
+    def get_trainer_config(self) -> Mapping[str, Any]:
         """Get normalized trainer configuration.
 
         This method processes the raw trainer configuration and applies
@@ -1586,9 +1587,7 @@ class eLargeModel:
 
             resolved_reward = reward_funcs if reward_funcs is not None else reward_model
             if resolved_reward is None:
-                raise ValueError(
-                    "sdpo training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
-                )
+                raise ValueError("sdpo training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg).")
 
             trainer_kwargs["arguments"] = training_args
             trainer_kwargs["model"] = model
@@ -1990,8 +1989,8 @@ class eLargeModel:
 
         # Sharding
         sharding = self._config.get("sharding", {})
-        if sharding.get("axis_dims"):
-            dims = sharding["axis_dims"]
+        dims = sharding.get("axis_dims")
+        if dims:
             auto = "auto" if sharding.get("auto_shard_model") else "manual"
             dims_str = ",".join(str(d) for d in dims)
             lines.append(_line(f"▸ shard: ({dims_str}) {auto}"))
@@ -2029,27 +2028,33 @@ class eLargeModel:
             parts = []
             if hbm:
                 parts.append(f"{hbm:.0%} HBM")
-            if esurge.get("page_size"):
-                parts.append(f"page:{esurge['page_size']}")
+            page_size = esurge.get("page_size")
+            if page_size:
+                parts.append(f"page:{page_size}")
             if esurge.get("enable_prefix_caching"):
                 parts.append("prefix_cache")
-            if esurge.get("min_input_pad"):
-                parts.append(f"pad:{esurge['min_input_pad']}")
+            min_input_pad = esurge.get("min_input_pad")
+            if min_input_pad:
+                parts.append(f"pad:{min_input_pad}")
             if parts:
                 lines.append(_line(f"▸ {' │ '.join(parts)}"))
 
         # Training
         trainer = self._config.get("trainer", {})
-        if trainer.get("trainer_type"):
+        trainer_type = trainer.get("trainer_type")
+        if trainer_type:
             lines.append(_sep())
-            lines.append(_line(f"Training: {trainer['trainer_type'].upper()}"))
+            lines.append(_line(f"Training: {str(trainer_type).upper()}"))
             parts = []
-            if trainer.get("learning_rate"):
-                parts.append(f"lr:{trainer['learning_rate']:.2e}")
-            if trainer.get("num_train_epochs"):
-                parts.append(f"epochs:{trainer['num_train_epochs']}")
-            if trainer.get("total_batch_size"):
-                parts.append(f"batch:{trainer['total_batch_size']}")
+            learning_rate = trainer.get("learning_rate")
+            if isinstance(learning_rate, (int, float)) and learning_rate:
+                parts.append(f"lr:{learning_rate:.2e}")
+            num_train_epochs = trainer.get("num_train_epochs")
+            if num_train_epochs:
+                parts.append(f"epochs:{num_train_epochs}")
+            total_batch_size = trainer.get("total_batch_size")
+            if total_batch_size:
+                parts.append(f"batch:{total_batch_size}")
             if parts:
                 lines.append(_line(f"▸ {' │ '.join(parts)}"))
 

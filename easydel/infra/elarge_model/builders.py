@@ -137,6 +137,7 @@ def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[s
     quant_model = quant.get("model")
     if quant_model is not None:
         quant_model = QuantizationConfig(**quant_model)
+    dcn_axis_dims = sharding.get("dcn_axis_dims")
     return dict(
         pretrained_model_name_or_path=model["name_or_path"],
         device=loader.get("device"),
@@ -144,7 +145,7 @@ def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[s
         param_dtype=coerce_dtype(loader.get("param_dtype")),
         precision=coerce_precision(loader.get("precision")),
         sharding_axis_dims=tuple(sharding.get("axis_dims", (1, 1, 1, -1, 1))),
-        sharding_dcn_axis_dims=tuple(sharding["dcn_axis_dims"]) if sharding.get("dcn_axis_dims") else None,
+        sharding_dcn_axis_dims=tuple(dcn_axis_dims) if dcn_axis_dims else None,
         sharding_axis_names=tuple(sharding.get("axis_names", ("dp", "fsdp", "ep", "tp", "sp"))),
         partition_axis=sharding.get("partition_axis"),
         shard_fns=sharding.get("shard_fns"),
@@ -401,9 +402,7 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
         distributed_mode=False if distributed_mode_val is None else bool(distributed_mode_val),
         distributed_role="auto" if distributed_role_val is None else str(distributed_role_val),
         distributed_service_name=distributed_service_name_val,
-        distributed_world_size=(
-            int(distributed_world_size_val) if distributed_world_size_val is not None else None
-        ),
+        distributed_world_size=(int(distributed_world_size_val) if distributed_world_size_val is not None else None),
         distributed_rank=int(distributed_rank_val) if distributed_rank_val is not None else None,
         distributed_control_port=(
             int(distributed_control_port_val) if distributed_control_port_val is not None else 19666
@@ -420,9 +419,7 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
             15.0 if distributed_connect_timeout_s_val is None else float(distributed_connect_timeout_s_val)
         ),
         distributed_verify_sampling_digest=(
-            True
-            if distributed_verify_sampling_digest_val is None
-            else bool(distributed_verify_sampling_digest_val)
+            True if distributed_verify_sampling_digest_val is None else bool(distributed_verify_sampling_digest_val)
         ),
     )
 
@@ -490,7 +487,8 @@ def build_esurge(cfg_like: ELMConfig | Mapping[str, Any], model: EasyDeLBaseModu
         getattr(TaskType, "VISION_LM", None),
     ]:
         raise NotImplementedError(f"eSurge supports [CAUSAL_LM, IMAGE_TEXT_TO_TEXT, ANY_TO_ANY, VISION_LM]; got {task}")
-    trust_remote_code = bool(cfg["loader"].get("trust_remote_code", False))
+    loader_cfg = cfg.get("loader", {})
+    trust_remote_code = bool(loader_cfg.get("trust_remote_code", False))
     proc_path = (
         cfg["model"].get("processor")
         or cfg["model"].get("tokenizer")
@@ -612,6 +610,7 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
                 raise ValueError("mixture.informs[].data_files is required")
 
         if "pixel_field" in inform_cfg:
+            image_size = inform_cfg.get("image_size")
             inform = VisualDatasetInform(
                 type=source_type,
                 data_files=data_files,
@@ -619,7 +618,7 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
                 split=inform_cfg.get("split", "train"),
                 pixel_field=inform_cfg.get("pixel_field", "images"),
                 content_field=inform_cfg.get("content_field"),
-                image_size=tuple(inform_cfg["image_size"]) if inform_cfg.get("image_size") else None,
+                image_size=tuple(image_size) if image_size else None,
                 num_rows=inform_cfg.get("num_rows"),
                 format_callback=inform_cfg.get("format_callback"),
                 format_fields=inform_cfg.get("format_fields"),
@@ -1504,8 +1503,9 @@ def build_sharded_source(cfg_like: ELMConfig | Mapping[str, Any]) -> "ShardedDat
             source = source.transform(MapTransform(format_callback))
 
         # Apply field renaming if format_fields is specified
-        if inform_cfg.get("format_fields"):
-            source = source.transform(RenameFields(inform_cfg["format_fields"]))
+        format_fields = inform_cfg.get("format_fields")
+        if format_fields:
+            source = source.transform(RenameFields(format_fields))
 
         # Rename content_field to target field
         content_field = inform_cfg.get("content_field", "content")
