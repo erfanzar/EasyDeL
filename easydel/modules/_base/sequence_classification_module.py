@@ -158,6 +158,10 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
         score_head_name: str = "score",
         score_head_bias: bool = False,
         score_head_kernel_init: Callable | None = None,
+        # Backward-compatible aliases used by older model wrappers
+        classifier_name: str | None = None,
+        classifier_bias: bool | None = None,
+        classifier_kernel_init: Callable | None = None,
     ):
         """Initialize the Sequence Classification module.
 
@@ -218,6 +222,13 @@ class BaseSequenceClassificationModule(BaseTaskModule[ModelT, ConfigT]):
             "in order to use `SequenceClassification` Models in `EasyDeL` "
             "you first need to attach `num_labels` to model `config`"
         )
+
+        if classifier_name is not None:
+            score_head_name = classifier_name
+        if classifier_bias is not None:
+            score_head_bias = classifier_bias
+        if classifier_kernel_init is not None:
+            score_head_kernel_init = classifier_kernel_init
 
         # Initialize base with features
         super().__init__(

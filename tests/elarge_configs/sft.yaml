@@ -36,7 +36,7 @@ trainer:
   total_batch_size: 4
   gradient_accumulation_steps: 2
   max_training_steps: 1024
-  max_sequence_length: 512
+  max_length: 512
   save_steps: 1000
   save_total_limit: 1
   log_steps: 1

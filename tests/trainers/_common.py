@@ -167,7 +167,6 @@ def make_config(
         "log_steps": 1,
         "learning_rate": 8e-6,
         "max_training_steps": MAX_TRAINING_STEP,
-        "max_sequence_length": MAX_TOTAL_LENGTH,
         "save_steps": 1_000,
         "save_total_limit": 1,
         "save_optimizer_state": True,

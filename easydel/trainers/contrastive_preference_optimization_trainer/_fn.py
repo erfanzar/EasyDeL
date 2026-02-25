@@ -30,8 +30,10 @@ from easydel.infra.loss_utils import LossConfig, LossMetrics
 from easydel.trainers.direct_preference_optimization_trainer._fn import concatenated_inputs
 
 from ..training_utils import (
+    filter_kwargs_for_callable,
     make_assertions_and_get_sizes,
     minibatch_call,
+    sanitize_model_call_kwargs,
     update_metrics,
     update_state_respectfully,
 )
@@ -85,12 +87,15 @@ def concatenated_forward(
             label_pad_token_id,
             completion_input_ids,
         )
-        outputs = model(
-            input_ids=prompt_input_ids,
-            attention_mask=prompt_attention_mask,
-            labels=labels,
+        call_kwargs = {
+            "input_ids": prompt_input_ids,
+            "attention_mask": prompt_attention_mask,
+            "labels": labels,
             **model_kwargs,
-        )
+        }
+        call_kwargs = filter_kwargs_for_callable(model.__call__, call_kwargs)
+        call_kwargs = sanitize_model_call_kwargs(call_kwargs)
+        outputs = model(**call_kwargs)
         logits = outputs.logits
         loss_mask = completion_attention_mask.astype(bool)
     else:
@@ -113,8 +118,14 @@ def concatenated_forward(
                 raise ValueError(
                     f"Unknown truncation mode: '{truncation_mode}'. Should be one of ['keep_end', 'keep_start']."
                 )
-
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, **model_kwargs)
+        call_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            **model_kwargs,
+        }
+        call_kwargs = filter_kwargs_for_callable(model.__call__, call_kwargs)
+        call_kwargs = sanitize_model_call_kwargs(call_kwargs)
+        outputs = model(**call_kwargs)
         logits = outputs.logits
         labels = jnp.roll(input_ids, shift=-1, axis=1)
         loss_mask = jnp.roll(loss_mask, shift=-1, axis=1).astype(bool)

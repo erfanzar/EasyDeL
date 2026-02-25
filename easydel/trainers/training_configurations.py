@@ -1150,12 +1150,14 @@ class TrainingArguments:
                 prefix = ""
             else:
                 prefix = "-" + prefix
+            resolved_model_name = self.model_name if isinstance(self.model_name, str) and self.model_name else "model"
+            safe_model_name = resolved_model_name.lower().replace("/", "-")
             if wandb_name is None:
                 _time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                wandb_name = f"{self.model_name.lower()}-{_time}"
+                wandb_name = f"{safe_model_name}-{_time}"
 
             return wandb.init(
-                project=f"EasyDeL{prefix}-{self.model_name}",
+                project=f"EasyDeL{prefix}-{safe_model_name}",
                 config=self.to_dict(),
                 save_code=True,
                 name=wandb_name,
@@ -1435,8 +1437,11 @@ class TrainingArguments:
             TrainingArguments: A new instance created from the dictionary.
         """
         data = dict(data)
-        if "quantization_group_size" not in data and "quantization_block" in data:
-            data["quantization_group_size"] = data["quantization_block"]
+        if "quantization_block" in data:
+            if "quantization_group_size" not in data:
+                data["quantization_group_size"] = data["quantization_block"]
+            # Drop deprecated alias for constructor calls built from dictionaries.
+            data.pop("quantization_block", None)
 
         processed_data = {}
         type_hints = tp.get_type_hints(cls)
@@ -1499,8 +1504,11 @@ class TrainingArguments:
     @classmethod
     def load_from_json(cls, config_dict):
         config_dict = dict(config_dict)
-        if "quantization_group_size" not in config_dict and "quantization_block" in config_dict:
-            config_dict["quantization_group_size"] = config_dict["quantization_block"]
+        if "quantization_block" in config_dict:
+            if "quantization_group_size" not in config_dict:
+                config_dict["quantization_group_size"] = config_dict["quantization_block"]
+            # Drop deprecated alias for constructor calls built from JSON payloads.
+            config_dict.pop("quantization_block", None)
         if "trainer_config_class" in config_dict.keys():
             import easydel as ed
 

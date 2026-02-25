@@ -56,6 +56,9 @@ def run_elarge_config(config_name: str, dry_run: bool = False) -> subprocess.Com
         cmd.append("--dry-run")
 
     env = os.environ.copy()
+    # Keep tests non-interactive and CI-safe.
+    env.setdefault("WANDB_MODE", "offline")
+    env.setdefault("WANDB_SILENT", "true")
 
     # Ensure caches are writable in sandboxed/CI environments (mirrors tests/inference/*).
     # Only redirect when the default $HOME/.cache isn't writable.
@@ -69,14 +72,37 @@ def run_elarge_config(config_name: str, dry_run: bool = False) -> subprocess.Com
         env.setdefault("TRANSFORMERS_CACHE", str(cache_root / "transformers"))
         env.setdefault("COMPILE_FUNC_DIR", str(cache_root / "ejkernel" / "ejit_compiled_functions"))
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=1800,  # 30 minute timeout for training
-        env=env,
+    if dry_run:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=1800,  # 30 minute timeout for training
+            env=env,
+        )
+
+    logs_dir = (Path.cwd() / "tmp-files" / "elarge-tests" / "logs").resolve()
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / f"{Path(config_name).stem}.log"
+
+    with log_path.open("w+", encoding="utf-8") as log_fp:
+        proc = subprocess.run(
+            cmd,
+            stdout=log_fp,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=1800,  # 30 minute timeout for training
+            env=env,
+        )
+        log_fp.seek(0)
+        output = log_fp.read()
+
+    return subprocess.CompletedProcess(
+        args=proc.args,
+        returncode=proc.returncode,
+        stdout=output,
+        stderr="",
     )
-    return result
 
 
 class TestElargeDryRun:
@@ -95,6 +121,7 @@ class TestElargeDryRun:
             "kto.yaml",
             "gkd.yaml",
             "grpo.yaml",
+            "sdpo.yaml",
             "ppo.yaml",
             "gfpo.yaml",
             "gspo.yaml",
@@ -119,25 +146,31 @@ class TestElargeTraining:
     def test_sft(self):
         """Test SFT training via YAML config."""
         result = run_elarge_config("sft.yaml")
-        assert result.returncode == 0, f"SFT training failed:\n{result.stderr}"
+        assert result.returncode == 0, f"SFT training failed:\n{result.stderr or result.stdout}"
 
     @pytest.mark.slow
     def test_dpo(self):
         """Test DPO training via YAML config."""
         result = run_elarge_config("dpo.yaml")
-        assert result.returncode == 0, f"DPO training failed:\n{result.stderr}"
+        assert result.returncode == 0, f"DPO training failed:\n{result.stderr or result.stdout}"
 
     @pytest.mark.slow
     def test_orpo(self):
         """Test ORPO training via YAML config."""
         result = run_elarge_config("orpo.yaml")
-        assert result.returncode == 0, f"ORPO training failed:\n{result.stderr}"
+        assert result.returncode == 0, f"ORPO training failed:\n{result.stderr or result.stdout}"
 
     @pytest.mark.slow
     def test_distillation(self):
         """Test distillation training via YAML config."""
         result = run_elarge_config("distillation.yaml")
-        assert result.returncode == 0, f"Distillation training failed:\n{result.stderr}"
+        assert result.returncode == 0, f"Distillation training failed:\n{result.stderr or result.stdout}"
+
+    @pytest.mark.slow
+    def test_sdpo(self):
+        """Test SDPO training via YAML config."""
+        result = run_elarge_config("sdpo.yaml")
+        assert result.returncode == 0, f"SDPO training failed:\n{result.stderr or result.stdout}"
 
 
 if __name__ == "__main__":
@@ -149,7 +182,7 @@ if __name__ == "__main__":
         "config",
         nargs="?",
         default="all",
-        help="Config name (sft, dpo, orpo, distillation) or 'all'",
+        help="Config name (sft, dpo, orpo, distillation, sdpo, ...) or 'all'",
     )
     parser.add_argument("--dry-run", action="store_true", help="Only parse and validate")
     args = parser.parse_args()
@@ -165,6 +198,7 @@ if __name__ == "__main__":
         "kto": "kto.yaml",
         "gkd": "gkd.yaml",
         "grpo": "grpo.yaml",
+        "sdpo": "sdpo.yaml",
         "ppo": "ppo.yaml",
         "gfpo": "gfpo.yaml",
         "gspo": "gspo.yaml",

@@ -64,6 +64,7 @@ between EasyDeL and HuggingFace model formats.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import re
 import typing as tp
 import warnings
@@ -2688,7 +2689,24 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
         assert labels is not None, "`labels` can not be `None` for computing loss."
         loss_kwargs = loss_kwargs or {}
-        outputs = self(**batch)
+        forward_batch = batch
+        try:
+            call_signature = inspect.signature(self.__call__)
+        except (TypeError, ValueError):
+            call_signature = None
+
+        if call_signature is not None:
+            call_parameters = call_signature.parameters
+            if not any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in call_parameters.values()):
+                accepted_keys = set(call_parameters.keys())
+                forward_batch = {key: value for key, value in batch.items() if key in accepted_keys}
+
+        # Most task heads accept either token IDs or input embeddings, not both simultaneously.
+        if forward_batch.get("input_ids", None) is not None and forward_batch.get("inputs_embeds", None) is not None:
+            forward_batch = dict(forward_batch)
+            forward_batch.pop("inputs_embeds", None)
+
+        outputs = self(**forward_batch)
 
         loss_output: LossMetrics = self.loss_function(
             labels=labels,

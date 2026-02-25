@@ -87,7 +87,8 @@ class BuildTrainerKws(typing.TypedDict, total=False):
         reference_model: Reference model for DPO/preference optimization
         reward_model: Reward model for GRPO training
         teacher_model: Teacher model for distillation training
-        reward_funcs: Custom reward functions for GRPO
+        reward_funcs: Custom reward functions for GRPO/SDPO/PPO-style trainers
+        feedback_func: Optional textual feedback callback for SDPO
     """
 
     data_collator: NotRequired[typing.Callable]
@@ -98,6 +99,7 @@ class BuildTrainerKws(typing.TypedDict, total=False):
     reward_model: NotRequired[EasyDeLBaseModule | None]
     teacher_model: NotRequired[EasyDeLBaseModule | None]
     reward_funcs: NotRequired[Any | None]
+    feedback_func: NotRequired[typing.Callable | None]
 
 
 class eLargeModel:
@@ -1259,6 +1261,7 @@ class eLargeModel:
                 - "dpo": Direct Preference Optimization
                 - "orpo": Odds Ratio Preference Optimization
                 - "grpo": Group Relative Policy Optimization
+                - "sdpo": Self-Distillation Policy Optimization
                 - "reward": Reward model training
                 - "distillation": Knowledge distillation
                 - "base": Basic trainer for custom training loops
@@ -1453,10 +1456,12 @@ class eLargeModel:
             eval_dataset: Evaluation dataset for validation metrics.
             reference_model: Reference model for DPO/ORPO. If None, builds from
                 reference_model configuration if present.
-            reward_model: Reward model for GRPO. If None, builds from config.
+            reward_model: Reward model for GRPO/SDPO/PPO-style trainers.
+                If None, builds from config.
             teacher_model: Teacher model for distillation. If None, builds from
                 teacher_model configuration if present.
-            reward_funcs: Custom reward functions for GRPO. Alternative to reward_model.
+            reward_funcs: Custom reward functions for GRPO/SDPO/PPO-style trainers.
+                Alternative to reward_model.
             base_state_class: Custom EasyDeLState class for model state management.
             args_class: Custom TrainingArguments class. Auto-selected if None.
             trainer_class: Custom Trainer class. Auto-selected if None.
@@ -1575,6 +1580,26 @@ class eLargeModel:
             trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
             trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
 
+        elif trainer_type == "sdpo":
+            if reward_funcs is None and reward_model is None:
+                reward_model = self.build_reward_model()
+
+            resolved_reward = reward_funcs if reward_funcs is not None else reward_model
+            if resolved_reward is None:
+                raise ValueError(
+                    "sdpo training requires `reward_model` (config key) or `reward_funcs` (runtime kwarg)."
+                )
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = resolved_reward
+            trainer_kwargs["feedback_func"] = kwargs.get("feedback_func", None)
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes", None)
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn", None)
+
         elif trainer_type == "ppo":
             if reward_funcs is None and reward_model is None:
                 reward_model = self.build_reward_model()
@@ -1676,7 +1701,13 @@ class eLargeModel:
 
         for key, value in kwargs.items():
             if key not in trainer_kwargs and value is not None:
-                if key not in ["data_collator", "formatting_func", "reward_processing_classes", "data_tokenize_fn"]:
+                if key not in [
+                    "data_collator",
+                    "formatting_func",
+                    "reward_processing_classes",
+                    "data_tokenize_fn",
+                    "feedback_func",
+                ]:
                     trainer_kwargs[key] = value
 
         return trainer_class(**trainer_kwargs)

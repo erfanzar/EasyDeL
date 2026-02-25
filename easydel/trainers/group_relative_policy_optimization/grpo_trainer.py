@@ -21,6 +21,7 @@ from functools import partial
 import flax
 import flax.nnx
 import jax
+import numpy as np
 from eformer.escale import with_sharding_constraint
 from flax import nnx as nn
 from jax import numpy as jnp
@@ -40,7 +41,11 @@ from ..prompt_utils import apply_chat_template
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_configurations import MetricsType
-from ..training_utils import resolve_straight_through_emulator
+from ..training_utils import (
+    filter_kwargs_for_callable,
+    resolve_straight_through_emulator,
+    sanitize_model_call_kwargs,
+)
 from ._fn import get_per_token_logps, grpo_step
 from .grpo_config import GRPOConfig
 
@@ -132,6 +137,10 @@ class GRPOTrainer(Trainer):
         self.arguments = arguments
         self.truncation_mode = arguments.truncation_mode
         self.processing_class = processing_class
+        pad_token_id = getattr(self.processing_class, "pad_token_id", None)
+        if pad_token_id is None and hasattr(self.processing_class, "tokenizer"):
+            pad_token_id = getattr(self.processing_class.tokenizer, "pad_token_id", None)
+        self.padding_value = 0 if pad_token_id is None else int(pad_token_id)
         self.loss_type = arguments.loss_type.lower() if isinstance(arguments.loss_type, str) else arguments.loss_type
         self.epsilon = arguments.epsilon
         self.epsilon_high = arguments.epsilon_high
@@ -182,7 +191,10 @@ class GRPOTrainer(Trainer):
                     )
                     def apply_fn(gd, gs, gt, batch):
                         batch = with_sharding_constraint(arr=batch, sharding=self.arguments.step_partition_spec)
-                        return nn.merge(gd, gs, gt)(**batch)
+                        module = nn.merge(gd, gs, gt)
+                        call_kwargs = filter_kwargs_for_callable(module.__call__, batch)
+                        call_kwargs = sanitize_model_call_kwargs(call_kwargs)
+                        return module(**call_kwargs)
 
                     reward_func = reward_func.replace(apply_fn=apply_fn)
 
@@ -422,11 +434,11 @@ class GRPOTrainer(Trainer):
                 return get_per_token_logps(apply, ids, mask, self.arguments.max_prompt_length)
 
         self.compute_refmodel_logps = ejit(
-            partial(_compute_refmodel_logps, graphdef=self.model_state.graphdef),
+            partial(_compute_refmodel_logps, graphdef=self.ref_state.graphdef),
             static_argnames=("graphdef"),
             in_shardings=(
-                self.model_state.shardings.graphstate,
-                self.model_state.shardings.graphother,
+                self.ref_state.shardings.graphstate,
+                self.ref_state.shardings.graphother,
                 empty_sharding,
                 empty_sharding,
             ),
@@ -494,7 +506,11 @@ class GRPOTrainer(Trainer):
                 )
             token_logps_time = token_logps_time_fn()
 
-            completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+            host_completion_ids = np.asarray(jax.device_get(completion_ids), dtype=np.int64)
+            completions_text = self.processing_class.batch_decode(
+                host_completion_ids.tolist(),
+                skip_special_tokens=True,
+            )
 
             is_conversational = self.train_is_conversational if is_train else self.eval_is_conversational
 

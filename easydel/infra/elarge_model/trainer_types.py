@@ -22,6 +22,7 @@ workflows, supporting various optimization paradigms including:
 - Direct Preference Optimization (DPO)
 - Odds Ratio Preference Optimization (ORPO)
 - Group Relative Policy Optimization (GRPO)
+- Self-Distillation Policy Optimization (SDPO)
 - Proximal Policy Optimization (PPO)
 - Kahneman-Tversky Optimization (KTO)
 - Binary Classifier Optimization (BCO)
@@ -337,6 +338,7 @@ class BaseTrainerCfg(TypedDict, total=False):
             "base",
             "dpo",
             "grpo",
+            "sdpo",
             "gfpo",
             "gspo",
             "ppo",
@@ -671,6 +673,23 @@ class GRPOTrainerCfg(BaseTrainerCfg):
     top_p: NotRequired[float]
     top_k: NotRequired[int]
     temperature: NotRequired[float]
+
+
+class SDPOTrainerCfg(GRPOTrainerCfg):
+    """Configuration for Self-Distillation Policy Optimization trainer (SDPOConfig).
+
+    SDPO extends GRPO with token-level self-distillation signals derived from
+    model-generated feedback contexts.
+
+    Attributes:
+        max_feedback_length: Maximum token budget reserved for textual feedback.
+        distillation_type: Distillation objective variant ("kl" or "jsd").
+        beta: KL regularization toward a reference model (defaults to 0.0 in SDPO).
+    """
+
+    max_feedback_length: NotRequired[int]
+    distillation_type: NotRequired[Literal["kl", "jsd"]]
+    beta: NotRequired[float]
 
 
 class PPOTrainerCfg(BaseTrainerCfg):
@@ -1117,6 +1136,7 @@ class XPOTrainerCfg(GRPOTrainerCfg):
 class TrainerConfig(
     ORPOTrainerCfg,
     GRPOTrainerCfg,
+    SDPOTrainerCfg,
     PPOTrainerCfg,
     SFTTrainerCfg,
     RewardTrainerCfg,
@@ -1272,6 +1292,24 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "ref_model_sync_steps": 64,
         "skip_apply_chat_template": False,
         "num_return_sequences": 1,
+        "top_p": 0.95,
+        "top_k": 50,
+        "temperature": 0.7,
+    },
+    "sdpo": {
+        "trainer_prefix": "sdpotrainer",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "max_feedback_length": 256,
+        "distillation_type": "jsd",
+        "beta": 0.0,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 4,
         "top_p": 0.95,
         "top_k": 50,
         "temperature": 0.7,
@@ -1439,7 +1477,7 @@ New trainer types can be registered dynamically using register_trainer_defaults(
 """
 
 # Trainers that need max_completion_length auto-computed
-_TRAINERS_WITH_COMPLETION_LENGTH = frozenset({"dpo", "orpo", "kto", "bco", "cpo", "ppo"})
+_TRAINERS_WITH_COMPLETION_LENGTH = frozenset({"dpo", "orpo", "kto", "bco", "cpo", "ppo", "sdpo"})
 """Set of trainer types that support automatic max_completion_length computation.
 
 For these trainers, if max_completion_length is not explicitly set but max_length
@@ -1613,7 +1651,7 @@ def get_trainer_class(trainer_type: str):
 
     Args:
         trainer_type: Type of trainer to retrieve. Supported values include:
-            "sft", "dpo", "orpo", "grpo", "ppo", "reward", "distillation",
+            "sft", "dpo", "orpo", "grpo", "sdpo", "ppo", "reward", "distillation",
             "kto", "bco", "cpo", "gkd", "nash-md", "xpo", "base".
             Case-insensitive with alias support.
 
@@ -1648,7 +1686,7 @@ def get_training_arguments_class(trainer_type: str):
 
     Args:
         trainer_type: Type of trainer configuration to retrieve. Supported values
-            include: "sft", "dpo", "orpo", "grpo", "ppo", "reward", "distillation",
+            include: "sft", "dpo", "orpo", "grpo", "sdpo", "ppo", "reward", "distillation",
             "kto", "bco", "cpo", "gkd", "nash-md", "xpo", "base".
             Case-insensitive with alias support.
 
