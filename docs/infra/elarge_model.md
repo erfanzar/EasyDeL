@@ -62,16 +62,16 @@ actions:
 
 ### Available Actions
 
-| Action                   | Description                               | Parameters                                                       |
-| ------------------------ | ----------------------------------------- | ---------------------------------------------------------------- |
-| `validate`               | Validate configuration before execution   | None                                                             |
-| `train`                  | Run training with configured trainer      | None                                                             |
-| `eval`                   | Run evaluation with lm-evaluation-harness | `tasks`, `engine`, `num_fewshot`, `output_path`, `print_results` |
-| `serve` / `server`       | Start OpenAI-compatible API server        | `host`, `port`, `log_level`, etc.                                |
-| `print` / `show`         | Print eLargeModel summary                 | None                                                             |
-| `dump_config` / `config` | Print normalized configuration            | None                                                             |
-| `to_json` / `save_json`  | Save config to JSON file                  | `path` or string path                                            |
-| `to_yaml` / `save_yaml`  | Save config to YAML file                  | `path` or string path                                            |
+| Action                   | Description                               | Parameters                                             |
+| ------------------------ | ----------------------------------------- | ------------------------------------------------------ |
+| `validate`               | Validate configuration before execution   | None                                                   |
+| `train`                  | Run training with configured trainer      | None                                                   |
+| `eval`                   | Run evaluation with lm-evaluation-harness | `tasks`, `num_fewshot`, `output_path`, `print_results` |
+| `serve` / `server`       | Start OpenAI-compatible API server        | `host`, `port`, `log_level`, etc.                      |
+| `print` / `show`         | Print eLargeModel summary                 | None                                                   |
+| `dump_config` / `config` | Print normalized configuration            | None                                                   |
+| `to_json` / `save_json`  | Save config to JSON file                  | `path` or string path                                  |
+| `to_yaml` / `save_yaml`  | Save config to YAML file                  | `path` or string path                                  |
 
 ---
 
@@ -418,7 +418,6 @@ actions:
   - validate
   - eval:
       tasks: [hellaswag, winogrande, arc_easy, arc_challenge]
-      engine: esurge
       num_fewshot: 0
       output_path: ./eval_results.json
       print_results: true
@@ -654,7 +653,6 @@ print(f"Training completed. Final loss: {output.metrics['train_loss']}")
 # Evaluation with lm-evaluation-harness
 results = elm.eval(
     tasks=["hellaswag", "mmlu", "gsm8k"],
-    engine="esurge",
     num_fewshot=5,
     output_path="eval_results.json",
 )

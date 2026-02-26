@@ -1345,6 +1345,8 @@ class EvalKwargs(TypedDict, total=False):
     which provides standardized benchmarking across common NLP tasks.
 
     Attributes:
+        num_fewshot: Number of few-shot examples. When omitted, eLargeModel.eval
+            uses its explicit argument (or defaults to 0).
         max_new_tokens: Maximum number of tokens to generate for
             generation-based tasks. Default: 2048.
         temperature: Sampling temperature for text generation.
@@ -1353,13 +1355,21 @@ class EvalKwargs(TypedDict, total=False):
         top_p: Top-p (nucleus) sampling parameter. Only tokens with
             cumulative probability <= top_p are considered. Default: 0.95.
         batch_size: Evaluation batch size. None uses engine default.
+        max_batch_size: Maximum dynamic batch size for model backends
+            that support auto-batching.
+        device: Device string forwarded to lm-eval.
+            eLargeModel defaults this to "cpu" unless overridden.
+        use_cache: lm-eval cache sqlite path / URI.
         use_tqdm: Show progress bar during evaluation. Default: True.
         limit: Maximum number of examples to evaluate per task.
             Can be int (absolute) or float (fraction). None for all.
         cache_requests: Cache model outputs for repeated evaluations.
+        rewrite_requests_cache: Rewrite cached request payloads.
+        delete_requests_cache: Delete cached request payloads.
         check_integrity: Verify task data integrity before evaluation.
         write_out: Write detailed outputs to file.
         log_samples: Log individual sample predictions and targets.
+        evaluation_tracker: Optional lm-eval tracker object for artifact logging.
         system_instruction: System instruction prepended to prompts
             for chat/instruction-tuned models.
         apply_chat_template: Apply the model's chat template to prompts.
@@ -1369,12 +1379,20 @@ class EvalKwargs(TypedDict, total=False):
             conversation rather than concatenated text.
         gen_kwargs: Additional generation keyword arguments passed
             to the model's generate method.
+        task_manager: Optional lm-eval TaskManager instance.
+        verbosity: Logging verbosity passed to lm-eval.
         predict_only: Only run predictions without computing metrics.
             Useful for generating outputs for manual analysis.
         random_seed: Random seed for reproducible evaluation.
         numpy_random_seed: NumPy random seed for reproducibility.
         torch_random_seed: PyTorch random seed for reproducibility.
         fewshot_random_seed: Random seed for few-shot example sampling.
+        bootstrap_iters: Number of bootstrap iterations for stderr estimation.
+        confirm_run_unsafe_code: Confirm execution of tasks marked unsafe.
+        metadata: Optional metadata dictionary passed to lm-eval.
+        samples: Explicit sample-index mapping per task.
+        include_path: Additional task include path for custom tasks.
+        include_defaults: Whether to include lm-eval default task registry.
 
     Example:
         >>> from easydel.infra.elarge_model.types import EvalKwargs
@@ -1403,27 +1421,42 @@ class EvalKwargs(TypedDict, total=False):
         See https://github.com/EleutherAI/lm-evaluation-harness for details.
     """
 
+    num_fewshot: NotRequired[int | None]
     max_new_tokens: NotRequired[int]
     temperature: NotRequired[float]
     top_p: NotRequired[float]
     normalize_math_answers: NotRequired[bool]
     math_answer_task_hints: NotRequired[collections.abc.Sequence[str] | str | None]
-    batch_size: NotRequired[int | None]
+    batch_size: NotRequired[int | str | None]
+    max_batch_size: NotRequired[int | None]
+    device: NotRequired[str | None]
+    use_cache: NotRequired[str | None]
     use_tqdm: NotRequired[bool]
     limit: NotRequired[int | float | None]
     cache_requests: NotRequired[bool]
+    rewrite_requests_cache: NotRequired[bool]
+    delete_requests_cache: NotRequired[bool]
     check_integrity: NotRequired[bool]
     write_out: NotRequired[bool]
     log_samples: NotRequired[bool]
+    evaluation_tracker: NotRequired[Any | None]
     system_instruction: NotRequired[str | None]
     apply_chat_template: NotRequired[bool | str]
     fewshot_as_multiturn: NotRequired[bool]
-    gen_kwargs: NotRequired[dict[str, Any] | None]
+    gen_kwargs: NotRequired[str | dict[str, Any] | None]
+    task_manager: NotRequired[Any | None]
+    verbosity: NotRequired[Any]
     predict_only: NotRequired[bool]
+    samples: NotRequired[dict[str, Any] | None]
+    bootstrap_iters: NotRequired[int]
     random_seed: NotRequired[int | None]
     numpy_random_seed: NotRequired[int | None]
     torch_random_seed: NotRequired[int | None]
     fewshot_random_seed: NotRequired[int | None]
+    confirm_run_unsafe_code: NotRequired[bool]
+    metadata: NotRequired[dict[str, Any] | None]
+    include_path: NotRequired[str | None]
+    include_defaults: NotRequired[bool]
 
 
 class ELMConfig(TypedDict, total=False):

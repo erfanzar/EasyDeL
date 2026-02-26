@@ -38,7 +38,6 @@ YAML schema (recommended):
       - eval:
           tasks: ["gsm8k", "mmlu"]
           num_fewshot: 5
-          engine: esurge
           output_path: eval_results.json
       - serve:
           host: "0.0.0.0"
@@ -196,12 +195,6 @@ def _run_action(elm: Any, name: str, value: Any | None) -> None:
         tasks = params.get("tasks")
         if tasks is None:
             raise SystemExit("`eval` action requires `tasks` (string or list of strings).")
-        engine = params.get("engine", "auto")
-        if not isinstance(engine, str):
-            raise SystemExit("`eval.engine` must be a string ('auto' or 'esurge').")
-        engine = engine.lower()
-        if engine not in {"auto", "esurge"}:
-            raise SystemExit("`eval.engine` must be 'auto' or 'esurge'.")
 
         num_fewshot = params.get("num_fewshot", 0)
         if not isinstance(num_fewshot, int):
@@ -213,7 +206,6 @@ def _run_action(elm: Any, name: str, value: Any | None) -> None:
 
         results = elm.eval(
             tasks=tasks,
-            engine=engine,
             num_fewshot=num_fewshot,
             output_path=output_path,
         )
