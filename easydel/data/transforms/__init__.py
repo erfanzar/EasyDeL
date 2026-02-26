@@ -89,13 +89,18 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+# These are provided via __getattr__ for backwards compatibility:
+# BCOPreprocessTransform, CPOPreprocessTransform, DPOPreprocessTransform,
+# GRPOPreprocessTransform, KTOPreprocessTransform, ORPOPreprocessTransform,
+# RewardPreprocessTransform, SFTPreprocessTransform
+
 __all__ = [
     "DEFAULT_ROLE_MAPPING",
     "AddField",
     "BCOPreprocessTransform",
-    "CPOPreprocessTransform",
     "ChainedTransform",
     "ChatTemplateTransform",
+    "CPOPreprocessTransform",
     "CombineFields",
     "ConvertInputOutputToChatML",
     "ConvertToChatML",

@@ -524,7 +524,7 @@ class TestTransformIntegration:
         from easydel.data.sources.hf_wrapper import wrap_hf_dataset
 
         try:
-            from datasets import Dataset
+            from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
         except ImportError:
             pytest.skip("datasets library not available")
 

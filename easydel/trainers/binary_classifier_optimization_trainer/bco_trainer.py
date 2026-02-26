@@ -38,7 +38,7 @@ from ._fn import RunningMoments, concatenated_forward, evaluation_step, training
 from .bco_config import BCOConfig
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.data.core.protocols import ShardedDataSource
 
@@ -449,7 +449,7 @@ class BCOTrainer(Trainer):
         """
         return self.input_data_collator_tfds
 
-    def compute_reference_log_probs(self, batch: dict[str, np.ndarray]) -> np.ndarray:
+    def compute_reference_log_probs(self, batch: dict[str, np.ndarray]) -> jax.Array:
         """Compute reference model log probabilities for a batch.
 
         Args:

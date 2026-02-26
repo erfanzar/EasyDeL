@@ -54,7 +54,7 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.helpers import capture_time, get_logger
+from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
 from easydel.utils.traversals import deepcopy_model
 
 from ..group_relative_policy_optimization._fn import get_per_token_logps
@@ -67,12 +67,12 @@ from ._fn import sdpo_step
 from .sdpo_config import SDPOConfig
 
 try:
-    import wandb  # type:ignore
+    import wandb  # type: ignore[import-untyped]
 except ImportError:
     wandb = None
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.data.core.protocols import ShardedDataSource
 
@@ -82,7 +82,7 @@ FeedbackFunc = tp.Callable[
     [list[str], list[str], list[float]],
     list[str],
 ]
-RewardFunc = tp.Union[EasyDeLBaseModule, EasyDeLState, tp.Callable[[list, list], list[float]]]  # noqa
+RewardFunc = EasyDeLBaseModule | EasyDeLState | tp.Callable[[list, list], list[float]]
 
 _FEEDBACK_CORRECT = "Your previous attempt was correct.\n"
 _FEEDBACK_TEMPLATE_SOLUTION = "Correct solution:\n{solution}\n\n"
@@ -223,9 +223,7 @@ class SDPOTrainer(GRPOTrainer):
         requested_teacher_len = base_len + requested_feedback_len
 
         model_config = getattr(self.model_state.model, "config", None)
-        model_context_window = (
-            self._resolve_model_context_window(model_config) if model_config is not None else None
-        )
+        model_context_window = self._resolve_model_context_window(model_config) if model_config is not None else None
         if model_context_window is None and self.arguments.max_length is not None:
             model_context_window = int(self.arguments.max_length)
 
@@ -333,7 +331,7 @@ class SDPOTrainer(GRPOTrainer):
         completions: list[str],
         rewards: jax.Array,
         generation_factor: int,
-    ) -> tuple[list[str], list[str | None]]:
+    ) -> tuple[list[str], list[str]]:
         """Derive feedback without a rich-feedback function.
 
         For each rollout group the best-rewarded completion is used as the

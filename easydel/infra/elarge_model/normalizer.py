@@ -40,7 +40,7 @@ from typing import Any, cast
 
 from easydel.infra.base_config import EasyDeLBaseConfigDict
 from easydel.infra.factory import TaskType
-from easydel.layers.quantization._quants import QuantizationConfig
+from easydel.layers.quantization._quants import QuantizationConfig  # pyright: ignore[reportPrivateLocalImportUsage]
 
 from .defaults import DEFAULTS
 from .types import ELMConfig

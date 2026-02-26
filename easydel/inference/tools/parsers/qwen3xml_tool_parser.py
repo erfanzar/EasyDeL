@@ -28,7 +28,7 @@ from ..abstract_tool import ToolParserManager
 from .qwen3coder_tool_parser import Qwen3CoderToolParser
 
 
-@ToolParserManager.register_module(["qwen3_xml"])
+@ToolParserManager.register_module(["qwen3_xml"])  # pyright: ignore[reportUntypedClassDecorator]
 class Qwen3XMLToolParser(Qwen3CoderToolParser):
     """Alias parser for Qwen3 XML tool calling format (non-coder variant).
 

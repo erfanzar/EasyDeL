@@ -354,7 +354,7 @@ def block_mixture_interleave(
     datasets: dict[str, tp.Any],
     weights: dict[str, float] | None = None,
     block_size: int = 1000,
-    seed: int = 42,
+    seed: int | None = 42,
     stop: str = "restart",
 ):
     """Create a deterministic block-based mixture of multiple datasets.
@@ -394,7 +394,7 @@ def block_mixture_interleave(
         ...     weights=None,  # Equal 50/50
         ... )
     """
-    from datasets import IterableDataset
+    from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     if not isinstance(datasets, dict):
         raise TypeError(f"datasets must be a dict, got {type(datasets).__name__}")

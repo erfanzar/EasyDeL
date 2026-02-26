@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import collections.abc
 import inspect
 import typing as tp
 import warnings
@@ -48,7 +49,7 @@ FIXED_QUANTIZATION_BITS_BY_MODE: dict[QuantizationMode, int] = {
 
 def filter_kwargs_for_callable(
     callable_obj: tp.Callable[..., tp.Any],
-    kwargs: tp.Mapping[str, tp.Any],
+    kwargs: collections.abc.Mapping[str, tp.Any],
 ) -> dict[str, tp.Any]:
     """Filter kwargs so only parameters accepted by ``callable_obj`` are forwarded.
 
@@ -69,7 +70,7 @@ def filter_kwargs_for_callable(
     return {key: value for key, value in kwargs.items() if key in accepted_keys}
 
 
-def sanitize_model_call_kwargs(kwargs: tp.Mapping[str, tp.Any]) -> dict[str, tp.Any]:
+def sanitize_model_call_kwargs(kwargs: collections.abc.Mapping[str, tp.Any]) -> dict[str, tp.Any]:
     """Normalize model call kwargs to avoid known incompatible combinations.
 
     Causal LM forwards generally accept either ``input_ids`` or ``inputs_embeds``,
@@ -133,8 +134,8 @@ def make_default_tensor_straight_through(
                 f"`quantization_bits` for `{quantization_mode}` must be {required_bits}, got {quantization_bits}."
             )
 
-    from ejkernel.quantization import dequantize as ej_dequantize
-    from ejkernel.quantization import quantize as ej_quantize
+    from ejkernel.quantization import dequantize as ej_dequantize  # pyright: ignore[reportMissingTypeStubs]
+    from ejkernel.quantization import quantize as ej_quantize  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.layers.quantization import QuantizationConfig
     from easydel.layers.quantization._configs import resolve_ejkernel_quant_params
@@ -356,7 +357,7 @@ def update_metrics(
 def update_state_respectfully(
     state: EasyDeLState,
     gradients: jax.Array,
-    loss_config: LossConfig,
+    loss_config: LossConfig | None,
     metrics: LossMetrics,
 ) -> EasyDeLState:
     """
@@ -481,4 +482,4 @@ def minibatch_call(
     else:
         (_, metrics), gradients = grad_fn(state.graphstate, batch)
 
-    return gradients, metrics
+    return gradients, metrics  # type: ignore[return-value]

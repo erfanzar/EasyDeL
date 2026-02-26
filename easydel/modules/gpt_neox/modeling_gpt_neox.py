@@ -19,7 +19,7 @@ from typing import ClassVar
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -651,7 +651,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=GPTNeoXConfig, model_type="gpt_neox")
-class GPTNeoXForCausalLM(BaseCausalLMModule[GPTNeoXModel, GPTNeoXConfig]):
+class GPTNeoXForCausalLM(BaseCausalLMModule[GPTNeoXModel, GPTNeoXConfig]):  # type: ignore
     """GPT-NeoX model with a language modeling head for autoregressive text generation.
 
     This model extends GPTNeoXModel with a linear language modeling head (embed_out) that

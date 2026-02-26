@@ -54,7 +54,7 @@ from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
 from jax import numpy as jnp
 
-from .types import DTypeLike, ELMConfig, PrecisionLike, TaskType
+from .types import DTypeLike, ELMConfig, PrecisionLike, TaskType  # pyright: ignore[reportPrivateLocalImportUsage]
 
 logger = get_logger(__name__)
 

@@ -26,8 +26,6 @@ from dataclasses import InitVar, dataclass, field, fields
 
 import flax.nnx
 import jax
-import jax.experimental
-import jax.experimental.multihost_utils
 import jax.numpy as jnp
 import numpy as np
 from eformer.loggings import get_logger
@@ -35,7 +33,7 @@ from eformer.optimizers import OptimizerFactory, SchedulerConfig
 from eformer.paths import ePath, ePathLike
 from eformer.serialization import Checkpointer
 from jax.sharding import PartitionSpec
-from optax import GradientTransformation
+from optax import GradientTransformation  # pyright: ignore[reportMissingTypeStubs]
 
 from easydel.infra.errors import EasyDeLTimerError
 from easydel.infra.etils import (
@@ -53,19 +51,19 @@ from .metrics import MetricsHistogram, compute_weight_stats
 from .utils import JaxDistributedConfig
 
 try:
-    import wandb  # type: ignore
+    import wandb
 except ImportError:
     wandb = None
 
 if tp.TYPE_CHECKING:
-    from flax.metrics.tensorboard import SummaryWriter  # type:ignore
-    from jax import Array  # type:ignore
-    from torch import Tensor  # type:ignore
+    from flax.metrics.tensorboard import SummaryWriter
+    from jax import Array
+    from torch import Tensor
 else:
     Array, Tensor = [tp.Any] * 2
 
 
-MetricsType = dict[str, float | list | tuple | np.ndarray | Array | Tensor]
+MetricsType = dict[str, float | list | tuple | np.ndarray | Array | Tensor | None]
 logger = get_logger(__name__)
 
 QuantizationMode = tp.Literal[
@@ -178,7 +176,7 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Run evaluation every X steps."},
     )
-    extra_optimizer_kwargs: dict = field(
+    extra_optimizer_kwargs: dict | None = field(
         default_factory=dict,
         metadata={"help": "Additional keyword arguments to pass to the optimizer."},
     )
@@ -371,7 +369,7 @@ class TrainingArguments:
         default=False,
         metadata={"help": "When True, sample additional prompts from the training dataset for previews."},
     )
-    generation_num_prompts: int = field(
+    generation_num_prompts: int | None = field(
         default=1,
         metadata={"help": "Number of prompts to use per preview generation call."},
     )
@@ -481,7 +479,7 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Interval Minutes to save the checkpoint for state."},
     )
-    save_directory: str = field(
+    save_directory: str | None = field(
         default="EasyDeL-Checkpoints",
         metadata={"help": "The directory to save checkpoints to."},
     )
@@ -625,7 +623,7 @@ class TrainingArguments:
         return jax.devices(self.offload_device_type)[self.offload_device_index]
 
     @property
-    def training_time_seconds(self) -> int:
+    def training_time_seconds(self) -> int | None:
         if self.training_time_limit is None:
             return None
         return self._time_to_seconds(self.training_time_limit)
@@ -738,8 +736,7 @@ class TrainingArguments:
             if self.quantization_bits not in AFFINE_SUPPORTED_BITS:
                 bits_values = ", ".join(str(v) for v in sorted(AFFINE_SUPPORTED_BITS))
                 raise ValueError(
-                    f"`quantization_bits` for `affine` must be one of {{{bits_values}}}, "
-                    f"got {self.quantization_bits}."
+                    f"`quantization_bits` for `affine` must be one of {{{bits_values}}}, got {self.quantization_bits}."
                 )
         if self.quantization_mode in FIXED_QUANTIZATION_BITS_BY_MODE and self.quantization_bits is not None:
             expected_bits = FIXED_QUANTIZATION_BITS_BY_MODE[self.quantization_mode]
@@ -917,8 +914,7 @@ class TrainingArguments:
             self.quantization_mode = tp.cast(QuantizationMode | None, quantization_mode or None)
         if self.quantization_mode is not None and self.quantization_mode not in STE_QAT_QUANTIZATION_MODES:
             raise ValueError(
-                "`quantization_mode` must be one of "
-                f"{STE_QAT_QUANTIZATION_MODES_DOC}, got {self.quantization_mode!r}."
+                f"`quantization_mode` must be one of {STE_QAT_QUANTIZATION_MODES_DOC}, got {self.quantization_mode!r}."
             )
 
         if isinstance(self.step_partition_spec, str):
@@ -1016,7 +1012,7 @@ class TrainingArguments:
         Note:
             Creates a model-specific subdirectory within the main save directory.
         """
-        return ePath(self.save_directory) / self.model_name
+        return ePath(self.save_directory) / self.model_name  # pyright: ignore[reportReturnType]
 
     def ensure_checkpoint_path(self):
         """Create the checkpoint directory if it doesn't exist.
@@ -1155,7 +1151,7 @@ class TrainingArguments:
             Cached property to avoid multiple initializations.
             TensorBoard doesn't support cloud storage paths directly.
         """
-        from flax.metrics.tensorboard import SummaryWriter  # type:ignore
+        from flax.metrics.tensorboard import SummaryWriter
 
         path = self._get_save_directory(create=True)
         if path is None:
@@ -1599,7 +1595,7 @@ class TrainingArguments:
         """
         ePath(json_file_path).write_text(self.to_json_string())
 
-    def _get_save_directory(self, create: bool = True) -> ePathLike:
+    def _get_save_directory(self, create: bool = True) -> ePathLike | None:
         if create:
             self.ensure_checkpoint_path()
         return self.get_path()
@@ -1608,7 +1604,7 @@ class TrainingArguments:
         directory_name = f"run-{step}"
         savedir = self._get_save_directory(create=create)
         if savedir is None:
-            return ePath("/dev/null")
+            return ePath("/dev/null")  # pyright: ignore[reportReturnType]
         save_directory = savedir / directory_name
         if create:
             save_directory.mkdir(exist_ok=True, parents=True)
@@ -1630,7 +1626,7 @@ def _set_max_sequence_length(self: TrainingArguments, value: int | None) -> None
     self.max_length = value
 
 
-TrainingArguments.max_sequence_length = property(  # type: ignore[attr-defined]
+TrainingArguments.max_sequence_length = property(
     _get_max_sequence_length,
     _set_max_sequence_length,
     doc="Deprecated alias for `max_length`.",
@@ -1650,7 +1646,7 @@ def _set_quantization_block(self: TrainingArguments, value: int | None) -> None:
     self.quantization_group_size = value
 
 
-TrainingArguments.quantization_block = property(  # type: ignore[attr-defined]
+TrainingArguments.quantization_block = property(
     _get_quantization_block,
     _set_quantization_block,
     doc="Deprecated alias for `quantization_group_size`.",

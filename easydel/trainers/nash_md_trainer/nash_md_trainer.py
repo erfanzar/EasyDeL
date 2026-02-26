@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import collections.abc
 import typing as tp
 from functools import partial
 
@@ -21,7 +22,7 @@ import flax.nnx
 import jax
 import jax.nn
 import numpy as np
-from datasets import Dataset, IterableDataset
+from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 from eformer.escale import with_sharding_constraint
 from eformer.loggings import get_logger
 from jax import numpy as jnp
@@ -88,7 +89,7 @@ class NashMDTrainer(GRPOTrainer):
         self,
         arguments: NashMDConfig,
         model: EasyDeLBaseModule | EasyDeLState,
-        reward_funcs: tp.Sequence[tp.Callable] | tp.Callable,
+        reward_funcs: collections.abc.Sequence[tp.Callable] | tp.Callable,
         *,
         reference_model: EasyDeLBaseModule | EasyDeLState | None = None,
         train_dataset: Dataset | IterableDataset | None = None,
@@ -130,7 +131,7 @@ class NashMDTrainer(GRPOTrainer):
         Returns:
             Current scheduled value.
         """
-        if isinstance(schedule, tp.Sequence):
+        if isinstance(schedule, collections.abc.Sequence):
             if not schedule:
                 return default
             if self.max_training_steps is None or self.arguments.num_train_epochs <= 0:
@@ -350,7 +351,7 @@ class NashMDTrainer(GRPOTrainer):
                 completion_mask = results.completion_mask
             generation_time = generation_time_fn()
 
-            with capture_time() as mixture_time_fn:  # noqa
+            with capture_time() as _mixture_time_fn:
                 mixture_results = self.generate_unified(
                     input_ids=prompt_ids,
                     attention_mask=prompt_mask,

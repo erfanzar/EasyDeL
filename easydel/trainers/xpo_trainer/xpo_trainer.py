@@ -14,11 +14,12 @@
 
 from __future__ import annotations
 
+import collections.abc
 import typing as tp
 
 import jax
 import numpy as np
-from datasets import Dataset, IterableDataset
+from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 
@@ -70,7 +71,7 @@ class XPOTrainer(GRPOTrainer):
         self,
         arguments: XPOConfig,
         model: EasyDeLBaseModule | EasyDeLState,
-        reward_funcs: tp.Sequence[tp.Callable] | tp.Callable,
+        reward_funcs: collections.abc.Sequence[tp.Callable] | tp.Callable,
         *,
         reference_model: EasyDeLBaseModule | EasyDeLState | None = None,
         train_dataset: Dataset | IterableDataset | None = None,
@@ -116,7 +117,7 @@ class XPOTrainer(GRPOTrainer):
 
     def _get_reward_processing_classes(self) -> list[ProcessingClassType | None]:
         """Normalize reward processing classes to a list aligned to reward functions."""
-        reward_processing_classes = self.reward_processing_classes
+        reward_processing_classes: list | None = self.reward_processing_classes
         if reward_processing_classes is None:
             return [None] * len(self.reward_funcs)
         if isinstance(reward_processing_classes, (list, tuple)):
@@ -137,7 +138,7 @@ class XPOTrainer(GRPOTrainer):
         Returns:
             Current scheduled value based on training progress.
         """
-        if isinstance(schedule, tp.Sequence):
+        if isinstance(schedule, collections.abc.Sequence):
             if not schedule:
                 return default
             if self.max_training_steps is None or self.arguments.num_train_epochs <= 0:

@@ -21,7 +21,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import ColumnWise, RowWise
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -81,7 +81,7 @@ def _patch_hf_dbrx_aux_loss_return_type() -> None:
             device = getattr(gate_logits[0], "device", None)
         return torch.tensor(float(out), device=device)
 
-    _patched_load_balancing_loss_func._ed_tensor_return_patch = True
+    _patched_load_balancing_loss_func._ed_tensor_return_patch = True  # type: ignore
     hf_dbrx.load_balancing_loss_func = _patched_load_balancing_loss_func
 
 
@@ -1090,7 +1090,7 @@ class DbrxModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
@@ -1245,7 +1245,7 @@ class DbrxModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=DbrxConfig, model_type="dbrx")
-class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):
+class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):  # type: ignore
     """DBRX model with a language modeling head for causal language modeling tasks.
 
     This model is a sparse MoE transformer-based language model with causal attention masks
@@ -1378,7 +1378,7 @@ class DbrxForCausalLM(BaseCausalLMModule[DbrxModel, DbrxConfig]):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=DbrxConfig, model_type="dbrx")
-class DbrxForSequenceClassification(BaseSequenceClassificationModule[DbrxModel, DbrxConfig]):
+class DbrxForSequenceClassification(BaseSequenceClassificationModule[DbrxModel, DbrxConfig]):  # type: ignore
     """DBRX model for sequence classification tasks.
 
     This class extends the base DBRX model by adding a linear classification head
@@ -1428,7 +1428,7 @@ class DbrxForSequenceClassification(BaseSequenceClassificationModule[DbrxModel, 
 
     def __call__(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,

@@ -187,17 +187,17 @@ class ParquetShardedSource(ShardedDataSource[dict]):
 
     def _open_file(self, path: str):
         """Open a parquet file with fsspec."""
-        import fsspec
+        import fsspec  # pyright: ignore[reportMissingTypeStubs]
 
         return fsspec.open(path, "rb", **self._storage_options)
 
-    @with_retry(max_retries=3, initial_delay=1.0)
+    @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def get_shard_info(self, shard_name: str) -> ParquetShardInfo:
         """Get metadata about a Parquet shard."""
         if shard_name in self._shard_info_cache:
             return self._shard_info_cache[shard_name]
 
-        import pyarrow.parquet as pq
+        import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
         with self._open_file(shard_name) as fh:
             pf = pq.ParquetFile(fh)
@@ -210,10 +210,10 @@ class ParquetShardedSource(ShardedDataSource[dict]):
             self._shard_info_cache[shard_name] = info
             return info
 
-    @with_retry(max_retries=3, initial_delay=1.0)
+    @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
         """Open a Parquet shard and iterate over rows."""
-        import pyarrow.parquet as pq
+        import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
         with self._open_file(shard_name) as fh:
             pf = pq.ParquetFile(fh)
@@ -231,7 +231,7 @@ class ParquetShardedSource(ShardedDataSource[dict]):
 
         Uses row group metadata for efficient seeking.
         """
-        import pyarrow.parquet as pq
+        import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
         with self._open_file(shard_name) as fh:
             pf = pq.ParquetFile(fh)
@@ -304,11 +304,11 @@ class JsonShardedSource(ShardedDataSource[dict]):
 
     def _open_file(self, path: str):
         """Open a file with fsspec."""
-        import fsspec
+        import fsspec  # pyright: ignore[reportMissingTypeStubs]
 
         return fsspec.open(path, "r", **self._storage_options)
 
-    @with_retry(max_retries=3, initial_delay=1.0)
+    @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
         """Open a JSON/JSONL shard and iterate over records."""
         import json
@@ -387,11 +387,11 @@ class ArrowShardedSource(ShardedDataSource[dict]):
     def num_shards(self) -> int:
         return len(self._files)
 
-    @with_retry(max_retries=3, initial_delay=1.0)
+    @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
         """Open an Arrow IPC shard and iterate over rows."""
-        import fsspec
-        import pyarrow.ipc as ipc
+        import fsspec  # pyright: ignore[reportMissingTypeStubs]
+        import pyarrow.ipc as ipc  # pyright: ignore[reportMissingTypeStubs]
 
         with fsspec.open(shard_name, "rb", **self._storage_options) as fh:
             reader = ipc.open_file(fh)
@@ -448,12 +448,12 @@ class CsvShardedSource(ShardedDataSource[dict]):
     def num_shards(self) -> int:
         return len(self._files)
 
-    @with_retry(max_retries=3, initial_delay=1.0)
+    @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
         """Open a CSV shard and iterate over rows."""
         import csv
 
-        import fsspec
+        import fsspec  # pyright: ignore[reportMissingTypeStubs]
 
         with fsspec.open(shard_name, "r", **self._storage_options) as fh:
             reader = csv.DictReader(fh, delimiter=self._delimiter)
@@ -508,7 +508,7 @@ class TextShardedSource(ShardedDataSource[dict]):
 
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
         """Open a text shard and iterate over lines."""
-        import fsspec
+        import fsspec  # pyright: ignore[reportMissingTypeStubs]
 
         with fsspec.open(shard_name, "r", **self._storage_options) as fh:
             for line in fh:
@@ -572,7 +572,7 @@ class HuggingFaceShardedSource(ShardedDataSource[dict]):
     def _load_dataset(self):
         """Lazily load the dataset."""
         if self._dataset is None:
-            from datasets import load_dataset
+            from datasets import load_dataset  # pyright: ignore[reportMissingTypeStubs]
 
             self._dataset = load_dataset(
                 self._dataset_name,
@@ -760,7 +760,7 @@ def load_for_inform(inform, mixture):
     Returns:
         Loaded Dataset or IterableDataset.
     """
-    from datasets import IterableDataset, load_dataset
+    from datasets import IterableDataset, load_dataset  # pyright: ignore[reportMissingTypeStubs]
 
     t = str(inform.get_str_type())
     df = inform.data_files
@@ -782,8 +782,8 @@ def load_for_inform(inform, mixture):
     builder = specified_builder or builder
 
     def _iter_parquet_rows(files: list[str]):
-        import fsspec
-        import pyarrow.parquet as pq
+        import fsspec  # pyright: ignore[reportMissingTypeStubs]
+        import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
         for path in files:
             with fsspec.open(path, "rb") as fh:

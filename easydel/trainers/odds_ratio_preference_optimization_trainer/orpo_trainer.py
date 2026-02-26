@@ -28,7 +28,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
 
-from ..base_trainer import TrainerConfigureFunctionOutput
+from ..base_trainer import TrainerConfigureFunctionOutput  # pyright: ignore[reportPrivateLocalImportUsage]
 from ..prompt_transforms import ORPOPreprocessTransform
 from ..trainer.trainer import Trainer
 from ..training_utils import resolve_straight_through_emulator
@@ -37,7 +37,7 @@ from ._fn import concatenated_forward, orpo_step
 from .orpo_config import ORPOConfig
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.data.core.protocols import ShardedDataSource
 
@@ -82,7 +82,7 @@ class ORPOTrainer(Trainer):
 
     def __init__(
         self,
-        arguments: ORPOConfig,
+        arguments: ORPOConfig | None,
         model: EasyDeLBaseModule | EasyDeLState | None = None,
         data_collator: DPODataCollatorWithPaddingTFDS | DPODataCollatorWithPaddingGrain | None = None,
         train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,

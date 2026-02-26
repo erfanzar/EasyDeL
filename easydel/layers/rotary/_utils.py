@@ -48,7 +48,7 @@ def _yarn_find_correction_dim(
     dim: int,
     base: float = 10000,
     max_position_embeddings: int = 2048,
-) -> float:
+) -> float | Array:
     """
     Calculates the correction dimension for YaRN scaling.
 
@@ -72,13 +72,13 @@ def _yarn_find_correction_dim(
 
 
 @jax.named_scope("easydel-rotary-yarn-find-correction-range")
-def _yarn_find_correction_range(
+def _yarn_find_correction_range(  # pyright: ignore[reportUnusedFunction]
     low_rot: int,
     high_rot: int,
     dim: int,
     base: float = 10000,
     max_position_embeddings: int = 2048,
-) -> tuple[int, int]:
+) -> tuple[int | Array, int | Array]:
     """
     Finds the correction range for YaRN scaling based on low and high rotation frequencies.
 
@@ -115,7 +115,7 @@ def _yarn_find_correction_range(
 
 
 @jax.named_scope("easydel-rotary-yarn-linear-ramp-mask")
-def _yarn_linear_ramp_mask(
+def _yarn_linear_ramp_mask(  # pyright: ignore[reportUnusedFunction]
     low: float,
     high: float,
     dim: int,
@@ -144,7 +144,7 @@ def _yarn_linear_ramp_mask(
 
 
 @jax.named_scope("easydel-rotary-yarn-get-mscale")
-def _yarn_get_mscale(scale: float = 1) -> float:
+def _yarn_get_mscale(scale: float = 1) -> float | Array:  # pyright: ignore[reportUnusedFunction]
     """
     Calculates the mscale factor for YaRN context extension method.
 
@@ -162,7 +162,7 @@ def _yarn_get_mscale(scale: float = 1) -> float:
 
 
 @jax.named_scope("easydel-rotary-rotate-neox")
-def _rotate_neox(x: Float[Array, "... seq_len head_dim"]) -> Float[Array, "... seq_len head_dim"]:
+def _rotate_neox(x: Float[Array, "... seq_len head_dim"]) -> Float[Array, "... seq_len head_dim"]:  # pyright: ignore[reportUnusedFunction]
     """
     Applies the Neox-style rotation to the input array.
 
@@ -181,7 +181,7 @@ def _rotate_neox(x: Float[Array, "... seq_len head_dim"]) -> Float[Array, "... s
 
 
 @jax.named_scope("easydel-rotary-rotate-gptj")
-def _rotate_gptj(x: Float[Array, "... seq_len head_dim"]) -> Float[Array, "... seq_len head_dim"]:
+def _rotate_gptj(x: Float[Array, "... seq_len head_dim"]) -> Float[Array, "... seq_len head_dim"]:  # pyright: ignore[reportUnusedFunction]
     """
     Applies the GPT-J-style rotation to the input array.
 
@@ -200,7 +200,7 @@ def _rotate_gptj(x: Float[Array, "... seq_len head_dim"]) -> Float[Array, "... s
 
 
 @jax.named_scope("easydel-rotary-apply-rotary-emb")
-def _apply_rotary_emb(
+def _apply_rotary_emb(  # pyright: ignore[reportUnusedFunction]
     x: jnp.ndarray,
     cos: jnp.ndarray,
     sin: jnp.ndarray,

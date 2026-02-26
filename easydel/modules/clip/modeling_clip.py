@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -697,8 +697,8 @@ class CLIPTextTransformer(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"],
         mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
+        output_attentions: bool | None = False,
+        output_hidden_states: bool | None = False,
     ):
         """Forward pass through the text transformer.
 
@@ -1240,7 +1240,7 @@ class CLIPVisionModel(EasyDeLBaseModule):
 
 
 @register_module(config=CLIPVisionConfig, model_type="clip", task_type=TaskType.IMAGE_CLASSIFICATION)
-class CLIPForImageClassification(BaseImageClassificationModule[CLIPVisionTransformer, CLIPVisionConfig]):
+class CLIPForImageClassification(BaseImageClassificationModule[CLIPVisionTransformer, CLIPVisionConfig]):  # type: ignore
     """CLIP vision model with image classification head.
 
     Extends the CLIP vision transformer with a linear classification layer
@@ -1431,7 +1431,7 @@ class CLIPModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None,
         pixel_values: Array,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
@@ -1600,7 +1600,7 @@ class CLIPModel(EasyDeLBaseModule):
 
         loss = LossMetrics(loss=clip_loss(outputs.logits_per_text))
         outputs = outputs.replace(loss=loss.loss)
-        return outputs, loss
+        return outputs, loss  # pyright: ignore[reportReturnType]
 
     def get_encoder(self):
         """

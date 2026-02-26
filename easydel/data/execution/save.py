@@ -87,7 +87,7 @@ class WriteStats:
     num_examples: int = 0
     num_shards: int = 0
     total_bytes: int = 0
-    output_paths: list[str] = None
+    output_paths: list[str] | None = None
 
     def __post_init__(self):
         if self.output_paths is None:
@@ -137,9 +137,9 @@ class ParquetWriter(DatasetWriter):
 
     def write(self, source: ShardedDataSource) -> WriteStats:
         """Write source to Parquet files."""
-        import fsspec
-        import pyarrow as pa
-        import pyarrow.parquet as pq
+        import fsspec  # pyright: ignore[reportMissingTypeStubs]
+        import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
+        import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
         # Create output directory
         fs, path = fsspec.core.url_to_fs(self.output_path)
@@ -199,9 +199,9 @@ class ArrowWriter(DatasetWriter):
 
     def write(self, source: ShardedDataSource) -> WriteStats:
         """Write source to Arrow IPC files."""
-        import fsspec
-        import pyarrow as pa
-        import pyarrow.ipc as ipc
+        import fsspec  # pyright: ignore[reportMissingTypeStubs]
+        import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
+        import pyarrow.ipc as ipc  # pyright: ignore[reportMissingTypeStubs]
 
         fs, path = fsspec.core.url_to_fs(self.output_path)
         fs.makedirs(path, exist_ok=True)
@@ -258,7 +258,7 @@ class JsonlWriter(DatasetWriter):
 
     def write(self, source: ShardedDataSource) -> WriteStats:
         """Write source to JSONL files."""
-        import fsspec
+        import fsspec  # pyright: ignore[reportMissingTypeStubs]
 
         fs, path = fsspec.core.url_to_fs(self.output_path)
         fs.makedirs(path, exist_ok=True)
@@ -454,6 +454,9 @@ class SaveStage(BaseStage):
             )
 
             # Upload files
+            if stats.output_paths is None:
+                logger.warning("No output paths to upload")
+                return
             for file_path in stats.output_paths:
                 api.upload_file(
                     path_or_fileobj=file_path,

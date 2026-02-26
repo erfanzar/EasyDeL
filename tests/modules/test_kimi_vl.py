@@ -1,5 +1,7 @@
 """Tests for Kimi-VL model."""
 
+# pyright: reportPrivateLocalImportUsage=false
+
 import numpy as np
 import pytest
 import transformers
@@ -10,7 +12,7 @@ import easydel as ed
 try:
     from .test_utils import CausalLMTester, VisionLanguageTester
 except ImportError:
-    from test_utils import CausalLMTester, VisionLanguageTester
+    from test_utils import CausalLMTester, VisionLanguageTester  # pyright: ignore[reportImplicitRelativeImport]
 
 
 class TestKimiVL:

@@ -21,7 +21,7 @@ import numpy as np
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -857,7 +857,7 @@ class Glm4vVisionModel(EasyDeLBaseModule):
         cu_seqlens = jnp.cumsum(repeated, dtype="i4")
         cu_seqlens = jnp.pad(cu_seqlens, (1, 0), constant_values=0)
 
-        max_grid_size = int(np.array(grid_thw)[:, 1:].max()) if grid_thw is not None else 1
+        max_grid_size = int(np.array(grid_thw)[:, 1:].max())
         rotary_pos_emb = self.rot_pos_emb(grid_thw, max_grid_size=max_grid_size)
         rotary_pos_emb = jnp.concatenate([rotary_pos_emb, rotary_pos_emb], axis=-1)
 
@@ -1711,7 +1711,7 @@ class Glm4vModel(EasyDeLBaseModule):
 
     def compute_embedding(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None,
         *,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         pixel_values: Array | None = None,
@@ -1936,7 +1936,7 @@ class Glm4vModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Glm4vConfig, model_type="glm4v")
-class Glm4vForConditionalGeneration(BaseVisionLanguageModule[Glm4vModel, Glm4vConfig]):
+class Glm4vForConditionalGeneration(BaseVisionLanguageModule[Glm4vModel, Glm4vConfig]):  # type: ignore
     """GLM4V model for conditional generation.
 
     Vision-language model that combines a vision encoder with a text decoder

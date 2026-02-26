@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -175,7 +175,9 @@ class Qwen3Attention(UnifiedAttention):
             rngs=rngs,
             attention_type="standard",
             causal=True,
-            sliding_window=config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None,
+            sliding_window=config.sliding_window
+            if config.layer_types is not None and config.layer_types[layer_idx] == "sliding_attention"
+            else None,
             use_qk_norm=True,
             layer_idx=layer_idx,
         )

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+# pyright: reportPrivateLocalImportUsage=false
 import sys
 from pathlib import Path
 
@@ -80,7 +81,6 @@ def main_rich_feedback():
     logger = get_logger(__name__)
     tokenizer = get_tokenizer()
     model = load_causal_lm_model()
-
 
     trainer_args = make_config(
         ed.SDPOConfig,

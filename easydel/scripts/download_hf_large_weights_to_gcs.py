@@ -40,7 +40,6 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import requests
 from eformer.aparser import DataClassArgumentParser
@@ -84,7 +83,7 @@ class LargeWeightsArgs:
     out_root: str = field(metadata={"help": "Output root directory (e.g. /mnt/gcs/weights)."})
 
     repo_id: str = field(default_factory=list, metadata={"action": "append", "help": "Model repo id (repeatable)."})
-    repos_file: Optional[str] = field(default=None, metadata={"help": "File with one repo id per line."})  # noqa: UP045
+    repos_file: str | None = field(default=None, metadata={"help": "File with one repo id per line."})
     collection: str = field(
         default_factory=list,
         metadata={
@@ -93,9 +92,9 @@ class LargeWeightsArgs:
         },
     )
 
-    revision: Optional[str] = field(default=None, metadata={"help": "Repo revision to download from (default: main)."})  # noqa: UP045
-    token: Optional[str] = field(default=None, metadata={"help": "HF token (or use HF_TOKEN env / hf auth login)."})  # noqa: UP045
-    cache_dir: Optional[str] = field(  # noqa: UP045
+    revision: str | None = field(default=None, metadata={"help": "Repo revision to download from (default: main)."})
+    token: str | None = field(default=None, metadata={"help": "HF token (or use HF_TOKEN env / hf auth login)."})
+    cache_dir: str | None = field(
         default=None,
         metadata={
             "help": "HF cache dir. Set this to a non-root disk/mount to avoid filling up / (e.g. /mnt/gcs/hf-cache)."

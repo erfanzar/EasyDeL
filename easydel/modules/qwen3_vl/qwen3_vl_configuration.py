@@ -19,6 +19,7 @@ implementation, with proper separation of vision and text configurations.
 """
 
 import typing
+from collections.abc import Mapping
 
 from jax.sharding import PartitionSpec
 
@@ -145,7 +146,7 @@ class Qwen3VLTextConfig(EasyDeLBaseConfig):
         attention_dropout: float = 0.0,
         rope_scaling: dict | None = None,
         use_sliding_window: bool = False,
-        sliding_window: int = 4096,
+        sliding_window: int | None = 4096,
         max_window_layers: int = 80,
         layer_types: list[str] | None = None,
         **kwargs,
@@ -216,8 +217,8 @@ class Qwen3VLConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vision_config: typing.Mapping[str, typing.Any] | Qwen3VLVisionConfig | None = None,
-        text_config: typing.Mapping[str, typing.Any] | Qwen3VLTextConfig | None = None,
+        vision_config: Mapping[str, typing.Any] | Qwen3VLVisionConfig | None = None,
+        text_config: Mapping[str, typing.Any] | Qwen3VLTextConfig | None = None,
         image_token_id: int = 151655,
         video_token_id: int = 151656,
         vision_start_token_id: int = 151652,
@@ -250,7 +251,7 @@ class Qwen3VLConfig(EasyDeLBaseConfig):
         Returns:
             The text configuration object.
         """
-        return self.text_config
+        return self.text_config  # pyright: ignore[reportReturnType]
 
     def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
         """Returns partition rules for model sharding.

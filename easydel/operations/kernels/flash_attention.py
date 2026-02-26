@@ -52,8 +52,8 @@ Example:
 import jax
 from eformer import common_types
 from eformer.escale import with_sharding_constraint
-from ejkernel.modules import flash_attention
-from ejkernel.types import MaskInfo
+from ejkernel.modules import flash_attention  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import lax
 from jax import numpy as jnp
 from jax import random as jr
@@ -100,6 +100,7 @@ class FlashAttn(OperationImpl):
         Returns:
             The `OperationMetadata` provided during initialization.
         """
+        assert self.metadata is not None
         return self.metadata
 
     @classmethod
@@ -449,5 +450,6 @@ if __name__ == "__main__":
     vanilla = VanillaAttn(metadata)
     fout = attn(query=query, key=key, value=value, attention_mask=a, causal=False).attention_outputs
     vout = vanilla(query=query, key=key, value=value, attention_mask=a).attention_outputs
+    assert fout is not None and vout is not None
     print(fout[-1, -1, -1, -5:])
     print(vout[-1, -1, -1, -5:])

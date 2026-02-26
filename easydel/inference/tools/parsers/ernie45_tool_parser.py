@@ -52,7 +52,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = get_logger(__name__)
 
 
-@ToolParserManager.register_module("ernie45")
+@ToolParserManager.register_module("ernie45")  # pyright: ignore[reportUntypedClassDecorator]
 class Ernie45ToolParser(ToolParser):
     """Tool parser for ERNIE 4.5 (Baidu) model outputs.
 

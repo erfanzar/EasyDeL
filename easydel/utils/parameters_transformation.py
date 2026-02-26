@@ -22,15 +22,17 @@ import inspect
 import os
 import typing as tp
 import warnings
+from collections.abc import Mapping
 
 import jax
 import jax.extend
 import numpy as np
+from eformer.loggings import get_logger
 from jax import dlpack
 from jax import numpy as jnp
 from tqdm.autonotebook import tqdm
 
-from easydel.utils.helpers import check_bool_flag, get_logger
+from easydel.utils.helpers import check_bool_flag
 
 from .analyze_memory import SMPMemoryMonitor
 from .traversals import flatten_dict, unflatten_dict
@@ -45,8 +47,8 @@ if tp.TYPE_CHECKING:
 mem_ops = SMPMemoryMonitor(5)
 logger = get_logger(__name__)
 EASYDEL_PERFRED_HOST_COPY_INDEX = int(os.getenv("EASYDEL_PERFRED_HOST_COPY_INDEX", "0"))
-EASYDEL_PERFRED_HOST_COPY = str(os.getenv("EASYDEL_PERFRED_HOST_COPY", "cpu")).lower()
-EASYDEL_PERFRED_HOST_COPY = None if EASYDEL_PERFRED_HOST_COPY == "none" else EASYDEL_PERFRED_HOST_COPY
+_perfred_host_copy_raw = str(os.getenv("EASYDEL_PERFRED_HOST_COPY", "cpu")).lower()
+EASYDEL_PERFRED_HOST_COPY: str | None = None if _perfred_host_copy_raw == "none" else _perfred_host_copy_raw
 
 
 class DtypeHandler:
@@ -56,7 +58,7 @@ class DtypeHandler:
     def get_dtype(dtype: str | jnp.dtype) -> jnp.dtype:
         """Convert string dtype representation to JAX dtype."""
         if isinstance(dtype, str):
-            dtype_map = {
+            dtype_map: dict[str, jnp.dtype] = {
                 "bf16": jnp.bfloat16,
                 "bfloat16": jnp.bfloat16,
                 "fp16": jnp.float16,
@@ -80,7 +82,7 @@ class DtypeHandler:
                 "float8_e5m2": jnp.float8_e5m2,
                 "float8_e5m2fnuz": jnp.float8_e5m2fnuz,
             }
-            dtype = dtype_map[dtype]
+            return dtype_map[dtype]
         return dtype
 
     @staticmethod
@@ -262,7 +264,7 @@ class StateDictConverter:
         layernorm_names: list[str] | None = None,
         moe_block_names: list[str] | None = None,
         moe_names: list[str] | None = None,
-        shard_fns: tp.Mapping[tuple, tp.Callable] | None = None,
+        shard_fns: Mapping[tuple, tp.Callable] | None = None,
         dtype: jnp.dtype = jnp.float16,
         verbose: bool = True,
         callback: tp.Callable[[jax.Array, tuple], jax.Array] | None = None,
@@ -353,6 +355,10 @@ class StateDictConverter:
             return state_dict, set()
 
         import torch
+
+        assert moe_path is not None
+        assert moe_names is not None
+        assert moe_block_path is not None
 
         excepted_expert_name = moe_path[0].split(".")[-2]
         expert_prefix = f".{excepted_expert_name}."
@@ -455,7 +461,7 @@ class StateDictConverter:
         moe_names: list[str] | None = None,
         moe_block_path: list[str] | None = None,
         moe_path: list[str] | None = None,
-        shard_fns: tp.Mapping[tuple, tp.Callable] | None = None,
+        shard_fns: Mapping[tuple, tp.Callable] | None = None,
         dtype: jnp.dtype = jnp.float16,
         verbose: bool = True,
         callback: tp.Callable[[jax.Array, tuple], jax.Array] | None = None,
@@ -519,6 +525,9 @@ class StateDictConverter:
         if not all([moe_block_names, moe_names, moe_block_path]):
             return state_dict
 
+        assert moe_names is not None
+        assert moe_block_path is not None
+
         new_state_dict = {}
         processed_keys = set()
         excepted_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
@@ -555,7 +564,9 @@ class StateDictConverter:
         return new_state_dict
 
     @staticmethod
-    def easydel_to_torch(module: EasyDeLBaseModule, dtype: jnp.dtype = jnp.float16, **kwargs) -> dict[str, tp.Any]:
+    def easydel_to_torch(
+        module: EasyDeLBaseModule, dtype: jnp.dtype | None = jnp.float16, **kwargs
+    ) -> dict[str, tp.Any]:
         """Convert EasyDeL module to PyTorch state dict."""
         if dtype is None:
             dtype = module.param_dtype

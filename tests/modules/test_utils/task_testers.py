@@ -4,6 +4,8 @@ This module provides tester classes for different model task types,
 including CAUSAL_LM, BASE_MODULE, SEQUENCE_CLASSIFICATION, VLM, etc.
 """
 
+# pyright: reportPrivateLocalImportUsage=false
+
 import traceback
 from dataclasses import dataclass, field
 from typing import Any
@@ -113,7 +115,7 @@ class BaseTester:
         """
         try:
 
-            @ed.ejit(static_argnums=(1,))
+            @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
             def jited(ids, gd, gs, go, attention_mask, **kwargs):
                 model = nn.merge(gd, gs, go)
                 return model.compute_loss(
@@ -144,7 +146,7 @@ class BaseTester:
         except Exception:
             # Fallback without router logits (handles TypeError, ValueError, etc.)
 
-            @ed.ejit(static_argnums=(1,))
+            @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
             def jited_fallback(ids, gd, gs, go, attention_mask, **kwargs):
                 model = nn.merge(gd, gs, go)
                 return model.compute_loss(
@@ -178,7 +180,7 @@ class CausalLMTester(BaseTester):
     def run(
         self,
         module_name: str,
-        hf_class: type,
+        hf_class: type | None,
         task: ed.TaskType,
         config: Any,
         small_model_config: dict,
@@ -499,7 +501,7 @@ class BaseModuleTester(BaseTester):
                 # Run ED forward with hidden states
                 ed_inputs = inputs["jax"]
 
-                @ed.ejit(static_argnums=(0,))
+                @ed.ejit(static_argnums=(0,))  # pyright: ignore[reportUntypedFunctionDecorator]
                 def jited(gd, gs, go, **kwargs):
                     model = nn.merge(gd, gs, go)
                     return model(**kwargs, output_hidden_states=True)
@@ -686,7 +688,7 @@ class VisionLanguageTester(BaseTester):
     def run(
         self,
         module_name: str,
-        hf_class: type,
+        hf_class: type | None,
         task: ed.TaskType,
         config: Any,
         small_model_config: dict,
@@ -761,7 +763,7 @@ class VisionLanguageTester(BaseTester):
                     ed_inputs = inputs["jax"]
                     forward_kwargs, loss_kwargs = self._build_vlm_jit_inputs(ed_model, ed_inputs, vlm_config)
 
-                    @ed.ejit(static_argnums=(1,))
+                    @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                     def jited(embeds, gd, gs, go, attention_mask, labels, **kwargs):
                         model = nn.merge(gd, gs, go)
                         return model.compute_loss(
@@ -786,11 +788,7 @@ class VisionLanguageTester(BaseTester):
                             *ed_model.split_module(),
                             attention_mask=forward_kwargs["attention_mask"],
                             labels=loss_kwargs["labels"],
-                            **{
-                                k: v
-                                for k, v in forward_kwargs.items()
-                                if k not in ["inputs_embeds", "attention_mask"]
-                            },
+                            **{k: v for k, v in forward_kwargs.items() if k not in ["inputs_embeds", "attention_mask"]},
                         )
                     ed_time = timer()
 
@@ -832,7 +830,7 @@ class VisionLanguageTester(BaseTester):
                 ed_inputs = inputs["jax"]
                 forward_kwargs, loss_kwargs = self._build_vlm_jit_inputs(ed_model, ed_inputs, vlm_config)
 
-                @ed.ejit(static_argnums=(1,))
+                @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                 def jited(embeds, gd, gs, go, attention_mask, labels, **kwargs):
                     model = nn.merge(gd, gs, go)
                     return model.compute_loss(
@@ -949,7 +947,7 @@ class Seq2SeqTester(BaseTester):
                         "decoder_input_ids": decoder_inputs["jax"]["input_ids"],
                     }
 
-                    @ed.ejit(static_argnums=(1,))
+                    @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                     def jited(input_features, gd, gs, go, decoder_input_ids):
                         model = nn.merge(gd, gs, go)
                         return model.compute_loss(
@@ -990,7 +988,7 @@ class Seq2SeqTester(BaseTester):
                     # Run ED forward
                     ed_inputs = {**inputs["jax"], "labels": inputs["jax"]["decoder_input_ids"]}
 
-                    @ed.ejit(static_argnums=(1,))
+                    @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                     def jited(input_ids, gd, gs, go, attention_mask, labels, **kwargs):
                         model = nn.merge(gd, gs, go)
                         return model.compute_loss(
@@ -1199,7 +1197,8 @@ class EasyDeLOnlyTester:
 
                 # Run forward pass
                 with ed.utils.capture_time() as timer:
-                    @ed.ejit(static_argnums=(0,))
+
+                    @ed.ejit(static_argnums=(0,))  # pyright: ignore[reportUntypedFunctionDecorator]
                     def jited(gd, gs, go, input_ids, attention_mask):
                         model = nn.merge(gd, gs, go)
                         return model(

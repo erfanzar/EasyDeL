@@ -52,6 +52,8 @@ Example:
 
 from __future__ import annotations
 
+import typing as tp
+
 import jax
 import jax.numpy as jnp
 from flax import nnx as nn
@@ -74,7 +76,10 @@ AVAILABLE_ROPE_TYPES = {}
 """A dictionary to store registered RoPE (Rotary Position Embedding) types and their configurations."""
 
 
-def rope_wraper(type):  # noqa
+_T = tp.TypeVar("_T")
+
+
+def rope_wraper(type: str) -> tp.Callable[[_T], _T]:  # noqa
     """
     A decorator factory that registers a RotaryEmbedding class under a specific type name.
 
@@ -89,15 +94,15 @@ def rope_wraper(type):  # noqa
                   and returns the class.
     """
 
-    def w(rope: RotaryEmbedding):
+    def w(rope: _T) -> _T:
         """
         Decorator function that registers the RoPE class.
 
         Args:
-            rope (RotaryEmbedding): The RotaryEmbedding class to register.
+            rope: The RotaryEmbedding class to register.
 
         Returns:
-            RotaryEmbedding: The registered RotaryEmbedding class.
+            The registered RotaryEmbedding class.
         """
         properties = {k: v for k, v in rope.__dict__.items()}
         AVAILABLE_ROPE_TYPES[type] = properties
@@ -911,9 +916,8 @@ class DeepseekScalingRotaryEmbedding(nn.Module):
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
 
-        if self.rotary_dim < self.head_size:
-            query_pass = query[..., self.rotary_dim :]
-            key_pass = key[..., self.rotary_dim :]
+        query_pass = query[..., self.rotary_dim :]
+        key_pass = key[..., self.rotary_dim :]
 
         target_sc_shape = (query.shape[0], -1, 1, self.rotary_dim)
         if self.is_neox_style:

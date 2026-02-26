@@ -61,8 +61,8 @@ References:
 
 import jax
 from eformer import common_types
-from ejkernel.modules import ring_attention
-from ejkernel.types import MaskInfo
+from ejkernel.modules import ring_attention  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax import random as jr
 from jaxtyping import Array, Float
@@ -117,6 +117,7 @@ class RingAttn(OperationImpl):
         Returns:
             OperationMetadata: Configuration including dtype, mesh, etc.
         """
+        assert self.metadata is not None
         return self.metadata
 
     @classmethod
@@ -387,12 +388,13 @@ if __name__ == "__main__":
             base_config=EasyDeLBaseConfig(sharding_axis_dims=(1, 1, 1, 1, -1)),
         )
     )
-    from ejkernel.modules import attention
+    from ejkernel.modules import attention  # pyright: ignore[reportMissingTypeStubs]
 
     out = attention(q, k, v, mask_info=mask_info)[0]
     vout = ring(query=q, key=k, value=v, mask_info=mask_info).attention_outputs
 
     print(out[-1, -1, -1, -5:], out[-1, 0, -1, -5:])
+    assert vout is not None
     print(vout[-1, -1, -1, -5:], vout[-1, 0, -1, -5:])
 
     print(jnp.allclose(out, vout, atol=0.125))

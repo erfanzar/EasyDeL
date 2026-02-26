@@ -18,7 +18,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -252,7 +252,7 @@ class LlavaModel(EasyDeLBaseModule):
 
     def compute_embedding(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None,
         *,
         image_features: Array | None = None,
         pixel_values: Array | None = None,
@@ -306,8 +306,8 @@ class LlavaModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: Array = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        pixel_values: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
@@ -519,7 +519,7 @@ class LlavaModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=LlavaConfig, model_type="llava")
-class LlavaForConditionalGeneration(BaseVisionLanguageModule[LlavaModel, LlavaConfig]):
+class LlavaForConditionalGeneration(BaseVisionLanguageModule[LlavaModel, LlavaConfig]):  # type: ignore
     """LLaVA model for conditional text generation based on image inputs.
 
     Combines a vision tower and a language model with a multi-modal projector.
@@ -631,8 +631,8 @@ class LlavaForConditionalGeneration(BaseVisionLanguageModule[LlavaModel, LlavaCo
 
     def __call__(
         self,
-        input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: Array = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        pixel_values: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,

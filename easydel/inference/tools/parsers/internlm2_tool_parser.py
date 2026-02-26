@@ -36,9 +36,9 @@ import json
 from collections.abc import Sequence
 from uuid import uuid4
 
-import partial_json_parser
+import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
 from eformer.loggings import get_logger
-from partial_json_parser.core.options import Allow
+from partial_json_parser.core.options import Allow  # pyright: ignore[reportMissingTypeStubs]
 from transformers import AutoTokenizer as AnyTokenizer
 
 from ...openai_api_modules import (
@@ -56,7 +56,7 @@ from ..utils import extract_intermediate_diff
 logger = get_logger(__name__)
 
 
-@ToolParserManager.register_module(["internlm"])
+@ToolParserManager.register_module(["internlm"])  # pyright: ignore[reportUntypedClassDecorator]
 class Internlm2ToolParser(ToolParser):
     """Tool parser for InternLM2 models.
 
@@ -177,6 +177,7 @@ class Internlm2ToolParser(ToolParser):
         flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
 
         try:
+            delta: DeltaMessage | None = None
             parsable_arr = action
 
             try:

@@ -14,4 +14,4 @@
 
 from .cache import RaggedPagesCache, RaggedPagesCacheConfig, RaggedPagesCacheView, RaggedPagesMetadata
 
-__all__ = ("RaggedPagesCache", "RaggedPagesCacheView", "RaggedPagesCacheView", "RaggedPagesMetadata")
+__all__ = ("RaggedPagesCache", "RaggedPagesCacheConfig", "RaggedPagesCacheView", "RaggedPagesMetadata")

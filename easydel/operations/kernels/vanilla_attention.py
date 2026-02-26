@@ -56,8 +56,8 @@ import typing as tp
 import jax
 from eformer import common_types
 from eformer.escale import with_sharding_constraint
-from ejkernel.modules import attention
-from ejkernel.types import MaskInfo
+from ejkernel.modules import attention  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax import random as jr
 from jaxtyping import Array, Float, PRNGKeyArray
@@ -105,6 +105,7 @@ class VanillaAttn(OperationImpl):
         Returns:
             The `OperationMetadata` provided during initialization.
         """
+        assert self.metadata is not None
         return self.metadata
 
     @classmethod
@@ -166,7 +167,9 @@ class VanillaAttn(OperationImpl):
         Returns:
             AttentionOutput containing attention outputs and weights.
         """
-        with self.metadata.mesh:
+        mesh = self.metadata.mesh
+        assert mesh is not None, "VanillaAttn requires a mesh to be set on metadata"
+        with mesh:
             model_mode = self.get_mode(query=query, BTHD=True)
             shardings = self.metadata.get_shardings(model_mode, layout="bthd")
 

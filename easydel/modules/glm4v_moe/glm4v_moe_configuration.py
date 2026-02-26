@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import typing
+from collections.abc import Mapping
 
 from jax.sharding import PartitionSpec
 
@@ -413,8 +414,8 @@ class Glm4vMoeConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        text_config: typing.Mapping[str, typing.Any] | Glm4vMoeTextConfig | None = None,
-        vision_config: typing.Mapping[str, typing.Any] | Glm4vMoeVisionConfig | None = None,
+        text_config: Mapping[str, typing.Any] | Glm4vMoeTextConfig | None = None,
+        vision_config: Mapping[str, typing.Any] | Glm4vMoeVisionConfig | None = None,
         image_token_id: int = 151363,
         video_token_id: int = 151364,
         image_start_token_id: int = 151339,
@@ -449,10 +450,10 @@ class Glm4vMoeConfig(EasyDeLBaseConfig):
 
     def get_text_config(self, decoder: bool = True) -> Glm4vMoeTextConfig:
         del decoder
-        return self.text_config
+        return self.text_config  # pyright: ignore[reportReturnType]
 
     def get_vision_config(self) -> Glm4vMoeVisionConfig:
-        return self.vision_config
+        return self.vision_config  # type: ignore
 
     def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
         """Returns partition rules for model sharding.

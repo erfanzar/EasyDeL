@@ -38,7 +38,7 @@ _RESPONSE_STARTERS = [
 ]
 
 
-@ReasoningParserManager.register_module(["granite"])
+@ReasoningParserManager.register_module(["granite"])  # pyright: ignore[reportUntypedClassDecorator]
 class GraniteReasoningParser(ReasoningParser):
     """Reasoning parser for Granite models using text delimiters."""
 

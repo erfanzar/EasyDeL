@@ -52,9 +52,11 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from eformer.common_types import ColumnWise, Replicated, RowWise
-from ejkernel.modules.operations import quantized_matmul as ej_quantized_matmul
-from ejkernel.quantization import dequantize as ej_dequantize
-from ejkernel.quantization import prepack_quantized_weights
+from ejkernel.modules.operations import (  # pyright: ignore[reportMissingTypeStubs]
+    quantized_matmul as ej_quantized_matmul,
+)
+from ejkernel.quantization import dequantize as ej_dequantize  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.quantization import prepack_quantized_weights  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from flax.nnx import rnglib
 from flax.nnx.nn import initializers
@@ -186,7 +188,7 @@ def _mesh_matches(lhs: jax.sharding.Mesh, rhs: jax.sharding.Mesh) -> bool:
     return lhs_fingerprint == rhs_fingerprint
 
 
-def _pick_mesh_from_arrays(*arrays: jax.Array | None) -> jax.sharding.Mesh | None:
+def _pick_mesh_from_arrays(*arrays: jax.Array | None) -> jax.sharding.Mesh | jax.sharding.AbstractMesh | None:
     for array in arrays:
         if array is None:
             continue
@@ -1067,11 +1069,11 @@ class ParallelLinearQuantized(nn.Module):
             if self.dtype is not None:
                 out = out.astype(self.dtype)
 
-        if self.use_bias and self.bias.value is not None:
-            bias = self.bias.value
+        bias_value: jax.Array | None = self.bias.value if self.use_bias else None
+        if self.use_bias and bias_value is not None:
             if self.dtype is not None:
-                bias = bias.astype(self.dtype)
-            out = out + jnp.reshape(bias, (1,) * (out.ndim - 1) + (-1,))
+                bias_value = bias_value.astype(self.dtype)
+            out = out + jnp.reshape(bias_value, (1,) * (out.ndim - 1) + (-1,))
 
         return out
 
@@ -1096,7 +1098,7 @@ class ParallelLinearQuantized(nn.Module):
             The QuantizationType enum value indicating the quantization
             format used for weights (INT8, NF4, MXFP4, etc.).
         """
-        return self.config.dtype
+        return QuantizationType(self.config.dtype)
 
     def __repr__(self):
         """Return a string representation of the quantized layer.

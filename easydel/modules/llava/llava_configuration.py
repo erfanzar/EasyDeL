@@ -65,14 +65,14 @@ class LlavaConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vision_config=None,
-        text_config=None,
-        image_token_id=32000,
-        projector_hidden_act="gelu",
-        vision_feature_select_strategy="default",
-        vision_feature_layer=-2,
-        image_seq_length=576,
-        multimodal_projector_bias=True,
+        vision_config: dict | EasyDeLBaseConfig | None = None,
+        text_config: dict | EasyDeLBaseConfig | None = None,
+        image_token_id: int = 32000,
+        projector_hidden_act: str = "gelu",
+        vision_feature_select_strategy: str = "default",
+        vision_feature_layer: int | list[int] = -2,
+        image_seq_length: int = 576,
+        multimodal_projector_bias: bool = True,
         **kwargs,
     ):
         self.image_token_id = image_token_id

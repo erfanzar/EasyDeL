@@ -15,7 +15,7 @@ from ..abstract_reasoning import ReasoningParserManager
 from .step3_reasoning_parser import Step3ReasoningParser
 
 
-@ReasoningParserManager.register_module(["step3p5", "step3.5"])
+@ReasoningParserManager.register_module(["step3p5", "step3.5"])  # pyright: ignore[reportUntypedClassDecorator]
 class Step3p5ReasoningParser(Step3ReasoningParser):
     """Reasoning parser for Step3.5 models. Inherits Step3 logic."""
 

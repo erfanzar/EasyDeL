@@ -136,7 +136,7 @@ class PhiMoeConfig(EasyDeLBaseConfig):
         intermediate_size=6400,
         num_hidden_layers=32,
         num_attention_heads=32,
-        num_key_value_heads=8,
+        num_key_value_heads: int | None = 8,
         hidden_act="silu",
         max_position_embeddings=4096 * 32,
         initializer_range=0.02,
@@ -202,7 +202,7 @@ class PhiMoeConfig(EasyDeLBaseConfig):
         if self.layer_types is None:
             self.layer_types = [
                 "sliding_attention" if self.sliding_window is not None else "full_attention"
-                for i in range(self.num_hidden_layers)
+                for _ in range(self.num_hidden_layers)
             ]
         super().__init__(
             pad_token_id=pad_token_id,

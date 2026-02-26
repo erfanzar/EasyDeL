@@ -72,7 +72,7 @@ class TokenBudgetManager:
         >>> print(f"Remaining: {manager.remaining}")
     """
 
-    max_batch_tokens: int
+    max_batch_tokens: int | None
     """Maximum number of tokens allowed per batch."""
 
     page_size: int
@@ -86,7 +86,7 @@ class TokenBudgetManager:
 
         This is called automatically after dataclass initialization.
         """
-        self._remaining = self.max_batch_tokens
+        self._remaining = self.max_batch_tokens if self.max_batch_tokens is not None else 0
 
     @property
     def remaining(self) -> int:

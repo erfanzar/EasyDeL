@@ -25,8 +25,8 @@ from __future__ import annotations
 import jax
 from eformer import common_types as ct
 from eformer.escale import with_sharding_constraint
-from ejkernel.modules import flash_attention
-from ejkernel.types import MaskInfo
+from ejkernel.modules import flash_attention  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Float
@@ -70,7 +70,8 @@ def _localize_block_tables_for_dp_pages(
     row_shards = row_ids // jnp.int32(rows_per_shard)
     offsets = row_shards * jnp.int32(pages_per_shard)
     # Keep explicit padding entries unchanged (current page-table padding is 0).
-    return jnp.where(block_tables == 0, block_tables, block_tables - offsets)
+    result: Array = jnp.where(block_tables == 0, block_tables, block_tables - offsets)
+    return result
 
 
 @OperationRegistry.register
@@ -78,10 +79,11 @@ class PagedFlashAttn(OperationImpl):
     """Paged Flash Attention using CUDA flash_attention with block tables."""
 
     @classmethod
-    def get_impl_name(cls) -> str | tuple[str]:
+    def get_impl_name(cls) -> str | tuple[str, ...]:
         return "paged_flash_attention"
 
     def get_impl_metadata(self) -> OperationMetadata:
+        assert self.metadata is not None
         return self.metadata
 
     @classmethod
@@ -99,8 +101,8 @@ class PagedFlashAttn(OperationImpl):
         query: Float[Array, "batch seq_len_q num_heads head_dim"],
         key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-        cache_view: UnifiedAttentionCacheView,
-        cache_metadata: RaggedPagesMetadata | OperationsMetadata,
+        cache_view: UnifiedAttentionCacheView | None,
+        cache_metadata: RaggedPagesMetadata | OperationsMetadata | None,
         mask_info: MaskInfo | None = None,
         bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
         softmax_scale: float | None = None,
@@ -167,7 +169,7 @@ class PagedFlashAttn(OperationImpl):
         if bias is not None:
             bias = bias.astype(dtype)
 
-        model_mode = self.get_mode(query=query, BTHD=True)  # type: ignore
+        model_mode = self.get_mode(query=query, BTHD=True)
         is_decode_mode = model_mode == ct.MODE_DECODE
         causal_computed = causal if not is_decode_mode else False
 

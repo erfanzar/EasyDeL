@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+# pyright: reportPrivateLocalImportUsage=false
 import sys
 from pathlib import Path
 

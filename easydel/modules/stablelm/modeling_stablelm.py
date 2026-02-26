@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -180,7 +180,7 @@ class StableLmLayerNormPerHead(nn.Module):
                     param_dtype=param_dtype,
                     rngs=rngs,
                 )
-                for idx in range(num_heads)
+                for _ in range(num_heads)
             ]
         )
 

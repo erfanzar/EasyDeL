@@ -253,8 +253,7 @@ class DistributedController:
                 if hello.get("status") != STATUS_OK:
                     client.close()
                     raise ValueError(
-                        "Distributed worker handshake failed: "
-                        f"rank={worker_rank} endpoint={endpoint} response={hello}"
+                        f"Distributed worker handshake failed: rank={worker_rank} endpoint={endpoint} response={hello}"
                     )
 
                 worker_fp = str(hello.get("config_fingerprint", ""))
@@ -351,8 +350,7 @@ class DistributedController:
                         exc_info=True,
                     )
             raise ValueError(
-                "Distributed step synchronization failure: "
-                f"failed to dispatch step_id={step_id} to worker_rank={rank}"
+                f"Distributed step synchronization failure: failed to dispatch step_id={step_id} to worker_rank={rank}"
             ) from exc
 
         return StepDispatch(step_id=step_id)

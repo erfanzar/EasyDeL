@@ -13,7 +13,7 @@
 # limitations under the License.
 import contextlib
 import os
-import typing as tp
+from collections.abc import Callable, Mapping, Sequence
 
 import flax
 import flax.nnx
@@ -87,11 +87,11 @@ class BaseAutoEasyModel:
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
         precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: Sequence[int] | None = None,
+        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
-        shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
+        shard_fns: Mapping[tuple, Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
         config_kwargs: EasyDeLBaseConfigDict | None = None,
@@ -194,11 +194,11 @@ class BaseAutoEasyModel:
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
         precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: Sequence[int] | None = None,
+        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
-        shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
+        shard_fns: Mapping[tuple, Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
         config_kwargs: EasyDeLBaseConfigDict | None = None,
@@ -220,14 +220,14 @@ class BaseAutoEasyModel:
             dtype (jnp.dtype, optional): Data type of the model. Defaults to jnp.float32.
             param_dtype (jnp.dtype, optional): Data type of the model parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision, optional): Precision for computations. Defaults to None.
-            sharding_axis_dims (tp.Sequence[int], optional): Dimensions of each sharding axis.
+            sharding_axis_dims (Sequence[int], optional): Dimensions of each sharding axis.
                 Defaults to (1, -1, 1, 1, 1).
-            sharding_dcn_axis_dims (tp.Optional[tp.Sequence[int]], optional): Dimensions for DCN sharding.
+            sharding_dcn_axis_dims (tp.Optional[Sequence[int]], optional): Dimensions for DCN sharding.
                 Defaults to None.
-            sharding_axis_names (tp.Sequence[str], optional): Names of the sharding axes.
+            sharding_axis_names (Sequence[str], optional): Names of the sharding axes.
                 Defaults to ("dp", "fsdp",  "ep", "tp", "sp").
             partition_axis (PartitionAxis, optional): Partitioning configuration. Defaults to None.
-            shard_fns (tp.Optional[tp.Mapping[tuple, tp.Callable] | dict], optional): Custom sharding functions.
+            shard_fns (tp.Optional[Mapping[tuple, Callable] | dict], optional): Custom sharding functions.
                 Defaults to None.
             backend (tp.Optional[EasyDeLBackends], optional): Backend to use. Defaults to None.
             platform (tp.Optional[EasyDeLPlatforms], optional): Platform to use. Defaults to None.
@@ -277,11 +277,11 @@ class BaseAutoEasyModel:
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
         precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: Sequence[int] | None = None,
+        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
-        shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
+        shard_fns: Mapping[tuple, Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
         config_kwargs: EasyDeLBaseConfigDict | None = None,
@@ -303,14 +303,14 @@ class BaseAutoEasyModel:
             dtype (jnp.dtype, optional): Data type of the model. Defaults to jnp.float32.
             param_dtype (jnp.dtype, optional): Data type of the model parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision, optional): Precision for computations. Defaults to None.
-            sharding_axis_dims (tp.Sequence[int], optional): Dimensions of each sharding axis.
+            sharding_axis_dims (Sequence[int], optional): Dimensions of each sharding axis.
                 Defaults to (1, -1, 1, 1, 1).
-            sharding_dcn_axis_dims (tp.Optional[tp.Sequence[int]], optional): Dimensions for DCN sharding.
+            sharding_dcn_axis_dims (tp.Optional[Sequence[int]], optional): Dimensions for DCN sharding.
                 Defaults to None.
-            sharding_axis_names (tp.Sequence[str], optional): Names of the sharding axes.
+            sharding_axis_names (Sequence[str], optional): Names of the sharding axes.
                 Defaults to ("dp", "fsdp",  "ep", "tp", "sp").
             partition_axis (PartitionAxis, optional): Partitioning configuration. Defaults to None.
-            shard_fns (tp.Optional[tp.Mapping[tuple, tp.Callable] | dict], optional): Custom sharding functions.
+            shard_fns (tp.Optional[Mapping[tuple, Callable] | dict], optional): Custom sharding functions.
                 Defaults to None.
             backend (tp.Optional[EasyDeLBackends], optional): Backend to use. Defaults to None.
             platform (tp.Optional[EasyDeLPlatforms], optional): Platform to use. Defaults to None.
@@ -419,6 +419,7 @@ class BaseAutoEasyModel:
                     "_raise_exceptions_for_missing_entries": False,
                     "_commit_hash": commit_hash,
                 }
+                resolved_archive_file = None
                 for filename in [FLAX_WEIGHTS_NAME, MULTI_PART_NAME, TENSORSTORE_INDEX_NAME, MODEL_INDEX_NAME]:
                     resolved_archive_file = _cached_file(pretrained_model_name_or_path, filename, **cached_file_kwargs)
                     if resolved_archive_file is not None:
@@ -487,11 +488,11 @@ class BaseAutoEasyState:
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: Sequence[int] | None = None,
+        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
-        shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
+        shard_fns: Mapping[tuple, Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
         config_kwargs: EasyDeLBaseConfigDict | None = None,
@@ -511,12 +512,12 @@ class BaseAutoEasyState:
             param_dtype (jnp.dtype, optional): Data type of the model parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision, optional): Precision for computations.
                 Defaults to jax.lax.Precision("fastest").
-            sharding_axis_dims (tp.Sequence[int], optional): Dimensions of each sharding axis.
+            sharding_axis_dims (Sequence[int], optional): Dimensions of each sharding axis.
                 Defaults to (1, -1, 1, 1, 1).
-            sharding_axis_names (tp.Sequence[str], optional): Names of the sharding axes.
+            sharding_axis_names (Sequence[str], optional): Names of the sharding axes.
                 Defaults to ("dp", "fsdp",  "ep", "tp", "sp").
             partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
-            shard_fns (tp.Optional[tp.Mapping[tuple, tp.Callable] | dict], optional): Sharding functions to use for
+            shard_fns (tp.Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for
                 the model. If None, auto-sharding is used if auto_shard_model is True. Defaults to None.
             backend (tp.Optional[str], optional): Backend to use for the model. Defaults to None.
             config_kwargs (tp.Optional[tp.Mapping[str, tp.Any]], optional): Configuration keyword

@@ -37,7 +37,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
@@ -598,6 +598,7 @@ class OPTDecoder(EasyDeLBaseModule):
         self.position_offset = offset
         # Use `Embed` directly so HF -> EasyDeL conversion treats this as an embedding
         # (no weight transpose) and maps `*.weight` -> `*.embedding`.
+        assert self.config.max_position_embeddings is not None
         self.embed_positions = Embed(
             self.config.max_position_embeddings + offset,
             embed_dim,
@@ -651,7 +652,7 @@ class OPTDecoder(EasyDeLBaseModule):
                     precision=precision,
                     rngs=rngs,
                 )
-                for i in range(config.num_hidden_layers)
+                for _ in range(config.num_hidden_layers)
             ]
         )
 
@@ -928,7 +929,7 @@ class OPTModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=OPTConfig, model_type="opt")
-class OPTForCausalLM(BaseCausalLMModule[OPTModel, OPTConfig]):
+class OPTForCausalLM(BaseCausalLMModule[OPTModel, OPTConfig]):  # type: ignore
     """OPT model with a causal language modeling head.
 
     This model extends the base OPTModel by adding a linear layer on top to

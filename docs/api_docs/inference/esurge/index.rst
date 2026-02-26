@@ -5,6 +5,7 @@ easydel.inference.esurge package
    :maxdepth: 2
 
    core/index
+   distributed/index
    mixins/index
    multimodal/index
    runners/index

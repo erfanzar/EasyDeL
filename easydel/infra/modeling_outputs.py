@@ -95,6 +95,7 @@ Note:
 
 from __future__ import annotations
 
+import collections
 import typing as tp
 from dataclasses import fields, is_dataclass
 
@@ -132,7 +133,7 @@ def _is_array(array):
     return False
 
 
-class ModelOutput(tp.OrderedDict):
+class ModelOutput(collections.OrderedDict):
     """Base class for all model outputs.
 
     Provides a consistent interface for model outputs that behaves like
@@ -236,6 +237,7 @@ class ModelOutput(tp.OrderedDict):
         other_fields_are_none = all(getattr(self, field.name) is None for field in class_fields[1:])
 
         if other_fields_are_none and not _is_array(first_field):
+            iterator: tp.Any = None
             if isinstance(first_field, dict):
                 iterator = first_field.items()
                 first_field_iterator = True

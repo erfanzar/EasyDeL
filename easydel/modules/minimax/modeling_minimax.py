@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -655,7 +655,7 @@ class MiniMaxDecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.layer_type = config.layer_types[layer_idx]
+        self.layer_type = config.layer_types[layer_idx] if config.layer_types is not None else "full_attention"
 
         if self.layer_type == "linear_attention":
             attn_block: type[nn.Module] = MiniMaxLightningAttention
@@ -1064,7 +1064,7 @@ class MiniMaxModel(EasyDeLBaseModule):
 @register_module(TaskType.CAUSAL_LM, config=MiniMaxConfig, model_type="minimax")
 @register_module(TaskType.CAUSAL_LM, config=MiniMaxConfig, model_type="minimax_text_01")
 @register_module(TaskType.CAUSAL_LM, config=MiniMaxConfig, model_type="MiniMaxText01")
-class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):
+class MiniMaxForCausalLM(BaseCausalLMModule[MiniMaxModel, MiniMaxConfig]):  # type: ignore
     """MiniMax model with a causal language modeling head.
 
     This model extends MiniMaxModel with a language modeling head for next-token

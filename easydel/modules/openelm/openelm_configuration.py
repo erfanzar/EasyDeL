@@ -38,6 +38,8 @@ def make_divisible(
     Returns:
         new_v: new divisible value
     """
+    if divisor is None:
+        divisor = 8
     if min_value is None:
         min_value = divisor
     new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
@@ -144,7 +146,7 @@ class OpenELMConfig(EasyDeLBaseConfig):
         head_dim: int = 128,
         qkv_multipliers: Number | list[Number] = 1.0,
         num_query_heads: int | None = None,
-        num_gqa_groups: int = 1,
+        num_gqa_groups: int | None = 1,
         ffn_multipliers: Number | list[Number] = 4.0,
         ffn_with_glu: bool = True,
         ffn_dim_divisor: int = 256,
@@ -273,10 +275,11 @@ class OpenELMConfig(EasyDeLBaseConfig):
         else:
             head_multiple_of = 2
 
+        qkv_multipliers = self.qkv_multipliers
         if isinstance(self.qkv_multipliers, Number):
             # All attention layers have the same latent dimensions, resulting in uniform allocation of parameters.
             qkv_dim = make_divisible(
-                self.model_dim * self.qkv_multipliers,  # type:ignore
+                self.model_dim * self.qkv_multipliers,
                 divisor=self.head_dim * head_multiple_of,
             )
             query_dims = [int(qkv_dim)] * self.num_transformer_layers

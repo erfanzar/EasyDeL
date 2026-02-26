@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -668,7 +668,7 @@ class SeedOssForCausalLM(BaseCausalLMModule[SeedOssModel, SeedOssConfig]):
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
-    ) -> CausalLMOutput:  # type:ignore
+    ) -> CausalLMOutput:
         """Perform forward pass for causal language modeling.
 
         Args:

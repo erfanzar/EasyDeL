@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import collections.abc
 import copy
 import os
 import pprint
@@ -25,7 +26,7 @@ from typing import NamedTuple
 import contextlib2
 import flax
 import flax.nnx
-import grain.python as grain
+import grain.python as grain  # pyright: ignore[reportMissingTypeStubs]
 import jax
 import jax.extend
 import numpy as np
@@ -71,12 +72,12 @@ from .training_utils import resolve_total_steps
 from .utils import CollateMapTransform, HFDataSource, ToNumpy
 
 try:
-    import wandb  # type:ignore
+    import wandb
 except ImportError:
     wandb = None
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.data.transforms.base import Transform
     from easydel.inference.esurge.esurge_engine import RequestOutput
@@ -140,6 +141,8 @@ class BaseTrainer(BaseTrainerProtocol):
     """
 
     # Type annotations for internal data sources
+    arguments: TrainingArguments | None
+    model_state: EasyDeLState | None
     _train_source: ShardedDataSource | None
     _eval_source: ShardedDataSource | None
 
@@ -433,20 +436,20 @@ class BaseTrainer(BaseTrainerProtocol):
         return self.arguments.eval_batch_size
 
     @property
-    def _train_shared_fn_extra_args(self) -> tuple[tp.Any]:
+    def _train_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
         return self._train_shared_fn_extra_args_
 
     @property
-    def _eval_shared_fn_extra_args(self) -> tuple[tp.Any]:
+    def _eval_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
         return self._eval_shared_fn_extra_args_
 
     @property
-    def _train_shared_fn_static_args(self) -> tuple[tp.Any]:
-        return self._train_shared_fn_static_args_
+    def _train_shared_fn_static_args(self) -> tuple[tp.Any, ...]:
+        return self._train_shared_fn_static_args_  # pyright: ignore[reportReturnType]
 
     @property
-    def _eval_shared_fn_static_args(self) -> tuple[tp.Any]:
-        return self._eval_shared_fn_static_args_
+    def _eval_shared_fn_static_args(self) -> tuple[tp.Any, ...]:
+        return self._eval_shared_fn_static_args_  # pyright: ignore[reportReturnType]
 
     @_train_shared_fn_static_args.setter
     def _train_shared_fn_static_args(self, val):
@@ -636,12 +639,12 @@ class BaseTrainer(BaseTrainerProtocol):
         self._train_shared_fn_static_args_ = getattr(
             self,
             "_train_shared_fn_static_args_",
-            {},
+            (),
         )
         self._eval_shared_fn_static_args_ = getattr(
             self,
             "_eval_shared_fn_static_args_",
-            {},
+            (),
         )
 
         self._train_shared_fn_extra_args_ = getattr(
@@ -899,7 +902,8 @@ class BaseTrainer(BaseTrainerProtocol):
         generation_config: GenerationConfig | None,
     ) -> GenerationConfig | None:
         """Return a copy of the generation config to avoid mutating shared references."""
-        if GenerationConfig is None:
+        _gen_config_cls: type | None = globals().get("GenerationConfig")
+        if _gen_config_cls is None:
             return generation_config
         if generation_config is not None:
             return copy.deepcopy(generation_config)
@@ -1000,7 +1004,7 @@ class BaseTrainer(BaseTrainerProtocol):
         mesh = self.model.mesh
         empty_sharding = jax.sharding.NamedSharding(spec=jax.sharding.PartitionSpec(), mesh=mesh)
 
-        @ejit(
+        @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
             in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
             out_shardings=(empty_sharding, empty_sharding, empty_sharding),
         )
@@ -1038,7 +1042,7 @@ class BaseTrainer(BaseTrainerProtocol):
                         **effective_generate_kwargs,
                     )
 
-                sequences = outputs.sequences if hasattr(outputs, "sequences") else outputs
+                sequences: jax.Array = outputs.sequences if hasattr(outputs, "sequences") else outputs
                 return sequences, shard_input_ids, shard_attention_mask
 
         return generate
@@ -1252,7 +1256,7 @@ class BaseTrainer(BaseTrainerProtocol):
             if args.esurge_max_num_seqs is not None:
                 esurge_kwargs["max_num_seqs"] = args.esurge_max_num_seqs
             else:
-                esurge_kwargs["max_num_seqs"] = args.generation_num_return_sequences * args.total_batch_size
+                esurge_kwargs["max_num_seqs"] = (args.generation_num_return_sequences or 1) * args.total_batch_size
             if args.esurge_min_input_pad is not None:
                 esurge_kwargs["min_input_pad"] = args.esurge_min_input_pad
             if args.esurge_page_size is not None:
@@ -1271,7 +1275,7 @@ class BaseTrainer(BaseTrainerProtocol):
             reserve_tokens = esurge_kwargs.get("reserve_tokens")
             if reserve_tokens is None:
                 reserve_tokens = esurge_kwargs.get("max_num_seqs", 0)
-            esurge_kwargs["max_model_len"] = sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens)
+            esurge_kwargs["max_model_len"] = sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)  # pyright: ignore[reportOptionalOperand]
 
             logger.info_once(f"Creating eSurge {pprint.pformat(esurge_kwargs)}")
             logger.info_once(
@@ -1297,7 +1301,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
             # Build padded token arrays from eSurge outputs to ensure consistent shapes
             max_seq_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
-            max_new_tokens = sampling_params.max_tokens
+            max_new_tokens = sampling_params.max_tokens if sampling_params.max_tokens is not None else 1024
             max_total_len = max_seq_len + max_new_tokens
 
             # Track prompt arrays once per request
@@ -1363,7 +1367,7 @@ class BaseTrainer(BaseTrainerProtocol):
                         if not prompt_signature_map[sig]:
                             prompt_signature_map.pop(sig, None)
 
-                source_prompt = getattr(output, "prompt", return_prompts[output_idx])
+                source_prompt = getattr(output, "prompt", return_prompts[output_idx] if return_prompts else None)
 
                 # Process each completion (handles n>1 sampling)
                 for completion in output.outputs:
@@ -1599,7 +1603,7 @@ class BaseTrainer(BaseTrainerProtocol):
         configured_prompts = list(args.generation_prompts)
         target = args.generation_num_prompts
         prompts = configured_prompts[: target or len(configured_prompts)]
-        remaining = max(target - len(prompts), 0)
+        remaining = max((target or 0) - len(prompts), 0)
         if remaining > 0 and args.generation_use_train_prompts:
             prompts.extend(self._sample_prompts_from_dataset(remaining))
         return prompts
@@ -1782,6 +1786,8 @@ class BaseTrainer(BaseTrainerProtocol):
 
         self.latest_generation_samples = results
 
+        prompt_repr = "<prompt tokens>"
+        record: dict[str, tp.Any] = {}
         for record in results:
             prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
 
@@ -2064,7 +2070,7 @@ class BaseTrainer(BaseTrainerProtocol):
         shuffle: bool = False,
         num_epochs: int = 1,
         drop_remainder: bool = True,
-    ) -> tp.Iterator:
+    ) -> collections.abc.Iterator:
         """Create dataloader iterator from ShardedDataSource.
 
         Iterates over the transformed source (with tokenization applied).
@@ -2125,7 +2131,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 shard_count=self.arguments.grain_shard_count or 1,
                 drop_remainder=True,
             )
-            from datasets import IterableDataset
+            from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
             if is_train and hasattr(self, "model_state") and self.model_state is not None:
                 current_step = int(jax.device_get(self.model_state.step))
@@ -2267,7 +2273,7 @@ class BaseTrainer(BaseTrainerProtocol):
         except AssertionError:
             logger.warning("TensorFlow may be hogging GPU memory.")
 
-        def create_tf_dataset(dataset: Dataset, is_train: bool) -> tp.Iterator[np.ndarray]:
+        def create_tf_dataset(dataset: Dataset, is_train: bool) -> collections.abc.Iterator[np.ndarray]:
             """
             Creates a TensorFlow dataset from a Hugging Face Dataset.
 
@@ -2276,7 +2282,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 is_train (bool): Whether the dataset is for training.
 
             Returns:
-                tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
+                collections.abc.Iterator[np.ndarray]: The TensorFlow dataset iterator.
             """
 
             batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
@@ -2297,7 +2303,9 @@ class BaseTrainer(BaseTrainerProtocol):
                 .as_numpy_iterator()
             )
 
-        def create_tf_dataset_from_iterable(dataset: IterableDataset, is_train: bool) -> tp.Iterator[np.ndarray]:
+        def create_tf_dataset_from_iterable(
+            dataset: IterableDataset, is_train: bool
+        ) -> collections.abc.Iterator[np.ndarray]:
             """
             Creates a TensorFlow dataset from an iterable Hugging Face Dataset.
 
@@ -2306,7 +2314,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 is_train (bool): Whether the dataset is for training.
 
             Returns:
-                tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
+                collections.abc.Iterator[np.ndarray]: The TensorFlow dataset iterator.
             """
 
             batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
@@ -2383,7 +2391,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 is_train=is_train,
             )
 
-        def to_tf_dataloader(dataset: Dataset | IterableDataset, is_train: bool) -> tp.Iterator[np.ndarray]:
+        def to_tf_dataloader(dataset: Dataset | IterableDataset, is_train: bool) -> collections.abc.Iterator[np.ndarray]:
             """
             Converts a Hugging Face Dataset to a TensorFlow dataloader.
 
@@ -2392,7 +2400,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 is_train (bool): Whether the dataset is for training.
 
             Returns:
-                tp.Iterator[np.ndarray]: The TensorFlow dataloader iterator.
+                collections.abc.Iterator[np.ndarray]: The TensorFlow dataloader iterator.
             """
             if hasattr(dataset, "__len__"):
                 return create_tf_dataset(dataset, is_train)
@@ -2764,7 +2772,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self,
         state: EasyDeLState,
         save_directory: str | None = None,
-        gather_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None = None,
+        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None = None,
         to_torch: bool = False,
         easystate_to_huggingface_model_kwargs: dict | None = None,
         torch_save_pretrained_kwargs: dict | None = None,
@@ -3009,8 +3017,8 @@ class BaseTrainer(BaseTrainerProtocol):
         self,
         state: EasyDeLState,
         exception: Exception,
-        shard_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
-        gather_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
+        shard_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
+        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
     ):
         """Handle training interruption gracefully."""
         if isinstance(exception, KeyboardInterrupt):
@@ -3073,7 +3081,7 @@ class BaseTrainer(BaseTrainerProtocol):
             batch = next(data_iter)
 
         # Remove specified ids from batch if needed
-        for id_to_pop in self.arguments.ids_to_pop_from_dataset:
+        for id_to_pop in self.arguments.ids_to_pop_from_dataset or []:
             _ = batch.pop(id_to_pop, None)
 
         return batch, data_iter

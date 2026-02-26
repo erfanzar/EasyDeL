@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import typing as tp
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 
 from eformer.pytree import auto_pytree
 
@@ -618,7 +619,7 @@ class BaseCache(ABC):
         the initialization methods.
     """
 
-    views: tp.Sequence[BaseCacheView | None]
+    views: Sequence[BaseCacheView | None]
 
     @classmethod
     @abstractmethod

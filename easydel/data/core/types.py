@@ -169,7 +169,7 @@ class TextDatasetInform(BaseDatasetInform):
         preprocessing_fn: Optional function to preprocess text data.
     """
 
-    content_field: str = "content"
+    content_field: str | None = "content"
     additional_fields: list[str] | None = None
     preprocessing_fn: tp.Callable[[dict[str, tp.Any]], dict[str, tp.Any]] | None = None
 

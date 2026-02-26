@@ -34,7 +34,7 @@ Key Functions:
 
 Example:
     >>> from easydel.inference.tools.utils import partial_json_loads
-    >>> from partial_json_parser.core.options import Allow
+    >>> from partial_json_parser.core.options import Allow  # pyright: ignore[reportMissingTypeStubs]
     >>> obj, consumed = partial_json_loads('{"name": "test"', Allow.ALL)
     >>> print(obj)
     {'name': 'test'}
@@ -44,8 +44,8 @@ import json
 from json import JSONDecodeError, JSONDecoder
 from typing import Any
 
-import partial_json_parser
-from partial_json_parser.core.options import Allow
+import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
+from partial_json_parser.core.options import Allow  # pyright: ignore[reportMissingTypeStubs]
 
 
 def find_common_prefix(s1: str, s2: str) -> str:

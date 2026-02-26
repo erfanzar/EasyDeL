@@ -843,7 +843,7 @@ class RwkvModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=RwkvConfig, model_type="rwkv")
-class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):
+class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):  # type: ignore
     """RWKV model with a language modeling head for causal language modeling tasks.
 
     This model combines the RWKV recurrent backbone with a linear language

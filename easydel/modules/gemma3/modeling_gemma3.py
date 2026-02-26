@@ -22,7 +22,7 @@ from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -237,7 +237,7 @@ class Gemma3Attention(UnifiedAttention):
                 Defaults to False.
             rngs (nn.Rngs): Random number generator state.
         """
-        self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
+        self.is_sliding = config.layer_types is not None and config.layer_types[layer_idx] == "sliding_attention"
 
         super().__init__(
             config=config,
@@ -836,7 +836,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Gemma3TextConfig, model_type="gemma3_text")
-class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]):
+class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]):  # type: ignore
     """Gemma3 model with a language modeling head for causal language modeling tasks.
 
     This model is a transformer-based language model with causal attention masks
@@ -908,7 +908,7 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]):
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
-    ) -> CausalLMOutput:  # type:ignore
+    ) -> CausalLMOutput:
         """Forward pass through the Gemma3 causal language model.
 
         Runs the base model and optionally applies the language modeling head to produce
@@ -964,6 +964,7 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]):
         if apply_lm_head:
             lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
         if self.config.final_logit_softcapping is not None:
+            assert lm_logits is not None
             cap = jnp.array(self.config.final_logit_softcapping, dtype=lm_logits.dtype)
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
 
@@ -1003,7 +1004,7 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Gemma3TextConfig, model_type="gemma3_text")
-class Gemma3ForSequenceClassification(BaseSequenceClassificationModule[Gemma3TextModel, Gemma3TextConfig]):
+class Gemma3ForSequenceClassification(BaseSequenceClassificationModule[Gemma3TextModel, Gemma3TextConfig]):  # type: ignore
     """Gemma3 model for sequence classification tasks.
 
     This class extends the base Gemma3 model by adding a linear classification head
@@ -1220,14 +1221,17 @@ class Gemma3MultiModalProjector(nn.Module):
         self.tokens_per_side = int(config.mm_tokens_per_image**0.5)
         kernel_size = self.patches_per_image // self.tokens_per_side
         self.kernel_size = kernel_size
-        self.avg_pool = lambda x: jax.lax.reduce_window(
-            x,
-            init_value=0.0,
-            computation=jax.lax.add,
-            window_dimensions=(1, 1, kernel_size, kernel_size),
-            window_strides=(1, 1, kernel_size, kernel_size),
-            padding="VALID",
-        ) / (kernel_size * kernel_size)
+        self.avg_pool = lambda x: (
+            jax.lax.reduce_window(
+                x,
+                init_value=0.0,
+                computation=jax.lax.add,
+                window_dimensions=(1, 1, kernel_size, kernel_size),
+                window_strides=(1, 1, kernel_size, kernel_size),
+                padding="VALID",
+            )
+            / (kernel_size * kernel_size)
+        )
 
     def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
         """Return sharding specs for multimodal projection parameters."""
@@ -1358,7 +1362,7 @@ class Gemma3Model(EasyDeLBaseModule):
 
     def compute_embedding(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None,
         *,
         image_features: Array | None = None,
         pixel_values: Array | None = None,
@@ -1411,8 +1415,8 @@ class Gemma3Model(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: Array = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        pixel_values: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
@@ -1531,7 +1535,7 @@ class Gemma3Model(EasyDeLBaseModule):
         Returns:
             TransformerCache: Initialized cache for the language model.
         """
-        return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
+        return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)  # pyright: ignore[reportReturnType]
 
     def prepare_inputs_for_generation(
         self,
@@ -1619,7 +1623,7 @@ class Gemma3Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Gemma3Config, model_type="gemma3")
-class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma3Config]):
+class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma3Config]):  # type: ignore
     """Gemma3 multimodal language model for conditional generation.
 
     Combines a vision tower, language model, and multi-modal projector for
@@ -1733,8 +1737,8 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
 
     def __call__(
         self,
-        input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: Array = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        pixel_values: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,

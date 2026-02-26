@@ -51,7 +51,7 @@ from collections.abc import Mapping
 from typing import Any
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
     from transformers import PreTrainedTokenizerBase
 
     from easydel.data.core.protocols import ShardedDataSource
@@ -61,7 +61,7 @@ from eformer.common_types import NOT_GIVEN
 from easydel.inference.esurge.esurge_engine import DEFAULT_DETOKENIZER_MAX_STATES
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType
-from easydel.layers.quantization._quants import QuantizationConfig
+from easydel.layers.quantization._quants import QuantizationConfig  # pyright: ignore[reportPrivateLocalImportUsage]
 from easydel.modules.auto import (
     AutoEasyDeLAnyToAnyModel,
     AutoEasyDeLModel,
@@ -319,7 +319,7 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     distributed_connect_timeout_s_val = es.get("distributed_connect_timeout_s")
     distributed_verify_sampling_digest_val = es.get("distributed_verify_sampling_digest")
 
-    sharding_axis_dims_val = es.get("sharding_axis_dims", (1, 1, 1, -1, 1))
+    sharding_axis_dims_val: tuple | list | None = es.get("sharding_axis_dims", (1, 1, 1, -1, 1))
     sharding_axis_dims = tuple(sharding_axis_dims_val) if sharding_axis_dims_val is not None else None
 
     max_num_batched_tokens = es.get("max_num_batched_tokens", NOT_GIVEN)
@@ -330,7 +330,7 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     if reserve_tokens is not None:
         reserve_tokens = int(reserve_tokens)
 
-    detokenizer_max_states = es.get("detokenizer_max_states", DEFAULT_DETOKENIZER_MAX_STATES)
+    detokenizer_max_states: int | str | None = es.get("detokenizer_max_states", DEFAULT_DETOKENIZER_MAX_STATES)
     if detokenizer_max_states is not None:
         detokenizer_max_states = int(detokenizer_max_states)
 
@@ -947,7 +947,7 @@ def save_dataset(
 
     # Handle streaming datasets - materialize first
     if is_streaming(dataset):
-        from datasets import Dataset
+        from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
 
         # Convert iterable dataset to regular dataset
         dataset = Dataset.from_generator(lambda: (ex for ex in dataset))

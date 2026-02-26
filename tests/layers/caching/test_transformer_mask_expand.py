@@ -1,5 +1,5 @@
 import jax.numpy as jnp
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 
 from easydel.caching.transformer.cache import _expand_mask_kv_dim
 

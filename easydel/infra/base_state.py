@@ -73,6 +73,7 @@ See Also:
 
 from __future__ import annotations
 
+import collections.abc
 import contextlib
 import os
 import pickle
@@ -81,7 +82,7 @@ import typing as tp
 from typing import Self
 
 import jax
-import optax
+import optax  # pyright: ignore[reportMissingTypeStubs]
 from eformer import escale as es
 from eformer.escale import PartitionAxis
 from eformer.loggings import get_logger
@@ -213,7 +214,7 @@ class EasyDeLState(struct.PyTreeNode):
     graphstate: nn.GraphState = struct.field(pytree_node=True)
     graphother: nn.GraphState = struct.field(pytree_node=True)
 
-    tx: optax.GradientTransformation = struct.field(pytree_node=False)
+    tx: optax.GradientTransformation | None = struct.field(pytree_node=False)
     opt_state: optax.OptState | None = struct.field(pytree_node=True)
     apply_fn: tp.Callable | None = struct.field(pytree_node=False, default=None)
 
@@ -840,6 +841,7 @@ class EasyDeLState(struct.PyTreeNode):
             """Load using modern TensorStore format."""
             path = str(AsyncCheckpointManager.safe_loadpath(org_path))
             tx_template = tx_template if tx_template is not None else self.tx
+            template = None
             if tx_template is not None:
                 template = jax.eval_shape(tx_template.init, self.graphstate)
             opt_state, metadata = checkpointer.load_pytree(
@@ -1068,11 +1070,11 @@ class EasyDeLState(struct.PyTreeNode):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_dims: collections.abc.Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
+        sharding_axis_names: collections.abc.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
-        shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
+        shard_fns: collections.abc.Mapping[tuple, tp.Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
         config_kwargs: EasyDeLBaseConfigDict | None = None,
@@ -1106,17 +1108,17 @@ class EasyDeLState(struct.PyTreeNode):
             precision (jax.lax.Precision | None): JAX precision level for matrix
                 operations (e.g., `jax.lax.Precision.HIGHEST`). Defaults to None
                 (uses JAX default).
-            sharding_axis_dims (tp.Sequence[int]): Dimensions of the device mesh for
+            sharding_axis_dims (collections.abc.Sequence[int]): Dimensions of the device mesh for
                 sharding. Format: (dp, fsdp, ep, tp, sp) where -1 means infer from
                 available devices. Defaults to (1, -1, 1, 1, 1).
-            sharding_dcn_axis_dims (tp.Sequence[int] | None): Optional dimensions for
+            sharding_dcn_axis_dims (collections.abc.Sequence[int] | None): Optional dimensions for
                 data-center network (DCN) sharding in multi-host setups. Defaults to
                 None.
-            sharding_axis_names (tp.Sequence[str]): Names for sharding axes matching
+            sharding_axis_names (collections.abc.Sequence[str]): Names for sharding axes matching
                 `sharding_axis_dims`. Defaults to ("dp", "fsdp", "ep", "tp", "sp").
             partition_axis (PartitionAxis | None): Configuration object for partitioning
                 specific model dimensions. Defaults to None (uses model defaults).
-            shard_fns (tp.Mapping[tuple, tp.Callable] | dict | None): Custom sharding
+            shard_fns (collections.abc.Mapping[tuple, tp.Callable] | dict | None): Custom sharding
                 functions mapped by parameter path tuples. Defaults to None.
             backend (EasyDeLBackends | None): Backend framework (e.g., JAX, PyTorch).
                 Defaults to None (auto-detected).

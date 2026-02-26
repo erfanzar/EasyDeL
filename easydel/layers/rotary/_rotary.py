@@ -51,7 +51,7 @@ import typing as tp
 import jax
 import jax.numpy as jnp
 
-from easydel.utils.compiling_utils import ejit
+from easydel.utils import ejit
 
 from ._compute_fns import (
     compute_basic_frequencies,
@@ -252,10 +252,10 @@ def get_rope(
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
-    return rotary_emb
+    return rotary_emb  # pyright: ignore[reportReturnType]
 
 
-@ejit(
+@ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
     static_argnames=[
         "head_size",
         "rotary_dim",
@@ -433,7 +433,7 @@ def get_frequencies(
     return frequencies
 
 
-@ejit(
+@ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
     static_argnames=[
         "head_size",
         "rotary_dim",
@@ -555,4 +555,4 @@ def get_inv_frequencies(
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
-    return inv_frequencies
+    return jnp.asarray(inv_frequencies)

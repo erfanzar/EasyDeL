@@ -1,5 +1,7 @@
 """Tests for CLIP model."""
 
+# pyright: reportPrivateLocalImportUsage=false
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -12,8 +14,12 @@ try:
     from .test_utils import compare_hidden_states, setup_config
     from .test_utils.model_factory import cleanup_models, create_ed_model, create_hf_model
 except ImportError:
-    from test_utils import compare_hidden_states, setup_config
-    from test_utils.model_factory import cleanup_models, create_ed_model, create_hf_model
+    from test_utils import compare_hidden_states, setup_config  # pyright: ignore[reportImplicitRelativeImport]
+    from test_utils.model_factory import (  # pyright: ignore[reportImplicitRelativeImport]
+        cleanup_models,
+        create_ed_model,
+        create_hf_model,
+    )
 
 
 class TestCLIP:

@@ -910,7 +910,7 @@ def training_step(
 def evaluation_step(
     state: EasyDeLState,
     batch: dict,
-    reference_state: EasyDeLState,
+    reference_state: EasyDeLState | None,
     concatenated_forward: tp.Callable,
     beta: float = 0.1,
     label_smoothing: float = 0,

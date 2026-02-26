@@ -50,7 +50,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = get_logger(__name__)
 
 
-@ToolParserManager.register_module("deepseek_v3")
+@ToolParserManager.register_module("deepseek_v3")  # pyright: ignore[reportUntypedClassDecorator]
 class DeepSeekV3ToolParser(ToolParser):
     """Tool parser for DeepSeek V3 models.
 
@@ -102,7 +102,7 @@ class DeepSeekV3ToolParser(ToolParser):
         super().__init__(tokenizer)
 
         self.current_tool_name_sent: bool = False
-        self.prev_tool_call_arr: list[dict] = []
+        self.prev_tool_call_arr: list[dict] | None = []
         self.current_tool_id: int = -1
         self.streamed_args_for_tool: list[str] = []
 
@@ -242,6 +242,7 @@ class DeepSeekV3ToolParser(ToolParser):
             return DeltaMessage(content=delta_text)
         delta_text = delta_text.replace(self.tool_calls_start_token, "").replace(self.tool_calls_end_token, "")
         try:
+            delta: DeltaMessage | None = None
             prev_tool_start_count = previous_token_ids.count(self.tool_call_start_token_id)
             prev_tool_end_count = previous_token_ids.count(self.tool_call_end_token_id)
             cur_tool_start_count = current_token_ids.count(self.tool_call_start_token_id)
@@ -315,8 +316,9 @@ class DeepSeekV3ToolParser(ToolParser):
                 delta = DeltaMessage(tool_calls=[], content=text)
                 return delta
 
-            current_tool_call = dict()
+            current_tool_call: dict | None = None
             if tool_call_portion:
+                current_tool_call = dict()
                 current_tool_call_matches = self.stream_tool_call_portion_regex.match(tool_call_portion)
                 if current_tool_call_matches:
                     _tool_type, tool_name, tool_args = current_tool_call_matches.groups()
@@ -356,6 +358,8 @@ class DeepSeekV3ToolParser(ToolParser):
                 return delta
 
             logger.debug("Trying to parse current tool call with ID %s", self.current_tool_id)
+
+            assert self.prev_tool_call_arr is not None
 
             if len(self.prev_tool_call_arr) <= self.current_tool_id:
                 self.prev_tool_call_arr.append({})

@@ -13,6 +13,7 @@
 # limitations under the License.
 import json
 import typing as tp
+from collections.abc import Callable, Mapping, Sequence
 
 import flax
 from eformer.escale import PartitionAxis, make_shard_and_gather_fns, match_partition_rules
@@ -234,7 +235,7 @@ class AutoEasyDeLConfig:
                 architectures = architectures[0]
             import easydel as ed
 
-            module_class: ed.EasyDeLBaseModule = getattr(ed, architectures, None)
+            module_class: EasyDeLBaseModule = getattr(ed, architectures, None)
             assert module_class is not None, f"we couldn't find {architectures} in easydel collections!"
             model_task = module_class._model_task
         return model_task
@@ -243,9 +244,9 @@ class AutoEasyDeLConfig:
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: Sequence[int] | None = None,
+        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
@@ -260,7 +261,7 @@ class AutoEasyDeLConfig:
         Args:
             cls: Create an instance of the class that called this function.
             pretrained_model_name_or_path: str: Identify the model in the huggingface model hub.
-            sharding_axis_dims: tp.Sequence[int]: Specify the dimension of each axis in the sharded
+            sharding_axis_dims: Sequence[int]: Specify the dimension of each axis in the sharded
                 model_tasking arrays in easydel.
             backend: tp.Optional[EasyDeLBackends] : backend to use for model.
                         model_task (TaskType): Task type of model load and find.
@@ -398,19 +399,19 @@ class AutoShardAndGatherFunctions:
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_dims: Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: Sequence[int] | None = None,
+        sharding_axis_names: Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
         partition_rules: tuple[tuple[str, PartitionSpec]] | None = None,
         flatten: bool = True,
-        config_kwargs: tp.Mapping[str, tp.Any] | None = None,
+        config_kwargs: Mapping[str, tp.Any] | None = None,
         model_task: TaskType = TaskType.CAUSAL_LM,
         from_torch: bool = False,
         trust_remote_code: bool = False,
-    ) -> tuple[tp.Mapping[str, tp.Callable], tp.Mapping[str, tp.Callable]]:
+    ) -> tuple[Mapping[str, Callable], Mapping[str, Callable]]:
         """
         Generates shard and gather functions based on a pretrained model name or path.
 
@@ -447,7 +448,7 @@ class AutoShardAndGatherFunctions:
         if config_kwargs is not None:
             for k, v in config_kwargs.items():
                 setattr(config, k, v)
-        return cls.from_config(
+        return cls.from_config(  # pyright: ignore[reportReturnType]
             config=config,
             partition_rules=partition_rules,
             flatten=flatten,

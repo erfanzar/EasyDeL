@@ -39,6 +39,7 @@ import secrets
 import threading
 import time
 import typing as tp
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 
@@ -139,7 +140,7 @@ class ApiKeyManager:
 
     def __init__(
         self,
-        api_keys: tp.Sequence[str] | dict[str, tp.Mapping[str, tp.Any]] | None = None,
+        api_keys: Sequence[str] | dict[str, Mapping[str, tp.Any]] | None = None,
         require_api_key: bool = False,
     ) -> None:
         """Initialize the API key manager.
@@ -161,7 +162,7 @@ class ApiKeyManager:
 
     def _load_initial_keys(
         self,
-        api_keys: tp.Sequence[str] | dict[str, tp.Mapping[str, tp.Any]],
+        api_keys: Sequence[str] | dict[str, Mapping[str, tp.Any]],
     ) -> None:
         """Load initial API keys into the registry.
 

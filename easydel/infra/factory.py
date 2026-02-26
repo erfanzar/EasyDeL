@@ -76,7 +76,8 @@ from enum import StrEnum
 
 from eformer.pytree import auto_pytree
 
-from .base_module import EasyDeLBaseConfig, EasyDeLBaseModule
+from .base_config import EasyDeLBaseConfig
+from .base_module import EasyDeLBaseModule
 
 T = tp.TypeVar("T")
 
