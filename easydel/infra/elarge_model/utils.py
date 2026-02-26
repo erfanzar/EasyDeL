@@ -45,8 +45,10 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
+from enum import Enum
 from typing import Any, cast
 
 import jax
@@ -57,6 +59,61 @@ from jax import numpy as jnp
 from .types import DTypeLike, ELMConfig, PrecisionLike, TaskType  # pyright: ignore[reportPrivateLocalImportUsage]
 
 logger = get_logger(__name__)
+
+
+def make_serializable(obj: Any) -> Any:
+    """Convert arbitrary config-like objects into JSON/YAML-safe primitives.
+
+    This recursively normalizes common configuration value types used in ELM:
+    mappings, sequences, dataclasses, enums, PathLike objects, and objects with
+    ``to_dict``/``model_dump`` methods.
+    """
+    if isinstance(obj, Enum):
+        return make_serializable(obj.value)
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, Mapping):
+        return {str(k): make_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [make_serializable(v) for v in obj]
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return make_serializable(asdict(obj))
+    if hasattr(obj, "model_dump") and callable(obj.model_dump):
+        return make_serializable(obj.model_dump())
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        return make_serializable(obj.to_dict())
+    if isinstance(obj, os.PathLike) or hasattr(obj, "__fspath__"):
+        return os.fspath(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not serializable")
+
+
+def write_text_atomic(path: str | os.PathLike | ePathLike, data: str, *, encoding: str = "utf-8") -> None:
+    """Atomically write text to a file.
+
+    Writes data to a temporary file in the same directory and then replaces
+    the target path with ``os.replace`` to avoid partial writes.
+    """
+    target = ePath(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target_dir = str(target.parent)
+    target_path = str(target)
+
+    fd, tmp_path = tempfile.mkstemp(
+        dir=target_dir,
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(data)
+        os.replace(tmp_path, target_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def prune_nones(obj: Any) -> Any:
@@ -435,7 +492,7 @@ def save_elm_config(
         - The JSON output is formatted with 2-space indentation for
           readability.
         - Unicode characters are preserved (ensure_ascii=False).
-        - Existing files at the target path will be overwritten.
+        - Writes are atomic (temp file + replace) to avoid partial files.
 
     See Also:
         - `load_elm_config`: For loading configurations from JSON files.
@@ -443,10 +500,9 @@ def save_elm_config(
     """
     from .normalizer import normalize
 
-    cfg = normalize(config)
-    json_path = ePath(json_file_path)
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    cfg = make_serializable(normalize(config))
+    payload = json.dumps(cfg, indent=2, ensure_ascii=False)
+    write_text_atomic(json_file_path, payload, encoding="utf-8")
 
 
 def load_elm_config(json_file_path: str | os.PathLike | ePathLike) -> ELMConfig:
@@ -468,7 +524,8 @@ def load_elm_config(json_file_path: str | os.PathLike | ePathLike) -> ELMConfig:
 
     Raises:
         FileNotFoundError: If the specified JSON file does not exist.
-        json.JSONDecodeError: If the file contains invalid JSON.
+        ValueError: If the file contains invalid JSON.
+        TypeError: If the file root is not a JSON object.
 
     Example:
         >>> config = load_elm_config("configs/my_config.json")
@@ -493,5 +550,12 @@ def load_elm_config(json_file_path: str | os.PathLike | ePathLike) -> ELMConfig:
     if not json_path.exists():
         raise FileNotFoundError(f"Config file not found: {json_file_path}")
 
-    raw_config = json.loads(json_path.read_text(encoding="utf-8"))
+    try:
+        raw_config = json.loads(json_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid JSON in config file {json_path}: {exc.msg} (line {exc.lineno}, column {exc.colno})"
+        ) from exc
+    if not isinstance(raw_config, Mapping):
+        raise TypeError(f"Config file must contain a JSON object, got {type(raw_config).__name__}.")
     return normalize(raw_config)
