@@ -15,10 +15,10 @@
 import jax.numpy as jnp
 import pytest
 
-from easydel.inference.evaluations.esurge_eval import eSurgeLMEvalAdapter
 from easydel.inference.esurge.config import CacheConfig, Config, SchedulerConfig
-from easydel.inference.esurge.core.interface import CacheGroupSpec, CacheGroupsConfig, FullAttentionSpec
+from easydel.inference.esurge.core.interface import CacheGroupsConfig, CacheGroupSpec, FullAttentionSpec
 from easydel.inference.esurge.scheduler.scheduler import Scheduler
+from easydel.inference.evaluations.esurge_eval import eSurgeLMEvalAdapter
 
 
 class _DummyProcessor:
