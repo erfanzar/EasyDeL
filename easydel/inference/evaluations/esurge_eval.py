@@ -54,6 +54,7 @@ from __future__ import annotations
 import re
 import uuid
 from collections.abc import Iterable
+from contextlib import nullcontext
 from typing import Any
 
 import jax.numpy as jnp
@@ -867,7 +868,14 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         target_ids_jax = jnp.asarray(target_ids)
         attention_mask_jax = jnp.asarray(attention_mask)
 
-        outputs = self.model(input_ids=input_ids_jax, attention_mask=attention_mask_jax)
+        runner = getattr(self.surge, "runner", None)
+        mesh = getattr(runner, "mesh", None)
+        if mesh is None:
+            mesh = getattr(self.model, "mesh", None)
+
+        mesh_ctx = mesh if hasattr(mesh, "__enter__") and hasattr(mesh, "__exit__") else nullcontext()
+        with mesh_ctx:
+            outputs = self.model(input_ids=input_ids_jax, attention_mask=attention_mask_jax)
         logits = getattr(outputs, "logits", None)
         if logits is None:
             raise RuntimeError("Model forward did not return logits; cannot compute loglikelihood.")
