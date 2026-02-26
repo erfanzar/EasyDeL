@@ -63,6 +63,7 @@ from flax.nnx.nn import initializers
 from flax.typing import Dtype, Initializer, PrecisionLike
 from jax import shard_map
 
+from easydel.layers._sharding import resolve_safe_sharding
 from easydel.layers.quantization._configs import QuantizationType, resolve_ejkernel_quant_params
 from easydel.layers.quantization._quants import quantize
 
@@ -1082,13 +1083,39 @@ class ParallelLinearQuantized(nn.Module):
         if self._direction is None:
             return {}
         mode, group_size, _bits, needs_biases = self._resolve_ejkernel_params()
-        return _quantized_linear_craft_spec(
+        specs = _quantized_linear_craft_spec(
             direction=self._direction,
             use_bias=self.use_bias,
             mode=mode,
             group_size=group_size,
             needs_biases=needs_biases,
         )
+        if partition_manager is None:
+            return specs
+
+        mesh = _kwargs.get("mesh")
+
+        def _shape_of(name: str) -> tuple[int, ...] | None:
+            if not hasattr(self, name):
+                return None
+            value = getattr(getattr(self, name), "value", getattr(self, name))
+            if value is None or not hasattr(value, "shape"):
+                return None
+            return tuple(value.shape)
+
+        safe_specs: dict[str, tp.Any] = {}
+        for name, axes in specs.items():
+            shape = _shape_of(name)
+            if shape is None:
+                safe_specs[name] = axes
+                continue
+            safe_specs[name] = resolve_safe_sharding(
+                axes=axes,
+                shape=shape,
+                partition_manager=partition_manager,
+                mesh=mesh,
+            )
+        return safe_specs
 
     @property
     def wqdtype(self) -> QuantizationType:

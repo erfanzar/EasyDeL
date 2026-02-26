@@ -1263,7 +1263,8 @@ class BaseTrainer(BaseTrainerProtocol):
                 esurge_kwargs["page_size"] = args.esurge_page_size
             if hasattr(args, "esurge_silent_mode"):
                 esurge_kwargs["silent_mode"] = args.esurge_silent_mode
-
+            if args.esurge_max_num_batched_tokens is not None:
+                esurge_kwargs["max_num_batched_tokens"] = args.esurge_max_num_batched_tokens
             effective_prompt_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
             # eSurge reserves a few tokens from the context budget (defaults to
             # `reserve_tokens = max_num_seqs`). When we tightly pack
@@ -1275,7 +1276,9 @@ class BaseTrainer(BaseTrainerProtocol):
             reserve_tokens = esurge_kwargs.get("reserve_tokens")
             if reserve_tokens is None:
                 reserve_tokens = esurge_kwargs.get("max_num_seqs", 0)
-            esurge_kwargs["max_model_len"] = sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)  # pyright: ignore[reportOptionalOperand]
+            esurge_kwargs["max_model_len"] = (
+                sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)
+            )  # pyright: ignore[reportOptionalOperand]
 
             logger.info_once(f"Creating eSurge {pprint.pformat(esurge_kwargs)}")
             logger.info_once(

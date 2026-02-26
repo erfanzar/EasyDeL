@@ -59,6 +59,7 @@ from flax.nnx.nn.dtypes import promote_dtype
 from jax import lax
 from jaxtyping import Array, Shaped
 
+from easydel.layers._sharding import resolve_safe_sharding
 from easydel.layers.quantization._configs import QuantizationConfig
 
 if tp.TYPE_CHECKING:
@@ -358,9 +359,22 @@ class ParallelLinear(nn.Module):
             kernel_spec = ColumnWise
         else:
             return {}
-        specs: dict[str, tp.Any] = {"kernel": kernel_spec}
+        mesh = _kwargs.get("mesh")
+        specs: dict[str, tp.Any] = {
+            "kernel": resolve_safe_sharding(
+                axes=kernel_spec,
+                shape=tuple(self.kernel.value.shape),
+                partition_manager=partition_manager,
+                mesh=mesh,
+            )
+        }
         if self.use_bias:
-            specs["bias"] = Replicated
+            specs["bias"] = resolve_safe_sharding(
+                axes=Replicated,
+                shape=tuple(self.bias.value.shape),
+                partition_manager=partition_manager,
+                mesh=mesh,
+            )
         return specs
 
     def to_quantized(

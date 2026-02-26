@@ -75,7 +75,7 @@ from eformer.paths import ePath, ePathLike
 from eformer.serialization import Checkpointer
 from eformer.serialization.checkpointer import find_latest_checkpoint
 from flax import nnx as nn
-from huggingface_hub import CommitOperationAdd, create_branch, create_commit
+from huggingface_hub import CommitOperationAdd, create_branch, create_commit, create_repo
 from huggingface_hub.utils import HfHubHTTPError
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -482,13 +482,12 @@ class EasyBridgeMixin(PushToHubMixin):
         """
         working_dir = ePath(repo_id.split("/")[-1])
 
-        repo_id = self._create_repo(
+        repo_id = create_repo(
             repo_id,
             private=private,
             token=token,
-            repo_url=None,
-            organization=None,
-        )
+            exist_ok=True,
+        ).repo_id
 
         if use_temp_dir is None:
             use_temp_dir = not working_dir.is_dir()
