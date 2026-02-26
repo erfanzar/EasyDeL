@@ -1724,7 +1724,8 @@ class eLargeModel:
                 - Coding: "humaneval", "mbpp"
                 Full list: https://github.com/EleutherAI/lm-evaluation-harness/tree/main/lm_eval/tasks
             num_fewshot: Number of few-shot examples to use.
-                If None, uses `eval.num_fewshot` when set, otherwise 0.
+                If None, uses `eval.num_fewshot` when set; otherwise lm-eval
+                task defaults are preserved.
                 Different tasks may have different recommended values:
                 - MMLU: typically 5-shot
                 - GSM8K: typically 8-shot
@@ -1804,8 +1805,6 @@ class eLargeModel:
         top_p = eval_config.pop("top_p", 0.95)
         device = eval_config.pop("device", "cpu")
         num_fewshot = eval_config.pop("num_fewshot", num_fewshot)
-        if num_fewshot is None:
-            num_fewshot = 0
         normalize_math_answers = bool(eval_config.pop("normalize_math_answers", True))
         math_answer_task_hints = eval_config.pop("math_answer_task_hints", None)
         include_path = eval_config.pop("include_path", None)
@@ -1843,7 +1842,7 @@ class eLargeModel:
         try:
             logger.info(f"Starting evaluation on tasks: {tasks}")
             logger.info("Using eSurge engine")
-            logger.info(f"Batch size: {batch_size}, Few-shot: {num_fewshot}")
+            logger.info(f"Batch size: {batch_size}, Few-shot: {num_fewshot if num_fewshot is not None else 'task-default'}")
 
             results = evaluator.simple_evaluate(
                 model=eval_adapter,
