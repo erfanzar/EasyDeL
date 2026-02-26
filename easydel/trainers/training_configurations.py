@@ -427,6 +427,10 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Silence eSurge info logs (engine start/stop/resume, cache events)."},
     )
+    esurge_max_num_batched_tokens: int | None = field(
+        default=None,
+        metadata={"help": "Maximum number of tokens to batch together for eSurge generation. None uses eSurge default."},
+    )
     num_train_epochs: int = field(
         default=10,
         metadata={"help": "The number of training epochs."},
@@ -494,8 +498,10 @@ class TrainingArguments:
     save_total_limit: int | None = field(
         default=None,
         metadata={
-            "help": "Maximum number of permanent checkpoints to keep. Older checkpoints are deleted. "
-            "Note: Temporary checkpoints (time-based) are managed separately by Checkpointer."
+            "help": (
+                "Maximum number of permanent checkpoints to keep. Older checkpoints are deleted. "
+                "Note: Temporary checkpoints (time-based) are managed separately by Checkpointer."
+            )
         },
     )
     scheduler: AVAILABLE_SCHEDULERS = field(

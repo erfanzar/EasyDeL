@@ -57,6 +57,7 @@ from collections.abc import Iterable
 from contextlib import nullcontext
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 from eformer.loggings import get_logger
 from jax.scipy.special import logsumexp
@@ -369,6 +370,8 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         self.surge = surge
         self._batch_size = batch_size or surge.max_num_seqs
         self.model = getattr(getattr(surge, "runner", None), "model", None)
+        self._scoring_model = None
+        self._scoring_logits_fn = None
         self.setup_complete = False
         self._setup()
 
@@ -397,6 +400,55 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         """
         if self.surge:
             self.surge.terminate()
+
+    def _build_scoring_model(self):
+        """Build a scoring model that supports direct teacher-forced forward passes.
+
+        eSurge's runtime model commonly uses ragged-page attention and requires
+        cache metadata. For lm-eval loglikelihood scoring we need plain forward
+        passes over full token sequences, so we construct a non-paged variant
+        from the same parameters when needed.
+        """
+        if self.model is None:
+            raise RuntimeError("Scoring model is not available on the eSurge engine (missing `surge.runner.model`).")
+
+        text_config_getter = getattr(getattr(self.model, "config", None), "get_text_config", None)
+        text_config = text_config_getter() if callable(text_config_getter) else getattr(self.model, "config", None)
+        attn_mechanism = getattr(text_config, "attn_mechanism", None)
+        if hasattr(attn_mechanism, "value"):
+            attn_mechanism = attn_mechanism.value
+        attn_mechanism = str(attn_mechanism).lower() if attn_mechanism is not None else ""
+
+        if attn_mechanism in {"ragged_page_attention_v2", "ragged_page_attention_v3", "paged_flash_attention"}:
+            try:
+                compat_graphdef = self.model.new_graphdef(
+                    recursive_update=True,
+                    attn_mechanism="vanilla",
+                    decode_attn_mechanism="vanilla",
+                )
+                return self.model.merge_module(compat_graphdef, self.model.graphstate, self.model.graphother)
+            except Exception:
+                logger.warning(
+                    "Failed to build non-paged scoring model; falling back to eSurge runner model.",
+                    exc_info=True,
+                )
+        return self.model
+
+    def _get_scoring_model(self):
+        if self._scoring_model is None:
+            self._scoring_model = self._build_scoring_model()
+        return self._scoring_model
+
+    def _get_scoring_logits_fn(self):
+        """Return a cached jitted forward that outputs logits only."""
+        if self._scoring_logits_fn is None:
+            scoring_model = self._get_scoring_model()
+
+            def _forward(input_ids, attention_mask):
+                return scoring_model(input_ids=input_ids, attention_mask=attention_mask).logits
+
+            self._scoring_logits_fn = jax.jit(_forward)
+        return self._scoring_logits_fn
 
     def _generate(
         self,
@@ -853,30 +905,33 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         if max_len < 1:
             return results
 
-        import numpy as np
+        input_rows: list[jax.Array] = []
+        target_rows: list[jax.Array] = []
+        mask_rows: list[jax.Array] = []
+        for ids, t_ids in zip(inputs_scored, targets_scored, strict=False):
+            ids_arr = jnp.asarray(ids, dtype=jnp.int32)
+            targets_arr = jnp.asarray(t_ids, dtype=jnp.int32)
+            valid_len = ids_arr.shape[0]
+            pad_len = max_len - valid_len
 
-        input_ids = np.full((len(inputs_scored), max_len), pad_id, dtype=np.int32)
-        target_ids = np.full((len(inputs_scored), max_len), pad_id, dtype=np.int32)
-        attention_mask = np.zeros((len(inputs_scored), max_len), dtype=bool)
+            input_rows.append(jnp.pad(ids_arr, (0, pad_len), constant_values=pad_id))
+            target_rows.append(jnp.pad(targets_arr, (0, pad_len), constant_values=pad_id))
+            mask_rows.append(jnp.pad(jnp.ones((valid_len,), dtype=jnp.bool_), (0, pad_len), constant_values=False))
 
-        for i, ids in enumerate(inputs_scored):
-            input_ids[i, : len(ids)] = np.asarray(ids, dtype=np.int32)
-            target_ids[i, : len(ids)] = np.asarray(targets_scored[i], dtype=np.int32)
-            attention_mask[i, : len(ids)] = True
+        input_ids_jax = jnp.stack(input_rows, axis=0)
+        target_ids_jax = jnp.stack(target_rows, axis=0)
+        attention_mask_jax = jnp.stack(mask_rows, axis=0)
 
-        input_ids_jax = jnp.asarray(input_ids)
-        target_ids_jax = jnp.asarray(target_ids)
-        attention_mask_jax = jnp.asarray(attention_mask)
-
+        scoring_model = self._get_scoring_model()
+        scoring_logits_fn = self._get_scoring_logits_fn()
         runner = getattr(self.surge, "runner", None)
         mesh = getattr(runner, "mesh", None)
         if mesh is None:
-            mesh = getattr(self.model, "mesh", None)
+            mesh = getattr(scoring_model, "mesh", None)
 
         mesh_ctx = mesh if hasattr(mesh, "__enter__") and hasattr(mesh, "__exit__") else nullcontext()
         with mesh_ctx:
-            outputs = self.model(input_ids=input_ids_jax, attention_mask=attention_mask_jax)
-        logits = getattr(outputs, "logits", None)
+            logits = scoring_logits_fn(input_ids_jax, attention_mask_jax)
         if logits is None:
             raise RuntimeError("Model forward did not return logits; cannot compute loglikelihood.")
 

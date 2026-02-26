@@ -53,6 +53,8 @@ from flax.typing import (
 from jax import Array
 from jax import numpy as jnp
 
+from easydel.layers._sharding import resolve_safe_sharding
+
 default_embed_init = initializers.variance_scaling(1.0, "fan_in", "normal", out_axis=0)
 """Default embedding initializer using variance scaling.
 
@@ -189,7 +191,14 @@ class Embed(nn.Module):
 
     def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
         """Return dynamic partition specs for this module's parameters."""
-        return {"embedding": ColumnWise}
+        return {
+            "embedding": resolve_safe_sharding(
+                axes=ColumnWise,
+                shape=tuple(self.embedding.value.shape),
+                partition_manager=partition_manager,
+                mesh=_kwargs.get("mesh"),
+            )
+        }
 
     def attend(self, query: Array) -> Array:
         """Compute attention scores between query vectors and embeddings.
