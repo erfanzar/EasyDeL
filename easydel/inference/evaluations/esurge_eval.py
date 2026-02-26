@@ -362,9 +362,7 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         else:
             raise TypeError("math_answer_task_hints must be None, a string, or an iterable of strings")
         self.math_answer_task_hints = tuple(
-            hint_text
-            for hint in raw_task_hints
-            if (hint_text := str(hint).strip().lower())
+            hint_text for hint in raw_task_hints if (hint_text := str(hint).strip().lower())
         )
 
         self.surge = surge
