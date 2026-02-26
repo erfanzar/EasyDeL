@@ -142,6 +142,109 @@ CANDIDATE_FILENAMES = [
 ]
 
 
+def _mesh_partition_product(mesh: jax.sharding.Mesh, axis_spec: object) -> int:
+    """Return shard multiplicity implied by a PartitionSpec entry."""
+    if axis_spec is None:
+        return 1
+    if isinstance(axis_spec, (tuple, list)):
+        product = 1
+        for axis_name in axis_spec:
+            if axis_name is None:
+                continue
+            try:
+                product *= int(mesh.shape[str(axis_name)])
+            except Exception:
+                product *= 1
+        return int(product)
+    try:
+        return int(mesh.shape[str(axis_spec)])
+    except Exception:
+        return 1
+
+
+def _sanitize_partition_spec_for_shape(
+    spec: PartitionSpec,
+    shape: tuple[int, ...],
+    mesh: jax.sharding.Mesh,
+) -> PartitionSpec:
+    """Drop non-divisible sharding axes for a concrete tensor shape."""
+    axes = list(tuple(spec))
+    changed = False
+    ndim = len(shape)
+
+    if len(axes) > ndim:
+        axes = axes[:ndim]
+        changed = True
+
+    for dim_index, axis_spec in enumerate(axes):
+        if axis_spec is None:
+            continue
+        shard_factor = _mesh_partition_product(mesh, axis_spec)
+        if shard_factor > 1 and int(shape[dim_index]) % shard_factor != 0:
+            axes[dim_index] = None
+            changed = True
+
+    if not changed:
+        return spec
+    return PartitionSpec(*axes)
+
+
+def _tree_key_to_path(key: tp.Any) -> str:
+    if isinstance(key, tuple):
+        return "/".join(str(k) for k in key)
+    s = str(key)
+    return s if "/" in s else s.replace(".", "/")
+
+
+def _build_safe_checkpoint_partition_rules(
+    *,
+    model: "EasyDeLBaseModule",
+    mesh: jax.sharding.Mesh,
+    partition_rules: tuple[tuple[str, PartitionSpec], ...] | list[tuple[str, PartitionSpec]] | None,
+) -> tuple[tuple[str, PartitionSpec], ...] | None:
+    """Create path-specific override rules for non-divisible shardings.
+
+    The checkpoint loader applies regex partition rules without shape validation.
+    We precompute matched specs against model parameter shapes and prepend exact
+    overrides for only the problematic leaves.
+    """
+    if not partition_rules:
+        return partition_rules
+
+    try:
+        from eformer.escale import match_partition_rules
+
+        specs_tree = match_partition_rules(list(partition_rules), model.graphtree_params_shape, strict=False)
+        flat_specs = flatten_dict(specs_tree)
+        flat_shapes = flatten_dict(model.graphtree_params_shape)
+    except Exception:
+        return tuple(partition_rules)
+
+    overrides: list[tuple[str, PartitionSpec]] = []
+    for key, spec in flat_specs.items():
+        if not isinstance(spec, PartitionSpec):
+            continue
+
+        shape_obj = flat_shapes.get(key)
+        shape = tuple(getattr(shape_obj, "shape", ()))
+        if not shape:
+            continue
+
+        safe_spec = _sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=mesh)
+        if safe_spec != spec:
+            path = _tree_key_to_path(key)
+            overrides.append((rf"^{re.escape(path)}$", safe_spec))
+
+    if not overrides:
+        return tuple(partition_rules)
+
+    logger.warning(
+        "Adjusted %d non-divisible parameter sharding specs for checkpoint load.",
+        len(overrides),
+    )
+    return tuple(overrides) + tuple(partition_rules)
+
+
 @dataclass
 class TorchLoadOptions:
     """Options for torch_load_mode in _from_torch_pretrained."""
@@ -699,6 +802,11 @@ class EasyBridgeMixin(PushToHubMixin):
             extraargs["callback"] = callback
             if itwas_tensorstore and apply_quantization:
                 extraargs["chunk_size"] = 32
+            checkpoint_partition_rules = _build_safe_checkpoint_partition_rules(
+                model=model,
+                mesh=mesh,
+                partition_rules=model._get_partition_rules(None),
+            )
             state, _ = Checkpointer(
                 base_path=str(resolved_archive_file),
                 save_interval=None,
@@ -706,7 +814,7 @@ class EasyBridgeMixin(PushToHubMixin):
             ).load_pytree(
                 mesh=mesh,
                 dtype=param_dtype,  # legacy
-                partition_rules=model._get_partition_rules(None),
+                partition_rules=checkpoint_partition_rules,
                 prefix="model",
                 discover_latest=True,
                 discover_raise=False,
