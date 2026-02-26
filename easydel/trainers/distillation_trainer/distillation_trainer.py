@@ -34,7 +34,7 @@ from ._fn import distillation_step
 from .distillation_config import DistillationConfig
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset
+    from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
 
 logger = get_logger(__name__)
 
@@ -250,7 +250,9 @@ class DistillationTrainer(Trainer):
             completion_mask_np = np.asarray(completion_mask)
             if attention_mask is not None:
                 completion_mask_np = completion_mask_np * np.asarray(attention_mask)
-            completion_dtype = np.asarray(attention_mask).dtype if attention_mask is not None else completion_mask_np.dtype
+            completion_dtype = (
+                np.asarray(attention_mask).dtype if attention_mask is not None else completion_mask_np.dtype
+            )
             batch["completion_mask"] = completion_mask_np.astype(completion_dtype, copy=False)
 
             if "labels" not in batch and "input_ids" in batch:

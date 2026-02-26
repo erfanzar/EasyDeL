@@ -59,7 +59,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = get_logger(__name__)
 
 
-@ToolParserManager.register_module("minimax_m2")
+@ToolParserManager.register_module("minimax_m2")  # pyright: ignore[reportUntypedClassDecorator]
 class MinimaxM2ToolParser(ToolParser):
     """Tool parser for Minimax M2 models with XML-style tool calls.
 
@@ -121,7 +121,7 @@ class MinimaxM2ToolParser(ToolParser):
         self.parameter_end_token: str = "</parameter>"
 
         self.current_tool_name_sent: bool = False
-        self.current_tool_id: str | None = None  # type: ignore[assignment]
+        self.current_tool_id: str | None = None
         self.streamed_args_for_tool: list[str] = []
         self.is_tool_call_started: bool = False
         self.failed_count: int = 0

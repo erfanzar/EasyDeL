@@ -68,8 +68,8 @@ import typing as tp
 import jax
 from eformer import common_types
 from eformer.escale import with_sharding_constraint
-from ejkernel.modules import scaled_dot_product_attention
-from ejkernel.types import MaskInfo
+from ejkernel.modules import scaled_dot_product_attention  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import Array
 from jax import numpy as jnp
 from jax import random as jr
@@ -104,7 +104,7 @@ class ScaledDotProductAttn(OperationImpl):
     """
 
     @classmethod
-    def get_impl_name(cls) -> str | tuple[str]:
+    def get_impl_name(cls) -> str | tuple[str, ...]:
         """
         Returns the registered name(s) for this implementation.
 
@@ -120,6 +120,7 @@ class ScaledDotProductAttn(OperationImpl):
         Returns:
             The `OperationMetadata` provided during initialization.
         """
+        assert self.metadata is not None
         return self.metadata
 
     @classmethod

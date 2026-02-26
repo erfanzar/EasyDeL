@@ -21,6 +21,7 @@ response length inflation while maintaining accuracy.
 
 from __future__ import annotations
 
+# pyright: reportPrivateLocalImportUsage=false
 import sys
 from pathlib import Path
 
@@ -37,7 +38,7 @@ if __package__ in {None, ""}:
         make_config,
     )
 else:
-    from ._common import (  # type: ignore
+    from ._common import (
         dummy_reward_fn,
         get_logger,
         get_tokenizer,
@@ -61,7 +62,7 @@ def main():
             "max_length": 768,
             "num_train_epochs": 1,
             "total_batch_size": 2,
-            "num_generations": 8,       # Generate more samples
+            "num_generations": 8,  # Generate more samples
             "num_remains_in_group": 4,  # Keep top 4 after filtering
             "filter_by_length": True,
             "filter_by_efficiency": True,

@@ -36,7 +36,7 @@ Example:
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
 import jax
 import numpy as np
@@ -54,7 +54,7 @@ from ..page_table import MultiGroupPageTable
 logger = get_logger(__name__)
 
 
-@ejit(static_argnames=("padded_num_reqs", "padded_prompt_len"))
+@ejit(static_argnames=("padded_num_reqs", "padded_prompt_len"))  # pyright: ignore[reportUntypedFunctionDecorator]
 def pack_prompts(token_ids, num_prompt_tokens, padded_num_reqs, padded_prompt_len, pad_id):
     """Pack prompt tokens into a padded tensor.
 
@@ -85,7 +85,7 @@ def pack_prompts(token_ids, num_prompt_tokens, padded_num_reqs, padded_prompt_le
     return jnp.where(mask, slice_tokens, pad_mat)
 
 
-@ejit(static_argnames=("padded_num_reqs",))
+@ejit(static_argnames=("padded_num_reqs",))  # pyright: ignore[reportUntypedFunctionDecorator]
 def build_sampling_arrays(temperature, min_p, top_p, top_k, num_reqs, padded_num_reqs):
     """Build padded sampling parameter arrays.
 
@@ -200,7 +200,7 @@ def move_row(arr, from_idx, to_idx):
     return out
 
 
-@ejit(static_argnames=("vocab_size", "max_allowed"))
+@ejit(static_argnames=("vocab_size", "max_allowed"))  # pyright: ignore[reportUntypedFunctionDecorator]
 def build_allowed_mask(allowed_ids_padded, allowed_lens, vocab_size, max_allowed):
     """Build a mask for allowed token IDs.
 
@@ -331,8 +331,8 @@ class SequenceBuffer:
         self.request_distribution = [0, 0, total]
 
     @property
-    def req_ids(self) -> list[str]:
-        return cast(list[str], self._req_ids)
+    def req_ids(self) -> list[str | None]:
+        return self._req_ids
 
     @property
     def num_reqs(self) -> int:
@@ -900,13 +900,15 @@ class SequenceBuffer:
 
         max_prompt_len = int(np.max(self.num_prompt_tokens[: self.num_reqs]))
         # Convert to JAX for pack_prompts (which is JIT-compiled)
-        return pack_prompts(
+        result = pack_prompts(
             jnp.asarray(self.token_ids),
             jnp.asarray(self.num_prompt_tokens),
             self.num_reqs,
             max_prompt_len,
             self.vocab_size,
         )
+        assert isinstance(result, jax.Array)
+        return result
 
     def get_request_indices_with_penalty(self) -> jax.Array:
         """Get indices of requests with penalties.
@@ -1104,7 +1106,7 @@ class ModelRunnerSamplingMetadata:
         )
 
 
-@ejit(static_argnums=(2, 3))
+@ejit(static_argnums=(2, 3))  # pyright: ignore[reportUntypedFunctionDecorator]
 def fill_slice(arr, fill_val, num_reqs, padded_num_reqs):
     """Fill array slice with padding value.
 

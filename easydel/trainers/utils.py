@@ -23,6 +23,7 @@ This module provides essential utilities for training, including:
 - Training state management utilities
 """
 
+import collections.abc
 import logging
 import os
 import random
@@ -34,15 +35,15 @@ from threading import current_thread
 
 import jax
 import numpy as np
-from datasets import Dataset, IterableDataset
-from datasets.distributed import split_dataset_by_node
+from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
+from datasets.distributed import split_dataset_by_node  # pyright: ignore[reportMissingTypeStubs]
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
-from grain import python as pygrain
+from grain import python as pygrain  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jaxtyping import Array
-from ml_collections import ConfigDict
-from ml_collections.config_dict import placeholder
+from ml_collections import ConfigDict  # pyright: ignore[reportMissingTypeStubs]
+from ml_collections.config_dict import placeholder  # pyright: ignore[reportMissingTypeStubs]
 
 from easydel.infra.utils import ProcessingClassType
 
@@ -188,7 +189,7 @@ def create_constant_length_dataset(
     shuffle: bool = True,
     append_concat_token: bool = True,
     add_special_tokens: bool = True,
-) -> tp.Callable[[], tp.Iterator[dict[str, jnp.ndarray]]]:
+) -> tp.Callable[[], collections.abc.Iterator[dict[str, jnp.ndarray]]]:
     """
     Creates a generator function that yields constant length chunks of tokens from a stream of text files.
 
@@ -241,7 +242,7 @@ def create_constant_length_dataset(
     else:
         raise ValueError("Either `dataset_text_field` or `formatting_func` should be provided.")
 
-    def constant_length_generator() -> tp.Iterator[dict[str, jnp.ndarray]]:
+    def constant_length_generator() -> collections.abc.Iterator[dict[str, jnp.ndarray]]:
         iterator = iter(dataset)
         more_examples = True
 
@@ -522,7 +523,9 @@ class DataCollatorForCompletionOnlyLM:
         labels[~masked_indices] = -100
         indices_replaced = np.random.binomial(1, 0.8, size=labels.shape).astype(bool) & masked_indices  # noqa
         inputs[indices_replaced] = self.processing_class.mask_token_id
-        indices_random = np.random.binomial(1, 0.5, size=labels.shape).astype(bool) & masked_indices & ~indices_replaced  # noqa
+        indices_random = (
+            np.random.binomial(1, 0.5, size=labels.shape).astype(bool) & masked_indices & ~indices_replaced  # noqa
+        )
         random_words = np.random.randint(  # noqa
             low=0,
             high=len(self.processing_class),
@@ -533,7 +536,7 @@ class DataCollatorForCompletionOnlyLM:
         return inputs, labels
 
     def jax_call(self, examples: list[list[int] | tp.Any | dict[str, tp.Any]]) -> dict[str, tp.Any]:
-        if isinstance(examples[0], tp.Mapping):
+        if isinstance(examples[0], collections.abc.Mapping):
             input_ids = [e["input_ids"] for e in examples]
         else:
             input_ids = examples
@@ -613,6 +616,7 @@ class DataCollatorForCompletionOnlyLM:
                     batch["labels"][i, :] = self.ignore_index
 
                 human_token_ids = self.instruction_token_ids
+                assert human_token_ids is not None
                 for human_idx in jnp.where(batch["labels"][i] == human_token_ids[0])[0]:
                     if human_token_ids == batch["labels"][i][human_idx : human_idx + len(human_token_ids)].tolist():
                         human_token_ids_idxs.append(human_idx)
@@ -1213,7 +1217,7 @@ class DPODataCollatorWithPaddingTFDS:
 
     max_prompt_length: int
     max_completion_length: int
-    pad_token_id: int = 0
+    pad_token_id: int | None = 0
     label_pad_token_id: int = -100
     is_encoder_decoder: bool | None = False
     output_arrays_only: bool = True
@@ -1333,7 +1337,7 @@ class DPODataCollatorWithPaddingGrain:
 
     max_prompt_length: int
     max_completion_length: int
-    pad_token_id: int = 0
+    pad_token_id: int | None = 0
     label_pad_token_id: int = -100
     is_encoder_decoder: bool | None = False
     output_arrays_only: bool = True
@@ -1641,6 +1645,7 @@ def pad(
     current_max = tensors[0].shape[-1]
     if max_lenght is None:
         max_lenght = current_max
+    assert isinstance(max_lenght, int)
     x_lenght = max(current_max, max_lenght)
     output_shape += (x_lenght,)
     output = jnp.full((len(tensors), *output_shape), padding_value, dtype=tensors[0].dtype)
@@ -1738,6 +1743,7 @@ def np_pad(
     current_max = tensors[0].shape[-1]
     if max_lenght is None:
         max_lenght = current_max
+    assert isinstance(max_lenght, int)
     x_lenght = max(current_max, max_lenght)
     output_shape += (x_lenght,)
     output = np.full((len(tensors), *output_shape), padding_value, dtype=tensors[0].dtype)
@@ -1945,14 +1951,14 @@ def instructions_formatting_function(processing_class: "AutoTokenizer"):  # type
                     {"role": "user", "content": examples["prompt"][i]},
                     {"role": "assistant", "content": examples["completion"][i]},
                 ]
-                output_texts.append(processing_class.apply_chat_template(converted_sample, tokenize=False))  # type: ignore
+                output_texts.append(processing_class.apply_chat_template(converted_sample, tokenize=False))
             return output_texts
         else:
             converted_sample = [
                 {"role": "user", "content": examples["prompt"]},
                 {"role": "assistant", "content": examples["completion"]},
             ]
-            return processing_class.apply_chat_template(converted_sample, tokenize=False)  # type: ignore
+            return processing_class.apply_chat_template(converted_sample, tokenize=False)
 
     return format_dataset
 
@@ -1984,7 +1990,7 @@ def get_formatting_func_from_dataset(
         Returns None if dataset doesn't match known formats.
     """
     try:
-        from datasets import Dataset, Value
+        from datasets import Dataset, Value  # pyright: ignore[reportMissingTypeStubs]
     except ImportError as e:
         raise ImportError("Please install the datasets library to use this function.") from e
     FORMAT_MAPPING = {

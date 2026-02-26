@@ -17,7 +17,7 @@ import jax
 from eformer import common_types
 from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from flax.nnx.nn.attention import dot_product_attention_weights
 from jax import lax
@@ -1395,7 +1395,7 @@ class RobertaModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=RobertaConfig, model_type="roberta")
-class RobertaForSequenceClassification(BaseSequenceClassificationModule[RobertaModel, RobertaConfig]):
+class RobertaForSequenceClassification(BaseSequenceClassificationModule[RobertaModel, RobertaConfig]):  # type: ignore
     """RoBERTa model with a classification head for sequence classification.
 
     This model extends the base RoBERTa model by adding a classification head
@@ -1660,7 +1660,7 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
         return self.roberta.get_embedding()
 
 
-class RobertaForTokenClassification(BaseTokenClassificationModule[RobertaModel, RobertaConfig]):
+class RobertaForTokenClassification(BaseTokenClassificationModule[RobertaModel, RobertaConfig]):  # type: ignore
     """RoBERTa model with a token classification head.
 
     This model extends RoBERTa for token-level classification tasks such as
@@ -1793,7 +1793,7 @@ class RobertaForTokenClassification(BaseTokenClassificationModule[RobertaModel, 
         return self.classifier
 
 
-class RobertaForQuestionAnswering(BaseQuestionAnsweringModule[RobertaModel, RobertaConfig]):
+class RobertaForQuestionAnswering(BaseQuestionAnsweringModule[RobertaModel, RobertaConfig]):  # type: ignore
     """RoBERTa model for extractive question answering.
 
     This model extends RoBERTa for extractive QA tasks where the answer is
@@ -1925,7 +1925,7 @@ class RobertaForQuestionAnswering(BaseQuestionAnsweringModule[RobertaModel, Robe
 
 
 @register_module(TaskType.CAUSAL_LM, config=RobertaConfig, model_type="roberta")
-class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):
+class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):  # type: ignore
     """RoBERTa model with a causal language modeling head.
 
     This model adapts RoBERTa for causal (autoregressive) language modeling,

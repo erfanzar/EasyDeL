@@ -256,7 +256,7 @@ class Qwen3NextConfig(EasyDeLBaseConfig):
         Returns:
             True if the layer uses full attention, False for linear attention.
         """
-        return self.layer_types[layer_idx] == "full_attention"
+        return self.layer_types is not None and self.layer_types[layer_idx] == "full_attention"
 
     def is_moe_layer(self, layer_idx: int) -> bool:
         """Check if a layer uses MoE FFN.

@@ -14,7 +14,9 @@ from easydel.trainers.training_configurations import TrainingArguments
 
 
 def test_base_trainer_cfg_covers_training_arguments_fields():
-    training_argument_fields = {field_obj.name for field_obj in fields(TrainingArguments) if not field_obj.name.startswith("_")}
+    training_argument_fields = {
+        field_obj.name for field_obj in fields(TrainingArguments) if not field_obj.name.startswith("_")
+    }
     config_keys = set(BaseTrainerCfg.__required_keys__) | set(BaseTrainerCfg.__optional_keys__)
     missing_keys = sorted(training_argument_fields - config_keys)
     assert missing_keys == [], f"BaseTrainerCfg is missing TrainingArguments fields: {missing_keys}"

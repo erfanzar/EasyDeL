@@ -348,9 +348,9 @@ class Qwen3OmniMoeThinkerConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        audio_config=None,
-        vision_config=None,
-        text_config=None,
+        audio_config: dict | Qwen3OmniMoeAudioEncoderConfig | None = None,
+        vision_config: dict | Qwen3OmniMoeVisionEncoderConfig | None = None,
+        text_config: dict | Qwen3OmniMoeTextConfig | None = None,
         audio_token_id: int = 151646,
         image_token_id: int = 151655,
         video_token_id: int = 151656,
@@ -639,8 +639,8 @@ class Qwen3OmniMoeTalkerConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        code_predictor_config=None,
-        text_config=None,
+        code_predictor_config: dict | Qwen3OmniMoeTalkerCodePredictorConfig | None = None,
+        text_config: dict | Qwen3OmniMoeTalkerTextConfig | None = None,
         num_code_groups: int = 32,
         thinker_hidden_size: int = 2048,
         codec_eos_token_id: int = 4198,
@@ -656,7 +656,7 @@ class Qwen3OmniMoeTalkerConfig(EasyDeLBaseConfig):
         vision_start_token_id: int = 151652,
         position_id_per_seconds: int = 25,
         audio_start_token_id: int = 151669,
-        speaker_id=None,
+        speaker_id: dict | None = None,
         spatial_merge_size: int = 2,
         **kwargs,
     ):
@@ -760,7 +760,7 @@ class Qwen3OmniMoeCode2WavConfig(EasyDeLBaseConfig):
         rope_theta: float = 10000.0,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
-        sliding_window: int = 72,
+        sliding_window: int | None = 72,
         layer_scale_initial_scale: float = 0.01,
         num_quantizers: int = 16,
         upsample_rates: tuple[int, ...] = (8, 5, 4, 3),
@@ -843,9 +843,9 @@ class Qwen3OmniMoeConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        thinker_config=None,
-        talker_config=None,
-        code2wav_config=None,
+        thinker_config: dict | Qwen3OmniMoeThinkerConfig | None = None,
+        talker_config: dict | Qwen3OmniMoeTalkerConfig | None = None,
+        code2wav_config: dict | Qwen3OmniMoeCode2WavConfig | None = None,
         enable_audio_output: bool = True,
         im_start_token_id: int = 151644,
         im_end_token_id: int = 151645,
@@ -893,7 +893,7 @@ class Qwen3OmniMoeConfig(EasyDeLBaseConfig):
 
     def get_text_config(self, decoder: bool = True) -> Qwen3OmniMoeTextConfig:
         """Get the text configuration from thinker."""
-        return self.thinker_config.get_text_config(decoder)
+        return self.thinker_config.get_text_config(decoder)  # pyright: ignore[reportReturnType]
 
     def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
         """Returns partition rules for model sharding.

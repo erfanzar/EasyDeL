@@ -152,7 +152,7 @@ class Glm4MoeLiteConfig(EasyDeLBaseConfig):
         num_attention_heads: int = 20,
         num_key_value_heads: int = 20,
         n_shared_experts: int = 1,
-        n_routed_experts: int = 64,
+        n_routed_experts: int | None = 64,
         routed_scaling_factor: float = 1.8,
         kv_lora_rank: int = 512,
         q_lora_rank: int | None = 768,

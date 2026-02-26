@@ -34,6 +34,7 @@ also CPU-first and return NumPy arrays suitable for a single `jax.device_put`.
 from __future__ import annotations
 
 import typing as tp
+from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -48,9 +49,9 @@ NumpyArray = np.ndarray
 
 # Accept either JAX or NumPy arrays, and allow basic Python sequences for convenience.
 ArrayLike = JaxArray | NumpyArray
-IntVectorLike = ArrayLike | tp.Sequence[int]
-IntMatrixLike = ArrayLike | tp.Sequence[tp.Sequence[int]]
-BoolVectorLike = ArrayLike | tp.Sequence[bool] | tp.Sequence[int]
+IntVectorLike = ArrayLike | Sequence[int]
+IntMatrixLike = ArrayLike | Sequence[Sequence[int]]
+BoolVectorLike = ArrayLike | Sequence[bool] | Sequence[int]
 
 
 class SupportsStartsIndexs(tp.Protocol):
@@ -727,9 +728,10 @@ class AttentionMetadataBuilder:
         x: ArrayLike
         | _HasCpuTensor
         | _HasDeviceTensor
-        | tp.Sequence[int]
-        | tp.Sequence[bool]
-        | tp.Sequence[tp.Sequence[int]],
+        | Sequence[int]
+        | Sequence[bool]
+        | Sequence[Sequence[int]]
+        | None,
     ) -> np.ndarray:
         """Convert various array-like inputs to a NumPy array on CPU.
 
@@ -994,7 +996,7 @@ class AttentionMetadataBuilder:
         else:
             raise ValueError(f"Unknown ragged attention version: {version!r}.")
 
-        return out
+        return tp.cast(_RaggedComputed, tp.cast(object, out))
 
     @classmethod
     def compute_ragged_batch_fields_cpu(
@@ -1385,7 +1387,7 @@ class AttentionMetadataBuilder:
         else:
             raise ValueError(f"Unknown ragged attention version: {version!r}.")
 
-        return tp.cast(_PagedBatchComputed, out)
+        return tp.cast(_PagedBatchComputed, tp.cast(object, out))
 
     @classmethod
     def _compute_slot_mapping_v2_cpu_padded(

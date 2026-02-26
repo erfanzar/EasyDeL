@@ -18,7 +18,7 @@ from ..abstract_reasoning import ReasoningParserManager
 from ..basic_parsers import BaseThinkingReasoningParser
 
 
-@ReasoningParserManager.register_module(["olmo3"])
+@ReasoningParserManager.register_module(["olmo3"])  # pyright: ignore[reportUntypedClassDecorator]
 class Olmo3ReasoningParser(BaseThinkingReasoningParser):
     """Reasoning parser for OLMo3 models using <think>...</think> tags."""
 

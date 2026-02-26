@@ -27,7 +27,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from ..core.protocols import ShardedDataSource, ShardInfo
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
 
 class HFDatasetShardedSource(ShardedDataSource[dict]):
@@ -78,7 +78,7 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
     def _check_is_iterable(dataset) -> bool:
         """Check if dataset is an IterableDataset."""
         try:
-            from datasets import IterableDataset
+            from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
             return isinstance(dataset, IterableDataset)
         except ImportError:
@@ -212,7 +212,7 @@ def wrap_hf_dataset(
 
     # Check for HF datasets
     try:
-        from datasets import Dataset, IterableDataset
+        from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
         if isinstance(dataset, (Dataset, IterableDataset)):
             return HFDatasetShardedSource(dataset)

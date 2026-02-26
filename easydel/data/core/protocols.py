@@ -37,14 +37,13 @@ from typing import (
 )
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
     from jax.sharding import NamedSharding
 
     from .config import PipelineConfig
 
 T = TypeVar("T")
 T_co = TypeVar("T_co", covariant=True)
-DatasetLike = tp.Union["Dataset", "IterableDataset", tp.Iterator[dict]]
+DatasetLike = "Dataset | IterableDataset | Iterator[dict]"
 
 
 @dataclass

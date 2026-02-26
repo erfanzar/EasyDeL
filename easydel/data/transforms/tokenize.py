@@ -32,7 +32,7 @@ from ..core.config import DatasetConfig, TokenizerConfig, TokenizeStageConfig, m
 from ..core.protocols import BaseStage, PipelineContext, ShardedDataSource
 
 if tp.TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
 
     from transformers import PreTrainedTokenizer
 
@@ -178,7 +178,7 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
         self._manager = TokenizerManager()
 
     @property
-    def shard_names(self) -> tp.Sequence[str]:
+    def shard_names(self) -> Sequence[str]:
         return self._source.shard_names
 
     def num_shards(self) -> int:

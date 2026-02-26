@@ -107,7 +107,7 @@ class SchedulerConfig:
     max_num_seqs: int
     """The maximum number of sequences running at the same time."""
 
-    max_num_batched_tokens: int
+    max_num_batched_tokens: int | None
     """The maximum number of tokens to be processed in a single batch."""
 
     max_model_len: int
@@ -140,13 +140,13 @@ class SchedulerConfig:
         if self.max_num_seqs <= 0:
             raise ValueError(f"max_num_seqs must be positive, got {self.max_num_seqs}")
 
-        if self.max_num_batched_tokens <= 0:
+        if self.max_num_batched_tokens is not None and self.max_num_batched_tokens <= 0:
             raise ValueError(f"max_num_batched_tokens must be positive, got {self.max_num_batched_tokens}")
 
         if self.max_model_len <= 0:
             raise ValueError(f"max_model_len must be positive, got {self.max_model_len}")
 
-        if self.max_num_batched_tokens > self.max_model_len:
+        if self.max_num_batched_tokens is not None and self.max_num_batched_tokens > self.max_model_len:
             raise ValueError(
                 f"max_num_batched_tokens ({self.max_num_batched_tokens}) cannot exceed "
                 f"max_model_len ({self.max_model_len})"

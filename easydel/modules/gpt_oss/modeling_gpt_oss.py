@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -414,7 +414,7 @@ class GptOssAttention(UnifiedAttention):
             layer_idx (int): Index of this layer in the model. Used to determine
                 whether this layer uses sliding window attention.
         """
-        is_sliding = config.layer_types[layer_idx] == "sliding_attention"
+        is_sliding = config.layer_types is not None and config.layer_types[layer_idx] == "sliding_attention"
         sliding_window = None
 
         if is_sliding:
@@ -538,7 +538,7 @@ class GptOssDecoderLayer(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.attention_type = config.layer_types[layer_idx]
+        self.attention_type = config.layer_types[layer_idx] if config.layer_types is not None else "standard"
 
     def __call__(
         self,
@@ -863,7 +863,7 @@ class GptOssModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=GptOssConfig, model_type="gpt_oss")
-class GptOssForCausalLM(BaseCausalLMModule[GptOssModel, GptOssConfig]):
+class GptOssForCausalLM(BaseCausalLMModule[GptOssModel, GptOssConfig]):  # type: ignore
     """GPT-OSS model with a Causal Language Modeling head.
 
     This model extends the base GPT-OSS transformer by adding a linear layer on top
@@ -1007,7 +1007,7 @@ class GptOssForCausalLM(BaseCausalLMModule[GptOssModel, GptOssConfig]):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=GptOssConfig, model_type="gpt_oss")
-class GptOssForSequenceClassification(BaseSequenceClassificationModule[GptOssModel, GptOssConfig]):
+class GptOssForSequenceClassification(BaseSequenceClassificationModule[GptOssModel, GptOssConfig]):  # type: ignore
     """GptOss model with a Sequence Classification head.
 
     This model consists of the base GptOss transformer (`GptOssModel`) followed by a

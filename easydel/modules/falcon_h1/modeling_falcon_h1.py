@@ -274,7 +274,7 @@ class Conv1D(nn.Module):
         specs = {"kernel": Replicated}
         if getattr(self, "use_bias", False) and hasattr(self, "bias"):
             specs["bias"] = Replicated
-        return specs
+        return specs  # pyright: ignore[reportReturnType]
 
     def __call__(self, x: Array) -> Array:
         """Apply 1D convolution to the input.
@@ -567,7 +567,7 @@ class FalconH1Mixer(nn.Module):
     def __call__(
         self,
         hidden_states: Array,
-        mask_info: MaskInfo,
+        mask_info: MaskInfo | None,
         cache_view: HybridCacheView | None = None,
     ) -> tuple[Array, HybridCacheView | None]:
         """Process input through the Mamba SSM mixer.
@@ -597,9 +597,9 @@ class FalconH1Mixer(nn.Module):
                 - updated_cache_view: Updated cache with new conv_state and recurrent_state,
                   or None if caching is disabled
         """
-        q_mask = None
+        q_mask: Array | None = None
         if mask_info is not None:
-            q_mask = mask_info.q_attention_mask
+            q_mask = tp.cast("Array | None", mask_info.q_attention_mask)
             if q_mask is not None and q_mask.shape[1] != hidden_states.shape[1]:
                 q_mask = q_mask[:, : hidden_states.shape[1]]
         hidden_states = apply_mask_to_padding_states(hidden_states, q_mask)
@@ -622,8 +622,7 @@ class FalconH1Mixer(nn.Module):
             axis=-1,
         )
 
-        if q_mask is not None:
-            # Mask *post-projection* so biases don't leak into padding positions.
+        if q_mask is not None:  # Mask *post-projection* so biases don't leak into padding positions.
             gate = apply_mask_to_padding_states(gate, q_mask)
             hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, q_mask)
 
@@ -656,17 +655,18 @@ class FalconH1Mixer(nn.Module):
             conv_out = apply_mask_to_padding_states(conv_out, q_mask)
 
         groups_time_state_size = self.n_groups * self.ssm_state_size
-        x, B, C = jnp.split(conv_out, [self.intermediate_size, self.intermediate_size + groups_time_state_size], axis=-1)
+        x, ssm_b, ssm_c = jnp.split(
+            conv_out, [self.intermediate_size, self.intermediate_size + groups_time_state_size], axis=-1
+        )
 
         x = x.reshape(batch_size, seq_len, self.num_heads, self.head_dim).astype(jnp.float32)
-        B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
-        C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
+        ssm_b = ssm_b.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
+        ssm_c = ssm_c.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
         # Note: SSM2Op handles group expansion internally
 
         # Prepare dt with bias
         dt = jax.nn.softplus(dt.astype(jnp.float32) + self.dt_bias.value.astype(jnp.float32))
-        if q_mask is not None and seq_len > 1:
-            # For padding tokens, force dt=0 so the SSM state remains unchanged.
+        if q_mask is not None and seq_len > 1:  # For padding tokens, force dt=0 so the SSM state remains unchanged.
             dt = dt * q_mask[:, :, None].astype(dt.dtype)
 
         if cache_view is not None and cache_view.recurrent_state is not None:
@@ -678,8 +678,8 @@ class FalconH1Mixer(nn.Module):
         ssm_output = self.ssm_op(
             x=x,  # [batch, seq_len, num_heads, head_dim]
             A=self.A_log.value,  # [num_heads] in log form
-            B=B,  # [batch, seq_len, n_groups, ssm_state_size]
-            C=C,  # [batch, seq_len, n_groups, ssm_state_size]
+            B=ssm_b,  # [batch, seq_len, n_groups, ssm_state_size]
+            C=ssm_c,  # [batch, seq_len, n_groups, ssm_state_size]
             D=self.D.value,  # [num_heads]
             dt=dt,  # [batch, seq_len, num_heads]
             gate=None,  # Gating handled by self.norm below (if mamba_rms_norm) or manually
@@ -697,7 +697,8 @@ class FalconH1Mixer(nn.Module):
         if self.mamba_rms_norm:
             scan_output = self.norm(y, gate)
         else:
-            scan_output = y * jax.nn.silu(gate.astype(jnp.float32))
+            assert gate is not None
+            scan_output = y * jax.nn.silu(gate.astype(jnp.float32))  # pyright: ignore[reportOptionalOperand]
 
         contextualized_states = checkpoint_name(self.out_proj(scan_output.astype(dtype)), name="ssm_output_proj")
         return contextualized_states, updated_cache_view
@@ -1222,7 +1223,7 @@ class FalconH1Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=FalconH1Config, model_type="falcon_h1")
-class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):
+class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):  # type: ignore
     """FalconH1 model with a language modeling head for causal language modeling.
 
     This model combines the FalconH1 parallel hybrid architecture (Mamba2 SSM +

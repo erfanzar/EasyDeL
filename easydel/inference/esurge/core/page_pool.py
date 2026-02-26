@@ -114,6 +114,8 @@ class PagePool:
             and int(data_parallel_size) > 1
             and self.num_pages % int(data_parallel_size) == 0
         )
+        page_lo = 0
+        page_hi = 0
         if use_shard_hint:
             dp_size = int(data_parallel_size)
             shard_idx = int(dp_shard_hint) % dp_size
@@ -128,11 +130,7 @@ class PagePool:
                 return None
             if use_shard_hint:
                 shard_page = next(
-                    (
-                        page
-                        for page in cached_pages_one_group.values()
-                        if page_lo <= int(page.page_id) < page_hi
-                    ),
+                    (page for page in cached_pages_one_group.values() if page_lo <= int(page.page_id) < page_hi),
                     None,
                 )
                 if shard_page is None:

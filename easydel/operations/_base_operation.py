@@ -34,6 +34,8 @@ from .requirements import (
     OperationRequirements,
 )
 
+__all__ = ["BaseOperation", "OperationRegistry"]
+
 logger = get_logger("EasyDeL-BaseOperation")
 
 
@@ -132,7 +134,7 @@ class BaseOperation(ABC):
         Returns:
             "tpu", "gpu", or "cpu".
         """
-        return jax.default_backend()
+        return jax.default_backend()  # type: ignore[return-value]
 
     @abstractmethod
     def forward_native(self, *args, **kwargs) -> tp.Any:
@@ -348,7 +350,7 @@ class OperationRegistry:
         return impl_cls
 
     @classmethod
-    def get(cls, impl_name: str) -> type[BaseOperation]:
+    def get(cls, impl_name: str) -> type[BaseOperation] | None:
         """
         Retrieves an attention implementation class by its registered name.
 
@@ -356,7 +358,8 @@ class OperationRegistry:
             impl_name: The name of the implementation to retrieve.
 
         Returns:
-            The `OperationImpl` subclass registered under the given name.
+            The `OperationImpl` subclass registered under the given name,
+            or None if not found.
 
         Raises:
             ValueError: If no implementation is registered with that name.

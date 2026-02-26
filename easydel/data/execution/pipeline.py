@@ -49,8 +49,8 @@ from .save import SaveStage, WriteStats
 if tp.TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from datasets import Dataset as DS
-    from datasets import IterableDataset as IDS
+    from datasets import Dataset as DS  # pyright: ignore[reportMissingTypeStubs]
+    from datasets import IterableDataset as IDS  # pyright: ignore[reportMissingTypeStubs]
 
 
 logger = logging.getLogger(__name__)
@@ -571,21 +571,21 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
                 stop=getattr(mixture, "stop_strategy", "restart"),
             )
         else:
-            from datasets import interleave_datasets
+            from datasets import interleave_datasets  # pyright: ignore[reportMissingTypeStubs]
 
             mixed = interleave_datasets(per_ds, seed=mixture.seed, stopping_strategy="first_exhausted")
             if mixture.shuffle_buffer_size:
                 mixed = mixed.shuffle(buffer_size=mixture.shuffle_buffer_size, seed=mixture.seed)
     else:
         per_ds = align_columns_intersection(per_ds)
-        from datasets import concatenate_datasets
+        from datasets import concatenate_datasets  # pyright: ignore[reportMissingTypeStubs]
 
         mixed = concatenate_datasets(per_ds)
         if mixture.shuffle_buffer_size:
             mixed = mixed.shuffle(seed=mixture.seed)
 
     if getattr(mixture, "pack_tokens", False):
-        from datasets import IterableDataset
+        from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
         gen = pack_pre_tokenized(
             iter(mixed),
@@ -600,7 +600,7 @@ def build_dataset(mixture: DatasetMixture) -> "DS | IDS":
     if getattr(mixture, "pack_on_the_fly", False):
         if mixture.tokenize_callback is None:
             raise ValueError("pack_on_the_fly=True requires mixture.tokenize_callback")
-        from datasets import IterableDataset
+        from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
         gen = pack_constant_length(
             iter(mixed),

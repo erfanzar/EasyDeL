@@ -44,14 +44,14 @@ from collections.abc import Sequence
 from random import choices
 from string import ascii_letters, digits
 
-import partial_json_parser
+import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
 from eformer.loggings import get_logger
-from partial_json_parser.core.options import Allow
+from partial_json_parser.core.options import Allow  # pyright: ignore[reportMissingTypeStubs]
 from pydantic import Field
 from transformers import AutoTokenizer as AnyTokenizer
 
 try:
-    from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+    from mistral_common.tokens.tokenizers.mistral import MistralTokenizer  # pyright: ignore[reportMissingImports]
 except ImportError:
     MistralTokenizer = None
 
@@ -156,10 +156,10 @@ def _is_fn_name_regex_support(model_tokenizer: AnyTokenizer) -> bool:
         bool: True if the tokenizer is a MistralTokenizer with version >= 11,
             False otherwise (including when mistral_common is not installed).
     """
-    return MistralTokenizer and isinstance(model_tokenizer, MistralTokenizer) and model_tokenizer.version >= 11
+    return bool(MistralTokenizer and isinstance(model_tokenizer, MistralTokenizer) and model_tokenizer.version >= 11)
 
 
-@ToolParserManager.register_module("mistral")
+@ToolParserManager.register_module("mistral")  # pyright: ignore[reportUntypedClassDecorator]
 class MistralToolParser(ToolParser):
     """Tool call parser for Mistral models (7B Instruct v0.3+).
 

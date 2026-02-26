@@ -52,7 +52,6 @@ from __future__ import annotations
 import typing as tp
 
 import jax
-import jax.experimental
 import jax.numpy as jnp
 from eformer import common_types
 from eformer import escale as es
@@ -386,7 +385,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             raise ValueError("`num_hidden_layers` must be positive")
         if num_kv_heads <= 0:
             raise ValueError("`num_kv_heads` must be positive")
-        if kv_head_dim_size <= 0:
+        if kv_head_dim_size is None or kv_head_dim_size <= 0:
             raise ValueError("`kv_head_dim_size` must be positive")
         data_parallel_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
         if data_parallel_size > 1:
@@ -766,7 +765,9 @@ class RaggedPagesCacheView(BaseCacheView):
             return self.replace(kv_pages=kv_pages)
         return self
 
-    def flattened_kv_pages(self) -> Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"]:
+    def flattened_kv_pages(
+        self,
+    ) -> Float[Array, "num_pages page_size num_kv_heads_x2 head_dim"] | ImplicitArray:
         """Get KV pages in flattened format with interleaved K and V.
 
         Converts the internal storage format to a standard 4D tensor with
@@ -779,6 +780,8 @@ class RaggedPagesCacheView(BaseCacheView):
         if self.metadata.is_v2:
             return self.kv_pages
         pages = self.kv_pages
+        if isinstance(pages, ImplicitArray):
+            pages = pages.materialize()
         shape = pages.shape
         return pages.reshape(shape[0], shape[1], shape[2] * shape[3], shape[4])
 
@@ -823,7 +826,7 @@ class RaggedPagesCache(BaseCache):
             for each layer in the model.
     """
 
-    views: list[RaggedPagesCacheView]
+    views: list[RaggedPagesCacheView | None]
 
     @property
     def metadata(self) -> RaggedPagesCacheConfig | None:
@@ -958,7 +961,7 @@ class RaggedPagesCache(BaseCache):
         Returns:
             New RaggedPagesCache with the inserted pages.
         """
-        new_views: list[RaggedPagesCacheView] = []
+        new_views: list[RaggedPagesCacheView | None] = []
 
         for self_view, other_view in zip(self.views, other.views, strict=False):
             if self_view is None or other_view is None:
@@ -966,7 +969,6 @@ class RaggedPagesCache(BaseCache):
             else:
                 # For paged attention, we insert at the page level
                 # This assumes slot is a page index
-                other_view.kv_pages.shape[0]
                 new_kv_pages = jax.lax.dynamic_update_slice(
                     self_view.kv_pages,
                     other_view.kv_pages,

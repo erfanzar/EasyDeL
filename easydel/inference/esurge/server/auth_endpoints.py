@@ -498,7 +498,9 @@ class AuthEndpointsMixin:
         if provided_fields.intersection(permission_fields):
             permissions = ApiKeyPermissions(
                 allowed_models=(
-                    request.allowed_models if "allowed_models" in provided_fields else existing.permissions.allowed_models
+                    request.allowed_models
+                    if "allowed_models" in provided_fields
+                    else existing.permissions.allowed_models
                 ),
                 allowed_endpoints=(
                     request.allowed_endpoints

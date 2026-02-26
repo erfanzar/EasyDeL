@@ -27,7 +27,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -80,7 +80,7 @@ class SmolLM3Attention(UnifiedAttention):
         layer_idx: int,
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
-        precision: jax.lax.Precision = jax.lax.Precision("fastest"),
+        precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
         *,
         rngs: nn.Rngs,
     ):
@@ -94,7 +94,7 @@ class SmolLM3Attention(UnifiedAttention):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision, optional): Numerical precision for matrix operations.
-                Defaults to jax.lax.Precision("fastest").
+                Defaults to jax.lax.Precision.DEFAULT.
             rngs (nn.Rngs): Random number generator state for initialization.
         """
         self.layer_idx = layer_idx
@@ -174,7 +174,7 @@ class SmolLM3DecoderLayer(nn.Module):
         layer_idx: int,
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
-        precision: jax.lax.Precision = jax.lax.Precision("fastest"),
+        precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
         *,
         rngs: nn.Rngs,
     ):
@@ -186,7 +186,7 @@ class SmolLM3DecoderLayer(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision, optional): Numerical precision for matrix operations.
-                Defaults to jax.lax.Precision("fastest").
+                Defaults to jax.lax.Precision.DEFAULT.
             rngs (nn.Rngs): Random number generator state for initialization.
         """
         self.config = config
@@ -364,7 +364,7 @@ class SmolLM3MLP(nn.Module):
         config: SmolLM3Config,
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
-        precision: jax.lax.Precision = jax.lax.Precision("fastest"),
+        precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
         *,
         rngs: nn.Rngs,
     ):
@@ -376,7 +376,7 @@ class SmolLM3MLP(nn.Module):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision, optional): Numerical precision for matrix operations.
-                Defaults to jax.lax.Precision("fastest").
+                Defaults to jax.lax.Precision.DEFAULT.
             rngs (nn.Rngs): Random number generator state for initialization.
         """
         self.config = config
@@ -471,7 +471,7 @@ class SmolLM3Model(EasyDeLBaseModule):
         config: SmolLM3Config,
         dtype: jnp.dtype = jnp.float32,
         param_dtype: jnp.dtype = jnp.float32,
-        precision: jax.lax.Precision = jax.lax.Precision("fastest"),
+        precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
         *,
         rngs: nn.Rngs,
     ):
@@ -482,7 +482,7 @@ class SmolLM3Model(EasyDeLBaseModule):
             dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
             param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
             precision (jax.lax.Precision, optional): Numerical precision for matrix operations.
-                Defaults to jax.lax.Precision("fastest").
+                Defaults to jax.lax.Precision.DEFAULT.
             rngs (nn.Rngs): Random number generator state for initialization.
         """
         super().__init__(
@@ -614,6 +614,7 @@ class SmolLM3Model(EasyDeLBaseModule):
 
         for idx, block in enumerate(self.layers):
             if output_hidden_states:
+                assert all_hidden_states is not None
                 all_hidden_states = (*all_hidden_states, hidden_states)
 
             layer_outputs = block(
@@ -633,6 +634,7 @@ class SmolLM3Model(EasyDeLBaseModule):
                 past_key_values[idx] = layer_outputs.cache_view
 
             if output_attentions and layer_outputs.attention_weight is not None:
+                assert all_attentions is not None
                 all_attentions = (
                     *all_attentions,
                     layer_outputs.attention_weight,
@@ -642,6 +644,7 @@ class SmolLM3Model(EasyDeLBaseModule):
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
+            assert all_hidden_states is not None
             all_hidden_states = (*all_hidden_states, hidden_states)
 
         return BaseModelOutput(

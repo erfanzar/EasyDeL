@@ -26,7 +26,7 @@ from collections.abc import Callable
 from functools import wraps
 from pathlib import Path
 
-import fsspec
+import fsspec  # pyright: ignore[reportMissingTypeStubs]
 
 
 def with_retry(

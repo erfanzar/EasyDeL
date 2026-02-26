@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -719,6 +719,7 @@ class XerxesModel(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
+        outputs = None
         for idx, block in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -748,10 +749,10 @@ class XerxesModel(EasyDeLBaseModule):
 
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
-            all_hidden_states = outputs[1] + (hidden_states,)
-            outputs = (hidden_states, all_hidden_states, *outputs[2:])
+            all_hidden_states = outputs[1] + (hidden_states,)  # pyright: ignore[reportOptionalSubscript]
+            outputs = (hidden_states, all_hidden_states, *outputs[2:])  # pyright: ignore[reportOptionalSubscript]
         else:
-            outputs = (hidden_states, *outputs[1:])
+            outputs = (hidden_states, *outputs[1:])  # pyright: ignore[reportOptionalSubscript]
 
         return BaseModelOutput(
             last_hidden_state=hidden_states,
@@ -788,7 +789,7 @@ class XerxesModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=XerxesConfig, model_type="xerxes")
-class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):
+class XerxesForCausalLM(BaseCausalLMModule[XerxesModel, XerxesConfig]):  # type: ignore
     """Xerxes model with a language modeling head for causal language modeling tasks.
 
     This model is a transformer-based language model with causal attention masks

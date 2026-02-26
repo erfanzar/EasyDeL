@@ -1,5 +1,7 @@
 """Tests for RoBERTa model."""
 
+# pyright: reportPrivateLocalImportUsage=false
+
 import pytest
 import transformers
 
@@ -8,7 +10,10 @@ import easydel as ed
 try:
     from .test_utils import BaseModuleTester, SequenceClassificationTester
 except ImportError:
-    from test_utils import BaseModuleTester, SequenceClassificationTester
+    from test_utils import (  # pyright: ignore[reportImplicitRelativeImport]
+        BaseModuleTester,
+        SequenceClassificationTester,
+    )
 
 
 class TestRoBERTa:

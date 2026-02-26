@@ -20,7 +20,7 @@ import typing
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -460,6 +460,7 @@ class FalconBlock(nn.Module):
         )
 
         # Match HuggingFace logic for mlp_layernorm_out assignment
+        mlp_layernorm_out = attention_layernorm_out
         if not self.config.new_decoder_architecture:
             if self.config.parallel_attn:
                 mlp_layernorm_out = attention_layernorm_out
@@ -634,8 +635,6 @@ class FalconModel(EasyDeLBaseModule):
                 mask_info,
                 self.config.num_attention_heads,
             ).astype(inputs_embeds.dtype)
-        elif position_ids is None:
-            position_ids = mask_info.q_position_ids
         if mode is None:
             mode = (
                 common_types.MODE_DECODE

@@ -66,6 +66,8 @@ from ._base_operation import BaseOperation, OperationRegistry
 from ._operation_meta import OperationMetadata
 from .requirements import ExecutionMode, OperationRequirements
 
+__all__ = ["OperationImpl", "OperationMetadata", "OperationOutput", "OperationRegistry"]
+
 OperationRegistry = OperationRegistry
 
 logger = get_logger("EasyDeL-OperationOperator")
@@ -330,7 +332,10 @@ class OperationImpl(BaseOperation):
             A new PartitionSpec with only specified axes partitioned, or None based on `dep`.
             Returns `state_ps` directly if `preserved_indices` is None.
         """
-        with self.metadata.mesh:
+        mesh = self.metadata.mesh
+        if mesh is None:
+            return state_ps
+        with mesh:
             if dep is None:
                 return None
 

@@ -128,7 +128,7 @@ def main():
 
     # --- Teacher Model Loading ---
     # Load the large teacher model and automatically shard it across all TPU devices.
-    teacher_model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+    teacher_model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(  # pyright: ignore[reportPrivateLocalImportUsage]
         TEACHER_MODEL_ID,
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,
@@ -136,19 +136,19 @@ def main():
         auto_shard_model=True,
         # Shard across data-parallel and fully-sharded data-parallel dimensions.
         sharding_axis_dims=(1, jax.process_count(), 1, -1, 1),
-        config_kwargs=ed.EasyDeLBaseConfigDict(
+        config_kwargs=ed.EasyDeLBaseConfigDict(  # pyright: ignore[reportPrivateLocalImportUsage]
             freq_max_position_embeddings=max_length,
             mask_max_position_embeddings=max_length,
-            attn_mechanism=ed.AttentionMechanisms.AUTO,
-            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS,
+            attn_mechanism=ed.AttentionMechanisms.AUTO,  # pyright: ignore[reportPrivateLocalImportUsage]
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS,  # pyright: ignore[reportPrivateLocalImportUsage]
         ),
     )
 
     # --- Student Model Definition ---
     # We define the student model's architecture from scratch using an EasyDeL config object.
     # This allows us to create a much smaller model than the teacher.
-    student_model = ed.Qwen3ForCausalLM(
-        config=ed.Qwen3Config(
+    student_model = ed.Qwen3ForCausalLM(  # pyright: ignore[reportPrivateLocalImportUsage]
+        config=ed.Qwen3Config(  # pyright: ignore[reportPrivateLocalImportUsage]
             vocab_size=151936,
             hidden_size=4096,
             intermediate_size=4096 * 2,
@@ -166,20 +166,20 @@ def main():
             use_sliding_window=False,
             sliding_window=4096,
             sharding_axis_dims=(1, jax.process_count(), 1, -1, 1),
-            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS,
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS,  # pyright: ignore[reportPrivateLocalImportUsage]
             freq_max_position_embeddings=max_length,
             mask_max_position_embeddings=max_length,
-            attn_mechanism=ed.AttentionMechanisms.AUTO,
+            attn_mechanism=ed.AttentionMechanisms.AUTO,  # pyright: ignore[reportPrivateLocalImportUsage]
         ),
         dtype=jnp.bfloat16,
         param_dtype=jnp.bfloat16,
         precision=jax.lax.Precision.DEFAULT,
-        rngs=ed.Rngs(0),
+        rngs=ed.Rngs(0),  # pyright: ignore[reportPrivateLocalImportUsage]
     ).shard_model()  # Shard the newly created student model across devices.
 
     # --- Distillation Configuration ---
     # The DistillationConfig holds all hyperparameters for the distillation process.
-    arguments = ed.DistillationConfig(
+    arguments = ed.DistillationConfig(  # pyright: ignore[reportPrivateLocalImportUsage]
         num_train_epochs=1,
         total_batch_size=total_batch_size,
         use_wandb=True,
@@ -191,8 +191,8 @@ def main():
         per_epoch_training_steps=98_000_000,
         learning_rate=2e-4,
         learning_rate_end=7e-6,
-        optimizer=ed.EasyDeLOptimizers.ADAMW,
-        scheduler=ed.EasyDeLSchedulers.COSINE,
+        optimizer=ed.EasyDeLOptimizers.ADAMW,  # pyright: ignore[reportPrivateLocalImportUsage]
+        scheduler=ed.EasyDeLSchedulers.COSINE,  # pyright: ignore[reportPrivateLocalImportUsage]
         # --- Key Distillation Hyperparameters ---
         # `temperature`: Softens the teacher's output probabilities, providing a richer
         # signal for the student. Higher values make the distribution "softer".
@@ -246,7 +246,7 @@ def main():
     # --- Trainer Setup and Execution ---
     # The `DistillationTrainer` is a specialized EasyDeL trainer that orchestrates
     # the entire distillation process.
-    trainer = ed.DistillationTrainer(
+    trainer = ed.DistillationTrainer(  # pyright: ignore[reportPrivateLocalImportUsage]
         arguments=arguments,
         student_model=student_model,
         teacher_model=teacher_model,

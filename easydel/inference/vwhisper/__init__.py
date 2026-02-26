@@ -141,8 +141,8 @@ from .utils import chunk_iter_with_batch, process_audio_input
 
 # Import server-related functionality
 try:
-    from .cli import main as run_cli
-    from .server import WhisperModel, create_whisper_app, run_server
+    from .cli import main as run_cli  # pyright: ignore[reportUnusedImport]
+    from .server import WhisperModel, create_whisper_app, run_server  # pyright: ignore[reportUnusedImport]
 
     __all__ = (
         "WhisperModel",

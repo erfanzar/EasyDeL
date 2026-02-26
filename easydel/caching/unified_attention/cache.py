@@ -606,7 +606,7 @@ class UnifiedAttentionCache(BaseCache):
         >>> layer_view = cache.views[layer_idx]
     """
 
-    views: list[UnifiedAttentionCacheView]
+    views: list[UnifiedAttentionCacheView | None]
 
     @property
     def metadata(self) -> UnifiedAttentionCacheConfig | None:

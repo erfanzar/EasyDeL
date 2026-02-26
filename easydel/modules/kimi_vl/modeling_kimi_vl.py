@@ -940,7 +940,7 @@ class KimiVLMultiModalProjector(nn.Module):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=KimiVLConfig, model_type="kimi_vl")
-class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausalLM, KimiVLConfig]):
+class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausalLM, KimiVLConfig]):  # type: ignore
     """Kimi-VL vision-language model for conditional text generation.
 
     Combines MoonViT vision encoder with DeepSeek-V3 MoE language model
@@ -1101,7 +1101,7 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
 
     def compute_embedding(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None,
         *,
         image_features: Array | None = None,
         pixel_values: Float[Array, "num_patches channels patch_h patch_w"] | None = None,

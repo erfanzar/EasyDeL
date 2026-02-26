@@ -119,16 +119,19 @@ def test_set_esurge_preserves_parsers_when_omitted_and_clears_when_none():
     elm._config = {"model": {"name_or_path": "dummy-model"}, "esurge": {}}
 
     elm.set_esurge(tool_parser="openai", reasoning_parser="deepseek_r1")
-    assert elm.config["esurge"]["tool_parser"] == "openai"
-    assert elm.config["esurge"]["reasoning_parser"] == "deepseek_r1"
+    esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["tool_parser"] == "openai"  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["reasoning_parser"] == "deepseek_r1"  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
     elm.set_esurge(max_num_seqs=8)
-    assert elm.config["esurge"]["tool_parser"] == "openai"
-    assert elm.config["esurge"]["reasoning_parser"] == "deepseek_r1"
+    esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["tool_parser"] == "openai"  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["reasoning_parser"] == "deepseek_r1"  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
     elm.set_esurge(tool_parser=None, reasoning_parser=None)
-    assert elm.config["esurge"]["tool_parser"] is None
-    assert elm.config["esurge"]["reasoning_parser"] is None
+    esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["tool_parser"] is None  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["reasoning_parser"] is None  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
 
 def test_set_esurge_bind_graphstate_for_aot_override_is_optional():
@@ -136,10 +139,13 @@ def test_set_esurge_bind_graphstate_for_aot_override_is_optional():
     elm._config = {"model": {"name_or_path": "dummy-model"}, "esurge": {}}
 
     elm.set_esurge(bind_graphstate_for_aot=True)
-    assert elm.config["esurge"]["bind_graphstate_for_aot"] is True
+    esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["bind_graphstate_for_aot"] is True  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
     elm.set_esurge(max_num_seqs=8)
-    assert elm.config["esurge"]["bind_graphstate_for_aot"] is True
+    esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["bind_graphstate_for_aot"] is True  # pyright: ignore[reportTypedDictNotRequiredAccess]
 
     elm.set_esurge(bind_graphstate_for_aot=False)
-    assert elm.config["esurge"]["bind_graphstate_for_aot"] is False
+    esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["bind_graphstate_for_aot"] is False  # pyright: ignore[reportTypedDictNotRequiredAccess]

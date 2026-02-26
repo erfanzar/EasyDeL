@@ -28,7 +28,7 @@ from ..utils import DataCollatorForCompletionOnlyLM, get_formatting_func_from_da
 from .sft_config import SFTConfig
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.data.core.protocols import ShardedDataSource
 

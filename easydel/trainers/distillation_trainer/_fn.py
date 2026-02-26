@@ -27,12 +27,13 @@ distributions with optional supervised learning loss.
 All functions are designed for JAX/Flax models and support distributed training.
 """
 
+import collections.abc
 import typing as tp
 
 import flax
 import flax.nnx
 import jax
-import optax
+import optax  # pyright: ignore[reportMissingTypeStubs]
 from eformer.escale import with_sharding_constraint
 from jax import Array as JaxArray
 from jax import numpy as jnp
@@ -197,7 +198,7 @@ def _stop_gradient_tree(tree):
 
 def distillation_step(
     student_state: EasyDeLState,
-    batch: tp.Mapping[str, jax.Array],
+    batch: collections.abc.Mapping[str, jax.Array],
     teacher_state: EasyDeLState,
     loss_config: LossConfig | None = None,
     learning_rate_fn: optax.Schedule = None,
@@ -213,7 +214,7 @@ def distillation_step(
     attention_layers: tuple[int, ...] | None = None,
     attention_normalize: bool = False,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
-) -> tuple[EasyDeLState, LossMetrics]:
+) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
         gradient_accumulation_steps=gradient_accumulation_steps,

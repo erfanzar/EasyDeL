@@ -44,6 +44,7 @@ Example:
     ... )
 """
 
+import collections.abc
 import typing as tp
 from enum import StrEnum
 from functools import cached_property, partial
@@ -51,11 +52,11 @@ from functools import cached_property, partial
 import einops
 import flax.nnx as nn
 import jax
-from chex import Array
+from chex import Array  # pyright: ignore[reportMissingTypeStubs]
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import NamedSharding, lax
 from jax import numpy as jnp
 from jax import tree_util as jtu
@@ -471,7 +472,7 @@ class FlexibleAttentionModule(nn.Module):
         else:
             policy_computed = policy
 
-        with self.config.mesh:
+        with self.config.mesh:  # pyright: ignore[reportOptionalContextManager]
             input_dict: dict[str, tp.Any] = dict(
                 query=query_states,
                 key=key_states,
@@ -731,7 +732,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
     def build_cache_pos(
         attention_mask: Bool[JArray, "batch heads seq_q seq_k"],
         mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
-        cache_view: TransformerCacheView = None,
+        cache_view: TransformerCacheView | None = None,
     ) -> Int[JArray, "batch seq"]:
         """
         Calculates the position indices within the sequence for cache-aware operations.
@@ -815,7 +816,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
     @staticmethod
     def _transpose_sequence_head(
         *args: Float[JArray, "batch seq heads dim"],
-    ) -> tp.Iterator[Float[JArray, "batch heads seq dim"]]:
+    ) -> collections.abc.Iterator[Float[JArray, "batch heads seq dim"]]:
         """
         Transposes the sequence and head dimensions of input tensors.
 
@@ -833,7 +834,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             transposed: Float[JArray, "batch heads seq dim"] = jnp.transpose(x, (0, 2, 1, 3))
             return transposed
 
-        result_iterator: tp.Iterator[Float[JArray, "batch heads seq dim"]] = map(transpose_array, args)
+        result_iterator: collections.abc.Iterator[Float[JArray, "batch heads seq dim"]] = map(transpose_array, args)
         return result_iterator
 
     def _handle_cache_concat(
@@ -892,7 +893,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             partition_manager=self.config.partition_manager,
         )
 
-        return key, value, mask_info, cache_view, masking_details
+        return key, value, mask_info, cache_view, masking_details  # pyright: ignore[reportReturnType]
 
     def _apply_sliding_window(
         self,
@@ -1095,12 +1096,11 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
                 )
                 return bias
 
-            return key, value, mask_info, init_attention_bias, cache_view, cache_metadata
+            return key, value, mask_info, init_attention_bias, cache_view, cache_metadata  # pyright: ignore[reportReturnType]
 
-        cache_exists: bool = cache_view is not None
-        if cache_exists:
+        if cache_view is not None and cache_view.key is not None:
             query_batch: int = query.shape[0]
-            cache_batch: int = cache_view.key.shape[0]
+            cache_batch: int = cache_view.key.shape[0]  # pyright: ignore[reportOptionalSubscript]
             batches_match: bool = query_batch == cache_batch
             assert batches_match, "Batch size mismatch between query and cache."
 
@@ -1162,7 +1162,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             bias: Array = mask_info.create_bias(dtype_self)
             return bias
 
-        return key, value, mask_info, init_attention_bias, cache_view, cache_metadata
+        return key, value, mask_info, init_attention_bias, cache_view, cache_metadata  # pyright: ignore[reportReturnType]
 
     def shard_attention_prod(
         self, attn_output: Float[JArray, "batch seq heads dim"]

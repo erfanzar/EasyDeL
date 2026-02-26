@@ -26,7 +26,7 @@ from ..abstract_reasoning import ReasoningParserManager
 from ..basic_parsers import BaseThinkingReasoningParser
 
 
-@ReasoningParserManager.register_module(["qwen3", "qwen3_reasoning"])
+@ReasoningParserManager.register_module(["qwen3", "qwen3_reasoning"])  # pyright: ignore[reportUntypedClassDecorator]
 class Qwen3ReasoningParser(BaseThinkingReasoningParser):
     """Reasoning parser for Qwen3 models using <think>...</think>.
 

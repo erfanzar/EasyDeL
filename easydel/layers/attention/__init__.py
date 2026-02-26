@@ -6,12 +6,13 @@ This subpackage consolidates:
 - BaseDecoderLayer and block_wise_ffn
 """
 
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
+
 from ._decoder_base import BaseDecoderLayer, block_wise_ffn
 from ._flexible import (
     AttentionMechanisms,
     AttentionModule,
     FlexibleAttentionModule,
-    MaskInfo,
     get_optimal_config,
     tpu_version_check,
 )

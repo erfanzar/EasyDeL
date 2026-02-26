@@ -4,6 +4,8 @@ This module provides reusable fixtures for testing EasyDeL models across differe
 configurations, attention mechanisms, and hardware setups.
 """
 
+# pyright: reportPrivateLocalImportUsage=false
+
 import gc
 
 import jax
@@ -169,7 +171,7 @@ def model_factory(small_model_config, jax_mesh):
         )
 
         # Create EasyDeL model
-        with config.mesh:
+        with config.mesh:  # pyright: ignore[reportOptionalContextManager]
             ed_model = module_class.lazy_init(
                 config=config,
                 dtype=small_model_config["dtype"],
@@ -257,7 +259,7 @@ def model_tester(small_model_config, random_input_ids):
         with config.mesh:
             try:
 
-                @ed.ejit(static_argnums=(1,))
+                @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                 def jited(ids, gd, gs, go):
                     return nn.merge(gd, gs, go).compute_loss(
                         input_ids=ids,
@@ -269,7 +271,7 @@ def model_tester(small_model_config, random_input_ids):
                 ed_output, _metrics = jited(jax_input_ids, *ed_model.split_module())
             except Exception:
 
-                @ed.ejit(static_argnums=(1,))
+                @ed.ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
                 def jited(ids, gd, gs, go):
                     return nn.merge(gd, gs, go).compute_loss(
                         input_ids=ids,
@@ -287,7 +289,7 @@ def model_tester(small_model_config, random_input_ids):
 
         # Compare loss
         jux = getattr(ed_output, "aux_loss", 0) or 0
-        tux = getattr(hf_output, "aux_loss", 0) or 0  # noqa
+        _tux = getattr(hf_output, "aux_loss", 0) or 0
         ed_loss = ed_output.loss - jux
         hf_loss = hf_output.loss.cpu().detach().numpy()
         loss_match = jnp.allclose(hf_loss, ed_loss, atol=atol, rtol=rtol)

@@ -105,30 +105,30 @@ class FalconConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vocab_size=65024,
-        hidden_size=4544,
-        num_hidden_layers=32,
-        num_attention_heads=71,
-        num_ln_in_parallel_attn=None,
-        layer_norm_epsilon=1e-5,
-        initializer_range=0.02,
-        use_cache=True,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        num_kv_heads=None,
-        alibi=False,
-        new_decoder_architecture=False,
-        multi_query=True,
-        parallel_attn=True,
-        bias=False,
-        max_position_embeddings=2048,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        bos_token_id=11,
-        eos_token_id=11,
-        ffn_hidden_size=None,
-        ff_factor=None,
-        activation="gelu",
+        vocab_size: int = 65024,
+        hidden_size: int = 4544,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 71,
+        num_ln_in_parallel_attn: int | None = None,
+        layer_norm_epsilon: float = 1e-5,
+        initializer_range: float = 0.02,
+        use_cache: bool = True,
+        hidden_dropout: float = 0.0,
+        attention_dropout: float = 0.0,
+        num_kv_heads: int | None = None,
+        alibi: bool = False,
+        new_decoder_architecture: bool = False,
+        multi_query: bool = True,
+        parallel_attn: bool = True,
+        bias: bool = False,
+        max_position_embeddings: int = 2048,
+        rope_theta: float = 10000.0,
+        rope_scaling: dict | None = None,
+        bos_token_id: int = 11,
+        eos_token_id: int = 11,
+        ffn_hidden_size: int | None = None,
+        ff_factor: int | None = None,
+        activation: str = "gelu",
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
         layer_types: list[str] | None = None,
@@ -138,8 +138,6 @@ class FalconConfig(EasyDeLBaseConfig):
         n_embed = kwargs.pop("n_embed", None)
         self.hidden_size = hidden_size if n_embed is None else n_embed
         self.num_hidden_layers = num_hidden_layers
-        if num_ln_in_parallel_attn is None:
-            num_ln_in_parallel_attn = 0
         self.num_ln_in_parallel_attn = num_ln_in_parallel_attn
         self.num_attention_heads = num_attention_heads
         self.layer_norm_epsilon = layer_norm_epsilon

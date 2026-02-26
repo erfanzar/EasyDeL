@@ -430,7 +430,7 @@ def create_data_iterator(
     prefetch_buffer: int = 4,
     shuffle_buffer: int | None = None,
     seed: int | None = None,
-) -> tp.Iterator:
+) -> Iterator:
     """Create an efficient data iterator with optional batching and prefetching.
 
     Creates an iterator over a dataset with support for shuffling, batching,

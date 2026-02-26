@@ -49,8 +49,8 @@ from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE
 from easydel.utils.compiling_utils import ejit
 
 
-@ejit(static_argnames=["graphdef", "inference_config", "return_timestamps"])
-def _compiled_generate(
+@ejit(static_argnames=["graphdef", "inference_config", "return_timestamps"])  # pyright: ignore[reportUntypedFunctionDecorator]
+def _compiled_generate(  # pyright: ignore[reportUnusedFunction]
     graphdef,
     graphstate,
     inference_config,

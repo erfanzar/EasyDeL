@@ -18,7 +18,7 @@ from ..abstract_reasoning import ReasoningParserManager
 from ..basic_parsers import BaseThinkingReasoningParser
 
 
-@ReasoningParserManager.register_module(["ernie45"])
+@ReasoningParserManager.register_module(["ernie45"])  # pyright: ignore[reportUntypedClassDecorator]
 class Ernie45ReasoningParser(BaseThinkingReasoningParser):
     """Reasoning parser for ERNIE 4.5 models using <think>...</think> tags."""
 

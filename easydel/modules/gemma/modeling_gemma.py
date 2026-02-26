@@ -22,7 +22,7 @@ from eformer import common_types
 from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -686,7 +686,7 @@ class GemmaForCausalLM(BaseCausalLMModule[GemmaModel, GemmaConfig]):
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-    ) -> CausalLMOutput:  # type:ignore
+    ) -> CausalLMOutput:
         """Forward pass through the Gemma causal language model.
 
         Runs the base model and optionally applies the language modeling head to produce

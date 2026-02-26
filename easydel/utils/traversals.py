@@ -15,7 +15,7 @@
 """Utility functions for managing and manipulating nnx module states."""
 
 import typing as tp
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable, Mapping
 from copy import deepcopy
 
 import jax
@@ -149,7 +149,7 @@ def _dict_unflatten_dict(xs, sep=None):
 
 
 def flatten_dict(
-    xs: dict | tp.Mapping,
+    xs: dict | Mapping,
     keep_empty_nodes: bool = False,
     is_leaf: tp.Callable[[tuple, tp.Any], bool] | None = None,
     sep: str | None = None,
@@ -181,11 +181,14 @@ def flatten_dict(
             sep=sep,
             fumap=fumap,
         )
-    return traversals.flatten_mapping(
-        xs,
-        keep_empty_nodes=keep_empty_nodes,
-        is_leaf=is_leaf,
-        sep=sep,
+    return tp.cast(
+        dict[tuple | str, tp.Any],
+        traversals.flatten_mapping(
+            xs,
+            keep_empty_nodes=keep_empty_nodes,
+            is_leaf=is_leaf,
+            sep=sep,
+        ),
     )
 
 
@@ -235,7 +238,7 @@ def create_graphdef(
     _rng_key: str = "rngs",
     _seed: int = 0,
     **kwargs,
-) -> dict:
+) -> tp.Any:
     """Creates a graph definition from an nnx module.
 
     This function initializes the module lazily and extracts the graph
@@ -273,7 +276,7 @@ def init_garphstate(
     _seed: int = 0,
     _lazy: bool = True,
     **kwargs,
-) -> dict:
+) -> tp.Any:
     """Initializes the graph state of an nnx module.
 
     This function initializes the module and returns the graph state, which
@@ -578,7 +581,7 @@ def tree_apply(fns: FnDict, tree: TreeDict) -> TreeDict:
     return jax.tree_util.tree_map(lambda fn, x: fn(x), fns, tree)
 
 
-def tree_path_to_string(path: Path, sep: str | None = None) -> str:
+def tree_path_to_string(path: Path, sep: str | None = None) -> str | tuple[str, ...]:
     """
     Convert a JAX tree path to a string representation.
 
@@ -715,7 +718,7 @@ def recursive_merge(full_tree, updates):
         return updates
 
 
-def iter_module_search(model: nn.Module, instance: type[T] | None = None) -> tp.Iterator[tuple[ModulePath, T]]:
+def iter_module_search(model: nn.Module, instance: type[T] | None = None) -> Generator[tuple[tp.Any, T], None, None]:
     """
     Iterates through a model and yields paths and modules of a specific type.
 

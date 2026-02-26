@@ -32,7 +32,7 @@ from eformer import common_types
 from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -2550,7 +2550,7 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
 
 
 class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
-    BaseConditionalGenerationModule[Qwen3OmniMoeTalkerCodePredictorModel, Qwen3OmniMoeTalkerCodePredictorConfig]
+    BaseConditionalGenerationModule[Qwen3OmniMoeTalkerCodePredictorModel, Qwen3OmniMoeTalkerCodePredictorConfig]  # type: ignore
 ):
     """Talker code predictor with per-group LM heads."""
 
@@ -2783,7 +2783,7 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
 
 
 class Qwen3OmniMoeTalkerForConditionalGeneration(
-    BaseConditionalGenerationModule[Qwen3OmniMoeTalkerModel, Qwen3OmniMoeTalkerConfig]
+    BaseConditionalGenerationModule[Qwen3OmniMoeTalkerModel, Qwen3OmniMoeTalkerConfig]  # type: ignore
 ):
     """Full Talker model combining text model and code predictor.
 
@@ -3573,7 +3573,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
 
     def compute_embedding(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None,
         *,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         input_features: Float[Array, "batch mel_bins time"] | None = None,
@@ -3649,7 +3649,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
                 self.config.video_token_id,
             )
 
-        return inputs_embeds
+        return inputs_embeds  # pyright: ignore[reportReturnType]
 
     def __call__(
         self,
@@ -3786,7 +3786,7 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
     model_type="qwen3_omni_moe_thinker",
 )
 class Qwen3OmniMoeThinkerForConditionalGeneration(
-    BaseVisionLanguageModule[Qwen3OmniMoeThinkerTextModel, Qwen3OmniMoeThinkerConfig]
+    BaseVisionLanguageModule[Qwen3OmniMoeThinkerTextModel, Qwen3OmniMoeThinkerConfig]  # type: ignore
 ):
     """Qwen3OmniMoe Thinker for multimodal understanding (text output only).
 
@@ -3891,7 +3891,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
     def compute_embedding(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None,
         *,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         input_features: Float[Array, "batch mel_bins time"] | None = None,
@@ -3967,7 +3967,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 self.video_token_id,
             )
 
-        return inputs_embeds
+        return inputs_embeds  # pyright: ignore[reportReturnType]
 
     def __call__(
         self,
@@ -4127,7 +4127,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
 @register_module(TaskType.ANY_TO_ANY, config=Qwen3OmniMoeConfig, model_type="qwen3_omni_moe")
 class Qwen3OmniMoeForConditionalGeneration(
-    BaseConditionalGenerationModule[Qwen3OmniMoeThinkerForConditionalGeneration, Qwen3OmniMoeConfig]
+    BaseConditionalGenerationModule[Qwen3OmniMoeThinkerForConditionalGeneration, Qwen3OmniMoeConfig]  # type: ignore
 ):
     """Full Qwen3OmniMoe model with Thinker, Talker, and Code2Wav.
 

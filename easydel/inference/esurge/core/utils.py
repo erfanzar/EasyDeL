@@ -39,7 +39,7 @@ Example:
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, NamedTuple, Optional
+from typing import Any, NamedTuple
 
 from ..request import EngineRequest
 
@@ -121,8 +121,8 @@ class CachePage:
     page_id: int
     ref_cnt: int = 0
     _page_hash: PageHashWithGroupId | None = None
-    prev_free_page: Optional["CachePage"] = None
-    next_free_page: Optional["CachePage"] = None
+    prev_free_page: "CachePage | None" = None
+    next_free_page: "CachePage | None" = None
     is_null: bool = False
 
     def incr_ref(self) -> None:
@@ -381,19 +381,19 @@ class FreeCachePageQueue:
         return ret
 
 
-NONE_HASH: int
+none_hash: int
 """Global hash value used as the parent hash for the first page in a sequence."""
 
 
 def init_none_hash() -> None:
-    """Initialize the global NONE_HASH used for prefix caching.
+    """Initialize the global none_hash used for prefix caching.
 
     This function sets up the base hash value used as the "parent" hash for
     the first page in any token sequence. The hash is deterministic when
     PYTHONHASHSEED environment variable is set, enabling reproducible
     prefix cache behavior across runs.
 
-    The NONE_HASH is used in hash_page_tokens when computing the hash for
+    The none_hash is used in hash_page_tokens when computing the hash for
     the first page of a request (where there is no parent page).
 
     Note:
@@ -406,10 +406,11 @@ def init_none_hash() -> None:
             hashing. If not set or set to None, generates a random hash
             from 32 bytes of os.urandom().
     """
-    global NONE_HASH
+    global none_hash
 
-    hash_seed = int(os.getenv("PYTHONHASHSEED", "1524618910112"))
-    NONE_HASH = int.from_bytes(os.urandom(32), byteorder="big") if hash_seed is None else hash(hash_seed)
+    _hash_seed_env: str | None = os.getenv("PYTHONHASHSEED")
+    hash_seed: int | None = int(_hash_seed_env) if _hash_seed_env is not None else None
+    none_hash = int.from_bytes(os.urandom(32), byteorder="big") if hash_seed is None else hash(hash_seed)
 
 
 def hash_page_tokens(
@@ -435,7 +436,7 @@ def hash_page_tokens(
         The entire tuple is used as the hash key of the page.
     """
     if parent_page_hash is None:
-        parent_page_hash = NONE_HASH
+        parent_page_hash = none_hash
 
     curr_page_token_ids_tuple = tuple(curr_page_token_ids)
     return PageHash(

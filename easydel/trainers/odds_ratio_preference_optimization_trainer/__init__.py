@@ -52,6 +52,7 @@ References:
       (https://arxiv.org/abs/2403.07691)
 """
 
-from .orpo_trainer import ORPOConfig, ORPOTrainer
+from .orpo_config import ORPOConfig
+from .orpo_trainer import ORPOTrainer
 
 __all__ = ("ORPOConfig", "ORPOTrainer")

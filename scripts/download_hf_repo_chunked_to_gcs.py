@@ -51,7 +51,6 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from eformer.aparser import DataClassArgumentParser
 from huggingface_hub import HfApi, hf_hub_download
@@ -73,10 +72,10 @@ class ChunkedDownloadArgs:
     )
 
     repo_id: str = field(default_factory=list, metadata={"action": "append", "help": "HF repo id (repeatable)."})
-    repos_file: Optional[str] = field(default=None, metadata={"help": "File with one repo id per line."})  # noqa: UP045
+    repos_file: str | None = field(default=None, metadata={"help": "File with one repo id per line."})
     repo_type: str = field(default="model", metadata={"help": "HF repo type (model|dataset|space)."})
-    revision: Optional[str] = field(default=None, metadata={"help": "HF revision/branch/tag/commit (default: main)."})  # noqa: UP045
-    token: Optional[str] = field(  # noqa: UP045
+    revision: str | None = field(default=None, metadata={"help": "HF revision/branch/tag/commit (default: main)."})
+    token: str | None = field(
         default=None,
         metadata={"help": "HF token (or use HF_TOKEN env / `huggingface-cli login`)."},
     )
@@ -90,7 +89,7 @@ class ChunkedDownloadArgs:
         metadata={"help": "Parallel download threads per batch (I/O-bound). Set 1 to disable."},
     )
 
-    path_in_repo: Optional[str] = field(  # noqa: UP045
+    path_in_repo: str | None = field(
         default=None,
         metadata={"help": "Optional subfolder in the repo to download (e.g. 'weights/model.zarr')."},
     )

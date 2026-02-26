@@ -28,7 +28,7 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
 
-from ..base_trainer import TrainerConfigureFunctionOutput
+from ..base_trainer import TrainerConfigureFunctionOutput  # pyright: ignore[reportPrivateLocalImportUsage]
 from ..prompt_transforms import CPOPreprocessTransform
 from ..trainer.trainer import Trainer
 from ..training_configurations import MetricsType
@@ -41,7 +41,7 @@ from ._fn import concatenated_forward, evaluation_step, training_step
 from .cpo_config import CPOConfig
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.data.core.protocols import ShardedDataSource
 
@@ -303,11 +303,11 @@ class CPOTrainer(Trainer):
         return self.input_data_collator_tfds
 
     @property
-    def _train_shared_fn_extra_args(self) -> tuple[tp.Any]:
+    def _train_shared_fn_extra_args(self) -> tuple[()]:
         return ()
 
     @property
-    def _eval_shared_fn_extra_args(self) -> tuple[tp.Any]:
+    def _eval_shared_fn_extra_args(self) -> tuple[()]:
         return ()
 
     def on_step_end(

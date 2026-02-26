@@ -530,8 +530,8 @@ class HybridCacheView(BaseCacheView):
         v_conv_state: Float[Array, "batch value_dim d_conv"] | None = None,
         cache_position: Int[Array, "batch"] | None = None,  # noqa
     ) -> tuple[
-        Float[Array, "batch seq num_kv_heads head_dim"] | None,
-        Float[Array, "batch seq num_kv_heads head_dim"] | None,
+        Float[Array, "batch seq num_kv_heads head_dim"] | ImplicitArray | None,
+        Float[Array, "batch seq num_kv_heads head_dim"] | ImplicitArray | None,
         HybridCacheView,
     ]:
         """Update cache state based on layer type.
@@ -826,8 +826,8 @@ class ParallelHybridCacheView(BaseCacheView):
     single object to model code.
     """
 
-    transformer: TransformerCacheView
-    recurrent: RecurrentCacheView
+    transformer: TransformerCacheView | None
+    recurrent: RecurrentCacheView | None
 
     # Mirror recurrent fields so dataclasses.replace(self, conv_state=...) works.
     conv_state: Float[Array, "batch conv_dim conv_kernel_size"] | ImplicitArray | None = None
@@ -958,7 +958,9 @@ class HybridCache(BaseCache):
             RecurrentCacheView, KDACacheView).
     """
 
-    views: list[KDACacheView | RecurrentCacheView | TransformerCacheView | HybridCacheView | ParallelHybridCacheView]
+    views: list[
+        KDACacheView | RecurrentCacheView | TransformerCacheView | HybridCacheView | ParallelHybridCacheView | None
+    ]
 
     @classmethod
     def init_cache(
@@ -1016,8 +1018,8 @@ class HybridCache(BaseCache):
         value_states: Float[Array, "batch seq_len num_kv_heads head_dim"],
         cache_position: Int[Array, "batch"] | None = None,  # noqa
     ) -> tuple[
-        Float[Array, "batch seq num_kv_heads head_dim"],
-        Float[Array, "batch seq num_kv_heads head_dim"],
+        Float[Array, "batch seq num_kv_heads head_dim"] | ImplicitArray | None,
+        Float[Array, "batch seq num_kv_heads head_dim"] | ImplicitArray | None,
         HybridCache,
     ]:
         """Update KV cache for a full attention layer.
@@ -1094,14 +1096,16 @@ class HybridCache(BaseCache):
             return None
         return self.views[layer_idx].layer_type
 
-    def get_view(self, layer_idx: int) -> HybridCacheView | None:
+    def get_view(
+        self, layer_idx: int
+    ) -> KDACacheView | RecurrentCacheView | TransformerCacheView | HybridCacheView | ParallelHybridCacheView | None:
         """Get the cache view for a specific layer.
 
         Args:
             layer_idx: Index of the layer.
 
         Returns:
-            HybridCacheView for the layer or None if not initialized.
+            Cache view for the layer or None if not initialized.
         """
         return self.views[layer_idx]
 
@@ -1130,7 +1134,7 @@ class HybridCache(BaseCache):
                 return view.positions
         return jnp.zeros((1,), dtype=jnp.int32)
 
-    def to_pure(self) -> tuple[list[dict[str, tp.Any]], list[str]]:
+    def to_pure(self) -> tuple[list[dict[str, tp.Any] | None], list[str]]:
         """Convert cache to pure Python data structure for serialization.
 
         Extracts raw tensors and metadata for checkpointing or transfer.
@@ -1185,7 +1189,7 @@ class HybridCache(BaseCache):
     @classmethod
     def from_pure(
         cls,
-        cache_data: list[dict[str, tp.Any]],
+        cache_data: list[dict[str, tp.Any] | None],
         layer_types: list[str],
     ) -> HybridCache:
         """Reconstruct cache from pure Python data structure.

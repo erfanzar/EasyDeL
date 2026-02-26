@@ -1,5 +1,7 @@
 """Tests for GLM4-MoE-Lite model."""
 
+# pyright: reportPrivateLocalImportUsage=false
+
 import types
 
 import pytest
@@ -10,7 +12,7 @@ import easydel as ed
 try:
     from .test_utils import CausalLMTester
 except ImportError:
-    from test_utils import CausalLMTester
+    from test_utils import CausalLMTester  # pyright: ignore[reportImplicitRelativeImport]
 
 
 class TestGLM4MoeLite:

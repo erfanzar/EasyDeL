@@ -41,9 +41,9 @@ import re
 from collections.abc import Sequence
 from uuid import uuid4
 
-import partial_json_parser
+import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
 from eformer.loggings import get_logger
-from partial_json_parser.core.options import Allow
+from partial_json_parser.core.options import Allow  # pyright: ignore[reportMissingTypeStubs]
 from transformers import AutoTokenizer as AnyTokenizer
 
 from ...openai_api_modules import (
@@ -61,7 +61,7 @@ from ..utils import find_common_prefix, is_complete_json, partial_json_loads
 logger = get_logger(__name__)
 
 
-@ToolParserManager.register_module("openai")
+@ToolParserManager.register_module("openai")  # pyright: ignore[reportUntypedClassDecorator]
 class OpenAIToolParser(ToolParser):
     """Best-effort OpenAI-style tool call parser for local model outputs.
 

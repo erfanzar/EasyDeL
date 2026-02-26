@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import jax
 from eformer import common_types as ct
-from ejkernel.modules import UnifiedAttentionConfig, unified_attention
+from ejkernel.modules import UnifiedAttentionConfig, unified_attention  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Float
@@ -119,6 +119,7 @@ class UnifiedAttn(OperationImpl):
         Returns:
             OperationMetadata: The metadata object provided during initialization.
         """
+        assert self.metadata is not None
         return self.metadata
 
     @classmethod
@@ -159,7 +160,7 @@ class UnifiedAttn(OperationImpl):
     def forward_native(
         self,
         query: Float[Array, "... num_q_heads head_dim"],
-        cache_view: UnifiedAttentionCacheView,
+        cache_view: UnifiedAttentionCacheView | None,
         cache_metadata: RaggedPagesMetadata | OperationsMetadata,
         softmax_scale: float | None = None,
         causal: bool = True,
@@ -236,6 +237,10 @@ class UnifiedAttn(OperationImpl):
 
         query_in = query
         orig_is_4d = query_in.ndim == 4
+        batch: int = 0
+        seqlen: int = 0
+        num_heads: int = 0
+        head_dim: int = 0
         if orig_is_4d:
             batch, seqlen, num_heads, head_dim = query_in.shape
         query_ragged = query_in.reshape(-1, *query_in.shape[-2:])
@@ -282,7 +287,7 @@ class UnifiedAttn(OperationImpl):
         if can_use_dp_local:
             rows_per_shard = int(cache_metadata.context_lens.shape[0]) // page_axis_size
 
-            @jax.shard_map(
+            @jax.shard_map(  # pyright: ignore[reportUntypedFunctionDecorator]
                 mesh=self.metadata.mesh,
                 in_specs=(qaxes, kv_pages_spec, kv_pages_spec, Ps(), Ps(), Ps(), None, None, sinks_axis),
                 out_specs=qaxes,

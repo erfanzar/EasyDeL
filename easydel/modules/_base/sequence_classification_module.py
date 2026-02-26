@@ -59,7 +59,7 @@ from collections.abc import Callable
 
 import jax
 from eformer import common_types
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int

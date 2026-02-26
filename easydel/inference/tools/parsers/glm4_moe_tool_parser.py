@@ -51,7 +51,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = get_logger(__name__)
 
 
-@ToolParserManager.register_module(["glm45", "glm-4.5"])
+@ToolParserManager.register_module(["glm45", "glm-4.5"])  # pyright: ignore[reportUntypedClassDecorator]
 class Glm4MoeModelToolParser(ToolParser):
     """Tool parser for GLM-4 MoE (Mixture of Experts) models.
 

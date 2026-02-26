@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pyright: reportPrivateLocalImportUsage=false
+
 import json
 
 from jax import numpy as jnp
-from lm_eval import evaluator
+from lm_eval import evaluator  # pyright: ignore[reportMissingImports]
 from transformers import AutoTokenizer
 
 import easydel as ed

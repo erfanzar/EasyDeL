@@ -46,7 +46,7 @@ References:
 import jax
 import jax.numpy as jnp
 from eformer.pytree import auto_pytree
-from ejkernel.modules import state_space_v1
+from ejkernel.modules import state_space_v1  # pyright: ignore[reportMissingTypeStubs]
 from jaxtyping import Array, Float
 
 from easydel.caching import RecurrentCacheView
@@ -112,6 +112,7 @@ class SSM1Op(OperationImpl):
 
     def get_impl_metadata(self) -> OperationMetadata:
         """Returns the metadata associated with this operation instance."""
+        assert self.metadata is not None
         return self.metadata
 
     @classmethod

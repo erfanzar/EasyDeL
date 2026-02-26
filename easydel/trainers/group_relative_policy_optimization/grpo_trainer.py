@@ -33,7 +33,7 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.helpers import capture_time, get_logger
+from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
 from easydel.utils.traversals import deepcopy_model
 
 from ..prompt_transforms import GRPOPreprocessTransform, is_conversational
@@ -50,17 +50,17 @@ from ._fn import get_per_token_logps, grpo_step
 from .grpo_config import GRPOConfig
 
 try:
-    import wandb  # type:ignore
+    import wandb
 except ImportError:
     wandb = None
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.data.core.protocols import ShardedDataSource
 
 logger = get_logger(__name__)
-RewardFunc = tp.Union[EasyDeLBaseModule, EasyDeLState, tp.Callable[[list, list], list[float]]]  # noqa
+RewardFunc = EasyDeLBaseModule | EasyDeLState | tp.Callable[[list, list], list[float]]
 
 
 def _fileaf(x):
@@ -116,6 +116,7 @@ class GRPOTrainer(Trainer):
     """
 
     arguments: GRPOConfig  # type hinting
+    reward_processing_classes: list | None
 
     def __init__(
         self,
@@ -124,23 +125,16 @@ class GRPOTrainer(Trainer):
         reward_funcs: RewardFunc | list[RewardFunc],
         train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
         eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
-        processing_class: ProcessingClassType = None,
-        reward_processing_classes: ProcessingClassType = None,
+        processing_class: ProcessingClassType | None = None,
+        reward_processing_classes: ProcessingClassType | None = None,
         data_tokenize_fn: tp.Callable | None = None,
     ):
         assert arguments is not None, (
             "You Have to pass `arguments` that will be used for training, but you have passed `arguments=None`"
         )
         assert isinstance(arguments, GRPOConfig), f"arguments type must be `GRPOConfig` but got {type(arguments)}"
-        assert processing_class is not None, "processing_class must be specified to tokenize a DPO dataset."
-
         self.arguments = arguments
         self.truncation_mode = arguments.truncation_mode
-        self.processing_class = processing_class
-        pad_token_id = getattr(self.processing_class, "pad_token_id", None)
-        if pad_token_id is None and hasattr(self.processing_class, "tokenizer"):
-            pad_token_id = getattr(self.processing_class.tokenizer, "pad_token_id", None)
-        self.padding_value = 0 if pad_token_id is None else int(pad_token_id)
         self.loss_type = arguments.loss_type.lower() if isinstance(arguments.loss_type, str) else arguments.loss_type
         self.epsilon = arguments.epsilon
         self.epsilon_high = arguments.epsilon_high
@@ -163,6 +157,11 @@ class GRPOTrainer(Trainer):
                 model.model.config._name_or_path,
                 padding_side="left",
             )
+        self.processing_class = processing_class
+        pad_token_id = getattr(self.processing_class, "pad_token_id", None)
+        if pad_token_id is None and hasattr(self.processing_class, "tokenizer"):
+            pad_token_id = getattr(self.processing_class.tokenizer, "pad_token_id", None)
+        self.padding_value = 0 if pad_token_id is None else int(pad_token_id)
         if not isinstance(reward_funcs, list):
             reward_funcs = [reward_funcs]
         self.reward_funcs = reward_funcs
@@ -175,6 +174,7 @@ class GRPOTrainer(Trainer):
                 raise ValueError("The number of reward processing classes must match the number of reward functions.")
 
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=model.model.mesh)
+        assert isinstance(reward_processing_classes, list)
 
         for i, (reward_processing_class, reward_func) in enumerate(
             zip(reward_processing_classes, reward_funcs, strict=False)
@@ -184,7 +184,7 @@ class GRPOTrainer(Trainer):
                     reward_func = reward_func.to_state()
                     sharding = reward_func.shardings
 
-                    @ejit(
+                    @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
                         static_argnums=(0,),
                         in_shardings=(sharding.graphstate, sharding.graphother, empty_sharding),
                         out_shardings=empty_sharding,
@@ -229,7 +229,6 @@ class GRPOTrainer(Trainer):
         self.reward_processing_classes = reward_processing_classes
         self.reward_funcs = reward_funcs
         self.arguments = arguments
-        self.processing_class = processing_class
         if getattr(self.arguments, "generation_num_return_sequences", None) is None:
             self.arguments.generation_num_return_sequences = self.num_generations
         if getattr(self.arguments, "generation_top_p", None) is None:
@@ -247,7 +246,7 @@ class GRPOTrainer(Trainer):
             ("repetition_penalty", self.arguments.repetition_penalty),
         ):
             if value is not None and key not in self.arguments.generation_extra_kwargs:
-                self.arguments.generation_extra_kwargs[key] = value
+                self.arguments.generation_extra_kwargs[key] = value  # pyright: ignore[reportOptionalSubscript]
 
         def _peek_first_example(dataset):
             if dataset is None:
@@ -603,19 +602,19 @@ class GRPOTrainer(Trainer):
             grouped_comp_time = grouped_comp_time_fn()
         preprocessing_time = preprocessing_time_fn()
         completion_length = jnp.sum(completion_mask, -1)
-        metrics_dict = {
-            "reward_mean": jnp.nanmean(rewards, -1),
-            "reward_std": jnp.nanmean(std_rewards),
-            "completion_length": jnp.mean(completion_length),
+        metrics_dict: dict[str, float | int | str] = {
+            "reward_mean": float(jnp.nanmean(rewards, -1)),
+            "reward_std": float(jnp.nanmean(std_rewards)),
+            "completion_length": float(jnp.mean(completion_length)),
             "grouped_comp_time": grouped_comp_time,
             "rewarding_time": rewarding_time,
             "token_logps_time": token_logps_time,
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
-            "frac_reward_zero_std": jnp.mean(is_std_zero.astype(jnp.float32)),
+            "frac_reward_zero_std": float(jnp.mean(is_std_zero.astype(jnp.float32))),
         }
         for i, reward_func_name in enumerate(self.reward_func_names):
-            metrics_dict[reward_func_name] = jnp.nanmean(rewards_per_func[:, i])
+            metrics_dict[reward_func_name] = float(jnp.nanmean(rewards_per_func[:, i]))
         if self.log_table is not None:
             cur_step = jax.device_get(state.step)
             decoded_prompt = completion_prompts

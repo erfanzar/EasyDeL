@@ -66,8 +66,8 @@ import typing as tp
 import jax
 from eformer import common_types
 from eformer.loggings import get_logger
-from ejkernel.modules import blocksparse_attention
-from ejkernel.types import MaskInfo
+from ejkernel.modules import blocksparse_attention  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax import random as jr
 from jax.sharding import PartitionSpec
@@ -130,6 +130,7 @@ class BlockSparseAttn(OperationImpl):
         Returns:
             The `OperationMetadata` provided during initialization.
         """
+        assert self.metadata is not None
         return self.metadata
 
     @classmethod
@@ -274,9 +275,7 @@ class BlockSparseAttn(OperationImpl):
         blockshape_constraints_failed = invalid_q_block or invalid_k_block
 
         should_fallback: bool = (
-            (tpu_constraints_failed and is_tpu)
-            or (gpu_constraints_failed and is_gpu)
-            or blockshape_constraints_failed
+            (tpu_constraints_failed and is_tpu) or (gpu_constraints_failed and is_gpu) or blockshape_constraints_failed
         )
 
         if should_fallback:

@@ -21,7 +21,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -833,7 +833,7 @@ class Xerxes2Model(EasyDeLBaseModule):
         Returns:
             jnp.ndarray: Precomputed RoPE frequencies for the rope head dimension.
         """
-        return self.config.get_basic_frequencies(self.config.qk_rope_head_dim)
+        return self.config.get_basic_frequencies(self.config.qk_rope_head_dim)  # pyright: ignore[reportReturnType]
 
     def __call__(
         self,
@@ -994,7 +994,7 @@ class Xerxes2Model(EasyDeLBaseModule):
         return self.embed_tokens
 
 
-class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):
+class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):  # type: ignore
     """Xerxes2 model with a language modeling head for causal language modeling tasks.
 
     Extends the base Xerxes2Model by adding a linear language modeling head for

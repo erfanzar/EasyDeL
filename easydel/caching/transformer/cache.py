@@ -79,7 +79,7 @@ from eformer import common_types
 from eformer.escale import PartitionManager, apply_logical_sharding
 from eformer.jaximus import ImplicitArray, register
 from eformer.pytree import auto_pytree, field
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import lax
 from jax import numpy as jnp
 from jax.extend.core import Primitive
@@ -121,7 +121,7 @@ class AttnMaskDetail:
         bricks (int | None): Number of bricks for blocked attention patterns.
     """
 
-    mask_type: Enum = field(pytree_node=False)
+    mask_type: str | Enum = field(pytree_node=False)
     size: int = field(pytree_node=False)
     offset: int | None = field(pytree_node=False, default=None)
     chunks: int | None = field(pytree_node=False, default=None)
@@ -207,7 +207,7 @@ def _expand_mask_kv_dim(
     """
     current_kv_len = mask_info.kv_len
 
-    if current_kv_len >= target_kv_len:
+    if current_kv_len is not None and current_kv_len >= target_kv_len:
         return mask_info
 
     # Preserve any existing padding/segment mask and expand the KV dimension.
@@ -435,8 +435,8 @@ class TransformerCacheView(BaseCacheView):
         masking_details (AttnMaskDetail | None): Attention mask configuration.
     """
 
-    key: Float[JAXArray, "batch seq_len num_key_heads key_dim"] | ImplicitArray
-    value: Float[JAXArray, "batch seq_len num_value_heads value_dim"] | ImplicitArray
+    key: Float[JAXArray, "batch seq_len num_key_heads key_dim"] | ImplicitArray | None
+    value: Float[JAXArray, "batch seq_len num_value_heads value_dim"] | ImplicitArray | None
     indexs: Int[JAXArray, "batch"] | ImplicitArray  # noqa: F821
     starts: Int[JAXArray, "batch"] | ImplicitArray  # noqa: F821
 
@@ -595,9 +595,10 @@ class TransformerCacheView(BaseCacheView):
 
         # Expand mask KV dimension if it doesn't match cache size
         # This is needed when using HybridCache with TransformerCacheView
-        cache_kv_len = self.key.shape[1]
+        key_shape = self.key.shape if hasattr(self.key, "shape") else None
+        cache_kv_len = key_shape[1] if key_shape is not None else 0
         mask_kv_len = mask_info.kv_len
-        if mask_kv_len < cache_kv_len:
+        if mask_kv_len is not None and mask_kv_len < cache_kv_len:
             mask_info = _expand_mask_kv_dim(mask_info, cache_kv_len, indexs, num_updated_cache_vectors)
 
         def _kv_struct_shard(
@@ -606,9 +607,13 @@ class TransformerCacheView(BaseCacheView):
             axes = getattr(self, "kv_sharding_axes", (BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM))
             return apply_logical_sharding(x, axes=axes, **sharding_statics)
 
-        def _maybe_materialize(x: JAXArray | ImplicitArray) -> JAXArray:
-            if hasattr(x, "materialize"):
-                x = x.materialize()
+        def _maybe_materialize(x: JAXArray | ImplicitArray | None) -> JAXArray:
+            if x is None:
+                raise ValueError("Cannot materialize None")
+            if isinstance(x, ImplicitArray):
+                result = x.materialize()
+                assert result is not None
+                return result
             return x
 
         @partial(jax.vmap, in_axes=(0, 0, 0), out_axes=(0))
@@ -751,7 +756,7 @@ class TransformerCache(BaseCache):
                 ]
             )
 
-    def to_pure(self) -> tuple[list[list[JAXArray | ImplicitArray]], TransformerCacheConfig]:
+    def to_pure(self) -> tuple[list[list[JAXArray | ImplicitArray | None]], TransformerCacheConfig]:
         """Convert cache to pure Python data structure for serialization.
 
         Extracts raw tensors and metadata for checkpointing or transfer.
@@ -763,12 +768,14 @@ class TransformerCache(BaseCache):
                 - metadata: Cache configuration metadata
         """
         return (
-            [[layer.key, layer.value, layer.indexs, layer.starts] for i, layer in enumerate(self.views)],
+            [[layer.key, layer.value, layer.indexs, layer.starts] for layer in self.views],
             self.views[-1].metadata,
         )
 
     @classmethod
-    def from_pure(cls, pure: list[list[JAXArray | ImplicitArray]], metadata: TransformerCacheConfig) -> TransformerCache:
+    def from_pure(
+        cls, pure: list[list[JAXArray | ImplicitArray | None]], metadata: TransformerCacheConfig
+    ) -> TransformerCache:
         """Reconstruct cache from pure Python data structure.
 
         Restores a cache from serialized tensors and metadata,
@@ -876,9 +883,13 @@ class TransformerCache(BaseCache):
             TransformerCache: Updated cache instance.
         """
 
-        def _maybe_materialize(x: ImplicitArray | JAXArray) -> JAXArray:
-            if hasattr(x, "materialize"):
-                x = x.materialize()
+        def _maybe_materialize(x: ImplicitArray | JAXArray | None) -> JAXArray:
+            if x is None:
+                raise ValueError("Cannot materialize None")
+            if isinstance(x, ImplicitArray):
+                result = x.materialize()
+                assert result is not None
+                return result
             return x
 
         for idx in range(len(self.views)):

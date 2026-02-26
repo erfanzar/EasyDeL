@@ -475,7 +475,7 @@ class SamplingParams:
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
-    temperature: float = 1.0
+    temperature: float | None = 1.0
     top_p: float = 1.0
     min_p: float = 0.0
     top_k: int = 0
@@ -504,7 +504,7 @@ class SamplingParams:
     guided_decoding: GuidedDecodingParams | None = None
     logit_bias: dict[int, float] | None = None
     allowed_token_ids: list[int] | None = None
-    extra_args: dict[str, Any] = field(default_factory=dict)
+    extra_args: dict[str, Any] | None = field(default_factory=dict)
 
     # Internal fields computed during initialization or via update methods.
     # They are not part of the constructor (`init=False`).
@@ -574,6 +574,7 @@ class SamplingParams:
             raise ValueError(f"n must be at least 1, got {self.n}.")
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise ValueError(f"presence_penalty must be in [-2, 2], got {self.presence_penalty}.")
+        assert self.temperature is not None, "temperature must be set before validation"
         if self.temperature < 0.0:
             raise ValueError(f"temperature must be non-negative, got {self.temperature}.")
         if not 0.0 < self.top_p <= 1.0:
@@ -670,7 +671,7 @@ class SamplingParams:
         Returns:
             SamplingType.GREEDY if temperature < 1e-5, else SamplingType.RANDOM.
         """
-        if self.temperature < 1e-5:
+        if self.temperature is None or self.temperature < 1e-5:
             return SamplingType.GREEDY
         return SamplingType.RANDOM
 

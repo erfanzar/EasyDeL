@@ -206,7 +206,7 @@ class Conv1D(nn.Module):
         specs = {"kernel": Replicated}
         if getattr(self, "use_bias", False) and hasattr(self, "bias"):
             specs["bias"] = Replicated
-        return specs
+        return specs  # pyright: ignore[reportReturnType]
 
     def __call__(self, x: Array) -> Array:
         """Apply 1D convolution to the input tensor.
@@ -311,6 +311,7 @@ class FalconMambaMixer(nn.Module):
 
         hidden_size = config.hidden_size
         ssm_state_size = config.state_size
+        assert config.intermediate_size is not None, "intermediate_size must not be None"
         intermediate_size = config.intermediate_size
         time_step_rank = int(config.time_step_rank)
         conv_kernel_size = config.conv_kernel
@@ -507,14 +508,14 @@ class FalconMambaMixer(nn.Module):
             hidden_states = hidden_states * jnp.expand_dims(attention_mask, 1)
 
         ssm_parameters = checkpoint_name(self.x_proj(jnp.swapaxes(hidden_states, 2, 1)), name="ssm_x_proj")
-        time_step, B, C = jnp.split(
+        time_step, ssm_b, ssm_c = jnp.split(
             ssm_parameters,
             [self.time_step_rank, self.time_step_rank + self.ssm_state_size],
             axis=-1,
         )
 
-        B = rms_forward(B, variance_epsilon=self.rms_eps)
-        C = rms_forward(C, variance_epsilon=self.rms_eps)
+        ssm_b = rms_forward(ssm_b, variance_epsilon=self.rms_eps)
+        ssm_c = rms_forward(ssm_c, variance_epsilon=self.rms_eps)
         time_step = rms_forward(time_step, variance_epsilon=self.rms_eps)
 
         discrete_time_step = checkpoint_name(self.dt_proj(time_step), name="ssm_dt_proj")
@@ -526,8 +527,8 @@ class FalconMambaMixer(nn.Module):
         ssm_output = self.ssm_op(
             hidden_states=hidden_states_t,
             A=self.A_log.value,
-            B=B,
-            C=C,
+            B=ssm_b,
+            C=ssm_c,
             D=self.D.value,
             discrete_time_step=discrete_time_step,
             gate=gate_t,
@@ -813,10 +814,12 @@ class FalconMambaModel(EasyDeLBaseModule):
             )
             cache_params[idx] = cache_view
             if output_hidden_states:
+                assert all_hidden_states is not None
                 all_hidden_states = (*all_hidden_states, hidden_states)
 
         hidden_states = self.norm_f(hidden_states)
         if output_hidden_states:
+            assert all_hidden_states is not None
             all_hidden_states = (*all_hidden_states, hidden_states)
 
         return FalconMambaOutput(
@@ -859,7 +862,7 @@ class FalconMambaModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=FalconMambaConfig, model_type="falcon_mamba")
-class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaConfig]):
+class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaConfig]):  # type: ignore
     """FalconMamba model with a causal language modeling head.
 
     This model combines the FalconMamba backbone with a language modeling head

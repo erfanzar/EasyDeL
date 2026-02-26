@@ -82,7 +82,7 @@ import numpy
 from eformer import escale as es
 from eformer.loggings import ProgressLogger, get_logger
 from eformer.pytree import key_path_to_str
-from ejkernel.ops import forward_autotune_only
+from ejkernel.ops import forward_autotune_only  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 
 from easydel.caching import (
@@ -138,7 +138,7 @@ def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pa
     return min(res, upper_limit)
 
 
-def _compute_sampling_valid_mask(
+def _compute_sampling_valid_mask(  # pyright: ignore[reportUnusedFunction]
     *,
     i_reqs: jax.Array,
     num_requests: jax.Array,
@@ -191,7 +191,7 @@ def _device_put_tree_with_shardings(tree, shardings_tree):
     return jax.tree_util.tree_map(lambda x, s: jax.device_put(x, s) if hasattr(x, "dtype") else x, tree, shardings_tree)
 
 
-def _device_put_tree_uniform(tree, sharding):
+def _device_put_tree_uniform(tree, sharding):  # pyright: ignore[reportUnusedFunction]
     """Place a PyTree on device with uniform sharding for all leaves.
 
     Args:

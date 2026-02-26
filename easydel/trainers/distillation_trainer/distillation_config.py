@@ -94,12 +94,7 @@ class DistillationConfig(TrainingArguments):
     )
     completion_only_loss: bool | None = field(
         default=None,
-        metadata={
-            "help": (
-                "Deprecated alias for `assistant_only_loss`. If set, it overrides "
-                "`assistant_only_loss`."
-            )
-        },
+        metadata={"help": ("Deprecated alias for `assistant_only_loss`. If set, it overrides `assistant_only_loss`.")},
     )
     hidden_state_loss_weight: float = field(
         default=0.0,

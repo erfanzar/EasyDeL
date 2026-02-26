@@ -326,7 +326,7 @@ class ModelStepExecutor:
 
                 self._cache_put(key, _wrapped_bound)
             else:
-                compiled = self._model_step_fn.lower(
+                compiled = self._model_step_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
                     *(graphdef, graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
                 ).compile()
                 self._cache_put(key, compiled)
@@ -395,7 +395,7 @@ class ModelStepExecutor:
             logits=self._empty_sharding,
         )
 
-        @ejit(
+        @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
             static_argnums=(0,),
             donate_argnames=["kv_pages"],
             in_shardings=(

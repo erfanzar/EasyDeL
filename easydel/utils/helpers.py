@@ -65,7 +65,7 @@ warnings.filterwarnings("ignore", message=".*'frozen' attribute.*", category=Use
 if tp.TYPE_CHECKING:
     from flax.metrics.tensorboard import SummaryWriter
 try:
-    import wandb  # type: ignore
+    import wandb
 except ModuleNotFoundError:
     wandb = None
 

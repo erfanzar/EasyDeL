@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import threading
 import time
-import typing
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 from easydel.inference.sampling_params import SamplingParams
@@ -41,7 +41,7 @@ class EngineRequestsMixin:
         self,
         reasoning_parser: Any | None,
         prompt_text: str,
-        prompt_token_ids: typing.Sequence[int],
+        prompt_token_ids: Sequence[int],
     ) -> None:
         """Configure prompt context on a request-scoped reasoning parser."""
         if reasoning_parser is None:

@@ -56,12 +56,21 @@ import logging
 import threading
 import time
 
+from .metrics import MetricsCollector, get_metrics_collector
+
 try:
     from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
 
-    PROMETHEUS_AVAILABLE = True
+    _prometheus_available = True
 except ImportError:
-    PROMETHEUS_AVAILABLE = False
+    Counter = None
+    Gauge = None
+    Histogram = None
+    Info = None
+    start_http_server = None
+    _prometheus_available = False
+
+PROMETHEUS_AVAILABLE: bool = _prometheus_available
 
 try:
     from rich.console import Console
@@ -71,11 +80,17 @@ try:
     from rich.table import Table
     from rich.text import Text
 
-    RICH_AVAILABLE = True
+    _rich_available = True
 except ImportError:
-    RICH_AVAILABLE = False
+    Console = None
+    Layout = None
+    Live = None
+    Panel = None
+    Table = None
+    Text = None
+    _rich_available = False
 
-from .metrics import MetricsCollector, get_metrics_collector
+RICH_AVAILABLE: bool = _rich_available
 
 
 class PrometheusMetrics:
@@ -307,7 +322,7 @@ class RichConsoleMonitor:
 
         self.layout["main"].split_row(Layout(name="left"), Layout(name="right"))
 
-    def _create_system_metrics_table(self, collector: MetricsCollector) -> Table:
+    def _create_system_metrics_table(self, collector: MetricsCollector) -> Table:  # pyright: ignore[reportInvalidTypeForm]
         """Create system metrics table.
 
         Args:
@@ -332,7 +347,7 @@ class RichConsoleMonitor:
 
         return table
 
-    def _create_scheduler_metrics_table(self, collector: MetricsCollector) -> Table:
+    def _create_scheduler_metrics_table(self, collector: MetricsCollector) -> Table:  # pyright: ignore[reportInvalidTypeForm]
         """Create scheduler metrics table.
 
         Args:
@@ -358,7 +373,7 @@ class RichConsoleMonitor:
 
         return table
 
-    def _create_runner_metrics_table(self, collector: MetricsCollector) -> Table:
+    def _create_runner_metrics_table(self, collector: MetricsCollector) -> Table:  # pyright: ignore[reportInvalidTypeForm]
         """Create runner metrics table.
 
         Args:
@@ -383,7 +398,7 @@ class RichConsoleMonitor:
 
         return table
 
-    def _create_cache_metrics_table(self, collector: MetricsCollector) -> Table:
+    def _create_cache_metrics_table(self, collector: MetricsCollector) -> Table:  # pyright: ignore[reportInvalidTypeForm]
         """Create cache metrics table.
 
         Args:
@@ -410,7 +425,7 @@ class RichConsoleMonitor:
 
         return table
 
-    def _create_recent_requests_table(self, collector: MetricsCollector) -> Table:
+    def _create_recent_requests_table(self, collector: MetricsCollector) -> Table:  # pyright: ignore[reportInvalidTypeForm]
         """Create recent requests table.
 
         Args:

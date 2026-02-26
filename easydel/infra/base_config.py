@@ -43,6 +43,7 @@ Example:
 
 from __future__ import annotations
 
+import collections.abc
 import copy
 import json
 import os
@@ -53,7 +54,6 @@ from typing import Any, NotRequired
 
 import jax
 import jax.extend
-import jax.tree_util
 import transformers
 from eformer import common_types
 from eformer.common_types import DP, EP, FSDP, MODE_TRAIN, NOT_GIVEN, SP, TP
@@ -105,7 +105,7 @@ from transformers.utils.generic import is_timm_config_dict
 
 from easydel.layers import QuantizationConfig
 from easydel.utils.compiling_utils import hash_fn
-from easydel.utils.helpers import check_bool_flag, get_logger
+from easydel.utils.helpers import check_bool_flag, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
 
 from .etils import (
     AVAILABLE_ATTENTION_MECHANISMS,
@@ -119,7 +119,7 @@ from .etils import (
 )
 
 if tp.TYPE_CHECKING:
-    from ejkernel.modules.operations.configs import BaseOperationConfig
+    from ejkernel.modules.operations.configs import BaseOperationConfig  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.layers import RopeConfig
 
@@ -214,7 +214,7 @@ EKERNEL_OPS = check_bool_flag("EKERNEL_OPS", default=False)
 
 
 if ED_DEFAULT_HARDWARE_ABSTRACTION:
-    DEFAULT_HARDWARE_ABSTRACTION = True
+    DEFAULT_HARDWARE_ABSTRACTION = True  # pyright: ignore[reportConstantRedefinition]
 
 
 if DEFAULT_HARDWARE_ABSTRACTION:
@@ -398,9 +398,9 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     from dictionaries or JSON.
     """
 
-    sharding_axis_dims: NotRequired[tp.Sequence[int]]
-    sharding_dcn_axis_dims: NotRequired[tp.Sequence[int] | None]
-    sharding_axis_names: NotRequired[tp.Sequence[str]]
+    sharding_axis_dims: NotRequired[collections.abc.Sequence[int]]
+    sharding_dcn_axis_dims: NotRequired[collections.abc.Sequence[int] | None]
+    sharding_axis_names: NotRequired[collections.abc.Sequence[str]]
     attn_mechanism: NotRequired[AVAILABLE_ATTENTION_MECHANISMS]
     decode_attn_mechanism: NotRequired[AVAILABLE_ATTENTION_MECHANISMS]
     blocksize_k: NotRequired[int]
@@ -723,7 +723,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """Bridge legacy rope fields to `rope_parameters` expected by HF v5."""
         rope_theta = kwargs.get("rope_theta", getattr(self, "rope_theta", None))
         partial_rotary_factor = kwargs.get("partial_rotary_factor", getattr(self, "partial_rotary_factor", None))
-        layer_types = kwargs.get("layer_types", getattr(self, "layer_types", None))  # noqa
+        _layer_types = kwargs.get("layer_types", getattr(self, "layer_types", None))
 
         rope_parameters = kwargs.get("rope_parameters", getattr(self, "rope_parameters", None))
         if rope_parameters is None and "rope_scaling" in kwargs:
@@ -757,9 +757,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     def __init__(
         self,
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_dims: collections.abc.Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
+        sharding_axis_names: collections.abc.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM,
         decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = None,
         blocksize_k: int = 128,
@@ -768,7 +768,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         moe_tiling_size_batch: int = 4,
         moe_tiling_size_seqlen: int = 128,
         moe_tiling_size_dim: int = 128,
-        partition_axis: PartitionAxis = PartitionAxis(),
+        partition_axis: PartitionAxis | None = None,
         use_sharded_kv_caching: bool = False,
         use_sharding_constraint: bool = False,
         backend: EasyDeLBackends | None = None,
@@ -840,6 +840,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.moe_tiling_size_batch = getattr(self, "moe_tiling_size_batch", moe_tiling_size_batch)
         self.moe_tiling_size_seqlen = getattr(self, "moe_tiling_size_seqlen", moe_tiling_size_seqlen)
         self.moe_tiling_size_dim = getattr(self, "moe_tiling_size_dim", moe_tiling_size_dim)
+        if partition_axis is None:
+            partition_axis = PartitionAxis()
         if isinstance(partition_axis, dict):
             partition_axis = PartitionAxis(**partition_axis)
         self.partition_axis = getattr(self, "partition_axis", partition_axis)
@@ -905,16 +907,16 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     @staticmethod
     def create_mesh(
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
+        sharding_axis_dims: collections.abc.Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_axis_names: collections.abc.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
         process_is_granule: bool = False,
         should_sort_granules_by_key: bool = True,
         allow_split_physical_axes: bool = True,
         backend: str | None = None,
         eformer_craft_mesh: bool | None = None,
         axis_types: (
-            tp.Sequence[AxisType | str] | AxisType | str | None | tp.Literal["auto", "explicit", "manual"]
+            collections.abc.Sequence[AxisType | str] | AxisType | str | None | tp.Literal["auto", "explicit", "manual"]
         ) = None,
     ):
         """Creates a JAX device mesh for distributed model execution.
@@ -986,7 +988,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
     def _build_mesh(
         self,
         axis_types: (
-            tp.Sequence[AxisType | str] | AxisType | str | None | tp.Literal["auto", "explicit", "manual"]
+            collections.abc.Sequence[AxisType | str] | AxisType | str | None | tp.Literal["auto", "explicit", "manual"]
         ) = None,
     ) -> common_types.Mesh:
         """Create a JAX mesh using the config sharding settings.
@@ -1003,17 +1005,17 @@ class EasyDeLBaseConfig(PretrainedConfig):
             JAX Mesh object configured with the normalized sharding parameters.
         """
         sharding_axis_dims = (
-            [v for k, v in self.sharding_axis_dims.items()]
+            [v for _k, v in self.sharding_axis_dims.items()]
             if isinstance(self.sharding_axis_dims, dict)
             else self.sharding_axis_dims
         )
         sharding_axis_names = (
-            [v for k, v in self.sharding_axis_names.items()]
+            [v for _k, v in self.sharding_axis_names.items()]
             if isinstance(self.sharding_axis_names, dict)
             else self.sharding_axis_names
         )
         sharding_dcn_axis_dims = (
-            [v for k, v in self.sharding_dcn_axis_dims.items()]
+            [v for _k, v in self.sharding_dcn_axis_dims.items()]
             if isinstance(self.sharding_dcn_axis_dims, dict)
             else self.sharding_dcn_axis_dims
         )
@@ -1310,7 +1312,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         return None
 
-    def get_axis_dims(self) -> tp.Sequence[int]:
+    def get_axis_dims(self) -> collections.abc.Sequence[int]:
         """Returns the device mesh axis dimensions for parallelism.
 
         Returns:
@@ -1325,7 +1327,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         return self.sharding_axis_dims
 
-    def get_axis_names(self) -> tp.Sequence[str]:
+    def get_axis_names(self) -> collections.abc.Sequence[str]:
         """Returns the logical names for each device mesh axis.
 
         Returns:
@@ -1423,9 +1425,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
     def add_basic_configurations(
         self,
-        sharding_axis_dims: tp.Sequence[int] = NOT_GIVEN,
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = NOT_GIVEN,
-        sharding_axis_names: tp.Sequence[str] = NOT_GIVEN,
+        sharding_axis_dims: collections.abc.Sequence[int] = NOT_GIVEN,
+        sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = NOT_GIVEN,
+        sharding_axis_names: collections.abc.Sequence[str] = NOT_GIVEN,
         attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
         decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
         blocksize_k: int = NOT_GIVEN,
@@ -2062,6 +2064,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         easy_directory.mkdir(parents=True, exist_ok=True)
 
+        commit_message: str | None = None
+        repo_id: str = ""
+        files_timestamps: dict[str, float] = {}
         if push_to_hub:
             commit_message = kwargs.pop("commit_message", None)
             repo_id = kwargs.pop("repo_id", save_directory.split(os.path.sep)[-1])
@@ -2123,7 +2128,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         cls,
         pretrained_model_name_or_path: str | os.PathLike,
         **kwargs,
-    ) -> tuple[dict[str, tp.Any], dict[str, tp.Any]]:
+    ) -> tuple[dict[str, tp.Any] | None, dict[str, tp.Any]]:
         """Load a configuration dictionary from a local path or HuggingFace Hub.
 
         Internal method that handles multiple loading scenarios:
@@ -2187,6 +2192,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         pretrained_model_name_or_path = str(pretrained_model_name_or_path)
 
+        configuration_file = CONFIG_NAME
         is_local = ePath(pretrained_model_name_or_path).is_dir()
         if (ePath(subfolder) / pretrained_model_name_or_path).is_file():
             resolved_config_file = pretrained_model_name_or_path
@@ -2263,7 +2269,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 Falls back to `max_position_embeddings` if `freq_max_position_embeddings`
                 is not set.
         """
-        return getattr(self, "freq_max_position_embeddings", self.max_position_embeddings)
+        result = getattr(self, "freq_max_position_embeddings", self.max_position_embeddings)
+        assert result is not None, "max_position_embeddings must be set"
+        return result
 
     @property
     def granted_mask_max_position_embedding(self) -> int:
@@ -2278,7 +2286,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 Falls back to `max_position_embeddings` if `mask_max_position_embeddings`
                 is not set.
         """
-        return getattr(self, "mask_max_position_embeddings", self.max_position_embeddings)
+        result = getattr(self, "mask_max_position_embeddings", self.max_position_embeddings)
+        assert result is not None, "max_position_embeddings must be set"
+        return result
 
     def _get_rope_config(self) -> RopeConfig:
         """Build a RopeConfig from the configuration fields.

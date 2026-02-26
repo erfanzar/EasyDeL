@@ -31,7 +31,7 @@ from ..abstract_tool import ToolParserManager
 from .qwen3coder_tool_parser import Qwen3CoderToolParser
 
 
-@ToolParserManager.register_module(["step3p5", "step3.5"])
+@ToolParserManager.register_module(["step3p5", "step3.5"])  # pyright: ignore[reportUntypedClassDecorator]
 class Step3p5ToolParser(Qwen3CoderToolParser):
     """Tool parser for Step 3.5 models.
 

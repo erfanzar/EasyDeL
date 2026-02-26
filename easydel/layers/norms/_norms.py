@@ -44,6 +44,7 @@ Note:
     similar normalization benefits.
 """
 
+import collections.abc
 import typing as tp
 
 import jax
@@ -316,15 +317,15 @@ class BatchNorm(nn.Module):
         param_dtype: DTypeLike = jnp.float32,
         use_bias: bool = True,
         use_scale: bool = True,
-        bias_init: nutil.Initializer = nn.initializers.zeros_init(),
-        scale_init: nutil.Initializer = nn.initializers.ones_init(),
+        bias_init: nutil.Initializer = nn.initializers.zeros_init(),  # pyright: ignore[reportCallInDefaultInitializer]
+        scale_init: nutil.Initializer = nn.initializers.ones_init(),  # pyright: ignore[reportCallInDefaultInitializer]
         axis_name: str | None = None,
         axis_index_groups: tp.Any = None,
         use_fast_variance: bool = True,
         promote_dtype: nutil.PromoteDtypeFn = nutil.dtypes.promote_dtype,
         rngs: nn.Rngs,
-        bias_metadata: tp.Mapping[str, tp.Any] = nutil.MappingProxyType({}),
-        scale_metadata: tp.Mapping[str, tp.Any] = nutil.MappingProxyType({}),
+        bias_metadata: collections.abc.Mapping[str, tp.Any] = nutil.MappingProxyType({}),  # pyright: ignore[reportCallInDefaultInitializer]
+        scale_metadata: collections.abc.Mapping[str, tp.Any] = nutil.MappingProxyType({}),  # pyright: ignore[reportCallInDefaultInitializer]
     ):
         """Initialize the BatchNorm layer.
 
@@ -532,8 +533,8 @@ class LayerNorm(nn.Module):
         param_dtype: DTypeLike = jnp.float32,
         use_bias: bool = True,
         use_scale: bool = True,
-        bias_init: nutil.Initializer = nn.initializers.zeros_init(),
-        scale_init: nutil.Initializer = nn.initializers.ones_init(),
+        bias_init: nutil.Initializer = nn.initializers.zeros_init(),  # pyright: ignore[reportCallInDefaultInitializer]
+        scale_init: nutil.Initializer = nn.initializers.ones_init(),  # pyright: ignore[reportCallInDefaultInitializer]
         reduction_axes: nutil.Axes = -1,
         feature_axes: nutil.Axes = -1,
         axis_name: str | None = None,
@@ -541,8 +542,8 @@ class LayerNorm(nn.Module):
         use_fast_variance: bool = True,
         promote_dtype: nutil.PromoteDtypeFn = nutil.dtypes.promote_dtype,
         rngs: nn.Rngs,
-        bias_metadata: tp.Mapping[str, tp.Any] = nutil.MappingProxyType({}),
-        scale_metadata: tp.Mapping[str, tp.Any] = nutil.MappingProxyType({}),
+        bias_metadata: collections.abc.Mapping[str, tp.Any] = nutil.MappingProxyType({}),  # pyright: ignore[reportCallInDefaultInitializer]
+        scale_metadata: collections.abc.Mapping[str, tp.Any] = nutil.MappingProxyType({}),  # pyright: ignore[reportCallInDefaultInitializer]
     ):
         """Initialize the LayerNorm layer.
 

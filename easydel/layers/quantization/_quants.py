@@ -59,8 +59,8 @@ import re
 import typing
 
 import jax
-from ejkernel.quantization import dequantize as ej_dequantize
-from ejkernel.quantization import quantize as ej_quantize
+from ejkernel.quantization import dequantize as ej_dequantize  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.quantization import quantize as ej_quantize  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import numpy as jnp
 
@@ -344,7 +344,7 @@ class EasyQuantizer:
         return self._config
 
     @property
-    def pattern(self) -> str:
+    def pattern(self) -> str | None:
         """Get the regex pattern for layer selection.
 
         The pattern is used to determine which layers should be quantized
@@ -353,7 +353,8 @@ class EasyQuantizer:
         Returns:
             Regex pattern string. Returns the config's pattern if available,
             otherwise returns the default pattern that excludes embedding,
-            normalization, and output head layers.
+            normalization, and output head layers. May return None if the
+            config's pattern is None.
         """
         if self._config is None:
             return DEFAULT_QUANTIZATION_PATTERN

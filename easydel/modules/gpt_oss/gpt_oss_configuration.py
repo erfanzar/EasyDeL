@@ -83,23 +83,23 @@ class GptOssConfig(EasyDeLBaseConfig):
         vocab_size: int = 201088,
         hidden_size: int = 2880,
         intermediate_size: int = 2880,
-        head_dim: int = 64,
+        head_dim: int | None = 64,
         num_attention_heads: int = 64,
-        num_key_value_heads: int = 8,
+        num_key_value_heads: int | None = 8,
         sliding_window: int = 128,
         rope_theta: float = 150000.0,
-        tie_word_embeddings=False,
+        tie_word_embeddings: bool = False,
         hidden_act: str = "silu",
         initializer_range: float = 0.02,
-        max_position_embeddings=131072,
+        max_position_embeddings: int = 131072,
         rms_norm_eps: float = 1e-5,
-        rope_scaling=None,
+        rope_scaling: dict | None = None,
         attention_dropout: float = 0.0,
-        num_experts_per_tok=4,
+        num_experts_per_tok: int = 4,
         router_aux_loss_coef: float = 0.9,
-        output_router_logits=False,
-        use_cache=True,
-        layer_types=None,
+        output_router_logits: bool = False,
+        use_cache: bool = True,
+        layer_types: list[str] | None = None,
         mlp_activations_limit: float = 7.0,
         **kwargs,
     ):
@@ -130,7 +130,7 @@ class GptOssConfig(EasyDeLBaseConfig):
             self.layer_types = [
                 "sliding_attention" if bool((i + 1) % 2) else "full_attention" for i in range(self.num_hidden_layers)
             ]
-        if self.rope_scaling is not None and "type" in self.rope_scaling:
+        if "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
         self.attention_bias = True

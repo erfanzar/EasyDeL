@@ -26,7 +26,7 @@ from .deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
 from .identity_reasoning_parser import IdentityReasoningParser
 
 
-@ReasoningParserManager.register_module(["deepseek_v3", "glm45", "holo2", "kimi_k2"])
+@ReasoningParserManager.register_module(["deepseek_v3", "glm45", "holo2", "kimi_k2"])  # pyright: ignore[reportUntypedClassDecorator]
 class DeepSeekV3ReasoningParser(ReasoningParser):
     """Conditional reasoning parser: delegates to R1 or Identity based on tokenizer config.
 

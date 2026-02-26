@@ -141,7 +141,6 @@ __all__ = (
     "mamba",
     "mamba2",
     "minimax",
-    "minimax_text_v1",
     "mistral",
     "mistral3",
     "mixtral",

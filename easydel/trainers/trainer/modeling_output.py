@@ -20,6 +20,7 @@ including the final state and associated metadata from training runs.
 
 from __future__ import annotations
 
+import collections.abc
 import typing as tp
 
 import jax
@@ -29,7 +30,7 @@ if tp.TYPE_CHECKING:
     from easydel.infra.base_state import EasyDeLState
 else:
     EasyDeLState = tp.Any
-CallFN: tp.TypeAlias = tp.Any | tp.Mapping[str, tp.Callable] | dict[str, tp.Callable]
+CallFN: tp.TypeAlias = tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable]
 
 
 @auto_pytree

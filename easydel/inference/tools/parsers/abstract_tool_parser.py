@@ -36,7 +36,7 @@ Example:
     ...     ToolParser,
     ...     ToolParserManager
     ... )
-    >>> @ToolParserManager.register_module("custom")
+    >>> @ToolParserManager.register_module("custom")  # pyright: ignore[reportUntypedClassDecorator]
     ... class CustomToolParser(ToolParser):
     ...     def extract_tool_calls(self, model_output, request):
     ...         # Implementation here
