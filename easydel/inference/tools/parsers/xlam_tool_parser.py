@@ -70,7 +70,7 @@ def _make_tool_call_id() -> str:
     return f"chatcmpl-tool-{uuid4()}"
 
 
-@ToolParserManager.register_module("xlam")
+@ToolParserManager.register_module("xlam")  # pyright: ignore[reportUntypedClassDecorator]
 class xLAMToolParser(ToolParser):
     """Tool parser for xLAM and similar models with flexible JSON formats.
 

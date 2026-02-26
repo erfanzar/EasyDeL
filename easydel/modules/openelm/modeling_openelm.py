@@ -19,7 +19,7 @@ from functools import cached_property
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -373,7 +373,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
         ffn_multiplier = config.ffn_multipliers[layer_idx]
         intermediate_dim = int(
             make_divisible(
-                ffn_multiplier * config.model_dim,  # type:ignore
+                ffn_multiplier * config.model_dim,
                 divisor=config.ffn_dim_divisor,
             )
         )

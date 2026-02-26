@@ -70,14 +70,16 @@ Example:
     ...         pass
 """
 
+# pyright: reportOverlappingOverload=false, reportNoOverloadImplementation=false, reportInconsistentOverload=false
 from __future__ import annotations
 
+import collections.abc
 import os
 import typing as tp
 from abc import ABCMeta, abstractmethod
 from mimetypes import common_types
 
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import Mesh
@@ -108,7 +110,7 @@ from ..modeling_outputs import (
     VLMCausalLMOutput,
 )
 
-PartitionLike = tp.Optional[tp.Mapping[str, tp.Callable] | tp.Mapping[tuple, tp.Callable]]  # noqa
+PartitionLike = collections.abc.Mapping[str, tp.Callable] | collections.abc.Mapping[tuple, tp.Callable] | None
 _CP = type[EasyDeLBaseConfig]
 _T = tp.TypeVar("_T")
 Self = tp.TypeVar("Self")
@@ -217,7 +219,7 @@ def get_module_repr(module: nn.Module) -> str:
         in_features = (
             (module.kernel.shape[0] if hasattr(module.kernel, "shape") else "Null")
             if hasattr(module, "kernel")
-            else module.kernel_init.__wrapped__.__code__.co_argcount - 1
+            else getattr(module.kernel_init, "__wrapped__", module.kernel_init).__code__.co_argcount - 1
         )
         out_features = (
             module.features
@@ -3045,7 +3047,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         """
 
     @abstractmethod
-    def _apply_sharding_fns(self, sharding_fns: tp.Mapping[str, tp.Callable]):
+    def _apply_sharding_fns(self, sharding_fns: collections.abc.Mapping[str, tp.Callable]):
         """Apply sharding functions to the model's state.
 
         Internal method that applies a mapping of sharding functions to
@@ -3100,7 +3102,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
     @abstractmethod
     def quantize(
-        self: Self,
+        self: Self,  # pyright: ignore[reportInvalidTypeVarUse]
         quantization_config: QuantizationConfig | None = None,
         apply_quantization: bool = True,
         verbose: bool | None = None,
@@ -3237,7 +3239,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def split_lora_params(self: Self) -> dict:
+    def split_lora_params(self: Self) -> dict:  # pyright: ignore[reportInvalidTypeVarUse]
         """Split LoRA parameters from the base model parameters.
 
         Extracts the LoRA adaptation matrices from the model, returning
@@ -3379,7 +3381,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         save_directory: str | os.PathLike,
         push_to_hub: bool = False,
         token: str | bool | None = None,
-        gather_fns: dict[tp.Callable] | None = None,
+        gather_fns: dict[str, tp.Callable] | None = None,
         float_dtype: jnp.dtype | None = None,
         step: int | None = None,
         **kwargs,
@@ -3406,7 +3408,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         private: bool | None = None,
         token: bool | str | None = None,
         create_pr: bool = False,
-        gather_fns: dict[tp.Callable] | None = None,
+        gather_fns: dict[str, tp.Callable] | None = None,
         float_dtype: jnp.dtype | None = None,
         verbose: bool = True,
         mismatch_allowed: bool = True,

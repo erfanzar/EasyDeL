@@ -35,8 +35,8 @@ import google.auth
 import jinja2
 import yaml
 from google.auth.transport.requests import AuthorizedSession
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+from googleapiclient.discovery import build  # pyright: ignore[reportMissingTypeStubs]
+from googleapiclient.errors import HttpError  # pyright: ignore[reportMissingTypeStubs]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 this_path = Path(__file__).parent.absolute()
 cluster_template_path = this_path / "easydel-cluster-template.yaml"
 
-PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
+project_id = os.environ.get("GCP_PROJECT_ID")
 
 
 @dataclass
@@ -528,15 +528,15 @@ def main():
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
-    global PROJECT_ID
-    PROJECT_ID = args.project_id or get_default_project_id()
-    if not PROJECT_ID:
+    global project_id
+    project_id = args.project_id or get_default_project_id()
+    if not project_id:
         print("Could not determine project ID. Set GCP_PROJECT_ID or pass --project-id.", file=sys.stderr)
         sys.exit(1)
-    logger.info(f"Using project ID: {PROJECT_ID}")
+    logger.info(f"Using project ID: {project_id}")
 
     try:
-        project_number = get_project_number(PROJECT_ID)
+        project_number = get_project_number(project_id)
     except Exception as e:
         print(f"Failed to get project number: {e}", file=sys.stderr)
         sys.exit(1)
@@ -545,10 +545,10 @@ def main():
 
     acc_types_by_zone: dict[str, list[str]] = {}
     try:
-        zones = tpu_list_locations(session, PROJECT_ID)
+        zones = tpu_list_locations(session, project_id)
         for z in zones:
             try:
-                acc_types_by_zone[z] = tpu_list_accelerator_types(session, PROJECT_ID, z)
+                acc_types_by_zone[z] = tpu_list_accelerator_types(session, project_id, z)
             except Exception as e:
                 if args.verbose:
                     print(f"accel types error for {z}: {e}")
@@ -624,7 +624,7 @@ def main():
                 zone=zone,
                 families_sizes=availability_by_zone[zone],
                 output_dir=args.output_dir,
-                project_id=PROJECT_ID,
+                project_id=project_id,
                 bucket=bucket,
             )
             generated_files[zone] = str(out_path)

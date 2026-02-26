@@ -1,5 +1,7 @@
 """Tests for MiniMax Text V1 model."""
 
+# pyright: reportPrivateLocalImportUsage=false
+
 import pytest
 import transformers
 
@@ -9,7 +11,7 @@ from easydel.modules.minimax import MiniMaxConfig
 try:
     from .test_utils import CausalLMTester
 except ImportError:
-    from test_utils import CausalLMTester
+    from test_utils import CausalLMTester  # pyright: ignore[reportImplicitRelativeImport]
 
 
 class TestMiniMaxTextV1:

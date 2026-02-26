@@ -38,9 +38,10 @@ Example:
 
 from __future__ import annotations
 
+import collections.abc
 import typing as tp
 
-import chex
+import chex  # pyright: ignore[reportMissingTypeStubs]
 
 
 @chex.dataclass
@@ -137,7 +138,7 @@ class RopeConfig:
 
     def update(
         self,
-        config_dict: tp.Mapping[str, tp.Any] | RopeConfig | None = None,
+        config_dict: collections.abc.Mapping[str, tp.Any] | RopeConfig | None = None,
         /,
         **kwargs: tp.Any,
     ) -> None:

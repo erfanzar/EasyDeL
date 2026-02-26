@@ -156,7 +156,7 @@ def generate_api_docs(clean: bool = True) -> bool:
     return True
 
 
-def run_command(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+def run_command(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess | subprocess.CalledProcessError:
     """
     Run a shell command and return the result.
 

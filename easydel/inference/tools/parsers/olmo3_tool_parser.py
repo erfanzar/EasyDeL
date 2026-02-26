@@ -64,7 +64,7 @@ class _UnexpectedAstError(Exception):
     pass
 
 
-@ToolParserManager.register_module("olmo3")
+@ToolParserManager.register_module("olmo3")  # pyright: ignore[reportUntypedClassDecorator]
 class Olmo3PythonicToolParser(ToolParser):
     """Parser for OLMo-3 models that emit newline-separated pythonic tool calls.
 
@@ -155,7 +155,7 @@ class Olmo3PythonicToolParser(ToolParser):
             if isinstance(parsed, ast.List) and all(isinstance(e, ast.Call) for e in parsed.elts):
                 return ExtractedToolCallInformation(
                     tools_called=True,
-                    tool_calls=[_handle_single_tool(e) for e in parsed.elts],  # type: ignore[arg-type]
+                    tool_calls=[_handle_single_tool(e) for e in parsed.elts],
                     content=None,
                 )
             raise _UnexpectedAstError("Tool output must be a list of function calls")
@@ -216,7 +216,7 @@ class Olmo3PythonicToolParser(ToolParser):
             if not isinstance(parsed, ast.List) or not all(isinstance(e, ast.Call) for e in parsed.elts):
                 raise _UnexpectedAstError("Tool output must be a sequence of newline-separated calls")
 
-            tool_calls = [_handle_single_tool(e) for e in parsed.elts]  # type: ignore[arg-type]
+            tool_calls = [_handle_single_tool(e) for e in parsed.elts]
 
             tool_deltas: list[DeltaToolCall] = []
             for index, new_call in enumerate(tool_calls):
@@ -279,7 +279,7 @@ def _get_parameter_value(val: ast.expr) -> Any:
     if isinstance(val, ast.Dict):
         if not all(isinstance(k, ast.Constant) for k in val.keys):
             raise _UnexpectedAstError("Dict tool call arguments must have literal keys")
-        return {k.value: _get_parameter_value(v) for k, v in zip(val.keys, val.values, strict=False)}  # type: ignore[misc]
+        return {k.value: _get_parameter_value(v) for k, v in zip(val.keys, val.values, strict=False)}
     if isinstance(val, ast.List):
         return [_get_parameter_value(v) for v in val.elts]
     if isinstance(val, ast.Name) and val.id in {"null", "true", "false"}:

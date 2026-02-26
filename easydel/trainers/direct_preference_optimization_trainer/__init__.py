@@ -53,6 +53,7 @@ References:
       Secretly a Reward Model" (https://arxiv.org/abs/2305.18290)
 """
 
-from .dpo_trainer import DPOConfig, DPOTrainer
+from .dpo_config import DPOConfig
+from .dpo_trainer import DPOTrainer
 
 __all__ = "DPOConfig", "DPOTrainer"

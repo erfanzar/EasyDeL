@@ -67,7 +67,7 @@ from ..trainer.trainer import Trainer
 from ..training_configurations import TrainingArguments
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset
+    from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
 
 logger = get_logger("RayTrainer")
 
@@ -441,7 +441,7 @@ class RayDistributedTrainer:
         not_allowed = ["precision", "dtype", "param_dtype"]
         scaled = {k: v * scaling_index for k, v in copy.deepcopy(self.config_scaling_variables).items()}
         config_kwargs = {**{k: v for k, v in self.config_variables.items() if k not in not_allowed}, **scaled}
-        config_class = self.model_class.config_class
+        config_class: type | None = self.model_class.config_class
         if config_class is None:
             config_class, _ = get_modules_by_type(model_type=self.model_type, task_type=self.model_task)
         return config_class(**config_kwargs)
@@ -620,7 +620,7 @@ class RayDistributedTrainer:
                     sharding_axis_names=self.config_variables["sharding_axis_names"],
                     sharding_axis_dims=self.config_variables["sharding_axis_dims"],
                     sharding_dcn_axis_dims=self.config_variables["sharding_dcn_axis_dims"],
-                    config_kwargs=ed.EasyDeLBaseConfigDict(
+                    config_kwargs=ed.EasyDeLBaseConfigDict(  # pyright: ignore[reportPrivateLocalImportUsage]
                         freq_max_position_embeddings=self.config_variables["max_position_embeddings"],
                         mask_max_position_embeddings=self.config_variables["max_position_embeddings"],
                         attn_mechanism=self.config_variables["attn_mechanism"],

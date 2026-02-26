@@ -22,10 +22,11 @@ Implements the PPO clipped objective for language-model RLHF training, including
 
 from __future__ import annotations
 
+import collections.abc
 import typing as tp
 
 import jax
-import optax
+import optax  # pyright: ignore[reportMissingTypeStubs]
 from eformer.escale import with_sharding_constraint
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -128,7 +129,7 @@ def get_per_token_logps_values_entropies(model, input_ids: jax.Array, attention_
 
 def ppo_step(
     state: EasyDeLState,
-    batch: tp.Mapping[str, jax.Array],
+    batch: collections.abc.Mapping[str, jax.Array],
     prompt_length: int,
     cliprange: float,
     vf_coef: float,

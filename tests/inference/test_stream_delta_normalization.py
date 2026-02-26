@@ -17,7 +17,9 @@ def test_jsonify_tool_calls_filters_non_mapping_entries():
 
 def test_coerce_stream_delta_message_normalizes_tool_calls_and_fallback():
     delta = DeltaMessage(content="ok", tool_calls=["bad", {"index": 0, "function": {"arguments": "{}"}}])
-    normalized = BaseInferenceApiServer._coerce_stream_delta_message(delta, fallback_text="fallback", default_role="assistant")
+    normalized = BaseInferenceApiServer._coerce_stream_delta_message(
+        delta, fallback_text="fallback", default_role="assistant"
+    )
 
     assert normalized is not None
     assert normalized.role == "assistant"

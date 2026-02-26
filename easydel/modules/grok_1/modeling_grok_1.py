@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -406,7 +406,7 @@ class Grok1SparseMoeBlock(nn.Module):
                     precision=precision,
                     rngs=rngs,
                 )
-                for i in range(self.config.num_experts)
+                for _ in range(self.config.num_experts)
             ]
         )
 
@@ -868,7 +868,7 @@ class Grok1Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Grok1Config, model_type="grok-1")
-class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):
+class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):  # type: ignore
     """Grok-1 model with a language modeling head.
 
     This model extends the base Grok1Model by adding a linear layer on top to
@@ -928,7 +928,7 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         output_router_logits: bool | None = None,
-        mode: common_types.RUNTIME_MODE_TYPES | None = None,
+        mode: common_types.RUNTIME_MODE_TYPES | None = None,  # pyright: ignore[reportInvalidTypeForm]
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,

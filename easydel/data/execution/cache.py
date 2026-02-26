@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, DatasetDict, IterableDataset
+    from datasets import Dataset, DatasetDict, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     DatasetLike = Dataset | IterableDataset | DatasetDict
 
@@ -224,7 +224,7 @@ class DiskCache(CacheLayer):
                 return data
         elif self.compression == "zstd":
             try:
-                import zstandard  # pyright: ignore[reportMissingImports]
+                import zstandard
 
                 return zstandard.compress(data)
             except ImportError:
@@ -246,7 +246,7 @@ class DiskCache(CacheLayer):
                 return data
         elif self.compression == "zstd":
             try:
-                import zstandard  # pyright: ignore[reportMissingImports]
+                import zstandard
 
                 return zstandard.decompress(data)
             except ImportError:
@@ -482,7 +482,7 @@ class DatasetCache:
 
     def get(self, key: str) -> "DatasetLike | None":
         """Load a cached dataset."""
-        from datasets import load_from_disk
+        from datasets import load_from_disk  # pyright: ignore[reportMissingTypeStubs]
 
         path = self._get_dataset_path(key)
         if not path.exists():

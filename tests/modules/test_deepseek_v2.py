@@ -1,5 +1,7 @@
 """Tests for DeepSeek V2 model."""
 
+# pyright: reportPrivateLocalImportUsage=false
+
 import pytest
 
 import easydel as ed
@@ -8,7 +10,7 @@ from easydel.infra.etils import EasyDeLGradientCheckPointers
 try:
     from .test_utils import CausalLMTester, get_hf_model_from_hub
 except ImportError:
-    from test_utils import CausalLMTester, get_hf_model_from_hub
+    from test_utils import CausalLMTester, get_hf_model_from_hub  # pyright: ignore[reportImplicitRelativeImport]
 
 
 class TestDeepSeekV2:

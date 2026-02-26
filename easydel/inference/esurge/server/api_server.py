@@ -78,6 +78,7 @@ import time
 import traceback
 import typing as tp
 import uuid
+from collections.abc import AsyncGenerator, Iterable, Iterator
 from http import HTTPStatus
 
 from eformer.loggings import get_logger
@@ -120,6 +121,15 @@ from .auth_endpoints import AuthEndpointsMixin
 
 logger = get_logger("eSurgeApiServer")
 
+__all__ = (
+    "RefineChatRequestFn",
+    "RefineSamplingParamsFn",
+    "ServerStatus",
+    "create_error_response",
+    "eSurgeAdapter",
+    "eSurgeApiServer",
+)
+
 _STREAM_DATA = "data"
 _STREAM_ERROR = "error"
 _STREAM_END = "end"
@@ -161,7 +171,7 @@ class eSurgeAdapter(InferenceEngineAdapter):
         prompts: str | list[str],
         sampling_params: SamplingParams,
         stream: bool = False,
-    ) -> list[RequestOutput] | tp.AsyncGenerator[RequestOutput, None]:
+    ) -> list[RequestOutput] | AsyncGenerator[RequestOutput, None]:
         """Generate text using eSurge engine.
 
         Args:
@@ -560,7 +570,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             return False
 
         try:
-            enabled = manager.enabled  # type: ignore[attr-defined]
+            enabled = manager.enabled
         except AttributeError:
             enabled = None
 
@@ -568,7 +578,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             return bool(enabled)
 
         try:
-            _ = manager.authorize_request  # type: ignore[attr-defined]
+            _ = manager.authorize_request
         except AttributeError:
             return self._require_api_key
 
@@ -577,7 +587,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
     def _authorize_request(
         self,
         raw_request: Request,
-        payload_api_keys: str | tp.Iterable[str | None] | None = None,
+        payload_api_keys: str | Iterable[str | None] | None = None,
         endpoint: str | None = None,
         model: str | None = None,
         requested_tokens: int = 0,
@@ -648,7 +658,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
         # No valid key found
         try:
-            require_key = self.auth_manager.require_api_key  # type: ignore[attr-defined]
+            require_key = self.auth_manager.require_api_key
         except AttributeError:
             require_key = self._require_api_key
 
@@ -1057,7 +1067,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             else:
                 if max_tokens < 0:
                     max_tokens = None
-        raw_temperature = request.temperature
+        raw_temperature: float | None = request.temperature
         if raw_temperature is None:
             temperature_f = 1.0
         else:
@@ -1149,12 +1159,14 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             if request.chat_template_kwargs is None:
                 request.chat_template_kwargs = {}
             add_generation_prompt = request.chat_template_kwargs.pop("add_generation_prompt", True)
-            return processor.apply_chat_template(
-                tokenize=False,
-                conversation=conversation,
-                add_generation_prompt=add_generation_prompt,
-                tools=self.extract_tools(request=request),
-                **request.chat_template_kwargs,
+            return str(
+                processor.apply_chat_template(
+                    tokenize=False,
+                    conversation=conversation,
+                    add_generation_prompt=add_generation_prompt,
+                    tools=self.extract_tools(request=request),
+                    **request.chat_template_kwargs,
+                )
             )
         except Exception as e:
             logger.exception(f"Error applying chat template: {e}")
@@ -1448,7 +1460,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                 if not self._enable_response_store:
                     raise HTTPException(status_code=400, detail="conversation requires enable_response_store=True")
                 conversation_history = (await self._response_store_get_conversation(conversation_id)) or []
-                history_messages = list(tp.cast(list[dict[str, tp.Any]], conversation_history))
+                history_messages = list(conversation_history)
 
             # `full_messages` is the persisted conversation state for this response (excludes `instructions`).
             full_messages = list(history_messages) + list(input_messages)
@@ -1635,7 +1647,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
                     queue = self._start_stream_task(
                         lambda: tp.cast(
-                            tp.Iterator[RequestOutput],
+                            Iterator[RequestOutput],
                             esurge.chat(
                                 messages=engine_messages,
                                 tools=tools_for_template,
@@ -1647,7 +1659,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                     )
 
                     try:
-                        stream_error: Exception | None = None
+                        stream_error: Exception | None = None  # pyright: ignore[reportUnusedVariable]
                         while True:
                             if await raw_request.is_disconnected():
                                 try:
@@ -1662,7 +1674,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                             if kind == _STREAM_END:
                                 break
                             if kind == _STREAM_ERROR:
-                                stream_error = tp.cast(Exception, stream_payload)
+                                stream_error = tp.cast(Exception, stream_payload)  # pyright: ignore[reportUnusedVariable]
                                 raise tp.cast(Exception, stream_payload)
 
                             output = tp.cast(RequestOutput, stream_payload)
@@ -2359,7 +2371,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                 previous_token_ids: list[int] = []
                 queue = self._start_stream_task(
                     lambda: tp.cast(
-                        tp.Iterator[RequestOutput],
+                        Iterator[RequestOutput],
                         esurge.chat(
                             messages=messages,
                             tools=tools,
@@ -2378,7 +2390,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                 saw_tool_call_delta = False
 
                 try:
-                    stream_error: Exception | None = None
+                    stream_error: Exception | None = None  # pyright: ignore[reportUnusedVariable]
                     while True:
                         if await raw_request.is_disconnected():
                             try:
@@ -2391,7 +2403,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                         if kind == _STREAM_END:
                             break
                         if kind == _STREAM_ERROR:
-                            stream_error = tp.cast(Exception, payload)
+                            stream_error = tp.cast(Exception, payload)  # pyright: ignore[reportUnusedVariable]
                             raise tp.cast(Exception, payload)
 
                         output = tp.cast(RequestOutput, payload)
@@ -2726,7 +2738,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                 disconnected = False
 
                 try:
-                    stream_error: Exception | None = None
+                    stream_error: Exception | None = None  # pyright: ignore[reportUnusedVariable]
                     while True:
                         if await raw_request.is_disconnected():
                             try:
@@ -2739,7 +2751,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                         if kind == _STREAM_END:
                             break
                         if kind == _STREAM_ERROR:
-                            stream_error = tp.cast(Exception, payload)
+                            stream_error = tp.cast(Exception, payload)  # pyright: ignore[reportUnusedVariable]
                             raise tp.cast(Exception, payload)
 
                         output = tp.cast(RequestOutput, payload)

@@ -1,5 +1,7 @@
 """Tests for Pixtral vision model."""
 
+# pyright: reportPrivateLocalImportUsage=false
+
 import pytest
 import transformers
 
@@ -8,7 +10,7 @@ import easydel as ed
 try:
     from .test_utils import BaseModuleTester
 except ImportError:
-    from test_utils import BaseModuleTester
+    from test_utils import BaseModuleTester  # pyright: ignore[reportImplicitRelativeImport]
 
 
 class TestPixtral:

@@ -67,7 +67,6 @@ Example:
 from __future__ import annotations
 
 import time
-import typing as tp
 
 import jax
 import numpy as np
@@ -118,7 +117,7 @@ class BatchMetadataPreparer:
     def __init__(
         self,
         *,
-        metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig,
+        metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig | None,
         empty_sharding: jax.sharding.Sharding,
         max_num_tokens: int,
         max_num_reqs: int,
@@ -1106,7 +1105,7 @@ class BatchMetadataPreparer:
 
         device_put_took = 0.0
         host_build_took = 0.0
-        transfer_meta = tp.cast(dict, self._pending_transfer_metadata or {})
+        transfer_meta = self._pending_transfer_metadata or {}
         try:
             device_put_took = float(transfer_meta.get("device_put_time", 0.0))
         except Exception:

@@ -52,7 +52,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = get_logger(__name__)
 
 
-@ToolParserManager.register_module("deepseek_v32")
+@ToolParserManager.register_module("deepseek_v32")  # pyright: ignore[reportUntypedClassDecorator]
 class DeepSeekV32ToolParser(ToolParser):
     """Tool parser for DeepSeek V3.2 models using DSML format.
 
@@ -135,7 +135,7 @@ class DeepSeekV32ToolParser(ToolParser):
         # Streaming state variables
         self.current_tool_name_sent: bool = False
         # Override base class type - we use string IDs for tool calls
-        self.current_tool_id: str | None = None  # type: ignore[assignment]
+        self.current_tool_id: str | None = None
         self.streamed_args_for_tool: list[str] = []
         self.is_tool_call_started: bool = False
         self.failed_count: int = 0

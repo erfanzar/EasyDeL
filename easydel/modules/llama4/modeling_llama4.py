@@ -23,7 +23,7 @@ from eformer import common_types
 from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -111,7 +111,7 @@ class Llama4CausalLMOutputWithPast(ModelOutput):
     image_hidden_states: Float[Array, "batch seq_len hidden_dim"] | None = None
 
 
-@ejit(static_argnums=(0, 1, 2, 3))
+@ejit(static_argnums=(0, 1, 2, 3))  # pyright: ignore[reportUntypedFunctionDecorator]
 def _vision_freqs(idx, hidden_size, num_attention_heads, rope_theta):
     """Compute rotary frequencies for the vision transformer grid."""
     img_idx = jnp.arange(idx**2, dtype="i4").reshape(idx**2, 1)
@@ -131,7 +131,7 @@ def _vision_freqs(idx, hidden_size, num_attention_heads, rope_theta):
     return jnp.exp(1j * freqs)
 
 
-def _create_chunked_attention_mask(
+def _create_chunked_attention_mask(  # pyright: ignore[reportUnusedFunction]
     attention_chunk_size: int,
     start: int,
     end: int,
@@ -529,7 +529,7 @@ class Llama4TextMoe(BaseMoeModule):
         )
 
         final_output = checkpoint_name(shared_out + expert_out, "moe_expert_output")
-        return final_output, checkpoint_name(router_logits, "moe_router_logits")
+        return final_output, checkpoint_name(router_logits, "moe_router_logits")  # pyright: ignore[reportReturnType]
 
 
 class Llama4TextAttention(UnifiedAttention):
@@ -1692,6 +1692,7 @@ class Llama4VisionEncoder(nn.Module):
         all_attentions = () if output_attentions else None
         for encoder_layer in self.layers:
             if output_hidden_states:
+                assert encoder_states is not None
                 encoder_states = (*encoder_states, hidden_states)
             layer_outputs = encoder_layer(
                 hidden_states=hidden_states,
@@ -1700,11 +1701,13 @@ class Llama4VisionEncoder(nn.Module):
             )
 
             if output_attentions:
+                assert all_attentions is not None
                 all_attentions = (*all_attentions, layer_outputs.attention_weight)
 
             hidden_states = layer_outputs.hidden_states
 
         if output_hidden_states:
+            assert encoder_states is not None
             encoder_states = (*encoder_states, hidden_states)
 
         return BaseModelOutput(
@@ -2006,7 +2009,7 @@ class Llama4VisionModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Llama4Config, model_type="llama4")
-class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM, Llama4Config]):
+class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM, Llama4Config]):  # type: ignore
     """Llama4 Vision model for conditional text generation based on image inputs.
 
     Combines a vision tower and a language model with a multi-modal projector.
@@ -2122,7 +2125,7 @@ class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM,
 
     def compute_embedding(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None,
         *,
         image_features: Array | None = None,
         pixel_values: Array | None = None,
@@ -2162,8 +2165,8 @@ class Llama4ForConditionalGeneration(BaseVisionLanguageModule[Llama4ForCausalLM,
 
     def __call__(
         self,
-        input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: Array = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        pixel_values: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,

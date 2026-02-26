@@ -51,6 +51,7 @@ Example:
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Iterable
 from typing import Any
@@ -68,11 +69,21 @@ logger = get_logger("eSurgeLMEvalAdapter")
 try:
     from lm_eval.api.model import LM  # type:ignore
 except Exception:
-    LM = object
-    err = "consider installing easydel[lm_eval] if you want to use `eSurgeLMEvalAdapter`."
+    LM = object  # type: ignore[misc]
+    err = "consider installing easydel[torch, lm_eval] if you want to use `eSurgeLMEvalAdapter`."
     logger.warning(err, stacklevel=1)
 
 _DEFAULT_REQUEST_ID_PREFIX = "lm_eval"
+_DEFAULT_MATH_ANSWER_TASK_HINTS = (
+    "gsm8k",
+    "mgsm",
+    "afrimgsm",
+    "tinygsm8k",
+    "gsm_plus",
+)
+_STRICT_MATH_ANSWER_RE = re.compile(r"####\s*(-?[0-9\.\,]+)")
+_BOXED_ANSWER_RE = re.compile(r"\\boxed\{([^{}]+)\}")
+_NUMBER_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 
 
 def _chunked(seq: list[Any], size: int) -> Iterable[list[Any]]:
@@ -125,6 +136,57 @@ def _trim_stop_sequences(text: str, stop: list[str]) -> str:
         if earliest is None or idx < earliest:
             earliest = idx
     return text if earliest is None else text[:earliest]
+
+
+def _is_math_answer_task(task_name: str | None, task_hints: tuple[str, ...]) -> bool:
+    if not task_name:
+        return False
+    normalized = task_name.lower()
+    return any(hint in normalized for hint in task_hints)
+
+
+def _normalize_number_candidate(candidate: str) -> str | None:
+    candidate = candidate.strip()
+    if not candidate:
+        return None
+    if "=" in candidate:
+        candidate = candidate.rsplit("=", maxsplit=1)[-1].strip()
+    candidate = candidate.replace("$", "").replace(",", "").rstrip(".")
+    match = _NUMBER_RE.search(candidate)
+    if match is None:
+        return None
+    return match.group(0)
+
+
+def _extract_math_answer(generation: str) -> str | None:
+    strict_match = _STRICT_MATH_ANSWER_RE.search(generation)
+    if strict_match is not None:
+        return _normalize_number_candidate(strict_match.group(1))
+
+    boxed_matches = _BOXED_ANSWER_RE.findall(generation)
+    for boxed in reversed(boxed_matches):
+        boxed_value = _normalize_number_candidate(boxed)
+        if boxed_value is not None:
+            return boxed_value
+
+    numeric_matches = _NUMBER_RE.findall(generation)
+    if not numeric_matches:
+        return None
+    return _normalize_number_candidate(numeric_matches[-1])
+
+
+def _normalize_math_generation(generation: str) -> str:
+    if _STRICT_MATH_ANSWER_RE.search(generation) is not None:
+        return generation
+
+    answer = _extract_math_answer(generation)
+    if answer is None:
+        return generation
+
+    normalized = generation.rstrip()
+    if not normalized:
+        return f"#### {answer}"
+    return f"{normalized}\n#### {answer}"
 
 
 def _get_rolling_token_windows(
@@ -210,7 +272,7 @@ def _make_disjoint_window(context: list[int], continuation: list[int]) -> tuple[
     return context[: len(context) - (len(continuation) - 1)], continuation
 
 
-class eSurgeLMEvalAdapter(LM):
+class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
     """Adapter for EasyDeL models to be compatible with lm-evaluation-harness.
 
     This class inherits from lm_eval.api.model.LM to ensure compatibility with
@@ -251,6 +313,8 @@ class eSurgeLMEvalAdapter(LM):
         top_p: float = 0.95,
         temperature: float = 0.0,
         batch_size: int | None = None,
+        normalize_math_answers: bool = True,
+        math_answer_task_hints: tuple[str, ...] | list[str] | None = None,
     ):
         """Initialize the eSurgeLMEvalAdapter.
 
@@ -267,6 +331,11 @@ class eSurgeLMEvalAdapter(LM):
             temperature: Sampling temperature. Defaults to 0.0 (greedy).
             batch_size: Optional batch size override. If None, uses
                 surge's max_num_seqs setting.
+            normalize_math_answers: If True, normalize math-style generations for
+                GSM-like tasks by appending a `#### <number>` line when possible.
+            math_answer_task_hints: Optional task-name hints used to decide where
+                math normalization is applied. Matching is case-insensitive and
+                substring-based.
 
         Note:
             The processor's padding_side is automatically set to "left"
@@ -283,6 +352,20 @@ class eSurgeLMEvalAdapter(LM):
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
         self.top_p = top_p
+        self.normalize_math_answers = normalize_math_answers
+        if math_answer_task_hints is None:
+            raw_task_hints: Iterable[str] = _DEFAULT_MATH_ANSWER_TASK_HINTS
+        elif isinstance(math_answer_task_hints, str):
+            raw_task_hints = (math_answer_task_hints,)
+        elif isinstance(math_answer_task_hints, Iterable):
+            raw_task_hints = math_answer_task_hints
+        else:
+            raise TypeError("math_answer_task_hints must be None, a string, or an iterable of strings")
+        self.math_answer_task_hints = tuple(
+            hint_text
+            for hint in raw_task_hints
+            if (hint_text := str(hint).strip().lower())
+        )
 
         self.surge = surge
         self._batch_size = batch_size or surge.max_num_seqs
@@ -417,8 +500,6 @@ class eSurgeLMEvalAdapter(LM):
             >>> adapter._extract_choice_from_generation("The answer is B.")
             'B'
         """
-        import re
-
         patterns = [
             r"^([A-Da-d])[^A-Za-z0-9]",
             r"^([A-Da-d])$",
@@ -439,6 +520,63 @@ class eSurgeLMEvalAdapter(LM):
 
         return ""
 
+    @staticmethod
+    def _parse_instances(instances) -> tuple[list[str], list[list[str]]]:
+        """Extract prompts and stop sequences from lm-eval Instance objects.
+
+        Handles both modern Instance objects (with `.arguments`) and legacy
+        ``(context, until)`` tuples.
+
+        Args:
+            instances: List of Instance objects or tuples.
+
+        Returns:
+            Tuple of (prompts, stop_sequences).
+        """
+        if instances and not hasattr(instances[0], "arguments") and isinstance(instances[0], tuple):
+            prompts: list[str] = []
+            stop_sequences: list[list[str]] = []
+            for request in instances:
+                prompt = str(request[0]) if request else ""
+                config = request[1] if len(request) > 1 else None
+                if isinstance(config, dict):
+                    until = config.get("until", []) or []
+                elif isinstance(config, (list, tuple)):
+                    until = config
+                else:
+                    until = []
+                prompts.append(prompt)
+                stop_sequences.append([str(s) for s in until])
+            return prompts, stop_sequences
+
+        prompts: list[str] = []
+        stop_sequences: list[list[str]] = []
+        for instance in instances:
+            arguments = instance.arguments if hasattr(instance, "arguments") else instance
+            prompt = str(arguments[0]) if arguments else ""
+            config = arguments[1] if len(arguments) > 1 else None
+            if isinstance(config, dict):
+                until = config.get("until", []) or []
+            elif isinstance(config, (list, tuple)):
+                until = config
+            else:
+                until = []
+            prompts.append(prompt)
+            stop_sequences.append([str(s) for s in until])
+        return prompts, stop_sequences
+
+    def _maybe_normalize_math(self, generations: list[str], instances) -> list[str]:
+        """Apply math answer normalization for GSM-like tasks when enabled."""
+        if not self.normalize_math_answers:
+            return generations
+        normalized: list[str] = []
+        for generation, instance in zip(generations, instances, strict=False):
+            task_name = getattr(instance, "task_name", None)
+            if _is_math_answer_task(task_name, self.math_answer_task_hints):
+                generation = _normalize_math_generation(generation)
+            normalized.append(generation)
+        return normalized
+
     def generate_until(self, instances):
         """Generate text until a specified set of stop sequences is reached.
 
@@ -453,32 +591,13 @@ class eSurgeLMEvalAdapter(LM):
         Returns:
             List of generated strings, one for each instance.
         """
-        prompts: list[str] = []
-        stop_sequences: list[list[str]] = []
-
-        for instance in instances:
-            if hasattr(instance, "arguments"):
-                arguments = instance.arguments
-            else:
-                arguments = instance
-
-            prompt = str(arguments[0]) if arguments else ""
-            config = arguments[1] if len(arguments) > 1 else None
-            if isinstance(config, dict):
-                until = config.get("until", []) or []
-            elif isinstance(config, list):
-                until = config
-            else:
-                until = []
-
-            prompts.append(prompt)
-            stop_sequences.append([str(s) for s in until])
-
-        return self._generate(
+        prompts, stop_sequences = self._parse_instances(instances)
+        generations = self._generate(
             prompts,
             max_tokens=self.max_gen_toks,
             stop_sequences=stop_sequences,
         )
+        return self._maybe_normalize_math(generations, instances)
 
     @property
     def eot_token_id(self):
@@ -544,16 +663,11 @@ class eSurgeLMEvalAdapter(LM):
         Returns:
             str: Tokenizer name, path, or class name as fallback.
         """
-        # Try to get the tokenizer name from various possible attributes
         if hasattr(self.tokenizer, "name_or_path") and self.tokenizer.name_or_path:
             return self.tokenizer.name_or_path
-        elif hasattr(self.tokenizer, "tokenizer_name") and self.tokenizer.tokenizer_name:
+        if hasattr(self.tokenizer, "tokenizer_name") and self.tokenizer.tokenizer_name:
             return self.tokenizer.tokenizer_name
-        elif hasattr(self.tokenizer, "__class__"):
-            # Return the class name as a fallback
-            return self.tokenizer.__class__.__name__
-        else:
-            return ""
+        return self.tokenizer.__class__.__name__
 
     def apply_chat_template(self, messages, add_generation_prompt: bool):
         """Apply chat template to messages.
@@ -927,33 +1041,12 @@ class eSurgeLMEvalAdapter(LM):
         Returns:
             List of generated completion strings.
         """
-        # Support both legacy (context, until) tuples and modern Instance objects.
-        if requests and not hasattr(requests[0], "arguments") and isinstance(requests[0], tuple):
-            prompts = [str(r[0]) for r in requests]
-            stop_sequences = [[str(s) for s in (r[1] or [])] for r in requests]
-        else:
-            prompts = []
-            stop_sequences = []
-            for instance in requests:
-                if hasattr(instance, "arguments"):
-                    arguments = instance.arguments
-                else:
-                    arguments = instance
-                prompt = str(arguments[0]) if arguments else ""
-                config = arguments[1] if len(arguments) > 1 else None
-                if isinstance(config, dict):
-                    until = config.get("until", []) or []
-                elif isinstance(config, list):
-                    until = config
-                else:
-                    until = []
-                prompts.append(prompt)
-                stop_sequences.append([str(s) for s in until])
-
-        return self._generate(
+        prompts, stop_sequences = self._parse_instances(requests)
+        generations = self._generate(
             prompts,
             max_tokens=self.max_gen_toks,
             temperature=0.0,
             top_p=1.0,
             stop_sequences=stop_sequences,
         )
+        return self._maybe_normalize_math(generations, requests)

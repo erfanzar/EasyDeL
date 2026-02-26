@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -84,7 +84,7 @@ class Glm46VModel(Glm4vModel):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Glm46VConfig, model_type="glm46v")
-class Glm46VForConditionalGeneration(BaseVisionLanguageModule[Glm46VModel, Glm46VConfig]):
+class Glm46VForConditionalGeneration(BaseVisionLanguageModule[Glm46VModel, Glm46VConfig]):  # type: ignore
     """GLM-4.6V model for image/video-to-text conditional generation.
 
     This model combines the GLM-4.6V multimodal base model with a language modeling

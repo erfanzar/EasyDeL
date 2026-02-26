@@ -37,6 +37,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import typing as tp
+from collections.abc import Iterator, Mapping
 
 import jax
 from jax._src.lib import xla_client
@@ -58,7 +59,7 @@ class CompilationContext(tp.NamedTuple):
 
     name: str
     phase: str | None = None
-    metadata: tp.Mapping[str, tp.Any] | None = None
+    metadata: Mapping[str, tp.Any] | None = None
     flags: frozenset[str] = frozenset()
 
 
@@ -67,14 +68,15 @@ ContextPayload = tp.TypeVar("ContextPayload", bound=tuple)
 _context_var: contextvars.ContextVar[ContextPayload | None] = contextvars.ContextVar("easydeL_jit_context", default=None)
 _context_generation = 0
 
+_JAX_USER_CONTEXT: tp.Any = None
 try:
-    _JAX_USER_CONTEXT = jax.make_user_context(default_value=None)
+    _JAX_USER_CONTEXT = jax.make_user_context(default_value=None)  # pyright: ignore[reportConstantRedefinition]
 except AttributeError:  # pragma: no cover - older JAX fallback
-    _JAX_USER_CONTEXT = None
+    pass
 
-_JIT_CONTEXT_STATE = getattr(_JAX_USER_CONTEXT, "_obj", None) if _JAX_USER_CONTEXT is not None else None
+_JIT_CONTEXT_STATE: tp.Any = getattr(_JAX_USER_CONTEXT, "_obj", None) if _JAX_USER_CONTEXT is not None else None
 if _JIT_CONTEXT_STATE is None:
-    _JIT_CONTEXT_STATE = config_ext.Config("easydeL_jit_context_state", None, include_in_jit_key=True)
+    _JIT_CONTEXT_STATE = config_ext.Config("easydeL_jit_context_state", None, include_in_jit_key=True)  # pyright: ignore[reportConstantRedefinition]
 
 
 def _get_state_value() -> ContextPayload | None:
@@ -83,7 +85,7 @@ def _get_state_value() -> ContextPayload | None:
 
 
 @contextlib.contextmanager
-def jit_context(context: ContextPayload | None) -> tp.Iterator[ContextPayload | None]:
+def jit_context(context: ContextPayload | None) -> Iterator[ContextPayload | None]:
     """Context manager that sets the active JIT context.
 
     Args:

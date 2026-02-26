@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import collections.abc
 import typing as tp
 from dataclasses import dataclass, field
 
@@ -52,7 +53,7 @@ class XPOConfig(GRPOConfig):
         metadata={"help": "Choice of DPO loss. Matches the TRL implementation options."},
     )
 
-    beta: float | tp.Sequence[float] = field(
+    beta: float | collections.abc.Sequence[float] = field(
         default=0.1,
         metadata={
             "help": "Prospect-theoretic scaling for the KL penalty. A list enables epoch-wise scheduling; the final "
@@ -60,7 +61,7 @@ class XPOConfig(GRPOConfig):
         },
     )
 
-    alpha: float | tp.Sequence[float] = field(
+    alpha: float | collections.abc.Sequence[float] = field(
         default_factory=lambda: [1e-5],
         metadata={
             "help": "Weight of the exploratory term that encourages the policy to assign probability mass to "
@@ -78,9 +79,9 @@ class XPOConfig(GRPOConfig):
 
     def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
         self._handle_deprecated_max_sequence_length(max_sequence_length)
-        if isinstance(self.alpha, tp.Sequence) and len(self.alpha) == 1:
+        if isinstance(self.alpha, collections.abc.Sequence) and len(self.alpha) == 1:
             self.alpha = self.alpha[0]
-        if isinstance(self.beta, tp.Sequence) and len(self.beta) == 1:
+        if isinstance(self.beta, collections.abc.Sequence) and len(self.beta) == 1:
             self.beta = self.beta[0]
         if hasattr(super(), "__post_init__"):
             super().__post_init__(max_sequence_length=None, quantization_block=quantization_block)

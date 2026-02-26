@@ -42,7 +42,7 @@ if __package__ in {None, ""}:
         make_config,
     )
 else:
-    from ._common import (  # type: ignore
+    from ._common import (
         get_logger,
         get_tokenizer,
         load_causal_lm_model,

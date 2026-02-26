@@ -43,7 +43,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = get_logger(__name__)
 
 
-@ToolParserManager.register_module("phi4_mini_json")
+@ToolParserManager.register_module("phi4_mini_json")  # pyright: ignore[reportUntypedClassDecorator]
 class Phi4MiniJsonToolParser(ToolParser):
     """Tool call parser for Phi-4-mini models.
 

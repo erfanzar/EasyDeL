@@ -26,7 +26,7 @@ from ..abstract_reasoning import ReasoningParserManager
 from ..basic_parsers import BaseThinkingReasoningParser
 
 
-@ReasoningParserManager.register_module(["minimax_m2"])
+@ReasoningParserManager.register_module(["minimax_m2"])  # pyright: ignore[reportUntypedClassDecorator]
 class MiniMaxM2ReasoningParser(BaseThinkingReasoningParser):
     """Asymmetric reasoning parser: no start token, only </think> end token.
 
@@ -78,7 +78,7 @@ class MiniMaxM2ReasoningParser(BaseThinkingReasoningParser):
         return DeltaMessage(reasoning_content=cleaned) if cleaned else None
 
 
-@ReasoningParserManager.register_module(["minimax_m2_append_think"])
+@ReasoningParserManager.register_module(["minimax_m2_append_think"])  # pyright: ignore[reportUntypedClassDecorator]
 class MiniMaxM2AppendThinkReasoningParser(BaseThinkingReasoningParser):
     """Reasoning parser that synthetically prepends <think> to model output.
 

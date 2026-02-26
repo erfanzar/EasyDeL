@@ -16,13 +16,14 @@
 import functools
 import itertools
 import typing as tp
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
 from eformer.common_types import Replicated
 from eformer.pytree import auto_pytree
 from einops import repeat
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
@@ -71,11 +72,11 @@ _T = tp.TypeVar("_T")
 
 def create_tuple_parser(
     n: int,
-) -> tp.Callable[[_T | tp.Sequence[_T]], tuple[_T, ...]]:
+) -> Callable[[_T | Sequence[_T]], tuple[_T, ...]]:
     """Normalize a scalar or sequence into a tuple of length ``n``."""
 
-    def parse(x: _T | tp.Sequence[_T]) -> tuple[_T, ...]:
-        if isinstance(x, tp.Sequence):
+    def parse(x: _T | Sequence[_T]) -> tuple[_T, ...]:
+        if isinstance(x, Sequence):
             if len(x) == n:
                 return tuple(x)
             else:
@@ -168,7 +169,7 @@ class MambaConv1D(nn.Module):
         specs = {"kernel": Replicated}
         if getattr(self, "use_bias", False) and hasattr(self, "bias"):
             specs["bias"] = Replicated
-        return specs
+        return specs  # pyright: ignore[reportReturnType]
 
     def __call__(self, x: Array) -> Array:
         """Apply 1D convolution to input tensor.
@@ -247,6 +248,7 @@ class MambaMixer(nn.Module):
 
         hidden_size = config.hidden_size
         ssm_state_size = config.state_size
+        assert config.intermediate_size is not None, "intermediate_size must not be None"
         intermediate_size = config.intermediate_size
         time_step_rank = config.time_step_rank
         conv_kernel_size = config.conv_kernel
@@ -718,11 +720,13 @@ class MambaModel(EasyDeLBaseModule):
             )
             cache[idx] = cache_view
             if output_hidden_states:
+                assert all_hidden_states is not None
                 all_hidden_states = (*all_hidden_states, hidden_states)
 
         hidden_states = self.norm_f(hidden_states)
 
         if output_hidden_states:
+            assert all_hidden_states is not None
             all_hidden_states = (*all_hidden_states, hidden_states)
 
         return MambaOutput(
@@ -759,7 +763,7 @@ class MambaModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=MambaConfig, model_type="mamba")
-class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):
+class MambaForCausalLM(BaseCausalLMModule[MambaModel, MambaConfig]):  # type: ignore
     """Mamba model with a language modeling head for causal language modeling tasks.
 
     This model combines the Mamba selective state space backbone with a

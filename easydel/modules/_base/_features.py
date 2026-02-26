@@ -340,7 +340,7 @@ class RouterAuxLossFeature:
             return None
 
         total_loss = sum(router_losses)
-        return total_loss * self.coef
+        return total_loss * self.coef  # pyright: ignore[reportReturnType]
 
     def __repr__(self) -> str:
         """Return string representation of the feature.

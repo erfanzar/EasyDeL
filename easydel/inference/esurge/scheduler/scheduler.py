@@ -175,6 +175,10 @@ class Scheduler(SchedulerInterface):
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
         self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_model_len = self.scheduler_config.max_model_len
+        if self.max_num_scheduled_tokens is None:
+            # Keep runtime behavior aligned with engine docs: unset budget
+            # falls back to model context length.
+            self.max_num_scheduled_tokens = self.max_model_len
         self.data_parallel_size = 1
         num_pages = self.cache_config.num_pages
         assert num_pages is not None and num_pages > 0
@@ -391,6 +395,7 @@ class Scheduler(SchedulerInterface):
         if self._token_budget_manager:
             token_budget = self._token_budget_manager.begin_cycle(self.kv_cache_manager, len(self.running))
         else:
+            assert self.max_num_scheduled_tokens is not None
             token_budget = self.max_num_scheduled_tokens
 
         dp_size = max(1, int(getattr(self, "data_parallel_size", 1) or 1))
@@ -445,7 +450,7 @@ class Scheduler(SchedulerInterface):
             if not candidate_shards:
                 return None
             # Keep per-shard occupancy balanced to avoid overfilling one DP row range.
-            return min(candidate_shards, key=lambda sid: (planned_shard_counts[sid], sid))
+            return min(candidate_shards, key=lambda sid: (planned_shard_counts[sid], sid))  # pyright: ignore[reportOptionalSubscript]
 
         def _reserve_dp_shard(shard_hint: int | None) -> None:
             if not use_dp_local_shard_hints or shard_hint is None:
@@ -461,7 +466,10 @@ class Scheduler(SchedulerInterface):
             request = self.running[req_index]
 
             num_new_tokens = request.num_tokens_with_spec + request.num_output_placeholders - request.num_computed_tokens
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+            if (
+                self.scheduler_config.long_prefill_token_threshold is not None
+                and 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens
+            ):
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
 
@@ -473,6 +481,7 @@ class Scheduler(SchedulerInterface):
 
             preemption_attempts = 0
             max_preemption_attempts = len(self.running) + 1  # Allow one full cycle plus one
+            new_pages = None
 
             while True:
                 row_shard_hint = _pick_dp_shard_hint(request)
@@ -591,7 +600,10 @@ class Scheduler(SchedulerInterface):
 
                 else:
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+                    if (
+                        self.scheduler_config.long_prefill_token_threshold is not None
+                        and 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens
+                    ):
                         num_new_tokens = self.scheduler_config.long_prefill_token_threshold
 
                     if not self.scheduler_config.chunked_prefill_enabled and num_new_tokens > token_budget:
@@ -599,7 +611,9 @@ class Scheduler(SchedulerInterface):
                         # otherwise it will never run.
                         # If it's larger than available memory (reflected in token_budget via capacity),
                         # allocate_slots will fail anyway.
-                        is_inherently_too_large = num_new_tokens > self.max_num_scheduled_tokens
+                        is_inherently_too_large = (
+                            self.max_num_scheduled_tokens is not None and num_new_tokens > self.max_num_scheduled_tokens
+                        )
                         is_batch_empty = (
                             len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs) == 0
                         )
@@ -672,7 +686,7 @@ class Scheduler(SchedulerInterface):
 
         self._ensure_capacity(len(self.running))
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        assert self.max_num_scheduled_tokens is None or total_num_scheduled_tokens <= self.max_num_scheduled_tokens
         assert token_budget >= 0
         assert len(self.running) <= self._current_seq_bucket
 

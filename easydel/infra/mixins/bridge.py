@@ -54,6 +54,7 @@ Example:
 
 from __future__ import annotations
 
+import collections.abc
 import contextlib
 import gc
 import json
@@ -342,7 +343,7 @@ class EasyBridgeMixin(PushToHubMixin):
     def _save_model_files(
         self,
         save_directory: ePathLike,
-        gather_fns: dict[tp.Callable] | None = None,
+        gather_fns: dict[str, tp.Callable] | None = None,
         float_dtype=None,
         *,
         step: int | None = None,
@@ -392,7 +393,7 @@ class EasyBridgeMixin(PushToHubMixin):
         save_directory: str | os.PathLike,
         push_to_hub: bool = False,
         token: str | bool | None = None,
-        gather_fns: dict[tp.Callable] | None = None,
+        gather_fns: dict[str, tp.Callable] | None = None,
         float_dtype: jnp.dtype | None = None,
         step: int | None = None,
         **kwargs,
@@ -420,6 +421,8 @@ class EasyBridgeMixin(PushToHubMixin):
             return
 
         repo_id = kwargs.pop("repo_id", easy_directory.name)
+        commit_message: str | None = None
+        files_timestamps: dict[str, float] = {}
         if push_to_hub:
             commit_message = kwargs.pop("commit_message", None)
             repo_id = self._create_repo(repo_id, **kwargs)
@@ -451,13 +454,13 @@ class EasyBridgeMixin(PushToHubMixin):
         private: bool | None = None,
         token: bool | str | None = None,
         create_pr: bool = False,
-        gather_fns: dict[tp.Callable] | None = None,
+        gather_fns: dict[str, tp.Callable] | None = None,
         float_dtype: jnp.dtype | None = None,
         verbose: bool = True,
         mismatch_allowed: bool = True,
         revision: str | None = None,
         commit_description: str | None = None,
-    ) -> str:
+    ) -> tp.Any:
         """Pushes the model to the Hugging Face Hub.
 
         Args:
@@ -613,7 +616,7 @@ class EasyBridgeMixin(PushToHubMixin):
         model: EasyDeLBaseModule,
         param_dtype: jnp.dtype,
         mesh: jax.sharding.Mesh,
-        shard_fns: dict[tp.Callable] | None,
+        shard_fns: dict[str, tp.Callable] | None,
         quantization_config: QuantizationConfig | None,
         apply_quantization: bool,
         verbose: bool,
@@ -669,7 +672,7 @@ class EasyBridgeMixin(PushToHubMixin):
             from easydel.utils.traversals import iter_module_search
 
             quantizer_for_modules = EasyQuantizer(quantization_config=quantization_config)
-            pattern_str = quantizer_for_modules.pattern
+            pattern_str: str | None = quantizer_for_modules.pattern
             pattern = re.compile(pattern_str) if pattern_str is not None else None
             for path, module in iter_module_search(model, nn.Module):
                 if not hasattr(module, "to_quantized") or not callable(module.to_quantized):
@@ -757,8 +760,8 @@ class EasyBridgeMixin(PushToHubMixin):
                         "apply_quantization was requested but no quantization_config was provided; "
                         "defaulting to INT8. Pass quantization_config to control quantization type."
                     )
-                from ejkernel.callib import ejit
-                from ejkernel.quantization import prepack_quantized_weights
+                from ejkernel.callib import ejit  # pyright: ignore[reportMissingTypeStubs]
+                from ejkernel.quantization import prepack_quantized_weights  # pyright: ignore[reportMissingTypeStubs]
 
                 prepack_quantized_weights = ejit(
                     prepack_quantized_weights,
@@ -847,18 +850,18 @@ class EasyBridgeMixin(PushToHubMixin):
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str | os.PathLike | None,
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
-        partition_axis: PartitionAxis = PartitionAxis(),
+        sharding_axis_dims: collections.abc.Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
+        sharding_axis_names: collections.abc.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        partition_axis: PartitionAxis | None = None,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
-        precision: jax.lax.PrecisionLike = jax.lax.Precision("fastest"),
+        precision: jax.lax.PrecisionLike | None = None,
         config_kwargs: dict[str, tp.Any] | None = None,
         partition_rules: tuple[tuple[str, PartitionSpec]] | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = "jax",
-        shard_fns: dict[tp.Callable] | None = None,
+        shard_fns: dict[str, tp.Callable] | None = None,
         auto_shard_model: bool = True,
         verbose: bool = True,
         mismatch_allowed: bool = True,
@@ -937,6 +940,11 @@ class EasyBridgeMixin(PushToHubMixin):
             get_modules_by_type,
         )
 
+        if partition_axis is None:
+            partition_axis = PartitionAxis()
+        if precision is None:
+            precision = jax.lax.Precision("fastest")
+
         api = HfApi(token=token)
 
         proxies = kwargs.pop("proxies", None)
@@ -1000,6 +1008,8 @@ class EasyBridgeMixin(PushToHubMixin):
             shard_fns = fns
 
         resolved_archive_file = None
+        archive_file: ePath | None = None  # pyright: ignore[reportInvalidTypeForm]
+        filename: str | None = None
         if pretrained_model_name_or_path:
             pretrained_model_name_or_path = str(pretrained_model_name_or_path)
 
@@ -1163,11 +1173,11 @@ class EasyBridgeMixin(PushToHubMixin):
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
         precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_dims: collections.abc.Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
+        sharding_axis_names: collections.abc.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
-        shard_fns: tp.Mapping[tuple, tp.Callable] | dict | None = None,
+        shard_fns: collections.abc.Mapping[tuple, tp.Callable] | dict | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
         config_kwargs: EasyDeLBaseConfigDict | None = None,
@@ -1934,9 +1944,9 @@ class EasyBridgeMixin(PushToHubMixin):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: jax.lax.Precision | None = None,
-        sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1, 1),
-        sharding_dcn_axis_dims: tp.Sequence[int] | None = None,
-        sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
+        sharding_axis_dims: collections.abc.Sequence[int] = (1, -1, 1, 1, 1),
+        sharding_dcn_axis_dims: collections.abc.Sequence[int] | None = None,
+        sharding_axis_names: collections.abc.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         partition_axis: PartitionAxis | None = None,
         backend: EasyDeLBackends | None = None,
         platform: EasyDeLPlatforms | None = None,
@@ -2391,7 +2401,7 @@ class EasyBridgeMixin(PushToHubMixin):
 
         def _iter_keys_single_file(filename: str, path: str):
             import torch
-            from safetensors.torch import safe_open  # type:ignore
+            from safetensors.torch import safe_open
 
             if ckpt_weight_format == "safetensors":
                 with safe_open(path, framework="pt", device="cpu") as f:
@@ -2485,7 +2495,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 _write_tensor(key_tuple, jax_array)
 
         import torch
-        from safetensors.torch import safe_open  # type:ignore
+        from safetensors.torch import safe_open
 
         if verbose:
             logger.info(f"Sequential conversion started: {pretrained_model_name_or_path} -> {save_root}")

@@ -42,7 +42,7 @@ from ._fn import evaluation_step, training_step
 from .kto_config import KTOConfig
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.data.core.protocols import ShardedDataSource
 
@@ -199,7 +199,7 @@ class KTOTrainer(Trainer):
         # Map kwargs for dataset processing
         map_kwargs = {"writer_batch_size": 10}
         try:
-            from datasets import Dataset
+            from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
 
             if isinstance(dataset, Dataset):
                 map_kwargs["num_proc"] = getattr(arguments, "dataset_num_proc", None)

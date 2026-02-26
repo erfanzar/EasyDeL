@@ -30,7 +30,7 @@ from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
 from easydel.utils.traversals import deepcopy_model
 
-from ..base_trainer import TrainerConfigureFunctionOutput
+from ..base_trainer import TrainerConfigureFunctionOutput  # pyright: ignore[reportPrivateLocalImportUsage]
 from ..prompt_transforms import DPOPreprocessTransform
 from ..trainer.trainer import Trainer
 from ..training_configurations import MetricsType
@@ -40,7 +40,7 @@ from ._fn import concatenated_forward, evaluation_step, training_step
 from .dpo_config import DPOConfig
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.data.core.protocols import ShardedDataSource
 
@@ -90,7 +90,7 @@ class DPOTrainer(Trainer):
 
     def __init__(
         self,
-        arguments: DPOConfig,
+        arguments: DPOConfig | None,
         model: EasyDeLBaseModule | EasyDeLState,
         reference_model: EasyDeLBaseModule | EasyDeLState | None = None,
         processing_class: ProcessingClassType = None,
@@ -163,7 +163,7 @@ class DPOTrainer(Trainer):
         if not isinstance(reference_model, EasyDeLState):
             reference_model = reference_model.to_state()
 
-        self.reference_state = reference_model
+        self.reference_state: EasyDeLState | None = reference_model
 
         super().__init__(
             model_state=model,

@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -80,7 +80,7 @@ class RMSNorm(nn.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         do_t: bool = False,
-        rngs: nn.Rngs = None,
+        rngs: nn.Rngs | None = None,
     ):
         """Initialize RMSNorm layer.
 
@@ -636,6 +636,7 @@ class CohereModel(EasyDeLBaseModule):
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
+            assert all_hidden_states is not None
             all_hidden_states = (*all_hidden_states, hidden_states)
 
         return BaseModelOutput(
@@ -735,7 +736,7 @@ class CohereForCausalLM(BaseCausalLMModule[CohereModel, CohereConfig]):
         apply_lm_head: bool = True,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-    ) -> CausalLMOutput:  # type:ignore
+    ) -> CausalLMOutput:
         """Forward pass through the Cohere model for causal language modeling.
 
         Processes input through the Cohere transformer and applies the language

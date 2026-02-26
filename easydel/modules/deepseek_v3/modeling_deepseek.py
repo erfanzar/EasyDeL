@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -211,7 +211,7 @@ class MoEGate(nn.Module):
         specs = {"kernel": kernel_spec}
         if hasattr(self, "e_score_correction_bias"):
             specs["e_score_correction_bias"] = Replicated
-        return specs
+        return specs  # pyright: ignore[reportReturnType]
 
     def __call__(self, hidden_states):
         """Compute expert routing weights for input tokens.
@@ -249,6 +249,7 @@ class MoEGate(nn.Module):
             indices = jnp.arange(group_mask.shape[0])[:, None]
             group_mask = group_mask.at[indices, group_idx].set(1.0)
 
+            assert self.n_routed_experts is not None
             score_mask = jnp.repeat(
                 group_mask[:, :, None],
                 self.n_routed_experts // self.n_group,
@@ -1096,7 +1097,7 @@ class DeepseekV3Model(EasyDeLBaseModule):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        return MoeModelOutput(
+        return MoeModelOutput(  # pyright: ignore[reportReturnType]
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_attentions,

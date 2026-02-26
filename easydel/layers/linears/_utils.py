@@ -16,7 +16,7 @@ Note:
 """
 
 import jax
-from ejkernel.callib import cdiv, ejit
+from ejkernel.callib import cdiv, ejit  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 
 
@@ -76,7 +76,7 @@ def i4tou4(x):
     return jnp.where(x < 0, 16 + x, x)
 
 
-@ejit(static_argnames=["BK", "BM", "BNQL", "compute_dtype"])
+@ejit(static_argnames=["BK", "BM", "BNQL", "compute_dtype"])  # pyright: ignore[reportUntypedFunctionDecorator]
 def nf4_qmm_jax(
     x: jax.Array,
     wq: jax.Array,
@@ -136,31 +136,31 @@ def nf4_qmm_jax(
     UN = qblocksize * qnumblocks
     M = x.shape[0]
     K = x.shape[1]
-    BNQL = min(BNQL, qnumblocks)
-    BN = min(cdiv(BNQL, qnumblocks) * qnumblocks, UN)
-    BM, BK = min(BM, M), min(BK, K)
-    num_mblocks = cdiv(M, BM)
-    num_kblocks = cdiv(K, BK)
+    bnql = min(BNQL, qnumblocks)
+    BN = min(cdiv(bnql, qnumblocks) * qnumblocks, UN)
+    bm, bk = min(BM, M), min(BK, K)
+    num_mblocks = cdiv(M, bm)
+    num_kblocks = cdiv(K, bk)
     num_nblocks = cdiv(UN, BN)
     BQ = cdiv(num_nblocks, qnumblocks)
     output = jnp.zeros([M, UN])
     for midx in range(num_mblocks):
         for nidx in range(num_nblocks):
-            acc = jnp.zeros([BM, BN], compute_dtype)
+            acc = jnp.zeros([bm, BN], compute_dtype)
             for kidx in range(num_kblocks):
-                a = jax.lax.dynamic_slice(x, (midx * BM, kidx * BK), (BM, BK))
-                b = jax.lax.dynamic_slice(wq, (kidx * BK, nidx * BQ, 0), (BK, BQ, qfeatures))
-                bs = jax.lax.dynamic_slice(wscale, (kidx * BK, nidx * BQ), (BK, BQ))
+                a = jax.lax.dynamic_slice(x, (midx * bm, kidx * bk), (bm, bk))
+                b = jax.lax.dynamic_slice(wq, (kidx * bk, nidx * BQ, 0), (bk, BQ, qfeatures))
+                bs = jax.lax.dynamic_slice(wscale, (kidx * bk, nidx * BQ), (bk, BQ))
 
                 b = jnp.stack([(b >> 4) & 0xF, b & 0xF], axis=-1)
                 *batch_dims, num_blocks, _ = b.shape
                 b = b.reshape(*batch_dims, num_blocks, -1)
                 b = i4tou4(b)
                 b = nf4xf32_to_f32(b).reshape(*b.shape[:-2], -1)
-                w = (b * jnp.expand_dims(bs, -1)).reshape(BK, -1).astype(compute_dtype)
+                w = (b * jnp.expand_dims(bs, -1)).reshape(bk, -1).astype(compute_dtype)
                 acc += jnp.dot(a, w)
             output = output.at[
-                midx * BM : (midx * BM) + BM,
+                midx * bm : (midx * bm) + bm,
                 nidx * BN : (nidx * BN) + BN,
             ].set(acc)
     return output

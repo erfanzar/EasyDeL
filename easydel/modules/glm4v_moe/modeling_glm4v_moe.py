@@ -17,7 +17,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -476,6 +476,7 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
             partition_manager=self.config.partition_manager,
         )
 
+        layer_outputs = None
         for idx, block in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -508,7 +509,7 @@ class Glm4vMoeTextModel(EasyDeLBaseModule):
             attentions=all_attentions,
             past_key_values=past_key_values,
             router_logits=all_router_logits,
-            all_router_losses=getattr(layer_outputs, "all_router_losses", None),
+            all_router_losses=getattr(layer_outputs, "all_router_losses", None) if layer_outputs is not None else None,
         )
 
     def get_decoder(self):
@@ -698,7 +699,7 @@ class Glm4vMoeModel(Glm4vModel):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Glm4vMoeConfig, model_type="glm4v_moe")
-class Glm4vMoeForConditionalGeneration(BaseVisionLanguageModule[Glm4vMoeModel, Glm4vMoeConfig]):
+class Glm4vMoeForConditionalGeneration(BaseVisionLanguageModule[Glm4vMoeModel, Glm4vMoeConfig]):  # type: ignore
     """GLM4V-MoE model for conditional generation.
 
     Vision-language model that combines a vision encoder with a MoE-enhanced text decoder

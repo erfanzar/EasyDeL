@@ -113,7 +113,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from einops import rearrange
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, DTypeLike, Float, Int, PRNGKeyArray
@@ -233,7 +233,7 @@ def yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
     """
     if scale <= 1:
         return 1.0
-    return 0.1 * mscale * jnp.log(scale) + 1.0
+    return float(0.1 * mscale * jnp.log(scale) + 1.0)
 
 
 class UnifiedAttention(AttentionModule, Generic[Cfg]):
@@ -421,10 +421,11 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
 
         if self.attention_type == "alibi":
             self._create_alibi_slopes(config)
+            self.rotary = None  # ALiBi does not use rotary embeddings
         else:
             self.rotary = self._create_rotary(config, dtype)
 
-        self.attention_performer = self._create_attention_performer(config, rngs)
+        self.attention_performer: FlexibleAttentionModule | None = self._create_attention_performer(config, rngs)
 
         if self.use_qk_norm:
             setattr(
@@ -665,11 +666,12 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             If self.rotary is None (e.g., for ALiBi attention), returns the
             input tensors unchanged.
         """
-        if self.rotary is None:
+        rotary = getattr(self, "rotary", None)
+        if rotary is None:
             return query_states, key_states
         q_rotated: Float[Array, "batch_size seq_len num_heads head_dim"]
         k_rotated: Float[Array, "batch_size seq_len num_kv_heads head_dim"]
-        q_rotated, k_rotated = self.rotary(
+        q_rotated, k_rotated = rotary(
             query=query_states,
             key=key_states,
             positions=position_ids,

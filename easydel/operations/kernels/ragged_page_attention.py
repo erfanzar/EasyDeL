@@ -80,7 +80,10 @@ from functools import partial
 
 import jax
 from eformer import common_types as ct
-from ejkernel.modules import ragged_page_attention_v2, ragged_page_attention_v3
+from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
+    ragged_page_attention_v2,
+    ragged_page_attention_v3,
+)
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from jax.sharding import PartitionSpec as Ps
@@ -102,6 +105,7 @@ from ..requirements import (
 
 USE_SHARDMAP = True
 ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
+
 
 def _normalize_axis_names(axis: str | tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
     """Normalize a partition axis spec into a tuple of concrete mesh axis names."""
@@ -173,6 +177,7 @@ class _RaggedPageAttn(OperationImpl):
         Returns:
             OperationMetadata: The metadata object provided during initialization.
         """
+        assert self.metadata is not None
         return self.metadata
 
     def forward_v2(
@@ -182,7 +187,7 @@ class _RaggedPageAttn(OperationImpl):
         cache_metadata: RaggedPagesMetadata,
         softmax_scale: float | None = None,
         logits_soft_cap: float | None = None,
-        compute_dtype: DTypeLike = jnp.bfloat16,
+        compute_dtype: DTypeLike | None = jnp.bfloat16,
         optimized: bool = False,
         sliding_window: int | None = None,
         softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,  # noqa
@@ -308,8 +313,7 @@ class _RaggedPageAttn(OperationImpl):
         # inside the shard_map body. This avoids materializing global page all-gathers.
         can_use_dp_local = (
             ENABLE_DP_LOCAL_PAGE_PATH
-            and
-            page_axis == ATTN_DP
+            and page_axis == ATTN_DP
             and page_axis_size > 1
             and len(page_axis_names) > 0
             and int(cache_metadata.context_lens.shape[0]) % page_axis_size == 0
@@ -569,10 +573,10 @@ class _RaggedPageAttn(OperationImpl):
         num_query_dims: int = query.ndim
         is_4d: bool = num_query_dims == 4
 
-        batch: int
-        sequence: int
-        head: int
-        dim: int
+        batch: int = 0
+        sequence: int = 0
+        head: int = 0
+        dim: int = 0
         if is_4d:
             batch, sequence, head, dim = query.shape
 

@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -67,7 +67,7 @@ class Cohere2LayerNorm(nn.Module):
         eps: float = 1e-6,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nn.Rngs = None,
+        rngs: nn.Rngs | None = None,
     ):
         """Initialize Cohere2LayerNorm layer.
 
@@ -173,7 +173,9 @@ class Cohere2Attention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=True,
-            sliding_window=config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None,
+            sliding_window=config.sliding_window
+            if config.layer_types is not None and config.layer_types[layer_idx] == "sliding_attention"
+            else None,
         )
 
     def _create_rotary(self, config: Cohere2Config, dtype: jnp.dtype):
@@ -634,6 +636,7 @@ class Cohere2Model(EasyDeLBaseModule):
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
+            assert all_hidden_states is not None
             all_hidden_states = (*all_hidden_states, hidden_states)
 
         return BaseModelOutput(

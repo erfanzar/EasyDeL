@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import typing as tp
+from collections.abc import Mapping
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -53,7 +54,7 @@ class SeedOssConfig(EasyDeLBaseConfig):
         initializer_range: float = 0.02,
         rms_norm_eps: float = 1.0e-5,
         rope_theta: float = 1_000_000.0,
-        rope_scaling: tp.Mapping[str, tp.Any] | None = None,
+        rope_scaling: Mapping[str, tp.Any] | None = None,
         tie_word_embeddings: bool = False,
         attention_dropout: float = 0.0,
         resid_pdrop: float = 0.0,
@@ -71,7 +72,7 @@ class SeedOssConfig(EasyDeLBaseConfig):
         bits: int | None = None,
         attention_bias: bool = True,
         attention_out_bias: bool = False,
-        residual_dropout=0.1,
+        residual_dropout: float = 0.1,
         mlp_bias: bool = False,
         **kwargs,
     ):
@@ -140,7 +141,7 @@ class SeedOssConfig(EasyDeLBaseConfig):
         )
 
     def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, tp.Any], ...]:
-        return None
+        return None  # type: ignore
 
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Return per-layer attention mask settings."""

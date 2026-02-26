@@ -22,7 +22,7 @@ import numpy as np
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -112,7 +112,7 @@ class Qwen3VLMoeModelOutputWithPast(ModelOutput):
     router_logits: tuple[Array] | None = None
 
 
-def _dbg_tail(x: Array) -> Array:
+def _dbg_tail(x: Array) -> Array:  # pyright: ignore[reportUnusedFunction]
     """Return the last 5 flattened elements for compact debug prints."""
     flat = jnp.ravel(x)
     return flat[-5:]
@@ -191,11 +191,13 @@ def get_rope_index(
                     ed_video = len(input_tokens) + 1
 
                 if ed_image < ed_video:
+                    assert image_grid_thw is not None
                     t, h, w = image_grid_thw[image_index]
                     image_index += 1
                     remain_images -= 1
                     ed = ed_image
                 else:
+                    assert video_grid_thw is not None
                     t, h, w = video_grid_thw[video_index]
                     video_second_per_grid_t = 1.0
                     if second_per_grid_ts:
@@ -1841,7 +1843,7 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        return MoeCausalLMOutput(
+        return MoeCausalLMOutput(  # pyright: ignore[reportReturnType]
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
@@ -2049,7 +2051,7 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
 
     def compute_embedding(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None,
         *,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         pixel_values: Array | None = None,
@@ -2127,7 +2129,7 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
 
     def compute_embedding_with_info(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None,
         *,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         pixel_values: Array | None = None,
@@ -2558,9 +2560,8 @@ class Qwen3VLMoeModel(EasyDeLBaseModule):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
-
         router_logits = getattr(outputs, "router_logits", None) if output_router_logits else None
-        return Qwen3VLMoeModelOutputWithPast(
+        return Qwen3VLMoeModelOutputWithPast(  # pyright: ignore[reportReturnType]
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,

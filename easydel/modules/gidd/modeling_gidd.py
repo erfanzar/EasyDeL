@@ -34,7 +34,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -261,7 +261,7 @@ class GiddAttention(AttentionModule):
         key: Array,
         value: Array,
         mask_info: MaskInfo,
-        noise_mask: Array,
+        noise_mask: Array | None,
         cache_view: TransformerCacheView | RaggedPagesCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> tuple[Array, Array, Array, tp.Callable[[], Array]]:
@@ -287,12 +287,14 @@ class GiddAttention(AttentionModule):
         # Validate that query and key have matching sequence lengths
         assert query.shape[1] == key.shape[1], "Query and Key lengths must match for GIDD attention."
 
+        attention_mask = mask_info.attention_mask
         if attention_mask is not None:
             if attention_mask.dtype != jnp.bool:
                 warnings.warn("attention_mask should be a boolean array", stacklevel=1)
                 attention_mask = (attention_mask == 1).astype("b1")
 
         # Expand attention mask to match attention computation dimensions
+        assert attention_mask is not None, "attention_mask must not be None for GIDD attention"
         attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
         attention_mask = jnp.repeat(attention_mask, query.shape[1], -2)  # [Batch, 1, q_len, kv_len]
 
@@ -316,7 +318,7 @@ class GiddAttention(AttentionModule):
                 jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
             )
 
-        return key, value, attention_mask, init_attention_bias, cache_view
+        return key, value, attention_mask, init_attention_bias, cache_view  # pyright: ignore[reportReturnType]
 
     def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
         """Apply L2 normalization to query or key vectors.
@@ -437,7 +439,7 @@ class GiddAttention(AttentionModule):
             name="attn_output",
         )
 
-        return AttentionLayerOutput(
+        return AttentionLayerOutput(  # pyright: ignore[reportReturnType]
             attention_output=attn_output,
             attention_weight=attentions.attention_weights if output_attentions else None,
             cache_view=cache_view,

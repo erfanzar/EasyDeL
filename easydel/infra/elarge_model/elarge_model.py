@@ -62,7 +62,7 @@ from .types import ELMConfig
 from .utils import load_elm_config, save_elm_config
 
 if typing.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.data.core.protocols import ShardedDataSource
     from easydel.inference import eSurge
@@ -216,7 +216,7 @@ class eLargeModel:
             >>> elm = eLargeModel.from_yaml("pipeline.yaml")
         """
         try:
-            import yaml  # type: ignore
+            import yaml
         except ImportError as e:
             raise ImportError("PyYAML is required for YAML configs. Install with: pip install pyyaml") from e
 
@@ -902,7 +902,7 @@ class eLargeModel:
             >>> elm2 = eLargeModel.from_yaml("config.yaml")
         """
         try:
-            import yaml  # type: ignore
+            import yaml
         except ImportError as e:
             raise ImportError("PyYAML is required for YAML configs. Install with: pip install pyyaml") from e
 
@@ -1796,7 +1796,9 @@ class eLargeModel:
         try:
             from lm_eval import evaluator  # type:ignore
         except ImportError as e:
-            raise ImportError("lm-eval is required for evaluation. Install with: pip install lm-eval") from e
+            raise ImportError(
+                "lm-eval is required for evaluation. Install with: pip install easydel[torch, lm-eval]"
+            ) from e
 
         if isinstance(tasks, str):
             tasks = [tasks]
@@ -1809,11 +1811,13 @@ class eLargeModel:
         max_new_tokens = eval_config.pop("max_new_tokens", 2048)
         temperature = eval_config.pop("temperature", 0.0)
         top_p = eval_config.pop("top_p", 0.95)
+        normalize_math_answers = bool(eval_config.pop("normalize_math_answers", True))
+        math_answer_task_hints = eval_config.pop("math_answer_task_hints", None)
         include_path = eval_config.pop("include_path", None)
         include_defaults = bool(eval_config.pop("include_defaults", True))
         task_manager = eval_config.pop("task_manager", None)
 
-        eval_adapter = None
+        eval_adapter: Any | None = None
         engine_instance = None
 
         if isinstance(engine, str):
@@ -1836,6 +1840,8 @@ class eLargeModel:
                     batch_size=batch_size,
                     temperature=temperature,
                     top_p=top_p,
+                    normalize_math_answers=normalize_math_answers,
+                    math_answer_task_hints=math_answer_task_hints,
                 )
             else:
                 raise ValueError(f"Unknown engine type: {engine}")
@@ -1857,6 +1863,8 @@ class eLargeModel:
                     batch_size=batch_size,
                     temperature=temperature,
                     top_p=top_p,
+                    normalize_math_answers=normalize_math_answers,
+                    math_answer_task_hints=math_answer_task_hints,
                 )
 
             else:

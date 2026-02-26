@@ -20,7 +20,7 @@ from eformer import common_types
 from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import image as jimg
 from jax.ad_checkpoint import checkpoint_name
@@ -746,8 +746,8 @@ class SiglipTextTransformer(EasyDeLBaseModule):
         input_ids: Int[Array, "batch seq_len"],
         mask_info: MaskInfo,
         position_ids: Int[Array, "batch seq_len"],
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
+        output_attentions: bool | None = False,
+        output_hidden_states: bool | None = False,
     ):
         """Forward pass through the text transformer.
 
@@ -1682,7 +1682,7 @@ class SiglipModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.IMAGE_CLASSIFICATION, config=SiglipConfig, model_type="siglip")
-class SiglipForImageClassification(BaseImageClassificationModule[SiglipVisionModel, SiglipConfig]):
+class SiglipForImageClassification(BaseImageClassificationModule[SiglipVisionModel, SiglipConfig]):  # type: ignore
     """SigLIP vision model with image classification head.
 
     Extends the SigLIP vision transformer with a linear classification layer

@@ -101,7 +101,7 @@ class StepMetrics:
         learning_rate: float,
         mode: tp.Literal["eval", "train"] | None = None,
         **extras,
-    ) -> dict[str, float]:
+    ) -> dict[str, tp.Any]:
         """Calculate comprehensive metrics for the training step.
 
         Computes performance metrics, loss statistics, and optional detailed
@@ -146,7 +146,7 @@ class StepMetrics:
         total_tokens = batch_size * seq_length
         visited_tokens = total_tokens * current_step
         throughput = total_tokens / execution_time
-        perf_key = mode + "-mlperf"
+        perf_key = (mode or "step") + "-mlperf"
         mlperf_metrics = {
             f"{perf_key}/execution_time": float(execution_time),
             f"{perf_key}/flops": float(flops),
@@ -627,7 +627,7 @@ class MetricsHistogram:
         return jnp.sqrt(self.variance).reshape(-1)
 
 
-@ejit(static_argnums=(1,))
+@ejit(static_argnums=(1,))  # pyright: ignore[reportUntypedFunctionDecorator]
 def compute_weight_stats(params: dict[str, tp.Any], repattern: str) -> dict[str, MetricsHistogram]:
     """Compute statistics for model weights in a JIT-compatible way.
 

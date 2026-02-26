@@ -224,7 +224,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     for config_name in to_run:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Running: {config_name} (dry_run={args.dry_run})")
         print("=" * 60)
 

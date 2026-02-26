@@ -176,7 +176,7 @@ class Phi3Config(EasyDeLBaseConfig):
         if self.layer_types is None:
             self.layer_types = [
                 "sliding_attention" if self.sliding_window is not None else "full_attention"
-                for i in range(self.num_hidden_layers)
+                for _ in range(self.num_hidden_layers)
             ]
         super().__init__(
             pad_token_id=pad_token_id,

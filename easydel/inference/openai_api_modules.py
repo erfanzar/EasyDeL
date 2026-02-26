@@ -51,6 +51,7 @@ Example:
 import time
 import typing as tp
 import uuid
+from collections.abc import Mapping
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -110,7 +111,7 @@ class ChatMessage(OpenAIBaseModel):
     """
 
     role: str
-    content: str | list[tp.Mapping[str, tp.Any]]
+    content: str | list[Mapping[str, tp.Any]] | None
     name: str | None = None
     function_call: dict[str, tp.Any] | None = None
     tool_calls: list | None = None
@@ -131,7 +132,7 @@ class DeltaMessage(OpenAIBaseModel):
     """
 
     role: str | None = None
-    content: str | list[tp.Mapping[str, tp.Any]] | None = None
+    content: str | list[Mapping[str, tp.Any]] | None = None
     function_call: dict[str, tp.Any] | None = None
     tool_calls: list | None = None
     reasoning_content: str | None = None
@@ -223,7 +224,7 @@ class FunctionDefinition(OpenAIBaseModel):
 
     name: str
     description: str | None = None
-    parameters: dict[str, tp.Any] = Field(default_factory=dict)
+    parameters: dict[str, tp.Any] | None = Field(default_factory=dict)
     required: list[str] | None = None
 
 
@@ -275,7 +276,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
-    temperature: float = 0.7
+    temperature: float | None = 0.7
     top_p: float = 0.95
     top_k: int = 0
     min_p: float = 0.0
@@ -403,7 +404,7 @@ class CompletionRequest(OpenAIBaseModel):
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
-    temperature: float = 0.7
+    temperature: float | None = 0.7
     top_p: float = 0.95
     top_k: int = 0
     min_p: float = 0.0
@@ -452,7 +453,7 @@ class ResponsesRequest(OpenAIBaseModel):
 
     model: str
     input: str | list[tp.Any] | None = None
-    messages: list[tp.Mapping[str, tp.Any]] | None = None
+    messages: list[Mapping[str, tp.Any]] | None = None
     instructions: str | None = None
 
     # Conversation state / storage
@@ -475,8 +476,8 @@ class ResponsesRequest(OpenAIBaseModel):
     n: int | None = None
 
     # Tools
-    tools: list[tp.Mapping[str, tp.Any]] | None = None
-    functions: list[tp.Mapping[str, tp.Any]] | None = None
+    tools: list[Mapping[str, tp.Any]] | None = None
+    functions: list[Mapping[str, tp.Any]] | None = None
     tool_choice: str | dict[str, tp.Any] | None = None
     parallel_tool_calls: bool | None = None
 

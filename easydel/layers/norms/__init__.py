@@ -54,4 +54,4 @@ See Also:
 
 from ._norms import BatchNorm, LayerNorm, RMSNorm, lowfloats
 
-__all__ = "RMSNorm", "lowfloats", LayerNorm, BatchNorm
+__all__ = ("BatchNorm", "LayerNorm", "RMSNorm", "lowfloats")

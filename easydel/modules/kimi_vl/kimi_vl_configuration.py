@@ -22,6 +22,7 @@ layout:
 from __future__ import annotations
 
 import typing as tp
+from collections.abc import Mapping
 
 from jax.sharding import PartitionSpec
 
@@ -84,8 +85,8 @@ class KimiVLConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vision_config: tp.Mapping[str, tp.Any] | MoonViTConfig | None = None,
-        text_config: tp.Mapping[str, tp.Any] | DeepseekV3Config | None = None,
+        vision_config: Mapping[str, tp.Any] | MoonViTConfig | None = None,
+        text_config: Mapping[str, tp.Any] | DeepseekV3Config | None = None,
         ignore_index: int = -100,
         media_placeholder_token_id: int = 163605,
         pad_token_id: int = 0,
@@ -117,7 +118,7 @@ class KimiVLConfig(EasyDeLBaseConfig):
         )
 
     def get_text_config(self, decoder: bool = True) -> DeepseekV3Config:
-        return self.text_config
+        return self.text_config  # type: ignore
 
     def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
         """Returns partition rules for model sharding.

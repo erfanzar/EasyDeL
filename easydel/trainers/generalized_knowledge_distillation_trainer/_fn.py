@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import collections.abc
 import typing as tp
 
 import flax
@@ -129,7 +130,7 @@ def generalized_jsd_loss(
 
 def gkd_step(
     student_state: EasyDeLState,
-    batch: tp.Mapping[str, jax.Array],
+    batch: collections.abc.Mapping[str, jax.Array],
     teacher_state: EasyDeLState,
     loss_config: LossConfig | None = None,
     learning_rate_fn=None,

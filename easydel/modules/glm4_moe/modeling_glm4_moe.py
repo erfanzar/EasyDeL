@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -140,7 +140,7 @@ class Glm4MoeMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        return hidden_states, None
+        return hidden_states, None  # pyright: ignore[reportReturnType]
 
 
 class Glm4MoeMLPStack(nn.Module):
@@ -935,7 +935,7 @@ class Glm4MoeModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Glm4MoeConfig, model_type="glm4_moe")
-class Glm4MoeForCausalLM(BaseCausalLMModule[Glm4MoeModel, Glm4MoeConfig]):
+class Glm4MoeForCausalLM(BaseCausalLMModule[Glm4MoeModel, Glm4MoeConfig]):  # type: ignore
     """GLM-4 MoE model with a language modeling head for causal language modeling tasks.
 
     This model is a transformer-based language model with mixture-of-experts layers
@@ -984,7 +984,7 @@ class Glm4MoeForCausalLM(BaseCausalLMModule[Glm4MoeModel, Glm4MoeConfig]):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Glm4MoeConfig, model_type="glm4_moe")
-class Glm4MoeForSequenceClassification(BaseSequenceClassificationModule[Glm4MoeModel, Glm4MoeConfig]):
+class Glm4MoeForSequenceClassification(BaseSequenceClassificationModule[Glm4MoeModel, Glm4MoeConfig]):  # type: ignore
     """GLM-4 MoE model for sequence classification tasks.
 
     This class extends the base GLM-4 MoE model by adding a linear classification head

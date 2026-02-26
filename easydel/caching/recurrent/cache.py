@@ -236,7 +236,7 @@ class RecurrentCacheView(BaseCacheView):
 
     conv_state: Float[Array, "batch conv_dim conv_kernel_size"] | ImplicitArray | None
     recurrent_state: Float[Array, "batch ..."] | ImplicitArray | None
-    positions: Int[Array, "batch"]  # noqa:F821
+    positions: Int[Array, "batch"] | None  # noqa:F821
     # NOTE: this must be a JAX value (not static pytree metadata) so it can
     # change inside `lax.while_loop` during generation without breaking the
     # carry pytree structure.
@@ -306,8 +306,8 @@ class RecurrentCacheView(BaseCacheView):
         recurrent_state: Float[Array, "batch ..."] | None = None,
         cache_position: Int[Array, "..."] | None = None,
     ) -> tuple[
-        Float[Array, "batch conv_dim conv_kernel_size"] | None,
-        Float[Array, "batch ..."] | None,
+        Float[Array, "batch conv_dim conv_kernel_size"] | ImplicitArray | None,
+        Float[Array, "batch ..."] | ImplicitArray | None,
         RecurrentCacheView,
     ]:
         """Update cache state with new conv and/or recurrent states.
@@ -582,7 +582,8 @@ class RecurrentCache(BaseCache):
         """
         for view in self.views:
             if view is not None:
-                view.positions = view.positions + num
+                if view.positions is not None:
+                    view.positions = view.positions + num
                 view.seqlen_offset = view.seqlen_offset + num
 
     def to_pure(self) -> tuple[list[dict[str, tp.Any]], RecurrentCacheConfig | None]:

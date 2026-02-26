@@ -1,5 +1,7 @@
 """Tests for Kimi Linear model."""
 
+# pyright: reportPrivateLocalImportUsage=false
+
 import pytest
 
 import easydel as ed
@@ -7,16 +9,18 @@ import easydel as ed
 try:
     from .test_utils import CausalLMTester, get_hf_model_from_hub
 except ImportError:
-    from test_utils import CausalLMTester, get_hf_model_from_hub
+    from test_utils import CausalLMTester, get_hf_model_from_hub  # pyright: ignore[reportImplicitRelativeImport]
 
 
 # Check if fla-core is available (required for Kimi Linear)
+_has_fla = False
 try:
-    import fla  # noqa: F401
+    import fla  # noqa: F401  # pyright: ignore[reportMissingImports,reportUnusedImport]
 
-    HAS_FLA = True
+    _has_fla = True
 except ImportError:
-    HAS_FLA = False
+    pass
+HAS_FLA: bool = _has_fla
 
 
 @pytest.mark.skipif(not HAS_FLA, reason="fla-core package required: pip install -U fla-core")

@@ -1,5 +1,7 @@
 """Tests for Whisper model."""
 
+# pyright: reportPrivateLocalImportUsage=false
+
 import pytest
 import transformers
 
@@ -8,7 +10,7 @@ import easydel as ed
 try:
     from .test_utils import Seq2SeqTester
 except ImportError:
-    from test_utils import Seq2SeqTester
+    from test_utils import Seq2SeqTester  # pyright: ignore[reportImplicitRelativeImport]
 
 
 class TestWhisper:

@@ -18,7 +18,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import ColumnWise, Replicated, RowWise
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
@@ -118,7 +118,7 @@ class Conv1D(nn.Module):
         specs = {"kernel": kernel_spec}
         if self.bias is not None:
             specs["bias"] = Replicated
-        return specs
+        return specs  # pyright: ignore[reportReturnType]
 
     def __call__(self, inputs):
         """Forward pass of the Conv1D layer.
@@ -873,7 +873,7 @@ class GPT2Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=GPT2Config, model_type="gpt2")
-class GPT2LMHeadModel(BaseCausalLMModule[GPT2Model, GPT2Config]):
+class GPT2LMHeadModel(BaseCausalLMModule[GPT2Model, GPT2Config]):  # type: ignore
     """GPT-2 model with a language modeling head.
 
     This model extends the base GPT2Model by adding a linear layer on top to

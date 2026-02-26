@@ -67,6 +67,7 @@ See Also:
 
 from __future__ import annotations
 
+import collections.abc
 import os
 import typing as tp
 from typing import Any, Literal, NotRequired, Required, TypedDict
@@ -84,17 +85,17 @@ from easydel.layers import QuantizationConfig
 from .trainer_types import TrainerConfig
 
 if tp.TYPE_CHECKING:
-    from ejkernel.modules.operations.configs import BaseOperationConfig
+    from ejkernel.modules.operations.configs import BaseOperationConfig  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.inference.reasoning.abstract_reasoning import ReasoningParserName
     from easydel.inference.sampling_params import SamplingParams
     from easydel.inference.tools.abstract_tool import ToolParserName
 
-DTypeLike = tp.Union[  # noqa
-    str,
-    jnp.dtype,
-    type,
-    tp.Literal[
+DTypeLike = (
+    str
+    | jnp.dtype
+    | type
+    | tp.Literal[
         "fp8",
         "bf16",
         "fp16",
@@ -102,8 +103,8 @@ DTypeLike = tp.Union[  # noqa
         "mxfp4",
         "mxfp8",
         "nvfp8",
-    ],
-]
+    ]
+)
 """Type alias for data type specifications.
 
 Represents valid data type values that can be used for model computation and
@@ -125,11 +126,11 @@ Example:
     >>> dtype: DTypeLike = jnp.float32
 """
 
-PrecisionLike = tp.Union[  # noqa
-    str,
-    jax.lax.Precision,
-    None,
-    tp.Literal[
+PrecisionLike = (
+    str
+    | jax.lax.Precision
+    | None
+    | tp.Literal[
         "HIGH",
         "DEFAULT",
         "HIGHEST",
@@ -140,8 +141,8 @@ PrecisionLike = tp.Union[  # noqa
         "tensorfloat32",
         "default",
         "fastest",
-    ],
-]
+    ]
+)
 """Type alias for JAX precision level specifications.
 
 Controls the precision used in matrix multiplication and convolution operations.
@@ -499,11 +500,11 @@ class ShardingCfg(TypedDict, total=False):
         axis to automatically use remaining devices.
     """
 
-    axis_dims: NotRequired[tp.Sequence[int]]
-    dcn_axis_dims: NotRequired[tp.Sequence[int]]
-    axis_names: NotRequired[tp.Sequence[str]]
+    axis_dims: NotRequired[collections.abc.Sequence[int]]
+    dcn_axis_dims: NotRequired[collections.abc.Sequence[int]]
+    axis_names: NotRequired[collections.abc.Sequence[str]]
     partition_axis: NotRequired[PartitionAxis | None]
-    shard_fns: NotRequired[tp.Mapping[tuple, tp.Callable[..., Any]] | dict]
+    shard_fns: NotRequired[collections.abc.Mapping[tuple, tp.Callable[..., Any]] | dict]
     auto_shard_model: NotRequired[bool]
     partition_rules: NotRequired[PartitionRules]
     use_ring_of_experts: NotRequired[bool]
@@ -839,7 +840,7 @@ class eSurgeCfg(TypedDict, total=False):
     min_input_pad: NotRequired[int]
     min_token_pad: NotRequired[int | None]
     max_num_seqs: NotRequired[int]
-    max_num_seq_buckets: NotRequired[tp.Sequence[int] | None]
+    max_num_seq_buckets: NotRequired[collections.abc.Sequence[int] | None]
     max_num_batched_tokens: NotRequired[int | None]
     hbm_utilization: NotRequired[float]
     page_size: NotRequired[int]
@@ -847,7 +848,7 @@ class eSurgeCfg(TypedDict, total=False):
     bind_graphstate_for_aot: NotRequired[bool]
     enable_prefix_caching: NotRequired[bool]
     auto_shard_model: NotRequired[bool]
-    sharding_axis_dims: NotRequired[tp.Sequence[int]]
+    sharding_axis_dims: NotRequired[collections.abc.Sequence[int]]
     compile_runner: NotRequired[bool]
     runner_verbose: NotRequired[bool]
     verbose: NotRequired[bool]
@@ -863,7 +864,7 @@ class eSurgeCfg(TypedDict, total=False):
     prefer_preserve_prompt: NotRequired[bool]
     decode_truncated_prompt: NotRequired[bool]
     destroy_pages_on_pause: NotRequired[bool]
-    detokenizer_max_states: NotRequired[int]
+    detokenizer_max_states: NotRequired[int | None]
     idle_reset_seconds: NotRequired[float | None]
     idle_reset_min_interval: NotRequired[float]
     tokenizer_endpoint: NotRequired[str | None]
@@ -1403,6 +1404,8 @@ class EvalKwargs(TypedDict, total=False):
     max_new_tokens: NotRequired[int]
     temperature: NotRequired[float]
     top_p: NotRequired[float]
+    normalize_math_answers: NotRequired[bool]
+    math_answer_task_hints: NotRequired[collections.abc.Sequence[str] | str | None]
     batch_size: NotRequired[int | None]
     use_tqdm: NotRequired[bool]
     limit: NotRequired[int | float | None]

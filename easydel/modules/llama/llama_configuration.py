@@ -189,9 +189,9 @@ class VisionLlamaConfig(LlamaConfig):
 
     def __init__(
         self,
-        vision_vocab_size=8448,
-        tie_vision_embeddings=False,
-        sample_mode="all",
+        vision_vocab_size: int = 8448,
+        tie_vision_embeddings: bool = False,
+        sample_mode: str = "all",
         **kwargs,
     ):
         """Initialize VisionLlamaConfig for vision-augmented Llama models.

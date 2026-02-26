@@ -54,7 +54,7 @@ NAME_REGEX = re.compile(r'"name"\s*:\s*"([^"]*)"', re.DOTALL)
 ARGS_REGEX = re.compile(r'"arguments"\s*:\s*(.*)', re.DOTALL)
 
 
-@ToolParserManager.register_module("gigachat3")
+@ToolParserManager.register_module("gigachat3")  # pyright: ignore[reportUntypedClassDecorator]
 class GigaChat3ToolParser(ToolParser):
     """Tool parser for GigaChat3 model outputs.
 

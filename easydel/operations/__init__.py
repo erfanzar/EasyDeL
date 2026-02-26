@@ -47,7 +47,7 @@ Example:
     ... )
 """
 
-from ejkernel.modules.operations.configs import (
+from ejkernel.modules.operations.configs import (  # pyright: ignore[reportMissingTypeStubs]
     AttentionConfig,
     BaseOperationConfig,
     BlockSparseAttentionConfig,

@@ -61,7 +61,7 @@ from collections.abc import Callable
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -404,7 +404,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
 
         # Return MoeCausalLMOutput for MoE models, CausalLMOutput otherwise
         if aux_loss is not None or hasattr(outputs, "all_router_losses"):
-            return MoeCausalLMOutput(
+            return MoeCausalLMOutput(  # pyright: ignore[reportReturnType]
                 logits=lm_logits,
                 hidden_states=outputs.hidden_states,
                 last_hidden_state=outputs.last_hidden_state,

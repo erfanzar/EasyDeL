@@ -460,7 +460,7 @@ class KernelDeltaAttnOp(OperationImpl):
     """
 
     @classmethod
-    def get_impl_name(cls) -> str | tuple[str]:
+    def get_impl_name(cls) -> str | tuple[str, ...]:
         """Returns the registered name of this operation.
 
         Returns:
@@ -474,6 +474,7 @@ class KernelDeltaAttnOp(OperationImpl):
         Returns:
             The OperationMetadata provided during initialization.
         """
+        assert self.metadata is not None
         return self.metadata
 
     @classmethod
@@ -539,6 +540,7 @@ class KernelDeltaAttnOp(OperationImpl):
             KDAOutput containing attention outputs and updated states
         """
         seq_len = query.shape[1]
+        shardings = None
 
         if self.metadata.mesh is not None:
             with self.metadata.mesh:
@@ -592,7 +594,7 @@ class KernelDeltaAttnOp(OperationImpl):
 
         outputs = outputs.transpose(0, 2, 1, 3)
 
-        if self.metadata.mesh is not None:
+        if self.metadata.mesh is not None and shardings is not None:
             with self.metadata.mesh:
                 outputs = with_sharding_constraint(arr=outputs, sharding=shardings.output)
 

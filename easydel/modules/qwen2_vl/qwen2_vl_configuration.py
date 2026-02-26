@@ -14,6 +14,7 @@
 
 
 import typing
+from collections.abc import Mapping
 
 from jax.sharding import PartitionSpec
 
@@ -56,17 +57,17 @@ class Qwen2VLVisionConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        depth=32,
-        embed_dim=1280,
-        hidden_size=3584,
-        hidden_act="quick_gelu",
-        mlp_ratio=4,
-        num_heads=16,
-        in_channels=3,
-        patch_size=14,
-        spatial_merge_size=2,
-        temporal_patch_size=2,
-        initializer_range=0.02,
+        depth: int = 32,
+        embed_dim: int = 1280,
+        hidden_size: int = 3584,
+        hidden_act: str = "quick_gelu",
+        mlp_ratio: int = 4,
+        num_heads: int = 16,
+        in_channels: int = 3,
+        patch_size: int = 14,
+        spatial_merge_size: int = 2,
+        temporal_patch_size: int = 2,
+        initializer_range: float = 0.02,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -191,8 +192,8 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        text_config: typing.Mapping[str, typing.Any] | Qwen2VLTextConfig | None = None,
-        vision_config: typing.Mapping[str, typing.Any] | Qwen2VLVisionConfig | None = None,
+        text_config: Mapping[str, typing.Any] | Qwen2VLTextConfig | None = None,
+        vision_config: Mapping[str, typing.Any] | Qwen2VLVisionConfig | None = None,
         image_token_id: int = 151655,
         video_token_id: int = 151656,
         vision_start_token_id: int = 151652,

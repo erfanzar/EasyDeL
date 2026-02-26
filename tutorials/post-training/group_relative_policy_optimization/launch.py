@@ -17,8 +17,8 @@ import pprint
 import re
 from typing import Any
 
-import ray  # type: ignore
-from eformer.executor.ray import TpuAcceleratorConfig, execute  # type: ignore
+import ray
+from eformer.executor.ray import TpuAcceleratorConfig, execute
 
 ray.init()
 # --- Configuration Constants ---
@@ -61,9 +61,9 @@ pprint.pprint(TPU_EXECUTION_ENV_VARS)
 @ray.remote
 def main():
     # Imports inside main to ensure they are available in the Ray remote environment
-    import jax  # type: ignore
-    from datasets import load_dataset  # type: ignore
-    from jax import numpy as jnp  # type: ignore
+    import jax
+    from datasets import load_dataset  # pyright: ignore[reportMissingTypeStubs]
+    from jax import numpy as jnp
     from math_verify import LatexExtractionConfig, parse, verify  # type: ignore
     from transformers import AutoTokenizer
 
@@ -89,7 +89,7 @@ def main():
     max_prompt_length = 2048
     max_completion_length = 2048
 
-    grpo_config = ed.GRPOConfig(
+    grpo_config = ed.GRPOConfig(  # pyright: ignore[reportPrivateLocalImportUsage]
         total_batch_size=total_batch_size,
         max_prompt_length=max_prompt_length,
         max_completion_length=max_completion_length,
@@ -99,8 +99,8 @@ def main():
         report_steps=10,
         progress_bar_type="json",
         num_train_epochs=3,
-        optimizer=ed.EasyDeLOptimizers.ADAMW,
-        scheduler=ed.EasyDeLSchedulers.LINEAR,
+        optimizer=ed.EasyDeLOptimizers.ADAMW,  # pyright: ignore[reportPrivateLocalImportUsage]
+        scheduler=ed.EasyDeLSchedulers.LINEAR,  # pyright: ignore[reportPrivateLocalImportUsage]
         do_last_save=True,
         track_memory=False,  # Set to True if memory tracking is needed
         save_steps=1000,
@@ -123,19 +123,19 @@ def main():
 
     # --- Model Loading ---
     logger.info(f"Loading model: {MODEL_ID}")
-    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(  # pyright: ignore[reportPrivateLocalImportUsage]
         MODEL_ID,
         auto_shard_model=True,
         sharding_axis_dims=(1, -1, 1, 1, 1),  # Specific to model architecture and TPU topology
-        config_kwargs=ed.EasyDeLBaseConfigDict(
+        config_kwargs=ed.EasyDeLBaseConfigDict(  # pyright: ignore[reportPrivateLocalImportUsage]
             freq_max_position_embeddings=max_sequence_length,
             mask_max_position_embeddings=max_sequence_length,
             attn_dtype=jnp.bfloat16,
             attn_softmax_dtype=jnp.bfloat16,
             kvdtype=jnp.bfloat16,
             #  # Default
-            attn_mechanism=ed.AttentionMechanisms.AUTO,
-            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,  # change this if u go OOM
+            attn_mechanism=ed.AttentionMechanisms.AUTO,  # pyright: ignore[reportPrivateLocalImportUsage]
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,  # pyright: ignore[reportPrivateLocalImportUsage]  # change this if u go OOM
         ),
         #  # Default
         param_dtype=jnp.bfloat16,
@@ -239,7 +239,7 @@ def main():
 
     # --- Trainer Setup and Execution ---
     logger.info("Initializing GRPOTrainer.")
-    trainer = ed.GRPOTrainer(
+    trainer = ed.GRPOTrainer(  # pyright: ignore[reportPrivateLocalImportUsage]
         model=model,
         reward_funcs=[format_reward, accuracy_reward],
         processing_class=tokenizer,  # Pass the instance

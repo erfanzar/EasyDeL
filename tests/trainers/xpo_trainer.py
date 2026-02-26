@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+# pyright: reportPrivateLocalImportUsage=false
 import sys
 from pathlib import Path
 
@@ -30,7 +31,7 @@ if __package__ in {None, ""}:
         make_config,
     )
 else:
-    from ._common import (  # type: ignore
+    from ._common import (
         dummy_reward_fn,
         get_logger,
         get_tokenizer,

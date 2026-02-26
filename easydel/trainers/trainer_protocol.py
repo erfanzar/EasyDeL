@@ -13,18 +13,19 @@
 # limitations under the License.
 from __future__ import annotations
 
+import collections.abc
 import os
 import typing as tp
 from abc import ABCMeta, abstractmethod
 
 import jax
 import numpy as np
-import optax
+import optax  # pyright: ignore[reportMissingTypeStubs]
 from eformer.paths import ePathLike
 from eformer.pytree import auto_pytree
 from eformer.serialization import AsyncCheckpointManager
 from jax.sharding import Mesh
-from optax import GradientTransformation, Schedule
+from optax import GradientTransformation, Schedule  # pyright: ignore[reportMissingTypeStubs]
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
@@ -44,11 +45,22 @@ from easydel.utils import Timers
 from .metrics import BaseProgressBar, MetricsTracker, StepMetrics
 from .training_configurations import MetricsType, TrainingArguments
 
+__all__ = [
+    "BaseProgressBar",
+    "BaseTrainerProtocol",
+    "MetricsTracker",
+    "StepMetrics",
+    "TrainerConfigureDataloaderOutput",
+    "TrainerConfigureFunctionOutput",
+    "TrainerConfigureModelOutput",
+    "TrainerOutput",
+]
+
 if tp.TYPE_CHECKING:
     pass
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset
+    from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
     from jax._src.pjit import JitWrapped
 else:
     JitWrapped = tp.Any
@@ -72,9 +84,9 @@ class TrainerConfigureDataloaderOutput:
         max_evaluation_steps: Optional total number of evaluation steps
     """
 
-    dataloader_train: tp.Iterator[np.ndarray]
+    dataloader_train: collections.abc.Iterator[np.ndarray]
     max_training_steps: int
-    dataloader_eval: tp.Iterator[np.ndarray] | None = None
+    dataloader_eval: collections.abc.Iterator[np.ndarray] | None = None
     max_evaluation_steps: int | None = None
 
 
@@ -168,12 +180,12 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 
     timer: Timers
     wandb_runtime: tp.Any  # wandb runtime
-    dataloader_train: tp.Iterator[np.ndarray]
-    dataloader_eval: tp.Iterator[np.ndarray] | None
-    max_training_steps: int
+    dataloader_train: collections.abc.Iterator[np.ndarray] | None
+    dataloader_eval: collections.abc.Iterator[np.ndarray] | None
+    max_training_steps: int | None
     max_evaluation_steps: int
     _model: EasyDeLBaseModule
-    config: EasyDeLBaseConfig
+    config: EasyDeLBaseConfig | None
     scheduler: optax.Schedule
     tx: optax.GradientTransformation
     model_state: EasyDeLState
@@ -596,7 +608,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         self,
         state: EasyDeLState,
         save_directory: str | None = None,
-        gather_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None = None,
+        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None = None,
         to_torch: bool = False,
         easystate_to_huggingface_model_kwargs: dict | None = None,
         torch_save_pretrained_kwargs: dict | None = None,
@@ -721,8 +733,8 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         self,
         state: EasyDeLState,
         exception: Exception,
-        shard_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
-        gather_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
+        shard_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
+        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
     ):
         """
         Handle training interruption gracefully.
@@ -848,8 +860,8 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
         start_time: float,
-        shard_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
-        gather_fns: tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable] | None,
+        shard_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
+        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
     ):
         """
         Execute the core training loop.
@@ -1080,7 +1092,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def eval(self, model_state: EasyDeLState) -> tp.Iterator[dict]:
+    def eval(self, model_state: EasyDeLState) -> collections.abc.Iterator[dict]:
         """
         Evaluate the model on the evaluation dataset.
 

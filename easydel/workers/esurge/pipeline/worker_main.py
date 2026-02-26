@@ -220,7 +220,9 @@ def _detokenizer_worker(
                 finished = message["finished"]
                 skip_special = message["skip_special_tokens"]
 
-                state = states.setdefault(rid, {"last_index": 0, "previous_text": "", "buffered": [], "prompt_context": None})
+                state = states.setdefault(
+                    rid, {"last_index": 0, "previous_text": "", "buffered": [], "prompt_context": None}
+                )
                 # Store prompt context on first encounter so callers
                 # only need to send it once.
                 if "prompt_context" not in state or state["prompt_context"] is None:
@@ -237,7 +239,7 @@ def _detokenizer_worker(
                     if decoder.context_window:
                         if emitted_index == 0 and state.get("prompt_context"):
                             pc = state["prompt_context"]
-                            context_tokens = pc[-decoder.context_window:]
+                            context_tokens = pc[-decoder.context_window :]
                         else:
                             context_start = max(0, emitted_index - decoder.context_window)
                             context_tokens = generated_tokens[context_start:emitted_index]

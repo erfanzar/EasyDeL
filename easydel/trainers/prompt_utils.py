@@ -33,9 +33,9 @@ from collections.abc import Mapping, Sequence
 
 import jax
 import numpy as np
-import pyarrow as pa
-import pyarrow.compute as pc
-from datasets import Dataset, DatasetDict
+import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
+import pyarrow.compute as pc  # pyright: ignore[reportMissingTypeStubs]
+from datasets import Dataset, DatasetDict  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 
 from easydel.infra.utils import ProcessingClassType
@@ -45,12 +45,12 @@ DatasetType = tp.TypeVar("DatasetType", Dataset, DatasetDict)
 InputDict = dict[str, str]
 InputListDict = list[InputDict]
 InputListListDict = list[list[InputDict]]
-InputType = tp.Union[InputListListDict, InputListDict, InputDict]  # noqa:UP007
+InputType = InputListListDict | InputListDict | InputDict
 OpenAIMessageContentPart = dict[str, str]
 OpenAIMessage = dict[str, str | list[OpenAIMessageContentPart]]
 OutputDict = dict[str, str]
 OutputListDict = list[OutputDict]
-OutputType = tp.Union[OutputDict, OutputListDict, None]  # noqa:UP007
+OutputType = OutputDict | OutputListDict | None
 OpenAIMessageList = list[OpenAIMessage]
 TListOrMapping = tp.TypeVar("TListOrMapping", list, Mapping)
 DatasetLike = Dataset | DatasetDict
@@ -382,6 +382,16 @@ def apply_chat_template(
     ]:
         raise KeyError(f"Invalid keys in the example: {example_keys}")
 
+    # Initialize variables that may be conditionally assigned
+    messages: str = ""
+    prompt: str = ""
+    chosen: str = ""
+    rejected: str = ""
+    completion: str = ""
+    prompt_chosen: str = ""
+    prompt_rejected: str = ""
+    prompt_completion: str = ""
+
     if "messages" in example:
         messages = tokenizer.apply_chat_template(
             example["messages"],
@@ -494,7 +504,7 @@ def maybe_apply_chat_template(
     if is_conversational(example):
         return apply_chat_template(example, tokenizer, tools)
     else:
-        return example
+        return example  # pyright: ignore[reportReturnType]
 
 
 def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
@@ -621,7 +631,7 @@ def keep_array_and_primitives(example: TListOrMapping) -> TListOrMapping:
                     filtered.append(nested)
             elif is_valid_type(value):
                 filtered.append(value)
-        return filtered
+        return filtered  # pyright: ignore[reportReturnType]
     elif isinstance(example, Mapping):
         filtered = {}
         for key, value in example.items():
@@ -631,7 +641,7 @@ def keep_array_and_primitives(example: TListOrMapping) -> TListOrMapping:
                     filtered[key] = nested
             elif is_valid_type(value):
                 filtered[key] = value
-        return filtered
+        return filtered  # pyright: ignore[reportReturnType]
     else:
         raise TypeError("Input must be a list or a dictionary.")
 
@@ -744,7 +754,7 @@ def unpair_preference_dataset(dataset: DatasetType, num_proc: int | None = None,
                 data["label"].append(label)
                 if "prompt" in column_names:
                     data["prompt"].append(prompt_value)
-        return Dataset.from_dict(data)
+        return Dataset.from_dict(data)  # pyright: ignore[reportReturnType]
 
 
 def maybe_unpair_preference_dataset(
@@ -806,6 +816,7 @@ def extract_prompt(example: dict[str, Sequence]) -> dict[str, Sequence]:
 
     For more details, see [`maybe_extract_prompt`].
     """
+    idx = 0
     for idx in range(min(len(example["chosen"]), len(example["rejected"]))):
         if example["chosen"][idx] != example["rejected"][idx]:
             if example["chosen"][idx - 1] == " ":
@@ -901,7 +912,7 @@ def maybe_extract_prompt(example: dict[str, list]) -> dict[str, list]:
         prompt_conv = is_conversational({"prompt": example["prompt"]})
         if (chosen_conv and prompt_conv) or (not chosen_conv and not prompt_conv):
             return example
-    return extract_prompt({"chosen": example["chosen"], "rejected": example["rejected"]})
+    return extract_prompt({"chosen": example["chosen"], "rejected": example["rejected"]})  # pyright: ignore[reportReturnType]
 
 
 class _SegmentTree:

@@ -53,7 +53,7 @@ from __future__ import annotations
 import json
 import pprint
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from eformer.aparser import DataClassArgumentParser
 from eformer.loggings import get_logger
@@ -63,13 +63,13 @@ logger = get_logger("eLargeScript")
 
 @dataclass
 class ElargeArgs:
-    config: Optional[str] = field(default=None, metadata={"help": "Path to YAML config.", "aliases": ["-c"]})  # noqa: UP045
+    config: str | None = field(default=None, metadata={"help": "Path to YAML config.", "aliases": ["-c"]})
     dry_run: bool = field(default=False, metadata={"help": "Parse and print config/actions, then exit."})
 
 
 def _load_yaml(path: str) -> dict[str, Any]:
     try:
-        import yaml  # type: ignore
+        import yaml
     except ImportError as exc:
         raise SystemExit(
             "PyYAML is required to run `python -m easydel.scripts.elarge`.\n"

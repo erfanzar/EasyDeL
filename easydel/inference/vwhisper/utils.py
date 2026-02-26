@@ -263,6 +263,7 @@ def process_audio_input(
 
         audio_input = ffmpeg_read(audio_input, feature_extractor.sampling_rate)
 
+    ratio = 1
     if isinstance(audio_input, dict):
         stride = audio_input.get("stride", None)
         if not ("sampling_rate" in audio_input and "array" in audio_input):

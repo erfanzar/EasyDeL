@@ -13,6 +13,7 @@
 # limitations under the License.
 import math
 import typing as tp
+from collections.abc import Mapping
 from functools import partial
 
 import jax
@@ -21,7 +22,7 @@ import numpy as np
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -140,11 +141,13 @@ def get_rope_index(
                     ed_video = len(input_tokens) + 1
 
                 if ed_image < ed_video:
+                    assert image_grid_thw is not None
                     t, h, w = image_grid_thw[image_index]
                     image_index += 1
                     remain_images -= 1
                     ed = ed_image
                 else:
+                    assert video_grid_thw is not None
                     t, h, w = video_grid_thw[video_index]
                     video_second_per_grid_t = 1.0
                     if second_per_grid_ts:
@@ -215,7 +218,7 @@ def get_rope_index(
             position_ids = jnp.arange(seq_length).reshape(1, 1, -1).repeat(3, axis=0).repeat(batch_size, axis=1)
             mrope_position_deltas = jnp.zeros((batch_size,), dtype=input_ids.dtype)
 
-    return jnp.asarray(position_ids), jnp.asarray(mrope_position_deltas).reshape(-1, 1)
+    return jnp.asarray(position_ids), jnp.asarray(mrope_position_deltas).reshape(-1, 1)  # pyright: ignore[reportReturnType]
 
 
 @auto_pytree
@@ -1812,7 +1815,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
 
     def compute_embedding(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None,
         *,
         pixel_values: Array | None = None,
         pixel_values_videos: Array | None = None,
@@ -1994,7 +1997,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Qwen2VLConfig, model_type="qwen2_vl")
-class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwen2VLConfig]):
+class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwen2VLConfig]):  # type: ignore
     """Multimodal Qwen2-VL model for conditional generation from images/video and text.
 
     Inherits from BaseVisionLanguageModule to leverage common VLM infrastructure.
@@ -2387,7 +2390,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
     def _create_required_props_from_kwargs(
         self,
         model_kwargs: dict[str, Array],
-    ) -> tp.Mapping[str, dict[str, tp.Any]] | None:
+    ) -> Mapping[str, dict[str, tp.Any]] | None:
         """Create required properties from model kwargs for generation.
 
         Extracts grid dimensions that need to be preserved across generation steps.
@@ -2396,7 +2399,7 @@ class Qwen2VLForConditionalGeneration(BaseVisionLanguageModule[Qwen2VLModel, Qwe
             model_kwargs (dict[str, Array]): Model keyword arguments.
 
         Returns:
-            tp.Mapping[str, dict[str, tp.Any]] | None: Dictionary of properties
+            Mapping[str, dict[str, tp.Any]] | None: Dictionary of properties
                 to preserve, or None if no relevant properties found.
         """
         basics = {}

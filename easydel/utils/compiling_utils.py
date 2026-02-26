@@ -63,7 +63,7 @@ from functools import wraps
 
 import jax
 import numpy as np
-from ejkernel.callib import ejit
+from ejkernel.callib import ejit  # pyright: ignore[reportMissingTypeStubs]
 from jax._src.interpreters import pxla
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
 
@@ -73,6 +73,19 @@ if tp.TYPE_CHECKING:
     from jax._src.stages import Compiled, Lowered
 
 ejit = ejit
+
+__all__ = [
+    "NoCompileContext",
+    "ejit",
+    "get_hash_of_lowering",
+    "get_safe_hash_int",
+    "hash_fn",
+    "load_cached_functions",
+    "load_compiled_fn",
+    "save_compiled_fn",
+    "smart_compile",
+]
+
 P = tp.ParamSpec("P")
 R = tp.TypeVar("R")
 
@@ -90,7 +103,7 @@ SIGNATURE_FILE_NAME = "compiled.signature"
 COMPILED_CACHE: dict[str, Compiled] = {}
 
 
-def _get_hardware_signature() -> str:
+def _get_hardware_signature() -> str:  # pyright: ignore[reportUnusedFunction]
     """Create signature for current JAX hardware environment.
 
     Returns:
@@ -115,7 +128,7 @@ def _get_leaf_signature(leaf: tp.Any) -> tp.Hashable:
     return type(leaf)
 
 
-def _get_args_signature(args: tuple, kwargs: dict) -> str:
+def _get_args_signature(args: tuple, kwargs: dict) -> str:  # pyright: ignore[reportUnusedFunction]
     """Create signature for function arguments.
 
     Generates a unique signature based on the PyTree structure,

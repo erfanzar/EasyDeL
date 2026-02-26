@@ -31,6 +31,7 @@ which provides better gradient properties and eliminates the need for a referenc
 All functions are JAX-compatible and support distributed training.
 """
 
+import collections.abc
 import typing as tp
 
 import jax
@@ -55,7 +56,7 @@ from ..training_utils import (
 
 def concatenated_forward(
     state: EasyDeLState,
-    batch: tp.Mapping[str, list | Array],
+    batch: collections.abc.Mapping[str, list | Array],
     is_encoder_decoder: bool,
     label_pad_token_id: int,
     padding_value: tp.Any,
@@ -72,7 +73,7 @@ def concatenated_forward(
 
     Args:
         state (EasyDeLState): The current state of the model containing parameters and the model itself.
-        batch (tp.Mapping[str, tp.Union[tp.List, Array]]): A dictionary containing input arrays for
+        batch (collections.abc.Mapping[str, tp.Union[tp.List, Array]]): A dictionary containing input arrays for
             chosen and rejected examples as well as other necessary inputs.
         is_encoder_decoder (bool): Flag indicating whether the model is an encoder-decoder.
         label_pad_token_id (int): The token ID used to mark padding positions in the labels.

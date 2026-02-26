@@ -19,7 +19,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -360,7 +360,7 @@ class Mistral3Model(EasyDeLBaseModule):
 
     def compute_embedding(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None,
         *,
         image_features: Array | None = None,
         pixel_values: Array | None = None,
@@ -419,9 +419,9 @@ class Mistral3Model(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: Array = None,
-        image_sizes: Array = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        pixel_values: Array | None = None,
+        image_sizes: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
@@ -625,7 +625,7 @@ class Mistral3Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=Mistral3Config, model_type="mistral3")
-class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, Mistral3Config]):
+class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, Mistral3Config]):  # type: ignore
     """Mistral3 model for conditional generation with vision-language capabilities.
 
     Combines a vision tower, patch merger/projector, and language model for
@@ -734,9 +734,9 @@ class Mistral3ForConditionalGeneration(BaseVisionLanguageModule[Mistral3Model, M
 
     def __call__(
         self,
-        input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: Array = None,
-        image_sizes: Array = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        pixel_values: Array | None = None,
+        image_sizes: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,

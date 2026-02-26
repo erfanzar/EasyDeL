@@ -41,7 +41,7 @@ from ._fn import gkd_step
 from .gkd_config import GKDConfig
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset
+    from datasets import Dataset  # pyright: ignore[reportMissingTypeStubs]
 
 logger = get_logger(__name__)
 
@@ -84,7 +84,7 @@ class GKDTrainer(SFTTrainer):
         if isinstance(model, EasyDeLState):
             student_state = model
         else:
-            student_state = model.to_state()  # type: ignore[union-attr]
+            student_state = model.to_state()
 
         self.lmbda = float(arguments.lmbda)
         self.seq_kd = bool(arguments.seq_kd)
@@ -289,9 +289,7 @@ class GKDTrainer(SFTTrainer):
         prompt_seq_len = int(prompt_ids.shape[1])
 
         try:
-            sequences, _, _ = jax.block_until_ready(
-                self.gkd_generate_function(generator_state, prompt_ids, prompt_mask)  # type: ignore[arg-type]
-            )
+            sequences, _, _ = jax.block_until_ready(self.gkd_generate_function(generator_state, prompt_ids, prompt_mask))
         except Exception as exc:  # pragma: no cover - generation failures are rare
             logger.warning("Failed to generate %s continuations: %s", source, exc)
             return None, {}

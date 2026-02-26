@@ -18,7 +18,7 @@ import typing
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -719,7 +719,7 @@ class MixtralModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=MixtralConfig, model_type="mixtral")
-class MixtralForCausalLM(BaseCausalLMModule[MixtralModel, MixtralConfig]):
+class MixtralForCausalLM(BaseCausalLMModule[MixtralModel, MixtralConfig]):  # type: ignore
     """Mixtral model with a language modeling head for causal language modeling tasks.
 
     This model is a sparse MoE transformer-based language model with causal attention masks
@@ -851,7 +851,7 @@ class MixtralForCausalLM(BaseCausalLMModule[MixtralModel, MixtralConfig]):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=MixtralConfig, model_type="mixtral")
-class MixtralForSequenceClassification(BaseSequenceClassificationModule[MixtralModel, MixtralConfig]):
+class MixtralForSequenceClassification(BaseSequenceClassificationModule[MixtralModel, MixtralConfig]):  # type: ignore
     """Mixtral model for sequence classification tasks.
 
     This class extends the base Mixtral model by adding a linear classification head

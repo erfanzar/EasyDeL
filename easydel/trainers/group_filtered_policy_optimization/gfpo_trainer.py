@@ -31,7 +31,7 @@ from ..prompt_utils import apply_chat_template
 from .gfpo_config import GFPOConfig
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.data.core.protocols import ShardedDataSource
 
@@ -41,7 +41,7 @@ except ImportError:
     wandb = None
 
 
-RewardFunc = tp.Union[EasyDeLBaseModule, EasyDeLState, tp.Callable[[list, list], list[float]]]  # noqa: UP007
+RewardFunc = EasyDeLBaseModule | EasyDeLState | tp.Callable[[list, list], list[float]]
 GroupFilterFunc = tp.Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
 
 
@@ -495,20 +495,20 @@ class GFPOTrainer(GRPOTrainer):
 
         preprocessing_time = preprocessing_time_fn()
         completion_length = jnp.sum(completion_mask, -1)
-        metrics_dict = {
-            "reward_mean": jnp.nanmean(rewards, -1),
-            "reward_std": jnp.nanmean(std_rewards),
-            "completion_length": jnp.mean(completion_length),
+        metrics_dict: dict[str, float | int | str] = {
+            "reward_mean": float(jnp.nanmean(rewards, -1)),
+            "reward_std": float(jnp.nanmean(std_rewards)),
+            "completion_length": float(jnp.mean(completion_length)),
             "grouped_comp_time": grouped_comp_time,
             "rewarding_time": rewarding_time,
             "token_logps_time": token_logps_time,
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
-            "frac_reward_zero_std": jnp.mean(is_std_zero.astype(jnp.float32)),
+            "frac_reward_zero_std": float(jnp.mean(is_std_zero.astype(jnp.float32))),
             "filter_time": filter_time,
         }
         for i, reward_func_name in enumerate(self.reward_func_names):
-            metrics_dict[reward_func_name] = jnp.nanmean(rewards_per_func[:, i])
+            metrics_dict[reward_func_name] = float(jnp.nanmean(rewards_per_func[:, i]))
 
         if self.log_table is not None:
             cur_step = jax.device_get(state.step)

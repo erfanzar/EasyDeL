@@ -18,7 +18,7 @@ import functools
 import jax.lax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -230,7 +230,7 @@ class PhiMoeSparseMoeBlock(nn.Module):
                     precision=precision,
                     rngs=rngs,
                 )
-                for i in range(self.config.num_local_experts)
+                for _ in range(self.config.num_local_experts)
             ]
         )
 

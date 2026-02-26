@@ -67,7 +67,7 @@ class _UnexpectedAstError(Exception):
     pass
 
 
-@ToolParserManager.register_module("llama4_pythonic")
+@ToolParserManager.register_module("llama4_pythonic")  # pyright: ignore[reportUntypedClassDecorator]
 class Llama4PythonicToolParser(ToolParser):
     """Tool call parser for Llama 4 models with Pythonic syntax.
 
@@ -162,10 +162,7 @@ class Llama4PythonicToolParser(ToolParser):
             if isinstance(parsed, ast.List) and all(isinstance(e, ast.Call) for e in parsed.elts):
                 return ExtractedToolCallInformation(
                     tools_called=True,
-                    tool_calls=[
-                        _handle_single_tool(e)  # type: ignore
-                        for e in parsed.elts
-                    ],
+                    tool_calls=[_handle_single_tool(e) for e in parsed.elts],
                     content=None,
                 )
             else:
@@ -221,10 +218,7 @@ class Llama4PythonicToolParser(ToolParser):
             parsed = getattr(module.body[0], "value", None)
             if not isinstance(parsed, ast.List) or not all(isinstance(e, ast.Call) for e in parsed.elts):
                 raise _UnexpectedAstError("Tool output must be a list of function calls")
-            tool_calls = [
-                _handle_single_tool(e)  # type: ignore
-                for e in parsed.elts
-            ]
+            tool_calls = [_handle_single_tool(e) for e in parsed.elts]
 
             tool_deltas = []
             for index, new_call in enumerate(tool_calls):
@@ -290,10 +284,7 @@ def _get_parameter_value(val: ast.expr) -> Any:
     elif isinstance(val, ast.Dict):
         if not all(isinstance(k, ast.Constant) for k in val.keys):
             raise _UnexpectedAstError("Dict tool call arguments must have literal keys")
-        return {
-            k.value: _get_parameter_value(v)  # type: ignore
-            for k, v in zip(val.keys, val.values, strict=False)
-        }
+        return {k.value: _get_parameter_value(v) for k, v in zip(val.keys, val.values, strict=False)}
     elif isinstance(val, ast.List):
         return [_get_parameter_value(v) for v in val.elts]
     else:

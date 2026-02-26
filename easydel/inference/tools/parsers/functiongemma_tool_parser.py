@@ -48,7 +48,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = get_logger(__name__)
 
 
-@ToolParserManager.register_module("functiongemma")
+@ToolParserManager.register_module("functiongemma")  # pyright: ignore[reportUntypedClassDecorator]
 class FunctionGemmaToolParser(ToolParser):
     """Tool parser for Google's FunctionGemma model.
 

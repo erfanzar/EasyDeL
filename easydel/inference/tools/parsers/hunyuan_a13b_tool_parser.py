@@ -51,7 +51,7 @@ from ..utils import consume_space
 logger = get_logger(__name__)
 
 
-@ToolParserManager.register_module("hunyuan_a13b")
+@ToolParserManager.register_module("hunyuan_a13b")  # pyright: ignore[reportUntypedClassDecorator]
 class HunyuanA13BToolParser(ToolParser):
     """Tool parser for Hunyuan A13B model outputs.
 

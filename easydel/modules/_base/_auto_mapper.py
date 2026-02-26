@@ -84,7 +84,7 @@ def create_causal_lm_class(
     model_type: str,
     base_model_name: str = "model",
     **default_feature_kwargs: Any,
-) -> type[BaseCausalLMModule[ModelT, ConfigT]]:
+) -> type[BaseCausalLMModule[ModelT, ConfigT]]:  # type: ignore
     """Create a ForCausalLM class dynamically.
 
     This factory function creates a new ForCausalLM class that inherits from
@@ -200,7 +200,7 @@ def create_sequence_classification_class(
     model_type: str,
     base_model_name: str = "model",
     **default_feature_kwargs: Any,
-) -> type[BaseSequenceClassificationModule[ModelT, ConfigT]]:
+) -> type[BaseSequenceClassificationModule[ModelT, ConfigT]]:  # type: ignore
     """Create a ForSequenceClassification class dynamically.
 
     This factory function creates a new ForSequenceClassification class that
@@ -293,7 +293,7 @@ def create_token_classification_class(
     model_type: str,
     base_model_name: str = "model",
     **default_feature_kwargs: Any,
-) -> type[BaseTokenClassificationModule[ModelT, ConfigT]]:
+) -> type[BaseTokenClassificationModule[ModelT, ConfigT]]:  # type: ignore
     """Create a ForTokenClassification class dynamically.
 
     This factory function creates a new ForTokenClassification class for
@@ -381,7 +381,7 @@ def create_question_answering_class(
     model_type: str,
     base_model_name: str = "model",
     **default_feature_kwargs: Any,
-) -> type[BaseQuestionAnsweringModule[ModelT, ConfigT]]:
+) -> type[BaseQuestionAnsweringModule[ModelT, ConfigT]]:  # type: ignore
     """Create a ForQuestionAnswering class dynamically.
 
     This factory function creates a new ForQuestionAnswering class for
@@ -469,7 +469,7 @@ def create_conditional_generation_class(
     model_type: str,
     base_model_name: str = "model",
     **default_feature_kwargs: Any,
-) -> type[BaseConditionalGenerationModule[ModelT, ConfigT]]:
+) -> type[BaseConditionalGenerationModule[ModelT, ConfigT]]:  # type: ignore
     """Create a ForConditionalGeneration class dynamically.
 
     This factory function creates a new ForConditionalGeneration class for
@@ -557,7 +557,7 @@ def create_image_classification_class(
     model_type: str,
     base_model_name: str = "vision_model",
     **default_feature_kwargs: Any,
-) -> type[BaseImageClassificationModule[ModelT, ConfigT]]:
+) -> type[BaseImageClassificationModule[ModelT, ConfigT]]:  # type: ignore
     """Create a ForImageClassification class dynamically.
 
     This factory function creates a new ForImageClassification class for

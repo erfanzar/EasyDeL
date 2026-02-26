@@ -22,12 +22,11 @@ Optimizations:
 """
 
 import jax
+from ejkernel.callib import ejit  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Float, Int
-
-from easydel.utils.compiling_utils import ejit
 
 
 def cdiv(a: int, v: int) -> int:
@@ -177,7 +176,7 @@ def _kv_cache_update_kernel(
         copy_operation.wait()
 
 
-@ejit(static_argnames=["page_size", "slices_per_processing_page"])
+@ejit(static_argnames=["page_size", "slices_per_processing_page"])  # pyright: ignore[reportUntypedFunctionDecorator]
 def kv_cache_update(
     new_kv_tokens: Float[Array, "total_tokens num_combined_kv_heads head_dim"],
     slice_indices: Int[Array, "3 num_slices"],
@@ -279,7 +278,7 @@ def kv_cache_update(
     return pallas_kernel(*prefetch_scalars, new_kv_tokens, kv_cache_pages)[0]
 
 
-@ejit(static_argnames=["page_size"], donate_argnames=["kv_cache_pages"])
+@ejit(static_argnames=["page_size"], donate_argnames=["kv_cache_pages"])  # pyright: ignore[reportUntypedFunctionDecorator]
 def kv_cache_update_jax(
     new_kv_tokens: Float[Array, "total_tokens num_kv_heads head_dim"],
     slice_indices: Int[Array, "3 num_slices"],

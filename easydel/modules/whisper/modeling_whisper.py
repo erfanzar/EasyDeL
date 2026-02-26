@@ -18,11 +18,17 @@ import random
 import typing as tp
 from functools import partial
 
+__all__ = (
+    "WhisperForAudioClassification",
+    "WhisperForConditionalGeneration",
+    "WhisperTimeStampLogitsProcessor",
+)
+
 import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
@@ -631,13 +637,12 @@ class WhisperDecoderLayer(nn.Module):
         hidden_states = checkpoint_name(self.fc2(hidden_states), "mlp_down")
         hidden_states = self.dropout_layer(hidden_states)
         hidden_states = residual + hidden_states
-
         outputs = (hidden_states,)
 
         if output_attentions:
             outputs += (self_attn_weights, cross_attn_weights)
         outputs += (cache_view,)
-        return outputs
+        return outputs  # pyright: ignore[reportReturnType]
 
 
 class WhisperEncoder(EasyDeLBaseModule):
@@ -729,7 +734,7 @@ class WhisperEncoder(EasyDeLBaseModule):
                     precision=precision,
                     rngs=rngs,
                 )
-                for i in range(self.config.encoder_layers)
+                for _ in range(self.config.encoder_layers)
             ]
         )
 
@@ -795,6 +800,7 @@ class WhisperEncoder(EasyDeLBaseModule):
 
         for encoder_layer in self.layers:
             if output_hidden_states:
+                assert all_hidden_states is not None
                 all_hidden_states = (*all_hidden_states, hidden_states)
             dropout_probability = random.uniform(0, 1)
             if not self.dropout_layer.deterministic and (dropout_probability < self.layerdrop):
@@ -808,6 +814,7 @@ class WhisperEncoder(EasyDeLBaseModule):
                 )
             hidden_states = layer_outputs[0]
             if output_attentions:
+                assert all_attentions is not None
                 all_attentions = (*all_attentions, layer_outputs[1])
 
         if output_hidden_states:
@@ -897,7 +904,7 @@ class WhisperDecoder(EasyDeLBaseModule):
                     precision=precision,
                     rngs=rngs,
                 )
-                for i in range(self.config.decoder_layers)
+                for _ in range(self.config.decoder_layers)
             ]
         )
 
@@ -1108,8 +1115,8 @@ class WhisperModel(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
+        output_attentions: bool | None = False,
+        output_hidden_states: bool | None = False,
     ):
         """Forward pass of the complete Whisper model (encoder + decoder).
 
@@ -1180,8 +1187,8 @@ class WhisperModel(EasyDeLBaseModule):
         mode: common_types.RUNTIME_MODE_TYPES | None = None,  # type:ignore
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
+        output_attentions: bool | None = False,
+        output_hidden_states: bool | None = False,
     ):
         """Performs decoding using the decoder module.
 
@@ -1237,8 +1244,8 @@ class WhisperModel(EasyDeLBaseModule):
     def encode(
         self,
         input_features: jnp.ndarray,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
+        output_attentions: bool | None = False,
+        output_hidden_states: bool | None = False,
     ):
         """Performs encoding using the encoder module.
 
@@ -1294,7 +1301,7 @@ class WhisperModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.SPEECH_SEQUENCE_TO_SEQUENCE, config=WhisperConfig, model_type="whisper")
-class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperModel, WhisperConfig]):
+class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperModel, WhisperConfig]):  # type: ignore
     """Whisper encoder-decoder with projection head for speech-to-text generation.
 
     This model extends the base Whisper architecture with a language modeling head for
@@ -1669,7 +1676,7 @@ class WhisperForConditionalGeneration(BaseConditionalGenerationModule[WhisperMod
         if language is not None:
             generation_config.language = language
 
-        if kwargs is not None and "decoder_input_ids" in kwargs:
+        if "decoder_input_ids" in kwargs:
             decoder_input_length = len(kwargs["decoder_input_ids"])
         else:
             decoder_input_length = 1
@@ -2025,7 +2032,7 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
         input_features,
         encoder_outputs=None,
         output_attentions=None,
-        output_hidden_states: bool = True,
+        output_hidden_states: bool | None = True,
     ):
         """Forward pass of WhisperForAudioClassification.
 

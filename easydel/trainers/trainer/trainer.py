@@ -31,11 +31,10 @@ various model architectures including language models, vision models,
 and multimodal architectures.
 """
 
+import collections.abc
 import typing as tp
 
 import jax
-import jax.experimental
-import jax.lib
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
@@ -43,13 +42,13 @@ from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.helpers import capture_time, get_logger
+from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
 
-from ..base_trainer import BaseTrainer, TrainerConfigureFunctionOutput
-from ..trainer_protocol import BaseProgressBar, MetricsTracker, StepMetrics
+from ..base_trainer import BaseTrainer, TrainerConfigureFunctionOutput  # pyright: ignore[reportPrivateLocalImportUsage]
+from ..metrics import BaseProgressBar, MetricsTracker, StepMetrics
+from ..trainer_protocol import TrainerOutput
 from ..training_utils import resolve_straight_through_emulator
 from ._fn import evaluation_step, training_step
-from .modeling_output import TrainerOutput
 
 logger = get_logger(__name__)
 
@@ -327,6 +326,7 @@ class Trainer(BaseTrainer):
 
         if initial_step > 0:
             pbar.update(initial_step)
+            assert self.max_training_steps is not None, "max_training_steps must be set before training"
             steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
 
             if self.arguments.use_grain:
@@ -482,7 +482,9 @@ class Trainer(BaseTrainer):
             def data_collator(x):
                 return x
 
+        assert self.max_training_steps is not None, "max_training_steps must be set before training"
         steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
+        run_exception: Exception | None = None
 
         for _ in range(steps_per_epoch):
             current_step = int(jax.device_get(state.step))
@@ -679,7 +681,7 @@ class Trainer(BaseTrainer):
         self,
         state,
         batch,
-    ) -> tuple[EasyDeLState, LossMetrics, Exception | None]:
+    ) -> tuple[EasyDeLState, LossMetrics, BaseException | None]:
         """
         Execute a single training step with gradient computation and updates.
 
@@ -828,7 +830,7 @@ class Trainer(BaseTrainer):
         )
         return self._finalize_training(output, run_exception)
 
-    def eval(self, model_state: EasyDeLState) -> tp.Iterator[dict]:
+    def eval(self, model_state: EasyDeLState) -> collections.abc.Iterator[dict]:
         """
         Evaluate the model on the evaluation dataset.
 

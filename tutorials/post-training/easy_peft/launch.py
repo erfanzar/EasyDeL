@@ -76,7 +76,7 @@ def main():
     # are imported within the Ray remote worker's process, which is important for
     # dependency management in distributed contexts.
     import jax  # JAX: numerical computation library, backbone of EasyDeL.
-    from datasets import load_dataset  # Hugging Face Datasets library.
+    from datasets import load_dataset  # pyright: ignore[reportMissingTypeStubs]
     from jax import numpy as jnp  # JAX's NumPy-like API.
     from transformers import AutoTokenizer  # Hugging Face Transformers for tokenizer.
 
@@ -102,7 +102,7 @@ def main():
     # --- Model Loading ---
     logger.info(f"Loading model: {MODEL_ID}")
     # AutoEasyDeLModelForCausalLM intelligently loads and shards the model for JAX/TPU.
-    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+    model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(  # pyright: ignore[reportPrivateLocalImportUsage]
         MODEL_ID,
         dtype=jnp.bfloat16,  # Use bfloat16 for computations for efficiency on TPUs.
         param_dtype=jnp.bfloat16,  # Store model parameters in bfloat16.
@@ -112,19 +112,19 @@ def main():
         #  (data_parallel, fully_sharded_data_parallel, expert_parallel, tensor_parallel, sequence_parallel)
         # `(1, -1, 1, 1, 1)` is a common setting for FSDP-like sharding across batch and model.
         sharding_axis_dims=(1, -1, 1, 1, 1),
-        config_kwargs=ed.EasyDeLBaseConfigDict(
+        config_kwargs=ed.EasyDeLBaseConfigDict(  # pyright: ignore[reportPrivateLocalImportUsage]
             # Override specific model configuration parameters.
             freq_max_position_embeddings=max_length,  # For RoPE-based models, sets max position for frequency encoding.
             mask_max_position_embeddings=max_length,  # Max length for attention mask.
-              # Disables KV cache quantization.
-            attn_mechanism=ed.AttentionMechanisms.AUTO,
+            # Disables KV cache quantization.
+            attn_mechanism=ed.AttentionMechanisms.AUTO,  # pyright: ignore[reportPrivateLocalImportUsage]
             # EasyDeL selects the best attention mechanism (e.g., FlashAttention).
-            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,  # change this if u go OOM
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,  # pyright: ignore[reportPrivateLocalImportUsage]  # change this if u go OOM
             # Memory-saving technique for gradients.
         ),
         # `partition_axis` provides finer control over sharding, e.g., sharding KV heads via tensor parallelism.
-        partition_axis=ed.PartitionAxis(kv_head_axis="tp"),
-          # Disables quantization for model weights.
+        partition_axis=ed.PartitionAxis(kv_head_axis="tp"),  # pyright: ignore[reportPrivateLocalImportUsage]
+        # Disables quantization for model weights.
     )
     logger.info("Model loaded successfully.")
 
@@ -134,7 +134,7 @@ def main():
     logger.info(f"Train dataset size: {len(train_dataset)}")
     model = model.apply_lora_to_layers(LORA_RANK, LORA_PATTERN)  # here's how lora get applied to module
     # --- SFT Configuration (Hyperparameters for SFT training) ---
-    arguments = ed.SFTConfig(
+    arguments = ed.SFTConfig(  # pyright: ignore[reportPrivateLocalImportUsage]
         num_train_epochs=1,  # Number of full passes over the training dataset.
         total_batch_size=total_batch_size,  # Total batch size used across all TPU devices.
         gradient_accumulation_steps=1,  # Number of gradient accumulation steps .
@@ -145,7 +145,7 @@ def main():
         max_training_steps=None,  # Maximum number of training steps (None means train until epochs are done).
         max_evaluation_steps=None,  # Maximum number of evaluation steps (None means evaluate full test set).
         max_length=max_length,  # Maximum sequence length
-        loss_config=ed.LossConfig(z_loss=0.0),  # Z-loss regularization term in SFT loss (0.0 means off).
+        loss_config=ed.LossConfig(z_loss=0.0),  # pyright: ignore[reportPrivateLocalImportUsage]  # Z-loss regularization term in SFT loss (0.0 means off).
         track_memory=False,  # Set to True to enable memory tracking (can add minor overhead).
         save_steps=1_000,  # Save a model checkpoint every 1000 training steps.
         save_total_limit=0,  # Maximum number of checkpoints to keep (0 means keep all).
@@ -154,8 +154,8 @@ def main():
         per_epoch_evaluation_steps=None,  # Number of evaluation steps per epoch (None for automatic calculation).
         learning_rate=1e-5,  # Initial learning rate for the optimizer.
         learning_rate_end=7e-6,  # End learning rate for linear scheduler (not active with COSINE scheduler).
-        optimizer=ed.EasyDeLOptimizers.ADAMW,  # Optimizer to use (AdamW is common).
-        scheduler=ed.EasyDeLSchedulers.COSINE,  # Learning rate scheduler (Cosine annealing).
+        optimizer=ed.EasyDeLOptimizers.ADAMW,  # pyright: ignore[reportPrivateLocalImportUsage]  # Optimizer to use (AdamW is common).
+        scheduler=ed.EasyDeLSchedulers.COSINE,  # pyright: ignore[reportPrivateLocalImportUsage]  # Learning rate scheduler (Cosine annealing).
         clip_grad=1.0,  # Gradients will be clipped to this maximum L2 norm.
         weight_distribution_log_steps=100,  # Log weight distribution histograms every 100 steps (for debugging).
         warmup_steps=0,  # Number of warmup steps for the learning rate scheduler.
@@ -169,7 +169,7 @@ def main():
 
     # --- Trainer Setup and Execution ---
     logger.info("Initializing PEFT-SFTTrainer.")
-    trainer = ed.SFTTrainer(
+    trainer = ed.SFTTrainer(  # pyright: ignore[reportPrivateLocalImportUsage]
         arguments=arguments,  # Pass the configured SFT hyperparameters.
         model=model,  # The EasyDeL model instance to be trained.
         processing_class=processor,  # The tokenizer/processor instance for internal data handling.

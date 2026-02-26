@@ -4,6 +4,8 @@ This module provides functions to create matched EasyDeL and HuggingFace model p
 transfer weights between them, and load model classes from HuggingFace Hub.
 """
 
+# pyright: reportPrivateLocalImportUsage=false
+
 import copy
 import gc
 from typing import Any

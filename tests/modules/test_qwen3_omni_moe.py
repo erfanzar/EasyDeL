@@ -1,5 +1,7 @@
 """Tests for Qwen3OmniMoe model."""
 
+# pyright: reportPrivateLocalImportUsage=false
+
 import pytest
 
 import easydel as ed
@@ -7,7 +9,7 @@ import easydel as ed
 try:
     from .test_utils import EasyDeLOnlyTester
 except ImportError:
-    from test_utils import EasyDeLOnlyTester
+    from test_utils import EasyDeLOnlyTester  # pyright: ignore[reportImplicitRelativeImport]
 
 
 class TestQwen3OmniMoe:
