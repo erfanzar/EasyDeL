@@ -59,7 +59,7 @@ from .builders import (
 from .normalizer import materialize_base_config, normalize, resolve_task, validate
 from .trainer_types import get_trainer_class, get_training_arguments_class, normalize_trainer_config
 from .types import ELMConfig, EvalKwargs
-from .utils import load_elm_config, save_elm_config
+from .utils import load_elm_config, make_serializable, save_elm_config, write_text_atomic
 
 if typing.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
@@ -153,18 +153,65 @@ class eLargeModel:
         Args:
             config: Can be:
                 - ELMConfig or dict with configuration
-                - Path to JSON configuration file
+                - Path to JSON or YAML configuration file
                 - None to create empty configuration
         """
         if config is None:
             self._config = normalize({"model": {"name_or_path": ""}})
         elif isinstance(config, (str, os.PathLike)) or hasattr(config, "__fspath__"):
-            self._config = load_elm_config(config)
+            config_path = ePath(config)
+            suffix = config_path.suffix.lower()
+            if suffix in {".yaml", ".yml"}:
+                self._config = normalize(self._load_yaml_config(config_path))
+            elif suffix == ".json":
+                self._config = load_elm_config(config_path)
+            else:
+                try:
+                    self._config = load_elm_config(config_path)
+                except ValueError as exc:
+                    if not str(exc).startswith("Invalid JSON in config file"):
+                        raise
+                    self._config = normalize(self._load_yaml_config(config_path))
         else:
             self._config = normalize(config)
 
         self._model = None
         self._tokenizer = None
+
+    @staticmethod
+    def _load_yaml_config(yaml_path: str | os.PathLike | ePathLike) -> dict[str, Any]:
+        """Load raw ELM config mapping from a YAML file."""
+        try:
+            import yaml
+        except ImportError as e:
+            raise ImportError("PyYAML is required for YAML configs. Install with: pip install pyyaml") from e
+
+        yaml_path = ePath(yaml_path)
+        if not yaml_path.exists():
+            raise FileNotFoundError(f"Config file not found: {yaml_path}")
+
+        try:
+            raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Invalid YAML in config file {yaml_path}: {exc}") from exc
+
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, Mapping):
+            raise TypeError(f"YAML root must be a mapping/dict, got {type(raw).__name__}.")
+
+        config = None
+        for key in ("config", "elarge_model", "elm"):
+            if key in raw:
+                config = raw[key]
+                break
+        if config is None:
+            config = {k: v for k, v in raw.items() if k != "actions"}
+        if config is None:
+            config = {}
+        if not isinstance(config, Mapping):
+            raise TypeError(f"Config must be a mapping/dict, got {type(config).__name__}.")
+        return dict(config)
 
     @classmethod
     def from_json(cls, json_path: str | os.PathLike | ePathLike) -> eLargeModel:
@@ -215,33 +262,7 @@ class eLargeModel:
             >>> #   - train
             >>> elm = eLargeModel.from_yaml("pipeline.yaml")
         """
-        try:
-            import yaml
-        except ImportError as e:
-            raise ImportError("PyYAML is required for YAML configs. Install with: pip install pyyaml") from e
-
-        yaml_path = ePath(yaml_path)
-        if not yaml_path.exists():
-            raise FileNotFoundError(f"Config file not found: {yaml_path}")
-
-        raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-        if raw is None:
-            raw = {}
-        if not isinstance(raw, dict):
-            raise TypeError(f"YAML root must be a mapping/dict, got {type(raw).__name__}.")
-
-        config = None
-        for key in ("config", "elarge_model", "elm"):
-            if key in raw:
-                config = raw[key]
-                break
-        if config is None:
-            config = {k: v for k, v in raw.items() if k != "actions"}
-        if config is None:
-            config = {}
-        if not isinstance(config, dict):
-            raise TypeError(f"Config must be a mapping/dict, got {type(config).__name__}.")
-        return cls(config)
+        return cls(cls._load_yaml_config(yaml_path))
 
     @classmethod
     def from_pretrained(
@@ -906,42 +927,9 @@ class eLargeModel:
             import yaml
         except ImportError as e:
             raise ImportError("PyYAML is required for YAML configs. Install with: pip install pyyaml") from e
-
-        def to_yamlable(obj: Any) -> Any:
-            """Convert an object to a YAML-serializable form.
-
-            Recursively processes the object, converting dicts, lists, enums,
-            PathLike objects, and objects with to_dict() methods into basic
-            Python types that can be serialized to YAML.
-
-            Args:
-                obj: Any Python object to convert.
-
-            Returns:
-                A YAML-serializable representation of the object.
-
-            Raises:
-                TypeError: If the object cannot be converted to a YAML-serializable form.
-            """
-            if obj is None or isinstance(obj, (str, int, float, bool)):
-                return obj
-            if isinstance(obj, dict):
-                return {str(k): to_yamlable(v) for k, v in obj.items()}
-            if isinstance(obj, (list, tuple, set)):
-                return [to_yamlable(v) for v in obj]
-            if hasattr(obj, "to_dict") and callable(obj.to_dict):
-                return to_yamlable(obj.to_dict())
-            if hasattr(obj, "value") and not isinstance(obj, type):  # enums
-                return to_yamlable(obj.value)
-            if isinstance(obj, os.PathLike) or hasattr(obj, "__fspath__"):
-                return os.fspath(obj)
-            raise TypeError(f"Object of type {type(obj).__name__} is not YAML serializable")
-
-        data = to_yamlable(self._config)
-
-        yaml_path = ePath(yaml_path)
-        yaml_path.parent.mkdir(parents=True, exist_ok=True)
-        yaml_path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        data = make_serializable(normalize(self._config))
+        payload = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+        write_text_atomic(yaml_path, payload, encoding="utf-8")
 
     def to_dict(self) -> dict[str, Any]:
         """Get configuration as dictionary.
