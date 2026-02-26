@@ -19,7 +19,7 @@ from functools import partial
 import jax
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
@@ -534,8 +534,8 @@ class ArcticMoeBlock(BaseMoeModule):
                 wd_kernel=self.experts.w2.kernel.value,
                 act_fn=self.experts.act_fn,
             )
-            return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
-        return self.mlp(hidden_states), None
+            return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")  # pyright: ignore[reportReturnType]
+        return self.mlp(hidden_states), None  # pyright: ignore[reportReturnType]
 
 
 class ArcticDecoderLayer(nn.Module):
@@ -964,7 +964,7 @@ class ArcticModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=ArcticConfig, model_type="arctic")
-class ArcticForCausalLM(BaseCausalLMModule[ArcticModel, ArcticConfig]):
+class ArcticForCausalLM(BaseCausalLMModule[ArcticModel, ArcticConfig]):  # type: ignore
     """Arctic model with a language modeling head for causal language modeling tasks.
 
     This model is a sparse Mixture-of-Experts transformer with causal attention masks
@@ -1090,7 +1090,7 @@ class ArcticForCausalLM(BaseCausalLMModule[ArcticModel, ArcticConfig]):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=ArcticConfig, model_type="arctic")
-class ArcticForSequenceClassification(BaseSequenceClassificationModule[ArcticModel, ArcticConfig]):
+class ArcticForSequenceClassification(BaseSequenceClassificationModule[ArcticModel, ArcticConfig]):  # type: ignore
     """Arctic model for sequence classification tasks.
 
     This class extends the base Arctic model by adding a linear classification head

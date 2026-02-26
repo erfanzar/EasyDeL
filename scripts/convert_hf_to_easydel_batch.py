@@ -45,7 +45,6 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from eformer.aparser import DataClassArgumentParser
 
@@ -134,7 +133,7 @@ class BatchArgs:
         default_factory=list,
         metadata={"action": "append", "help": "HF source model id/path (repeatable)."},
     )
-    models_file: Optional[str] = field(  # noqa: UP045
+    models_file: str | None = field(
         default=None,
         metadata={
             "help": "File with one model per line (supports: 'source', 'source owner/name', 'source -> owner/name')."
@@ -144,14 +143,16 @@ class BatchArgs:
         default="EasyDeL",
         metadata={"help": "Default output HF owner/org when a repo id isn't specified in models-file."},
     )
-    python: Optional[str] = field(  # noqa: UP045
+    python: str | None = field(
         default=None,
         metadata={"help": "Python interpreter to run convert script (default: current interpreter)."},
     )
-    convert_script: Optional[str] = field(  # noqa: UP045
+    convert_script: str | None = field(
         default=None,
         metadata={
-            "help": "Optional path to a convert script. If omitted, runs the repo-local `easydel/scripts/convert_hf_to_easydel.py`."
+            "help": (
+                "Optional path to a convert script. If omitted, runs the repo-local `easydel/scripts/convert_hf_to_easydel.py`."
+            )
         },
     )
     dry_run: bool = field(default=False, metadata={"help": "Print commands without executing."})

@@ -47,7 +47,7 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.helpers import capture_time, get_logger
+from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
 from easydel.utils.traversals import deepcopy_model
 
 from ..prompt_transforms import GRPOPreprocessTransform, is_conversational
@@ -64,17 +64,17 @@ from .modeling_value_head import CausalLMWithValueHead
 from .ppo_config import PPOConfig
 
 try:
-    import wandb  # type:ignore
+    import wandb
 except ImportError:
     wandb = None
 
 if tp.TYPE_CHECKING:
-    from datasets import Dataset, IterableDataset
+    from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.data.core.protocols import ShardedDataSource
 
 logger = get_logger(__name__)
-RewardFunc = tp.Union[EasyDeLBaseModule, EasyDeLState, tp.Callable[[list, list], list[float]]]  # noqa
+RewardFunc = EasyDeLBaseModule | EasyDeLState | tp.Callable[[list, list], list[float]]
 
 
 @Registry.register("trainer", "ppo")
@@ -134,8 +134,8 @@ class PPOTrainer(Trainer):
         reward_funcs: RewardFunc | list[RewardFunc],
         train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
         eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
-        processing_class: ProcessingClassType = None,
-        reward_processing_classes: ProcessingClassType = None,
+        processing_class: ProcessingClassType | None = None,
+        reward_processing_classes: ProcessingClassType | None = None,
         data_tokenize_fn: tp.Callable | None = None,
     ):
         """Initialize the PPO trainer.
@@ -160,14 +160,7 @@ class PPOTrainer(Trainer):
         """
         assert arguments is not None, "PPOTrainer requires `arguments`."
         assert isinstance(arguments, PPOConfig), f"arguments type must be `PPOConfig` but got {type(arguments)}"
-        assert processing_class is not None, "processing_class must be specified to tokenize PPO prompts."
-
         self.arguments = arguments
-        self.processing_class = processing_class
-        pad_token_id = getattr(self.processing_class, "pad_token_id", None)
-        if pad_token_id is None and hasattr(self.processing_class, "tokenizer"):
-            pad_token_id = getattr(self.processing_class.tokenizer, "pad_token_id", None)
-        self.padding_value = 0 if pad_token_id is None else int(pad_token_id)
 
         if model is None:
             raise ValueError("`model` must be provided for PPO training.")
@@ -189,6 +182,11 @@ class PPOTrainer(Trainer):
                 model.model.config._name_or_path,
                 padding_side="left",
             )
+        self.processing_class = processing_class
+        pad_token_id = getattr(self.processing_class, "pad_token_id", None)
+        if pad_token_id is None and hasattr(self.processing_class, "tokenizer"):
+            pad_token_id = getattr(self.processing_class.tokenizer, "pad_token_id", None)
+        self.padding_value = 0 if pad_token_id is None else int(pad_token_id)
 
         if not isinstance(reward_funcs, list):
             reward_funcs = [reward_funcs]
@@ -202,6 +200,7 @@ class PPOTrainer(Trainer):
                 raise ValueError("The number of reward processing classes must match the number of reward functions.")
 
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=model.model.mesh)
+        assert isinstance(reward_processing_classes, list)
 
         for i, (reward_processing_class, reward_func) in enumerate(
             zip(reward_processing_classes, reward_funcs, strict=False)
@@ -211,7 +210,7 @@ class PPOTrainer(Trainer):
                     reward_func = reward_func.to_state()
                     sharding = reward_func.shardings
 
-                    @ejit(
+                    @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
                         static_argnums=(0,),
                         in_shardings=(sharding.graphstate, sharding.graphother, empty_sharding),
                         out_shardings=empty_sharding,
@@ -266,7 +265,7 @@ class PPOTrainer(Trainer):
             ("repetition_penalty", self.arguments.repetition_penalty),
         ):
             if value is not None and key not in self.arguments.generation_extra_kwargs:
-                self.arguments.generation_extra_kwargs[key] = value
+                self.arguments.generation_extra_kwargs[key] = value  # pyright: ignore[reportOptionalSubscript]
 
         def _peek_first_example(dataset):
             if dataset is None:
@@ -782,11 +781,11 @@ class PPOTrainer(Trainer):
         preprocessing_time = preprocessing_time_fn()
 
         token_count = jnp.maximum(jnp.sum(completion_mask), 1.0)
-        metrics_dict = {
-            "score_mean": jnp.nanmean(scores),
-            "reward_mean": jnp.sum(rewards) / token_count,
-            "mean_kl": jnp.sum(kl * completion_mask) / token_count,
-            "completion_length": jnp.mean(jnp.sum(completion_mask, axis=1)),
+        metrics_dict: dict[str, float | int | str] = {
+            "score_mean": float(jnp.nanmean(scores)),
+            "reward_mean": float(jnp.sum(rewards) / token_count),
+            "mean_kl": float(jnp.sum(kl * completion_mask) / token_count),
+            "completion_length": float(jnp.mean(jnp.sum(completion_mask, axis=1))),
             "rewarding_time": rewarding_time,
             "rollout_stats_time": rollout_stats_time,
             "ref_logps_time": ref_logps_time,
@@ -794,7 +793,7 @@ class PPOTrainer(Trainer):
             "preprocessing_time": preprocessing_time,
         }
         for i, reward_func_name in enumerate(self.reward_func_names):
-            metrics_dict[reward_func_name] = jnp.nanmean(rewards_per_func[:, i])
+            metrics_dict[reward_func_name] = float(jnp.nanmean(rewards_per_func[:, i]))
 
         return (
             {

@@ -38,7 +38,7 @@ except ModuleNotFoundError:  # pragma: no cover
 try:
     from eformer.paths import ePath
 except ModuleNotFoundError:  # pragma: no cover
-    ePath = Path  # type: ignore[assignment]
+    ePath = Path
 
 from jinja2 import Environment, FileSystemLoader, TemplateNotFound
 

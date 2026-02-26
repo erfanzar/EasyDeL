@@ -21,7 +21,7 @@ from eformer import common_types
 from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -147,7 +147,9 @@ class Gemma2Attention(UnifiedAttention):
             layer_idx=layer_idx,
             attention_type="standard",
             causal=causal,
-            sliding_window=config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None,
+            sliding_window=config.sliding_window
+            if config.layer_types is not None and config.layer_types[layer_idx] == "sliding_attention"
+            else None,
         )
 
         # Gemma2-specific attributes
@@ -802,6 +804,7 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
             lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
 
         if self.config.final_logit_softcapping is not None:
+            assert lm_logits is not None
             cap = jnp.array(self.config.final_logit_softcapping, dtype=lm_logits.dtype)
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
 

@@ -113,7 +113,7 @@ WORKER_DRAIN_INITIAL_DELAY = 0.1  # Initial retry delay in seconds
 SamplingCallable = typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None] | None
 
 
-def _set_requested_new(sp, n: int):
+def _set_requested_new(sp, n: int):  # pyright: ignore[reportUnusedFunction]
     """Set the max_tokens or max_new_tokens attribute on a SamplingParams object.
 
     Args:
@@ -480,8 +480,9 @@ class eSurge(
             ValueError: If tokenizer not provided and cannot be inferred, or if
                 configuration parameters are invalid.
         """
-        from easydel import AutoEasyDeLModelForCausalLM, EasyDeLBaseConfigDict
+        from easydel.infra import EasyDeLBaseConfigDict
         from easydel.layers.attention import AttentionMechanisms
+        from easydel.modules.auto import AutoEasyDeLModelForCausalLM
 
         self.silent_mode = silent_mode
         self._info = logger.info if not self.silent_mode else lambda *args, **kwargs: None
@@ -904,8 +905,14 @@ class eSurge(
                 "max_num_seqs": int(self.max_num_seqs),
                 "page_size": int(self.page_size),
                 "data_parallelism_axis": str(self.data_parallelism_axis),
-                "max_num_batched_tokens": int(self.scheduler.max_num_scheduled_tokens),
-                "scheduler_policy": str(self.scheduler.policy.value if hasattr(self.scheduler.policy, "value") else self.scheduler.policy),
+                "max_num_batched_tokens": (
+                    int(self.scheduler.max_num_scheduled_tokens)
+                    if self.scheduler.max_num_scheduled_tokens is not None
+                    else None
+                ),
+                "scheduler_policy": str(
+                    self.scheduler.policy.value if hasattr(self.scheduler.policy, "value") else self.scheduler.policy
+                ),
             }
             self._distributed_config_fingerprint = make_config_fingerprint(distributed_config)
             self._distributed_controller = DistributedController(

@@ -1298,6 +1298,7 @@ class MultiModalManager:
 
         for i in range(num_images):
             if patch_offsets is not None:
+                assert image_grid_thw is not None
                 size = int(np.asarray(image_grid_thw[i]).prod())
                 start = int(patch_offsets[i])
                 single_pv = pixel_values[start : start + size]
@@ -1374,6 +1375,7 @@ class MultiModalManager:
 
         for i in range(num_videos):
             if patch_offsets is not None:
+                assert video_grid_thw is not None
                 size = int(np.asarray(video_grid_thw[i]).prod())
                 start = int(patch_offsets[i])
                 single_pv = pixel_values_videos[start : start + size]

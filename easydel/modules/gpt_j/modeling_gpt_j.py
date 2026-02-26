@@ -21,7 +21,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -738,7 +738,7 @@ class GPTJModel(EasyDeLBaseModule):
             f"(Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         )
 
-        hidden_states = inputs_embeds + extra_embedding if extra_embedding is not None else inputs_embeds
+        hidden_states = (inputs_embeds + extra_embedding) if extra_embedding is not None else inputs_embeds  # pyright: ignore[reportOptionalOperand]
 
         if mode is None:
             mode = (
@@ -807,7 +807,7 @@ class GPTJModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=GPTJConfig, model_type="gptj")
-class GPTJForCausalLM(BaseCausalLMModule[GPTJModel, GPTJConfig]):
+class GPTJForCausalLM(BaseCausalLMModule[GPTJModel, GPTJConfig]):  # type: ignore
     """GPT-J model with a language modeling head for autoregressive text generation.
 
     This model extends the base GPTJModel by adding a linear layer on top to

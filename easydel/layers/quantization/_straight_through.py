@@ -67,8 +67,8 @@ from __future__ import annotations
 
 import jax
 from eformer.jaximus import ste
-from ejkernel.quantization import dequantize as ej_dequantize
-from ejkernel.quantization import quantize as ej_quantize
+from ejkernel.quantization import dequantize as ej_dequantize  # pyright: ignore[reportMissingTypeStubs]
+from ejkernel.quantization import quantize as ej_quantize  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
 
 from ._configs import (

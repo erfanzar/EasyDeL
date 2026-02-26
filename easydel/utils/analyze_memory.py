@@ -30,11 +30,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("MemoryMonitor")
 
 try:
-    import pandas as pd
+    import pandas as pd  # pyright: ignore[reportMissingTypeStubs]
 
-    PANDAS_AVAILABLE = True
+    _pandas_available = True
 except ImportError:
-    PANDAS_AVAILABLE = False
+    pd = None
+    _pandas_available = False
 
 
 class SMPMemoryMonitor:
@@ -122,7 +123,7 @@ class SMPMemoryMonitor:
 
         return results
 
-    def get_summary(self, format: str = "auto") -> tp.Union[list[dict], "pd.DataFrame"]:  # noqa
+    def get_summary(self, format: str = "auto") -> list[dict] | tp.Any:  # noqa
         """
         Get a summary of memory usage history.
 
@@ -135,12 +136,12 @@ class SMPMemoryMonitor:
             and pandas availability
         """
         if not self.history:
-            return [] if format == "list" else pd.DataFrame() if PANDAS_AVAILABLE else []
+            return [] if format == "list" else pd.DataFrame() if _pandas_available else []
 
-        if format == "pandas" and not PANDAS_AVAILABLE:
+        if format == "pandas" and not _pandas_available:
             raise ImportError("Pandas is not available. Install pandas or use format='list'")
 
-        if format == "pandas" or (format == "auto" and PANDAS_AVAILABLE):
+        if format == "pandas" or (format == "auto" and _pandas_available):
             return pd.DataFrame(self.history).sort_values("timestamp", ascending=False)
 
         return sorted(self.history, key=lambda x: x["timestamp"], reverse=True)

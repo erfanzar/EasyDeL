@@ -58,7 +58,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = get_logger(__name__)
 
 
-@ToolParserManager.register_module(["step3"])
+@ToolParserManager.register_module(["step3"])  # pyright: ignore[reportUntypedClassDecorator]
 class Step3ToolParser(ToolParser):
     """Tool parser for Step3 models with XML-like format.
 
@@ -330,7 +330,7 @@ class Step3ToolParser(ToolParser):
 
                     final_args = self._cast_arguments(
                         function_name,
-                        tool_call_arr.get("parameters", {}),  # type: ignore
+                        tool_call_arr.get("parameters", {}),
                         request,
                     )
                     if final_args:

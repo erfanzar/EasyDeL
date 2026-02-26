@@ -59,7 +59,7 @@ Example:
 
 import jax
 from eformer import common_types
-from ejkernel.modules import ragged_decode_attention
+from ejkernel.modules import ragged_decode_attention  # pyright: ignore[reportMissingTypeStubs]
 from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Float
 
@@ -109,6 +109,7 @@ class AutoRegressiveDecodeAttn(OperationImpl):
         Returns:
             The `OperationMetadata` provided during initialization.
         """
+        assert self.metadata is not None
         return self.metadata
 
     @classmethod

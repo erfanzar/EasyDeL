@@ -39,7 +39,7 @@ from ..abstract_tool import ToolParserManager
 from .hermes_tool_parser import HermesToolParser
 
 
-@ToolParserManager.register_module("longcat")
+@ToolParserManager.register_module("longcat")  # pyright: ignore[reportUntypedClassDecorator]
 class LongcatFlashToolParser(HermesToolParser):
     """Tool parser for Longcat Flash models.
 

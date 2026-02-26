@@ -13,6 +13,7 @@
 # limitations under the License.
 import itertools
 import typing as tp
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -115,11 +116,11 @@ _T = tp.TypeVar("_T")
 
 def create_tuple_parser(
     n: int,
-) -> tp.Callable[[_T | tp.Sequence[_T]], tuple[_T, ...]]:
+) -> Callable[[_T | Sequence[_T]], tuple[_T, ...]]:
     """Ensure a scalar or sequence is expanded into a tuple of length ``n``."""
 
-    def parse(x: _T | tp.Sequence[_T]) -> tuple[_T, ...]:
-        if isinstance(x, tp.Sequence):
+    def parse(x: _T | Sequence[_T]) -> tuple[_T, ...]:
+        if isinstance(x, Sequence):
             if len(x) == n:
                 return tuple(x)
             else:
@@ -197,7 +198,7 @@ class Conv1D(nn.Module):
         specs = {"kernel": Replicated}
         if getattr(self, "use_bias", False) and hasattr(self, "bias"):
             specs["bias"] = Replicated
-        return specs
+        return specs  # pyright: ignore[reportReturnType]
 
     def __call__(self, x):
         """Apply 1D convolution.
@@ -542,15 +543,15 @@ class Mamba2Mixer(nn.Module):
         if mask is not None:
             conv_out = conv_out * mask[:, :, None]
 
-        x, B, C = jnp.split(
+        x, ssm_b, ssm_c = jnp.split(
             conv_out,
             [self.intermediate_size, self.intermediate_size + self.n_groups * self.ssm_state_size],
             axis=-1,
         )
 
         x = x.reshape(batch_size, seq_len, self.num_heads, self.head_dim).astype(jnp.float32)
-        B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
-        C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
+        ssm_b = ssm_b.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
+        ssm_c = ssm_c.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
         # Note: SSM2Op handles group expansion internally
 
         # Prepare dt with bias and clipping
@@ -567,8 +568,8 @@ class Mamba2Mixer(nn.Module):
         ssm_output = self.ssm_op(
             x=x,  # [batch, seq_len, num_heads, head_dim]
             A=self.A_log.value,  # [num_heads] in log form
-            B=B,  # [batch, seq_len, n_groups, ssm_state_size]
-            C=C,  # [batch, seq_len, n_groups, ssm_state_size]
+            B=ssm_b,  # [batch, seq_len, n_groups, ssm_state_size]
+            C=ssm_c,  # [batch, seq_len, n_groups, ssm_state_size]
             D=self.D.value,  # [num_heads]
             dt=dt,  # [batch, seq_len, num_heads]
             gate=None,  # Gating handled by self.norm below
@@ -685,7 +686,7 @@ class Mamba2Block(nn.Module):
             attention_mask,
         )
         hidden_states = residual + hidden_states
-        return hidden_states, cache_params
+        return hidden_states, cache_params  # pyright: ignore[reportReturnType]
 
 
 @register_module(TaskType.BASE_MODULE, config=Mamba2Config, model_type="mamba2")
@@ -824,11 +825,13 @@ class Mamba2Model(EasyDeLBaseModule):
             )
             cache_params[idx] = cache_view
             if output_hidden_states:
+                assert all_hidden_states is not None
                 all_hidden_states = (*all_hidden_states, hidden_states)
 
         hidden_states = self.norm_f(hidden_states)
 
         if output_hidden_states:
+            assert all_hidden_states is not None
             all_hidden_states = (*all_hidden_states, hidden_states)
 
         return Mamba2Output(
@@ -865,7 +868,7 @@ class Mamba2Model(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Mamba2Config, model_type="mamba2")
-class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):
+class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):  # type: ignore
     """Mamba2 model with a language modeling head for causal language modeling tasks.
 
     This model combines the Mamba2 selective state space backbone with a

@@ -48,6 +48,7 @@ Example:
 
 from __future__ import annotations
 
+import collections.abc
 import typing as tp
 
 import jax
@@ -58,7 +59,7 @@ from flax.nnx.nn.dtypes import promote_dtype
 from jax import lax
 from jaxtyping import Array, Shaped
 
-from easydel.layers.quantization._quants import QuantizationConfig
+from easydel.layers.quantization._configs import QuantizationConfig
 
 if tp.TYPE_CHECKING:
     from ._linear_quantized import ColumnParallelLinearQuantized, RowParallelLinearQuantized
@@ -66,8 +67,8 @@ if tp.TYPE_CHECKING:
 Dtype = jnp.dtype
 Initializer = nn.initializers.Initializer
 PrecisionLike = lax.PrecisionLike
-Shape = tp.Sequence[int]
-AxisNames = str | tp.Sequence[str] | tuple[str, ...]
+Shape = collections.abc.Sequence[int]
+AxisNames = str | collections.abc.Sequence[str] | tuple[str, ...]
 
 # Default initializers
 default_kernel_init = nn.initializers.lecun_normal()
@@ -213,7 +214,7 @@ class ParallelLinear(nn.Module):
         self.bias_init: Initializer = bias_init
         self.rngs: nn.Rngs = rngs_computed
 
-        out_features_is_sequence: bool = isinstance(out_features, tp.Sequence)
+        out_features_is_sequence: bool = isinstance(out_features, collections.abc.Sequence)
         tp_merged: int
         if out_features_is_sequence:
             tp_merged = len(out_features)

@@ -271,7 +271,7 @@ class SamplerExecutor:
         )
 
         if self.use_aot_forward:
-            compiled = self._sampling_fn.lower(*sampler_args).compile()
+            compiled = self._sampling_fn.lower(*sampler_args).compile()  # pyright: ignore[reportFunctionMemberAccess]
             self._cache_put(key, compiled)
             return
 

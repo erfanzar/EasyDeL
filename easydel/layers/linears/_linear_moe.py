@@ -60,7 +60,7 @@ import typing
 
 from eformer import common_types
 from eformer.escale import PartitionManager
-from ejkernel.modules import GroupedMatmulConfig, grouped_matmul
+from ejkernel.modules import GroupedMatmulConfig, grouped_matmul  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from flax.nnx.nn.dtypes import promote_dtype
 from jax import numpy as jnp
@@ -360,7 +360,7 @@ class ParallelMoELinear(nn.Module):
             return [DP, EMPTY]
         return [DP, EMPTY]
 
-    def _output_axes(self) -> list[str | None]:
+    def _output_axes(self) -> list[str | list[str] | None]:
         """Returns sharding axes for output activations based on parallelism direction.
 
         The output sharding depends on the parallelism strategy:

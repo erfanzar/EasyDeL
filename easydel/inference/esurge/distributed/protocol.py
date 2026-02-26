@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import json
 import typing as tp
+from collections.abc import Mapping
 
 CMD_HELLO = "hello"
 CMD_HEALTH = "health"
@@ -127,7 +128,7 @@ def _hash_payload(payload: tp.Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def make_config_fingerprint(config: tp.Mapping[str, tp.Any]) -> str:
+def make_config_fingerprint(config: Mapping[str, tp.Any]) -> str:
     """Build a stable SHA-256 fingerprint of an engine configuration mapping.
 
     The leader sends its fingerprint during the handshake and compares it

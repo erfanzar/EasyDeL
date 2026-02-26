@@ -45,6 +45,7 @@ Example:
 
 from __future__ import annotations
 
+import collections.abc
 import copy
 import hashlib
 import inspect
@@ -58,7 +59,7 @@ import numpy as np
 from eformer.escale import PartitionAxis
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array
@@ -166,7 +167,7 @@ class BeamSearchState:
     model_kwargs: dict[str, Array]
 
 
-def _safepick(config, pickname):
+def _safepick(config, pickname):  # pyright: ignore[reportUnusedFunction]
     """Safely retrieve an attribute from a config, falling back to text_config.
 
     This utility function attempts to get an attribute from the given config object.
@@ -1147,6 +1148,7 @@ class EasyGenerationMixin:
                         f"Missing cache view class for layer {idx}. "
                         "Operation discovery did not return a cache view for every layer."
                     )
+                assert config_classes is not None, f"Missing config for layer {idx}"
 
                 if view_class is ParallelHybridCacheView:
                     # Parallel hybrid layer: needs BOTH KV-cache and recurrent/SSM state.
@@ -1555,7 +1557,7 @@ class EasyGenerationMixin:
 
     def _create_required_props_from_kwargs(
         self, model_kwargs: dict[str, Array]
-    ) -> tp.Mapping[str, dict[str, tp.Any]] | None:
+    ) -> collections.abc.Mapping[str, dict[str, tp.Any]] | None:
         """
         Placeholder method to extract or create properties required for specific model types
         from keyword arguments. Intended to be overridden by subclasses if needed.
@@ -1613,7 +1615,7 @@ class EasyGenerationMixin:
                 param = valid_params[name]
                 if param.annotation != inspect.Parameter.empty:
                     try:
-                        if getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None:
+                        if getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None:  # pyright: ignore[reportDeprecated]
                             expected_type = param.annotation.__args__[0]
                             if not isinstance(value, expected_type):
                                 print(
@@ -1688,7 +1690,7 @@ class EasyGenerationMixin:
         batch_size: int,
         decoder_start_token_id: int | None = None,
         bos_token_id: int | None = None,
-        model_kwargs: dict[str, Array] | None = None,
+        model_kwargs: dict[str, Array | None] | None = None,
     ) -> Array:
         """
         Creates the initial `decoder_input_ids` tensor for encoder-decoder generation.
@@ -1709,7 +1711,7 @@ class EasyGenerationMixin:
             Array: The initial `decoder_input_ids` tensor, shape (batch_size, 1).
         """
         if model_kwargs is not None and "decoder_input_ids" in model_kwargs:
-            decoder_input_ids = model_kwargs.pop("decoder_input_ids")
+            decoder_input_ids: Array | None = model_kwargs.pop("decoder_input_ids")
             if decoder_input_ids is not None:
                 return decoder_input_ids
         decoder_start_token_id = self._get_decoder_start_token_id(decoder_start_token_id, bos_token_id)
@@ -1831,7 +1833,7 @@ class EasyGenerationMixin:
         is_encoder_decoder: bool = False,
         input_ids: jnp.ndarray | None = None,
         **model_kwargs,
-    ) -> tuple[jnp.ndarray, dict[str, tp.Any]]:
+    ) -> tuple[jnp.ndarray | None, dict[str, tp.Any]]:
         """Expands input tensors for generation with multiple return sequences.
 
         Repeats input_ids and all array-valued model_kwargs along the batch dimension
@@ -2627,7 +2629,7 @@ class EasyGenerationMixin:
                 return tensor
             return tensor.reshape((tensor.shape[0] * tensor.shape[1], *tensor.shape[2:]))
 
-        def flatten_mask_info(mi: MaskInfo, batch_size, num_beams):
+        def flatten_mask_info(mi: MaskInfo, batch_size, num_beams):  # pyright: ignore[reportUnusedFunction]
             """Flatten MaskInfo arrays for flattened beam dimension processing.
 
             Args:
@@ -2639,9 +2641,9 @@ class EasyGenerationMixin:
                 MaskInfo with flattened arrays.
             """
             return jax.tree_util.tree_map(
-                lambda t: t.reshape((batch_size * num_beams, *t.shape[2:]))
-                if isinstance(t, jax.Array) and t.ndim >= 2
-                else t,
+                lambda t: (
+                    t.reshape((batch_size * num_beams, *t.shape[2:])) if isinstance(t, jax.Array) and t.ndim >= 2 else t
+                ),
                 mi,
             )
 
@@ -2726,6 +2728,7 @@ class EasyGenerationMixin:
         model = self.decode if self.config.is_encoder_decoder else self
 
         # flatten beam dim
+        assert model_kwargs is not None, "model_kwargs must not be None for beam search"
         if "encoder_outputs" in model_kwargs:
             model_kwargs["encoder_outputs"]["last_hidden_state"] = flatten_beam_dim(
                 model_kwargs["encoder_outputs"]["last_hidden_state"]

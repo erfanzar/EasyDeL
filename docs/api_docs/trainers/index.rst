@@ -18,6 +18,7 @@ easydel.trainers package
    proximal_policy_optimization_trainer/index
    ray_scaler/index
    reward_trainer/index
+   self_distillation_policy_optimization/index
    supervised_fine_tuning_trainer/index
    trainer/index
    xpo_trainer/index

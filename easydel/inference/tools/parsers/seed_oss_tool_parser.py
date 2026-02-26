@@ -57,7 +57,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = get_logger(__name__)
 
 
-@ToolParserManager.register_module("seed_oss")
+@ToolParserManager.register_module("seed_oss")  # pyright: ignore[reportUntypedClassDecorator]
 class SeedOssToolParser(ToolParser):
     """Tool parser for Seed OSS model outputs.
 
@@ -287,7 +287,7 @@ class SeedOssToolParser(ToolParser):
                 or param_type.startswith("unsigned")
             ):
                 try:
-                    param_value = int(param_value)  # type: ignore
+                    param_value = int(param_value)
                 except (ValueError, TypeError):
                     logger.warning(
                         "Parsed value '%s' of parameter '%s' is not an integer in tool '%s', degenerating to string.",
@@ -301,7 +301,7 @@ class SeedOssToolParser(ToolParser):
                     float_param_value = float(param_value)
                     param_value = (
                         float_param_value if float_param_value - int(float_param_value) != 0 else int(float_param_value)
-                    )  # type: ignore
+                    )
                 except (ValueError, TypeError):
                     logger.warning(
                         "Parsed value '%s' of parameter '%s' is not a float in tool '%s', degenerating to string.",
@@ -418,6 +418,8 @@ class SeedOssToolParser(ToolParser):
         if self.tool_call_prefix not in model_output:
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
 
+        result_content = model_output
+        thinking_content = ""
         if self.think_start_token in model_output and self.think_end_token in model_output:
             think_end_index = model_output.find(self.think_end_token) + len(self.think_end_token)
             result_content = model_output[think_end_index:]
@@ -584,7 +586,7 @@ class SeedOssToolParser(ToolParser):
 
                 if func_end != -1:
                     self.current_function_name = tool_text[func_start:func_end]
-                    self.current_tool_id = self._generate_tool_call_id()  # type: ignore
+                    self.current_tool_id = self._generate_tool_call_id()
                     self.header_sent = True
                     self.in_function = True
 

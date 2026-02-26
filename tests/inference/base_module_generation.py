@@ -1,3 +1,5 @@
+# pyright: reportPrivateLocalImportUsage=false
+
 import os
 import time
 
@@ -81,7 +83,7 @@ def main():
     model.generation_config.top_p = 0.95
     static_argnums = (0, 5)
 
-    @ed.ejit(static_argnums=static_argnums)
+    @ed.ejit(static_argnums=static_argnums)  # pyright: ignore[reportUntypedFunctionDecorator]
     def generate(
         graphdef,
         graphstate,

@@ -49,17 +49,17 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal
 
 import jax.numpy as jnp
 from eformer.aparser import DataClassArgumentParser
 
 try:
-    from eformer.loggings import get_logger  # type: ignore
+    from eformer.loggings import get_logger
 except ModuleNotFoundError:  # pragma: no cover
     import logging
 
-    def get_logger(name: str):  # type: ignore[no-redef]
+    def get_logger(name: str):
         return logging.getLogger(name)
 
 
@@ -123,7 +123,7 @@ class ConvertArgs:
     source: str = field(metadata={"help": "HF repo id (e.g. meta-llama/Llama-3.1-8B) or local path"})
     out: str = field(metadata={"help": "Output directory (local path; GCSFuse mount works)"})
 
-    repo_id: Optional[str] = field(  # noqa: UP045
+    repo_id: str | None = field(
         default=None,
         metadata={"help": "Optional: HF repo id to push to (e.g. EasyDeL/my-easydel)"},
     )
@@ -139,19 +139,23 @@ class ConvertArgs:
     convert_mode: ConvertMode = field(
         default="sequential",
         metadata={
-            "help": "sequential streams shards and writes a TensorStore checkpoint without loading full params; "
-            "from_pretrained loads the model then saves via model.save_pretrained()"
+            "help": (
+                "sequential streams shards and writes a TensorStore checkpoint without loading full params; "
+                "from_pretrained loads the model then saves via model.save_pretrained()"
+            )
         },
     )
 
     torch_streaming_cache: TorchStreamingCache = field(
         default="hf_cache",
         metadata={
-            "help": "Where to store streamed shard downloads: hf_cache keeps files in HF cache; "
-            "temp downloads one shard at a time"
+            "help": (
+                "Where to store streamed shard downloads: hf_cache keeps files in HF cache; "
+                "temp downloads one shard at a time"
+            )
         },
     )
-    torch_streaming_tmp_dir: Optional[str] = field(  # noqa: UP045
+    torch_streaming_tmp_dir: str | None = field(
         default=None,
         metadata={
             "help": "Optional parent directory for temp shard downloads (only used with --torch-streaming-cache temp)"
@@ -175,11 +179,11 @@ class ConvertArgs:
     )
     auto_shard_model: bool = field(default=True, metadata={"help": "Enable/disable automatic sharding"})
 
-    cache_dir: Optional[str] = field(  # noqa: UP045
+    cache_dir: str | None = field(
         default=None, metadata={"help": "HF cache directory (point this at your GCSFuse mount)"}
     )
-    revision: Optional[str] = field(default=None, metadata={"help": "HF revision/branch/tag/commit"})  # noqa: UP045
-    token: Optional[str] = field(  # noqa: UP045
+    revision: str | None = field(default=None, metadata={"help": "HF revision/branch/tag/commit"})
+    token: str | None = field(
         default=None,
         metadata={"help": "HF token (or rely on HF_TOKEN env / `huggingface-cli login`)"},
     )
@@ -202,9 +206,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.enable_hf_transfer:
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
         try:
-            import hf_transfer  # noqa: F401 #type:ignore
+            import hf_transfer  # noqa: F401  # pyright: ignore[reportMissingImports, reportUnusedImport]
         except Exception:
-            logger.warn("Warning: `hf_transfer` is not installed. Run: pip install -U hf_transfer")
+            logger.warning("`hf_transfer` is not installed. Run: pip install -U hf_transfer")
 
     out_dir = Path(args.out).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -276,16 +280,16 @@ def main(argv: list[str] | None = None) -> None:
     logger.info(f"Task: {task}")
 
     task_to_cls = {
-        "causal_lm": ed.AutoEasyDeLModelForCausalLM,
-        "seq2seq": ed.AutoEasyDeLModelForSeq2SeqLM,
-        "speech_seq2seq": ed.AutoEasyDeLModelForSpeechSeq2Seq,
-        "image_text_to_text": ed.AutoEasyDeLModelForImageTextToText,
-        "zero_shot_image_classification": ed.AutoEasyDeLModelForZeroShotImageClassification,
-        "sequence_classification": ed.AutoEasyDeLModelForSequenceClassification,
-        "diffusion_lm": ed.AutoEasyDeLModelForDiffusionLM,
-        "base": ed.AutoEasyDeLModel,
-        "vision": ed.AutoEasyDeLVisionModel,
-        "any_to_any": ed.AutoEasyDeLAnyToAnyModel,
+        "causal_lm": ed.AutoEasyDeLModelForCausalLM,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "seq2seq": ed.AutoEasyDeLModelForSeq2SeqLM,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "speech_seq2seq": ed.AutoEasyDeLModelForSpeechSeq2Seq,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "image_text_to_text": ed.AutoEasyDeLModelForImageTextToText,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "zero_shot_image_classification": ed.AutoEasyDeLModelForZeroShotImageClassification,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "sequence_classification": ed.AutoEasyDeLModelForSequenceClassification,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "diffusion_lm": ed.AutoEasyDeLModelForDiffusionLM,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "base": ed.AutoEasyDeLModel,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "vision": ed.AutoEasyDeLVisionModel,  # pyright: ignore[reportPrivateLocalImportUsage]
+        "any_to_any": ed.AutoEasyDeLAnyToAnyModel,  # pyright: ignore[reportPrivateLocalImportUsage]
     }
 
     model_cls = task_to_cls[task]

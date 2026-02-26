@@ -19,6 +19,7 @@ from Qwen3-VL with Mixture of Experts (MoE) architecture from Qwen3-MoE.
 """
 
 import typing
+from collections.abc import Mapping
 
 from eformer.loggings import get_logger
 from jax.sharding import PartitionSpec
@@ -250,8 +251,8 @@ class Qwen3VLMoeConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vision_config: typing.Mapping[str, typing.Any] | Qwen3VLMoeVisionConfig | None = None,
-        text_config: typing.Mapping[str, typing.Any] | Qwen3VLMoeTextConfig | None = None,
+        vision_config: Mapping[str, typing.Any] | Qwen3VLMoeVisionConfig | None = None,
+        text_config: Mapping[str, typing.Any] | Qwen3VLMoeTextConfig | None = None,
         image_token_id: int = 151655,
         video_token_id: int = 151656,
         vision_start_token_id: int = 151652,
@@ -283,7 +284,7 @@ class Qwen3VLMoeConfig(EasyDeLBaseConfig):
         Returns:
             The text configuration object.
         """
-        return self.text_config
+        return self.text_config  # pyright: ignore[reportReturnType]
 
     def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
         """Returns partition rules for model sharding.

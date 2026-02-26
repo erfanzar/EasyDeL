@@ -185,7 +185,7 @@ class WhisperModel:
             and network speed.
         """
         print(f"Loading model: {self.model_name}")
-        self.model = ed.AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
+        self.model = ed.AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(  # pyright: ignore[reportPrivateLocalImportUsage]
             self.model_name,
             dtype=self.dtype,
             param_dtype=self.dtype,
@@ -332,7 +332,7 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
     model_instance = WhisperModel(model_name=model_name, dtype=dtype)
 
     @app.get("/")
-    def read_root():
+    def read_root():  # pyright: ignore[reportUnusedFunction]
         """Root endpoint for health check and API information.
 
         Returns:
@@ -343,14 +343,14 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
         return {"message": "EasyDeL Whisper API", "model": model_instance.model_name}
 
     @app.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
-    async def create_transcription(
-        file: UploadFile = File(...),
-        model: str = Form(model_name),
-        prompt: str | None = Form(None),
-        response_format: ResponseFormat = Form(ResponseFormat.json),
-        temperature: float = Form(0.0),
-        language: str | None = Form(None),
-        timestamp_granularities: tp.Optional[tp.List[str]] = Form(None),  # noqa
+    async def create_transcription(  # pyright: ignore[reportUnusedFunction]
+        file: UploadFile = File(...),  # pyright: ignore[reportCallInDefaultInitializer]
+        model: str = Form(model_name),  # pyright: ignore[reportCallInDefaultInitializer]
+        prompt: str | None = Form(None),  # pyright: ignore[reportCallInDefaultInitializer]
+        response_format: ResponseFormat = Form(ResponseFormat.json),  # pyright: ignore[reportCallInDefaultInitializer]
+        temperature: float = Form(0.0),  # pyright: ignore[reportCallInDefaultInitializer]
+        language: str | None = Form(None),  # pyright: ignore[reportCallInDefaultInitializer]
+        timestamp_granularities: list[str] | None = Form(None),  # pyright: ignore[reportCallInDefaultInitializer]
     ):
         """Transcribe audio to text using the Whisper model.
 
@@ -396,6 +396,7 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
                     "text": "Hello, this is a test transcription."
                 }
         """
+        temp_file_path: str | None = None
         try:
             # Create a temporary file to store the uploaded audio
             with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
@@ -438,13 +439,13 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
                 os.unlink(temp_file_path)
 
     @app.post("/v1/audio/translations")
-    async def create_translation(
-        file: UploadFile = File(...),
-        model: str = Form(model_name),
-        prompt: tp.Optional[str] = Form(None),  # noqa
-        response_format: ResponseFormat = Form(ResponseFormat.json),
-        temperature: float = Form(0.0),
-        timestamp_granularities: tp.Optional[tp.List[str]] = Form(None),  # noqa
+    async def create_translation(  # pyright: ignore[reportUnusedFunction]
+        file: UploadFile = File(...),  # pyright: ignore[reportCallInDefaultInitializer]
+        model: str = Form(model_name),  # pyright: ignore[reportCallInDefaultInitializer]
+        prompt: str | None = Form(None),  # pyright: ignore[reportCallInDefaultInitializer]
+        response_format: ResponseFormat = Form(ResponseFormat.json),  # pyright: ignore[reportCallInDefaultInitializer]
+        temperature: float = Form(0.0),  # pyright: ignore[reportCallInDefaultInitializer]
+        timestamp_granularities: list[str] | None = Form(None),  # pyright: ignore[reportCallInDefaultInitializer]
     ):
         """Translate audio to English text using the Whisper model.
 
@@ -491,6 +492,7 @@ def create_whisper_app(model_name: str = "openai/whisper-large-v3-turbo", dtype=
             Unlike transcription, translation always outputs English
             regardless of the source language.
         """
+        temp_file_path: str | None = None
         try:
             # Create a temporary file to store the uploaded audio
             with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:

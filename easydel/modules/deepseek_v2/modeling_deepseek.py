@@ -21,7 +21,7 @@ import jax
 from eformer import common_types
 from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
@@ -1104,7 +1104,7 @@ class DeepseekV2Model(EasyDeLBaseModule):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        return MoeModelOutput(
+        return MoeModelOutput(  # pyright: ignore[reportReturnType]
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_attentions,

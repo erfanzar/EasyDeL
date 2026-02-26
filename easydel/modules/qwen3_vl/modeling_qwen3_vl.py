@@ -21,7 +21,7 @@ import numpy as np
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -169,11 +169,13 @@ def get_rope_index(
                     ed_video = len(input_tokens) + 1
 
                 if ed_image < ed_video:
+                    assert image_grid_thw is not None
                     t, h, w = image_grid_thw[image_index]
                     image_index += 1
                     remain_images -= 1
                     ed = ed_image
                 else:
+                    assert video_grid_thw is not None
                     t, h, w = video_grid_thw[video_index]
                     video_second_per_grid_t = 1.0
                     if second_per_grid_ts:
@@ -1767,7 +1769,7 @@ class Qwen3VLModel(EasyDeLBaseModule):
 
     def compute_embedding(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None,
         *,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         pixel_values: Array | None = None,
@@ -1848,7 +1850,7 @@ class Qwen3VLModel(EasyDeLBaseModule):
 
     def compute_embedding_with_info(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None,
         *,
         inputs_embeds: Float[Array, "batch seq_len hidden_dim"] | None = None,
         pixel_values: Array | None = None,
@@ -2270,7 +2272,7 @@ class Qwen3VLModel(EasyDeLBaseModule):
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
 
-        return Qwen3VLModelOutputWithPast(
+        return Qwen3VLModelOutputWithPast(  # pyright: ignore[reportReturnType]
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,

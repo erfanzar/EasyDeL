@@ -47,8 +47,8 @@ import re
 from collections.abc import Sequence
 from uuid import uuid4
 
-import partial_json_parser
-from partial_json_parser.core.options import Allow
+import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
+from partial_json_parser.core.options import Allow  # pyright: ignore[reportMissingTypeStubs]
 from transformers import AutoTokenizer as AnyTokenizer
 
 from ...openai_api_modules import (
@@ -63,7 +63,7 @@ from ...openai_api_modules import (
 from ..abstract_tool import ToolParser, ToolParserManager
 
 
-@ToolParserManager.register_module("hermes")
+@ToolParserManager.register_module("hermes")  # pyright: ignore[reportUntypedClassDecorator]
 class HermesToolParser(ToolParser):
     """
     Tool call parser for Hermes models.
@@ -105,7 +105,7 @@ class HermesToolParser(ToolParser):
         super().__init__(tokenizer)
 
         self.current_tool_name_sent: bool = False
-        self.prev_tool_call_arr: list[dict] = []
+        self.prev_tool_call_arr: list[dict] | None = []
         self.current_tool_id: int = -1
         self.streamed_args_for_tool: list[str] = []
 
@@ -262,6 +262,7 @@ class HermesToolParser(ToolParser):
             return DeltaMessage(content=delta_text)
 
         try:
+            delta: DeltaMessage | None = None
             prev_tool_start_count = previous_text.count(self.tool_call_start_token)
             prev_tool_end_count = previous_text.count(self.tool_call_end_token)
             cur_tool_start_count = current_text.count(self.tool_call_start_token)
@@ -360,6 +361,8 @@ class HermesToolParser(ToolParser):
             if tool_call_portion is None:
                 delta = DeltaMessage(content=delta_text) if text_portion is not None else None
                 return delta
+
+            assert self.prev_tool_call_arr is not None
 
             if len(self.prev_tool_call_arr) <= self.current_tool_id:
                 self.prev_tool_call_arr.append({})

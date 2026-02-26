@@ -52,6 +52,7 @@ import json
 import os
 import time
 import typing as tp
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from enum import StrEnum
 from http import HTTPStatus
@@ -376,7 +377,7 @@ class InferenceApiRouter:
     def build_oai_params_from_request(
         self,
         request: CompletionRequest,
-    ) -> dict[str, float | int | str | bool | list]:
+    ) -> dict[str, tp.Any]:
         """Build OpenAI parameters from a completion request.
 
         Converts a CompletionRequest object into a dictionary of parameters
@@ -404,7 +405,7 @@ class InferenceApiRouter:
     def build_oai_params_from_chat_request(
         self,
         request: ChatCompletionRequest,
-    ) -> dict[str, float | int | str | bool | list]:
+    ) -> dict[str, tp.Any]:
         """Build OpenAI parameters from a chat completion request.
 
         Converts a ChatCompletionRequest object into a dictionary of parameters
@@ -503,7 +504,7 @@ class InferenceApiRouter:
                 self.metrics.successful_requests += 1
                 return response
 
-            async def stream_events() -> tp.AsyncGenerator[bytes, None]:
+            async def stream_events() -> AsyncGenerator[bytes, None]:
                 """Stream Server-Sent Events from the backend."""
                 try:
                     stream = await self.client.responses.create(**params)
@@ -598,7 +599,7 @@ class InferenceApiRouter:
 
     async def _stream_chat_completion(
         self, params: dict, metadata: dict | None, request_id: str | None = None
-    ) -> tp.AsyncGenerator[bytes, None]:
+    ) -> AsyncGenerator[bytes, None]:
         """Handle streaming chat completion responses.
 
         Streams Server-Sent Events (SSE) formatted responses from the backend
@@ -684,7 +685,7 @@ class InferenceApiRouter:
 
     async def _stream_completion(
         self, params: dict, metadata: dict | None, request_id: str | None = None
-    ) -> tp.AsyncGenerator[bytes, None]:
+    ) -> AsyncGenerator[bytes, None]:
         """Handle streaming completion responses.
 
         Streams Server-Sent Events (SSE) formatted responses from the backend

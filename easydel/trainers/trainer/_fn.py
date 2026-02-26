@@ -26,10 +26,11 @@ The functions are designed to be JIT-compiled for optimal performance
 and support various model architectures through the EasyDeLState abstraction.
 """
 
+import collections.abc
 import typing as tp
 
 import jax
-import optax
+import optax  # pyright: ignore[reportMissingTypeStubs]
 from eformer.escale import with_sharding_constraint
 from jax.sharding import PartitionSpec
 
@@ -46,7 +47,7 @@ from ..training_utils import (
 
 def training_step(
     state: EasyDeLState,
-    batch: tp.Mapping[str, jax.Array],
+    batch: collections.abc.Mapping[str, jax.Array],
     loss_config: LossConfig | None = None,
     learning_rate_fn: optax.Schedule = None,
     partition_spec: PartitionSpec | None = None,
@@ -66,7 +67,7 @@ def training_step(
 
     Args:
         state (EasyDeLState): The current model state, which includes parameters and model graph.
-        batch (tp.Mapping[str, jax.Array]): A mapping of input arrays for the current batch.
+        batch (collections.abc.Mapping[str, jax.Array]): A mapping of input arrays for the current batch.
         loss_config (tp.Optional[LossConfig], optional): Configuration settings for the loss
             computation. Defaults to None.
         learning_rate_fn (optax.Schedule, optional): A schedule function for the learning rate.
@@ -144,10 +145,10 @@ def training_step(
 
 def evaluation_step(
     state: EasyDeLState,
-    batch: tp.Mapping[str, jax.Array],
+    batch: collections.abc.Mapping[str, jax.Array],
     loss_config: LossConfig | None = None,
     partition_spec: PartitionSpec | None = None,
-) -> tuple[tp.Any, LossMetrics]:
+) -> LossMetrics:
     """
     Performs a single evaluation step by computing loss metrics for the input batch.
 
@@ -158,7 +159,7 @@ def evaluation_step(
 
     Args:
         state (EasyDeLState): The current model state.
-        batch (tp.Mapping[str, jax.Array]): A mapping of input arrays for evaluation.
+        batch (collections.abc.Mapping[str, jax.Array]): A mapping of input arrays for evaluation.
         loss_config (tp.Optional[LossConfig], optional): Configuration for loss computation.
             Defaults to None.
         partition_spec (tp.Optional[PartitionSpec], optional): Specification for sharding the batch.

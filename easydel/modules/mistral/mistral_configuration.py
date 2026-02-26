@@ -96,19 +96,19 @@ class MistralConfig(EasyDeLBaseConfig):
         head_dim: int = 128,
         num_hidden_layers: int = 32,
         num_attention_heads: int = 32,
-        num_key_value_heads: int = 8,
-        hidden_act="silu",
-        max_position_embeddings=4096 * 32,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        pad_token_id=None,
+        num_key_value_heads: int | None = 8,
+        hidden_act: str = "silu",
+        max_position_embeddings: int = 4096 * 32,
+        initializer_range: float = 0.02,
+        rms_norm_eps: float = 1e-6,
+        use_cache: bool = True,
+        pad_token_id: int | None = None,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
+        tie_word_embeddings: bool = False,
+        rope_theta: float = 10000.0,
         rope_scaling: dict[str, str | float] | None = None,
-        sliding_window=4096,
+        sliding_window: int | None = 4096,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         number_rep_kv: int = 1,
         attention_dropout: float = 0.0,
@@ -149,7 +149,7 @@ class MistralConfig(EasyDeLBaseConfig):
         if self.layer_types is None:
             self.layer_types = [
                 "sliding_attention" if self.sliding_window is not None else "full_attention"
-                for i in range(self.num_hidden_layers)
+                for _ in range(self.num_hidden_layers)
             ]
         super().__init__(
             pad_token_id=pad_token_id,

@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -289,7 +289,7 @@ class Glm4MoeLiteMoE(BaseMoeModule):
         self.topk_group = config.topk_group
         self.norm_topk_prob = config.norm_topk_prob
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.group_topk_k = min(2, config.n_routed_experts // max(config.n_group, 1))
+        self.group_topk_k = min(2, (config.n_routed_experts or 0) // max(config.n_group, 1))
 
         self.experts = Glm4MoeLiteMLPStack(
             config=config,
@@ -732,7 +732,8 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         )
 
         if (
-            config.mlp_layer_types[layer_idx] == "sparse"
+            config.mlp_layer_types is not None
+            and config.mlp_layer_types[layer_idx] == "sparse"
             and config.n_routed_experts is not None
             and config.num_experts_per_tok is not None
         ):
@@ -980,7 +981,7 @@ class Glm4MoeLiteModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Glm4MoeLiteConfig, model_type="glm4_moe_lite")
-class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteConfig]):
+class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteConfig]):  # type: ignore
     """GLM-4-MoE-Lite model with causal LM head."""
 
     _task_type = TaskType.CAUSAL_LM

@@ -429,7 +429,7 @@ class OperationCacheMixin:
         if name is None:
             return None
         try:
-            op_class = OperationRegistry.get(name.lower())
+            op_class: type | None = OperationRegistry.get(name.lower())
             if op_class is not None:
                 return op_class.get_requirements(mode)
         except ValueError:
@@ -982,7 +982,7 @@ class OperationCacheMixin:
             ... )
         """
         cache_info = self.get_operations_cache_info()
-        cache_view_classes: set[type] = set()
+        cache_view_classes: set[type | None] = set()
 
         for layer in cache_info.layers:
             cache_view_class = layer.requirements.cache.cache_view_class

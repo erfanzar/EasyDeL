@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import collections.abc
 import typing as tp
 
 import jax
@@ -47,7 +48,7 @@ class RunningMoments:
         self.var = 1.0
         self.count = 1e-24
 
-    def update(self, values: tp.Sequence[float] | jnp.ndarray | None):
+    def update(self, values: collections.abc.Sequence[float] | jnp.ndarray | None):
         """Update running statistics with new values.
 
         Args:
@@ -149,6 +150,15 @@ def concatenated_forward(
         outputs = model(**call_kwargs)
         logits = outputs.logits
         loss_mask = completion_attention_mask.astype(bool)
+        # Compute log-probs and mean logits for encoder-decoder models
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        labels_safe = jnp.where(loss_mask, completion_labels, 0)
+        seq_len = labels_safe.shape[1]
+        per_token = log_probs[jnp.arange(log_probs.shape[0])[:, None], jnp.arange(seq_len)[None, :], labels_safe]
+        completion_logps = jnp.where(loss_mask, per_token, 0.0).sum(axis=1)
+        mean_logits = jnp.where(loss_mask[..., None], logits, 0.0).sum() / jnp.maximum(
+            loss_mask.sum(), jnp.array(1, dtype=jnp.int32)
+        )
     else:
         input_ids = completion_input_ids
         attention_mask = completion_attention_mask

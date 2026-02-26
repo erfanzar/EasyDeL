@@ -36,10 +36,11 @@ for JSD. This preserves the correct update direction (increase student log-prob
 when teacher is higher, decrease when teacher is lower) while remaining cheap.
 """
 
+import collections.abc
 import typing as tp
 
 import jax
-import optax
+import optax  # pyright: ignore[reportMissingTypeStubs]
 from eformer.escale import with_sharding_constraint
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -58,7 +59,7 @@ from ..training_utils import (
 
 def sdpo_step(
     state: EasyDeLState,
-    batch: tp.Mapping[str, jax.Array],
+    batch: collections.abc.Mapping[str, jax.Array],
     num_generations: int,
     teacher_prompt_length: int,
     beta: float,
@@ -69,7 +70,7 @@ def sdpo_step(
     gradient_accumulation_steps: int = 1,
     is_training: bool = True,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
-) -> tuple[EasyDeLState, LossMetrics]:
+) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Single SDPO training / evaluation step.
 
     The batch must contain the following arrays (produced by
@@ -143,7 +144,7 @@ def sdpo_step(
         elif distillation_type == "jsd":
             target_logps = jnp.logaddexp(student_logps, teacher_logps) - jnp.log(2.0)
         else:
-            raise ValueError(f"Unknown distillation_type '{distillation_type}'. " "Must be 'kl' or 'jsd'.")
+            raise ValueError(f"Unknown distillation_type '{distillation_type}'. Must be 'kl' or 'jsd'.")
         distill_weight = jax.lax.stop_gradient(student_logps - target_logps)
         per_token_loss = distill_weight * student_logps
 

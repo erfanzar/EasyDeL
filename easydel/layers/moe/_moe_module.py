@@ -59,10 +59,9 @@ from collections.abc import Callable
 from functools import partial
 
 import jax
-import jax.extend
 from eformer import common_types
 from eformer.loggings import get_logger
-from ejkernel.modules import GroupedMatmulConfig, grouped_matmul
+from ejkernel.modules import GroupedMatmulConfig, grouped_matmul  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax import shard_map
@@ -169,7 +168,7 @@ class BaseMoeModule(nn.Module, ABC):
         self.rzl_coef = rzl_coef
         self.routing_strategy = routing_strategy
         self.load_balancing_strategy = load_balancing_strategy
-        self.moe_hooks = MoeFusedHooks() if moe_hooks is None else moe_hooks
+        self.moe_hooks: MoeFusedHooks | None = MoeFusedHooks() if moe_hooks is None else moe_hooks
         self.module_moe_method = self.config.moe_method
 
         self.expert_mesh = self.config.expert_mesh
@@ -437,7 +436,7 @@ class BaseMoeModule(nn.Module, ABC):
         router_probs: jax.Array,
         expert_loads: jax.Array,
         strategy: MoeLoadBalancingStrategy | None = None,
-    ) -> float | None:
+    ) -> Array | float | None:
         """Compute the load balancing auxiliary loss for even expert utilization.
 
         This method calculates an auxiliary loss term that encourages the router to
@@ -507,7 +506,7 @@ class BaseMoeModule(nn.Module, ABC):
         else:
             raise ValueError(f"Unknown load balancing strategy: {strategy}")
 
-    def _compute_router_z_loss(self, router_logits: Float[Array, "batch_seq num_experts"]) -> float | None:
+    def _compute_router_z_loss(self, router_logits: Float[Array, "batch_seq num_experts"]) -> Array | float | None:
         """Compute router z-loss to encourage numerical stability.
 
         The router z-loss penalizes large router logit magnitudes, which helps prevent
@@ -821,7 +820,7 @@ class BaseMoeModule(nn.Module, ABC):
         self,
         selected_experts: Int[Array, "batch_seq k"],
         expert_id: int,
-    ) -> Bool[Array, "batch_seq"]:  # type: ignore #noqa
+    ) -> Bool[Array, "batch_seq"]:  # noqa: F821
         """Creates a boolean mask identifying tokens assigned to a specific expert.
 
         This utility method is useful for per-expert analysis, debugging, or when
@@ -1041,6 +1040,7 @@ class BaseMoeModule(nn.Module, ABC):
         ):
             batch_size, sequence_length, _ = x.shape
             expert_shard_id = jax.lax.axis_index(expert_axis_name)
+            reshaped_group_sizes: jax.Array | None = None
 
             if self.config.use_ring_of_experts:
                 x, gate_logits = tuple(

@@ -1,4 +1,5 @@
 """Test eSurge streaming responses."""
+# pyright: reportPrivateLocalImportUsage=false
 
 import json
 

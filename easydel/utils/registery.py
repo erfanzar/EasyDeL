@@ -264,14 +264,7 @@ class Registry:
         """
         if wakeup:
             try:
-                from easydel import (  # noqa
-                    inference,
-                    infra,
-                    kernels,
-                    layers,
-                    modules,
-                    trainers,
-                )
+                from easydel import inference, infra, kernels, layers, modules, trainers  # noqa  # pyright: ignore[reportUnusedImport]
             except Exception:
                 ...
         impl_cls = cls.get(category, impl_name)
@@ -315,14 +308,7 @@ class Registry:
         """Get all implementations in a category."""
         if wakeup:
             try:
-                from easydel import (  # noqa
-                    inference,
-                    infra,
-                    kernels,
-                    layers,
-                    modules,
-                    trainers,
-                )
+                from easydel import inference, infra, kernels, layers, modules, trainers  # noqa  # pyright: ignore[reportUnusedImport]
             except Exception:
                 ...
         with cls._lock:

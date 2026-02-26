@@ -36,7 +36,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import ColumnWise, Replicated
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -351,6 +351,9 @@ class KimiMoEGate(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
+        assert config.num_experts_per_token is not None, "num_experts_per_token must not be None"
+        assert config.num_experts is not None, "num_experts must not be None"
+        assert config.num_expert_group is not None, "num_expert_group must not be None"
         self.top_k = config.num_experts_per_token
         self.n_routed_experts = config.num_experts
         self.routed_scaling_factor = config.routed_scaling_factor
@@ -604,7 +607,8 @@ class KimiSparseMoeBlock(BaseMoeModule):
             rngs=rngs,
         )
 
-        if config.num_shared_experts > 0:
+        if config.num_shared_experts is not None and config.num_shared_experts > 0:
+            assert config.moe_intermediate_size is not None
             shared_intermediate_size = config.moe_intermediate_size * config.num_shared_experts
             self.shared_experts = KimiMLP(
                 config=config,
@@ -639,7 +643,7 @@ class KimiSparseMoeBlock(BaseMoeModule):
             act_fn=self.experts.act_fn,
         )
 
-        if self.config.num_shared_experts > 0:
+        if self.config.num_shared_experts is not None and self.config.num_shared_experts > 0:
             shared_out = self.shared_experts(hidden_states)
             out = out + shared_out
 
@@ -1161,7 +1165,7 @@ class KimiDeltaAttention(nn.Module):
             AttentionLayerOutput with attention output and updated cache
         """
         if mask_info is not None:
-            q_mask = mask_info.q_attention_mask
+            q_mask: Array | None = typing.cast("Array | None", mask_info.q_attention_mask)
             if q_mask is not None and q_mask.shape[1] != hidden_states.shape[1]:
                 q_mask = q_mask[:, : hidden_states.shape[1]]
             hidden_states = apply_mask_to_padding_states(hidden_states, q_mask)
@@ -1687,7 +1691,7 @@ class KimiLinearModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=KimiLinearConfig, model_type="kimi_linear")
-class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig]):
+class KimiLinearForCausalLM(BaseCausalLMModule[KimiLinearModel, KimiLinearConfig]):  # type: ignore
     """Kimi Linear model with a causal language modeling head.
 
     Extends the base KimiLinearModel with a linear output layer for

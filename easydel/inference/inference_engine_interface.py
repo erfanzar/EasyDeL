@@ -36,6 +36,7 @@ import typing as tp
 import uuid
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -388,7 +389,7 @@ class BaseInferenceApiServer(ABC):
         """
 
         @self.app.middleware("http")
-        async def add_request_id(request: Request, call_next):
+        async def add_request_id(request: Request, call_next):  # pyright: ignore[reportUnusedFunction]
             """Add unique request ID to each request."""
             request_id = f"req_{int(time.time() * 1000000)}"
             request.state.request_id = request_id
@@ -405,7 +406,7 @@ class BaseInferenceApiServer(ABC):
                     self._active_requests.discard(request_id)
 
         @self.app.middleware("http")
-        async def track_metrics(request: Request, call_next):
+        async def track_metrics(request: Request, call_next):  # pyright: ignore[reportUnusedFunction]
             """Track request metrics."""
             self.metrics.total_requests += 1
 
@@ -676,7 +677,7 @@ class BaseInferenceApiServer(ABC):
         return delta_text
 
     @asynccontextmanager
-    async def _acquire_generation_slot(self) -> tp.AsyncIterator[None]:
+    async def _acquire_generation_slot(self) -> AsyncIterator[None]:
         """Acquire a generation slot or raise HTTP 503 when the server is saturated."""
 
         queue = self._generation_slots
@@ -699,7 +700,7 @@ class BaseInferenceApiServer(ABC):
 
     def _start_stream_task(
         self,
-        stream_fn: tp.Callable[[], tp.Iterator[tp.Any]],
+        stream_fn: tp.Callable[[], Iterator[tp.Any]],
     ) -> asyncio.Queue[tuple[str, tp.Any]]:
         """Run blocking ``stream_fn`` in a worker thread and push results to an asyncio queue."""
 
@@ -1514,7 +1515,7 @@ class InferenceEngineAdapter(ABC):
         prompts: str | list[str],
         sampling_params: SamplingParams,
         stream: bool = False,
-    ) -> list[ReturnSample] | tp.AsyncGenerator[list[ReturnSample], None]:
+    ) -> list[ReturnSample] | AsyncGenerator[list[ReturnSample], None]:
         """
         Generate text from prompts.
 

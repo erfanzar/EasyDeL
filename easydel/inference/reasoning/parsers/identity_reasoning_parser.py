@@ -19,7 +19,7 @@ from ...openai_api_modules import DeltaMessage
 from ..abstract_reasoning import ReasoningParser, ReasoningParserManager
 
 
-@ReasoningParserManager.register_module(["identity", "none", "passthrough"])
+@ReasoningParserManager.register_module(["identity", "none", "passthrough"])  # pyright: ignore[reportUntypedClassDecorator]
 class IdentityReasoningParser(ReasoningParser):
     """Pass-through parser: no reasoning extraction, all text is content."""
 

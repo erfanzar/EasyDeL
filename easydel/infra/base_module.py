@@ -68,7 +68,7 @@ import inspect
 import re
 import typing as tp
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import cached_property, partial
@@ -79,7 +79,6 @@ import flax
 import flax.nnx
 import flax.struct
 import jax
-import jax.extend
 import jax.tree_util
 from eformer.common_types import Replicated
 from eformer.escale import make_shard_and_gather_fns, match_partition_rules
@@ -97,6 +96,13 @@ from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 
 from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
 from .etils import EasyDeLGradientCheckPointers
+
+__all__ = (
+    "EasyDeLBaseConfig",
+    "EasyDeLBaseConfigDict",
+    "EasyDeLBaseModule",
+    "ParameterTransformRule",
+)
 from .loss_utils import LOSS_MAPPING, ForCausalLMLoss, ForSequenceClassificationLoss, LossConfig, LossMetrics
 from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin, OperationCacheMixin
 from .modeling_outputs import EmbeddingInfo
@@ -106,7 +112,7 @@ if tp.TYPE_CHECKING:
     from easydel.layers import Embed, ParallelLinear, QuantizationConfig
 
 
-PartitionLike = tp.Mapping[str, tp.Callable] | tp.Mapping[tuple, tp.Callable] | None
+PartitionLike = Mapping[str, tp.Callable] | Mapping[tuple, tp.Callable] | tuple[tuple[str, tp.Any], ...] | None
 """Type alias for partition rule specifications.
 
 Can be a mapping from parameter name patterns (as strings or tuples) to
@@ -220,7 +226,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         - Use lazy_init() for memory-efficient model initialization.
     """
 
-    config_class: type[BaseConf]
+    config_class: type[BaseConf] | None
     base_model_prefix: str
     config: BaseConf | None = None
     _model_task: str | None = None
@@ -521,7 +527,9 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> print(model.mesh.axis_names)
             ('dp', 'fsdp', 'tp', 'sp')
         """
-        return self.config.mesh
+        result = self.config.mesh
+        assert result is not None, "mesh is not configured"
+        return result
 
     @property
     def explicit_mesh(self: Self) -> jax.sharding.Mesh:
@@ -534,7 +542,9 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             jax.sharding.Mesh: The explicit-axis device mesh defined in
                 self.config.explicit_mesh.
         """
-        return self.config.explicit_mesh
+        result = self.config.explicit_mesh
+        assert result is not None, "explicit_mesh is not configured"
+        return result
 
     @property
     def manual_mesh(self: Self) -> jax.sharding.Mesh:
@@ -547,7 +557,9 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             jax.sharding.Mesh: The manual-axis device mesh defined in
                 self.config.manual_mesh.
         """
-        return self.config.manual_mesh
+        result = self.config.manual_mesh
+        assert result is not None, "manual_mesh is not configured"
+        return result
 
     def mesh_call(self: Self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
         """Call the module under the configured JAX mesh context.
@@ -631,10 +643,10 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> model = LlamaModel(config, dtype, param_dtype, precision, rngs)
             >>> all_state = model.params
         """
-        return nn.split(self)[-1]
+        return nn.split(self)[-1]  # pyright: ignore[reportReturnType]
 
     @cached_property
-    def causal_mask(self: Self) -> jnp.ndarray:
+    def causal_mask(self: Self) -> tp.Any:
         """Get or compute the basic causal attention mask from configuration.
 
         Retrieves the causal attention mask from the configuration, computing
@@ -654,7 +666,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         return self.config.get_basic_causal_mask()
 
     @cached_property
-    def frequencies(self: Self) -> jnp.ndarray:
+    def frequencies(self: Self) -> tp.Any:
         """Get or compute the frequency components for rotary embeddings.
 
         Retrieves the frequency components used in Rotary Position Embeddings
@@ -672,7 +684,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         return self.config.get_basic_frequencies()
 
     @cached_property
-    def inv_frequencies(self: Self) -> jnp.ndarray:
+    def inv_frequencies(self: Self) -> tp.Any:
         """Get or compute the inverse frequency components for rotary embeddings.
 
         Retrieves the inverse frequency components used in Rotary Position
@@ -1235,7 +1247,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
     def _apply_sharding_fns(
         self: Self,
-        sharding_fns: tp.Mapping[str, tp.Callable],
+        sharding_fns: Mapping[str, tp.Callable],
     ) -> Self:
         """Apply sharding or gathering functions to the module's parameters.
 
@@ -1279,7 +1291,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         self: Self,
         partition_rules: PartitionLike = None,
         mesh: Mesh | None = None,
-        overlay_fns: tp.Mapping[str, tp.Callable] | None = None,
+        overlay_fns: Mapping[str, tp.Callable] | None = None,
     ) -> Self:
         """Shard the model's parameters according to partition rules and mesh.
 
@@ -1327,7 +1339,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         self: Self,
         partition_rules: PartitionLike = None,
         mesh: Mesh | None = None,
-        overlay_fns: tp.Mapping[str, tp.Callable] | None = None,
+        overlay_fns: Mapping[str, tp.Callable] | None = None,
     ) -> Self:
         """Gather the model's parameters from distributed devices to host.
 
@@ -1773,7 +1785,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         """
         raise NotImplementedError()
 
-    def compute_embedding(self: Self, input_ids: Int[Array, "..."], *args, **kwargs) -> Float[Array, "..."]:
+    def compute_embedding(self: Self, input_ids: Int[Array, "..."] | None, *args, **kwargs) -> Float[Array, "..."]:
         """Compute input embeddings from token IDs.
 
         By default, calls the embedding layer returned by get_embedding().
@@ -1881,30 +1893,31 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         if partition_rules is None:
             partition_rules = lazy_model.resolve_shardings_automatically()
         for path, module in iter_module_search(lazy_model, (flax.nnx.Module, ArrayParam)):
-            if path:
-                joined_path = "/".join([str(p) for p in path])
-                a = jnp.ones((1,))
-                partition_spec = jax.tree_util.tree_map(
-                    lambda x: NamedSharding(lazy_model.mesh, x),
-                    match_partition_rules(
-                        partition_rules,
-                        {
-                            joined_path + "/kernel": a,
-                            joined_path + "/bias": a,
-                            joined_path + "/embedding": a,
-                            joined_path + "/scale": a,
-                            joined_path: a,
-                        },
-                        strict=False,
-                    ),
-                )
-                shardings = {
-                    "kernel": partition_spec[joined_path + "/kernel"],
-                    "bias": partition_spec[joined_path + "/bias"],
-                    "embedding": partition_spec[joined_path + "/embedding"],
-                    "scale": partition_spec[joined_path + "/scale"],
-                    "raw": partition_spec[joined_path],
-                }
+            if not path:
+                continue
+            joined_path = "/".join([str(p) for p in path])
+            a = jnp.ones((1,))
+            partition_spec = jax.tree_util.tree_map(
+                lambda x: NamedSharding(lazy_model.mesh, x),
+                match_partition_rules(
+                    partition_rules,
+                    {
+                        joined_path + "/kernel": a,
+                        joined_path + "/bias": a,
+                        joined_path + "/embedding": a,
+                        joined_path + "/scale": a,
+                        joined_path: a,
+                    },
+                    strict=False,
+                ),
+            )
+            shardings = {
+                "kernel": partition_spec[joined_path + "/kernel"],
+                "bias": partition_spec[joined_path + "/bias"],
+                "embedding": partition_spec[joined_path + "/embedding"],
+                "scale": partition_spec[joined_path + "/scale"],
+                "raw": partition_spec[joined_path],
+            }
             if hasattr(module, "kernel") and hasattr(module, "kernel_init"):
                 arr = module.kernel_init(
                     key=rng.param(),
@@ -2037,7 +2050,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         self = merge_lora_params(self, pytree)
         return self
 
-    def split_lora_params(self: Self) -> dict:
+    def split_lora_params(self: Self) -> tp.Any:
         """Split merged LoRA parameters back out from the base model.
 
         Extracts LoRA adaptation matrices that were previously merged using
@@ -2900,7 +2913,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         Note:
             The hash is deterministic - identical states produce identical hashes.
         """
-        from ejkernel.callib._ejit import _get_args_signature
+        from ejkernel.callib._ejit import _get_args_signature  # pyright: ignore[reportMissingTypeStubs]
 
         dict_config = self.config.to_dict()
         if pop_things:

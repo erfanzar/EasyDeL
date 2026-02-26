@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+# pyright: reportPrivateLocalImportUsage=false
 import logging
 from collections.abc import Callable, Iterable
 from functools import lru_cache
@@ -22,17 +23,14 @@ from typing import Any
 
 import jax
 import numpy as np
-from datasets import Dataset, IterableDataset, load_dataset
+from datasets import Dataset, IterableDataset, load_dataset  # pyright: ignore[reportMissingTypeStubs]
 from jax import lax
 from jax import numpy as jnp
 from transformers import AutoTokenizer
 
 import easydel as ed
 
-if jax.default_backend() == "tpu":
-    MODEL_REPO = "Qwen/Qwen3-4B"
-else:
-    MODEL_REPO = "Qwen/Qwen2.5-0.5B-Instruct"
+MODEL_REPO: str = "Qwen/Qwen3-4B" if jax.default_backend() == "tpu" else "Qwen/Qwen2.5-0.5B-Instruct"
 
 PREFERENCE_DATASET = "trl-lib/ultrafeedback_binarized"
 PREFERENCE_SPLIT = "train[:50%]"
@@ -100,7 +98,7 @@ def load_causal_lm_model(model_repo: str | None = None) -> ed.AutoEasyDeLModelFo
     tokenizer = get_tokenizer(repo)
     model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(repo, **_load_model_kwargs())
     model.config.pad_token_id = tokenizer.pad_token_id
-    return model
+    return model  # pyright: ignore[reportReturnType]
 
 
 def load_sequence_classifier_model(
@@ -110,7 +108,7 @@ def load_sequence_classifier_model(
     tokenizer = get_tokenizer(repo)
     model = ed.AutoEasyDeLModelForSequenceClassification.from_pretrained(repo, num_labels=1, **_load_model_kwargs())
     model.config.pad_token_id = tokenizer.pad_token_id
-    return model
+    return model  # pyright: ignore[reportReturnType]
 
 
 def load_preference_dataset(split: str = PREFERENCE_SPLIT):

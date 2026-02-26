@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -786,7 +786,7 @@ class Qwen3MoeModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Qwen3MoeConfig, model_type="qwen3_moe")
-class Qwen3MoeForCausalLM(BaseCausalLMModule[Qwen3MoeModel, Qwen3MoeConfig]):
+class Qwen3MoeForCausalLM(BaseCausalLMModule[Qwen3MoeModel, Qwen3MoeConfig]):  # type: ignore
     """Qwen3 MoE model with a language modeling head for causal language modeling tasks.
 
     This model is a Mixture of Experts transformer-based language model with causal
@@ -907,7 +907,7 @@ class Qwen3MoeForCausalLM(BaseCausalLMModule[Qwen3MoeModel, Qwen3MoeConfig]):
 
 
 @register_module(TaskType.SEQUENCE_CLASSIFICATION, config=Qwen3MoeConfig, model_type="qwen3_moe")
-class Qwen3MoeForSequenceClassification(BaseSequenceClassificationModule[Qwen3MoeModel, Qwen3MoeConfig]):
+class Qwen3MoeForSequenceClassification(BaseSequenceClassificationModule[Qwen3MoeModel, Qwen3MoeConfig]):  # type: ignore
     """Qwen3 MoE model for sequence classification tasks.
 
     This class extends the base Qwen3 MoE model by adding a linear classification head

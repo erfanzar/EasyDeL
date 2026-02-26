@@ -24,7 +24,7 @@ from ..abstract_reasoning import ReasoningParserManager
 from ..basic_parsers import BaseThinkingReasoningParser
 
 
-@ReasoningParserManager.register_module(["step3"])
+@ReasoningParserManager.register_module(["step3"])  # pyright: ignore[reportUntypedClassDecorator]
 class Step3ReasoningParser(BaseThinkingReasoningParser):
     """Reasoning parser for Step3 models. Uses only </think> end token."""
 

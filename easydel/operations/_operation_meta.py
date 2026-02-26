@@ -5,6 +5,8 @@ import enum
 import typing as tp
 from typing import NamedTuple
 
+__all__ = ["AttnShardingRules", "OperationMetadata"]
+
 import jax
 import jaxtyping
 from eformer import common_types
@@ -14,7 +16,7 @@ from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 
 if tp.TYPE_CHECKING:
-    from ejkernel.modules.operations.configs import BaseOperationConfig
+    from ejkernel.modules.operations.configs import BaseOperationConfig  # pyright: ignore[reportMissingTypeStubs]
 
     from easydel.infra.base_config import EasyDeLBaseConfig
     from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
@@ -106,7 +108,7 @@ class OperationMetadata:
 
     sequence_axis_name: str = NOT_GIVEN
     platform: EasyDeLPlatforms = NOT_GIVEN
-    backend: EasyDeLBackends = NOT_GIVEN
+    backend: EasyDeLBackends | None = NOT_GIVEN
 
     partition_axis: PartitionAxis = NOT_GIVEN
     partition_manager: PartitionManager = NOT_GIVEN

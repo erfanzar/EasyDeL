@@ -6,6 +6,8 @@ available from the GRPO test helpers. It checks that prompt_ids/prompt_mask are
 preserved and that completion_prompts length matches completions.
 """
 
+# pyright: reportPrivateLocalImportUsage=false
+
 import numpy as np
 
 import easydel as ed

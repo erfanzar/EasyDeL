@@ -67,6 +67,7 @@ Example:
     >>> print(f"Loss: {metrics.loss}, Accuracy: {metrics.accuracy}")
 """
 
+import collections.abc
 import dataclasses
 import enum
 import typing as tp
@@ -129,7 +130,7 @@ class SpecialLossNormalizingFactor(enum.Enum):
 SLNF = SpecialLossNormalizingFactor
 
 # Type alias for loss normalizing factor that can be a float, int, string, or enum.
-FACTOR_TYPE = tp.Optional[float | int | str | SLNF]  # noqa
+FACTOR_TYPE = float | int | str | SLNF | None
 
 
 @auto_pytree
@@ -276,7 +277,7 @@ class LossMetrics:
     grad_norms: flax.struct.PyTreeNode | None = None
     chosen_rewards: jax.Array | None = None
     rejected_rewards: jax.Array | None = None
-    other_metrics: tp.Mapping[str, jax.Array] | None = None
+    other_metrics: collections.abc.Mapping[str, jax.Array] | None = None
     execution_time: float | None = None
 
 
@@ -415,7 +416,7 @@ def cross_entropy_blockwise_logits(
         y = targets.reshape(L)
         w = None if weights is None else weights.reshape(L).astype(jnp.float32)
     elif logits.ndim == 2:
-        L, V = logits.shape
+        L, V = logits.shape  # pyright: ignore[reportConstantRedefinition]
         logits2d = logits
         y = targets
         w = None if weights is None else weights.astype(jnp.float32)
@@ -521,7 +522,7 @@ def sparse_cross_entropy_chunked_vocab(
     reduction: str = "mean",
     chunk_size: int = 8192,
     compute_dtype: jnp.dtype = jnp.float32,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Compute sparse cross-entropy loss with vocabulary chunking.
 
     This function chunks along the vocabulary dimension to reduce memory usage
@@ -950,7 +951,6 @@ def _cross_entropy_with_logits_fwd(
     ],
     tuple[
         Array,
-        Array,
         float,
         Array,
         Array,
@@ -994,7 +994,6 @@ def _cross_entropy_with_logits_fwd(
 
 def _cross_entropy_with_logits_bwd(
     res: tuple[
-        Array,
         Array,
         float,
         Array,
@@ -1345,9 +1344,9 @@ def _sum_weights_per_segment(
 
 def get_factor_and_weight(
     loss_normalizing_factor: FACTOR_TYPE,
-    batch: tp.Mapping[str, Array],
+    batch: collections.abc.Mapping[str, Array],
     compute_dtype: jnp.dtype = jnp.float32,
-) -> tuple[float | None, Array | None]:
+) -> tuple[float | Array | None, Array | None]:
     """Get loss normalizing factor and weights from batch data.
 
     This function resolves dynamic loss normalization factors based on batch
@@ -1415,8 +1414,8 @@ def get_factor_and_weight(
 
 
 def auxiliary_load_balancing_loss_func(
-    gate_logits: Array | tuple[Array, ...],
-    num_experts: int,
+    gate_logits: Array | tuple[Array, ...] | None,
+    num_experts: int | None,
     top_k: int,
     attention_mask: Array | None = None,
     compute_dtype: jnp.dtype = jnp.float32,
@@ -1550,12 +1549,12 @@ def auxiliary_load_balancing_loss_func(
 
 
 def fixed_cross_entropy(
-    source: jax.Array,
-    target: jax.Array,
+    source: jax.Array | None,
+    target: jax.Array | None,
     attention_mask: jax.Array | None = None,
     config: LossConfig | None = None,
     num_items_in_batch: int | None = None,
-    batch: tp.Mapping[str, Array] | None = None,
+    batch: collections.abc.Mapping[str, Array] | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
     """Compute cross-entropy loss with comprehensive configuration options.
@@ -1723,13 +1722,13 @@ def fixed_cross_entropy(
 
 
 def ForCausalLMLoss(
-    logits: jax.Array,
-    labels: jax.Array,
+    logits: jax.Array | None,
+    labels: jax.Array | None,
     attention_mask: jax.Array | None = None,
     config: LossConfig | None = None,
     paxis: PartitionAxis | None = None,
     num_items_in_batch: int | None = None,
-    batch: tp.Mapping[str, Array] | None = None,
+    batch: collections.abc.Mapping[str, Array] | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
     """Compute loss for causal language modeling (next-token prediction).
@@ -1794,6 +1793,7 @@ def ForCausalLMLoss(
     shift_attn_m = attention_mask
     if config is None:
         config = LossConfig()
+    assert logits is not None and labels is not None
     if config.shift_tokens:
         shift_logits = logits[:, :-1, :]
         shift_labels = labels[:, 1:]
@@ -1819,12 +1819,12 @@ def ForCausalLMLoss(
 
 
 def ForSequenceClassificationLoss(
-    logits: jax.Array,
-    labels: jax.Array,
+    logits: jax.Array | None,
+    labels: jax.Array | None,
     attention_mask: jax.Array | None = None,
     config: LossConfig | None = None,
     paxis: PartitionAxis | None = None,
-    batch: tp.Mapping[str, Array] | None = None,
+    batch: collections.abc.Mapping[str, Array] | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
     """Compute loss for sequence classification tasks.
@@ -1928,13 +1928,13 @@ def ForSequenceClassificationLoss(
 
 
 def ForQuestionAnsweringLoss(
-    start_logits: jax.Array,
-    end_logits: jax.Array,
-    start_positions: jax.Array,
-    end_positions: jax.Array,
+    start_logits: jax.Array | None,
+    end_logits: jax.Array | None,
+    start_positions: jax.Array | None,
+    end_positions: jax.Array | None,
     config: LossConfig | None = None,
     paxis: PartitionAxis | None = None,
-    batch: tp.Mapping[str, Array] | None = None,
+    batch: collections.abc.Mapping[str, Array] | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
     """Compute loss for extractive question answering (SQuAD-style).
@@ -2001,11 +2001,11 @@ def ForQuestionAnsweringLoss(
 
 
 def ForTokenClassification(
-    logits: jax.Array,
-    labels: jax.Array,
+    logits: jax.Array | None,
+    labels: jax.Array | None,
     config: LossConfig | None = None,
     paxis: PartitionAxis | None = None,
-    batch: tp.Mapping[str, Array] | None = None,
+    batch: collections.abc.Mapping[str, Array] | None = None,
     **kwargs: tp.Any,
 ) -> LossMetrics:
     """Compute loss for token classification tasks.

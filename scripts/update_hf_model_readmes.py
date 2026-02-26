@@ -39,7 +39,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from eformer.aparser import DataClassArgumentParser
 from huggingface_hub import HfApi, hf_hub_download, list_models
@@ -49,23 +49,21 @@ from huggingface_hub.errors import EntryNotFoundError
 @dataclass
 class ScriptArgs:
     repo_id: str = field(default_factory=list, metadata={"action": "append", "help": "Model repo id (repeatable)."})
-    repos_file: Optional[str] = field(default=None, metadata={"help": "Path to a file with one repo id per line."})  # noqa: UP045
-    author: Optional[str] = field(default=None, metadata={"help": "Update all model repos owned by this HF user/org."})  # noqa: UP045
-    match: Optional[str] = field(default=None, metadata={"help": "Only process repo ids containing this substring."})  # noqa: UP045
-    token: Optional[str] = field(default=None, metadata={"help": "HF token (or set HF_TOKEN env var / hf auth login)."})  # noqa: UP045
-    revision: Optional[str] = field(default=None, metadata={"help": "Repo revision to read from (default: main)."})  # noqa: UP045
+    repos_file: str | None = field(default=None, metadata={"help": "Path to a file with one repo id per line."})
+    author: str | None = field(default=None, metadata={"help": "Update all model repos owned by this HF user/org."})
+    match: str | None = field(default=None, metadata={"help": "Only process repo ids containing this substring."})
+    token: str | None = field(default=None, metadata={"help": "HF token (or set HF_TOKEN env var / hf auth login)."})
+    revision: str | None = field(default=None, metadata={"help": "Repo revision to read from (default: main)."})
     commit_message: str = field(
         default="Update README.md (EasyDeL auto-generated)", metadata={"help": "Commit message."}
     )
     dry_run: bool = field(default=False, metadata={"help": "Generate but do not push changes."})
-    output_dir: Optional[str] = field(  # noqa: UP045
+    output_dir: str | None = field(
         default=None,
         metadata={"help": "Optional directory to write generated READMEs for review."},
     )
-    template_dir: Optional[str] = field(default=None, metadata={"help": "Optional custom Jinja template directory."})  # noqa: UP045
-    template_name: Optional[str] = field(
-        default=None, metadata={"help": "Optional template filename inside template_dir."}
-    )  # noqa: UP045
+    template_dir: str | None = field(default=None, metadata={"help": "Optional custom Jinja template directory."})
+    template_name: str | None = field(default=None, metadata={"help": "Optional template filename inside template_dir."})
 
 
 def _load_readme_generator():

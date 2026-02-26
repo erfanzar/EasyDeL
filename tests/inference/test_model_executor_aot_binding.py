@@ -33,9 +33,7 @@ def _make_min_executor(*, bind_graphstate_for_aot: bool) -> ModelStepExecutor:
     executor.graphdef = 0
     # Minimal step body: output depends on graphstate + kv_pages.
     executor._model_step_fn = jax.jit(
-        lambda graphdef, graphstate, graphother, kv_pages, metadata: (
-            kv_pages + graphstate
-        ),
+        lambda graphdef, graphstate, graphother, kv_pages, metadata: kv_pages + graphstate,
         static_argnums=(0,),
     )
     return executor

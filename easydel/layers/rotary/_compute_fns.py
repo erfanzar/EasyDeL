@@ -494,7 +494,7 @@ def apply_phi3_rope(
     key,
     positions,
     frequencies,
-    offsets: jax.Array = None,
+    offsets: jax.Array | None = None,
     dtype: jnp.dtype = jnp.float32,
 ):
     """
@@ -537,7 +537,7 @@ def apply_basic_rope(
     frequencies: jax.Array,
     rotary_dim: int,
     is_neox_style: bool,
-    offsets: jax.Array = None,
+    offsets: jax.Array | None = None,
     dtype: jnp.dtype = jnp.float32,
 ):
     """

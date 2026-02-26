@@ -32,7 +32,7 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import Replicated
 from eformer.escale import apply_logical_sharding
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -972,7 +972,7 @@ class Qwen3NextLinearAttention(nn.Module):
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
-        mask_info: MaskInfo,
+        mask_info: MaskInfo | None,
         cache_view: LinearCacheView | None = None,
         cache_metadata: LinearMetadata | None = None,
     ) -> DecoderLayerOutput:
@@ -994,7 +994,7 @@ class Qwen3NextLinearAttention(nn.Module):
             AttentionLayerOutput: Contains attention output and updated cache view.
         """
         if mask_info is not None:
-            q_mask = mask_info.q_attention_mask
+            q_mask: Array | None = typing.cast("Array | None", mask_info.q_attention_mask)
             if q_mask is not None and q_mask.shape[1] != hidden_states.shape[1]:
                 q_mask = q_mask[:, : hidden_states.shape[1]]
             hidden_states = apply_mask_to_padding_states(hidden_states, q_mask)
@@ -1114,7 +1114,7 @@ class Qwen3NextLinearAttention(nn.Module):
                 recurrent_state=gdr_output.recurrent_state,
             )
 
-        return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)
+        return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)  # pyright: ignore[reportReturnType]
 
 
 class Qwen3NextDecoderLayer(nn.Module):
@@ -1530,7 +1530,7 @@ class Qwen3NextModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.CAUSAL_LM, config=Qwen3NextConfig, model_type="qwen3_next")
-class Qwen3NextForCausalLM(BaseCausalLMModule[Qwen3NextModel, Qwen3NextConfig]):
+class Qwen3NextForCausalLM(BaseCausalLMModule[Qwen3NextModel, Qwen3NextConfig]):  # type: ignore
     """Qwen3Next model with a causal language modeling head.
 
     Extends the base Qwen3NextModel with a linear output layer for

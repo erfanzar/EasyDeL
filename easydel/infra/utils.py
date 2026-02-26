@@ -119,7 +119,7 @@ Maps activation function names to their implementations.
 Supports common activations used in neural networks.
 """
 
-ROPE_TYPES = tp.Optional[tp.Literal["none", "linear", "dynamic", "yarn", "su", "llama3", "longrope"]]  # noqa
+ROPE_TYPES = tp.Literal["none", "linear", "dynamic", "yarn", "su", "llama3", "longrope"] | None
 
 
 with_sharding_constraint = with_sharding_constraint
@@ -462,7 +462,7 @@ def apply_lora_to_layers(
     return model
 
 
-def split_lora_params(model: nn.Module) -> nn.Module:
+def split_lora_params(model: nn.Module) -> tp.Any:
     """
     get LoRA (Low-Rank Adaptation) from layers within a model.
 
@@ -635,7 +635,7 @@ M = tp.TypeVar("M", bound=nn.Module)
 
 
 @tp.overload
-def auto_remat(
+def auto_remat(  # pyright: ignore[reportOverlappingOverload]
     module: type[M],
     /,
     *,
@@ -794,7 +794,7 @@ def count_flop_jaxpr(jaxpr) -> int:
         out_size = batch_size * np.prod(lhs_remaining) * np.prod(rhs_remaining)
 
         # Each output element requires 2*contracting_size - 1 operations
-        return out_size * (2 * contracting_size - 1)
+        return int(out_size * (2 * contracting_size - 1))
 
     def compute_conv_flops(eqn) -> int:
         """Compute FLOPs for convolution operation."""
@@ -834,7 +834,7 @@ def count_flop_jaxpr(jaxpr) -> int:
         remaining_shape = [s for i, s in enumerate(shape) if i not in reduced_axes]
         remaining_size = np.prod(remaining_shape) if remaining_shape else 1
 
-        return remaining_size * (reduced_size - 1)
+        return int(remaining_size * (reduced_size - 1))
 
     def compute_attention_flops(eqn) -> int:
         """Compute FLOPs for attention operation."""
@@ -1392,7 +1392,7 @@ def flop_attention(
     hidden_dim: int,
     num_heads: int,
     num_kv_heads: int,
-    head_dim: int,
+    head_dim: int | None,
     seq_len: int,
 ) -> float:
     if head_dim is None:
@@ -1730,13 +1730,6 @@ class ArrayParam(nn.Param):
 if tp.TYPE_CHECKING:
     from transformers import BaseImageProcessor, FeatureExtractionMixin, PreTrainedTokenizerBase, ProcessorMixin
 
-    ProcessingClassType = tp.Optional[  # noqa
-        tp.Union[  # noqa
-            PreTrainedTokenizerBase,
-            BaseImageProcessor,
-            FeatureExtractionMixin,
-            ProcessorMixin,
-        ]
-    ]
+    ProcessingClassType = PreTrainedTokenizerBase | BaseImageProcessor | FeatureExtractionMixin | ProcessorMixin | None
 else:
     ProcessingClassType = tp.Any

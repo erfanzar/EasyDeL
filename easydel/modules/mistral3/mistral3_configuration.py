@@ -53,13 +53,13 @@ class Mistral3Config(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vision_config=None,
-        text_config=None,
-        image_token_index=10,
-        projector_hidden_act="gelu",
-        vision_feature_layer=-1,
-        multimodal_projector_bias=False,
-        spatial_merge_size=2,
+        vision_config: dict | EasyDeLBaseConfig | None = None,
+        text_config: dict | EasyDeLBaseConfig | None = None,
+        image_token_index: int = 10,
+        projector_hidden_act: str = "gelu",
+        vision_feature_layer: int | list[int] = -1,
+        multimodal_projector_bias: bool = False,
+        spatial_merge_size: int = 2,
         layer_types: list[str] | None = None,
         **kwargs,
     ):

@@ -34,7 +34,7 @@ def test_set_quantization_exposes_qmm_controls():
         qmm_tpu_path_override="packed",
     )
 
-    quant = elm.config["quantization"]
-    assert quant["use_qmm_best_config"] is False
-    assert quant["qmm_platform_override"] == "xla"
-    assert quant["qmm_tpu_path_override"] == "packed"
+    quant = elm.config["quantization"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert quant["use_qmm_best_config"] is False  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert quant["qmm_platform_override"] == "xla"  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert quant["qmm_tpu_path_override"] == "packed"  # pyright: ignore[reportTypedDictNotRequiredAccess]

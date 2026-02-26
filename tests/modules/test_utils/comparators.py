@@ -67,9 +67,7 @@ def compare_outputs(
     outputs_match = bool(jnp.allclose(hf_arr, ed_arr, atol=atol, rtol=rtol))
 
     # Calculate error metrics
-    correct_percentage = float(
-        jnp.mean(jnp.where(jnp.isclose(hf_arr, ed_arr, atol=atol, rtol=rtol), 1, 0))
-    )
+    correct_percentage = float(jnp.mean(jnp.where(jnp.isclose(hf_arr, ed_arr, atol=atol, rtol=rtol), 1, 0)))
     max_error = float(jnp.abs(hf_arr - ed_arr).max())
 
     # Find location of maximum difference
@@ -111,15 +109,13 @@ def compare_outputs(
     # Format colored output
     loss_close_str = _color(str(loss_match), "32" if loss_match else "31")
     max_error_str = _color(f"{max_error:.6f}", "32" if max_error < 1e-2 else "31")
-    correct_pct_str = _color(
-        f"{correct_percentage:.2%}", "32" if correct_percentage > 0.99 else "31"
-    )
+    correct_pct_str = _color(f"{correct_percentage:.2%}", "32" if correct_percentage > 0.99 else "31")
 
     details = f"""
-{_color(name, '36;1')}
+{_color(name, "36;1")}
 {table}
 
-{_color('Additional Information:', '33;1')}
+{_color("Additional Information:", "33;1")}
 Correct %: {correct_pct_str}
 Max Error: {max_error_str}
 Losses Close: {loss_close_str}

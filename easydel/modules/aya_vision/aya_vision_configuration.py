@@ -62,13 +62,13 @@ class AyaVisionConfig(EasyDeLBaseConfig):
 
     def __init__(
         self,
-        vision_config=None,
-        text_config=None,
-        vision_feature_select_strategy="full",
-        vision_feature_layer=-1,
-        downsample_factor=2,
-        adapter_layer_norm_eps=1e-6,
-        image_token_index=255036,
+        vision_config: dict | EasyDeLBaseConfig | None = None,
+        text_config: dict | EasyDeLBaseConfig | None = None,
+        vision_feature_select_strategy: str = "full",
+        vision_feature_layer: int = -1,
+        downsample_factor: int = 2,
+        adapter_layer_norm_eps: float = 1e-6,
+        image_token_index: int = 255036,
         **kwargs,
     ):
         self.image_token_index = image_token_index

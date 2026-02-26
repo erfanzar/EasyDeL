@@ -18,7 +18,7 @@ from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
-from ejkernel.types import MaskInfo
+from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
@@ -354,7 +354,7 @@ class AyaVisionModel(EasyDeLBaseModule):
 
     def compute_embedding(
         self,
-        input_ids: Int[Array, "batch seq_len"],
+        input_ids: Int[Array, "batch seq_len"] | None,
         *,
         image_features: Array | None = None,
         pixel_values: Array | None = None,
@@ -410,8 +410,8 @@ class AyaVisionModel(EasyDeLBaseModule):
 
     def __call__(
         self,
-        input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: Array = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        pixel_values: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,
@@ -528,7 +528,7 @@ class AyaVisionModel(EasyDeLBaseModule):
         Returns:
             TransformerCache: Initialized empty cache ready for generation.
         """
-        return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)
+        return self.language_model.init_cache(batch_size, max_length, starts, shardings, pad_token_id)  # pyright: ignore[reportReturnType]
 
     def prepare_inputs_for_generation(
         self,
@@ -640,7 +640,7 @@ class AyaVisionModel(EasyDeLBaseModule):
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=AyaVisionConfig, model_type="aya_vision")
-class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel, AyaVisionConfig]):
+class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel, AyaVisionConfig]):  # type: ignore
     """AyaVision model for conditional text generation from images.
 
     A vision-language model that generates text conditioned on image inputs.
@@ -771,8 +771,8 @@ class AyaVisionForConditionalGeneration(BaseVisionLanguageModule[AyaVisionModel,
 
     def __call__(
         self,
-        input_ids: Int[Array, "batch seq_len"] = None,
-        pixel_values: Array = None,
+        input_ids: Int[Array, "batch seq_len"] | None = None,
+        pixel_values: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Int[Array, "batch seq_len"] | None = None,

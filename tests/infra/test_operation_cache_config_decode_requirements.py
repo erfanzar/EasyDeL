@@ -101,8 +101,8 @@ def _load_symbols():
 OperationCacheMixin, CacheType, MetadataField = _load_symbols()
 
 
-class _Dummy(OperationCacheMixin):
-    def __init__(self, config):
+class _Dummy(OperationCacheMixin):  # pyright: ignore[reportUntypedBaseClass]
+    def __init__(self, config):  # pyright: ignore[reportMissingSuperCall]
         self.config = config
 
 

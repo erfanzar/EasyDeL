@@ -94,7 +94,7 @@ if typing.TYPE_CHECKING:
 logger = get_logger("eSurge")
 
 
-def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:
+def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:  # pyright: ignore[reportUnusedFunction]
     """Calculate padded request count for compilation efficiency.
 
     Pads the number of requests to powers of 2 (up to 8) or the nearest
@@ -449,8 +449,8 @@ class eSurgeRunner:
         self._vlm_cpu_buffers: dict[
             int,
             tuple[
-                np.ndarray,  # prefill_embeds_cpu
-                np.ndarray,  # prefill_embeds_mask_cpu
+                np.ndarray | None,  # prefill_embeds_cpu
+                np.ndarray | None,  # prefill_embeds_mask_cpu
                 np.ndarray | None,  # mrope_position_ids_cpu
                 np.ndarray | None,  # visual_pos_masks_cpu
                 list[np.ndarray] | None,  # deepstack_visual_embeds_cpu
@@ -462,7 +462,7 @@ class eSurgeRunner:
         *,
         num_tokens_static: int,
         uses_mrope_model: bool,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, list[np.ndarray] | None]:
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, list[np.ndarray] | None]:
         """Get or create cached CPU buffers for VLM prefill data.
 
         Retrieves pre-allocated CPU buffers for VLM embedding overrides,
@@ -577,7 +577,7 @@ class eSurgeRunner:
             pr_len = min(pr_len, self.max_model_len)
             for pr_reqs in reqs_padds:
                 try:
-                    lowered = pack_prompts.lower(
+                    lowered = pack_prompts.lower(  # pyright: ignore[reportFunctionMemberAccess]
                         token_ids,
                         num_prompt_tokens,
                         padded_num_reqs=pr_reqs,
@@ -591,7 +591,7 @@ class eSurgeRunner:
 
         for pr_reqs in reqs_padds:
             try:
-                lowered = build_sampling_arrays.lower(
+                lowered = build_sampling_arrays.lower(  # pyright: ignore[reportFunctionMemberAccess]
                     temperature,
                     min_p,
                     top_p,
@@ -606,7 +606,7 @@ class eSurgeRunner:
 
         for pr_reqs in reqs_padds:
             try:
-                lowered = fill_slice.lower(
+                lowered = fill_slice.lower(  # pyright: ignore[reportFunctionMemberAccess]
                     temperature,
                     jnp.float32(0.0),
                     int(pr_reqs),
@@ -618,8 +618,8 @@ class eSurgeRunner:
                 logger.debug(f"fill_slice skip ({pr_reqs}): {e}")
 
         try:
-            _ = swap_rows.lower(token_ids, jnp.int32(0), jnp.int32(1)).compile()
-            _ = move_row.lower(token_ids, jnp.int32(0), jnp.int32(1)).compile()
+            _ = swap_rows.lower(token_ids, jnp.int32(0), jnp.int32(1)).compile()  # pyright: ignore[reportFunctionMemberAccess]
+            _ = move_row.lower(token_ids, jnp.int32(0), jnp.int32(1)).compile()  # pyright: ignore[reportFunctionMemberAccess]
             logger.debug("swap_rows and move_row compiled")
         except Exception as e:
             logger.debug(f"swap_rows/move_row skip: {e}")
@@ -629,7 +629,7 @@ class eSurgeRunner:
             allowed_ids_padded = jnp.zeros((B, max_allowed), dtype=jnp.int32)
             allowed_lens = jnp.zeros((B,), dtype=jnp.int32)
             try:
-                lowered = build_allowed_mask.lower(
+                lowered = build_allowed_mask.lower(  # pyright: ignore[reportFunctionMemberAccess]
                     allowed_ids_padded,
                     allowed_lens,
                     vocab_size=int(V),
@@ -827,6 +827,7 @@ class eSurgeRunner:
 
         if getattr(info, "deepstack_visual_embeds", None) is not None:
             ds_list = []
+            assert info.deepstack_visual_embeds is not None
             for arr in info.deepstack_visual_embeds:
                 ds_list.append(np.asarray(jax.device_get(arr)))
             req_state.prefill_deepstack_visual_embeds = ds_list
@@ -1295,6 +1296,9 @@ class eSurgeRunner:
         total_d2h_time = 0.0
         token_buckets_used: set[int] = set()
         req_buckets_used: set[int] = set()
+        tokens_np: np.ndarray = np.array([], dtype=np.int32)
+        request_seq_lens: list[tuple[int, CachedRequestState, int]] = []
+        discard_sampled_tokens_req_indices: list[int] = []
 
         cfg = getattr(self.model, "config", None)
         task_type = getattr(self.model, "_task_type", None)
@@ -1314,7 +1318,6 @@ class eSurgeRunner:
                 rid = self.sequence_buffer.req_ids[i]
                 req_ids_window.append(rid)
                 scheduled_list.append(int(scheduler_output.num_scheduled_tokens.get(rid, 0)) if rid is not None else 0)
-
             while scheduled_list and scheduled_list[-1] == 0:
                 scheduled_list.pop()
                 req_ids_window.pop()
@@ -1336,6 +1339,8 @@ class eSurgeRunner:
             current_bucket = self._get_current_bucket(num_reqs)
             padded_num_reqs = current_bucket  # Use bucket size for compilation lookup
 
+            scheduled_full_cpu = self._scheduled_full_cpu
+            active_mask_full_cpu = self._active_mask_full_cpu
             if num_reqs > 0:
                 # Keep scheduled and active_mask as CPU arrays
                 scheduled_full_cpu = self._scheduled_full_cpu
@@ -1356,9 +1361,9 @@ class eSurgeRunner:
 
                 self.req_num_tokens_full_buf = jax.device_put(req_num_tokens_np, self._empty_sharding)
 
-            mrope_position_ids_cpu = None
-            prefill_embeds_cpu = None
-            prefill_embeds_mask_cpu = None
+            mrope_position_ids_cpu: np.ndarray | None = None
+            prefill_embeds_cpu: np.ndarray | None = None
+            prefill_embeds_mask_cpu: np.ndarray | None = None
             visual_pos_masks_cpu = None
             deepstack_visual_embeds_cpu = None
             if is_vlm_model:
@@ -1382,6 +1387,7 @@ class eSurgeRunner:
                     num_tokens_static=num_tokens_static,
                     uses_mrope_model=uses_mrope_model,
                 )
+                visual_off = 0
                 if uses_mrope_model:
                     visual_off = 0
 
@@ -1558,7 +1564,8 @@ class eSurgeRunner:
             d2h_start = time.time()
             tokens_np = np.asarray(out_tokens_win)
             valid_np = np.asarray(valid_mask_win)
-            logits_np = np.asarray(_logits) if self.enable_sampler_metrics and _logits is not None else None
+            _logits_maybe: typing.Any | None = _logits
+            logits_np = np.asarray(_logits_maybe) if self.enable_sampler_metrics and _logits_maybe is not None else None
             total_d2h_time += time.time() - d2h_start
 
             # Track for async scheduling

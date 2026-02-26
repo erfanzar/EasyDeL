@@ -28,10 +28,11 @@ The module provides functions for:
 All functions are JAX-compatible and support distributed training through sharding.
 """
 
+import collections.abc
 import typing as tp
 
 import jax
-import optax
+import optax  # pyright: ignore[reportMissingTypeStubs]
 from eformer.escale import with_sharding_constraint
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -46,7 +47,7 @@ from ..training_utils import (
     update_state_respectfully,
 )
 
-RewardFunc = tp.Union[EasyDeLState, tp.Callable[[list, list], list[float]]]  # noqa
+RewardFunc = EasyDeLState | tp.Callable[[list, list], list[float]]
 
 
 def get_per_token_logps(model, input_ids, attention_mask, prompt_length):
@@ -123,7 +124,7 @@ def get_per_token_logps_and_entropies(model, input_ids, attention_mask, prompt_l
 
 def grpo_step(
     state: EasyDeLState,
-    batch: tp.Mapping[str, jax.Array],
+    batch: collections.abc.Mapping[str, jax.Array],
     num_generations: int,
     beta: float,
     loss_config: LossConfig | None = None,
@@ -138,7 +139,7 @@ def grpo_step(
     importance_sampling_level: str = "token",
     top_entropy_quantile: float = 1.0,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
-) -> tuple[EasyDeLState, LossMetrics]:
+) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     # Determine batch size, minibatch size, and enforce partition spec.
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
