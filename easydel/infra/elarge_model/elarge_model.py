@@ -1807,6 +1807,8 @@ class eLargeModel:
             self.build_tokenizer()
 
         eval_config = self._config.get("eval", {}).copy()
+        # Use chat templating by default for eval unless explicitly overridden.
+        eval_config.setdefault("apply_chat_template", True)
         batch_size = eval_config.pop("batch_size", None)
         max_new_tokens = eval_config.pop("max_new_tokens", 2048)
         temperature = eval_config.pop("temperature", 0.0)

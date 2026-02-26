@@ -1363,6 +1363,8 @@ class EvalKwargs(TypedDict, total=False):
         system_instruction: System instruction prepended to prompts
             for chat/instruction-tuned models.
         apply_chat_template: Apply the model's chat template to prompts.
+            EasyDeL eval defaults this to True when omitted.
+            Can be bool or a template name string supported by lm-eval.
         fewshot_as_multiturn: Format few-shot examples as multi-turn
             conversation rather than concatenated text.
         gen_kwargs: Additional generation keyword arguments passed
@@ -1414,7 +1416,7 @@ class EvalKwargs(TypedDict, total=False):
     write_out: NotRequired[bool]
     log_samples: NotRequired[bool]
     system_instruction: NotRequired[str | None]
-    apply_chat_template: NotRequired[bool]
+    apply_chat_template: NotRequired[bool | str]
     fewshot_as_multiturn: NotRequired[bool]
     gen_kwargs: NotRequired[dict[str, Any] | None]
     predict_only: NotRequired[bool]
