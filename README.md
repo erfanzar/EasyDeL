@@ -580,7 +580,6 @@ elm = (
 # Evaluate on benchmarks
 results = elm.eval(
     tasks=["hellaswag", "mmlu", "gsm8k"],
-    engine="esurge",
     num_fewshot=5,
     output_path="eval_results.json",
 )

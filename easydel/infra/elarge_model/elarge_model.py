@@ -58,7 +58,7 @@ from .builders import (
 )
 from .normalizer import materialize_base_config, normalize, resolve_task, validate
 from .trainer_types import get_trainer_class, get_training_arguments_class, normalize_trainer_config
-from .types import ELMConfig
+from .types import ELMConfig, EvalKwargs
 from .utils import load_elm_config, save_elm_config
 
 if typing.TYPE_CHECKING:
@@ -144,7 +144,7 @@ class eLargeModel:
         >>> results = elm.train()
 
         Evaluation:
-        >>> results = elm.eval(["hellaswag", "mmlu"], engine="esurge")
+        >>> results = elm.eval(["hellaswag", "mmlu"])
     """
 
     def __init__(self, config: ELMConfig | Mapping[str, Any] | str | os.PathLike | ePathLike | None = None):
@@ -798,9 +798,9 @@ class eLargeModel:
         max_new_tokens: int = 2048,
         temperature: float = 0.0,
         top_p: float = 0.95,
-        batch_size: int | None = None,
+        batch_size: int | str | None = None,
         use_tqdm: bool = True,
-        **kwargs,
+        **kwargs: Unpack[EvalKwargs],
     ) -> eLargeModel:
         """Configure evaluation settings for lm-evaluation-harness.
 
@@ -815,7 +815,8 @@ class eLargeModel:
             top_p: Top-p (nucleus) sampling parameter (default: 0.95).
                 Only used when temperature > 0.
             batch_size: Evaluation batch size (default: engine-specific).
-                Higher values increase throughput but use more memory.
+                Can be int or "auto" (backend-dependent). Higher values
+                increase throughput but use more memory.
             use_tqdm: Show progress bar during evaluation (default: True)
             **kwargs: Additional evaluation options:
                 - top_k: Top-k sampling parameter
@@ -1713,10 +1714,10 @@ class eLargeModel:
 
     def eval(
         self,
-        tasks: str | list[str],
-        engine: typing.Literal["esurge", "auto"] | Any = "auto",
-        num_fewshot: int = 0,
+        tasks: str | list[str | dict[str, Any] | Any],
+        num_fewshot: int | None = None,
         output_path: str | None = None,
+        **eval_overrides: Unpack[EvalKwargs],
     ) -> dict[str, Any]:
         """Run evaluation on specified tasks using lm-evaluation-harness.
 
@@ -1724,7 +1725,8 @@ class eLargeModel:
         eSurge engine with the lm-evaluation-harness framework.
 
         Args:
-            tasks: Task name(s) to evaluate on. Can be a single task string or list of tasks.
+            tasks: Task name(s) to evaluate on. Can be a single task string,
+                a list of task names, or lm-eval task objects/config dictionaries.
                 Common tasks include:
                 - Language understanding: "hellaswag", "winogrande", "piqa", "arc_easy", "arc_challenge"
                 - Math: "gsm8k", "math", "minerva_math"
@@ -1733,17 +1735,16 @@ class eLargeModel:
                 - Truthfulness: "truthfulqa_mc1", "truthfulqa_mc2"
                 - Coding: "humaneval", "mbpp"
                 Full list: https://github.com/EleutherAI/lm-evaluation-harness/tree/main/lm_eval/tasks
-            engine: Inference engine to use. Options:
-                - "esurge": Use eSurge engine (high throughput)
-                - "auto": Automatically select based on configuration (default)
-                - An existing eSurge instance for custom configuration
-            num_fewshot: Number of few-shot examples to use (default: 0 for zero-shot).
+            num_fewshot: Number of few-shot examples to use.
+                If None, uses `eval.num_fewshot` when set, otherwise 0.
                 Different tasks may have different recommended values:
                 - MMLU: typically 5-shot
                 - GSM8K: typically 8-shot
                 - HellaSwag: typically 0-shot
             output_path: Optional path to save evaluation results as JSON.
                 Results include detailed metrics, task versions, and configuration.
+            **eval_overrides: Additional lm-eval keyword arguments. These override
+                values from `set_eval()`/`config["eval"]` for this call only.
 
         Returns:
             Dictionary containing evaluation results with structure:
@@ -1769,7 +1770,6 @@ class eLargeModel:
             >>> elm.set_esurge(max_num_seqs=64, hbm_utilization=0.9)
             >>> results = elm.eval(
             ...     ["gsm8k", "mmlu", "truthfulqa_mc1"],
-            ...     engine="esurge",
             ...     num_fewshot=5,
             ...     output_path="eval_results.json"
             ... )
@@ -1778,7 +1778,7 @@ class eLargeModel:
 
             Evaluation with custom settings:
             >>> elm.set_eval(
-                ...     max_new_tokens=512,
+            ...     max_new_tokens=512,
             ...     temperature=0.0,  # Greedy decoding
             ...     batch_size=32
             ... )
@@ -1786,7 +1786,6 @@ class eLargeModel:
 
         Raises:
             ImportError: If lm-eval is not installed (install with: pip install lm-eval)
-            ValueError: If invalid engine type or model not configured
             RuntimeError: If evaluation fails during execution
 
         Note:
@@ -1807,73 +1806,41 @@ class eLargeModel:
             self.build_tokenizer()
 
         eval_config = self._config.get("eval", {}).copy()
+        if eval_overrides:
+            eval_config.update(eval_overrides)
         # Use chat templating by default for eval unless explicitly overridden.
         eval_config.setdefault("apply_chat_template", True)
         batch_size = eval_config.pop("batch_size", None)
         max_new_tokens = eval_config.pop("max_new_tokens", 2048)
         temperature = eval_config.pop("temperature", 0.0)
         top_p = eval_config.pop("top_p", 0.95)
+        device = eval_config.pop("device", "cpu")
+        num_fewshot = eval_config.pop("num_fewshot", num_fewshot)
+        if num_fewshot is None:
+            num_fewshot = 0
         normalize_math_answers = bool(eval_config.pop("normalize_math_answers", True))
         math_answer_task_hints = eval_config.pop("math_answer_task_hints", None)
         include_path = eval_config.pop("include_path", None)
         include_defaults = bool(eval_config.pop("include_defaults", True))
         task_manager = eval_config.pop("task_manager", None)
 
-        eval_adapter: Any | None = None
-        engine_instance = None
+        from easydel.inference.evaluations import eSurgeLMEvalAdapter
 
-        if isinstance(engine, str):
-            if engine == "auto":
-                engine = "esurge"
+        engine_instance = self.build_esurge()
+        if batch_size is None:
+            batch_size = self._config.get("esurge", {}).get("max_num_seqs", 32)
 
-            if engine == "esurge":
-                from easydel.inference.evaluations import eSurgeLMEvalAdapter
-
-                engine_instance = self.build_esurge()
-
-                if batch_size is None:
-                    batch_size = self._config.get("esurge", {}).get("max_num_seqs", 32)
-
-                eval_adapter = eSurgeLMEvalAdapter(
-                    surge=engine_instance,
-                    processor=self._tokenizer,
-                    max_length=self._config.get("esurge", {}).get("max_model_len", 8192),
-                    max_new_tokens=max_new_tokens,
-                    batch_size=batch_size,
-                    temperature=temperature,
-                    top_p=top_p,
-                    normalize_math_answers=normalize_math_answers,
-                    math_answer_task_hints=math_answer_task_hints,
-                )
-            else:
-                raise ValueError(f"Unknown engine type: {engine}")
-
-        else:
-            engine_type = type(engine).__name__
-
-            if "eSurge" in engine_type:
-                from easydel.inference.evaluations import eSurgeLMEvalAdapter
-
-                if batch_size is None:
-                    batch_size = getattr(engine, "max_num_seqs", 32)
-
-                eval_adapter = eSurgeLMEvalAdapter(
-                    surge=engine,
-                    processor=self._tokenizer,
-                    max_length=getattr(engine, "max_model_len", 8192),
-                    max_new_tokens=max_new_tokens,
-                    batch_size=batch_size,
-                    temperature=temperature,
-                    top_p=top_p,
-                    normalize_math_answers=normalize_math_answers,
-                    math_answer_task_hints=math_answer_task_hints,
-                )
-
-            else:
-                raise ValueError(f"Unknown engine instance type: {engine_type}")
-
-        if eval_adapter is None:
-            raise RuntimeError("Failed to create evaluation adapter")
+        eval_adapter = eSurgeLMEvalAdapter(
+            surge=engine_instance,
+            processor=self._tokenizer,
+            max_length=self._config.get("esurge", {}).get("max_model_len", 8192),
+            max_new_tokens=max_new_tokens,
+            batch_size=batch_size,
+            temperature=temperature,
+            top_p=top_p,
+            normalize_math_answers=normalize_math_answers,
+            math_answer_task_hints=math_answer_task_hints,
+        )
 
         if task_manager is None and (include_path is not None or not include_defaults):
             from lm_eval.tasks import TaskManager  # type:ignore
@@ -1887,7 +1854,7 @@ class eLargeModel:
 
         try:
             logger.info(f"Starting evaluation on tasks: {tasks}")
-            logger.info(f"Using {engine if isinstance(engine, str) else type(engine).__name__} engine")
+            logger.info("Using eSurge engine")
             logger.info(f"Batch size: {batch_size}, Few-shot: {num_fewshot}")
 
             results = evaluator.simple_evaluate(
@@ -1895,7 +1862,7 @@ class eLargeModel:
                 tasks=tasks,
                 num_fewshot=num_fewshot,
                 batch_size=batch_size,
-                device="cpu",
+                device=device,
                 task_manager=task_manager,
                 **eval_config,
             )

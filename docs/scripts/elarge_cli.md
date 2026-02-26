@@ -79,7 +79,6 @@ actions:
   - eval:
       tasks: ["gsm8k", "mmlu"]
       num_fewshot: 5
-      engine: esurge  # or "auto"
       output_path: results.json
       print_results: true
 ```
