@@ -2973,6 +2973,31 @@ class EasyGenerationMixin:
         except Exception:
             return False
 
+    def _esurge_cache_scope(self) -> str:
+        """Return a stable cache scope for this model instance.
+
+        eSurge cache entries should be scoped to a model object, not to the
+        current weight values. Some training loops mutate/replace graphstate at
+        each step, and using a value-dependent hash causes unnecessary engine
+        churn and repeated recompilation.
+        """
+        scope = getattr(self, "_esurge_cache_scope_key", None)
+        if scope is not None:
+            return scope
+
+        try:
+            model_hash = self.static_hash(["attn_mechanism"])
+        except Exception:
+            model_hash = "unknown"
+
+        scope = f"{id(self)}-{model_hash}"
+        try:
+            self._esurge_cache_scope_key = scope
+        except Exception:
+            # Best-effort fallback when model objects disallow dynamic attrs.
+            pass
+        return scope
+
     def pause_esurge(
         self,
         engine_id: str | None = None,
@@ -3001,7 +3026,7 @@ class EasyGenerationMixin:
             >>> # Later, generate will auto-resume
             >>> outputs = model.esurge_generate("prompt")  # Auto-resumes!
         """
-        model_hash = self.static_hash(["attn_mechanism"])
+        model_hash = self._esurge_cache_scope()
 
         if engine_id is not None:
             # Pause specific engine
@@ -3049,7 +3074,7 @@ class EasyGenerationMixin:
             >>> model.resume_esurge()
             >>> outputs = model.esurge_generate("prompt")
         """
-        model_hash = self.static_hash(["attn_mechanism"])
+        model_hash = self._esurge_cache_scope()
 
         if engine_id is not None:
             # Resume specific engine
@@ -3100,7 +3125,7 @@ class EasyGenerationMixin:
             ...           f"Paused={engine['paused']}, "
             ...           f"Running={engine['running_requests']}")
         """
-        model_hash = self.static_hash(["attn_mechanism"])
+        model_hash = self._esurge_cache_scope()
         engines_info = []
 
         for cache_key, engine in _ESURGE_MAP_CACHE.items():
@@ -3146,7 +3171,7 @@ class EasyGenerationMixin:
             >>> # Get engine with specific tokenizer
             >>> engine = model.get_relevant_esurge(tokenizer="gpt2")
         """
-        model_hash = self.static_hash(["attn_mechanism"])
+        model_hash = self._esurge_cache_scope()
 
         # Search for any cached engine matching this model
         matching_engines = []
@@ -3335,7 +3360,7 @@ class EasyGenerationMixin:
             silent_mode = getattr(cached_engine, "silent_mode", False) if cached_engine else False
 
         # Build the configuration dict
-        model_hash = self.static_hash(["attn_mechanism"])
+        model_hash = self._esurge_cache_scope()
         extra_dict = dict(
             tokenizer=tokenizer,
             max_model_len=max_model_len,
@@ -3359,6 +3384,7 @@ class EasyGenerationMixin:
         extra_dict_hash = int.from_bytes(bytes_in, byteorder="big", signed=True)
         esurge_hash = f"{model_hash}-{extra_dict_hash}"
 
+        created_new_engine = False
         if esurge_hash in _ESURGE_MAP_CACHE:
             esurge = _ESURGE_MAP_CACHE[esurge_hash]
         else:
@@ -3367,8 +3393,15 @@ class EasyGenerationMixin:
 
             esurge = eSurge(model=self, **extra_dict)
             _ESURGE_MAP_CACHE[esurge_hash] = esurge
+            created_new_engine = True
 
-        if esurge.num_running_requests == 0 and esurge.num_pending_requests == 0:
+        # Freshly created engines already carry current model weights.
+        # Re-refreshing immediately forces an unnecessary scheduler restart.
+        if (
+            not created_new_engine
+            and esurge.num_running_requests == 0
+            and esurge.num_pending_requests == 0
+        ):
             esurge.update_model_weights(self)
 
         # Auto-resume only after weights/model state are refreshed.

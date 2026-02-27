@@ -1275,6 +1275,8 @@ class BaseTrainer(BaseTrainerProtocol):
                 esurge_kwargs["page_size"] = args.esurge_page_size
             if hasattr(args, "esurge_silent_mode"):
                 esurge_kwargs["silent_mode"] = args.esurge_silent_mode
+            if hasattr(args, "esurge_runner_verbose"):
+                esurge_kwargs["runner_verbose"] = args.esurge_runner_verbose
             if args.esurge_max_num_batched_tokens is not None:
                 esurge_kwargs["max_num_batched_tokens"] = args.esurge_max_num_batched_tokens
             if args.esurge_enable_prefix_caching is not None:

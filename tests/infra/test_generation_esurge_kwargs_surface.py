@@ -71,7 +71,7 @@ def test_get_esurge_refreshes_model_state_before_auto_resume(monkeypatch):
         silent_mode=True,
     )
 
-    model_hash = model.static_hash(["attn_mechanism"])
+    model_hash = model._esurge_cache_scope()
     extra_dict_str = pprint.pformat(kwargs)
     bytes_in = hashlib.md5(extra_dict_str.encode("utf-8")).digest()
     extra_dict_hash = int.from_bytes(bytes_in, byteorder="big", signed=True)
@@ -128,7 +128,7 @@ def test_resume_esurge_refreshes_model_state_before_resuming(monkeypatch):
     model = DummyModel()
     engine = DummyEngine()
 
-    generation_module._ESURGE_MAP_CACHE[f"{model.static_hash(['attn_mechanism'])}-resume"] = engine
+    generation_module._ESURGE_MAP_CACHE[f"{model._esurge_cache_scope()}-resume"] = engine
     model.resume_esurge()
 
     assert engine.update_calls == 1
@@ -192,7 +192,7 @@ def test_get_esurge_does_not_inherit_buckets_when_max_num_seqs_is_explicit(monke
         silent_mode=True,
     )
 
-    model_hash = model.static_hash(["attn_mechanism"])
+    model_hash = model._esurge_cache_scope()
     extra_dict = dict(
         tokenizer=kwargs["tokenizer"],
         max_model_len=kwargs["max_model_len"],
@@ -218,3 +218,63 @@ def test_get_esurge_does_not_inherit_buckets_when_max_num_seqs_is_explicit(monke
 
     assert resolved is expected_engine
     assert expected_engine.update_calls == 1
+
+
+def test_get_esurge_skips_redundant_refresh_for_fresh_engine(monkeypatch):
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "granted_freq_max_position_embedding": 1024,
+                },
+            )()
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+    class DummyEngine:
+        def __init__(self):
+            self._paused = False
+            self.silent_mode = True
+            self.num_running_requests = 0
+            self.num_pending_requests = 0
+            self.update_calls = 0
+            self.runner = type("Runner", (), {"model": object()})()
+
+        def update_model_weights(self, _model, *, restart_scheduler=True):
+            del restart_scheduler
+            self.update_calls += 1
+
+    monkeypatch.setattr(generation_module, "_ESURGE_MAP_CACHE", {})
+
+    created_engines: list[DummyEngine] = []
+
+    def _fake_esurge_ctor(*_args, **_kwargs):
+        engine = DummyEngine()
+        created_engines.append(engine)
+        return engine
+
+    monkeypatch.setattr("easydel.inference.eSurge", _fake_esurge_ctor)
+
+    model = DummyModel()
+    engine = model.get_esurge(
+        tokenizer="tok",
+        max_model_len=512,
+        min_input_pad=16,
+        max_num_seqs=8,
+        max_num_seq_buckets=[1, 2, 4, 8],
+        max_num_batched_tokens=64,
+        hbm_utilization=0.5,
+        page_size=32,
+        enable_prefix_caching=True,
+        data_parallelism_axis="dp",
+        runner_verbose=False,
+        decode_truncated_prompt=True,
+        destroy_pages_on_pause=True,
+        silent_mode=True,
+    )
+
+    assert engine is created_engines[0]
+    assert engine.update_calls == 0

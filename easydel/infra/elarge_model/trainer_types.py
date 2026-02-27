@@ -327,6 +327,7 @@ class BaseTrainerCfg(TypedDict, total=False):
         esurge_min_input_pad: Minimum input padding for eSurge.
         esurge_page_size: Page size for eSurge paged attention.
         esurge_silent_mode: Whether to suppress eSurge output.
+        esurge_runner_verbose: Whether to enable verbose eSurge runner performance logs.
         esurge_max_num_batched_tokens: Max num tokens to batch together for eSurge generation.
         esurge_enable_prefix_caching: Enable/disable eSurge prefix caching.
         esurge_data_parallelism_axis: Mesh axis name for eSurge data-parallel KV pages.
@@ -489,6 +490,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     esurge_min_input_pad: NotRequired[int | None]
     esurge_page_size: NotRequired[int | None]
     esurge_silent_mode: NotRequired[bool]
+    esurge_runner_verbose: NotRequired[bool]
     esurge_max_num_batched_tokens: NotRequired[int | None]
     esurge_enable_prefix_caching: NotRequired[bool | None]
     esurge_data_parallelism_axis: NotRequired[str | None]
@@ -1258,6 +1260,7 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "esurge_hbm_utilization": 0.45,
     "esurge_page_size": 32,
     "esurge_silent_mode": True,
+    "esurge_runner_verbose": False,
     "esurge_max_num_batched_tokens": None,
     "esurge_enable_prefix_caching": None,
     "esurge_data_parallelism_axis": None,

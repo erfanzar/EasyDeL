@@ -24,6 +24,17 @@ if TYPE_CHECKING:
 
 
 class EngineIOMixin:
+    def _ensure_scheduler_running(self, *, context: str) -> None:
+        """Raise a clear error when scheduler is unavailable.
+
+        This prevents request wait-loops from hanging indefinitely if the
+        scheduler is stopped without a fatal-crash exception.
+        """
+        if self._scheduler_running:
+            return
+        self._raise_if_scheduler_failed()
+        raise RuntimeError(f"Background scheduler is not running ({context}).")
+
     def generate(
         self,
         prompts: str | list[str],
@@ -107,14 +118,17 @@ class EngineIOMixin:
 
         completed = set()
 
-        if not self._scheduler_running:
-            self._raise_if_scheduler_failed()
-            raise RuntimeError("Background scheduler is not running. Call initiate() first.")
+        self._ensure_scheduler_running(context="generate-start")
 
         while len(completed) < len(prompts):
             self._output_event.wait(timeout=0.1)
             self._output_event.clear()
             self._raise_if_scheduler_failed()
+            if not self._scheduler_running:
+                pending_ids = [rid for rid in request_ids if rid not in completed]
+                for rid in pending_ids:
+                    self.abort_request(rid)
+                raise RuntimeError("Background scheduler stopped while waiting for generation outputs.")
             with self._output_lock:
                 for req_id in request_ids:
                     if req_id not in completed and req_id in self._request_outputs:
@@ -209,9 +223,7 @@ class EngineIOMixin:
         )
         self._add_request(request_id, prompt, effective_params, prompt_token_ids=prompt_tokens)
 
-        if not self._scheduler_running:
-            self._raise_if_scheduler_failed()
-            raise RuntimeError("Background scheduler is not running. Call initiate() first.")
+        self._ensure_scheduler_running(context="stream-start")
 
         with self._request_lock:
             req_event = self._request_events.get(request_id)
@@ -228,6 +240,9 @@ class EngineIOMixin:
                 req_event.wait(timeout=1.0)
                 req_event.clear()
                 self._raise_if_scheduler_failed()
+                if not self._scheduler_running:
+                    self.abort_request(request_id)
+                    raise RuntimeError("Background scheduler stopped while streaming request.")
 
                 snapshot = None
                 with self._output_lock:
@@ -532,9 +547,7 @@ class EngineIOMixin:
             mm_features=mm_features,
         )
 
-        if not self._scheduler_running:
-            self._raise_if_scheduler_failed()
-            raise RuntimeError("Background scheduler is not running. Call initiate() first.")
+        self._ensure_scheduler_running(context="multimodal-chat-start")
 
         if stream:
             return self._stream_multimodal_request(request_id)
@@ -568,6 +581,9 @@ class EngineIOMixin:
                 req_event.wait(timeout=1.0)
                 req_event.clear()
                 self._raise_if_scheduler_failed()
+                if not self._scheduler_running:
+                    self.abort_request(request_id)
+                    raise RuntimeError("Background scheduler stopped while streaming multimodal request.")
 
                 snapshot = None
                 with self._output_lock:
@@ -669,6 +685,9 @@ class EngineIOMixin:
             req_event.wait(timeout=1.0)
             req_event.clear()
             self._raise_if_scheduler_failed()
+            if not self._scheduler_running:
+                self.abort_request(request_id)
+                raise RuntimeError("Background scheduler stopped while waiting for request completion.")
             with self._output_lock:
                 output = self._request_outputs.get(request_id)
                 if output is not None and output.finished:
