@@ -436,6 +436,34 @@ class SDPOTrainer(GRPOTrainer):
         )
         return jnp.asarray(enc["input_ids"]), jnp.asarray(enc["attention_mask"])
 
+    def _ensure_non_empty_prompts(
+        self,
+        prompt_ids: jax.Array,
+        prompt_mask: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, int]:
+        """Ensure each prompt row has at least one visible token.
+
+        Empty prompt rows can appear with malformed / partially tokenized
+        datasets and propagate to eSurge as ``prompt_len=0`` requests. This
+        inserts a fallback token at the last prompt position for such rows.
+        """
+        prompt_mask_np = np.asarray(jax.device_get(prompt_mask))
+        if prompt_mask_np.ndim != 2 or prompt_mask_np.shape[1] == 0:
+            return prompt_ids, prompt_mask, 0
+
+        empty_rows = np.where(prompt_mask_np.sum(axis=1) <= 0)[0]
+        if empty_rows.size == 0:
+            return prompt_ids, prompt_mask, 0
+
+        prompt_ids_np = np.asarray(jax.device_get(prompt_ids)).copy()
+        prompt_mask_np = prompt_mask_np.copy()
+        fallback_token_id = int(self._eos_token_id[0] if len(self._eos_token_id) > 0 else self._pad_token_id)
+
+        prompt_ids_np[empty_rows, -1] = fallback_token_id
+        prompt_mask_np[empty_rows, -1] = 1
+
+        return jnp.asarray(prompt_ids_np), jnp.asarray(prompt_mask_np), int(empty_rows.size)
+
     def _preprocess_batch_input(
         self,
         state: EasyDeLState,
@@ -458,6 +486,12 @@ class SDPOTrainer(GRPOTrainer):
 
         with capture_time() as preprocessing_time_fn:
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
+            prompt_ids, prompt_mask, empty_prompt_rows = self._ensure_non_empty_prompts(prompt_ids, prompt_mask)
+            if empty_prompt_rows > 0:
+                logger.warning(
+                    "Detected %d empty prompt rows in SDPO batch; inserted fallback token.",
+                    empty_prompt_rows,
+                )
 
             with capture_time() as generation_time_fn:
                 results = self.generate_unified(

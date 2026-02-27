@@ -128,8 +128,10 @@ class GRPOConfig(TrainingArguments):
     num_return_sequences: int = field(
         default=4,
         metadata={
-            "help": "The number of sequences to return for each input prompt. Used during sampling to "
-            "generate multiple completions per prompt."
+            "help": (
+                "The number of sequences to return for each input prompt. Used during sampling to "
+                "generate multiple completions per prompt."
+            )
         },
     )
     num_generations: int | None = field(
@@ -177,12 +179,24 @@ class GRPOConfig(TrainingArguments):
         """Post initialization to set dependent parameters."""
         self._handle_deprecated_max_sequence_length(max_sequence_length)
 
+        default_completion = type(self).__dataclass_fields__["max_completion_length"].default
         if self.max_length is not None:
             if self.max_length < self.max_prompt_length:
                 raise ValueError(
                     f"`max_length` ({self.max_length}) must be >= `max_prompt_length` ({self.max_prompt_length})."
                 )
-            self.max_completion_length = self.max_length - self.max_prompt_length
+            max_allowed_completion = self.max_length - self.max_prompt_length
+
+            # Keep legacy behavior when completion length is left at class default:
+            # infer completion from max_length and max_prompt_length.
+            if self.max_completion_length == default_completion:
+                self.max_completion_length = max_allowed_completion
+            elif self.max_completion_length > max_allowed_completion:
+                raise ValueError(
+                    "`max_prompt_length + max_completion_length` "
+                    f"({self.max_prompt_length} + {self.max_completion_length}) must be <= `max_length` "
+                    f"({self.max_length})."
+                )
 
         self.max_length = self.max_prompt_length + self.max_completion_length
 

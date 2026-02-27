@@ -196,6 +196,24 @@ def _tree_key_to_path(key: tp.Any) -> str:
     return s if "/" in s else s.replace(".", "/")
 
 
+def _path_match_variants(path: str) -> tuple[str, ...]:
+    """Build exact-match path variants for different checkpoint key prefixes."""
+    normalized = path.strip("/")
+    slash_variants = {normalized}
+
+    if normalized.startswith("model/params/"):
+        slash_variants.add(normalized[len("model/params/") :])
+        slash_variants.add(normalized[len("model/") :])
+    if normalized.startswith("params/"):
+        slash_variants.add(normalized[len("params/") :])
+    if normalized.startswith("model/"):
+        slash_variants.add(normalized[len("model/") :])
+
+    dot_variants = {p.replace("/", ".") for p in slash_variants}
+    all_variants = slash_variants | dot_variants
+    return tuple(sorted(v for v in all_variants if v))
+
+
 def _build_safe_checkpoint_partition_rules(
     *,
     model: "EasyDeLBaseModule",
@@ -233,7 +251,8 @@ def _build_safe_checkpoint_partition_rules(
         safe_spec = _sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=mesh)
         if safe_spec != spec:
             path = _tree_key_to_path(key)
-            overrides.append((rf"^{re.escape(path)}$", safe_spec))
+            for variant in _path_match_variants(path):
+                overrides.append((rf"^{re.escape(variant)}$", safe_spec))
 
     if not overrides:
         return tuple(partition_rules)

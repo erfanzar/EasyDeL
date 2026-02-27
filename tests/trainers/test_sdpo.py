@@ -36,6 +36,7 @@ from easydel.trainers.self_distillation_policy_optimization import SDPOConfig
 from easydel.trainers.self_distillation_policy_optimization.sdpo_trainer import (
     _FEEDBACK_CORRECT,
     _FEEDBACK_TEMPLATE_SOLVE,
+    SDPOTrainer,
     _build_feedback_separator,
 )
 
@@ -281,6 +282,43 @@ class TestSDPOStepLoss:
         assert batch["completion_ids"].shape == (12, 6)
         assert batch["teacher_ids"].shape == (12, 8 + 10 + 6)
         assert batch["teacher_mask"].shape == batch["teacher_ids"].shape
+
+
+class TestSDPOPromptGuard:
+    """Tests for empty-prompt guard in SDPO preprocessing."""
+
+    @pytest.fixture()
+    def _mock_trainer(self):
+        class _Stub:
+            _eos_token_id = [2]  # noqa: RUF012
+            _pad_token_id = 0
+
+        stub = _Stub()
+        stub._ensure_non_empty_prompts = SDPOTrainer._ensure_non_empty_prompts.__get__(stub)
+        return stub
+
+    def test_inserts_fallback_token_for_empty_rows(self, _mock_trainer):
+        prompt_ids = jnp.array(
+            [
+                [0, 0, 0, 0],
+                [10, 11, 0, 0],
+            ],
+            dtype=jnp.int32,
+        )
+        prompt_mask = jnp.array(
+            [
+                [0, 0, 0, 0],
+                [1, 1, 0, 0],
+            ],
+            dtype=jnp.int32,
+        )
+
+        new_ids, new_mask, fixed = _mock_trainer._ensure_non_empty_prompts(prompt_ids, prompt_mask)
+
+        assert fixed == 1
+        assert int(jnp.sum(new_mask[0])) == 1
+        assert int(new_ids[0, -1]) == 2
+        assert int(jnp.sum(new_mask[1])) == 2
 
 
 if __name__ == "__main__":

@@ -1785,7 +1785,7 @@ class eLargeModel:
             from lm_eval import evaluator  # type:ignore
         except ImportError as e:
             raise ImportError(
-                "lm-eval is required for evaluation. Install with: pip install easydel[torch, lm-eval]"
+                "lm-eval is required for evaluation. Install with: pip install easydel[torch,lm-eval]"
             ) from e
 
         if isinstance(tasks, str):
