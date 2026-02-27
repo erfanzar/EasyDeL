@@ -96,6 +96,7 @@ from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 
 from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
 from .etils import EasyDeLGradientCheckPointers
+from .utils import sanitize_partition_spec_for_shape, sanitize_partition_specs_for_shape_tree
 
 __all__ = (
     "EasyDeLBaseConfig",
@@ -121,6 +122,7 @@ partition specification functions, or None for default partitioning.
 
 
 logger = get_logger(__name__)
+
 
 BaseConf = EasyDeLBaseConfig
 """Alias for EasyDeLBaseConfig for backward compatibility."""
@@ -1329,6 +1331,13 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         mesh = self._get_mesh(mesh)
         partition_rules = self._get_partition_rules(partition_rules)
         partition_specs = match_partition_rules(rules=partition_rules, tree=self.graphtree_params_shape)
+        partition_specs, adjusted = sanitize_partition_specs_for_shape_tree(
+            partition_specs=partition_specs,
+            shape_tree=self.graphtree_params_shape,
+            mesh=mesh,
+        )
+        if adjusted:
+            logger.warning("Adjusted %d non-divisible parameter sharding specs before shard_model.", adjusted)
         shard_fns, _ = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)
         if overlay_fns is not None:
             shard_fns.update(overlay_fns)
@@ -1374,6 +1383,11 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             rules=partition_rules,
             tree=self.graphtree_params_shape,
         )
+        partition_specs, _ = sanitize_partition_specs_for_shape_tree(
+            partition_specs=partition_specs,
+            shape_tree=self.graphtree_params_shape,
+            mesh=mesh,
+        )
         _, gather_fns = make_shard_and_gather_fns(
             partition_specs=partition_specs,
             mesh=mesh,
@@ -1399,6 +1413,11 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             rules=self._get_partition_rules(None),
             tree=self.graphtree_params_shape,
         )
+        partition_specs, _ = sanitize_partition_specs_for_shape_tree(
+            partition_specs=partition_specs,
+            shape_tree=self.graphtree_params_shape,
+            mesh=mesh,
+        )
         return make_shard_and_gather_fns(
             partition_specs=partition_specs,
             mesh=mesh,
@@ -1419,6 +1438,11 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         partition_specs = match_partition_rules(
             rules=self._get_partition_rules(None),
             tree=self.graphtree_params_shape,
+        )
+        partition_specs, _ = sanitize_partition_specs_for_shape_tree(
+            partition_specs=partition_specs,
+            shape_tree=self.graphtree_params_shape,
+            mesh=mesh,
         )
         return make_shard_and_gather_fns(
             partition_specs=partition_specs,
@@ -1482,9 +1506,22 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
         gdef, gstate = nn.split(self)
         mock = ShardState(graphdef=gdef, graphstate=gstate)
+        shape_tree = nn.eval_shape(lambda: mock)
+        partition_specs = match_partition_rules(self._get_partition_rules(partition_rules), shape_tree)
+        partition_specs = jax.tree_util.tree_map(
+            lambda spec, shape: sanitize_partition_spec_for_shape(
+                spec=spec,
+                shape=tuple(shape.shape),
+                mesh=self.mesh,
+            )
+            if isinstance(spec, PartitionSpec) and hasattr(shape, "shape")
+            else spec,
+            partition_specs,
+            shape_tree,
+        )
         shardings = jax.tree_util.tree_map(
             lambda x: NamedSharding(mesh=self.mesh, spec=x),
-            match_partition_rules(self._get_partition_rules(partition_rules), nn.eval_shape(lambda: mock)),
+            partition_specs,
         )
 
         @partial(jax.jit, out_shardings=shardings)
@@ -1617,15 +1654,13 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             from easydel.infra.base_state import EasyDeLState
 
             state_class = EasyDeLState
-
-        @partial(jax.jit, donate_argnums=(1, 2), static_argnums=(0,))
-        def _create_state(gstruct, gstate, gother):
-            return state_class.create(
-                step=0,
-                model=self.merge_module(gstruct, gstate, gother),
-            )
-
-        return _create_state(*self.split_module())
+        gstruct, gstate, gother = self.split_module()
+        return state_class.create(
+            step=0,
+            graphdef=gstruct,
+            graphstate=gstate,
+            graphother=gother,
+        )
 
     def to_torch(self, **kwargs):
         """Convert the EasyDeL module to its HuggingFace PyTorch equivalent.
@@ -1897,26 +1932,41 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 continue
             joined_path = "/".join([str(p) for p in path])
             a = jnp.ones((1,))
-            partition_spec = jax.tree_util.tree_map(
-                lambda x: NamedSharding(lazy_model.mesh, x),
-                match_partition_rules(
-                    partition_rules,
-                    {
-                        joined_path + "/kernel": a,
-                        joined_path + "/bias": a,
-                        joined_path + "/embedding": a,
-                        joined_path + "/scale": a,
-                        joined_path: a,
-                    },
-                    strict=False,
-                ),
+            partition_spec = match_partition_rules(
+                partition_rules,
+                {
+                    joined_path + "/kernel": a,
+                    joined_path + "/bias": a,
+                    joined_path + "/embedding": a,
+                    joined_path + "/scale": a,
+                    joined_path: a,
+                },
+                strict=False,
             )
+
+            def _to_named(spec, shape: tuple[int, ...] | None = None):
+                if shape is not None and isinstance(spec, PartitionSpec):
+                    spec = sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=lazy_model.mesh)
+                return NamedSharding(lazy_model.mesh, spec)
+
             shardings = {
-                "kernel": partition_spec[joined_path + "/kernel"],
-                "bias": partition_spec[joined_path + "/bias"],
-                "embedding": partition_spec[joined_path + "/embedding"],
-                "scale": partition_spec[joined_path + "/scale"],
-                "raw": partition_spec[joined_path],
+                "kernel": _to_named(
+                    partition_spec[joined_path + "/kernel"],
+                    tuple(module.kernel.value.shape) if hasattr(module, "kernel") else None,
+                ),
+                "bias": _to_named(
+                    partition_spec[joined_path + "/bias"],
+                    tuple(module.bias.value.shape) if hasattr(module, "bias") and module.bias is not None else None,
+                ),
+                "embedding": _to_named(
+                    partition_spec[joined_path + "/embedding"],
+                    tuple(module.embedding.value.shape) if hasattr(module, "embedding") else None,
+                ),
+                "scale": _to_named(
+                    partition_spec[joined_path + "/scale"],
+                    tuple(module.scale.value.shape) if hasattr(module, "scale") else None,
+                ),
+                "raw": _to_named(partition_spec[joined_path]),
             }
             if hasattr(module, "kernel") and hasattr(module, "kernel_init"):
                 arr = module.kernel_init(

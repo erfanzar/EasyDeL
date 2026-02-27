@@ -59,7 +59,6 @@ from functools import lru_cache, partial
 
 import jax
 import jax.extend
-import jax.numpy as jnp
 import jax.tree_util
 import numpy as np
 from eformer.escale import with_sharding_constraint
@@ -67,6 +66,8 @@ from eformer.loggings import get_logger
 from eformer.pytree import auto_pytree
 from einops import rearrange
 from flax import nnx as nn
+from jax import numpy as jnp
+from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, DTypeLike, PRNGKeyArray
 from tqdm.auto import tqdm
 
@@ -1733,3 +1734,104 @@ if tp.TYPE_CHECKING:
     ProcessingClassType = PreTrainedTokenizerBase | BaseImageProcessor | FeatureExtractionMixin | ProcessorMixin | None
 else:
     ProcessingClassType = tp.Any
+
+
+def mesh_partition_product(mesh: Mesh, axis_spec: object) -> int:
+    """Return shard multiplicity implied by a PartitionSpec entry."""
+    if axis_spec is None:
+        return 1
+    if isinstance(axis_spec, (tuple, list)):
+        product = 1
+        for axis_name in axis_spec:
+            if axis_name is None:
+                continue
+            try:
+                product *= int(mesh.shape[str(axis_name)])
+            except Exception:
+                product *= 1
+        return int(product)
+    try:
+        return int(mesh.shape[str(axis_spec)])
+    except Exception:
+        return 1
+
+
+def sanitize_partition_spec_for_shape(
+    spec: PartitionSpec,
+    shape: tuple[int, ...],
+    mesh: Mesh,
+) -> PartitionSpec:
+    """Drop non-divisible sharding axes for a concrete tensor shape."""
+    axes = list(tuple(spec))
+    changed = False
+    ndim = len(shape)
+
+    if len(axes) > ndim:
+        axes = axes[:ndim]
+        changed = True
+
+    for dim_index, axis_spec in enumerate(axes):
+        if axis_spec is None:
+            continue
+        shard_factor = mesh_partition_product(mesh, axis_spec)
+        if shard_factor > 1 and int(shape[dim_index]) % shard_factor != 0:
+            axes[dim_index] = None
+            changed = True
+
+    if not changed:
+        return spec
+    return PartitionSpec(*axes)
+
+
+def sanitize_partition_specs_for_shape_tree(
+    partition_specs: tp.Any,
+    shape_tree: tp.Any,
+    mesh: Mesh,
+) -> tuple[tp.Any, int]:
+    """Sanitize a partition-spec tree against concrete parameter shapes."""
+    flat_specs = flatten_dict(partition_specs)
+    flat_shapes = flatten_dict(shape_tree)
+    adjusted = 0
+
+    for key, spec in flat_specs.items():
+        if not isinstance(spec, PartitionSpec):
+            continue
+        shape_obj = flat_shapes.get(key)
+        shape = tuple(getattr(shape_obj, "shape", ()))
+        if not shape:
+            continue
+        safe_spec = sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=mesh)
+        if safe_spec != spec:
+            flat_specs[key] = safe_spec
+            adjusted += 1
+
+    if adjusted == 0:
+        return partition_specs, adjusted
+    return unflatten_dict(flat_specs), adjusted
+
+
+def materialize_meta_leaves(tree: tp.Any, *, seed: int = 0) -> tp.Any:
+    """Replace ShapeDtypeStruct placeholder leaves with concrete values."""
+    flat_tree = flatten_dict(tree)
+    changed = False
+    rng = jax.random.PRNGKey(seed)
+    count = 0
+
+    for leaf in flat_tree.values():
+        value = getattr(leaf, "value", None)
+        if not isinstance(value, jax.ShapeDtypeStruct):
+            continue
+        leaf_type = type(leaf)
+        if issubclass(leaf_type, nn.RngCount):
+            leaf.value = jnp.asarray(count, dtype=value.dtype)
+            count += 1
+        elif issubclass(leaf_type, nn.RngKey):
+            leaf.value = rng
+            rng, _ = jax.random.split(rng)
+        else:
+            leaf.value = jnp.zeros(value.shape, dtype=value.dtype)
+        changed = True
+
+    if not changed:
+        return tree
+    return unflatten_dict(flat_tree)
