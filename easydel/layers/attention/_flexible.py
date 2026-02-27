@@ -302,12 +302,6 @@ class FlexibleAttentionModule(nn.Module):
         if attn_mechanism is None:
             attn_mechanism = base_config.attn_mechanism
 
-        rngs_computed: nn.Rngs
-        if rngs is None:
-            rngs_computed = nn.Rngs(42)
-        else:
-            rngs_computed = rngs
-
         attn_dtype_is_string: bool = isinstance(base_config.attn_dtype, str)
         if attn_dtype_is_string:
             base_config.attn_dtype = _get_jax_dtype_from_string(base_config.attn_dtype)
@@ -328,7 +322,6 @@ class FlexibleAttentionModule(nn.Module):
         metadata: OperationMetadata = OperationMetadata.from_config(config=base_config)
         self.config: EasyDeLBaseConfig = base_config
         self.metadata: OperationMetadata = metadata
-        self.rngs: nn.Rngs = rngs_computed
         self.softmax_scale: float = softmax_scale
         self.dropout_prob: float = dropout_prob
         self._requires_cache: bool | None = requires_cache
@@ -434,17 +427,6 @@ class FlexibleAttentionModule(nn.Module):
                 AttentionMechanisms.UNIFIED_ATTENTION,
                 AttentionMechanisms.PAGED_FLASH_ATTENTION,
             ]
-
-        # NOTE: Attention Dropout is disabled for now.
-        # try:
-        #     rngs = self.rngs()
-        # except flax.errors.TraceContextError:
-        #     rngs = None
-
-        # Use provided dropout_rng or rngs
-        # if dropout_rng is None:
-
-        # Use provided deterministic or self.deterministic
 
         if deterministic is None:
             deterministic_computed = self.deterministic
