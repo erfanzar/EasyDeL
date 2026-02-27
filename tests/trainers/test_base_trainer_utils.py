@@ -285,6 +285,7 @@ def test_generate_unified_esurge_releases_only_used_engine():
         esurge_min_input_pad=None,
         esurge_page_size=None,
         esurge_silent_mode=True,
+        esurge_runner_verbose=True,
         esurge_max_num_batched_tokens=None,
         esurge_enable_prefix_caching=None,
         esurge_data_parallelism_axis=None,
@@ -347,6 +348,7 @@ def test_generate_unified_esurge_releases_only_used_engine():
     )
 
     assert model.call_esurge_engine_kwargs is not None
+    assert model.get_esurge_kwargs["runner_verbose"] is True
     assert results.generation_results == ["completion-text"]
     assert engine.pause_calls == 1
     assert engine.release_calls == [False]

@@ -433,6 +433,10 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Silence eSurge info logs (engine start/stop/resume, cache events)."},
     )
+    esurge_runner_verbose: bool = field(
+        default=False,
+        metadata={"help": "Enable verbose eSurge runner performance logs (including `[perf]` lines)."},
+    )
     esurge_max_num_batched_tokens: int | None = field(
         default=None,
         metadata={"help": "Maximum number of tokens to batch together for eSurge generation. None uses eSurge default."},
