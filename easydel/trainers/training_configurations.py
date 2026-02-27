@@ -415,6 +415,12 @@ class TrainingArguments:
             "help": "Maximum number of concurrent sequences for eSurge batch processing. None uses eSurge default."
         },
     )
+    esurge_max_num_seq_buckets: list[int] | None = field(
+        default=None,
+        metadata={
+            "help": "Optional explicit sequence-capacity buckets for eSurge runner compilation."
+        },
+    )
     esurge_min_input_pad: int | None = field(
         default=None,
         metadata={"help": "Minimum input padding for eSurge sequences. None uses eSurge default."},
@@ -430,6 +436,14 @@ class TrainingArguments:
     esurge_max_num_batched_tokens: int | None = field(
         default=None,
         metadata={"help": "Maximum number of tokens to batch together for eSurge generation. None uses eSurge default."},
+    )
+    esurge_enable_prefix_caching: bool | None = field(
+        default=None,
+        metadata={"help": "Enable/disable eSurge prefix caching. None keeps engine default behavior."},
+    )
+    esurge_data_parallelism_axis: str | None = field(
+        default=None,
+        metadata={"help": "Mesh axis name used by eSurge as the data-parallel KV-page axis (e.g. 'dp')."},
     )
     num_train_epochs: int = field(
         default=10,
@@ -939,6 +953,12 @@ class TrainingArguments:
             self.generation_interval = None
         if self.generation_num_prompts is not None:
             self.generation_num_prompts = max(1, int(self.generation_num_prompts))
+        if self.esurge_max_num_seq_buckets is not None:
+            self.esurge_max_num_seq_buckets = [int(v) for v in self.esurge_max_num_seq_buckets]
+        if self.esurge_data_parallelism_axis is not None:
+            self.esurge_data_parallelism_axis = str(self.esurge_data_parallelism_axis).strip()
+            if not self.esurge_data_parallelism_axis:
+                raise ValueError("`esurge_data_parallelism_axis` must be a non-empty string when provided.")
 
         def _inherit_generation_attr(attr, fallback_name):
             current = getattr(self, attr, None)

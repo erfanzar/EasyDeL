@@ -2965,7 +2965,21 @@ class EasyGenerationMixin:
 
         return self.merge_module(compat_graphdef, self.graphstate, self.graphother)
 
-    def pause_esurge(self, engine_id: str | None = None) -> None:
+    @staticmethod
+    def _esurge_engine_has_model_state(engine) -> bool:
+        """Check whether an engine still has runner model state attached."""
+        try:
+            return getattr(getattr(engine, "runner", None), "model", None) is not None
+        except Exception:
+            return False
+
+    def pause_esurge(
+        self,
+        engine_id: str | None = None,
+        *,
+        release_model_state: bool = False,
+        clear_compiled_cache: bool = False,
+    ) -> None:
         """Pause eSurge engine(s) for this model.
 
         Pauses the background scheduler of eSurge engines without clearing queued state.
@@ -2975,6 +2989,10 @@ class EasyGenerationMixin:
         Args:
             engine_id: Optional specific engine cache key to pause. If None, pauses all
                 engines associated with this model.
+            release_model_state: When True, also drops engine-held model state
+                references to free memory.
+            clear_compiled_cache: Whether to clear compiled engine caches when
+                releasing model state.
 
         Example:
             >>> # Pause all engines for this model
@@ -2990,6 +3008,8 @@ class EasyGenerationMixin:
             if engine_id in _ESURGE_MAP_CACHE:
                 eng = _ESURGE_MAP_CACHE[engine_id]
                 eng.pause()
+                if release_model_state and hasattr(eng, "release_model_state"):
+                    eng.release_model_state(clear_compiled_cache=clear_compiled_cache)
                 if not getattr(eng, "silent_mode", False):
                     logger.info(f"Paused eSurge engine: {engine_id}")
             else:
@@ -3001,6 +3021,8 @@ class EasyGenerationMixin:
             for cache_key, engine in _ESURGE_MAP_CACHE.items():
                 if cache_key.startswith(f"{model_hash}-"):
                     engine.pause()
+                    if release_model_state and hasattr(engine, "release_model_state"):
+                        engine.release_model_state(clear_compiled_cache=clear_compiled_cache)
                     paused_count += 1
                     should_log = should_log or not getattr(engine, "silent_mode", False)
             if paused_count > 0:
@@ -3033,6 +3055,8 @@ class EasyGenerationMixin:
             # Resume specific engine
             if engine_id in _ESURGE_MAP_CACHE:
                 eng = _ESURGE_MAP_CACHE[engine_id]
+                if not self._esurge_engine_has_model_state(eng):
+                    eng.update_model_weights(self, restart_scheduler=False)
                 eng.resume()
                 if not getattr(eng, "silent_mode", False):
                     logger.info(f"Resumed eSurge engine: {engine_id}")
@@ -3044,6 +3068,8 @@ class EasyGenerationMixin:
             should_log = False
             for cache_key, engine in _ESURGE_MAP_CACHE.items():
                 if cache_key.startswith(f"{model_hash}-"):
+                    if not self._esurge_engine_has_model_state(engine):
+                        engine.update_model_weights(self, restart_scheduler=False)
                     engine.resume()
                     resumed_count += 1
                     should_log = should_log or not getattr(engine, "silent_mode", False)
@@ -3159,6 +3185,8 @@ class EasyGenerationMixin:
         decode_truncated_prompt: bool | None = None,
         destroy_pages_on_pause: bool | None = None,
         silent_mode: bool | None = None,
+        max_num_seq_buckets: list[int] | None = None,
+        data_parallelism_axis: str | None = None,
     ):
         """Gets or creates an eSurge engine with the specified parameters.
 
@@ -3181,6 +3209,8 @@ class EasyGenerationMixin:
             runner_verbose: Enable verbose logging. Defaults to False.
             decode_truncated_prompt: Decode truncated prompts. Defaults to True.
             destroy_pages_on_pause: Free memory on pause. Defaults to True.
+            max_num_seq_buckets: Optional explicit sequence-capacity buckets for runner compilation.
+            data_parallelism_axis: Mesh axis name used by eSurge for KV-page data parallelism. Defaults to "dp".
 
         Returns:
             eSurge engine instance, either from cache or newly created.
@@ -3206,10 +3236,12 @@ class EasyGenerationMixin:
                 max_model_len,
                 min_input_pad,
                 max_num_seqs,
+                max_num_seq_buckets,
                 max_num_batched_tokens,
                 hbm_utilization,
                 page_size,
                 enable_prefix_caching,
+                data_parallelism_axis,
                 runner_verbose,
                 decode_truncated_prompt,
                 destroy_pages_on_pause,
@@ -3221,6 +3253,8 @@ class EasyGenerationMixin:
         if all_none:
             cached_engine = self.get_relevant_esurge()
             if cached_engine is not None:
+                if not self._esurge_engine_has_model_state(cached_engine):
+                    cached_engine.update_model_weights(self, restart_scheduler=False)
                 # Auto-resume if paused
                 if hasattr(cached_engine, "_paused") and cached_engine._paused:
                     if not getattr(cached_engine, "silent_mode", False):
@@ -3240,10 +3274,12 @@ class EasyGenerationMixin:
                 tokenizer,
                 min_input_pad,
                 max_num_seqs,
+                max_num_seq_buckets,
                 max_num_batched_tokens,
                 hbm_utilization,
                 page_size,
                 enable_prefix_caching,
+                data_parallelism_axis,
                 runner_verbose,
                 decode_truncated_prompt,
                 destroy_pages_on_pause,
@@ -3268,8 +3304,17 @@ class EasyGenerationMixin:
         # Set defaults for other parameters
         if min_input_pad is None:
             min_input_pad = getattr(cached_engine, "_min_input_pad", 16) if cached_engine else 16
+        max_num_seqs_was_none = max_num_seqs is None
         if max_num_seqs is None:
             max_num_seqs = getattr(cached_engine, "_max_num_seqs", 32) if cached_engine else 32
+        if max_num_seq_buckets is None:
+            # Only inherit cached buckets when max_num_seqs was also inherited.
+            # If max_num_seqs was explicitly provided by caller, let eSurgeRunner
+            # recompute buckets from that explicit capacity.
+            if max_num_seqs_was_none and cached_engine and hasattr(cached_engine, "runner"):
+                cached_buckets = getattr(cached_engine.runner, "max_num_seq_buckets", None)
+                if cached_buckets is not None:
+                    max_num_seq_buckets = [int(v) for v in cached_buckets]
         if max_num_batched_tokens is None:
             max_num_batched_tokens = getattr(cached_engine, "_max_num_batched_tokens", None) if cached_engine else None
         if hbm_utilization is None:
@@ -3278,6 +3323,8 @@ class EasyGenerationMixin:
             page_size = getattr(cached_engine, "_page_size", 128) if cached_engine else 128
         if enable_prefix_caching is None:
             enable_prefix_caching = getattr(cached_engine, "_enable_prefix_caching", True) if cached_engine else True
+        if data_parallelism_axis is None:
+            data_parallelism_axis = getattr(cached_engine, "data_parallelism_axis", "dp") if cached_engine else "dp"
         if runner_verbose is None:
             runner_verbose = getattr(cached_engine, "_runner_verbose", False) if cached_engine else False
         if decode_truncated_prompt is None:
@@ -3294,10 +3341,12 @@ class EasyGenerationMixin:
             max_model_len=max_model_len,
             min_input_pad=min_input_pad,
             max_num_seqs=max_num_seqs,
+            max_num_seq_buckets=max_num_seq_buckets,
             max_num_batched_tokens=max_num_batched_tokens,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             enable_prefix_caching=enable_prefix_caching,
+            data_parallelism_axis=data_parallelism_axis,
             runner_verbose=runner_verbose,
             decode_truncated_prompt=decode_truncated_prompt,
             destroy_pages_on_pause=destroy_pages_on_pause,
@@ -3312,11 +3361,6 @@ class EasyGenerationMixin:
 
         if esurge_hash in _ESURGE_MAP_CACHE:
             esurge = _ESURGE_MAP_CACHE[esurge_hash]
-            # Auto-resume if paused
-            if hasattr(esurge, "_paused") and esurge._paused:
-                if not getattr(esurge, "silent_mode", False):
-                    logger.info("Auto-resuming paused eSurge engine")
-                esurge.resume()
         else:
             # Create new engine
             from easydel.inference import eSurge
@@ -3326,6 +3370,12 @@ class EasyGenerationMixin:
 
         if esurge.num_running_requests == 0 and esurge.num_pending_requests == 0:
             esurge.update_model_weights(self)
+
+        # Auto-resume only after weights/model state are refreshed.
+        if hasattr(esurge, "_paused") and esurge._paused:
+            if not getattr(esurge, "silent_mode", False):
+                logger.info("Auto-resuming paused eSurge engine")
+            esurge.resume()
 
         return esurge
 
@@ -3399,10 +3449,12 @@ class EasyGenerationMixin:
         max_model_len: int | None = None,
         min_input_pad: int | None = None,
         max_num_seqs: int | None = None,
+        max_num_seq_buckets: list[int] | None = None,
         max_num_batched_tokens: int | None = None,
         hbm_utilization: float | None = None,
         page_size: int | None = None,
         enable_prefix_caching: bool | None = None,
+        data_parallelism_axis: str | None = None,
         runner_verbose: bool | None = None,
         decode_truncated_prompt: bool | None = None,
         destroy_pages_on_pause: bool | None = None,
@@ -3437,10 +3489,12 @@ class EasyGenerationMixin:
             max_model_len: Maximum sequence length. Defaults to model's max position embeddings.
             min_input_pad: Minimum padding for input sequences. Defaults to 16.
             max_num_seqs: Maximum number of concurrent sequences. Defaults to 32.
+            max_num_seq_buckets: Optional explicit sequence-capacity buckets for runner compilation.
             max_num_batched_tokens: Maximum tokens per batch. Defaults to None (auto-calculate).
             hbm_utilization: Fraction of HBM to use for KV cache. Defaults to 0.85.
             page_size: Size of memory pages for paged attention. Defaults to 128.
             enable_prefix_caching: Enable prefix caching for shared prompts. Defaults to True.
+            data_parallelism_axis: Mesh axis name used by eSurge for KV-page data parallelism. Defaults to "dp".
             runner_verbose: Enable verbose logging in the model runner. Defaults to False.
             decode_truncated_prompt: Decode and display truncated prompts. Defaults to True.
             destroy_pages_on_pause: Free memory pages when requests are paused. Defaults to True.
@@ -3476,10 +3530,12 @@ class EasyGenerationMixin:
             max_model_len=max_model_len,
             min_input_pad=min_input_pad,
             max_num_seqs=max_num_seqs,
+            max_num_seq_buckets=max_num_seq_buckets,
             max_num_batched_tokens=max_num_batched_tokens,
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             enable_prefix_caching=enable_prefix_caching,
+            data_parallelism_axis=data_parallelism_axis,
             runner_verbose=runner_verbose,
             decode_truncated_prompt=decode_truncated_prompt,
             destroy_pages_on_pause=destroy_pages_on_pause,

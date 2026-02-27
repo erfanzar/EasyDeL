@@ -1277,6 +1277,12 @@ class BaseTrainer(BaseTrainerProtocol):
                 esurge_kwargs["silent_mode"] = args.esurge_silent_mode
             if args.esurge_max_num_batched_tokens is not None:
                 esurge_kwargs["max_num_batched_tokens"] = args.esurge_max_num_batched_tokens
+            if args.esurge_enable_prefix_caching is not None:
+                esurge_kwargs["enable_prefix_caching"] = args.esurge_enable_prefix_caching
+            if args.esurge_data_parallelism_axis is not None:
+                esurge_kwargs["data_parallelism_axis"] = args.esurge_data_parallelism_axis
+            if args.esurge_max_num_seq_buckets is not None:
+                esurge_kwargs["max_num_seq_buckets"] = [int(v) for v in args.esurge_max_num_seq_buckets]
             effective_prompt_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
             # eSurge reserves a few tokens from the context budget (defaults to
             # `reserve_tokens = max_num_seqs`). When we tightly pack
@@ -1301,17 +1307,34 @@ class BaseTrainer(BaseTrainerProtocol):
                 f" n={sampling_params.n})"
             )
             esurge_kwargs["tokenizer"] = processor
+            esurge_engine = None
             try:
-                outputs: list[RequestOutput] = state.model.esurge_generate(
+                esurge_engine = state.model.get_esurge(**esurge_kwargs)
+                # Use the resolved engine directly to avoid a second get_esurge()/refresh pass.
+                outputs: list[RequestOutput] = state.model._call_esurge_engine(
+                    esurge_engine,
                     prompts=prompts,
                     sampling_params=sampling_params,
                     stream=False,
                     use_tqdm=args.esurge_use_tqdm,
-                    **esurge_kwargs,
                 )
-
+            except Exception:
+                if esurge_engine is None:
+                    try:
+                        # If setup failed before returning an engine handle, fall back to
+                        # model-level pause to clean any partially initialized cached engine.
+                        state.model.pause_esurge()
+                    except Exception as cleanup_exc:  # pragma: no cover - best-effort resource cleanup
+                        log_debug_maybe(f"Failed to pause eSurge engine(s) after setup failure: {cleanup_exc}")
+                raise
             finally:
-                state.model.pause_esurge()
+                if esurge_engine is not None:
+                    try:
+                        esurge_engine.pause()
+                        if hasattr(esurge_engine, "release_model_state"):
+                            esurge_engine.release_model_state(clear_compiled_cache=False)
+                    except Exception as exc:  # pragma: no cover - best-effort resource cleanup
+                        log_debug_maybe(f"Failed to pause/release eSurge engine after generation: {exc}")
 
             # Build padded token arrays from eSurge outputs to ensure consistent shapes
             max_seq_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
@@ -1747,82 +1770,183 @@ class BaseTrainer(BaseTrainerProtocol):
 
         results: list[dict[str, tp.Any]] = []
 
-        # Process each prompt using unified generation interface
+        def _finalize_preview_results(records: list[dict[str, tp.Any]]) -> None:
+            if not records:
+                return
+            self.latest_generation_samples = records
+
+            prompt_repr = "<prompt tokens>"
+            record: dict[str, tp.Any] = {}
+            for record in records:
+                prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
+
+            if wandb is not None and args.use_wandb and args.can_log_metrics and args.generation_log_to_wandb:
+                table = wandb.Table(columns=["step", "prompt", "completion_id", "completion"])
+                for record in records:
+                    prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
+                    for idx, completion in enumerate(record["completions"]):
+                        table.add_data(step, prompt_repr, idx, completion)
+                wandb.log({"preview_generations": table}, step=step)
+            if args.generation_preview_print:
+                logger.info(f"[preview step {step}] prompt: {prompt_repr}")
+                for idx, completion in enumerate(record["completions"]):
+                    logger.info(f"  completion[{idx}]: {completion}")
+
+        prepared_prompts: list[dict[str, tp.Any]] = []
         for prompt in prompts:
             try:
-                # Prepare the input (handles both string prompts and dict prompts with input_ids)
                 prepared = self._prepare_generation_input(prompt)
-                if prepared is None:
-                    continue
-
-                input_ids = prepared.get("input_ids")
-                attention_mask = prepared.get("attention_mask")
-                prompt_text = prepared.get("prompt_text")
-
-                # Use generate_unified which handles both eSurge and compiled paths
-                gen_results = self.generate_unified(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    state=state,
-                    use_esurge=args.use_esurge_generation,
-                    apply_chat_template=False,  # Prompts are already formatted
-                    shard_inputs=args.generation_shard_inputs,
-                    all_gather=False,  # Keep on device for now
-                )
-
-                # Extract completions from results
-                # generation_results contains the decoded completions
-                completions_text = gen_results.generation_results
-                if isinstance(completions_text, str):
-                    completions = [completions_text]
-                else:
-                    completions = completions_text
-
-                # Use the original prompt text if available, otherwise decode from prompt_ids
-                if prompt_text is None:
-                    processor = self._get_processing_class()
-                    if processor is not None:
-                        prompt_ids_np = np.asarray(jax.device_get(gen_results.prompt_ids))
-                        if prompt_ids_np.ndim > 1:
-                            prompt_ids_np = prompt_ids_np[0]
-                        decoded = self._batch_decode_tokens(prompt_ids_np[None, :])
-                        if decoded:
-                            prompt_text = decoded[0]
-
-                results.append({"prompt": prompt_text, "completions": completions, "step": step})
-
             except Exception as exc:  # pragma: no cover - preview should not break training
-                log_debug_maybe(f"Preview generation failed: {exc}")
+                log_debug_maybe(f"Preview generation failed while preparing prompt: {exc}")
                 continue
+            if prepared is not None:
+                prepared_prompts.append(prepared)
 
-        if not results:
+        if not prepared_prompts:
             return
 
-        self.latest_generation_samples = results
+        pad_token_id = self._pad_token_id
+        prompt_row_counts: list[int] = []
+        prompt_row_offsets: list[int] = []
+        input_rows: list[np.ndarray] = []
+        mask_rows: list[np.ndarray] = []
+        max_prompt_len = 0
+        running_offset = 0
+        valid_prepared_prompts: list[dict[str, tp.Any]] = []
 
-        prompt_repr = "<prompt tokens>"
-        record: dict[str, tp.Any] = {}
-        for record in results:
-            prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
-
-        if wandb is not None and args.use_wandb and args.can_log_metrics and args.generation_log_to_wandb:
-            table = wandb.Table(columns=["step", "prompt", "completion_id", "completion"])
-            for record in results:
-                prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
-                for idx, completion in enumerate(record["completions"]):
-                    table.add_data(step, prompt_repr, idx, completion)
-            wandb.log({"preview_generations": table}, step=step)
-        if args.generation_preview_print:
-            logger.info(f"[preview step {step}] prompt: {prompt_repr}")
-            for idx, completion in enumerate(record["completions"]):
-                logger.info(f"  completion[{idx}]: {completion}")
-
-        # Auto-pause eSurge engines after generation to free resources
-        if args.use_esurge_generation:
+        for prepared in prepared_prompts:
             try:
-                state.model.pause_esurge()
-            except Exception as exc:  # pragma: no cover
-                log_debug_maybe(f"Failed to pause eSurge engine: {exc}")
+                input_np = np.asarray(prepared["input_ids"], dtype=np.int32)
+                mask_np = np.asarray(prepared["attention_mask"], dtype=np.int32)
+
+                if input_np.ndim == 1:
+                    input_np = input_np[None, :]
+                if mask_np.ndim == 1:
+                    mask_np = mask_np[None, :]
+
+                if input_np.shape != mask_np.shape:
+                    raise ValueError(
+                        f"Prompt input_ids/attention_mask shape mismatch: {input_np.shape} vs {mask_np.shape}"
+                    )
+            except Exception as exc:  # pragma: no cover - preview should not break training
+                log_debug_maybe(f"Skipping malformed preview prompt while batching: {exc}")
+                continue
+
+            rows = int(input_np.shape[0])
+            prompt_row_counts.append(rows)
+            prompt_row_offsets.append(running_offset)
+            running_offset += rows
+            max_prompt_len = max(max_prompt_len, int(input_np.shape[1]))
+            input_rows.append(input_np)
+            mask_rows.append(mask_np)
+            valid_prepared_prompts.append(prepared)
+
+        if not valid_prepared_prompts:
+            return
+        prepared_prompts = valid_prepared_prompts
+
+        try:
+            batched_input_rows: list[np.ndarray] = []
+            batched_mask_rows: list[np.ndarray] = []
+            for input_np, mask_np in zip(input_rows, mask_rows, strict=False):
+                prompt_len = int(input_np.shape[1])
+                pad_len = max_prompt_len - prompt_len
+                if pad_len > 0:
+                    input_np = np.pad(
+                        input_np,
+                        ((0, 0), (pad_len, 0)),
+                        mode="constant",
+                        constant_values=pad_token_id,
+                    )
+                    mask_np = np.pad(mask_np, ((0, 0), (pad_len, 0)), mode="constant", constant_values=0)
+                batched_input_rows.append(input_np)
+                batched_mask_rows.append(mask_np)
+
+            batched_input_ids = jnp.asarray(np.concatenate(batched_input_rows, axis=0), dtype=jnp.int32)
+            batched_attention_mask = jnp.asarray(np.concatenate(batched_mask_rows, axis=0), dtype=jnp.int32)
+        except Exception as exc:  # pragma: no cover - preview should not break training
+            log_debug_maybe(f"Preview generation failed while batching prompts: {exc}")
+            return
+
+        try:
+            gen_results = self.generate_unified(
+                input_ids=batched_input_ids,
+                attention_mask=batched_attention_mask,
+                state=state,
+                use_esurge=args.use_esurge_generation,
+                apply_chat_template=False,  # Prompts are already formatted
+                shard_inputs=args.generation_shard_inputs,
+                all_gather=False,  # Keep on device for now
+            )
+        except Exception as exc:  # pragma: no cover - preview should not break training
+            log_debug_maybe(f"Preview generation failed: {exc}")
+            for prepared in prepared_prompts:
+                try:
+                    single_results = self.generate_unified(
+                        input_ids=prepared["input_ids"],
+                        attention_mask=prepared["attention_mask"],
+                        state=state,
+                        use_esurge=args.use_esurge_generation,
+                        apply_chat_template=False,  # Prompts are already formatted
+                        shard_inputs=args.generation_shard_inputs,
+                        all_gather=False,  # Keep on device for now
+                    )
+                except Exception as single_exc:  # pragma: no cover - preview should not break training
+                    log_debug_maybe(f"Preview generation failed for one prompt: {single_exc}")
+                    continue
+
+                single_completions_text = single_results.generation_results
+                if isinstance(single_completions_text, str):
+                    single_completions = [single_completions_text]
+                elif isinstance(single_completions_text, collections.abc.Sequence):
+                    single_completions = list(single_completions_text)
+                else:
+                    single_completions = [str(single_completions_text)]
+
+                prompt_text = prepared.get("prompt_text")
+                if prompt_text is None:
+                    decoded = self._batch_decode_tokens(jax.device_get(single_results.prompt_ids))
+                    if decoded:
+                        prompt_text = decoded[0]
+
+                results.append({"prompt": prompt_text, "completions": single_completions, "step": step})
+
+            _finalize_preview_results(results)
+            return
+
+        completions_text = gen_results.generation_results
+        if isinstance(completions_text, str):
+            all_completions = [completions_text]
+        elif isinstance(completions_text, collections.abc.Sequence):
+            all_completions = list(completions_text)
+        else:
+            all_completions = [str(completions_text)]
+
+        num_return_sequences = max(int(args.generation_num_return_sequences or 1), 1)
+        expected_total = sum(count * num_return_sequences for count in prompt_row_counts)
+        if len(all_completions) != expected_total:
+            log_debug_maybe(
+                "Preview generation completion count mismatch: "
+                f"expected {expected_total}, got {len(all_completions)}"
+            )
+
+        needs_decoding = any(prepared.get("prompt_text") is None for prepared in prepared_prompts)
+        decoded_prompts: list[str] | None = None
+        if needs_decoding:
+            decoded_prompts = self._batch_decode_tokens(jax.device_get(gen_results.prompt_ids))
+
+        completion_cursor = 0
+        for prepared, rows, row_offset in zip(prepared_prompts, prompt_row_counts, prompt_row_offsets, strict=False):
+            prompt_text = prepared.get("prompt_text")
+            if prompt_text is None and decoded_prompts is not None and row_offset < len(decoded_prompts):
+                prompt_text = decoded_prompts[row_offset]
+
+            completion_count = rows * num_return_sequences
+            completions = all_completions[completion_cursor : completion_cursor + completion_count]
+            completion_cursor += completion_count
+            results.append({"prompt": prompt_text, "completions": completions, "step": step})
+
+        _finalize_preview_results(results)
 
     def _one_to_all(self, arr: jax.Array) -> jax.Array:
         """Distribute array from one device to all devices.
