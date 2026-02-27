@@ -835,6 +835,15 @@ def training_step(
         label_smoothing=label_smoothing,
     )
 
+    # Pre-compute reference logps outside jax.value_and_grad to avoid
+    # nn.remat trace-level conflicts when the reference model uses
+    # gradient checkpointing inside the grad trace.
+    if "ref_chosen_logps" not in batch or "ref_rejected_logps" not in batch:
+        rfm = reference_state.model
+        rfm.eval()
+        ref_out = jax.lax.stop_gradient(concatenated_forward(rfm, batch))
+        batch = {**batch, "ref_chosen_logps": ref_out["chosen_logps"], "ref_rejected_logps": ref_out["rejected_logps"]}
+
     def calculate_loss(tree: flax.nnx.GraphState, call_batch):
         """
         Inner function to compute loss and metrics for a given minibatch.
@@ -852,15 +861,8 @@ def training_step(
 
         model_output = concatenated_forward(module, call_batch)
 
-        if "ref_chosen_logps" in call_batch and "ref_rejected_logps" in call_batch:
-            ref_chosen_logps = jax.lax.stop_gradient(call_batch["ref_chosen_logps"])
-            ref_rejected_logps = jax.lax.stop_gradient(call_batch["ref_rejected_logps"])
-        else:
-            rfm = reference_state.model
-            rfm.eval()
-            out = jax.lax.stop_gradient(concatenated_forward(rfm, call_batch))
-            ref_chosen_logps = out["chosen_logps"]
-            ref_rejected_logps = out["rejected_logps"]
+        ref_chosen_logps = jax.lax.stop_gradient(call_batch["ref_chosen_logps"])
+        ref_rejected_logps = jax.lax.stop_gradient(call_batch["ref_rejected_logps"])
 
         chosen_logps = model_output["chosen_logps"]
         rejected_logps = model_output["rejected_logps"]

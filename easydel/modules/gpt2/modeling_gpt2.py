@@ -192,7 +192,6 @@ class GPT2Attention(UnifiedAttention):
         )
         self.precision = precision
         self.dtype = dtype
-        self.rngs = rngs
         self.causal = causal
         self.head_dim = self.embed_dim // self.num_heads
 
@@ -246,7 +245,7 @@ class GPT2Attention(UnifiedAttention):
             rngs=rngs,
         )
         self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
-        self.attention_performer = self._create_attention_performer(self.config, self.rngs)
+        self.attention_performer = self._create_attention_performer(self.config, rngs)
 
     def _create_attention_performer(self, config: GPT2Config, rngs: nn.Rngs) -> FlexibleAttentionModule:
         """Use GPT-2 specific attention dropout setting."""
@@ -387,7 +386,6 @@ class GPT2MLP(nn.Module):
         self.config = config
         self.precision = precision
         self.dtype = dtype
-        self.rngs = rngs
         embed_dim = config.hidden_size
         self.c_fc = Conv1D(
             embed_dim,

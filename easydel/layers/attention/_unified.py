@@ -350,7 +350,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        self.rngs = rngs
 
         self.layer_idx = layer_idx
 

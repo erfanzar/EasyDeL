@@ -213,7 +213,6 @@ class ParallelLinear(nn.Module):
         self.precision: PrecisionLike = precision
         self.kernel_init: Initializer = kernel_init
         self.bias_init: Initializer = bias_init
-        self.rngs: nn.Rngs = rngs_computed
 
         out_features_is_sequence: bool = isinstance(out_features, collections.abc.Sequence)
         tp_merged: int
@@ -423,7 +422,7 @@ class ParallelLinear(nn.Module):
                 **kwargs,
                 rngs=rngs,
             ),
-            self.rngs,
+            nn.Rngs(0),
         )
 
         if isinstance(self.kernel.value, jax.ShapeDtypeStruct):
