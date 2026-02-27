@@ -65,6 +65,7 @@ from collections.abc import Iterable
 from eformer.loggings import get_logger
 
 from ..config import Config
+from ..core.dp_sharding import dp_shard_for_page_id, pages_per_dp_shard
 from ..core.interface import CacheGroupsConfig
 from ..core.manager import CacheManager
 from ..engine_types import EngineCoreOutput, EngineCoreOutputs
@@ -400,15 +401,15 @@ class Scheduler(SchedulerInterface):
 
         dp_size = max(1, int(getattr(self, "data_parallel_size", 1) or 1))
         num_pages = int(getattr(self.cache_config, "num_pages", 0) or 0)
+        pages_per_shard = pages_per_dp_shard(num_pages, dp_size)
         use_dp_local_shard_hints = (
             dp_size > 1
             and int(self.max_num_running_reqs) > 0
             and int(self.max_num_running_reqs) % dp_size == 0
-            and num_pages > 0
-            and num_pages % dp_size == 0
+            and pages_per_shard is not None
         )
         rows_per_shard = int(self.max_num_running_reqs) // dp_size if use_dp_local_shard_hints else 0
-        pages_per_shard = num_pages // dp_size if use_dp_local_shard_hints else 0
+        pages_per_shard = int(pages_per_shard) if use_dp_local_shard_hints else 0
         planned_shard_counts: list[int] | None = [0] * dp_size if use_dp_local_shard_hints else None
 
         def _row_to_dp_shard(row_index: int | None) -> int | None:
@@ -426,7 +427,9 @@ class Scheduler(SchedulerInterface):
                     # 0 is reserved as the null page.
                     if pid <= 0:
                         continue
-                    shard = min(pid // pages_per_shard, dp_size - 1)
+                    shard = dp_shard_for_page_id(pid, pages_per_shard, dp_size)
+                    if shard is None:
+                        continue
                     if inferred is None:
                         inferred = shard
                     elif inferred != shard:
