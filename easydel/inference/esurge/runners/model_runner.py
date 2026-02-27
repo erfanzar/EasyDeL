@@ -733,6 +733,34 @@ class eSurgeRunner:
         if reset_state:
             self._setup_variables()
 
+    def release_model_state(self, *, clear_compiled_cache: bool = False) -> None:
+        """Drop model/graph references held by the runner to free memory.
+
+        This keeps the runner object reusable, but it requires a later
+        `update_model_weights(...)` call before executing new generation steps.
+
+        Args:
+            clear_compiled_cache: Whether to clear compiled model/sampler caches.
+
+        Raises:
+            RuntimeError: If active requests exist.
+        """
+        if self.requests:
+            raise RuntimeError("Cannot release model state while requests are active")
+
+        self.reset_state()
+
+        if clear_compiled_cache:
+            self.executor_manager.clear_cache()
+
+        # Drop strong references to model and device-resident graph trees.
+        self.model = None
+        self.executor_manager.model = None
+        self.executor_manager.graphstate = None
+        self.executor_manager.graphother = None
+        self.executor_manager._model_executor.model = None
+        self.executor_manager._sampler_executor.model = None
+
     def destroy_kv_cache(self) -> None:
         """Destroy the current ragged KV cache to release memory."""
         logger.info("Destroying eSurgeRunner ragged KV cache pages")

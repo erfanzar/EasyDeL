@@ -483,6 +483,10 @@ class ExecutionManager:
         self._sampler_executor.clear_cache()
         self._debug_baselines.clear()
 
+    def has_compiled_variants(self) -> bool:
+        """Return whether model and sampler executors have compiled variants."""
+        return bool(self._model_executor.cache_keys()) and bool(self._sampler_executor.cache_keys())
+
     def update_graphs(
         self,
         model: EasyDeLBaseModule | None = None,
@@ -524,11 +528,13 @@ class ExecutionManager:
             self._model_executor.graphdef = graphdef
 
         if graphstate is not None:
-            shardings = es.extract_shardings(self.graphstate, self.mesh)
+            template_graphstate = self.graphstate if self.graphstate is not None else graphstate
+            shardings = es.extract_shardings(template_graphstate, self.mesh)
             self.graphstate = _device_put_tree_with_shardings(graphstate, shardings)
 
         if graphother is not None:
-            shardings = es.extract_shardings(self.graphother, self.mesh)
+            template_graphother = self.graphother if self.graphother is not None else graphother
+            shardings = es.extract_shardings(template_graphother, self.mesh)
             self.graphother = _device_put_tree_with_shardings(graphother, shardings)
 
         # AOT mode may capture graphstate/graphother as compile-time constants.

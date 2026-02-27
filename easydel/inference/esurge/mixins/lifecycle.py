@@ -395,6 +395,32 @@ class EngineLifecycleMixin:
             self._log_cache_event("kv_cache_reinitialized", {"reason": "resume"})
         self.initiate()
 
+    def release_model_state(self, *, clear_compiled_cache: bool = False) -> None:
+        """Release runner-held model weights/state references to reduce memory.
+
+        The engine remains reusable. Call `update_model_weights(...)` before
+        serving again.
+
+        Args:
+            clear_compiled_cache: Whether to clear compiled model/sampler caches.
+        """
+        if self.num_running_requests > 0 or self.num_pending_requests > 0:
+            logger.warning(
+                "Skipping model-state release because requests are active or pending "
+                "(running=%d, pending=%d).",
+                self.num_running_requests,
+                self.num_pending_requests,
+            )
+            return
+
+        if self._scheduler_running:
+            self.pause()
+        else:
+            self._drain_pipeline_workers("release_model_state")
+
+        self.runner.release_model_state(clear_compiled_cache=clear_compiled_cache)
+        self._paused = True
+
     def update_model_weights(
         self,
         model: EasyDeLBaseModule | None = None,
@@ -449,6 +475,12 @@ class EngineLifecycleMixin:
             graphother=graphother,
             reset_state=True,
         )
+        if not self.runner.executor_manager.has_compiled_variants():
+            # Compilation uses the current KV pages as a template for sharding/shape.
+            # Ensure pages exist when coming back from a released model state.
+            if self.runner.executor_manager.kv_pages is None:
+                self.runner.initialize_kv_cache()
+            self.runner.compile(max_num_batched_tokens=self._scheduler_max_num_batched_tokens)
         self._kv_cache_valid = self.runner.executor_manager.kv_pages is not None
         cache_event = "kv_cache_reinitialized" if self._kv_cache_valid else "kv_cache_destroyed"
         self._log_cache_event(cache_event, {"reason": "update_model_weights"})

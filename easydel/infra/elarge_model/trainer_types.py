@@ -328,6 +328,9 @@ class BaseTrainerCfg(TypedDict, total=False):
         esurge_page_size: Page size for eSurge paged attention.
         esurge_silent_mode: Whether to suppress eSurge output.
         esurge_max_num_batched_tokens: Max num tokens to batch together for eSurge generation.
+        esurge_enable_prefix_caching: Enable/disable eSurge prefix caching.
+        esurge_data_parallelism_axis: Mesh axis name for eSurge data-parallel KV pages.
+        esurge_max_num_seq_buckets: Optional explicit sequence-capacity buckets for eSurge runner compilation.
 
     Example:
         >>> config: BaseTrainerCfg = {
@@ -487,6 +490,9 @@ class BaseTrainerCfg(TypedDict, total=False):
     esurge_page_size: NotRequired[int | None]
     esurge_silent_mode: NotRequired[bool]
     esurge_max_num_batched_tokens: NotRequired[int | None]
+    esurge_enable_prefix_caching: NotRequired[bool | None]
+    esurge_data_parallelism_axis: NotRequired[str | None]
+    esurge_max_num_seq_buckets: NotRequired[list[int] | None]
 
 
 class DPOTrainerCfg(BaseTrainerCfg):
@@ -1253,6 +1259,9 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "esurge_page_size": 32,
     "esurge_silent_mode": True,
     "esurge_max_num_batched_tokens": None,
+    "esurge_enable_prefix_caching": None,
+    "esurge_data_parallelism_axis": None,
+    "esurge_max_num_seq_buckets": None,
 }
 """Default configuration values shared across all trainer types.
 

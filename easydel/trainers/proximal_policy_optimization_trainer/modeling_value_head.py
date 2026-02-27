@@ -150,6 +150,10 @@ class CausalLMWithValueHead(EasyDeLBaseModule):
         """Generate using eSurge from the underlying model."""
         return self.model.esurge_generate(*args, **kwargs)
 
+    def _call_esurge_engine(self, *args, **kwargs):  # pragma: no cover
+        """Call a pre-resolved eSurge engine via the underlying model helper."""
+        return self.model._call_esurge_engine(*args, **kwargs)
+
     def pause_esurge(self, *args, **kwargs):  # pragma: no cover
         """Pause eSurge engine in the underlying model."""
         return self.model.pause_esurge(*args, **kwargs)
