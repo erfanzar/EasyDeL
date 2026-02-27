@@ -12,6 +12,11 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 
+metadata_value() {
+  local path="$1"
+  curl -fsS "http://metadata.google.internal/computeMetadata/v1/${path}" -H "Metadata-Flavor: Google" 2>/dev/null || true
+}
+
 # Ensure ~/.local/bin in PATH for current session
 case ":$PATH:" in
   *":$HOME/.local/bin:"*) ;;
@@ -45,12 +50,6 @@ except Exception as e:
     print(f'\033[0;31m[ERROR]\033[0m (Python) Failed to modify shell config: {e}', file=sys.stderr)
 PY
 
-# Detect zone (GCE)
-log_info "Detecting current zone..."
-ZONE=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/zone" -H "Metadata-Flavor: Google" | cut -d/ -f4 || true)
-: "${ZONE:=}" || true
-log_info "Current zone: ${ZONE:-unknown}"
-
 # gcloud checks
 if ! command -v gcloud >/dev/null 2>&1; then
   log_error "gcloud CLI not found. Please install Google Cloud SDK."
@@ -61,56 +60,84 @@ if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" | head -n
   exit 1
 fi
 
-# TPU selection
-log_info "Searching for available TPUs in zone ${ZONE}..."
-mapfile -t READY_TPUS < <(gcloud compute tpus tpu-vm list --zone="$ZONE" --filter="state:READY" --format="value(name)" 2>/dev/null || true)
+# Detect project/zone similarly to eopod (metadata first, then gcloud config)
+log_info "Detecting project and zone..."
+PROJECT_ID="$(metadata_value "project/project-id" | sed -n '1p')"
+if [ -z "${PROJECT_ID:-}" ]; then
+  PROJECT_ID="$(gcloud config get-value project 2>/dev/null | sed -n '1p' || true)"
+fi
+if [ "${PROJECT_ID:-}" = "(unset)" ] || [ -z "${PROJECT_ID:-}" ]; then
+  log_error "Failed to detect project ID from metadata or gcloud config."
+  exit 1
+fi
 
-if (( ${#READY_TPUS[@]} == 0 )); then
-  log_warning "No READY TPUs found in zone $ZONE"
-  echo ""
-  log_info "All TPUs in zone $ZONE:"
-  gcloud compute tpus tpu-vm list --zone="$ZONE" --format="table(name,state,health,acceleratorType)" || {
-    log_error "Failed to list TPUs. Check your permissions."
-    exit 1
-  }
-  echo ""
-  read -p "Enter your TPU name: " TPU_NAME < /dev/tty
-  if [ -z "${TPU_NAME:-}" ]; then
-    log_error "TPU name cannot be empty"
-    exit 1
-  fi
-elif (( ${#READY_TPUS[@]} == 1 )); then
-  TPU_NAME="${READY_TPUS[0]}"
-  log_success "Found one READY TPU: $TPU_NAME - using it automatically"
+ZONE_RAW="$(metadata_value "instance/zone" | sed -n '1p')"
+ZONE=""
+if [ -n "${ZONE_RAW:-}" ]; then
+  ZONE="${ZONE_RAW##*/}"
+fi
+if [ -z "${ZONE:-}" ]; then
+  ZONE="$(gcloud config get-value compute/zone 2>/dev/null | sed -n '1p' || true)"
+fi
+if [ "${ZONE:-}" = "(unset)" ] || [ -z "${ZONE:-}" ]; then
+  log_error "Failed to detect zone from metadata or gcloud config."
+  exit 1
+fi
+
+log_success "Detected project: $PROJECT_ID"
+log_success "Detected zone: $ZONE"
+
+# TPU selection
+TPU_NAME=""
+SELF_INTERNAL_IP="$(metadata_value "instance/network-interfaces/0/ip" | sed -n '1p')"
+if [ -n "${SELF_INTERNAL_IP:-}" ]; then
+  log_info "Trying eopod-style TPU auto-detection using self internal IP: ${SELF_INTERNAL_IP}"
+  TPU_NAME="$(
+    gcloud compute tpus tpu-vm list \
+      --project="$PROJECT_ID" \
+      --zone="$ZONE" \
+      --flatten="networkEndpoints[]" \
+      --filter="networkEndpoints.ipAddress=${SELF_INTERNAL_IP}" \
+      --format="value(name.basename())" 2>/dev/null | sed -n '1p' || true
+  )"
+fi
+
+if [ -n "${TPU_NAME:-}" ]; then
+  log_success "Auto-detected TPU from metadata/network endpoints: $TPU_NAME"
 else
-  log_info "Multiple READY TPUs found:"
-  echo ""
-  gcloud compute tpus tpu-vm list --zone="$ZONE" --filter="state:READY" --format="table(name,acceleratorType,health)"
-  echo ""
-  echo "Available READY TPUs:"
-  for i in "${!READY_TPUS[@]}"; do
-    echo "$((i + 1)). ${READY_TPUS[i]}"
-  done
-  echo ""
-  while true; do
-    read -p "Enter TPU name or number (1-${#READY_TPUS[@]}): " input < /dev/tty
-    if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= ${#READY_TPUS[@]} )); then
-      TPU_NAME="${READY_TPUS[$((input - 1))]}"
-      break
-    elif [[ " ${READY_TPUS[*]} " == *" ${input} "* ]]; then
-      TPU_NAME="$input"
-      break
-    else
-      log_error "Invalid selection. Please enter a number (1-${#READY_TPUS[@]}) or a valid TPU name."
-    fi
-  done
+  log_warning "Could not resolve TPU from current VM metadata; falling back to READY TPU lookup."
+  mapfile -t READY_TPUS < <(
+    gcloud compute tpus tpu-vm list \
+      --project="$PROJECT_ID" \
+      --zone="$ZONE" \
+      --filter="state:READY" \
+      --format="value(name.basename())" 2>/dev/null || true
+  )
+
+  if (( ${#READY_TPUS[@]} == 0 )); then
+    log_error "Could not auto-detect TPU name (no READY TPUs found in zone ${ZONE})."
+    log_info "All TPUs in zone ${ZONE}:"
+    gcloud compute tpus tpu-vm list --project="$PROJECT_ID" --zone="$ZONE" --format="table(name.basename(),state,health,acceleratorType)" || true
+    exit 1
+  elif (( ${#READY_TPUS[@]} == 1 )); then
+    TPU_NAME="${READY_TPUS[0]}"
+    log_success "Found one READY TPU: $TPU_NAME - using it automatically"
+  else
+    TPU_NAME="${READY_TPUS[0]}"
+    log_warning "Multiple READY TPUs found; auto-selecting the first one: $TPU_NAME"
+    gcloud compute tpus tpu-vm list \
+      --project="$PROJECT_ID" \
+      --zone="$ZONE" \
+      --filter="state:READY" \
+      --format="table(name.basename(),acceleratorType,health)" || true
+  fi
 fi
 
 log_success "Selected TPU: $TPU_NAME"
 
 # TPU type
 log_info "Getting TPU accelerator type..."
-TPU_TYPE=$(gcloud compute tpus tpu-vm describe "$TPU_NAME" --zone="$ZONE" --format="value(acceleratorType)" 2>/dev/null | awk -F'/' '{print $NF}')
+TPU_TYPE=$(gcloud compute tpus tpu-vm describe "$TPU_NAME" --project="$PROJECT_ID" --zone="$ZONE" --format="value(acceleratorType)" 2>/dev/null | awk -F'/' '{print $NF}')
 if [ -z "${TPU_TYPE:-}" ]; then
   log_warning "Could not determine TPU type, defaulting to v4-8"
   TPU_TYPE="v4-8"
@@ -153,7 +180,7 @@ LOCAL_EOPOD_PATH="$LOCAL_VENV_PATH/bin/eopod"
 log_success "eopod installed in local environment"
 
 log_info "Configuring eopod with TPU: $TPU_NAME"
-if ! "$LOCAL_EOPOD_PATH" configure --tpu-name "$TPU_NAME"; then
+if ! "$LOCAL_EOPOD_PATH" configure --project-id "$PROJECT_ID" --zone "$ZONE" --tpu-name "$TPU_NAME"; then
   log_error "Failed to configure eopod with TPU"
   exit 1
 fi
@@ -215,12 +242,13 @@ log_success "Ray configured successfully"
 # ---------- Summary ----------
 echo ""
 log_success "🎉 TPU setup completed successfully!"
+log_info "Project: $PROJECT_ID"
 log_info "TPU Name: $TPU_NAME"
 log_info "TPU Type: $TPU_TYPE"
 log_info "Zone: $ZONE"
 echo ""
 log_info "Final TPU status:"
-gcloud compute tpus tpu-vm list --zone="$ZONE" --filter="name:$TPU_NAME" --format="table(name,state,health,acceleratorType)" || true
+gcloud compute tpus tpu-vm list --project="$PROJECT_ID" --zone="$ZONE" --filter="name:$TPU_NAME" --format="table(name,state,health,acceleratorType)" || true
 
 
 "${REMOTE_VENV_PATH}/bin/python" -c "
