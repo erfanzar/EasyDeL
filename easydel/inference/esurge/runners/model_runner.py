@@ -71,6 +71,7 @@ from jax import numpy as jnp
 
 from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
 
+from ..core.dp_sharding import dp_shard_for_page_id, dp_shard_page_bounds, pages_per_dp_shard
 from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
 from ..scheduler import SchedulerOutput
@@ -898,13 +899,15 @@ class eSurgeRunner:
             to ensure the runner's state matches the scheduler's decisions.
         """
         dp_size = int(getattr(self.metadata, "data_parallel_size", 1) or 1)
+        pages_per_shard_opt = pages_per_dp_shard(int(getattr(self.metadata, "num_pages", 0) or 0), dp_size)
         use_dp_local_rows = (
             dp_size > 1
             and int(self.sequence_buffer.max_num_reqs) > 0
             and int(self.sequence_buffer.max_num_reqs) % dp_size == 0
+            and pages_per_shard_opt is not None
         )
         rows_per_shard = int(self.sequence_buffer.max_num_reqs) // dp_size if use_dp_local_rows else 0
-        pages_per_shard = int(getattr(self.metadata, "num_pages", 0) or 0) // dp_size if use_dp_local_rows else 0
+        pages_per_shard = int(pages_per_shard_opt or 0) if use_dp_local_rows else 0
 
         def infer_req_shard(page_ids: tuple[list[int], ...]) -> int | None:
             if not use_dp_local_rows or pages_per_shard <= 0:
@@ -915,7 +918,9 @@ class eSurgeRunner:
                     # 0 is reserved for null/padding page in page pool.
                     if int(pid) <= 0:
                         continue
-                    shard = min(int(pid) // pages_per_shard, dp_size - 1)
+                    shard = dp_shard_for_page_id(int(pid), pages_per_shard, dp_size)
+                    if shard is None:
+                        continue
                     if inferred is None:
                         inferred = shard
                     elif inferred != shard:
@@ -1508,9 +1513,10 @@ class eSurgeRunner:
             if dp_size > 1:
                 total_pages = int(getattr(self.metadata, "num_pages", 0) or 0)
                 page_size = max(1, int(getattr(self.metadata, "page_size", 1)))
-                if total_pages > 0 and total_pages % dp_size == 0 and self.num_reqs_max_model_len % dp_size == 0:
+                pages_per_shard_opt = pages_per_dp_shard(total_pages, dp_size)
+                if pages_per_shard_opt is not None and self.num_reqs_max_model_len % dp_size == 0:
                     rows_per_shard = self.num_reqs_max_model_len // dp_size
-                    pages_per_shard = total_pages // dp_size
+                    pages_per_shard = int(pages_per_shard_opt)
                     for local_req_idx in range(num_reqs):
                         seq_len = int(self.sequence_buffer.num_computed_tokens[start_index + local_req_idx]) + int(
                             scheduled_list[local_req_idx]
@@ -1524,8 +1530,7 @@ class eSurgeRunner:
                             continue
                         global_req_idx = start_index + local_req_idx
                         req_shard = min(global_req_idx // rows_per_shard, dp_size - 1)
-                        page_lo = req_shard * pages_per_shard
-                        page_hi = page_lo + pages_per_shard
+                        page_lo, page_hi = dp_shard_page_bounds(req_shard, pages_per_shard)
                         invalid = row[(row < page_lo) | (row >= page_hi)]
                         if invalid.size:
                             req_id_dbg = req_ids_window[local_req_idx]

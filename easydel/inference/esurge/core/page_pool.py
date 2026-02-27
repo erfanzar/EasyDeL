@@ -29,6 +29,7 @@ Example:
 from collections import defaultdict
 from collections.abc import Iterable
 
+from .dp_sharding import dp_shard_for_page_id, dp_shard_page_bounds, pages_per_dp_shard
 from ..logger import logger
 from ..request import EngineRequest
 from .utils import CachePage, FreeCachePageQueue, PageHash, PageHashWithGroupId, hash_page_tokens
@@ -111,17 +112,16 @@ class PagePool:
         use_shard_hint = (
             dp_shard_hint is not None
             and data_parallel_size is not None
-            and int(data_parallel_size) > 1
-            and self.num_pages % int(data_parallel_size) == 0
+            and pages_per_dp_shard(self.num_pages, int(data_parallel_size)) is not None
         )
         page_lo = 0
         page_hi = 0
         if use_shard_hint:
             dp_size = int(data_parallel_size)
             shard_idx = int(dp_shard_hint) % dp_size
-            pages_per_shard = self.num_pages // dp_size
-            page_lo = shard_idx * pages_per_shard
-            page_hi = page_lo + pages_per_shard
+            pages_per_shard = pages_per_dp_shard(self.num_pages, dp_size)
+            assert pages_per_shard is not None
+            page_lo, page_hi = dp_shard_page_bounds(shard_idx, pages_per_shard)
 
         cached_pages = []
         for group_id in kv_cache_group_ids:
@@ -239,19 +239,18 @@ class PagePool:
         use_shard_hint = (
             dp_shard_hint is not None
             and data_parallel_size is not None
-            and int(data_parallel_size) > 1
-            and self.num_pages % int(data_parallel_size) == 0
+            and pages_per_dp_shard(self.num_pages, int(data_parallel_size)) is not None
         )
         if use_shard_hint:
             dp_size = int(data_parallel_size)
             shard_idx = int(dp_shard_hint) % dp_size
-            pages_per_shard = self.num_pages // dp_size
-            page_lo = shard_idx * pages_per_shard
-            page_hi = page_lo + pages_per_shard
+            pages_per_shard = pages_per_dp_shard(self.num_pages, dp_size)
+            assert pages_per_shard is not None
+            page_lo, page_hi = dp_shard_page_bounds(shard_idx, pages_per_shard)
 
             selected: list[CachePage] = []
             for page in self.free_page_queue.get_all_free_pages():
-                if page_lo <= int(page.page_id) < page_hi:
+                if dp_shard_for_page_id(int(page.page_id), pages_per_shard, dp_size) == shard_idx:
                     selected.append(page)
                     if len(selected) >= num_pages:
                         break

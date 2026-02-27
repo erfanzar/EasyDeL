@@ -75,6 +75,7 @@ from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
 from easydel.caching._metadatabuilder import AttentionMetadataBuilder
 from easydel.utils.helpers import check_bool_flag
 
+from ...core.dp_sharding import dp_shard_page_bounds, pages_per_dp_shard
 from ...page_table import PAGE_TABLE_PADDING_VAL, SLOT_MAPPING_PADDING_VAL
 from ..execution_types import BatchMetadata
 
@@ -292,14 +293,13 @@ class BatchMetadataPreparer:
             )
 
         total_pages = int(getattr(self.metadata, "num_pages", 0) or 0)
-        if total_pages <= 0 or total_pages % dp_size != 0:
-            raise ValueError(
-                "DP-local page-table invariant requires total pages divisible by data-parallel size: "
-                f"num_pages={total_pages}, dp_size={dp_size}."
-            )
+        pages_per_shard = pages_per_dp_shard(total_pages, dp_size)
+        if pages_per_shard is None:
+            # DP-local page partitioning is only valid when usable pages
+            # (excluding null page 0) split evenly across DP shards.
+            return
 
         rows_per_shard = total_rows // dp_size
-        pages_per_shard = total_pages // dp_size
         page_size = max(1, int(getattr(self.metadata, "page_size", 1)))
         max_pages_per_req = int(page_table_cpu.shape[1])
 
@@ -309,8 +309,7 @@ class BatchMetadataPreparer:
                 continue
 
             req_shard = min(req_idx // rows_per_shard, dp_size - 1)
-            page_lo = req_shard * pages_per_shard
-            page_hi = page_lo + pages_per_shard
+            page_lo, page_hi = dp_shard_page_bounds(req_shard, pages_per_shard)
             page_cnt = min((seq_len + page_size - 1) // page_size, max_pages_per_req)
 
             row = np.asarray(page_table_cpu[req_idx, :page_cnt], dtype=np.int32)

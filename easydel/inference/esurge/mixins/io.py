@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Any
 
 from easydel.inference.sampling_params import SamplingParams
 
+from ..logger import logger
+
 if TYPE_CHECKING:
     from ..esurge_engine import RequestOutput
 
@@ -34,6 +36,60 @@ class EngineIOMixin:
             return
         self._raise_if_scheduler_failed()
         raise RuntimeError(f"Background scheduler is not running ({context}).")
+
+    def _recover_orphaned_request(self, request_id: str) -> bool:
+        """Abort a request when unresolved samples have no live scheduler/request state.
+
+        This prevents indefinite waits if a child request (especially in n>1
+        sampling) disappears from both scheduler and active-request tracking
+        without delivering a terminal output update.
+        """
+        with self._output_lock:
+            ro = self._request_outputs.get(request_id)
+            if ro is None or ro.finished:
+                return False
+            n_samples = len(ro.outputs)
+            unresolved_child_ids: list[str] = []
+            if n_samples <= 1:
+                if ro.outputs and ro.outputs[0].finish_reason is None:
+                    unresolved_child_ids.append(request_id)
+            else:
+                for sample_idx, comp in enumerate(ro.outputs):
+                    if comp.finish_reason is None:
+                        unresolved_child_ids.append(f"{request_id}-{sample_idx}")
+
+        if not unresolved_child_ids:
+            return False
+
+        with self._scheduler_lock:
+            if any(child_id in self.scheduler.requests for child_id in unresolved_child_ids):
+                return False
+
+        with self._request_lock:
+            if any(child_id in self._active_requests for child_id in unresolved_child_ids):
+                return False
+
+        # Re-check under output lock to avoid aborting if completion just arrived.
+        with self._output_lock:
+            ro_now = self._request_outputs.get(request_id)
+            if ro_now is None or ro_now.finished:
+                return False
+            if len(ro_now.outputs) != n_samples:
+                return False
+            if n_samples <= 1:
+                still_pending = bool(ro_now.outputs and ro_now.outputs[0].finish_reason is None)
+            else:
+                still_pending = any(comp.finish_reason is None for comp in ro_now.outputs)
+            if not still_pending:
+                return False
+
+        logger.warning(
+            "Recovering orphaned request %s: unresolved child samples are missing from scheduler/active state. "
+            "Forcing abort to avoid an indefinite wait.",
+            request_id,
+        )
+        self.abort_request(request_id)
+        return True
 
     def generate(
         self,
@@ -129,6 +185,9 @@ class EngineIOMixin:
                 for rid in pending_ids:
                     self.abort_request(rid)
                 raise RuntimeError("Background scheduler stopped while waiting for generation outputs.")
+            for req_id in request_ids:
+                if req_id not in completed:
+                    self._recover_orphaned_request(req_id)
             with self._output_lock:
                 for req_id in request_ids:
                     if req_id not in completed and req_id in self._request_outputs:
@@ -243,6 +302,8 @@ class EngineIOMixin:
                 if not self._scheduler_running:
                     self.abort_request(request_id)
                     raise RuntimeError("Background scheduler stopped while streaming request.")
+                if self._recover_orphaned_request(request_id):
+                    continue
 
                 snapshot = None
                 with self._output_lock:
@@ -584,6 +645,8 @@ class EngineIOMixin:
                 if not self._scheduler_running:
                     self.abort_request(request_id)
                     raise RuntimeError("Background scheduler stopped while streaming multimodal request.")
+                if self._recover_orphaned_request(request_id):
+                    continue
 
                 snapshot = None
                 with self._output_lock:
@@ -688,6 +751,8 @@ class EngineIOMixin:
             if not self._scheduler_running:
                 self.abort_request(request_id)
                 raise RuntimeError("Background scheduler stopped while waiting for request completion.")
+            if self._recover_orphaned_request(request_id):
+                continue
             with self._output_lock:
                 output = self._request_outputs.get(request_id)
                 if output is not None and output.finished:

@@ -39,6 +39,7 @@ from dataclasses import dataclass
 
 from ..request import EngineRequest, EngineRequestStatus
 from .coordinator import get_kv_cache_coordinator
+from .dp_sharding import dp_shard_for_page_id, pages_per_dp_shard
 from .interface import CacheGroupSpec
 from .utils import CachePage, PageHash, hash_request_tokens, init_none_hash
 
@@ -281,10 +282,10 @@ class CacheManager:
         dp_size = int(data_parallel_size or 1)
         if dp_size <= 1:
             return None
-        if self.num_pages <= 0 or self.num_pages % dp_size != 0:
+        pages_per_shard = pages_per_dp_shard(self.num_pages, dp_size)
+        if pages_per_shard is None:
             return None
 
-        pages_per_shard = self.num_pages // dp_size
         inferred_shard: int | None = None
         for group_pages in pages:
             for page in group_pages:
@@ -293,7 +294,9 @@ class CacheManager:
                 page_id = int(page.page_id)
                 if page_id < 0:
                     continue
-                shard = min(page_id // pages_per_shard, dp_size - 1)
+                shard = dp_shard_for_page_id(page_id, pages_per_shard, dp_size)
+                if shard is None:
+                    continue
                 if inferred_shard is None:
                     inferred_shard = shard
                 elif inferred_shard != shard:
