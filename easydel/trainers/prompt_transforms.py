@@ -286,6 +286,12 @@ class GRPOPreprocessTransform(Transform):
         self._tools = tools
         self._skip_apply_chat_template = skip_apply_chat_template
         self._pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
+        self._fallback_prompt_token_id = (
+            getattr(tokenizer, "eos_token_id", None)
+            or getattr(tokenizer, "bos_token_id", None)
+            or getattr(tokenizer, "unk_token_id", None)
+            or self._pad_token_id
+        )
 
     def __call__(self, example: Example) -> Example:
         """Apply GRPO preprocessing to example.
@@ -303,8 +309,24 @@ class GRPOPreprocessTransform(Transform):
         # Convert from/value format to role/content if needed (ShareGPT → ChatML)
         example = maybe_convert_to_chatml(example)
 
-        # Extract prompt from preference data if needed (chosen/rejected → prompt)
-        result = extract_prompt_from_preference(example)
+        def _has_non_empty_prompt(value: tp.Any) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, str):
+                return value.strip() != ""
+            if isinstance(value, list):
+                return len(value) > 0
+            return True
+
+        # Preserve explicit non-empty prompts as-is. This avoids converting mixed
+        # preference rows (string `prompt` + conversational `chosen/rejected`) into
+        # an empty extracted prefix, which would produce all-zero prompt masks.
+        prompt_value = example.get("prompt")
+        if "prompt" in example and _has_non_empty_prompt(prompt_value):
+            result = dict(example)
+        else:
+            # Extract prompt from preference data if needed (chosen/rejected → prompt)
+            result = extract_prompt_from_preference(example)
 
         # Strict field access - will raise KeyError if prompt is missing
         prompt = result["prompt"]
@@ -330,6 +352,13 @@ class GRPOPreprocessTransform(Transform):
 
         input_ids = tokenized["input_ids"]
         attention_mask = tokenized["attention_mask"]
+
+        # Guard against empty prompts: some preference rows can resolve to an empty
+        # extracted prefix, which would otherwise produce an all-zero attention mask
+        # and trigger prompt_len=0 in generation.
+        if len(input_ids) == 0 or sum(attention_mask) == 0:
+            input_ids = [int(self._fallback_prompt_token_id)]
+            attention_mask = [1]
 
         # Apply left padding manually if tokenizer doesn't support it
         if self._max_prompt_length and len(input_ids) < self._max_prompt_length:

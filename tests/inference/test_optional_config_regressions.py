@@ -17,8 +17,10 @@ import pytest
 
 from easydel.inference.esurge.config import CacheConfig, Config, SchedulerConfig
 from easydel.inference.esurge.core.interface import CacheGroupsConfig, CacheGroupSpec, FullAttentionSpec
+from easydel.inference.esurge.request import EngineRequest, EngineRequestStatus
 from easydel.inference.esurge.scheduler.scheduler import Scheduler
 from easydel.inference.evaluations.esurge_eval import eSurgeLMEvalAdapter
+from easydel.inference.sampling_params import SamplingParams
 
 
 class _DummyProcessor:
@@ -90,3 +92,47 @@ def test_scheduler_falls_back_to_model_len_when_batch_token_limit_is_none():
     assert scheduler.max_num_scheduled_tokens == 128
     output = scheduler.schedule()
     assert output.total_num_scheduled_tokens == 0
+
+
+def test_scheduler_aborts_empty_prompt_request_instead_of_requeueing():
+    config = Config(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=64,
+            max_model_len=128,
+            token_safety_margin=None,
+        ),
+        cache_config=CacheConfig(num_pages=16, page_size=8, enable_prefix_caching=False),
+    )
+    kv_cache_config = CacheGroupsConfig(
+        num_pages=16,
+        kv_cache_groups=[
+            CacheGroupSpec(
+                kv_cache_spec=FullAttentionSpec(
+                    page_size=8,
+                    num_kv_heads=1,
+                    head_size=4,
+                    dtype=jnp.float32,
+                    use_mla=False,
+                ),
+                layer_names=None,
+            )
+        ],
+    )
+
+    scheduler = Scheduler(config=config, kv_cache_config=kv_cache_config)
+    request = EngineRequest(
+        request_id="req-empty-prompt",
+        prompt_token_ids=[],
+        sampling_params=SamplingParams(max_tokens=8),
+        eos_token_id=1,
+    )
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.total_num_scheduled_tokens == 0
+    assert "req-empty-prompt" in output.finished_req_ids
+    assert request.status == EngineRequestStatus.FINISHED_ABORTED
+    assert scheduler.get_num_unfinished_requests() == 0
+    assert "req-empty-prompt" not in scheduler.requests

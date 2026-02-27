@@ -331,12 +331,19 @@ class BaseTrainer(BaseTrainerProtocol):
         skip_special_tokens: bool = True,
         pad_token_id: int | None = None,
         pop_pad_tokens: bool = False,
+        attention_mask: jax.Array | np.ndarray | None = None,
     ) -> list[str]:
         if processor is None or not hasattr(processor, "decode"):
             raise ValueError("Cannot decode input_ids to prompts without a valid processor")
         array = np.asarray(input_ids)
         if array.ndim == 1:
             array = array[None, :]
+
+        mask = None
+        if attention_mask is not None:
+            mask = np.asarray(attention_mask)
+            if mask.ndim == 1:
+                mask = mask[None, :]
 
         # Get pad_token_id if not provided
         if pop_pad_tokens and pad_token_id is None:
@@ -346,10 +353,13 @@ class BaseTrainer(BaseTrainerProtocol):
                 or 0
             )
         prompts: list[str] = []
-        for seq in array:
-            # Remove pad tokens if requested
-            if pop_pad_tokens and pad_token_id is not None:
-                seq = seq[seq != pad_token_id]
+        for i, seq in enumerate(array):
+            if pop_pad_tokens:
+                if mask is not None:
+                    # Use attention_mask to reliably extract real tokens
+                    seq = seq[mask[i].astype(bool)]
+                elif pad_token_id is not None:
+                    seq = seq[seq != pad_token_id]
             prompts.append(processor.decode(seq, skip_special_tokens=skip_special_tokens))
         return prompts
 
@@ -1239,7 +1249,9 @@ class BaseTrainer(BaseTrainerProtocol):
                     prompt_seq_len = None
 
             if prompts is None:
-                decoded_prompts = self._decode_prompt_batch(processor, input_ids, False, pad_token_id, True)
+                decoded_prompts = self._decode_prompt_batch(
+                    processor, input_ids, False, pad_token_id, True, attention_mask,
+                )
                 prompts = self._normalize_esurge_prompts(decoded_prompts, apply_chat_template)
             else:
                 prompts = self._normalize_esurge_prompts(prompts, apply_chat_template)
@@ -1289,7 +1301,6 @@ class BaseTrainer(BaseTrainerProtocol):
                 f" n={sampling_params.n})"
             )
             esurge_kwargs["tokenizer"] = processor
-
             try:
                 outputs: list[RequestOutput] = state.model.esurge_generate(
                     prompts=prompts,

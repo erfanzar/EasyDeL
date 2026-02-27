@@ -627,7 +627,20 @@ class Scheduler(SchedulerInterface):
                             continue
 
                     num_new_tokens = min(num_new_tokens, token_budget)
-                    assert num_new_tokens > 0
+                    if num_new_tokens <= 0:
+                        # Avoid starvation: a waiting request with no schedulable
+                        # tokens cannot make progress in this queue state.
+                        request = self.waiting.pop_request()
+                        logger.warning(
+                            "Dropping request %s: zero schedulable prompt tokens "
+                            "(num_tokens=%d, num_computed_tokens=%d).",
+                            request.request_id,
+                            request.num_tokens,
+                            num_computed_tokens,
+                        )
+                        request.status = EngineRequestStatus.FINISHED_ABORTED
+                        self._free_request(request)
+                        continue
                 new_pages = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens + num_external_computed_tokens,

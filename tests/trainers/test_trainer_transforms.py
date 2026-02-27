@@ -430,6 +430,53 @@ class TestGRPOPreprocessTransform:
 
         assert "input_ids" in result
 
+    def test_mixed_preference_format_keeps_explicit_prompt(self):
+        """Explicit prompt should not be replaced by empty extracted prefix."""
+        tokenizer = MockTokenizer()
+        transform = GRPOPreprocessTransform(
+            tokenizer=tokenizer,
+            max_prompt_length=32,
+        )
+
+        example = {
+            "prompt": "Solve 2+2",
+            "chosen": [{"role": "assistant", "content": "4"}],
+            "rejected": [{"role": "assistant", "content": "5"}],
+        }
+
+        result = transform(example)
+        assert "input_ids" in result
+        assert "attention_mask" in result
+        assert sum(result["attention_mask"]) > 0
+
+    def test_empty_prompt_gets_fallback_token(self):
+        tokenizer = MockTokenizer()
+        transform = GRPOPreprocessTransform(
+            tokenizer=tokenizer,
+            max_prompt_length=16,
+        )
+
+        result = transform({"prompt": ""})
+        assert "input_ids" in result
+        assert "attention_mask" in result
+        assert sum(result["attention_mask"]) > 0
+
+    def test_empty_extracted_prompt_gets_fallback_token(self):
+        tokenizer = MockTokenizer()
+        transform = GRPOPreprocessTransform(
+            tokenizer=tokenizer,
+            max_prompt_length=16,
+        )
+
+        example = {
+            "chosen": [{"role": "assistant", "content": "Good"}],
+            "rejected": [{"role": "assistant", "content": "Bad"}],
+        }
+
+        result = transform(example)
+        assert "attention_mask" in result
+        assert sum(result["attention_mask"]) > 0
+
 
 class TestPPOPreprocessTransform:
     """Tests for PPOPreprocessTransform."""
