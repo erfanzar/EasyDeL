@@ -2818,6 +2818,56 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         w = self.get_embedding().embedding.value.T if tie_embeddings else None
         return self.get_lm_head()(hidden_states, w=w)
 
+    @staticmethod
+    def _recursive_config_children(config: EasyDeLBaseConfig) -> tuple[EasyDeLBaseConfig, ...]:
+        """Collect nested config objects without evaluating dynamic properties.
+
+        We intentionally avoid ``dir(config)`` + ``getattr(config, ...)`` here,
+        because that can evaluate computed properties (for example mesh accessors)
+        and trigger side effects during graph-def rebuild.
+        """
+        config_dict = getattr(config, "__dict__", None)
+        if not isinstance(config_dict, dict):
+            return ()
+
+        out: list[EasyDeLBaseConfig] = []
+        seen_ids: set[int] = set()
+
+        sub_configs = config_dict.get("sub_configs")
+        if isinstance(sub_configs, dict):
+            for attr_name in sub_configs.keys():
+                sub_cfg = config_dict.get(attr_name, None)
+                if isinstance(sub_cfg, EasyDeLBaseConfig):
+                    sub_cfg_id = id(sub_cfg)
+                    if sub_cfg_id not in seen_ids:
+                        out.append(sub_cfg)
+                        seen_ids.add(sub_cfg_id)
+
+        for value in config_dict.values():
+            if isinstance(value, EasyDeLBaseConfig):
+                value_id = id(value)
+                if value_id not in seen_ids:
+                    out.append(value)
+                    seen_ids.add(value_id)
+
+        return tuple(out)
+
+    @staticmethod
+    def _apply_recursive_config_updates(config: EasyDeLBaseConfig, updates: Mapping[str, tp.Any]) -> None:
+        """Apply overrides to nested configs discovered from concrete attributes."""
+        for sub_cfg in EasyDeLBaseModule._recursive_config_children(config):
+            sub_cfg_dict = getattr(sub_cfg, "__dict__", None)
+            for key, value in updates.items():
+                if (
+                    (isinstance(sub_cfg_dict, dict) and key in sub_cfg_dict)
+                    or hasattr(type(sub_cfg), key)
+                ):
+                    try:
+                        setattr(sub_cfg, key, value)
+                    except AttributeError:
+                        # Skip read-only attributes/properties while applying broad overrides.
+                        continue
+
     def update_module(
         self,
         recursive_update: bool = False,
@@ -2856,14 +2906,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         for k, v in kwargs.items():
             setattr(config, k, v)
         if recursive_update:
-            for attr_name in dir(config):
-                if attr_name.startswith("_"):
-                    continue
-                attr_value = getattr(config, attr_name, None)
-                if isinstance(attr_value, EasyDeLBaseConfig):
-                    for k, v in kwargs.items():
-                        if hasattr(attr_value, k):
-                            setattr(attr_value, k, v)
+            self._apply_recursive_config_updates(config, kwargs)
         module = self.lazy_init(
             config=config,
             dtype=self.dtype,
@@ -2906,14 +2949,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         for k, v in kwargs.items():
             setattr(config, k, v)
         if recursive_update:
-            for attr_name in dir(config):
-                if attr_name.startswith("_"):
-                    continue
-                attr_value = getattr(config, attr_name, None)
-                if isinstance(attr_value, EasyDeLBaseConfig):
-                    for k, v in kwargs.items():
-                        if hasattr(attr_value, k):
-                            setattr(attr_value, k, v)
+            self._apply_recursive_config_updates(config, kwargs)
         module = self.lazy_init(
             config=config,
             dtype=self.dtype,
