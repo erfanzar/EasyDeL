@@ -95,7 +95,9 @@ from jax.sharding import PartitionSpec
 
 from easydel.infra.factory import TaskType
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.traversals import specs_to_name_sharding
+from easydel.utils.traversals import flatten_dict, specs_to_name_sharding, unflatten_dict
+
+from .utils import materialize_meta_leaves, sanitize_partition_spec_for_shape
 
 if tp.TYPE_CHECKING:
     from jax.sharding import Mesh
@@ -122,6 +124,50 @@ TX_STRUCT_JSON = "tx_structure.json"
 """Filename for optimizer transformation structure in JSON format."""
 
 logger = get_logger(__name__)
+
+
+def _sanitize_partition_specs_for_shape_tree(
+    partition_specs: tp.Any,
+    shape_tree: tp.Any,
+    mesh: "Mesh",
+) -> tuple[tp.Any, int]:
+    """Sanitize a partition-spec tree against concrete tensor shapes."""
+    adjusted = {"count": 0}
+
+    def _sanitize(spec: tp.Any, shape_obj: tp.Any) -> tp.Any:
+        if not isinstance(spec, PartitionSpec) or not hasattr(shape_obj, "shape"):
+            return spec
+        safe_spec = sanitize_partition_spec_for_shape(
+            spec=spec,
+            shape=tuple(shape_obj.shape),
+            mesh=mesh,
+        )
+        if safe_spec != spec:
+            adjusted["count"] += 1
+        return safe_spec
+
+    try:
+        sanitized = jax.tree_util.tree_map(_sanitize, partition_specs, shape_tree)
+        return sanitized, adjusted["count"]
+    except Exception:
+        # Fallback for structures that don't support aligned tree mapping.
+        flat_specs = flatten_dict(partition_specs)
+        flat_shapes = flatten_dict(shape_tree)
+        adjusted_count = 0
+        for key, spec in flat_specs.items():
+            if not isinstance(spec, PartitionSpec):
+                continue
+            shape_obj = flat_shapes.get(key)
+            shape = tuple(getattr(shape_obj, "shape", ()))
+            if not shape:
+                continue
+            safe_spec = sanitize_partition_spec_for_shape(spec=spec, shape=shape, mesh=mesh)
+            if safe_spec != spec:
+                flat_specs[key] = safe_spec
+                adjusted_count += 1
+        if adjusted_count == 0:
+            return partition_specs, adjusted_count
+        return unflatten_dict(flat_specs), adjusted_count
 
 
 class EasyDeLState(struct.PyTreeNode):
@@ -400,20 +446,19 @@ class EasyDeLState(struct.PyTreeNode):
 
         if model is not None:
             graphdef, graphstate, graphother = nn.split(model, nn.Param, ...)
-
-        if graphdef is not None and graphstate is None and graphother is None:
-            raise ValueError(
-                "When providing graphdef, (graphstate, graphother) must also be provided.",
-            )
-
-        if graphstate is not None and graphdef is None and graphother is None:
-            raise ValueError(
-                "When providing graphstate, (graphdef, graphother) must also be provided.",
-            )
-        if graphother is not None and graphdef is None and graphstate is None:
-            raise ValueError(
-                "When providing graphother, (graphstate, graphdef) must also be provided.",
-            )
+        else:
+            has_graphdef = graphdef is not None
+            has_graphstate = graphstate is not None
+            has_graphother = graphother is not None
+            provided_count = int(has_graphdef) + int(has_graphstate) + int(has_graphother)
+            if provided_count == 0:
+                raise ValueError(
+                    "Either `model` or all graph components (`graphdef`, `graphstate`, `graphother`) must be provided.",
+                )
+            if provided_count != 3:
+                raise ValueError(
+                    "Graph components must be provided together: (`graphdef`, `graphstate`, `graphother`).",
+                )
         if init_opt_state and opt_state is not None:
             raise ValueError("When passing `init_opt_state` as `True` you can't also provide `opt_state`")
         if init_opt_state and tx is None:
@@ -423,6 +468,8 @@ class EasyDeLState(struct.PyTreeNode):
             opt_state = tx.init(graphstate)
         if step is None:
             step = 0
+        if graphother is not None:
+            graphother = materialize_meta_leaves(graphother, seed=42)
 
         return cls(
             step=step,
@@ -487,6 +534,7 @@ class EasyDeLState(struct.PyTreeNode):
             - :meth:`shard_optimizer_state`: Shard existing optimizer state.
         """
         partition_rules = self.model._get_partition_rules(partition_rules)
+        mesh = self.model._get_mesh(None)
 
         from eformer.escale import match_partition_rules
 
@@ -495,12 +543,19 @@ class EasyDeLState(struct.PyTreeNode):
 
         eval_opt_state = jax.eval_shape(lambda: make(self.graphstate))
         partition_specs = match_partition_rules(partition_rules, eval_opt_state)
-        named_shardings = specs_to_name_sharding(partition_specs, self.model.mesh)
+        partition_specs, adjusted = _sanitize_partition_specs_for_shape_tree(
+            partition_specs=partition_specs,
+            shape_tree=eval_opt_state,
+            mesh=mesh,
+        )
+        if adjusted:
+            logger.warning("Adjusted %d non-divisible optimizer sharding specs during init_tx.", adjusted)
+        named_shardings = specs_to_name_sharding(partition_specs, mesh)
 
         opt_state = ejit(
             make,
             out_shardings=named_shardings,
-            in_shardings=(es.extract_shardings(self.graphstate, mesh=self.model.mesh),),
+            in_shardings=(es.extract_shardings(self.graphstate, mesh=mesh),),
         )(self.graphstate)
 
         return self.replace(tx=tx, opt_state=opt_state)
@@ -559,14 +614,21 @@ class EasyDeLState(struct.PyTreeNode):
         if opt_state is None:
             opt_state = self.opt_state
         partition_rules = self.model._get_partition_rules(partition_rules)
+        mesh = self.model._get_mesh(None)
 
         from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 
-        with self.model.mesh:
-            partition_specs = match_partition_rules(partition_rules, opt_state)
-            shard_fns, _ = make_shard_and_gather_fns(partition_specs)
-            opt_state = jax.tree_util.tree_map(lambda f, o: f(o), shard_fns, opt_state)
-            return self.replace(opt_state=opt_state)
+        partition_specs = match_partition_rules(partition_rules, opt_state)
+        partition_specs, adjusted = _sanitize_partition_specs_for_shape_tree(
+            partition_specs=partition_specs,
+            shape_tree=opt_state,
+            mesh=mesh,
+        )
+        if adjusted:
+            logger.warning("Adjusted %d non-divisible optimizer sharding specs before shard_optimizer_state.", adjusted)
+        shard_fns, _ = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)
+        opt_state = jax.tree_util.tree_map(lambda f, o: f(o), shard_fns, opt_state)
+        return self.replace(opt_state=opt_state)
 
     def gather_optimizer_state(self: Self, partition_rules: PartitionLike = None) -> Self:
         """Gather the optimizer state from distributed devices to a single device.
@@ -603,11 +665,19 @@ class EasyDeLState(struct.PyTreeNode):
         """
         assert self.opt_state is not None, "Optimizer state is not initialized."
         partition_rules = self.model._get_partition_rules(partition_rules)
+        mesh = self.model._get_mesh(None)
 
         from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 
         partition_specs = match_partition_rules(partition_rules, self.opt_state)
-        _, gather = make_shard_and_gather_fns(partition_specs)
+        partition_specs, adjusted = _sanitize_partition_specs_for_shape_tree(
+            partition_specs=partition_specs,
+            shape_tree=self.opt_state,
+            mesh=mesh,
+        )
+        if adjusted:
+            logger.warning("Adjusted %d non-divisible optimizer sharding specs before gather_optimizer_state.", adjusted)
+        _, gather = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)
         self = self.replace(opt_state=jax.tree_util.tree_map(lambda f, o: f(o), gather, self.opt_state))
         return self
 
@@ -1368,10 +1438,18 @@ class EasyDeLState(struct.PyTreeNode):
         def appy_sharding_on_tree(tree):
             """Apply sharding functions to a pytree."""
             partition_specs = match_partition_rules(rules, tree)
+            partition_specs, adjusted = _sanitize_partition_specs_for_shape_tree(
+                partition_specs=partition_specs,
+                shape_tree=tree,
+                mesh=mesh,
+            )
+            if adjusted:
+                logger.warning("Adjusted %d non-divisible sharding specs before shard_state.", adjusted)
             shard_fns, _ = make_shard_and_gather_fns(partition_specs, mesh)
             return jax.tree_util.tree_map(lambda f, o: f(o), shard_fns, tree)
 
-        return appy_sharding_on_tree(self)
+        state_for_shard = self.replace(graphother=materialize_meta_leaves(self.graphother, seed=42))
+        return appy_sharding_on_tree(state_for_shard)
 
     def gather_state(self) -> Self:
         """Gather the entire state from distributed devices.
@@ -1457,10 +1535,26 @@ class EasyDeLState(struct.PyTreeNode):
 
         rules = partition_rules or self.model._get_partition_rules(None)
         mesh = mesh or self.model._get_mesh(None)
-        partition_specs = match_partition_rules(rules=rules, tree=self.graphstate)
-        _, gather_fns = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)
-        graphstate = jax.tree_util.tree_map(lambda f, o: f(o), gather_fns, self.graphstate)
-        graphother = jax.tree_util.tree_map(lambda f, o: f(o), gather_fns, self.graphother)
+
+        def _apply_gather_on_tree(tree, tree_name: str):
+            tree = materialize_meta_leaves(tree, seed=42)
+            partition_specs = match_partition_rules(rules=rules, tree=tree)
+            partition_specs, adjusted = _sanitize_partition_specs_for_shape_tree(
+                partition_specs=partition_specs,
+                shape_tree=tree,
+                mesh=mesh,
+            )
+            if adjusted:
+                logger.warning(
+                    "Adjusted %d non-divisible sharding specs before gather_model (%s).",
+                    adjusted,
+                    tree_name,
+                )
+            _, gather_fns = make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)
+            return jax.tree_util.tree_map(lambda f, o: f(o), gather_fns, tree)
+
+        graphstate = _apply_gather_on_tree(self.graphstate, "graphstate")
+        graphother = _apply_gather_on_tree(self.graphother, "graphother")
         self = self.replace(graphstate=graphstate, graphother=graphother)
         return self
 
@@ -1513,7 +1607,15 @@ class EasyDeLState(struct.PyTreeNode):
             """Apply sharding functions to a pytree."""
             from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 
+            tree = materialize_meta_leaves(tree, seed=42)
             partition_specs = match_partition_rules(rules, tree)
+            partition_specs, adjusted = _sanitize_partition_specs_for_shape_tree(
+                partition_specs=partition_specs,
+                shape_tree=tree,
+                mesh=mesh,
+            )
+            if adjusted:
+                logger.warning("Adjusted %d non-divisible sharding specs before state.shard_model.", adjusted)
             shard_fns, _ = make_shard_and_gather_fns(partition_specs, mesh)
             return jax.tree_util.tree_map(lambda f, o: f(o), shard_fns, tree)
 
