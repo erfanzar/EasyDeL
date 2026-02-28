@@ -501,6 +501,11 @@ _import_structure = {
         "Glm4MoeLiteForCausalLM",
         "Glm4MoeLiteModel",
     ],
+    "modules.glm_moe_dsa": [
+        "GlmMoeDsaConfig",
+        "GlmMoeDsaForCausalLM",
+        "GlmMoeDsaModel",
+    ],
     "modules.glm4v": [
         "Glm4vConfig",
         "Glm4vForConditionalGeneration",
@@ -688,6 +693,24 @@ _import_structure = {
         "Qwen2VLConfig",
         "Qwen2VLForConditionalGeneration",
         "Qwen2VLModel",
+    ],
+    "modules.qwen3_5": [
+        "Qwen3_5Config",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5Model",
+        "Qwen3_5TextConfig",
+        "Qwen3_5TextModel",
+        "Qwen3_5VisionConfig",
+    ],
+    "modules.qwen3_5_moe": [
+        "Qwen3_5MoeConfig",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5MoeModel",
+        "Qwen3_5MoeTextConfig",
+        "Qwen3_5MoeTextModel",
+        "Qwen3_5MoeVisionConfig",
     ],
     "modules.qwen3": [
         "Qwen3Config",
@@ -971,6 +994,7 @@ if _tp.TYPE_CHECKING:
         Glm4vMoeVisionModel,
     )
     from .modules.glm46v import Glm46VConfig, Glm46VForConditionalGeneration, Glm46VModel
+    from .modules.glm_moe_dsa import GlmMoeDsaConfig, GlmMoeDsaForCausalLM, GlmMoeDsaModel
     from .modules.gpt2 import GPT2Config, GPT2LMHeadModel, GPT2Model
     from .modules.gpt_j import GPTJConfig, GPTJForCausalLM, GPTJModel
     from .modules.gpt_neox import GPTNeoXConfig, GPTNeoXForCausalLM, GPTNeoXModel
@@ -1016,6 +1040,24 @@ if _tp.TYPE_CHECKING:
     from .modules.qwen2_moe import Qwen2MoeConfig, Qwen2MoeForCausalLM, Qwen2MoeForSequenceClassification, Qwen2MoeModel
     from .modules.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration, Qwen2VLModel
     from .modules.qwen3 import Qwen3Config, Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
+    from .modules.qwen3_5 import (
+        Qwen3_5Config,
+        Qwen3_5ForCausalLM,
+        Qwen3_5ForConditionalGeneration,
+        Qwen3_5Model,
+        Qwen3_5TextConfig,
+        Qwen3_5TextModel,
+        Qwen3_5VisionConfig,
+    )
+    from .modules.qwen3_5_moe import (
+        Qwen3_5MoeConfig,
+        Qwen3_5MoeForCausalLM,
+        Qwen3_5MoeForConditionalGeneration,
+        Qwen3_5MoeModel,
+        Qwen3_5MoeTextConfig,
+        Qwen3_5MoeTextModel,
+        Qwen3_5MoeVisionConfig,
+    )
     from .modules.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoeForSequenceClassification, Qwen3MoeModel
     from .modules.qwen3_next import (
         Qwen3NextConfig,

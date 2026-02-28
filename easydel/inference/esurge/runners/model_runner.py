@@ -938,11 +938,13 @@ class eSurgeRunner:
             if req_index is not None:
                 removed_req_indices.append(req_index)
 
-        # 3) Remove unscheduled requests from buffer
-        scheduled_req_ids = set(scheduler_output.num_scheduled_tokens.keys())
-        cached_req_ids = set(self.sequence_buffer.req_id_to_index.keys())
-        unscheduled_req_ids = cached_req_ids - scheduled_req_ids
-        for req_id in unscheduled_req_ids:
+        # 3) Remove preempted requests from buffer.
+        # Only remove requests the scheduler explicitly preempted (evicted from
+        # running to waiting). Running requests that were merely skipped due to
+        # token budget exhaustion still hold valid rows and pages — removing them
+        # would force re-insertion next cycle and trigger "No free sequence row
+        # in target DP shard" errors when shard rows are full.
+        for req_id in scheduler_output.preempted_req_ids:
             req_index = self.sequence_buffer.remove_request(req_id)
             if req_index is not None:
                 removed_req_indices.append(req_index)
@@ -1098,7 +1100,7 @@ class eSurgeRunner:
                 req_state.prefill_visual_pos_masks = None
                 req_state.prefill_deepstack_visual_embeds = None
 
-        has_changes = len(unscheduled_req_ids) > 0 or len(req_ids_to_add) > 0
+        has_changes = len(scheduler_output.preempted_req_ids) > 0 or len(req_ids_to_add) > 0
         return has_changes
 
     def _modify_prev_results(self) -> None:
@@ -1278,19 +1280,25 @@ class eSurgeRunner:
         for shard in range(dp_size):
             lo = shard * rows_per_shard
             hi = min(lo + rows_per_shard, num_slots)
-            # Find the first non-decode and last decode within this shard range.
-            i, j = lo, hi - 1
-            while i < j:
-                i_req_id = self.sequence_buffer.req_ids[i] if i < len(self.sequence_buffer.req_ids) else None
-                j_req_id = self.sequence_buffer.req_ids[j] if j < len(self.sequence_buffer.req_ids) else None
 
-                # Skip None slots (holes) — leave them in place.
-                if i_req_id is None:
-                    i += 1
-                    continue
-                if j_req_id is None:
-                    j -= 1
-                    continue
+            # 1) Compact holes (None slots) to the end of the shard range.
+            #    This ensures the attention kernel never encounters a 0-token
+            #    row in the middle of its processing range.
+            self.sequence_buffer.compact_holes_in_range(lo, hi)
+
+            # 2) Decode-first partitioning on the compacted (hole-free) prefix.
+            #    Find the boundary between non-None rows and holes.
+            shard_end = hi
+            while shard_end > lo and (
+                shard_end - 1 >= len(self.sequence_buffer.req_ids)
+                or self.sequence_buffer.req_ids[shard_end - 1] is None
+            ):
+                shard_end -= 1
+
+            i, j = lo, shard_end - 1
+            while i < j:
+                i_req_id = self.sequence_buffer.req_ids[i]
+                j_req_id = self.sequence_buffer.req_ids[j]
 
                 i_is_decode = (
                     scheduler_output.num_scheduled_tokens.get(i_req_id, 0) == 1

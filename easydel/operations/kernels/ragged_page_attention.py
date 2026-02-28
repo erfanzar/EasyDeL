@@ -363,10 +363,10 @@ class _RaggedPageAttn(OperationImpl):
                     axis=0,
                 )
 
-                row_start_i32 = row_start.astype(jnp.int32)
-                local_total = jnp.clip(full_distribution[2] - row_start_i32, 0, rows_per_shard).astype(jnp.int32)
-
                 local_scheduled = local_query_start_loc[1:] - local_query_start_loc[:-1]
+                local_has_tokens = local_scheduled > 0
+                local_total = jnp.sum(local_has_tokens).astype(jnp.int32)
+
                 local_is_decode = (local_scheduled == 1) & (local_context_lens > 1)
                 row_mask = jnp.arange(rows_per_shard, dtype=jnp.int32) < local_total
                 local_decode = jnp.sum(local_is_decode & row_mask).astype(jnp.int32)

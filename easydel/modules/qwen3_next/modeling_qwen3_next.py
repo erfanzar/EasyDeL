@@ -786,8 +786,8 @@ class Qwen3NextLinearAttention(nn.Module):
     - Mamba-style dt_bias for time discretization
 
     HuggingFace-compatible parameter naming:
-    - in_proj_qkvz: Projects to query, key, value, and z (gate)
-    - in_proj_ba: Projects to beta and alpha
+    - Packed mode (Qwen3-Next): in_proj_qkvz and in_proj_ba
+    - Split mode (Qwen3.5): in_proj_qkv, in_proj_z, in_proj_b, and in_proj_a
     - A_log: Log of decay matrix A
     - dt_bias: Time discretization bias
     - conv1d: Causal convolution
@@ -841,30 +841,72 @@ class Qwen3NextLinearAttention(nn.Module):
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.conv_dim = self.key_dim * 2 + self.value_dim
 
-        qkvz_dim = self.key_dim * 2 + self.value_dim * 2
+        self.uses_split_proj = bool(getattr(config, "linear_attention_separate_proj", False))
+        if self.uses_split_proj:
+            self.in_proj_qkv = ColumnParallelLinear(
+                config.hidden_size,
+                self.key_dim * 2 + self.value_dim,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
+            self.in_proj_z = ColumnParallelLinear(
+                config.hidden_size,
+                self.value_dim,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
+            self.in_proj_b = ColumnParallelLinear(
+                config.hidden_size,
+                self.num_v_heads,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
+            self.in_proj_a = ColumnParallelLinear(
+                config.hidden_size,
+                self.num_v_heads,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
+        else:
+            qkvz_dim = self.key_dim * 2 + self.value_dim * 2
+            self.in_proj_qkvz = ColumnParallelLinear(
+                config.hidden_size,
+                qkvz_dim,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
 
-        self.in_proj_qkvz = ColumnParallelLinear(
-            config.hidden_size,
-            qkvz_dim,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-        )
-
-        ba_dim = self.num_v_heads * 2
-        self.in_proj_ba = ColumnParallelLinear(
-            config.hidden_size,
-            ba_dim,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            precision=precision,
-            rngs=rngs,
-            kernel_init=jax.nn.initializers.normal(config.initializer_range),
-        )
+            ba_dim = self.num_v_heads * 2
+            self.in_proj_ba = ColumnParallelLinear(
+                config.hidden_size,
+                ba_dim,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+                kernel_init=jax.nn.initializers.normal(config.initializer_range),
+            )
 
         self.out_proj = RowParallelLinear(
             self.value_dim,
@@ -1002,15 +1044,20 @@ class Qwen3NextLinearAttention(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
         is_inference = seq_len == 1 and cache_view is not None
 
-        projected_qkvz = self.in_proj_qkvz(hidden_states)
-        projected_ba = self.in_proj_ba(hidden_states)
-
-        query, key, value, z, beta, alpha = self.fix_query_key_value_ordering(projected_qkvz, projected_ba)
-
-        query_flat = query.reshape(batch_size, seq_len, -1)
-        key_flat = key.reshape(batch_size, seq_len, -1)
-        value_flat = value.reshape(batch_size, seq_len, -1)
-        conv_input = jnp.concatenate([query_flat, key_flat, value_flat], axis=-1)
+        if self.uses_split_proj:
+            projected_qkv = self.in_proj_qkv(hidden_states)
+            z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+            beta = self.in_proj_b(hidden_states)
+            alpha = self.in_proj_a(hidden_states)
+            conv_input = projected_qkv
+        else:
+            projected_qkvz = self.in_proj_qkvz(hidden_states)
+            projected_ba = self.in_proj_ba(hidden_states)
+            query, key, value, z, beta, alpha = self.fix_query_key_value_ordering(projected_qkvz, projected_ba)
+            query_flat = query.reshape(batch_size, seq_len, -1)
+            key_flat = key.reshape(batch_size, seq_len, -1)
+            value_flat = value.reshape(batch_size, seq_len, -1)
+            conv_input = jnp.concatenate([query_flat, key_flat, value_flat], axis=-1)
         # conv_input: [batch, seq_len, conv_dim]
 
         conv_state = None

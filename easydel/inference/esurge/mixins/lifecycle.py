@@ -98,6 +98,7 @@ class EngineLifecycleMixin:
         dump scheduler/request state before the process is killed. This
         makes OOM-kills and external termination diagnosable.
         """
+
         def _dump_state(signum, frame):
             sig_name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
             try:
@@ -150,8 +151,7 @@ class EngineLifecycleMixin:
                 return
             self._scheduler_heartbeat_last_warn = now
             logger.warning(
-                "Scheduler heartbeat stale: last update %.1fs ago "
-                "(threshold=%.0fs). Possible hang or deadlock.",
+                "Scheduler heartbeat stale: last update %.1fs ago " "(threshold=%.0fs). Possible hang or deadlock.",
                 age,
                 _SCHEDULER_HEARTBEAT_WARN_S,
             )
@@ -237,23 +237,25 @@ class EngineLifecycleMixin:
                 max_consecutive_errors = MAX_CONSECUTIVE_SCHEDULER_ERRORS
                 distributed_controller = getattr(self, "_distributed_controller", None)
 
-                _loop_iter = 0
+                _diag_iter = 0
+                _diag_last_log = time.time()
                 if not self._overlap_execution:
                     while self._scheduler_running:
                         try:
-                            _loop_iter += 1
+                            _diag_iter += 1
                             with self._scheduler_lock:
                                 scheduler_output = self.scheduler.schedule()
-                            _n_sched = len(scheduler_output.num_scheduled_tokens) if scheduler_output else 0
-                            _has_work = len(self.scheduler.running) > 0 or len(self.scheduler.waiting) > 0
-                            if _n_sched == 0 and _loop_iter > 1 and _has_work:
-                                logger.warning(
-                                    "Scheduler produced empty output at loop iter %d "
-                                    "(running=%d waiting=%d). Possible DP scheduling stall.",
-                                    _loop_iter,
+                            _n = len(scheduler_output.num_scheduled_tokens) if scheduler_output else 0
+                            _now = time.time()
+                            if _n > 0 or (_now - _diag_last_log) > 30:
+                                logger.info(
+                                    "loop iter=%d sched=%d run=%d wait=%d",
+                                    _diag_iter,
+                                    _n,
                                     len(self.scheduler.running),
                                     len(self.scheduler.waiting),
                                 )
+                                _diag_last_log = _now
                             self._update_scheduler_heartbeat()
                             dispatch = None
                             if distributed_controller is not None and distributed_controller.has_remote_workers:
@@ -499,8 +501,7 @@ class EngineLifecycleMixin:
         """
         if self.num_running_requests > 0 or self.num_pending_requests > 0:
             logger.warning(
-                "Skipping model-state release because requests are active or pending "
-                "(running=%d, pending=%d).",
+                "Skipping model-state release because requests are active or pending " "(running=%d, pending=%d).",
                 self.num_running_requests,
                 self.num_pending_requests,
             )

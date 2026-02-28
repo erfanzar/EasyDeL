@@ -543,6 +543,73 @@ class SequenceBuffer:
         self._update_request_distribution()
         return req_index
 
+    def compact_holes_in_range(self, lo: int, hi: int) -> None:
+        """Move all None (hole) slots to the end within [lo, hi).
+
+        Shifts non-None rows forward to fill holes, keeping their relative
+        order. This is used under DP-local row sharding to ensure empty
+        rows are at the end of each shard range so the attention kernel
+        never encounters a 0-token row in its processing range.
+
+        Args:
+            lo: Start of the range (inclusive).
+            hi: End of the range (exclusive).
+        """
+        write = lo
+        for read in range(lo, hi):
+            req_id = self._req_ids[read]
+            if req_id is not None:
+                if read != write:
+                    # Move request from 'read' to 'write' (write is a hole)
+                    self._req_ids[write] = req_id
+                    self._req_ids[read] = None
+                    self.req_id_to_index[req_id] = write
+                    self.req_output_token_ids[write] = self.req_output_token_ids[read]
+                    self.req_output_token_ids[read] = None
+                    # NumPy array rows: copy then clear source
+                    self.token_ids[write] = self.token_ids[read]
+                    self.token_ids[read] = 0
+                    self.num_tokens[write] = self.num_tokens[read]
+                    self.num_tokens[read] = 0
+                    self.num_tokens_no_spec[write] = self.num_tokens_no_spec[read]
+                    self.num_tokens_no_spec[read] = 0
+                    self.num_prompt_tokens[write] = self.num_prompt_tokens[read]
+                    self.num_prompt_tokens[read] = 0
+                    self.num_computed_tokens[write] = self.num_computed_tokens[read]
+                    self.num_computed_tokens[read] = 0
+                    self.temperature[write] = self.temperature[read]
+                    self.temperature[read] = -1.0
+                    self.top_p[write] = self.top_p[read]
+                    self.top_p[read] = 1.0
+                    self.top_k[write] = self.top_k[read]
+                    self.top_k[read] = 0
+                    self.min_p[write] = self.min_p[read]
+                    self.min_p[read] = 0.0
+                    self.frequency_penalties[write] = self.frequency_penalties[read]
+                    self.frequency_penalties[read] = 0.0
+                    self.presence_penalties[write] = self.presence_penalties[read]
+                    self.presence_penalties[read] = 0.0
+                    self.repetition_penalties[write] = self.repetition_penalties[read]
+                    self.repetition_penalties[read] = 1.0
+                    # Page table
+                    self.page_table.swap_row(write, read)
+                    # Dict-based fields
+                    for d in (self.generator_seeds, self.min_tokens, self.bad_words_token_ids):
+                        if read in d:
+                            d[write] = d.pop(read)
+                        else:
+                            d.pop(write, None)
+                    self.logit_bias[write] = self.logit_bias[read]
+                    self.logit_bias[read] = None
+                    if self.allowed_token_ids_mask is not None:
+                        self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[write].set(
+                            self.allowed_token_ids_mask[read]
+                        )
+                        self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[read].set(False)
+                write += 1
+        if write < hi:
+            self._update_request_distribution()
+
     def swap_states(self, i1: int, i2: int) -> None:
         """Swap the states of two requests at given indices.
 
