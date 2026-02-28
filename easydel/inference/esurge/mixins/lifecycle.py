@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import threading
 import time
 import traceback
@@ -28,6 +29,8 @@ from ..logger import logger
 from ..scheduler import Scheduler, SchedulerOutput
 
 MAX_CONSECUTIVE_SCHEDULER_ERRORS = int(os.environ.get("EASURGE_MAX_SCHEDULER_ERRORS", "5"))
+_SCHEDULER_HEARTBEAT_WARN_S = float(os.environ.get("EASURGE_HEARTBEAT_WARN_S", "120"))
+_SCHEDULER_HEARTBEAT_WARN_INTERVAL_S = float(os.environ.get("EASURGE_HEARTBEAT_WARN_INTERVAL_S", "30"))
 
 if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
@@ -80,11 +83,78 @@ class EngineLifecycleMixin:
         """
         exc = self._scheduler_exception
         if exc is None:
+            # No crash, but check for heartbeat staleness (possible hang).
+            self._check_scheduler_heartbeat()
             return
         tb = self._scheduler_exception_tb
         if tb:
             raise RuntimeError(f"eSurge scheduler crashed: {exc}\n{tb}") from exc
         raise RuntimeError(f"eSurge scheduler crashed: {exc}") from exc
+
+    def _install_signal_diagnostics(self) -> None:
+        """Install signal handlers that log engine state before exit.
+
+        Registers handlers for SIGTERM and SIGUSR1 (where available) to
+        dump scheduler/request state before the process is killed. This
+        makes OOM-kills and external termination diagnosable.
+        """
+        def _dump_state(signum, frame):
+            sig_name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
+            try:
+                running = getattr(self, "num_running_requests", "?")
+                pending = getattr(self, "num_pending_requests", "?")
+                sched_alive = getattr(self, "_scheduler_running", "?")
+                heartbeat = getattr(self, "_scheduler_heartbeat", None)
+                hb_age = f"{time.monotonic() - heartbeat:.1f}s ago" if heartbeat else "never"
+                logger.critical(
+                    "eSurge received signal %s — dumping state before exit: "
+                    "scheduler_running=%s running_reqs=%s pending_reqs=%s "
+                    "last_heartbeat=%s",
+                    sig_name,
+                    sched_alive,
+                    running,
+                    pending,
+                    hb_age,
+                )
+            except Exception:
+                logger.critical("eSurge received signal %s (state dump failed)", signum)
+            # Re-raise with default handler so the process actually terminates.
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+        for sig in (signal.SIGTERM,):
+            try:
+                prev = signal.getsignal(sig)
+                # Only install if the current handler is the default.
+                if prev in (signal.SIG_DFL, None):
+                    signal.signal(sig, _dump_state)
+            except (OSError, ValueError):
+                pass  # Not main thread or signal not available
+
+    def _update_scheduler_heartbeat(self) -> None:
+        """Update the scheduler heartbeat timestamp."""
+        self._scheduler_heartbeat = time.monotonic()
+
+    def _check_scheduler_heartbeat(self) -> None:
+        """Warn if the scheduler hasn't produced a heartbeat recently."""
+        if not getattr(self, "_scheduler_running", False):
+            return
+        heartbeat = getattr(self, "_scheduler_heartbeat", None)
+        if heartbeat is None:
+            return
+        now = time.monotonic()
+        age = now - heartbeat
+        if age > _SCHEDULER_HEARTBEAT_WARN_S:
+            last_warn = getattr(self, "_scheduler_heartbeat_last_warn", 0.0)
+            if now - last_warn < _SCHEDULER_HEARTBEAT_WARN_INTERVAL_S:
+                return
+            self._scheduler_heartbeat_last_warn = now
+            logger.warning(
+                "Scheduler heartbeat stale: last update %.1fs ago "
+                "(threshold=%.0fs). Possible hang or deadlock.",
+                age,
+                _SCHEDULER_HEARTBEAT_WARN_S,
+            )
 
     def _track_finished_output(self, request_id: str) -> None:
         """Track and evict completed RequestOutput objects to cap memory usage.
@@ -153,6 +223,13 @@ class EngineLifecycleMixin:
             # Clear any previous crash state before starting a fresh scheduler thread.
             self._scheduler_exception = None
             self._scheduler_exception_tb = None
+            self._scheduler_heartbeat = None
+
+            # Install signal diagnostics (best-effort, main thread only).
+            try:
+                self._install_signal_diagnostics()
+            except Exception:
+                pass
 
             def _scheduler_loop():
                 self._info("Starting background scheduler loop")
@@ -160,11 +237,24 @@ class EngineLifecycleMixin:
                 max_consecutive_errors = MAX_CONSECUTIVE_SCHEDULER_ERRORS
                 distributed_controller = getattr(self, "_distributed_controller", None)
 
+                _loop_iter = 0
                 if not self._overlap_execution:
                     while self._scheduler_running:
                         try:
+                            _loop_iter += 1
                             with self._scheduler_lock:
                                 scheduler_output = self.scheduler.schedule()
+                            _n_sched = len(scheduler_output.num_scheduled_tokens) if scheduler_output else 0
+                            _has_work = len(self.scheduler.running) > 0 or len(self.scheduler.waiting) > 0
+                            if _n_sched == 0 and _loop_iter > 1 and _has_work:
+                                logger.warning(
+                                    "Scheduler produced empty output at loop iter %d "
+                                    "(running=%d waiting=%d). Possible DP scheduling stall.",
+                                    _loop_iter,
+                                    len(self.scheduler.running),
+                                    len(self.scheduler.waiting),
+                                )
+                            self._update_scheduler_heartbeat()
                             dispatch = None
                             if distributed_controller is not None and distributed_controller.has_remote_workers:
                                 dispatch = distributed_controller.dispatch_step(scheduler_output)
@@ -177,6 +267,7 @@ class EngineLifecycleMixin:
                                 self._process_engine_outputs(engine_outputs)
                             # Reset error counter on success
                             consecutive_errors = 0
+                            self._update_scheduler_heartbeat()
                         except KeyboardInterrupt:
                             self._info("Scheduler loop interrupted by user")
                             break
@@ -253,10 +344,12 @@ class EngineLifecycleMixin:
                         else:
                             with self._scheduler_lock:
                                 scheduler_output = self.scheduler.schedule()
+                        self._update_scheduler_heartbeat()
                         future = self.runner.execute_model_async(scheduler_output)
                         pending_future = (future, scheduler_output)
                         # Reset error counter on success
                         consecutive_errors = 0
+                        self._update_scheduler_heartbeat()
                     except KeyboardInterrupt:
                         self._info("Scheduler loop interrupted by user")
                         break

@@ -225,26 +225,49 @@ def distillation_step(
     if hidden_state_loss != "mse":
         raise ValueError(f"Unsupported hidden state loss '{hidden_state_loss}'. Only 'mse' is available.")
 
+    request_hidden_states = hidden_state_weight != 0.0
+    request_attentions = attention_weight != 0.0
+
+    teacher_call_kwargs = dict(batch)
+    teacher_call_kwargs.pop("labels", None)
+    if request_hidden_states:
+        teacher_call_kwargs["output_hidden_states"] = True
+    if request_attentions:
+        teacher_call_kwargs["output_attentions"] = True
+    teacher_call_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, teacher_call_kwargs)
+    teacher_call_kwargs = sanitize_model_call_kwargs(teacher_call_kwargs)
+    teacher_outputs = teacher_state.model(**teacher_call_kwargs)
+    teacher_outputs = _stop_gradient_tree(teacher_outputs)
+
+    batch = dict(batch)
+    batch["_teacher_logits"] = teacher_outputs.logits
+    if request_hidden_states:
+        teacher_hidden = getattr(teacher_outputs, "hidden_states", None)
+        if teacher_hidden is not None:
+            batch["_teacher_hidden_states"] = jnp.stack(teacher_hidden, axis=1)
+    if request_attentions:
+        teacher_attns = getattr(teacher_outputs, "attentions", None)
+        if teacher_attns is not None:
+            batch["_teacher_attentions"] = jnp.stack(teacher_attns, axis=1)
+
     def loss_fn(tree, minibatch):
         if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = flax.nnx.merge(student_state.graphdef, tree, student_state.graphother)
-        request_hidden_states = hidden_state_weight != 0.0
-        request_attentions = attention_weight != 0.0
         call_kwargs = dict(minibatch)
         call_kwargs.pop("labels", None)
+        # Extract pre-computed teacher outputs from minibatch.
+        teacher_logits = jax.lax.stop_gradient(call_kwargs.pop("_teacher_logits"))
+        teacher_hidden_stacked = call_kwargs.pop("_teacher_hidden_states", None)
+        teacher_attentions_stacked = call_kwargs.pop("_teacher_attentions", None)
         if request_hidden_states:
             call_kwargs["output_hidden_states"] = True
         if request_attentions:
             call_kwargs["output_attentions"] = True
         call_kwargs = filter_kwargs_for_callable(module.__call__, call_kwargs)
-        call_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         student_outputs = module(**call_kwargs)
-        teacher_outputs = teacher_state.model(**call_kwargs)
-        teacher_outputs = _stop_gradient_tree(teacher_outputs)
         student_logits = student_outputs.logits
-        teacher_logits = teacher_outputs.logits
         labels = minibatch.get("labels", None)
         attention_mask = minibatch.get("attention_mask", None)
         completion_mask = minibatch.get("completion_mask", None)
@@ -262,12 +285,12 @@ def distillation_step(
 
         if request_hidden_states:
             student_hidden = getattr(student_outputs, "hidden_states", None)
-            teacher_hidden = getattr(teacher_outputs, "hidden_states", None)
-            if student_hidden is None or teacher_hidden is None:
+            if student_hidden is None or teacher_hidden_stacked is None:
                 raise ValueError(
                     "Hidden-state distillation requested but models did not return hidden states. "
                     "Please ensure `output_hidden_states` is supported."
                 )
+            teacher_hidden = [teacher_hidden_stacked[:, i] for i in range(teacher_hidden_stacked.shape[1])]
             student_indices = _resolve_indices(len(student_hidden), hidden_state_layers, default_all=False)
             teacher_indices = _resolve_indices(len(teacher_hidden), hidden_state_layers, default_all=False)
             if len(student_indices) != len(teacher_indices):
@@ -285,12 +308,12 @@ def distillation_step(
 
         if request_attentions:
             student_attentions = getattr(student_outputs, "attentions", None)
-            teacher_attentions = getattr(teacher_outputs, "attentions", None)
-            if student_attentions is None or teacher_attentions is None:
+            if student_attentions is None or teacher_attentions_stacked is None:
                 raise ValueError(
                     "Attention distillation requested but models did not return attention probabilities. "
                     "Please ensure `output_attentions` is supported."
                 )
+            teacher_attentions = [teacher_attentions_stacked[:, i] for i in range(teacher_attentions_stacked.shape[1])]
             student_indices = _resolve_indices(len(student_attentions), attention_layers, default_all=True)
             teacher_indices = _resolve_indices(len(teacher_attentions), attention_layers, default_all=True)
             if len(student_indices) != len(teacher_indices):

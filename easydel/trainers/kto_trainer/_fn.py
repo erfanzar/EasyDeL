@@ -188,6 +188,16 @@ def training_step(
     )
     batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
+    batch = dict(batch)
+    if "reference_logps" not in batch:
+        ref_out = forward_fn(reference_state.model, batch)
+        batch["reference_logps"] = jax.lax.stop_gradient(ref_out["completion_logps"])
+
+    if calculate_kl:
+        kl_batch = _build_kl_batch(batch)
+        ref_kl_out = forward_fn(reference_state.model, kl_batch)
+        batch["_reference_kl_logps"] = jax.lax.stop_gradient(ref_kl_out["completion_logps"])
+
     def _loss_fn(tree: flax.nnx.GraphState, minibatch: dict[str, jax.Array]):
         if straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
@@ -195,16 +205,12 @@ def training_step(
         policy_out = forward_fn(module, minibatch)
         policy_logps = policy_out["completion_logps"]
 
-        if "reference_logps" in minibatch:
-            reference_logps = jax.lax.stop_gradient(minibatch["reference_logps"])
-        else:
-            ref_out = forward_fn(reference_state.model, minibatch)
-            reference_logps = jax.lax.stop_gradient(ref_out["completion_logps"])
+        reference_logps = jax.lax.stop_gradient(minibatch["reference_logps"])
 
         if calculate_kl:
             kl_batch = _build_kl_batch(minibatch)
             policy_kl_logps = jax.lax.stop_gradient(forward_fn(module, kl_batch)["completion_logps"])
-            reference_kl_logps = jax.lax.stop_gradient(forward_fn(reference_state.model, kl_batch)["completion_logps"])
+            reference_kl_logps = jax.lax.stop_gradient(minibatch["_reference_kl_logps"])
         else:
             policy_kl_logps = reference_kl_logps = None
 

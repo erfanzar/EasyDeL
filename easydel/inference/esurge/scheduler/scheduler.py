@@ -410,7 +410,8 @@ class Scheduler(SchedulerInterface):
         )
         rows_per_shard = int(self.max_num_running_reqs) // dp_size if use_dp_local_shard_hints else 0
         pages_per_shard = int(pages_per_shard) if use_dp_local_shard_hints else 0
-        planned_shard_counts: list[int] | None = [0] * dp_size if use_dp_local_shard_hints else None
+
+        _new_req_shard_counts: list[int] = [0] * dp_size if use_dp_local_shard_hints else []
 
         def _row_to_dp_shard(row_index: int | None) -> int | None:
             if not use_dp_local_shard_hints or row_index is None:
@@ -424,7 +425,6 @@ class Scheduler(SchedulerInterface):
             for group_page_ids in self.kv_cache_manager.get_page_ids(request.request_id):
                 for page_id in group_page_ids:
                     pid = int(page_id)
-                    # 0 is reserved as the null page.
                     if pid <= 0:
                         continue
                     shard = dp_shard_for_page_id(pid, pages_per_shard, dp_size)
@@ -436,30 +436,38 @@ class Scheduler(SchedulerInterface):
                         return None
             return inferred
 
-        def _pick_dp_shard_hint(request: EngineRequest) -> int | None:
+        def _pick_running_shard(request: EngineRequest) -> int | None:
+            """Shard hint for a RUNNING request — always its existing shard."""
             if not use_dp_local_shard_hints:
                 return None
-            assert planned_shard_counts is not None
+            shard = _infer_dp_shard_from_pages(request)
+            if shard is not None:
+                return shard
+            shard = _row_to_dp_shard(self.req_id_to_row_index.get(request.request_id))
+            if shard is not None:
+                return shard
+            return None
 
-            page_shard = _infer_dp_shard_from_pages(request)
-            if page_shard is not None and planned_shard_counts[page_shard] < rows_per_shard:
-                return page_shard
-
-            mapped_shard = _row_to_dp_shard(self.req_id_to_row_index.get(request.request_id))
-            if mapped_shard is not None and planned_shard_counts[mapped_shard] < rows_per_shard:
-                return mapped_shard
-
-            candidate_shards = [sid for sid, cnt in enumerate(planned_shard_counts) if cnt < rows_per_shard]
-            if not candidate_shards:
+        def _pick_new_shard(request: EngineRequest) -> int | None:
+            """Shard hint for a NEW/WAITING request — balanced distribution."""
+            if not use_dp_local_shard_hints:
                 return None
-            # Keep per-shard occupancy balanced to avoid overfilling one DP row range.
-            return min(candidate_shards, key=lambda sid: (planned_shard_counts[sid], sid))  # pyright: ignore[reportOptionalSubscript]
+            shard = _infer_dp_shard_from_pages(request)
+            if shard is not None:
+                return shard
+            shard = _row_to_dp_shard(self.req_id_to_row_index.get(request.request_id))
+            if shard is not None:
+                return shard
+            candidates = [sid for sid in range(dp_size) if _new_req_shard_counts[sid] < rows_per_shard]
+            if not candidates:
+                return None
+            return min(candidates, key=lambda sid: (_new_req_shard_counts[sid], sid))
 
-        def _reserve_dp_shard(shard_hint: int | None) -> None:
+        def _reserve_new_shard(shard_hint: int | None) -> None:
+            """Only count new/waiting requests for balancing purposes."""
             if not use_dp_local_shard_hints or shard_hint is None:
                 return
-            assert planned_shard_counts is not None
-            planned_shard_counts[shard_hint] += 1
+            _new_req_shard_counts[shard_hint] += 1
 
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
@@ -487,14 +495,7 @@ class Scheduler(SchedulerInterface):
             new_pages = None
 
             while True:
-                row_shard_hint = _pick_dp_shard_hint(request)
-                if use_dp_local_shard_hints and row_shard_hint is None:
-                    logger.warning(
-                        "No DP shard capacity available while scheduling running request %s. Deferring.",
-                        request.request_id,
-                    )
-                    can_schedule = False
-                    break
+                row_shard_hint = _pick_running_shard(request)
                 new_pages = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -535,11 +536,11 @@ class Scheduler(SchedulerInterface):
                     can_schedule = True
                     break
             if not can_schedule:
-                break
+                req_index += 1
+                continue
             assert new_pages is not None
 
             scheduled_running_reqs.append(request)
-            _reserve_dp_shard(row_shard_hint)
             req_to_new_page_ids[request.request_id] = new_pages.get_page_ids()
             num_scheduled_tokens[request.request_id] = num_new_tokens
             if self._token_budget_manager:
@@ -579,9 +580,11 @@ class Scheduler(SchedulerInterface):
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
-                row_shard_hint = _pick_dp_shard_hint(request)
+                row_shard_hint = _pick_new_shard(request)
                 if use_dp_local_shard_hints and row_shard_hint is None:
-                    break
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
 
                 if request.num_computed_tokens == 0:
                     new_computed_pages, num_new_local_computed_tokens = self.kv_cache_manager.get_computed_pages(
@@ -671,7 +674,7 @@ class Scheduler(SchedulerInterface):
                     scheduled_resumed_reqs.append(request)
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
-                _reserve_dp_shard(row_shard_hint)
+                _reserve_new_shard(row_shard_hint)
 
                 req_to_new_page_ids[request.request_id] = self.kv_cache_manager.get_page_ids(request.request_id)
                 if self._token_budget_manager:

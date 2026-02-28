@@ -14,8 +14,10 @@
 
 """Helpers for data-parallel page-shard math.
 
-The page pool reserves page-id ``0`` as a null/padding page. DP-local page
-sharding must therefore partition only usable page IDs ``[1, num_pages)``.
+The page tensor's first axis is DP-sharded, so ``num_pages`` itself must be
+evenly divisible by ``data_parallel_size``.  Each shard owns a contiguous
+slice of ``num_pages // dp_size`` pages.  Global page-id 0 (null/padding)
+lives in shard 0.
 """
 
 from __future__ import annotations
@@ -27,15 +29,19 @@ def usable_pages_count(num_pages: int) -> int:
 
 
 def pages_per_dp_shard(num_pages: int, data_parallel_size: int | None) -> int | None:
-    """Return usable pages per DP shard, or ``None`` when not evenly partitionable."""
+    """Return pages per DP shard, or ``None`` when not evenly partitionable.
+
+    The check is on ``num_pages % dp_size == 0`` (matching the JAX sharding
+    requirement on the full page tensor).
+    """
     dp_size = max(1, int(data_parallel_size or 1))
     if dp_size <= 1:
         return None
 
-    usable_pages = usable_pages_count(num_pages)
-    if usable_pages <= 0 or usable_pages % dp_size != 0:
+    num_pages = int(num_pages)
+    if num_pages <= 0 or num_pages % dp_size != 0:
         return None
-    return usable_pages // dp_size
+    return num_pages // dp_size
 
 
 def dp_shard_for_page_id(page_id: int, pages_per_shard: int, dp_size: int) -> int | None:
@@ -43,12 +49,18 @@ def dp_shard_for_page_id(page_id: int, pages_per_shard: int, dp_size: int) -> in
     pid = int(page_id)
     if pid <= 0 or pages_per_shard <= 0 or dp_size <= 0:
         return None
-    return min((pid - 1) // pages_per_shard, dp_size - 1)
+    return min(pid // pages_per_shard, dp_size - 1)
 
 
 def dp_shard_page_bounds(shard_index: int, pages_per_shard: int) -> tuple[int, int]:
-    """Return inclusive-exclusive usable page-ID bounds for a DP shard."""
+    """Return inclusive-exclusive page-ID bounds for a DP shard.
+
+    Shard 0 contains the null page (id 0), so its *usable* range starts at 1.
+    """
     shard = max(0, int(shard_index))
-    lo = 1 + shard * int(pages_per_shard)
+    lo = shard * int(pages_per_shard)
     hi = lo + int(pages_per_shard)
+    # Shard 0 owns page 0 (null), usable starts at 1.
+    if shard == 0:
+        lo = 1
     return lo, hi

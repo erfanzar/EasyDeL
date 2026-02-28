@@ -3,7 +3,7 @@ from __future__ import annotations
 import jax.numpy as jnp
 
 from easydel.inference.esurge.config import CacheConfig, Config, SchedulerConfig
-from easydel.inference.esurge.core.interface import CacheGroupSpec, CacheGroupsConfig, FullAttentionSpec
+from easydel.inference.esurge.core.interface import CacheGroupsConfig, CacheGroupSpec, FullAttentionSpec
 from easydel.inference.esurge.outputs import ModelRunnerOutput
 from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.scheduler.scheduler import Scheduler
@@ -68,21 +68,8 @@ def _add_request(scheduler: Scheduler, *, request_id: str = "req-fsdp") -> Engin
     return request
 
 
-def test_scheduler_disables_dp_local_hints_when_usable_pages_are_not_divisible() -> None:
-    scheduler = _make_scheduler(num_pages=8780)  # usable pages: 8779 (not divisible by 4)
-    _add_request(scheduler)
-    captured = _attach_allocate_slots_spy(scheduler)
-
-    output = scheduler.schedule()
-
-    assert output.total_num_scheduled_tokens > 0
-    assert captured
-    assert all(hint is None for hint, _ in captured)
-    assert all(dp_size == 4 for _, dp_size in captured)
-
-
-def test_scheduler_uses_dp_local_hints_when_usable_pages_are_divisible() -> None:
-    scheduler = _make_scheduler(num_pages=8781)  # usable pages: 8780 (divisible by 4)
+def test_scheduler_uses_dp_local_hints_when_num_pages_divisible() -> None:
+    scheduler = _make_scheduler(num_pages=8780)  # 8780 % 4 == 0 → DP-local hints enabled
     _add_request(scheduler)
     captured = _attach_allocate_slots_spy(scheduler)
 
@@ -91,6 +78,19 @@ def test_scheduler_uses_dp_local_hints_when_usable_pages_are_divisible() -> None
     assert output.total_num_scheduled_tokens > 0
     assert captured
     assert any(hint is not None for hint, _ in captured)
+    assert all(dp_size == 4 for _, dp_size in captured)
+
+
+def test_scheduler_disables_dp_local_hints_when_num_pages_not_divisible() -> None:
+    scheduler = _make_scheduler(num_pages=8781)  # 8781 % 4 != 0 → DP-local hints disabled
+    _add_request(scheduler)
+    captured = _attach_allocate_slots_spy(scheduler)
+
+    output = scheduler.schedule()
+
+    assert output.total_num_scheduled_tokens > 0
+    assert captured
+    assert all(hint is None for hint, _ in captured)
     assert all(dp_size == 4 for _, dp_size in captured)
 
 

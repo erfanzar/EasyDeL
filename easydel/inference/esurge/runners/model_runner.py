@@ -1245,6 +1245,71 @@ class eSurgeRunner:
                 i += 1
                 j -= 1
 
+    def _reorder_decode_first_per_shard(
+        self,
+        scheduler_output: SchedulerOutput,
+        dp_size: int,
+    ) -> None:
+        """Reorder decode requests first within each DP shard's row range.
+
+        Unlike _reorder_decode_first which reorders across the entire buffer
+        (and would move requests across shard boundaries), this method
+        reorders decode-first independently within each shard's contiguous
+        row range: [shard * rows_per_shard, (shard+1) * rows_per_shard).
+
+        This preserves DP-local row placement while giving each shard's
+        rows the decode-first ordering that the v3 attention kernel expects.
+
+        Args:
+            scheduler_output: Used to determine scheduled tokens per request.
+            dp_size: Number of data-parallel shards.
+        """
+        # Use max_num_reqs (not num_slots) for shard boundaries to match
+        # _update_states and the validation in batch_preparer, which both
+        # partition rows based on the fixed max_num_reqs capacity.
+        max_reqs = self.sequence_buffer.max_num_reqs
+        if max_reqs <= 1 or dp_size <= 1:
+            return
+        rows_per_shard = max_reqs // dp_size
+        if rows_per_shard <= 1 or max_reqs % dp_size != 0:
+            return
+
+        num_slots = self.sequence_buffer.num_slots
+        for shard in range(dp_size):
+            lo = shard * rows_per_shard
+            hi = min(lo + rows_per_shard, num_slots)
+            # Find the first non-decode and last decode within this shard range.
+            i, j = lo, hi - 1
+            while i < j:
+                i_req_id = self.sequence_buffer.req_ids[i] if i < len(self.sequence_buffer.req_ids) else None
+                j_req_id = self.sequence_buffer.req_ids[j] if j < len(self.sequence_buffer.req_ids) else None
+
+                # Skip None slots (holes) — leave them in place.
+                if i_req_id is None:
+                    i += 1
+                    continue
+                if j_req_id is None:
+                    j -= 1
+                    continue
+
+                i_is_decode = (
+                    scheduler_output.num_scheduled_tokens.get(i_req_id, 0) == 1
+                    and self.sequence_buffer.num_computed_tokens[i] > 0
+                )
+                j_is_decode = (
+                    scheduler_output.num_scheduled_tokens.get(j_req_id, 0) == 1
+                    and self.sequence_buffer.num_computed_tokens[j] > 0
+                )
+
+                if i_is_decode:
+                    i += 1
+                elif not j_is_decode:
+                    j -= 1
+                else:
+                    self.sequence_buffer.swap_states(i, j)
+                    i += 1
+                    j -= 1
+
     def _execute_model_impl(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         """Execute the model on scheduled requests.
 
@@ -1291,8 +1356,11 @@ class eSurgeRunner:
 
         # Align ordering with TPU runner: decode requests first.
         dp_size = int(getattr(self.metadata, "data_parallel_size", 1) or 1)
-        if self.sequence_buffer.num_reqs > 1 and dp_size <= 1:
-            self._reorder_decode_first(scheduler_output)
+        if self.sequence_buffer.num_reqs > 1:
+            if dp_size <= 1:
+                self._reorder_decode_first(scheduler_output)
+            else:
+                self._reorder_decode_first_per_shard(scheduler_output, dp_size)
 
         if not scheduler_output.total_num_scheduled_tokens:
             return ModelRunnerOutput(
