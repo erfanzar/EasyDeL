@@ -365,13 +365,18 @@ class _RaggedPageAttn(OperationImpl):
 
                 row_start_i32 = row_start.astype(jnp.int32)
                 local_total = jnp.clip(full_distribution[2] - row_start_i32, 0, rows_per_shard).astype(jnp.int32)
-                local_decode = jnp.clip(full_distribution[0] - row_start_i32, 0, local_total).astype(jnp.int32)
-                local_prefill = jnp.clip(full_distribution[1] - row_start_i32, 0, local_total).astype(jnp.int32)
+
+                local_scheduled = local_query_start_loc[1:] - local_query_start_loc[:-1]
+                local_is_decode = (local_scheduled == 1) & (local_context_lens > 1)
+                row_mask = jnp.arange(rows_per_shard, dtype=jnp.int32) < local_total
+                local_decode = jnp.sum(local_is_decode & row_mask).astype(jnp.int32)
+                local_prefill = local_decode
                 local_distribution = jnp.stack((local_decode, local_prefill, local_total)).astype(jnp.int32)
 
                 local_num_pages = jnp.int32(local_kv_pages.shape[0])
                 page_offset = shard_idx * local_num_pages
                 local_block_tables = local_block_tables - page_offset
+                local_block_tables = jnp.clip(local_block_tables, 0, local_num_pages - 1)
 
                 local_output, local_kv_pages = ragged_page_attention_v3(
                     local_query,

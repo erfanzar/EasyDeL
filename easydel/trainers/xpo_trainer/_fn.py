@@ -116,13 +116,28 @@ def xpo_step(
     )
     batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
-    ref_graphdef = reference_state.graphdef
+    ref_module = flax.nnx.merge(
+        reference_state.graphdef, reference_state.graphstate, reference_state.graphother
+    )
+    batch = dict(batch)
+    batch["_ref_on_policy"] = jax.lax.stop_gradient(
+        _compute_logps(
+            ref_module, batch["prompt_ids"], batch["prompt_mask"],
+            batch["policy_completion_ids"], batch["policy_completion_mask"],
+        )
+    )
+    batch["_ref_on_ref"] = jax.lax.stop_gradient(
+        _compute_logps(
+            ref_module, batch["prompt_ids"], batch["prompt_mask"],
+            batch["ref_completion_ids"], batch["ref_completion_mask"],
+        )
+    )
+    del ref_module
 
     def loss_fn(tree: flax.nnx.GraphState, minibatch: dict[str, jax.Array]):
         if is_train and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = state.merge(tree=tree)
-        ref_module = flax.nnx.merge(ref_graphdef, reference_state.graphstate, reference_state.graphother)
 
         prompt_ids = minibatch["prompt_ids"]
         prompt_mask = minibatch["prompt_mask"]
@@ -136,10 +151,8 @@ def xpo_step(
 
         policy_on_policy = _compute_logps(module, prompt_ids, prompt_mask, policy_completion_ids, policy_completion_mask)
         policy_on_ref = _compute_logps(module, prompt_ids, prompt_mask, ref_completion_ids, ref_completion_mask)
-        ref_on_policy = _compute_logps(
-            ref_module, prompt_ids, prompt_mask, policy_completion_ids, policy_completion_mask
-        )
-        ref_on_ref = _compute_logps(ref_module, prompt_ids, prompt_mask, ref_completion_ids, ref_completion_mask)
+        ref_on_policy = jax.lax.stop_gradient(minibatch["_ref_on_policy"])
+        ref_on_ref = jax.lax.stop_gradient(minibatch["_ref_on_ref"])
 
         policy_logps_policy = _sum_logps(policy_on_policy, policy_completion_mask)
         policy_logps_ref = _sum_logps(policy_on_ref, ref_completion_mask)

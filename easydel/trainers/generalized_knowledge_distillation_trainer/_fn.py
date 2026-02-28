@@ -164,6 +164,14 @@ def gkd_step(
         batch_partition_spec=partition_spec,
     )
     batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
+    teacher_call_kwargs = dict(batch)
+    teacher_call_kwargs.pop("labels", None)
+    teacher_call_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, teacher_call_kwargs)
+    teacher_call_kwargs = sanitize_model_call_kwargs(teacher_call_kwargs)
+    teacher_outputs = teacher_state.model(**teacher_call_kwargs)
+    teacher_outputs = _stop_gradient_tree(teacher_outputs)
+    batch = dict(batch)
+    batch["_teacher_logits"] = teacher_outputs.logits
 
     def loss_fn(tree, minibatch):
         if is_training and straight_through_emulator is not None:
@@ -171,12 +179,10 @@ def gkd_step(
         module = flax.nnx.merge(student_state.graphdef, tree, student_state.graphother)
         call_kwargs = dict(minibatch)
         labels = call_kwargs.pop("labels", None)
+        teacher_logits = jax.lax.stop_gradient(call_kwargs.pop("_teacher_logits"))
         call_kwargs = filter_kwargs_for_callable(module.__call__, call_kwargs)
-        call_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         student_outputs = module(**call_kwargs)
-        teacher_outputs = teacher_state.model(**call_kwargs)
-        teacher_outputs = _stop_gradient_tree(teacher_outputs)
 
         completion_mask = minibatch.get("completion_mask")
         attention_mask = minibatch.get("attention_mask")
@@ -184,7 +190,7 @@ def gkd_step(
 
         loss_value = generalized_jsd_loss(
             student_logits=student_outputs.logits,
-            teacher_logits=teacher_outputs.logits,
+            teacher_logits=teacher_logits,
             labels=labels,
             mask=mask,
             beta=beta,
