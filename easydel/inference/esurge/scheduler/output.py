@@ -324,6 +324,9 @@ class SchedulerOutput:
     finished_req_ids: set[str]
     """Set of request IDs that finished in the previous scheduling step."""
 
+    preempted_req_ids: set[str] = field(default_factory=set)
+    """Set of request IDs that were preempted (evicted from running to waiting)."""
+
     suggested_bucket: int | None = None
     """Optimal bucket size hint for runner's buffer selection."""
 

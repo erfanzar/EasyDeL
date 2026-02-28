@@ -411,7 +411,13 @@ class Scheduler(SchedulerInterface):
         rows_per_shard = int(self.max_num_running_reqs) // dp_size if use_dp_local_shard_hints else 0
         pages_per_shard = int(pages_per_shard) if use_dp_local_shard_hints else 0
 
-        _new_req_shard_counts: list[int] = [0] * dp_size if use_dp_local_shard_hints else []
+        _shard_occupancy: list[int] = [0] * dp_size if use_dp_local_shard_hints else []
+        if use_dp_local_shard_hints:
+            for _req in self.running:
+                _row = self.req_id_to_row_index.get(_req.request_id)
+                if _row is not None:
+                    _s = min(max(int(_row), 0) // rows_per_shard, dp_size - 1)
+                    _shard_occupancy[_s] += 1
 
         def _row_to_dp_shard(row_index: int | None) -> int | None:
             if not use_dp_local_shard_hints or row_index is None:
@@ -458,16 +464,16 @@ class Scheduler(SchedulerInterface):
             shard = _row_to_dp_shard(self.req_id_to_row_index.get(request.request_id))
             if shard is not None:
                 return shard
-            candidates = [sid for sid in range(dp_size) if _new_req_shard_counts[sid] < rows_per_shard]
+            candidates = [sid for sid in range(dp_size) if _shard_occupancy[sid] < rows_per_shard]
             if not candidates:
                 return None
-            return min(candidates, key=lambda sid: (_new_req_shard_counts[sid], sid))
+            return min(candidates, key=lambda sid: (_shard_occupancy[sid], sid))
 
         def _reserve_new_shard(shard_hint: int | None) -> None:
-            """Only count new/waiting requests for balancing purposes."""
+            """Increment shard occupancy when a new request is assigned."""
             if not use_dp_local_shard_hints or shard_hint is None:
                 return
-            _new_req_shard_counts[shard_hint] += 1
+            _shard_occupancy[shard_hint] += 1
 
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
@@ -526,6 +532,13 @@ class Scheduler(SchedulerInterface):
                     self.kv_cache_manager.free(preempted_req)
                     preempted_req.status = EngineRequestStatus.PREEMPTED
                     preempted_req.num_computed_tokens = 0
+
+                    # Decrement shard occupancy so new requests can use freed rows
+                    if use_dp_local_shard_hints:
+                        _preempt_row = self.req_id_to_row_index.get(preempted_req.request_id)
+                        if _preempt_row is not None:
+                            _preempt_shard = min(max(int(_preempt_row), 0) // rows_per_shard, dp_size - 1)
+                            _shard_occupancy[_preempt_shard] = max(0, _shard_occupancy[_preempt_shard] - 1)
 
                     self.waiting.prepend_request(preempted_req)
                     preempted_reqs.append(preempted_req)
@@ -749,6 +762,7 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             num_common_prefix_pages=num_common_prefix_pages,
             finished_req_ids=self.finished_req_ids,
+            preempted_req_ids={r.request_id for r in preempted_reqs},
             suggested_bucket=self._current_seq_bucket,  # Hint for runner's buffer selection
             async_scheduling=self.scheduler_config.async_scheduling,  # Pass async config to runner
         )

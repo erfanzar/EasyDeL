@@ -4,8 +4,6 @@ This module provides functions to create matched EasyDeL and HuggingFace model p
 transfer weights between them, and load model classes from HuggingFace Hub.
 """
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import copy
 import gc
 from typing import Any
@@ -143,7 +141,7 @@ def create_hf_model(
 
     # Ensure deterministic attention backend for strict parity checks.
     # HF defaults to SDPA which can introduce numerical differences vs EasyDeL/JAX.
-    if getattr(hf_config, "model_type", None) in {"glm4v", "glm4v_moe", "glm46v", "gemma3", "mistral3"}:
+    if getattr(hf_config, "model_type", None) in {"glm4v", "glm4v_moe", "glm46v", "gemma3", "mistral3", "glm_moe_dsa"}:
 
         def _force_eager(cfg: Any) -> None:
             if cfg is None:

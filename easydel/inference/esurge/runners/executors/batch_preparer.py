@@ -646,6 +646,13 @@ class BatchMetadataPreparer:
                 out=seq_lens[:num_requests],
                 dtype=np.int32,
             )
+            # Zero out seq_lens for unscheduled rows (budget-skipped running
+            # requests that stay in the buffer). Without this, the attention
+            # kernel sees context_lens > 0 with 0 query tokens, which can
+            # cause Pallas kernel hangs.
+            _unsched = scheduled[:num_requests] == 0
+            if np.any(_unsched):
+                seq_lens[:num_requests] *= (~_unsched).astype(np.int32)
             self._enforce_dp_local_page_tables(
                 num_requests=num_requests,
                 scheduled=scheduled,
