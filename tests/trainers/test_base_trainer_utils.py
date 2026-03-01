@@ -48,6 +48,103 @@ class _PreviewTrainer(BaseTrainer):
         raise NotImplementedError
 
 
+class _NoopTimer:
+    class _Ctx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def __init__(self):
+        self.logged: list[str] = []
+
+    def __call__(self, _name: str):
+        return self._Ctx()
+
+    def log(self, name: str):
+        self.logged.append(name)
+
+
+class _MeshCtx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _StateStub:
+    def __init__(self, *, opt_state, tx, step=0):
+        self.opt_state = opt_state
+        self.tx = tx
+        self.step = step
+        self.shardings = "state-shardings"
+        self.init_tx_calls: list[object] = []
+        self.replace_calls: list[dict[str, object]] = []
+        self.shard_state_calls: list[dict[str, object]] = []
+
+    def init_tx(self, tx):
+        self.init_tx_calls.append(tx)
+        self.tx = tx
+        self.opt_state = {"initialized": True}
+        return self
+
+    def replace(self, **kwargs):
+        self.replace_calls.append(dict(kwargs))
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+        return self
+
+    def shard_state(self, *, partition_rules, mesh):
+        self.shard_state_calls.append({"partition_rules": partition_rules, "mesh": mesh})
+        return self
+
+
+class _ModelStub:
+    def __init__(self, rules):
+        self.mesh = _MeshCtx()
+        self._rules = rules
+
+    def _get_partition_rules(self, _):
+        return self._rules
+
+
+def test_configure_state_initializes_tx_then_shards_via_state_api():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.timer = _NoopTimer()
+    trainer.arguments = SimpleNamespace(init_tx=True)
+    trainer._resumed_from_checkpoint = False
+    trainer.tx = "tx-object"
+    trainer.model_state = _StateStub(opt_state=None, tx=None, step=0)
+    trainer._model = _ModelStub(rules=((".*", "pspec"),))
+
+    BaseTrainer._configure_state(trainer)
+
+    assert trainer.model_state.init_tx_calls == ["tx-object"]
+    assert trainer.model_state.shard_state_calls == [{"partition_rules": ((".*", "pspec"),), "mesh": trainer.model.mesh}]
+    assert trainer.state_shardings == "state-shardings"
+    assert trainer.timer.logged == ["configure sharded state"]
+
+
+def test_configure_state_resume_keeps_step_and_sets_runtime_tx_before_sharding():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.timer = _NoopTimer()
+    trainer.arguments = SimpleNamespace(init_tx=True)
+    trainer._resumed_from_checkpoint = True
+    trainer.tx = "new-tx"
+    trainer.model_state = _StateStub(opt_state={"loaded": True}, tx="old-tx", step=17)
+    trainer._model = _ModelStub(rules=((".*", "pspec"),))
+
+    BaseTrainer._configure_state(trainer)
+
+    assert trainer.model_state.init_tx_calls == []
+    assert {"tx": "new-tx"} in trainer.model_state.replace_calls
+    assert {"step": 17} in trainer.model_state.replace_calls
+    assert trainer.model_state.shard_state_calls == [{"partition_rules": ((".*", "pspec"),), "mesh": trainer.model.mesh}]
+    assert trainer.state_shardings == "state-shardings"
+
+
 def test_normalize_prompts_plain_string():
     normalized = BaseTrainer._normalize_esurge_prompts("hello", apply_chat_template=False)
     assert normalized == ["hello"]

@@ -1,3 +1,5 @@
+import re
+
 import jax
 import jax.numpy as jnp
 import optax
@@ -5,6 +7,7 @@ import pytest
 from flax import nnx as nn
 
 import easydel as ed
+import easydel.infra.base_state as base_state_module
 from easydel.infra.base_state import EasyDeLState
 
 
@@ -56,3 +59,93 @@ def test_optimizer_gather_works_without_mesh_context_and_create_validation(tiny_
     graphdef, graphstate, _ = nn.split(tiny_sharded_llama, nn.Param, ...)
     with pytest.raises(ValueError):
         EasyDeLState.create(graphdef=graphdef, graphstate=graphstate, graphother=None)
+
+
+def test_partition_rules_match_optimizer_value_paths(tiny_sharded_llama):
+    from eformer import escale as es
+
+    state = EasyDeLState.create(model=tiny_sharded_llama)
+    rules = state.model._get_partition_rules(None)
+    eval_opt_state = jax.eval_shape(lambda: optax.adam(1e-3).init(state.graphstate))
+    partition_specs = es.match_partition_rules(rules, eval_opt_state)
+
+    def _has_sharded_axis(spec: jax.sharding.PartitionSpec) -> bool:
+        return any(axis_spec is not None for axis_spec in tuple(spec))
+
+    spec_leaves = [
+        spec for spec in jax.tree_util.tree_leaves(partition_specs) if isinstance(spec, jax.sharding.PartitionSpec)
+    ]
+    assert spec_leaves, "Expected optimizer partition-spec leaves."
+    assert any(
+        _has_sharded_axis(spec) for spec in spec_leaves
+    ), "Optimizer partition specs unexpectedly collapsed to replicated-only specs."
+
+
+def test_partition_rules_are_open_ended_for_state_suffixes(tiny_sharded_llama):
+    state = EasyDeLState.create(model=tiny_sharded_llama)
+    rules = state.model._get_partition_rules(None)
+    target_pattern = next(pattern for pattern, _ in rules if "model/norm/kernel" in pattern)
+
+    assert target_pattern.endswith("(?:/.*)?$")
+    assert re.search(target_pattern, "model/norm/kernel")
+    assert re.search(target_pattern, "0/mu/model/norm/kernel/value")
+    assert re.search(target_pattern, "0/mu/model/norm/kernel/value/extra")
+
+
+def test_init_tx_builds_corrected_explicit_output_shardings(monkeypatch, tiny_sharded_llama):
+    import eformer.escale as es
+
+    state = EasyDeLState.create(model=tiny_sharded_llama)
+    compile_calls = {"count": 0}
+    captured: dict[str, object] = {}
+
+    def fake_ejit(fn, **kwargs):
+        compile_calls["count"] += 1
+        captured.update(kwargs)
+
+        def wrapped(graphstate):
+            del graphstate
+            return {"ok": True}
+
+        return wrapped
+
+    def fake_match_partition_rules(_rules, tree, *args, **kwargs):
+        del _rules, args, kwargs
+        return jax.tree_util.tree_map(
+            lambda leaf: (
+                jax.sharding.PartitionSpec("does_not_exist")
+                if hasattr(leaf, "shape") and len(getattr(leaf, "shape", ())) > 0
+                else jax.sharding.PartitionSpec()
+            ),
+            tree,
+        )
+
+    monkeypatch.setattr(base_state_module, "ejit", fake_ejit)
+    monkeypatch.setattr(es, "match_partition_rules", fake_match_partition_rules)
+    updated = state.init_tx(optax.adam(1e-3))
+
+    assert compile_calls["count"] == 1
+    assert updated.tx is not None
+    assert updated.opt_state == {"ok": True}
+
+    out_shardings = captured.get("out_shardings")
+    assert out_shardings is not None
+
+    mesh_axis_names = set(state.mesh.axis_names)
+
+    def _iter_axis_names(spec):
+        for axis_spec in tuple(spec):
+            if axis_spec is None:
+                continue
+            if isinstance(axis_spec, tuple):
+                yield from axis_spec
+            else:
+                yield axis_spec
+
+    for leaf in jax.tree_util.tree_leaves(out_shardings):
+        if leaf is None:
+            continue
+        assert isinstance(leaf, jax.sharding.NamedSharding)
+        axis_names = set(_iter_axis_names(leaf.spec))
+        assert "does_not_exist" not in axis_names
+        assert axis_names.issubset(mesh_axis_names)

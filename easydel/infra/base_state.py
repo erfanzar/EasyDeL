@@ -95,7 +95,7 @@ from jax.sharding import PartitionSpec
 
 from easydel.infra.factory import TaskType
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.traversals import flatten_dict, specs_to_name_sharding, unflatten_dict
+from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 from .utils import materialize_meta_leaves, sanitize_partition_spec_for_shape
 
@@ -541,6 +541,7 @@ class EasyDeLState(struct.PyTreeNode):
         def make(graphstate):
             return tx.init(graphstate)
 
+        input_shardings = es.extract_shardings(self.graphstate, mesh=mesh)
         eval_opt_state = jax.eval_shape(lambda: make(self.graphstate))
         partition_specs = match_partition_rules(partition_rules, eval_opt_state)
         partition_specs, adjusted = _sanitize_partition_specs_for_shape_tree(
@@ -550,12 +551,24 @@ class EasyDeLState(struct.PyTreeNode):
         )
         if adjusted:
             logger.warning("Adjusted %d non-divisible optimizer sharding specs during init_tx.", adjusted)
-        named_shardings = specs_to_name_sharding(partition_specs, mesh)
+
+        # Build explicit output shardings from partition specs while correcting invalid
+        # mesh-axis references and non-divisible placements per concrete leaf shape.
+        with mesh:
+            named_shardings = jax.tree_util.tree_map(
+                lambda spec, shape_obj: (
+                    es.get_corrected_named_sharding(tuple(shape_obj.shape), spec)
+                    if isinstance(spec, PartitionSpec) and hasattr(shape_obj, "shape")
+                    else None
+                ),
+                partition_specs,
+                eval_opt_state,
+            )
 
         opt_state = ejit(
             make,
             out_shardings=named_shardings,
-            in_shardings=(es.extract_shardings(self.graphstate, mesh=mesh),),
+            in_shardings=(input_shardings,),
         )(self.graphstate)
 
         return self.replace(tx=tx, opt_state=opt_state)

@@ -34,7 +34,6 @@ from eformer import common_types
 from eformer.escale import with_sharding_constraint
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
-from flax import nnx as nn
 from jax import numpy as jnp
 from jax._src.stages import Compiled
 from jax.sharding import NamedSharding, PartitionSpec
@@ -1250,7 +1249,12 @@ class BaseTrainer(BaseTrainerProtocol):
 
             if prompts is None:
                 decoded_prompts = self._decode_prompt_batch(
-                    processor, input_ids, False, pad_token_id, True, attention_mask,
+                    processor,
+                    input_ids,
+                    False,
+                    pad_token_id,
+                    True,
+                    attention_mask,
                 )
                 prompts = self._normalize_esurge_prompts(decoded_prompts, apply_chat_template)
             else:
@@ -1928,8 +1932,7 @@ class BaseTrainer(BaseTrainerProtocol):
         expected_total = sum(count * num_return_sequences for count in prompt_row_counts)
         if len(all_completions) != expected_total:
             log_debug_maybe(
-                "Preview generation completion count mismatch: "
-                f"expected {expected_total}, got {len(all_completions)}"
+                "Preview generation completion count mismatch: " f"expected {expected_total}, got {len(all_completions)}"
             )
 
         needs_decoding = any(prepared.get("prompt_text") is None for prepared in prepared_prompts)
@@ -2099,8 +2102,6 @@ class BaseTrainer(BaseTrainerProtocol):
         partition rules to determine how parameters should be distributed across devices.
         """
         with self.timer("configure sharded state"):
-            from eformer.escale import match_partition_rules
-
             with self.model.mesh:
                 if self._resumed_from_checkpoint and self.model_state.opt_state is not None:
                     current_step = self.model_state.step
@@ -2115,12 +2116,9 @@ class BaseTrainer(BaseTrainerProtocol):
                 elif self.model_state.opt_state is not None and self.model_state.tx is None:
                     self.model_state = self.model_state.replace(tx=self.tx)
 
-                shape = nn.eval_shape(lambda: self.model_state)
                 rules = self.model._get_partition_rules(None)
-                state_shardings = specs_to_name_sharding(match_partition_rules(rules, shape))
-
-                self.state_shardings = state_shardings
-                self.model_state = self.model_state.shard_with_shape(state_shardings)
+                self.model_state = self.model_state.shard_state(partition_rules=rules, mesh=self.model.mesh)
+                self.state_shardings = self.model_state.shardings
 
         self.timer.log("configure sharded state")
 
