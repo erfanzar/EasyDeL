@@ -569,33 +569,24 @@ class FalconH1Mixer(nn.Module):
         hidden_states: Array,
         mask_info: MaskInfo | None,
         cache_view: HybridCacheView | None = None,
+        cache_metadata: "OperationsMetadata | None" = None,
     ) -> tuple[Array, HybridCacheView | None]:
         """Process input through the Mamba SSM mixer.
 
-        Applies the full Mamba2-style SSM computation pipeline:
-        1. Input projection with muP scaling
-        2. Split into gate, convolution input (x/B/C), and timestep (dt)
-        3. Causal convolution with activation
-        4. SSM computation (x, A, B, C, D, dt) -> y
-        5. Gated normalization and output projection
-
-        Supports both prefill mode (full sequence) and decode mode (single token)
-        with proper caching of convolution states and SSM recurrent states.
+        Supports three modes:
+        - Prefill: Full sequence convolution + SSM (no packed state).
+        - Decode (standard): Single-token convolution + SSM step.
+        - Decode (packed / eSurge): ``batch=1`` with multiple tokens packed
+          into seq_len.  Uses ``fori_loop`` to update each token's slot state.
 
         Args:
-            hidden_states (Array): Input tensor of shape (batch, seq_len, hidden_size).
-            mask_info (MaskInfo): Mask information containing attention mask for
-                handling padding tokens in the SSM computation.
-            cache_view (HybridCacheView | None, optional): Cache view containing
-                conv_state (for convolution) and recurrent_state (for SSM). When
-                provided in decode mode, enables efficient single-token generation.
-                Defaults to None.
+            hidden_states: Input ``(batch, seq_len, hidden_size)``.
+            mask_info: Mask / padding information.
+            cache_view: Cached conv_state + recurrent_state per slot.
+            cache_metadata: eSurge packed metadata (query_start_loc, num_seqs).
 
         Returns:
-            tuple[Array, HybridCacheView | None]: A tuple containing:
-                - contextualized_states: Output tensor of shape (batch, seq_len, hidden_size)
-                - updated_cache_view: Updated cache with new conv_state and recurrent_state,
-                  or None if caching is disabled
+            ``(output, updated_cache_view)``
         """
         q_mask: Array | None = None
         if mask_info is not None:
@@ -622,10 +613,108 @@ class FalconH1Mixer(nn.Module):
             axis=-1,
         )
 
-        if q_mask is not None:  # Mask *post-projection* so biases don't leak into padding positions.
+        if q_mask is not None:
             gate = apply_mask_to_padding_states(gate, q_mask)
             hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, q_mask)
 
+        packed_query_start_loc = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
+        packed_num_seqs = getattr(cache_metadata, "num_seqs", None) if cache_metadata is not None else None
+        use_packed_state_updates = (
+            cache_view is not None
+            and cache_view.conv_state is not None
+            and cache_view.recurrent_state is not None
+            and batch_size == 1
+            and packed_query_start_loc is not None
+            and packed_num_seqs is not None
+        )
+
+        if use_packed_state_updates:
+            from easydel.operations.kernels.ssm2 import _single_step_ssm2_fwd
+
+            conv_states = cache_view.conv_state  # [max_seqs, conv_dim, d_conv]
+            ssm_states = cache_view.recurrent_state.astype(jnp.float32)  # [max_seqs, H, D, N]
+            token_slots = jnp.clip(
+                jnp.searchsorted(packed_query_start_loc, jnp.arange(seq_len), side="right") - 1,
+                0,
+                packed_num_seqs - 1,
+            )
+
+            # Prepare dt with bias (for all tokens at once)
+            dt = jax.nn.softplus(dt.astype(jnp.float32) + self.dt_bias.value.astype(jnp.float32))
+
+            # A in real form (negative for stability)
+            A_real = -jnp.exp(self.A_log.value.astype(jnp.float32))
+            D_val = self.D.value.astype(jnp.float32)
+            kernel = self.conv1d.kernel.value  # [kernel_size, 1, conv_dim]
+            conv_bias = self.conv1d.bias.value if self.use_conv_bias else jnp.zeros(self.conv_dim, dtype=kernel.dtype)
+
+            token_outputs = jnp.zeros((seq_len, self.intermediate_size), dtype=jnp.float32)
+
+            def _body(idx, carry):
+                conv_states_c, ssm_states_c, token_outputs_c = carry
+                slot = token_slots[idx]
+
+                # 1) Conv update for this token
+                conv_state_i = jax.lax.dynamic_slice_in_dim(conv_states_c, slot, 1, axis=0)  # [1, conv_dim, d_conv]
+                new_token = hidden_states_B_C[0, idx, :]  # [conv_dim]
+                conv_state_i = jnp.roll(conv_state_i, shift=-1, axis=-1)
+                conv_state_i = conv_state_i.at[:, :, -1].set(new_token.astype(conv_state_i.dtype))
+
+                # Apply conv1d manually: depthwise dot product + bias
+                # kernel[:, 0, :] is [kernel_size, conv_dim], transpose to [conv_dim, kernel_size]
+                conv_out_full = jnp.sum(conv_state_i[0] * kernel[:, 0, :].T, axis=-1) + conv_bias  # [conv_dim]
+                conv_out_i = self.act(conv_out_full).astype(jnp.float32)
+
+                # 2) Split conv output into x, B, C
+                groups_time_state_size = self.n_groups * self.ssm_state_size
+                x_i = conv_out_i[:self.intermediate_size]
+                ssm_b_i = conv_out_i[self.intermediate_size:self.intermediate_size + groups_time_state_size]
+                ssm_c_i = conv_out_i[self.intermediate_size + groups_time_state_size:]
+
+                x_i = x_i.reshape(1, self.num_heads, self.head_dim)
+                ssm_b_i = ssm_b_i.reshape(1, self.n_groups, self.ssm_state_size)
+                ssm_c_i = ssm_c_i.reshape(1, self.n_groups, self.ssm_state_size)
+                dt_i = dt[0, idx, :].reshape(1, self.num_heads)
+
+                # 3) SSM single step
+                ssm_state_i = jax.lax.dynamic_slice_in_dim(ssm_states_c, slot, 1, axis=0)  # [1, H, D, N]
+                y_i, new_ssm_state_i = _single_step_ssm2_fwd(
+                    x=x_i, A=A_real, B=ssm_b_i, C=ssm_c_i,
+                    D=D_val, dt=dt_i, ssm_state=ssm_state_i,
+                    n_groups=self.n_groups,
+                )
+
+                # 4) Write back states
+                conv_states_c = jax.lax.dynamic_update_slice_in_dim(conv_states_c, conv_state_i, slot, axis=0)
+                ssm_states_c = jax.lax.dynamic_update_slice_in_dim(ssm_states_c, new_ssm_state_i.astype(ssm_states_c.dtype), slot, axis=0)
+                token_outputs_c = token_outputs_c.at[idx].set(y_i.reshape(self.intermediate_size))
+                return conv_states_c, ssm_states_c, token_outputs_c
+
+            conv_states, ssm_states, token_outputs = jax.lax.fori_loop(
+                0, seq_len,
+                _body,
+                (conv_states, ssm_states, token_outputs),
+            )
+
+            # Reshape token_outputs back to [batch=1, seq_len, intermediate_size]
+            y = token_outputs.reshape(1, seq_len, self.intermediate_size)
+
+            updated_cache_view = cache_view.replace(
+                conv_state=conv_states,
+                recurrent_state=ssm_states.astype(dtype),
+            )
+
+            # Apply gating and output projection
+            if self.mamba_rms_norm:
+                scan_output = self.norm(y, gate)
+            else:
+                assert gate is not None
+                scan_output = y * jax.nn.silu(gate.astype(jnp.float32))
+
+            contextualized_states = checkpoint_name(self.out_proj(scan_output.astype(dtype)), name="ssm_output_proj")
+            return contextualized_states, updated_cache_view
+
+        # --- Standard path (prefill / single-token decode) ---
         updated_cache_view = cache_view
 
         # Convolution with cache support for decode mode
@@ -662,11 +751,10 @@ class FalconH1Mixer(nn.Module):
         x = x.reshape(batch_size, seq_len, self.num_heads, self.head_dim).astype(jnp.float32)
         ssm_b = ssm_b.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
         ssm_c = ssm_c.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
-        # Note: SSM2Op handles group expansion internally
 
         # Prepare dt with bias
         dt = jax.nn.softplus(dt.astype(jnp.float32) + self.dt_bias.value.astype(jnp.float32))
-        if q_mask is not None and seq_len > 1:  # For padding tokens, force dt=0 so the SSM state remains unchanged.
+        if q_mask is not None and seq_len > 1:
             dt = dt * q_mask[:, :, None].astype(dt.dtype)
 
         if cache_view is not None and cache_view.recurrent_state is not None:
@@ -676,16 +764,16 @@ class FalconH1Mixer(nn.Module):
 
         # Call SSM2Op
         ssm_output = self.ssm_op(
-            x=x,  # [batch, seq_len, num_heads, head_dim]
-            A=self.A_log.value,  # [num_heads] in log form
-            B=ssm_b,  # [batch, seq_len, n_groups, ssm_state_size]
-            C=ssm_c,  # [batch, seq_len, n_groups, ssm_state_size]
-            D=self.D.value,  # [num_heads]
-            dt=dt,  # [batch, seq_len, num_heads]
-            gate=None,  # Gating handled by self.norm below (if mamba_rms_norm) or manually
+            x=x,
+            A=self.A_log.value,
+            B=ssm_b,
+            C=ssm_c,
+            D=self.D.value,
+            dt=dt,
+            gate=None,
             ssm_state=ssm_state0,
             n_groups=self.n_groups,
-            use_gated_rmsnorm=False,  # We handle norm/gating below
+            use_gated_rmsnorm=False,
             precision=self.precision,
         )
 
@@ -935,6 +1023,7 @@ class FalconH1DecoderLayer(nn.Module):
             hidden_states,
             mask_info=mask_info,
             cache_view=cache_view,
+            cache_metadata=cache_metadata,
         )
         mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
 

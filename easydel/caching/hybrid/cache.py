@@ -84,11 +84,13 @@ if tp.TYPE_CHECKING:
     from eformer.escale import PartitionManager
 
     from ..kda.cache import KDACacheView
+    from ..ragged_page.cache import RaggedPagesCacheView
     from ..recurrent.cache import RecurrentCacheView
     from ..transformer.cache import TransformerCacheView
+    from ..unified_attention.cache import UnifiedAttentionCacheView
 else:
     # AutoPytree need these informations for optimizations
-    KDACacheView, RecurrentCacheView, TransformerCacheView = [xTree] * 3
+    KDACacheView, RecurrentCacheView, TransformerCacheView, RaggedPagesCacheView, UnifiedAttentionCacheView = [xTree] * 5
 
 FULL_ATTENTION = "full_attention"
 LINEAR_ATTENTION = "linear_attention"
@@ -822,11 +824,15 @@ class ParallelHybridCacheView(BaseCacheView):
 
     Some decoder layers run more than one cache-bearing block in the same layer
     (e.g., attention KV-cache + SSM/Mamba state in FalconH1). This view carries
-    both a TransformerCacheView and a RecurrentCacheView while presenting a
+    both an attention cache view and a RecurrentCacheView while presenting a
     single object to model code.
+
+    The ``transformer`` field can hold any attention-style cache view:
+    ``TransformerCacheView``, ``RaggedPagesCacheView``, or
+    ``UnifiedAttentionCacheView``.
     """
 
-    transformer: TransformerCacheView | None
+    transformer: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None
     recurrent: RecurrentCacheView | None
 
     # Mirror recurrent fields so dataclasses.replace(self, conv_state=...) works.
@@ -876,20 +882,39 @@ class ParallelHybridCacheView(BaseCacheView):
         self.recurrent = self.recurrent.replace(**update_dict)
 
     @property
+    def is_ragged(self) -> bool:
+        """Whether the attention component uses paged (ragged/unified) cache."""
+        from easydel.caching.ragged_page.cache import RaggedPagesCacheView as _RPC
+        from easydel.caching.unified_attention.cache import UnifiedAttentionCacheView as _UAC
+
+        return isinstance(self.transformer, (_RPC, _UAC))
+
+    def _require_transformer_attr(self, name: str):
+        """Access an attribute on the inner transformer cache view, raising if unavailable."""
+        if self.transformer is None:
+            return None
+        val = getattr(self.transformer, name, None)
+        if val is None and not self.is_ragged:
+            raise AttributeError(
+                f"ParallelHybridCacheView.transformer ({type(self.transformer).__name__}) " f"has no attribute '{name}'"
+            )
+        return val
+
+    @property
     def key(self):
-        return self.transformer.key
+        return self._require_transformer_attr("key")
 
     @property
     def value(self):
-        return self.transformer.value
+        return self._require_transformer_attr("value")
 
     @property
     def indexs(self):
-        return self.transformer.indexs
+        return self._require_transformer_attr("indexs")
 
     @property
     def starts(self):
-        return self.transformer.starts
+        return self._require_transformer_attr("starts")
 
     @property
     def masking_details(self):
@@ -898,6 +923,17 @@ class ParallelHybridCacheView(BaseCacheView):
     @property
     def metadata(self):
         return getattr(self.transformer, "metadata", None)
+
+    @property
+    def kv_pages(self):
+        """Access kv_pages for ragged page cache views."""
+        return getattr(self.transformer, "kv_pages", None)
+
+    @kv_pages.setter
+    def kv_pages(self, value):
+        """Forward kv_pages write to the inner transformer cache view."""
+        if self.transformer is not None:
+            self.transformer.kv_pages = value
 
     @classmethod
     def init(cls, metadata: BaseCacheConfig, *args, **kwargs) -> "ParallelHybridCacheView":
@@ -914,8 +950,16 @@ class ParallelHybridCacheView(BaseCacheView):
     def concatenate_to_cache(self, *args, **kwargs):
         del args
 
+        # Dispatch based on the inner cache view type when possible,
+        # falling back to kwargs inspection for ambiguous cases.
+        is_ragged_call = self.is_ragged and "key" in kwargs and "value" in kwargs
         is_transformer_call = "query" in kwargs or ("key" in kwargs and "value" in kwargs and "mask_info" in kwargs)
         is_recurrent_call = "conv_state" in kwargs or "recurrent_state" in kwargs
+
+        if is_ragged_call:
+            # Ragged/unified page cache: signature is (key, value, cache_metadata) -> updated_view
+            new_transformer = self.transformer.concatenate_to_cache(**kwargs)
+            return self.replace(transformer=new_transformer)
 
         if is_transformer_call and is_recurrent_call:
             raise TypeError("ParallelHybridCacheView.concatenate_to_cache received mixed transformer + recurrent args.")
@@ -940,7 +984,8 @@ class ParallelHybridCacheView(BaseCacheView):
 
         raise TypeError(
             "ParallelHybridCacheView.concatenate_to_cache expected transformer-style args "
-            "(query/key/value/...) or recurrent-style args (conv_state/recurrent_state)."
+            "(query/key/value/...), ragged-style args (key/value/cache_metadata), "
+            "or recurrent-style args (conv_state/recurrent_state)."
         )
 
 

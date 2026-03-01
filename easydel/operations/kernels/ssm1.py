@@ -62,6 +62,48 @@ from ..requirements import (
 )
 
 
+def _single_step_ssm1_fwd(
+    hidden_states: Float[Array, "batch intermediate_size"],
+    A: Float[Array, "intermediate_size ssm_state_size"],
+    B: Float[Array, "batch ssm_state_size"],
+    C: Float[Array, "batch ssm_state_size"],
+    D: Float[Array, "intermediate_size"],  # noqa:F821
+    dt: Float[Array, "batch intermediate_size"],
+    ssm_state: Float[Array, "batch intermediate_size ssm_state_size"],
+) -> tuple[Float[Array, "batch intermediate_size"], Float[Array, "batch intermediate_size ssm_state_size"]]:
+    """Single-step SSM1 (Mamba1) forward pass.
+
+    Computes one discrete step of the selective state space model.
+    Bypasses ejKernel's type checking for use in JIT-compiled packed
+    decode paths (eSurge).
+
+    Args:
+        hidden_states: Input [batch, intermediate_size]
+        A: Real-form A matrix [intermediate_size, ssm_state_size] (negative)
+        B: B parameter [batch, ssm_state_size]
+        C: C parameter [batch, ssm_state_size]
+        D: Skip connection [intermediate_size]
+        dt: Time step (after softplus) [batch, intermediate_size]
+        ssm_state: Current SSM state [batch, intermediate_size, ssm_state_size]
+
+    Returns:
+        (y, ssm_state_new): Output and updated state.
+    """
+    # Discretize: dA = exp(dt * A)
+    dA = jnp.exp(dt[:, :, None] * A[None, :, :])  # [B, I, N]
+
+    # dB * x: (dt * B) * x
+    dBx = dt[:, :, None] * B[:, None, :] * hidden_states[:, :, None]  # [B, I, N]
+
+    # State update
+    ssm_state_new = dA * ssm_state + dBx
+
+    # Output: y = sum(state * C, axis=-1) + D * x
+    y = jnp.sum(ssm_state_new * C[:, None, :], axis=-1) + D[None, :] * hidden_states
+
+    return y, ssm_state_new
+
+
 @auto_pytree
 class SSM1Output(AttentionOutput):
     """Output container for SSM1 operation.

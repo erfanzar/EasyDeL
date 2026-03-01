@@ -1050,7 +1050,19 @@ class OperationCacheMixin:
         if not per_layer:
             return result
 
-        from easydel.caching import ParallelHybridCacheView, RecurrentCacheView, TransformerCacheView
+        from easydel.caching import (
+            ParallelHybridCacheView,
+            RaggedPagesCacheView,
+            RecurrentCacheView,
+            TransformerCacheView,
+            UnifiedAttentionCacheView,
+        )
+
+        _parallel_hybrid_combos = [
+            {TransformerCacheView, RecurrentCacheView},
+            {RaggedPagesCacheView, RecurrentCacheView},
+            {UnifiedAttentionCacheView, RecurrentCacheView},
+        ]
 
         for layer_idx, view_classes in per_layer.items():
             if len(view_classes) == 1:
@@ -1058,7 +1070,7 @@ class OperationCacheMixin:
                 continue
 
             # Parallel hybrid (e.g., FalconH1): attention KV + recurrent/SSM state
-            if view_classes == {TransformerCacheView, RecurrentCacheView}:
+            if view_classes in _parallel_hybrid_combos:
                 result[layer_idx] = ParallelHybridCacheView
                 continue
 

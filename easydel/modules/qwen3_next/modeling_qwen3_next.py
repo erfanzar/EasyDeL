@@ -73,6 +73,7 @@ from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import GatedDeltaRuleOp, GatedDeltaRuleOutput
+from easydel.operations.kernels.gated_delta_rule import _single_step_gated_delta_rule_fwd
 
 from .qwen3_next_configuration import Qwen3NextConfig
 
@@ -1116,43 +1117,51 @@ class Qwen3NextLinearAttention(nn.Module):
                     conv_state_i = conv_state_i.at[:, :, -1].set(conv_token.astype(conv_state_i.dtype))
 
                     conv_output_i = jnp.sum(conv_state_i * kernel[None, :, :], axis=-1)
-                    conv_output_i = jax.nn.silu(conv_output_i)[:, None, :]
+                    conv_output_i = jax.nn.silu(conv_output_i)
 
-                    conv_query_i = conv_output_i[:, :, : self.key_dim]
-                    conv_key_i = conv_output_i[:, :, self.key_dim : self.key_dim * 2]
-                    conv_value_i = conv_output_i[:, :, self.key_dim * 2 :]
-
-                    query_i = conv_query_i.reshape(1, 1, self.num_k_heads, self.head_k_dim)
-                    key_i = conv_key_i.reshape(1, 1, self.num_k_heads, self.head_k_dim)
-                    value_i = conv_value_i.reshape(1, 1, self.num_v_heads, self.head_v_dim)
+                    # Reshape directly into BHTD layout — skip the BTHD->BHTD
+                    # transposes that forward_native would add
+                    query_i = conv_output_i[:, :self.key_dim].reshape(
+                        1, self.num_k_heads, 1, self.head_k_dim
+                    )
+                    key_i = conv_output_i[:, self.key_dim:self.key_dim * 2].reshape(
+                        1, self.num_k_heads, 1, self.head_k_dim
+                    )
+                    value_i = conv_output_i[:, self.key_dim * 2:].reshape(
+                        1, self.num_v_heads, 1, self.head_v_dim
+                    )
 
                     if expand_ratio > 1:
-                        query_i = jnp.repeat(query_i, expand_ratio, axis=2)
-                        key_i = jnp.repeat(key_i, expand_ratio, axis=2)
+                        query_i = jnp.repeat(query_i, expand_ratio, axis=1)
+                        key_i = jnp.repeat(key_i, expand_ratio, axis=1)
 
-                    beta_i = jax.lax.dynamic_slice_in_dim(beta, idx, 1, axis=1)
-                    decay_i = jax.lax.dynamic_slice_in_dim(decay, idx, 1, axis=1)
+                    # Index beta/decay directly into [B, H, 1] — skip
+                    # dynamic_slice_in_dim + transpose that forward_native does
+                    beta_i = beta[0, idx].reshape(1, self.num_v_heads, 1)
+                    decay_i = decay[0, idx].reshape(1, self.num_v_heads, 1)
 
-                    gdr_output_i: GatedDeltaRuleOutput = self.gdr_op(
+                    # Call _single_step directly — bypass forward_native overhead
+                    # (no transposes, no sharding constraints, no dtype dispatch)
+                    out_i, new_rec_i = _single_step_gated_delta_rule_fwd(
                         query=query_i,
                         key=key_i,
                         value=value_i,
                         beta=beta_i,
                         decay=decay_i,
-                        conv_state=None,
                         recurrent_state=recurrent_state_i,
+                        use_qk_l2norm=True,
                     )
 
                     conv_states_i = jax.lax.dynamic_update_slice_in_dim(conv_states_i, conv_state_i, slot, axis=0)
                     recurrent_states_i = jax.lax.dynamic_update_slice_in_dim(
                         recurrent_states_i,
-                        gdr_output_i.recurrent_state.astype(recurrent_states_i.dtype),
+                        new_rec_i.astype(recurrent_states_i.dtype),
                         slot,
                         axis=0,
                     )
 
-                    attn_token = gdr_output_i.attention_outputs[:, 0, :, :].astype(token_outputs_i.dtype)
-                    token_outputs_i = token_outputs_i.at[idx].set(attn_token[0])
+                    attn_token = out_i[0, :, 0, :].astype(token_outputs_i.dtype)
+                    token_outputs_i = token_outputs_i.at[idx].set(attn_token)
                     return conv_states_i, recurrent_states_i, token_outputs_i
 
                 return jax.lax.cond(is_active, _update_states, lambda x: x, (conv_states_c, recurrent_states_c, token_outputs_c))

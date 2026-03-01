@@ -203,6 +203,26 @@ def _resolve_backend_for_esurge(config: EasyDeLBaseConfig) -> str:
         return "cpu"
 
 
+def _count_kv_layers(text_config) -> int:
+    """Count layers that consume KV cache pages.
+
+    For hybrid models (mixed attention + linear/recurrent), only attention
+    layers consume KV cache pages.  Returns the total ``num_hidden_layers``
+    when no ``layer_types`` attribute is present.
+    """
+    num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+    layer_types = getattr(text_config, "layer_types", None)
+    if layer_types is not None:
+        num_kv_layers = sum(
+            1
+            for lt in layer_types
+            if "full" in lt or "sliding" in lt or lt == "attention" or lt == "parallel_hybrid"
+        )
+        if num_kv_layers > 0:
+            num_hidden_layers = num_kv_layers
+    return num_hidden_layers
+
+
 class EasyGenerationMixin:
     """Mixin class providing text generation capabilities for EasyDeL models.
 
@@ -877,7 +897,16 @@ class EasyGenerationMixin:
             if hidden_size and num_heads:
                 head_dim = hidden_size // num_heads
 
-        num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+        num_hidden_layers = _count_kv_layers(text_config)
+        # Pure recurrent models (e.g. falcon-mamba) have no attention heads.
+        # Use minimal dummy KV dimensions so the page infrastructure stays valid
+        # but allocates negligible memory — no layer actually stores KV data.
+        if num_kv_heads is None or num_kv_heads <= 0:
+            num_kv_heads = 1
+        if head_dim is None or head_dim <= 0:
+            head_dim = 1
+        if num_hidden_layers <= 0:
+            num_hidden_layers = 1
         if self.config.get_text_config().attn_mechanism == "ragged_page_attention_v3":
             version = "v3"
         elif self.config.get_text_config().attn_mechanism == "ragged_page_attention_v2":
@@ -927,7 +956,7 @@ class EasyGenerationMixin:
             if hidden_size and num_heads:
                 head_dim = hidden_size // num_heads
 
-        num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+        num_hidden_layers = _count_kv_layers(text_config)
         return UnifiedAttentionCacheConfig.create(
             mesh=text_config.mesh,
             partition_manager=text_config.partition_manager,
@@ -1009,6 +1038,12 @@ class EasyGenerationMixin:
         shared_unified_config = None
         needs_ragged = any(view_class is RaggedPagesCacheView for view_class in cache_view_mapping.values())
         needs_unified = any(view_class is UnifiedAttentionCacheView for view_class in cache_view_mapping.values())
+        # If caller explicitly provides a ragged/unified config, make it available
+        # even when all layers are ParallelHybridCacheView (e.g., FalconH1 in eSurge).
+        if ragged_config is not None:
+            needs_ragged = True
+        if unified_config is not None:
+            needs_unified = True
 
         if needs_ragged:
             from easydel.caching import RaggedPagesCacheConfig
@@ -1049,7 +1084,13 @@ class EasyGenerationMixin:
                     )
 
                 if view_class is ParallelHybridCacheView:
-                    t_config = self.create_transformer_cache_config(batch_size=batch_size, max_length=max_length)
+                    # Use ragged/unified config if available (eSurge mode), else standard transformer config.
+                    if shared_ragged_config is not None:
+                        t_config = shared_ragged_config
+                    elif shared_unified_config is not None:
+                        t_config = shared_unified_config
+                    else:
+                        t_config = self.create_transformer_cache_config(batch_size=batch_size, max_length=max_length)
                     r_config = self.create_recurrent_cache_config(batch_size=batch_size)
                     views_config[idx] = (t_config, r_config)
                 elif view_class is TransformerCacheView:
@@ -1164,16 +1205,38 @@ class EasyGenerationMixin:
 
                 if view_class is ParallelHybridCacheView:
                     # Parallel hybrid layer: needs BOTH KV-cache and recurrent/SSM state.
-                    transformer_view = TransformerCacheView.init(
-                        config=config_classes[0],
-                        layer_index=idx,
-                        mesh=text_config.mesh,
-                        dtype=dtype,
-                        partition_manager=text_config.partition_manager,
-                        quantizer=quantizer,
-                        masking_details=masking_details,
-                        starts=starts,
-                    )
+                    # The attention config can be ragged, unified, or standard transformer.
+                    t_config = config_classes[0]
+
+                    from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
+
+                    if isinstance(t_config, RaggedPagesCacheConfig):
+                        attn_view = RaggedPagesCacheView.init(
+                            config=t_config,
+                            layer_index=idx,
+                            mesh=text_config.mesh,
+                            partition_manager=text_config.partition_manager,
+                            quantizer=quantizer,
+                        )
+                    elif isinstance(t_config, UnifiedAttentionCacheConfig):
+                        attn_view = UnifiedAttentionCacheView.init(
+                            config=t_config,
+                            layer_index=idx,
+                            mesh=text_config.mesh,
+                            partition_manager=text_config.partition_manager,
+                            quantizer=quantizer,
+                        )
+                    else:
+                        attn_view = TransformerCacheView.init(
+                            config=t_config,
+                            layer_index=idx,
+                            mesh=text_config.mesh,
+                            dtype=dtype,
+                            partition_manager=text_config.partition_manager,
+                            quantizer=quantizer,
+                            masking_details=masking_details,
+                            starts=starts,
+                        )
 
                     recurrent_view = RecurrentCacheView.init(
                         config=config_classes[1],
@@ -1182,7 +1245,7 @@ class EasyGenerationMixin:
                     )
 
                     view = ParallelHybridCacheView(
-                        transformer=transformer_view,
+                        transformer=attn_view,
                         recurrent=recurrent_view,
                         layer_index=idx,
                     )

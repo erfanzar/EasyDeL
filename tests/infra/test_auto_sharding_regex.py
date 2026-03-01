@@ -44,3 +44,13 @@ def test_resolve_shardings_compacts_layer_indices():
 
     exact_rule = "^layers/5/kernel$"
     assert all(pat != exact_rule for pat, _ in rules), "Expected compacted regex, not an exact rule."
+
+
+def test_resolve_shardings_matches_optimizer_prefixed_paths():
+    model = _DummyModel(config=_DummyConfig(), rngs=nn.Rngs(0))
+    rules = model.resolve_shardings_automatically()
+
+    for path in ("mu/layers/5/kernel", "0/mu/layers/5/kernel"):
+        matching = [(pat, spec) for pat, spec in rules if re.match(pat, path)]
+        assert matching, "Expected a regex rule matching optimizer-prefixed parameter paths."
+        assert matching[0][1] == Replicated

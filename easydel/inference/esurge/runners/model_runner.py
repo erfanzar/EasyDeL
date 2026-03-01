@@ -95,7 +95,9 @@ if typing.TYPE_CHECKING:
 logger = get_logger("eSurge")
 
 
-def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:  # pyright: ignore[reportUnusedFunction]
+def _get_padded_num_reqs_with_upper_limit(
+    x: int, upper_limit: int, min_input_pad: int
+) -> int:  # pyright: ignore[reportUnusedFunction]
     """Calculate padded request count for compilation efficiency.
 
     Pads the number of requests to powers of 2 (up to 8) or the nearest
@@ -296,6 +298,88 @@ class eSurgeRunner:
         self._pre_async_results: AsyncPreResults | None = None
         self._executor: typing.Any = None  # ThreadPoolExecutor, typed as Any to avoid circular import
         logger.debug("eSurgeRunner initialization complete")
+        self._log_startup_summary()
+
+    def _log_startup_summary(self) -> None:
+        """Log a consolidated startup summary showing model architecture, algorithms, cache config, and runtime info."""
+        try:
+            text_config = self.model.config.get_text_config()
+            model_type = getattr(text_config, "model_type", "unknown")
+            attn_mechanism = getattr(text_config, "attn_mechanism", "unknown")
+            num_layers = getattr(text_config, "num_hidden_layers", 0)
+            layer_types = getattr(text_config, "layer_types", None)
+            cache_info = None
+            try:
+                cache_info = self.model.get_operations_cache_info()
+            except Exception:
+                pass
+
+            rec_ops: set[str] = set()
+            if cache_info is not None and len(cache_info.layers) > 0:
+                for layer in cache_info.layers:
+                    if layer.is_recurrent_layer:
+                        rec_ops.add(layer.operation_name)
+                cache_type = cache_info.get_recommended_cache_type()
+            else:
+                cache_type = "paged"
+
+            if layer_types is not None:
+                from collections import Counter
+
+                type_counts = Counter(layer_types)
+                n_attn = sum(v for k, v in type_counts.items() if "full" in k or "sliding" in k)
+                n_linear = sum(v for k, v in type_counts.items() if "linear" in k)
+                n_parallel = type_counts.get("parallel_hybrid", 0)
+                n_other = num_layers - n_attn - n_linear - n_parallel
+
+                parts = []
+                if n_parallel:
+                    parts.append(f"{n_parallel} parallel attn+ssm")
+                if n_linear:
+                    parts.append(f"{n_linear} linear")
+                if n_attn:
+                    parts.append(f"{n_attn} full-attention")
+                if n_other:
+                    parts.append(f"{n_other} other")
+
+                has_recurrent = n_linear > 0 or n_parallel > 0
+                has_attention = n_attn > 0 or n_parallel > 0
+
+                if n_parallel and not n_attn and not n_linear:
+                    arch_desc = f"parallel_hybrid ({' + '.join(parts)} / {num_layers} layers)"
+                elif has_recurrent and has_attention:
+                    arch_desc = f"hybrid ({' + '.join(parts)} / {num_layers} layers)"
+                elif has_recurrent and not has_attention:
+                    arch_desc = f"recurrent ({' + '.join(parts)} / {num_layers} layers)"
+                else:
+                    arch_desc = f"attention ({num_layers} layers)"
+            elif num_layers > 0:
+                arch_desc = f"attention ({num_layers} layers)"
+            else:
+                arch_desc = "unknown"
+
+            algos = [f"attention={attn_mechanism}"]
+            if rec_ops:
+                algos.append(f"linear={', '.join(sorted(rec_ops))}")
+            algo_str = " | ".join(algos)
+
+            cache_parts = [f"type={cache_type}"]
+            if hasattr(self.metadata, "num_pages") and hasattr(self.metadata, "page_size"):
+                n_pages = int(self.metadata.num_pages)
+                p_size = int(self.metadata.page_size)
+                seq_cap = int((n_pages * p_size) / 1000)
+                cache_parts.append(f"pages={n_pages:,} ({p_size} tok/page)")
+                cache_parts.append(f"sequence_capacity={seq_cap:,}K")
+
+            lines = [
+                f"Model : {model_type}",
+                f"Architecture : {arch_desc}",
+                f"Algorithms : {algo_str}",
+                f"Cache : {' | '.join(cache_parts)}",
+            ]
+            logger.info("\n".join(lines))
+        except Exception as e:
+            logger.debug(f"Could not generate startup summary: {e}")
 
     @property
     def mesh(self):
@@ -619,8 +703,12 @@ class eSurgeRunner:
                 logger.debug(f"fill_slice skip ({pr_reqs}): {e}")
 
         try:
-            _ = swap_rows.lower(token_ids, jnp.int32(0), jnp.int32(1)).compile()  # pyright: ignore[reportFunctionMemberAccess]
-            _ = move_row.lower(token_ids, jnp.int32(0), jnp.int32(1)).compile()  # pyright: ignore[reportFunctionMemberAccess]
+            _ = swap_rows.lower(
+                token_ids, jnp.int32(0), jnp.int32(1)
+            ).compile()  # pyright: ignore[reportFunctionMemberAccess]
+            _ = move_row.lower(
+                token_ids, jnp.int32(0), jnp.int32(1)
+            ).compile()  # pyright: ignore[reportFunctionMemberAccess]
             logger.debug("swap_rows and move_row compiled")
         except Exception as e:
             logger.debug(f"swap_rows/move_row skip: {e}")
@@ -949,6 +1037,11 @@ class eSurgeRunner:
             if req_index is not None:
                 removed_req_indices.append(req_index)
                 removed_req_index_by_id[req_id] = req_index
+
+        # 3b) Clear recurrent/SSM state for freed slots so the next request
+        # assigned to the same slot starts from a clean state.
+        if removed_req_indices:
+            self.executor_manager.clear_recurrent_slots(removed_req_indices)
 
         # 4) Add new requests to tracking
         req_ids_to_add: list[str] = []
@@ -1290,8 +1383,7 @@ class eSurgeRunner:
             #    Find the boundary between non-None rows and holes.
             shard_end = hi
             while shard_end > lo and (
-                shard_end - 1 >= len(self.sequence_buffer.req_ids)
-                or self.sequence_buffer.req_ids[shard_end - 1] is None
+                shard_end - 1 >= len(self.sequence_buffer.req_ids) or self.sequence_buffer.req_ids[shard_end - 1] is None
             ):
                 shard_end -= 1
 

@@ -1224,6 +1224,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 _add_rule("", spec, prefix)
 
         def _generalize_numeric_path(pattern: str) -> str:
+            """Build a regex that matches both direct and optimizer-prefixed paths."""
             parts = pattern.split("/")
             regex_parts: list[str] = []
             for part in parts:
@@ -1231,7 +1232,10 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                     regex_parts.append(r"\d+")
                 else:
                     regex_parts.append(re.escape(part))
-            return "^" + "/".join(regex_parts) + "$"
+            # Optax state trees often prepend segments like "mu/", "nu/" or tuple-index
+            # wrappers before the original parameter path. Allow optional prefixes so
+            # auto-generated rules keep working for optimizer-state sharding.
+            return r"^(?:.*/)?" + "/".join(regex_parts) + r"$"
 
         seen: set[tuple[str, tp.Any]] = set()
         rules: list[tuple[str, tp.Any]] = []

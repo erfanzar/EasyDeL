@@ -1254,13 +1254,15 @@ class AttnMaskType(StrEnum):
             "chunk_attention",
             "chunked_attention",
             "linear_attention",
+            "parallel_hybrid",
         ],
     ):
         if hf_type == "sliding_attention":
             return AttnMaskType.SLIDING
-        elif hf_type in ("full_attention", "linear_attention"):
+        elif hf_type in ("full_attention", "linear_attention", "parallel_hybrid"):
             # eSurge cache grouping is page-table based; linear attention layers
-            # are treated as full-attention groups for scheduler compatibility.
+            # and parallel hybrid layers (attention+SSM) are treated as
+            # full-attention groups for scheduler compatibility.
             return AttnMaskType.FULL
         elif hf_type in ["chunk_attention", "chunked_attention"]:
             return AttnMaskType.CHUNK

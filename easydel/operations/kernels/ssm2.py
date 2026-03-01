@@ -63,6 +63,56 @@ from ..requirements import (
 )
 
 
+def _single_step_ssm2_fwd(
+    x: Float[Array, "batch num_heads head_dim"],
+    A: Float[Array, "num_heads"],
+    B: Float[Array, "batch n_groups ssm_state_size"],
+    C: Float[Array, "batch n_groups ssm_state_size"],
+    D: Float[Array, "num_heads"],
+    dt: Float[Array, "batch num_heads"],
+    ssm_state: Float[Array, "batch num_heads head_dim ssm_state_size"],
+    n_groups: int = 1,
+) -> tuple[Float[Array, "batch num_heads head_dim"], Float[Array, "batch num_heads head_dim ssm_state_size"]]:
+    """Single-step SSM2 (Mamba2) forward pass.
+
+    Computes one discrete step of the selective state space model.
+    This avoids ejKernel's type checking which fails during JIT compilation
+    with tracer values in eSurge's packed decode path.
+
+    Args:
+        x: Input [batch, num_heads, head_dim]
+        A: Log-space A vector [num_heads] (already -exp(A_log), negative)
+        B: B parameter [batch, n_groups, ssm_state_size]
+        C: C parameter [batch, n_groups, ssm_state_size]
+        D: Skip connection [num_heads]
+        dt: Time step (already through softplus) [batch, num_heads]
+        ssm_state: Current SSM state [batch, num_heads, head_dim, ssm_state_size]
+        n_groups: Number of groups for B, C
+
+    Returns:
+        (y, ssm_state_new): Output and updated state.
+    """
+    num_heads = x.shape[1]
+    heads_per_group = num_heads // n_groups
+
+    # Discretize: dA = exp(A * dt)
+    dA = jnp.exp(dt[:, :, None, None] * A[None, :, None, None])  # [B, H, 1, 1]
+
+    # Expand B, C from [B, G, N] -> [B, H, N]
+    B_exp = jnp.repeat(B, heads_per_group, axis=1)  # [B, H, N]
+    C_exp = jnp.repeat(C, heads_per_group, axis=1)  # [B, H, N]
+
+    # State update: s' = dA * s + x[..., None] * (dt * B_expanded)[..., None, :]
+    dBx = x[:, :, :, None] * (dt[:, :, None, None] * B_exp[:, :, None, :])  # [B, H, D, N]
+    ssm_state_new = dA * ssm_state + dBx
+
+    # Output: y = sum(C * s', axis=-1) + D * x
+    y = jnp.sum(C_exp[:, :, None, :] * ssm_state_new, axis=-1)  # [B, H, D]
+    y = y + D[None, :, None] * x
+
+    return y, ssm_state_new
+
+
 @auto_pytree
 class SSM2Output(AttentionOutput):
     """Output container for SSM2 operation.

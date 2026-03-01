@@ -66,6 +66,7 @@ from jaxtyping import Bool, Complex, Float, Int
 
 from easydel.caching import (
     OperationsMetadata,
+    ParallelHybridCacheView,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
     TransformerCacheView,
@@ -1066,6 +1067,8 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             mode_computed = mode
 
         is_ragged_cache: bool = isinstance(cache_view, (RaggedPagesCacheView, UnifiedAttentionCacheView))
+        if not is_ragged_cache and isinstance(cache_view, ParallelHybridCacheView):
+            is_ragged_cache = cache_view.is_ragged
         if is_ragged_cache:
             cache_view = cache_view.concatenate_to_cache(key=key, value=value, cache_metadata=cache_metadata)
 
