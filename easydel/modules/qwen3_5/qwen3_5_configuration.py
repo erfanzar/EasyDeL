@@ -25,6 +25,21 @@ from easydel.modules.qwen3_next.qwen3_next_configuration import Qwen3NextConfig
 from easydel.modules.qwen3_vl.qwen3_vl_configuration import Qwen3VLVisionConfig
 
 
+def _normalize_rope_scaling_for_mrope(rope_scaling: dict | None) -> dict | None:
+    """Normalize RoPE config so mRoPE keys imply ``rope_type='mrope'``."""
+    if not isinstance(rope_scaling, dict):
+        return rope_scaling
+    normalized = dict(rope_scaling)
+    has_mrope_keys = "mrope_section" in normalized or "mrope_interleaved" in normalized
+    if has_mrope_keys:
+        rope_type = normalized.get("rope_type", normalized.get("type"))
+        if rope_type in (None, "default"):
+            normalized["rope_type"] = "mrope"
+            if "type" in normalized:
+                normalized["type"] = "mrope"
+    return normalized
+
+
 @register_config("qwen3_5_text")
 class Qwen3_5TextConfig(Qwen3NextConfig):
     """
@@ -133,7 +148,7 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         mlp_only_layers: list[int] | None = None,
         **kwargs,
     ):
-        rope_scaling = rope_scaling or rope_parameters
+        rope_scaling = _normalize_rope_scaling_for_mrope(rope_scaling or rope_parameters)
         if rope_theta is None and isinstance(rope_scaling, dict):
             rope_theta = rope_scaling.get("rope_theta")
         if rope_theta is None:

@@ -1082,6 +1082,10 @@ class SFTPreprocessTransform(Transform):
         self._add_eos = add_eos
         self._truncation = truncation
         self._formatting_func = formatting_func
+        chat_template = getattr(tokenizer, "chat_template", None)
+        self._return_assistant_tokens_mask = bool(
+            mask_prompt and isinstance(chat_template, str) and "{% generation %}" in chat_template
+        )
 
     def __call__(self, example: Example) -> Example:
         """Apply SFT preprocessing to example.
@@ -1174,7 +1178,7 @@ class SFTPreprocessTransform(Transform):
                 messages,
                 return_dict=True,
                 return_attention_mask=True,
-                return_assistant_tokens_mask=self._mask_prompt,
+                return_assistant_tokens_mask=self._return_assistant_tokens_mask,
                 truncation=self._truncation,
                 max_length=self._max_length,
                 padding="max_length" if self._max_length else False,

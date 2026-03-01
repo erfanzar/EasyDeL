@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import jax.numpy as jnp
 
+from easydel.trainers.distillation_trainer.distillation_trainer import DistillationTrainer
 from easydel.trainers.binary_classifier_optimization_trainer._fn import (
     concatenated_forward as bco_concatenated_forward,
 )
@@ -16,6 +17,7 @@ from easydel.trainers.direct_preference_optimization_trainer._fn import (
 from easydel.trainers.odds_ratio_preference_optimization_trainer._fn import (
     concatenated_forward as orpo_concatenated_forward,
 )
+from easydel.trainers.trainer import Trainer
 
 
 class _StrictModel:
@@ -146,3 +148,29 @@ def test_orpo_forward_filters_encoder_decoder_kwargs():
     )
     assert model.calls == 1
     assert len(outputs) == 6
+
+
+def test_distillation_preprocess_converts_and_drops_assistant_masks(monkeypatch):
+    trainer = DistillationTrainer.__new__(DistillationTrainer)
+
+    def _fake_base_preprocess(self, state, batch, is_train):
+        del self, state, is_train
+        return dict(batch), {}
+
+    monkeypatch.setattr(Trainer, "_preprocess_batch_input", _fake_base_preprocess)
+
+    batch = {
+        "input_ids": jnp.array([[1, 2, 3]], dtype=jnp.int32),
+        "attention_mask": jnp.array([[1, 1, 1]], dtype=jnp.int32),
+        "assistant_masks": jnp.array([[0, 1, 1]], dtype=jnp.int32),
+    }
+    processed, _ = DistillationTrainer._preprocess_batch_input(
+        trainer,
+        state=None,
+        batch=batch,
+        is_train=True,
+    )
+
+    assert "assistant_masks" not in processed
+    assert "completion_mask" in processed
+    assert jnp.array_equal(processed["completion_mask"], batch["assistant_masks"])

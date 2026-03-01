@@ -230,6 +230,8 @@ def distillation_step(
 
     teacher_call_kwargs = dict(batch)
     teacher_call_kwargs.pop("labels", None)
+    teacher_call_kwargs.pop("completion_mask", None)
+    teacher_call_kwargs.pop("assistant_masks", None)
     if request_hidden_states:
         teacher_call_kwargs["output_hidden_states"] = True
     if request_attentions:
@@ -256,6 +258,8 @@ def distillation_step(
         module = flax.nnx.merge(student_state.graphdef, tree, student_state.graphother)
         call_kwargs = dict(minibatch)
         call_kwargs.pop("labels", None)
+        call_kwargs.pop("completion_mask", None)
+        call_kwargs.pop("assistant_masks", None)
         # Extract pre-computed teacher outputs from minibatch.
         teacher_logits = jax.lax.stop_gradient(call_kwargs.pop("_teacher_logits"))
         teacher_hidden_stacked = call_kwargs.pop("_teacher_hidden_states", None)

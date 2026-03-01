@@ -187,8 +187,6 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
             precision=precision,
             rngs=rngs,
         )
-        self.rope_deltas = None
-
     def __call__(
         self,
         input_ids: jax.Array | None = None,
@@ -241,6 +239,7 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
                 video_embeds=video_embeds,
             )
 
+        rope_deltas = None
         if position_ids is None:
             if mm_token_type_ids is not None:
                 position_ids, rope_deltas = _get_rope_index_from_mm_token_types(
@@ -258,7 +257,6 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
                     video_grid_thw=video_grid_thw if pixel_values_videos is not None else None,
                     attention_mask=attention_mask,
                 )
-            self.rope_deltas = rope_deltas
 
         position_ids = _maybe_flatten_position_ids_for_text(self.config.text_config, position_ids)
 
@@ -280,7 +278,7 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            rope_deltas=self.rope_deltas,
+            rope_deltas=rope_deltas,
         )
 
 

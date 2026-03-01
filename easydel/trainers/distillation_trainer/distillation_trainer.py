@@ -240,8 +240,12 @@ class DistillationTrainer(Trainer):
         """Normalize completion masks/labels for mixed SFT + pretrain distillation batches."""
         batch, infos = super()._preprocess_batch_input(state=state, batch=batch, is_train=is_train)
 
-        if "assistant_masks" in batch and "completion_mask" not in batch:
-            batch["completion_mask"] = batch["assistant_masks"]
+        if "assistant_masks" in batch:
+            if "completion_mask" not in batch:
+                batch["completion_mask"] = batch["assistant_masks"]
+            # Keep assistant mask only as training-time supervision metadata;
+            # model forwards must not receive this key.
+            batch.pop("assistant_masks", None)
 
         attention_mask = batch.get("attention_mask")
         completion_mask = batch.get("completion_mask")
