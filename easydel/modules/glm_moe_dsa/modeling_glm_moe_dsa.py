@@ -1395,5 +1395,40 @@ class GlmMoeDsaForCausalLM(BaseCausalLMModule[GlmMoeDsaModel, GlmMoeDsaConfig]):
             version=version,
         )
 
+    def create_unified_attention_cache_config(
+        self,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+    ):
+        """Create unified-attention cache configuration for MLA attention.
+
+        GLM-MoE-DSA's effective key width is ``qk_nope_head_dim + qk_rope_head_dim``.
+        The base implementation uses ``config.head_dim`` which is not the MLA KV width.
+        """
+        from easydel.caching import UnifiedAttentionCacheConfig
+
+        text_config = self.config.get_text_config()
+        q_head_dim = self.config.qk_nope_head_dim + self.config.qk_rope_head_dim
+
+        if dtype is None:
+            dtype = text_config.kvdtype
+            if isinstance(dtype, str):
+                dtype = getattr(jnp, dtype, jnp.bfloat16)
+
+        return UnifiedAttentionCacheConfig.create(
+            mesh=self.mesh,
+            partition_manager=text_config.partition_manager,
+            kvdtype=dtype,
+            num_hidden_layers=self.config.num_hidden_layers,
+            num_kv_heads=self.config.num_attention_heads,
+            max_model_length=max_length,
+            head_dim=q_head_dim,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+        )
+
 
 __all__ = ["GlmMoeDsaForCausalLM", "GlmMoeDsaModel"]

@@ -248,7 +248,7 @@ class EngineLifecycleMixin:
                             _n = len(scheduler_output.num_scheduled_tokens) if scheduler_output else 0
                             _now = time.time()
                             if _n > 0 or (_now - _diag_last_log) > 30:
-                                logger.info(
+                                logger.debug(
                                     "loop iter=%d sched=%d run=%d wait=%d",
                                     _diag_iter,
                                     _n,

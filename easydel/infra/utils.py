@@ -1243,12 +1243,24 @@ class AttnMaskType(StrEnum):
     FULL = "ATTN_MASK_FULL"
     SLIDING = "ATTN_MASK_SLIDING"
     CHUNK = "ATTN_MASK_CHUNK"
+    LINEAR = "ATTN_MASK_LINEAR"
 
     @classmethod
-    def from_hf(cls, hf_type: tp.Literal["sliding_attention", "full_attention", "chunk_attention", "chunked_attention"]):
+    def from_hf(
+        cls,
+        hf_type: tp.Literal[
+            "sliding_attention",
+            "full_attention",
+            "chunk_attention",
+            "chunked_attention",
+            "linear_attention",
+        ],
+    ):
         if hf_type == "sliding_attention":
             return AttnMaskType.SLIDING
-        elif hf_type == "full_attention":
+        elif hf_type in ("full_attention", "linear_attention"):
+            # eSurge cache grouping is page-table based; linear attention layers
+            # are treated as full-attention groups for scheduler compatibility.
             return AttnMaskType.FULL
         elif hf_type in ["chunk_attention", "chunked_attention"]:
             return AttnMaskType.CHUNK

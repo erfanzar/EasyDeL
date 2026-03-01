@@ -1,14 +1,18 @@
 """Tests for GLM-MoE-DSA model."""
 
+import jax.numpy as jnp
 import pytest
 import transformers
+from flax import nnx as nn
 
 import easydel as ed
 
 try:
     from .test_utils import CausalLMTester
+    from .test_utils.model_factory import setup_config
 except ImportError:
     from test_utils import CausalLMTester  # pyright: ignore[reportImplicitRelativeImport]
+    from test_utils.model_factory import setup_config  # pyright: ignore[reportImplicitRelativeImport]
 
 
 def _resolve_hf_class(top_level_name: str, module_path: str, class_name: str):
@@ -106,6 +110,35 @@ class TestGLMMoeDSA:
             max_new_tokens=16,
         )
         assert result.success, f"GLM-MoE-DSA generation failed: {result.error_message}"
+
+    def test_unified_cache_config_uses_mla_head_dim(self, glm_moe_dsa_config, small_model_config, monkeypatch):
+        """Unified cache config should use MLA q-head dim, not config.head_dim."""
+        import easydel.caching.unified_attention.cache as unified_cache_mod
+
+        # Keep cache sizing deterministic and tiny during tests.
+        monkeypatch.setattr(unified_cache_mod, "per_device_hbm_budget_bytes", lambda *_args, **_kwargs: 1 << 20)
+
+        glm_moe_dsa_config.moe_force_xla_gmm = True
+        config = setup_config(glm_moe_dsa_config, small_model_config)
+        _, module_class = ed.get_modules_by_type("glm_moe_dsa", ed.TaskType.CAUSAL_LM)
+
+        with config.mesh:
+            model = module_class.lazy_init(
+                config=config,
+                dtype=small_model_config["dtype"],
+                param_dtype=small_model_config["dtype"],
+                precision=small_model_config["precision"],
+                rngs=nn.Rngs(0),
+            )
+            cache_cfg = model.create_unified_attention_cache_config(
+                max_length=small_model_config["max_position_embeddings"],
+                page_size=16,
+                hbm_utilization=0.2,
+                dtype=jnp.float32,
+            )
+
+        assert cache_cfg.head_dim == (config.qk_nope_head_dim + config.qk_rope_head_dim)
+        assert cache_cfg.num_kv_heads == config.num_attention_heads
 
 
 if __name__ == "__main__":

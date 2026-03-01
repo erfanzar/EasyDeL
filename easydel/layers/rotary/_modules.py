@@ -454,14 +454,19 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
 
         cos = cos[:, :, jnp.newaxis, :]
         sin = sin[:, :, jnp.newaxis, :]
+
+        # mRoPE can be partial (e.g. rotary_dim=64 on head_size=256). Align rotary
+        # dimensions with Q/K tensors and keep the non-rotary tail as pass-through.
+        rotary_dim = min(int(cos.shape[-1]), int(query.shape[-1]), int(key.shape[-1]))
+        cos = cos[..., :rotary_dim]
+        sin = sin[..., :rotary_dim]
         if self.repetition_style:
-            rotary_dim = self.rotary_dim
             q_rot = query[..., :rotary_dim]
             k_rot = key[..., :rotary_dim]
 
             q_pass = None
             k_pass = None
-            if rotary_dim < self.head_size:
+            if rotary_dim < query.shape[-1]:
                 q_pass = query[..., rotary_dim:]
                 k_pass = key[..., rotary_dim:]
 
@@ -475,8 +480,16 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
 
             return q_rot.astype(self.dtype), k_rot.astype(self.dtype)
         else:
-            q_embed = (query * cos) + (_rotate_neox(query) * sin)
-            k_embed = (key * cos) + (_rotate_neox(key) * sin)
+            q_rot = query[..., :rotary_dim]
+            k_rot = key[..., :rotary_dim]
+
+            q_embed = (q_rot * cos) + (_rotate_neox(q_rot) * sin)
+            k_embed = (k_rot * cos) + (_rotate_neox(k_rot) * sin)
+
+            if rotary_dim < query.shape[-1]:
+                q_embed = jnp.concatenate([q_embed, query[..., rotary_dim:]], axis=-1)
+                k_embed = jnp.concatenate([k_embed, key[..., rotary_dim:]], axis=-1)
+
             return q_embed.astype(self.dtype), k_embed.astype(self.dtype)
 
 
