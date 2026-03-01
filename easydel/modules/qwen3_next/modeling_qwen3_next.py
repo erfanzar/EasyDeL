@@ -1043,6 +1043,7 @@ class Qwen3NextLinearAttention(nn.Module):
 
         batch_size, seq_len, _ = hidden_states.shape
         is_inference = seq_len == 1 and cache_view is not None
+        expand_ratio = self.num_v_heads // self.num_k_heads
 
         if self.uses_split_proj:
             projected_qkv = self.in_proj_qkv(hidden_states)
@@ -1060,10 +1061,116 @@ class Qwen3NextLinearAttention(nn.Module):
             conv_input = jnp.concatenate([query_flat, key_flat, value_flat], axis=-1)
         # conv_input: [batch, seq_len, conv_dim]
 
+        A = -jnp.exp(self.A_log.value.astype(jnp.float32))
+        alpha_biased = alpha.astype(jnp.float32) + self.dt_bias.value.astype(jnp.float32)
+        decay = A[None, None, :] * jax.nn.softplus(alpha_biased)
+        beta = jax.nn.sigmoid(beta)
+
         conv_state = None
         new_conv_state = None
 
-        if is_inference and cache_view.conv_state is not None:
+        packed_query_start_loc = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
+        packed_num_seqs = getattr(cache_metadata, "num_seqs", None) if cache_metadata is not None else None
+        use_packed_state_updates = (
+            cache_view is not None
+            and cache_view.conv_state is not None
+            and cache_view.recurrent_state is not None
+            and batch_size == 1
+            and packed_query_start_loc is not None
+            and packed_num_seqs is not None
+        )
+
+        if use_packed_state_updates:
+            conv_states = cache_view.conv_state
+            recurrent_states = cache_view.recurrent_state
+
+            query_start_loc = jnp.asarray(packed_query_start_loc, dtype=jnp.int32)
+            num_seqs_arr = jnp.asarray(packed_num_seqs, dtype=jnp.int32).reshape(-1)
+            num_requests = num_seqs_arr[0]
+            max_req_idx = query_start_loc.shape[0] - 1
+            total_tokens = query_start_loc[jnp.clip(num_requests, 0, max_req_idx)]
+
+            token_positions = jnp.arange(seq_len, dtype=jnp.int32)
+            token_slots = jnp.searchsorted(query_start_loc[1:], token_positions, side="right")
+            token_slots = jnp.clip(token_slots, 0, conv_states.shape[0] - 1)
+            token_active = token_positions < total_tokens
+
+            kernel = self.conv1d.kernel.value  # [kernel_size, 1, conv_dim]
+            kernel = jnp.squeeze(kernel, axis=1).T  # [conv_dim, kernel_size]
+
+            token_outputs = jnp.zeros((seq_len, self.num_v_heads, self.head_v_dim), dtype=jnp.float32)
+
+            def _body(idx: int, carry):
+                conv_states_c, recurrent_states_c, token_outputs_c = carry
+                slot = token_slots[idx]
+                is_active = token_active[idx]
+
+                def _update_states(inner_carry):
+                    conv_states_i, recurrent_states_i, token_outputs_i = inner_carry
+
+                    conv_state_i = jax.lax.dynamic_slice_in_dim(conv_states_i, slot, 1, axis=0)
+                    recurrent_state_i = jax.lax.dynamic_slice_in_dim(recurrent_states_i, slot, 1, axis=0)
+                    conv_token = jax.lax.dynamic_slice_in_dim(conv_input, idx, 1, axis=1)[:, 0, :]
+
+                    conv_state_i = jnp.roll(conv_state_i, shift=-1, axis=-1)
+                    conv_state_i = conv_state_i.at[:, :, -1].set(conv_token.astype(conv_state_i.dtype))
+
+                    conv_output_i = jnp.sum(conv_state_i * kernel[None, :, :], axis=-1)
+                    conv_output_i = jax.nn.silu(conv_output_i)[:, None, :]
+
+                    conv_query_i = conv_output_i[:, :, : self.key_dim]
+                    conv_key_i = conv_output_i[:, :, self.key_dim : self.key_dim * 2]
+                    conv_value_i = conv_output_i[:, :, self.key_dim * 2 :]
+
+                    query_i = conv_query_i.reshape(1, 1, self.num_k_heads, self.head_k_dim)
+                    key_i = conv_key_i.reshape(1, 1, self.num_k_heads, self.head_k_dim)
+                    value_i = conv_value_i.reshape(1, 1, self.num_v_heads, self.head_v_dim)
+
+                    if expand_ratio > 1:
+                        query_i = jnp.repeat(query_i, expand_ratio, axis=2)
+                        key_i = jnp.repeat(key_i, expand_ratio, axis=2)
+
+                    beta_i = jax.lax.dynamic_slice_in_dim(beta, idx, 1, axis=1)
+                    decay_i = jax.lax.dynamic_slice_in_dim(decay, idx, 1, axis=1)
+
+                    gdr_output_i: GatedDeltaRuleOutput = self.gdr_op(
+                        query=query_i,
+                        key=key_i,
+                        value=value_i,
+                        beta=beta_i,
+                        decay=decay_i,
+                        conv_state=None,
+                        recurrent_state=recurrent_state_i,
+                    )
+
+                    conv_states_i = jax.lax.dynamic_update_slice_in_dim(conv_states_i, conv_state_i, slot, axis=0)
+                    recurrent_states_i = jax.lax.dynamic_update_slice_in_dim(
+                        recurrent_states_i,
+                        gdr_output_i.recurrent_state.astype(recurrent_states_i.dtype),
+                        slot,
+                        axis=0,
+                    )
+
+                    attn_token = gdr_output_i.attention_outputs[:, 0, :, :].astype(token_outputs_i.dtype)
+                    token_outputs_i = token_outputs_i.at[idx].set(attn_token[0])
+                    return conv_states_i, recurrent_states_i, token_outputs_i
+
+                return jax.lax.cond(is_active, _update_states, lambda x: x, (conv_states_c, recurrent_states_c, token_outputs_c))
+
+            conv_states, recurrent_states, token_outputs = jax.lax.fori_loop(
+                0,
+                seq_len,
+                _body,
+                (conv_states, recurrent_states, token_outputs),
+            )
+
+            output = token_outputs[None, ...]
+            new_cache_view = cache_view.replace(
+                conv_state=conv_states,
+                recurrent_state=recurrent_states,
+            )
+
+        elif is_inference and cache_view.conv_state is not None:
             # Inference mode: use cached conv_state for incremental convolution
             # conv_state shape: [batch, conv_dim, d_conv]
             conv_state = cache_view.conv_state
@@ -1110,6 +1217,17 @@ class Qwen3NextLinearAttention(nn.Module):
                         constant_values=0,
                     )
 
+        if use_packed_state_updates:
+            z_shape_og = z.shape
+            output = output.reshape(-1, output.shape[-1])
+            z_flat = z.reshape(-1, z.shape[-1])
+            output = self.norm(output, z_flat)
+            output = output.reshape(z_shape_og)
+            output = output.reshape(batch_size, seq_len, -1)
+            output = self.out_proj(output)
+
+            return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)
+
         conv_query = conv_output[:, :, : self.key_dim]
         conv_key = conv_output[:, :, self.key_dim : self.key_dim * 2]
         conv_value = conv_output[:, :, self.key_dim * 2 :]
@@ -1118,32 +1236,26 @@ class Qwen3NextLinearAttention(nn.Module):
         key = conv_key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         value = conv_value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
-        expand_ratio = self.num_v_heads // self.num_k_heads
         if expand_ratio > 1:
             query = jnp.repeat(query, expand_ratio, axis=2)
             key = jnp.repeat(key, expand_ratio, axis=2)
-
-        A = -jnp.exp(self.A_log.value.astype(jnp.float32))
-        alpha_biased = alpha.astype(jnp.float32) + self.dt_bias.value.astype(jnp.float32)
-        decay = A[None, None, :] * jax.nn.softplus(alpha_biased)
-
-        beta = jax.nn.sigmoid(beta)
 
         recurrent_state = None
         if cache_view is not None and cache_view.recurrent_state is not None:
             recurrent_state = cache_view.recurrent_state
 
-        gdr_output: GatedDeltaRuleOutput = self.gdr_op(
-            query=query,
-            key=key,
-            value=value,
-            beta=beta,
-            decay=decay,
-            conv_state=None,  # conv_state is handled separately above
-            recurrent_state=recurrent_state,
-        )
+        if not use_packed_state_updates:
+            gdr_output: GatedDeltaRuleOutput = self.gdr_op(
+                query=query,
+                key=key,
+                value=value,
+                beta=beta,
+                decay=decay,
+                conv_state=None,  # conv_state is handled separately above
+                recurrent_state=recurrent_state,
+            )
 
-        output = gdr_output.attention_outputs
+            output = gdr_output.attention_outputs
 
         z_shape_og = z.shape
         output = output.reshape(-1, output.shape[-1])
@@ -1155,7 +1267,7 @@ class Qwen3NextLinearAttention(nn.Module):
         output = self.out_proj(output)
 
         new_cache_view = cache_view
-        if cache_view is not None:
+        if cache_view is not None and not use_packed_state_updates:
             new_cache_view = cache_view.replace(
                 conv_state=new_conv_state if new_conv_state is not None else cache_view.conv_state,
                 recurrent_state=gdr_output.recurrent_state,

@@ -820,15 +820,23 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.sharding_axis_dims = getattr(self, "sharding_axis_dims", sharding_axis_dims)
         self.sharding_dcn_axis_dims = getattr(self, "sharding_dcn_axis_dims", sharding_dcn_axis_dims)
         self.sharding_axis_names = getattr(self, "sharding_axis_names", sharding_axis_names)
-        self.backend = getattr(
-            self,
-            "backend",
-            backend if backend is not None else jax.default_backend(),
-        )
+
+        if backend is not None:
+            resolved_backend: str = backend
+        else:
+            try:
+                resolved_backend = jax.default_backend()
+            except Exception as err:
+                logger.warning(
+                    f"Unable to resolve JAX default backend ({err}); falling back to 'cpu' for config init."
+                )
+                resolved_backend = "cpu"
+
+        self.backend = getattr(self, "backend", resolved_backend)
         self.platform = getattr(
             self,
             "platform",
-            platform if platform is not None else ("triton" if jax.default_backend() == "gpu" else "jax"),
+            platform if platform is not None else ("triton" if resolved_backend == "gpu" else "jax"),
         )
 
         self.easy_method = getattr(self, "easy_method", easy_method)
@@ -973,8 +981,29 @@ class EasyDeLBaseConfig(PretrainedConfig):
         if eformer_craft_mesh is None:
             eformer_craft_mesh = check_bool_flag("EFORMER_CREATE_MESH", True)
 
+        axis_dims = tuple(int(v) for v in sharding_axis_dims)
+        try:
+            available_devices = jax.device_count(backend)
+        except Exception:
+            available_devices = None
+
+        if available_devices == 1:
+            known_product = 1
+            for dim in axis_dims:
+                if dim != -1:
+                    known_product *= dim
+            if known_product > 1:
+                normalized_axis_dims = tuple(-1 if dim == -1 else 1 for dim in axis_dims)
+                logger.warning(
+                    "Single-device runtime detected with multi-device sharding axis_dims=%s; "
+                    "normalizing to %s.",
+                    axis_dims,
+                    normalized_axis_dims,
+                )
+                axis_dims = normalized_axis_dims
+
         mesh = create_mesh(
-            axis_dims=sharding_axis_dims,
+            axis_dims=axis_dims,
             axis_names=sharding_axis_names,
             dcn_mesh_dims=sharding_dcn_axis_dims,
             should_sort_granules_by_key=should_sort_granules_by_key,

@@ -191,6 +191,18 @@ def _safepick(config, pickname):  # pyright: ignore[reportUnusedFunction]
     return vari
 
 
+def _resolve_backend_for_esurge(config: EasyDeLBaseConfig) -> str:
+    """Resolve backend safely for eSurge helpers when runtime backend probing fails."""
+    try:
+        return jax.default_backend()
+    except Exception as err:
+        cfg_backend = getattr(config, "backend", None)
+        if cfg_backend is not None:
+            return cfg_backend
+        logger.warning(f"Unable to resolve JAX backend ({err}); defaulting to 'cpu' for eSurge compatibility.")
+        return "cpu"
+
+
 class EasyGenerationMixin:
     """Mixin class providing text generation capabilities for EasyDeL models.
 
@@ -2903,7 +2915,8 @@ class EasyGenerationMixin:
         eSurge requires models to use paged attention mechanisms compatible with its
         continuous-batching KV cache (ragged v2/v3 or unified attention).
         If the current model uses a different attention mechanism, this property
-        creates a new graph definition with ragged_page_attention_v3.
+        creates a new graph definition with a backend-compatible mechanism
+        (ragged v3 on TPU/CPU-like backends, unified attention on GPU).
 
         Returns:
             nn.GraphDef: Graph definition with eSurge-compatible attention mechanism.
@@ -2917,13 +2930,26 @@ class EasyGenerationMixin:
             >>> # Use gdef for creating eSurge-compatible model instances
         """
         gdef = self.graphdef
-        if self.config.attn_mechanism not in [
-            "ragged_page_attention_v2",
-            "ragged_page_attention_v3",
-            "unified_attention",
-            "paged_flash_attention",
-        ]:
-            gdef = self.new_graphdef(attn_mechanism="ragged_page_attention_v3", recursive_update=True)
+        backend = _resolve_backend_for_esurge(self.config)
+        attn_mechanism = self.config.attn_mechanism
+        if backend == "tpu":
+            compatible = attn_mechanism in ["ragged_page_attention_v2", "ragged_page_attention_v3"]
+            target_attn = "ragged_page_attention_v3"
+        elif backend == "gpu":
+            compatible = attn_mechanism in [
+                "ragged_page_attention_v2",
+                "ragged_page_attention_v3",
+                "unified_attention",
+                "paged_flash_attention",
+            ]
+            target_attn = "unified_attention"
+        else:
+            # Unified/paged-flash kernels are not available on non-GPU backends.
+            compatible = attn_mechanism in ["ragged_page_attention_v2", "ragged_page_attention_v3"]
+            target_attn = "ragged_page_attention_v3"
+
+        if not compatible:
+            gdef = self.new_graphdef(attn_mechanism=target_attn, recursive_update=True)
         return gdef
 
     @property
@@ -2933,15 +2959,16 @@ class EasyGenerationMixin:
         eSurge requires models to use paged attention mechanisms compatible with its
         continuous-batching KV cache (ragged v2/v3 or unified attention).
         If the current model uses a different attention mechanism, this property
-        returns a new model instance with ragged_page_attention_v3 while preserving
-        all parameters and state.
+        returns a new model instance with a backend-compatible mechanism while
+        preserving all parameters and state.
 
         Returns:
             Self: Model instance with eSurge-compatible attention mechanism.
 
         Note:
             If the model already uses a compatible attention mechanism, returns self.
-            Otherwise, builds a new graph definition with ragged_page_attention_v3 and
+            Otherwise, builds a new graph definition with a backend-compatible
+            mechanism and
             merges the existing parameters/state, leaving the original model unchanged.
 
         Example:
@@ -2950,18 +2977,28 @@ class EasyGenerationMixin:
             >>> # Now safe to use with eSurge inference
             >>> outputs = esurge_model.esurge_generate("Hello world")
         """
-        if self.config.attn_mechanism in [
-            "ragged_page_attention_v2",
-            "ragged_page_attention_v3",
-            "unified_attention",
-            "paged_flash_attention",
-        ]:
+        backend = _resolve_backend_for_esurge(self.config)
+        attn_mechanism = self.config.attn_mechanism
+
+        if backend == "tpu":
+            compatible = attn_mechanism in ["ragged_page_attention_v2", "ragged_page_attention_v3"]
+            target_attn = "ragged_page_attention_v3"
+        elif backend == "gpu":
+            compatible = attn_mechanism in [
+                "ragged_page_attention_v2",
+                "ragged_page_attention_v3",
+                "unified_attention",
+                "paged_flash_attention",
+            ]
+            target_attn = "unified_attention"
+        else:
+            compatible = attn_mechanism in ["ragged_page_attention_v2", "ragged_page_attention_v3"]
+            target_attn = "ragged_page_attention_v3"
+
+        if compatible:
             return self
 
-        if jax.default_backend() == "tpu":
-            compat_graphdef = self.new_graphdef(attn_mechanism="ragged_page_attention_v3")
-        else:
-            compat_graphdef = self.new_graphdef(attn_mechanism="unified_attention")
+        compat_graphdef = self.new_graphdef(attn_mechanism=target_attn, recursive_update=True)
 
         return self.merge_module(compat_graphdef, self.graphstate, self.graphother)
 
