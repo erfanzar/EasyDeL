@@ -1443,7 +1443,7 @@ class EasyDeLState(struct.PyTreeNode):
             - :meth:`shard_optimizer_state`: Shard only optimizer state.
             - :meth:`gather_state`: Reverse operation to gather state.
         """
-        from eformer.escale import make_shard_and_gather_fns, match_partition_rules
+        from eformer.escale import match_partition_rules
 
         rules = partition_rules or self.model._get_partition_rules(None)
         mesh = mesh or self.model._get_mesh(None)
@@ -1458,8 +1458,25 @@ class EasyDeLState(struct.PyTreeNode):
             )
             if adjusted:
                 logger.warning("Adjusted %d non-divisible sharding specs before shard_state.", adjusted)
-            shard_fns, _ = make_shard_and_gather_fns(partition_specs, mesh)
-            return jax.tree_util.tree_map(lambda f, o: f(o), shard_fns, tree)
+            # Use explicit device_put with corrected NamedShardings. This ensures
+            # replicated specs (PartitionSpec()) are still concretely placed across
+            # the mesh, including scalar leaves such as RNG counters.
+            with mesh:
+                named_shardings = jax.tree_util.tree_map(
+                    lambda spec, shape_obj: (
+                        es.get_corrected_named_sharding(tuple(shape_obj.shape), spec)
+                        if isinstance(spec, PartitionSpec) and hasattr(shape_obj, "shape")
+                        else None
+                    ),
+                    partition_specs,
+                    tree,
+                )
+            return jax.tree_util.tree_map(
+                lambda sharding, leaf: jax.device_put(leaf, sharding) if sharding is not None else leaf,
+                named_shardings,
+                tree,
+                is_leaf=lambda x: x is None,
+            )
 
         state_for_shard = self.replace(graphother=materialize_meta_leaves(self.graphother, seed=42))
         return appy_sharding_on_tree(state_for_shard)

@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import optax
 import pytest
 from flax import nnx as nn
+from jax.sharding import NamedSharding, PartitionSpec
 
 import easydel as ed
 import easydel.infra.base_state as base_state_module
@@ -49,6 +50,26 @@ def test_state_gather_paths_handle_graphother_tree(tiny_sharded_llama):
     assert isinstance(gathered_model_state, EasyDeLState)
     gathered_state = state.gather_state()
     assert isinstance(gathered_state, EasyDeLState)
+
+
+def test_shard_state_places_rng_count_with_explicit_named_sharding(tiny_sharded_llama):
+    state = EasyDeLState.create(model=tiny_sharded_llama).shard_state()
+    flat, _ = jax.tree_util.tree_flatten_with_path(state)
+    rng_count_leaf = None
+
+    def _path_to_str(path):
+        return "/".join(str(getattr(k, "name", getattr(k, "idx", getattr(k, "key", k)))) for k in path)
+
+    for path, leaf in flat:
+        path_str = _path_to_str(path)
+        if "graphother" in path_str and "rngs" in path_str and "count" in path_str and "value" in path_str:
+            rng_count_leaf = leaf
+            break
+
+    assert rng_count_leaf is not None, "Expected RNG count leaf in graphother tree."
+    sharding = getattr(rng_count_leaf, "sharding", None)
+    assert isinstance(sharding, NamedSharding)
+    assert sharding.spec == PartitionSpec()
 
 
 def test_optimizer_gather_works_without_mesh_context_and_create_validation(tiny_sharded_llama):

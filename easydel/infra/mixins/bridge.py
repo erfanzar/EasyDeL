@@ -2232,13 +2232,7 @@ class EasyBridgeMixin(PushToHubMixin):
         )
 
         required_params = set(flatten_dict(model.graphtree_params_shape))
-        if partition_rules is None:
-            try:
-                partition_rules = ed_config.get_partition_rules(True)
-            except Exception:
-                partition_rules = None
-        if partition_rules is None:
-            partition_rules = model.resolve_shardings_automatically()
+        partition_rules = model._get_partition_rules(partition_rules)
         spec_map: dict[tuple, PartitionSpec] = {}
         if partition_rules is not None:
             try:

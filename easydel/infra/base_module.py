@@ -80,7 +80,6 @@ import flax.nnx
 import flax.struct
 import jax
 import jax.tree_util
-from eformer.common_types import Replicated
 from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 from eformer.loggings import get_logger
 from flax import nnx as nn
@@ -1272,7 +1271,9 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             seen.add(key)
             rules.append((generalized, spec))
 
-        rules.append((".*", _resolve_spec(Replicated)))
+        # Explicit catch-all replication for any unmatched leaf path.
+        # Use empty PartitionSpec() to avoid rank-dependent ambiguity.
+        rules.append((".*", PartitionSpec()))
 
         return tuple(rules)
 
@@ -1955,9 +1956,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
         rng = kwargs.get("rngs", flax.nnx.Rngs(44))
         lazy_model = cls.lazy_init(**kwargs)
-        partition_rules = lazy_model.config.get_partition_rules()
-        if partition_rules is None:
-            partition_rules = lazy_model.resolve_shardings_automatically()
+        partition_rules = lazy_model._get_partition_rules(None)
         for path, module in iter_module_search(lazy_model, (flax.nnx.Module, ArrayParam)):
             if not path:
                 continue
