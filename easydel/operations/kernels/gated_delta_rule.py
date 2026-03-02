@@ -275,7 +275,7 @@ def _chunk_gated_delta_rule_fwd(
     # XLA to parallelize exp across all chunks at once.
     g_cumsum_exp = jnp.exp(g_cumsum).astype(input_dtype)  # (B, H, C, cs)
     g_end = g_cumsum[:, :, :, -1]  # (B, H, C)
-    g_end_exp = jnp.exp(g_end)  # (B, H, C) f32 for state decay precision
+    g_end_exp = jnp.exp(g_end).astype(input_dtype)  # (B, H, C)
     g_diff_state_exp = jnp.exp(g_end[:, :, :, None] - g_cumsum).astype(input_dtype)
 
     value_local = jnp.einsum("bhcij,bhcjv->bhciv", attn, v_beta, precision=_MATMUL_PRECISION)
@@ -283,9 +283,9 @@ def _chunk_gated_delta_rule_fwd(
     k_cumdecay = jnp.einsum("bhcij,bhcjk->bhcik", attn, k_beta_scaled, precision=_MATMUL_PRECISION)
 
     if initial_state is None:
-        initial_state = jnp.zeros((B, H, K_dim, V_dim), dtype=jnp.float32)
+        initial_state = jnp.zeros((B, H, K_dim, V_dim), dtype=input_dtype)
     else:
-        initial_state = initial_state.astype(jnp.float32)
+        initial_state = initial_state.astype(input_dtype)
 
     mask_triu_inner = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=bool), k=1)
 
@@ -603,11 +603,11 @@ class GatedDeltaRuleOp(OperationImpl):
                     B, H = query.shape[0], query.shape[1]
                     K_dim, V_dim = query.shape[-1], value.shape[-1]
                     if decay is None:
-                        decay = jnp.zeros((B, H, seq_len), dtype=jnp.float32)
+                        decay = jnp.zeros((B, H, seq_len), dtype=runtime_dtype)
                     if recurrent_state is None:
                         recurrent_state = jnp.zeros(
                             (B, H, K_dim, V_dim),
-                            dtype=jnp.float32,
+                            dtype=runtime_dtype,
                         )
 
                     def _gdr_kernel(q, k, v, b, d, s):
