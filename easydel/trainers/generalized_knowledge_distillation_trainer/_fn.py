@@ -17,7 +17,6 @@ from __future__ import annotations
 import collections.abc
 import typing as tp
 
-import flax
 import jax
 from eformer.escale import with_sharding_constraint
 from jax import numpy as jnp
@@ -178,7 +177,7 @@ def gkd_step(
     def loss_fn(tree, minibatch):
         if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
-        module = flax.nnx.merge(student_state.graphdef, tree, student_state.graphother)
+        module = student_state.merge(tree)
         call_kwargs = dict(minibatch)
         labels = call_kwargs.pop("labels", None)
         call_kwargs.pop("completion_mask", None)

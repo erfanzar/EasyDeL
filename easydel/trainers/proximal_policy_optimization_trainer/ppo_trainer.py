@@ -217,6 +217,10 @@ class PPOTrainer(Trainer):
                     )
                     def apply_fn(gd, gs, gt, batch):
                         batch = with_sharding_constraint(arr=batch, sharding=self.arguments.step_partition_spec)
+                        gt = jax.tree_util.tree_map(
+                            lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
+                            gt,
+                        )
                         module = nn.merge(gd, gs, gt)
                         call_kwargs = filter_kwargs_for_callable(module.__call__, batch)
                         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
@@ -456,6 +460,10 @@ class PPOTrainer(Trainer):
         )
 
         def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef):
+            graphother = jax.tree_util.tree_map(
+                lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
+                graphother,
+            )
             apply = flax.nnx.merge(graphdef, graphtree, graphother)
             with apply.mesh:
                 ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
@@ -482,6 +490,10 @@ class PPOTrainer(Trainer):
         )
 
         def _compute_rollout_logps_values(graphtree, graphother, ids, mask, graphdef):
+            graphother = jax.tree_util.tree_map(
+                lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
+                graphother,
+            )
             apply = flax.nnx.merge(graphdef, graphtree, graphother)
             with apply.mesh:
                 ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)

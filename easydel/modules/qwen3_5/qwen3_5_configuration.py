@@ -14,6 +14,7 @@
 
 """Configuration for Qwen3.5 text and multimodal models."""
 
+import importlib.util
 import typing
 from collections.abc import Mapping
 
@@ -49,6 +50,11 @@ def _normalize_rope_scaling_for_mrope(rope_scaling: dict | None) -> dict | None:
             normalized["rope_type"] = target_rope_type
             normalized["type"] = target_rope_type
     return normalized
+
+
+def _has_hf_qwen3_5_text_impl() -> bool:
+    """Whether the installed transformers version exposes Qwen3.5 text classes."""
+    return importlib.util.find_spec("transformers.models.qwen3_5.modeling_qwen3_5") is not None
 
 
 @register_config("qwen3_5_text")
@@ -157,6 +163,7 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         output_router_logits: bool = False,
         router_aux_loss_coef: float = 0.001,
         mlp_only_layers: list[int] | None = None,
+        linear_attention_separate_proj: bool | None = None,
         **kwargs,
     ):
         rope_scaling = _normalize_rope_scaling_for_mrope(rope_scaling or rope_parameters)
@@ -206,9 +213,13 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
             mlp_only_layers=mlp_only_layers,
             **kwargs,
         )
-        # Qwen3.5 linear attention uses split projections in HF:
-        # in_proj_qkv, in_proj_z, in_proj_b, in_proj_a.
-        self.linear_attention_separate_proj = True
+        # Prefer split projections when native HF Qwen3.5 exists. In older HF
+        # installs that only expose Qwen3Next fallback classes, keep packed
+        # projections to match checkpoint parameter names.
+        if linear_attention_separate_proj is None:
+            self.linear_attention_separate_proj = _has_hf_qwen3_5_text_impl()
+        else:
+            self.linear_attention_separate_proj = bool(linear_attention_separate_proj)
         # Mirror HF naming for rope config interop.
         self.rope_parameters = rope_scaling
 

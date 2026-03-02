@@ -20,6 +20,9 @@ __version__ = "0.3.0"
 import os as _os
 import sys as _sys
 import typing as _tp
+import types as _types
+from importlib import machinery as _machinery
+from importlib import util as _importlib_util
 from logging import getLogger as _getlogger
 
 try:
@@ -38,6 +41,33 @@ from .utils import check_bool_flag as _check_bool_flag
 from .utils import is_package_available as _is_package_available
 
 _logger = _get_logger("EasyDeL")
+
+
+def _ensure_optional_deepspeed_stub() -> None:
+    """Provide a minimal deepspeed module for remote-code import checks.
+
+    Some HF Hub remote modules import `deepspeed` unconditionally even when
+    they can run without it. In environments where deepspeed is unavailable,
+    this keeps class loading functional without pretending the full package is
+    installed (`transformers.integrations.deepspeed.is_deepspeed_available()`
+    still returns `False` because distribution metadata is absent).
+    """
+    try:
+        if _importlib_util.find_spec("deepspeed") is not None:
+            return
+    except (ModuleNotFoundError, ValueError):
+        return
+
+    if "deepspeed" in _sys.modules:
+        return
+
+    _stub = _types.ModuleType("deepspeed")
+    _stub.__version__ = "0.0.0"
+    _stub.__spec__ = _machinery.ModuleSpec(name="deepspeed", loader=None)
+    _sys.modules["deepspeed"] = _stub
+
+
+_ensure_optional_deepspeed_stub()
 
 
 def _patch_transformers_import_utils() -> None:

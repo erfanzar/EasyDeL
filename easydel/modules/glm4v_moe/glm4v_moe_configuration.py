@@ -33,12 +33,38 @@ def _patch_hf_glm4v_moe_router_logits_output() -> None:
         output_cls.router_logits = None
 
     causal_lm_cls = getattr(hf_glm4v_moe, "Glm4vMoeForConditionalGeneration", None)
-    if causal_lm_cls is not None and not hasattr(causal_lm_cls, "num_experts"):
-        causal_lm_cls.num_experts = property(lambda self: getattr(self.config.text_config, "n_routed_experts", 0))
-    if causal_lm_cls is not None and not hasattr(causal_lm_cls, "num_experts_per_tok"):
-        causal_lm_cls.num_experts_per_tok = property(
-            lambda self: getattr(self.config.text_config, "num_experts_per_tok", 0)
-        )
+    if causal_lm_cls is not None:
+        num_experts_attr = getattr(causal_lm_cls, "num_experts", None)
+        if num_experts_attr is None or (isinstance(num_experts_attr, property) and num_experts_attr.fset is None):
+            # Newer HF versions assign these attributes during __init__. Use a
+            # settable property so legacy compatibility patching does not block assignment.
+            def _get_num_experts(self):
+                return getattr(
+                    self,
+                    "_easydel_num_experts",
+                    getattr(self.config.text_config, "n_routed_experts", 0),
+                )
+
+            def _set_num_experts(self, value):
+                self._easydel_num_experts = value
+
+            causal_lm_cls.num_experts = property(_get_num_experts, _set_num_experts)
+
+        num_experts_per_tok_attr = getattr(causal_lm_cls, "num_experts_per_tok", None)
+        if num_experts_per_tok_attr is None or (
+            isinstance(num_experts_per_tok_attr, property) and num_experts_per_tok_attr.fset is None
+        ):
+            def _get_num_experts_per_tok(self):
+                return getattr(
+                    self,
+                    "_easydel_num_experts_per_tok",
+                    getattr(self.config.text_config, "num_experts_per_tok", 0),
+                )
+
+            def _set_num_experts_per_tok(self, value):
+                self._easydel_num_experts_per_tok = value
+
+            causal_lm_cls.num_experts_per_tok = property(_get_num_experts_per_tok, _set_num_experts_per_tok)
 
     load_balancing_loss_func = getattr(hf_glm4v_moe, "load_balancing_loss_func", None)
     if load_balancing_loss_func is not None and not getattr(

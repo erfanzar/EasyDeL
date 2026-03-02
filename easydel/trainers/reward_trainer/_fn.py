@@ -34,8 +34,6 @@ All functions are JAX-compatible and support distributed training through shardi
 import collections.abc
 import typing as tp
 
-import flax
-import flax.nnx
 import jax
 import optax  # pyright: ignore[reportMissingTypeStubs]
 from eformer.escale import with_sharding_constraint
@@ -221,7 +219,7 @@ def evaluation_step(
         """
 
         # Merge the state with the provided tree update.
-        module = flax.nnx.merge(state.graphdef, tree, state.graphother)
+        module = state.merge(tree)
 
         rewards_chosen = module(
             input_ids=batch["input_ids_chosen"],

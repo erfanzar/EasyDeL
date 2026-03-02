@@ -740,16 +740,22 @@ def auto_remat(
     outs = ()
     for module in modules:
         assert issubclass(module, nn.Module)
+        if getattr(module.__call__, "_easydel_auto_remat_wrapped", False):
+            outs += (module,)
+            continue
+
         static_argnums = extract_static_parameters(module=module)
         if static_argnums is None:
             static_argnums = ()
 
-        module.__call__ = nn.remat(
+        rematted_call = nn.remat(
             f=module.__call__,
             prevent_cse=prevent_cse,
             static_argnums=static_argnums,
             policy=policy,
         )
+        setattr(rematted_call, "_easydel_auto_remat_wrapped", True)  # noqa
+        module.__call__ = rematted_call
 
         outs += (module,)
 

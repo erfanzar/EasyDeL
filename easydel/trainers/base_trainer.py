@@ -3113,7 +3113,7 @@ class BaseTrainer(BaseTrainerProtocol):
             elif isinstance(run_exception, StopIteration):
                 ...  # simply just pass
             else:
-                raise RuntimeError("EasyDeL Runtime dumped") from run_exception
+                raise RuntimeError(f"EasyDeL Runtime dumped due to {run_exception!s}") from run_exception
         checkpoint_path = "SAVING_SKIPPED"
         filename = None
 

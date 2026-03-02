@@ -35,7 +35,7 @@ dependencies = [
 	"eformer==0.0.98",
 	"ejkernel==0.0.67",
 	"einops~=0.8.0",
-	"transformers~=5.0.0",
+	"transformers~=5.2.0",
 	"sentencepiece>=0.2.0",
 	"flax==0.12.3",
 	"fastapi>=0.115.2",

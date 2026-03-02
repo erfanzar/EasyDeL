@@ -23,6 +23,18 @@ from easydel.infra.factory import register_config
 logger = get_logger(__name__)
 
 
+def _ensure_loss_tensor(result, gate_logits):
+    """Wrap a plain Python numeric loss in a torch tensor on the right device."""
+    if isinstance(result, (int, float)):
+        import torch
+
+        compute_device = None
+        if isinstance(gate_logits, tuple) and len(gate_logits) > 0:
+            compute_device = gate_logits[0].device
+        return torch.tensor(float(result), device=compute_device)
+    return result
+
+
 def _patch_hf_qwen3_next_load_balancing_loss() -> None:
     """HF compatibility: guard Qwen3-Next aux-loss mask shape regressions."""
     try:
@@ -41,22 +53,24 @@ def _patch_hf_qwen3_next_load_balancing_loss() -> None:
         attention_mask=None,
     ):
         try:
-            return original_fn(
+            result = original_fn(
                 gate_logits=gate_logits,
                 num_experts=num_experts,
                 top_k=top_k,
                 attention_mask=attention_mask,
             )
+            return _ensure_loss_tensor(result, gate_logits)
         except RuntimeError:
             # Some HF snapshots compute an invalid expert attention mask shape for
             # small synthetic tests. Fall back to the unmasked aux-loss path.
             try:
-                return original_fn(
+                result = original_fn(
                     gate_logits=gate_logits,
                     num_experts=num_experts,
                     top_k=top_k,
                     attention_mask=None,
                 )
+                return _ensure_loss_tensor(result, gate_logits)
             except RuntimeError:
                 import torch
 
@@ -67,6 +81,22 @@ def _patch_hf_qwen3_next_load_balancing_loss() -> None:
 
     _patched_load_balancing_loss_func._easydel_qwen3_next_lb_patch = True  # type: ignore[attr-defined]
     hf_qwen3_next.load_balancing_loss_func = _patched_load_balancing_loss_func
+
+    dynamic_cache_cls = getattr(hf_qwen3_next, "Qwen3NextDynamicCache", None)
+    if dynamic_cache_cls is not None:
+        original_get_seq_length = getattr(dynamic_cache_cls, "get_seq_length", None)
+        if (
+            original_get_seq_length is not None
+            and not getattr(original_get_seq_length, "_easydel_qwen3_next_cache_patch", False)
+        ):
+
+            def _patched_get_seq_length(self, layer_idx: int | None = 0) -> int:  # type: ignore[override]
+                if not getattr(self, "transformer_layers", None):
+                    return 0
+                return original_get_seq_length(self, layer_idx)
+
+            _patched_get_seq_length._easydel_qwen3_next_cache_patch = True  # type: ignore[attr-defined]
+            dynamic_cache_cls.get_seq_length = _patched_get_seq_length
 
 
 _patch_hf_qwen3_next_load_balancing_loss()

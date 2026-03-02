@@ -69,9 +69,13 @@ class FalconH1Config(EasyDeLBaseConfig):
         mamba_proj_bias: bool = False,
         mamba_norm_before_gate: bool = True,
         mamba_rms_norm: bool = False,
+        time_step_min: float = 0.001,
+        time_step_max: float = 0.1,
+        time_step_limit: tuple[float, float] | None = (0.0, float("inf")),
         # Shared projection biases
         projectors_bias: bool = False,
         # RoPE
+        rope_parameters: dict | None = None,
         rope_theta: float = 100_000.0,
         rope_scaling: dict[str, str | float] | None = None,
         # MuP multipliers and scaling knobs
@@ -135,10 +139,14 @@ class FalconH1Config(EasyDeLBaseConfig):
         self.mamba_proj_bias = mamba_proj_bias
         self.mamba_norm_before_gate = mamba_norm_before_gate
         self.mamba_rms_norm = mamba_rms_norm
+        self.time_step_min = time_step_min
+        self.time_step_max = time_step_max
+        self.time_step_limit = tuple(time_step_limit) if time_step_limit is not None else None
 
         self.lm_head_multiplier = lm_head_multiplier
         self.embedding_multiplier = embedding_multiplier
 
+        self.rope_parameters = rope_parameters
         self.mlp_multipliers = mlp_multipliers if mlp_multipliers is not None else [1.0, 1.0]
         self.attention_out_multiplier = attention_out_multiplier if attention_out_multiplier is not None else 1.0
         self.attention_in_multiplier = attention_in_multiplier if attention_in_multiplier is not None else 1.0

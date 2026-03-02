@@ -708,15 +708,30 @@ class Qwen3NextFullAttention(UnifiedAttention):
         sequence_length = hidden_states.shape[1]
 
         q_proj_output = checkpoint_name(self.q_proj(hidden_states), "attn_query")
+        q_proj_output = apply_logical_sharding(
+            q_proj_output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
 
-        q_proj_output = q_proj_output.reshape(batch_size, sequence_length, self.num_heads, self.head_dim * 2)
+        q_proj_output = q_proj_output.reshape(batch_size, sequence_length, -1, self.head_dim * 2)
         query_states, gate = jnp.split(q_proj_output, 2, axis=-1)
 
         key_states = checkpoint_name(self.k_proj(hidden_states), "attn_key")
         value_states = checkpoint_name(self.v_proj(hidden_states), "attn_value")
+        key_states = apply_logical_sharding(
+            key_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        value_states = apply_logical_sharding(
+            value_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
 
-        key_states = key_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
-        value_states = value_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim)
+        key_states = key_states.reshape(batch_size, sequence_length, -1, self.head_dim)
+        value_states = value_states.reshape(batch_size, sequence_length, -1, self.head_dim)
 
         query_states, key_states, value_states = self._postprocess_qkv(query_states, key_states, value_states)
 
@@ -763,6 +778,16 @@ class Qwen3NextFullAttention(UnifiedAttention):
             cache_view = attentions.cache_view
 
         attn_output = attentions.attention_outputs
+
+        # Re-apply QKV sharding so attn_output matches the gate's partition
+        # (which retains "sp" on the sequence axis from HiddenStateSharding).
+        # Without this, blocksparse's shard_map strips "sp" from the sequence
+        # dimension, causing GSPMD to insert f32 all-gathers during backward.
+        attn_output = apply_logical_sharding(
+            attn_output,
+            dynamic_axes=common_types.AttnQSharding,
+            partition_manager=self.config.partition_manager,
+        )
 
         attn_output = attn_output * jax.nn.sigmoid(gate)
 
