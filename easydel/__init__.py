@@ -200,11 +200,7 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _os.environ["TPU_LOG_DIR"] = "disabled"
     _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-    _os.environ["JAX_ENABLE_PGLE"] = "true"
-    _os.environ["JAX_CAPTURED_CONSTANTS_WARN_BYTES"] = "-1"
 
-    _os.environ["JAX_PGLE_PROFILING_RUNS"] = "3"
-    _os.environ["JAX_PGLE_AGGREGATION_PERCENTILE"] = "85"
     _os.environ["XLA_FLAGS"] = (
         _os.getenv("XLA_FLAGS", "") + " "
         "--xla_gpu_triton_gemm_any=true  "
@@ -1213,7 +1209,7 @@ else:
     )
 
     _targeted_eformer_versions = ["0.0.98"]
-    _targeted_ejkernel_versions = ["0.0.66"]
+    _targeted_ejkernel_versions = ["0.0.67"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version
