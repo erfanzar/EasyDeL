@@ -43,11 +43,14 @@ References:
     - Qwen3Next: https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_next/
 """
 
+import math
+
 import jax
 import jax.numpy as jnp
 from eformer.escale import with_sharding_constraint
 from eformer.pytree import auto_pytree
 from jax import lax
+from jax.sharding import PartitionSpec as Ps
 from jaxtyping import Array, Float
 
 from easydel.caching import RecurrentCacheView
@@ -206,10 +209,10 @@ def _chunk_gated_delta_rule_fwd(
         query = l2norm(query, axis=-1, eps=1e-6)
         key = l2norm(key, axis=-1, eps=1e-6)
 
-    query = query.astype(jnp.float32)
-    key = key.astype(jnp.float32)
-    value = value.astype(jnp.float32)
-    beta = beta.astype(jnp.float32)
+    # Keep query/key/value/beta in input dtype to reduce memory footprint.
+    # Only decay needs f32 for exp/cumsum numerical stability.
+    # Matmuls use lax.Precision.HIGHEST for f32 accumulation internally.
+    input_dtype = query.dtype
 
     if decay is None:
         decay = jnp.zeros((B, H, L), dtype=jnp.float32)
@@ -250,34 +253,35 @@ def _chunk_gated_delta_rule_fwd(
     decay_mask = jnp.tril(decay_mask)
 
     attn = jnp.einsum("bhcik,bhcjk->bhcij", k_beta, key, precision=_MATMUL_PRECISION)
-    attn = -(attn * decay_mask)
+    # Multiply by f32 decay_mask then immediately cast to input dtype.
+    attn = -(attn * decay_mask).astype(input_dtype)
     attn = jnp.where(mask_triu, 0.0, attn)
 
-    def resolve_intra_chunk_row(attn_chunk, i):
-        row = attn_chunk[i, :]
-        idx = jnp.arange(chunk_size)
-        mask_lt_i = idx < i
-        contribution = jnp.sum(row[:, None] * attn_chunk * mask_lt_i[:, None] * mask_lt_i[None, :], axis=0)
+    # Resolve (I - A)^{-1} via Neumann series with repeated squaring.
+    # A = attn is strictly lower triangular -> A^n = 0, so the series terminates:
+    #   (I - A)^{-1} = I + A + A^2 + ... + A^{n-1}
+    # Uses O(log n) parallel batched matmuls instead of O(n) sequential scan,
+    # eliminating the massive scan carry tensor entirely.
+    eye = jnp.eye(chunk_size, dtype=input_dtype)
+    M = eye + attn
+    P = attn
+    for _ in range(math.ceil(math.log2(max(chunk_size, 2))) - 1):
+        P = jnp.einsum("...ij,...jk->...ik", P, P, precision=_MATMUL_PRECISION)
+        M = M + jnp.einsum("...ij,...jk->...ik", P, M, precision=_MATMUL_PRECISION)
+    attn = M
 
-        new_row = row + contribution
-        new_row = jnp.where(mask_lt_i, new_row, row)
+    # Precompute all exp values once on full tensors instead of per-step in scan.
+    # This moves exp out of the scan body, simplifying backward and allowing
+    # XLA to parallelize exp across all chunks at once.
+    g_cumsum_exp = jnp.exp(g_cumsum).astype(input_dtype)  # (B, H, C, cs)
+    g_end = g_cumsum[:, :, :, -1]  # (B, H, C)
+    g_end_exp = jnp.exp(g_end)  # (B, H, C) f32 for state decay precision
+    g_diff_state_exp = jnp.exp(g_end[:, :, :, None] - g_cumsum).astype(input_dtype)
 
-        return attn_chunk.at[i].set(new_row), None
-
-    def resolve_single_chunk(attn_single):
-        resolved, _ = lax.scan(resolve_intra_chunk_row, attn_single, jnp.arange(chunk_size))
-        return resolved
-
-    attn_flat = attn.reshape(-1, chunk_size, chunk_size)
-    attn_resolved = jax.vmap(resolve_single_chunk)(attn_flat)
-    attn = attn_resolved.reshape(B, H, num_chunks, chunk_size, chunk_size)
-    eye = jnp.eye(chunk_size, dtype=attn.dtype)
-    attn = attn + eye
     value_local = jnp.einsum("bhcij,bhcjv->bhciv", attn, v_beta, precision=_MATMUL_PRECISION)
-    k_beta_scaled = k_beta * jnp.exp(g_cumsum)[:, :, :, :, None]
+    k_beta_scaled = k_beta * g_cumsum_exp[:, :, :, :, None]
     k_cumdecay = jnp.einsum("bhcij,bhcjk->bhcik", attn, k_beta_scaled, precision=_MATMUL_PRECISION)
 
-    # Initialize state
     if initial_state is None:
         initial_state = jnp.zeros((B, H, K_dim, V_dim), dtype=jnp.float32)
     else:
@@ -285,57 +289,40 @@ def _chunk_gated_delta_rule_fwd(
 
     mask_triu_inner = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=bool), k=1)
 
-    xs = {
-        "query": query.transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, K)
-        "key": key.transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, K)
-        "value": value_local.transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, V)
-        "k_cumdecay": k_cumdecay.transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, K)
-        "g_cumsum": g_cumsum.transpose(2, 0, 1, 3),  # (C, B, H, cs)
-        "decay_mask": decay_mask.transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, cs)
-    }
+    xs = (
+        query.transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, K)
+        key.transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, K)
+        value_local.transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, V)
+        k_cumdecay.transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, K)
+        g_cumsum_exp.transpose(2, 0, 1, 3),  # (C, B, H, cs)
+        g_end_exp.transpose(2, 0, 1),  # (C, B, H)
+        g_diff_state_exp.transpose(2, 0, 1, 3),  # (C, B, H, cs)
+        decay_mask.astype(input_dtype).transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, cs)
+    )
 
     def chunk_step(state, inputs):
-        q_i = inputs["query"]  # (B, H, cs, K)
-        k_i = inputs["key"]  # (B, H, cs, K)
-        v_i = inputs["value"]  # (B, H, cs, V)
-        k_cumdecay_i = inputs["k_cumdecay"]  # (B, H, cs, K)
-        g_cumsum_i = inputs["g_cumsum"]  # (B, H, cs)
-        decay_mask_i = inputs["decay_mask"]  # (B, H, cs, cs)
+        q_i, k_i, v_i, k_cumdecay_i, g_exp_i, g_end_exp_i, g_diff_exp_i, decay_mask_i = inputs
 
-        # attn = (q_i @ k_i.transpose(-1, -2) * decay_mask).masked_fill_(mask, 0)
         attn_qk = jnp.einsum("bhik,bhjk->bhij", q_i, k_i, precision=_MATMUL_PRECISION)
         attn_qk = attn_qk * decay_mask_i
         attn_qk = jnp.where(mask_triu_inner, 0.0, attn_qk)
 
-        # v_prime = k_cumdecay_i @ state
-        v_prime = jnp.einsum("bhik,bhkv->bhiv", k_cumdecay_i, state, precision=_MATMUL_PRECISION)
+        # Fuse two state-dependent einsums into one batched matmul:
+        # v_prime = k_cumdecay_i @ state  and  attn_inter = q_scaled @ state
+        q_scaled = q_i * g_exp_i[:, :, :, None]
+        qk_fused = jnp.stack([k_cumdecay_i, q_scaled], axis=0)
+        both = jnp.einsum("nbhik,bhkv->nbhiv", qk_fused, state, precision=_MATMUL_PRECISION)
+        v_prime, attn_inter = both[0], both[1]
 
-        # v_new = v_i - v_prime
         v_new = v_i - v_prime
-
-        # attn_inter = (q_i * g_cumsum.exp().unsqueeze(-1)) @ state
-        q_scaled = q_i * jnp.exp(g_cumsum_i)[:, :, :, None]
-        attn_inter = jnp.einsum("bhik,bhkv->bhiv", q_scaled, state, precision=_MATMUL_PRECISION)
-
-        # core_out = attn_inter + attn @ v_new
         core_out = attn_inter + jnp.einsum("bhij,bhjv->bhiv", attn_qk, v_new, precision=_MATMUL_PRECISION)
 
-        # Update state:
-        # state = state * g[:, :, i, -1, None, None].exp()
-        #       + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp().unsqueeze(-1)).transpose(-1, -2) @ v_new
-        g_end = g_cumsum_i[:, :, -1]  # (B, H)
-        state_decayed = state * jnp.exp(g_end)[:, :, None, None]
-
-        # k_i * (g_end - g_cumsum_i).exp().unsqueeze(-1)
-        g_diff_state = g_end[:, :, None] - g_cumsum_i  # (B, H, cs)
-        k_scaled = k_i * jnp.exp(g_diff_state)[:, :, :, None]  # (B, H, cs, K)
-
-        # k_scaled.transpose(-1, -2) @ v_new -> (B, H, K, V)
+        state_decayed = state * g_end_exp_i[:, :, None, None]
+        k_scaled = k_i * g_diff_exp_i[:, :, :, None]
         state_update = jnp.einsum("bhik,bhiv->bhkv", k_scaled, v_new, precision=_MATMUL_PRECISION)
-
         new_state = state_decayed + state_update
 
-        return new_state, core_out
+        return new_state, core_out.astype(input_dtype)
 
     final_state, core_attn_out = lax.scan(chunk_step, initial_state, xs)
 
@@ -488,6 +475,29 @@ class GatedDeltaRuleOp(OperationImpl):
             .build()
         )
 
+    def _call_kernel(self, query, key, value, beta, decay, state, is_inference, chunk_size):
+        """Dispatch to the appropriate kernel (inference vs training)."""
+        if is_inference:
+            return _single_step_gated_delta_rule_fwd(
+                query=query,
+                key=key,
+                value=value,
+                beta=beta,
+                decay=decay,
+                recurrent_state=state,
+                use_qk_l2norm=True,
+            )
+        return _chunk_gated_delta_rule_fwd(
+            query=query,
+            key=key,
+            value=value,
+            beta=beta,
+            decay=decay,
+            chunk_size=chunk_size,
+            initial_state=state,
+            use_qk_l2norm=True,
+        )
+
     @jax.named_scope("easydel-gated-delta-rule-native")
     def forward_native(
         self,
@@ -503,8 +513,8 @@ class GatedDeltaRuleOp(OperationImpl):
     ) -> GatedDeltaRuleOutput:
         """Forward pass for gated delta rule attention.
 
-        Automatically selects between chunked (training) and recurrent (inference)
-        modes based on sequence length.
+        Uses shard_map to preserve sharding across internal transposes.
+        Batch is sharded over (FSDP, DP), heads over TP.
 
         Args:
             query: Query tensor [batch, seq_len, num_heads, head_dim]
@@ -521,16 +531,17 @@ class GatedDeltaRuleOp(OperationImpl):
             GatedDeltaRuleOutput containing attention outputs and updated states
         """
         seq_len = query.shape[1]
-        shardings = None
+        is_inference = seq_len == 1
 
+        # Determine mode before transpose (query is still BTHD).
+        mode = None
+        shardings_bthd = None
         if self.metadata.mesh is not None:
             with self.metadata.mesh:
                 mode = self.get_mode(query=query, BTHD=True)
-                shardings = self.metadata.get_shardings(mode, layout="bthd")
-                query = with_sharding_constraint(arr=query, sharding=shardings.query)
-                key = with_sharding_constraint(arr=key, sharding=shardings.key)
-                value = with_sharding_constraint(arr=value, sharding=shardings.value)
+                shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
 
+        # Transpose BTHD -> BHTD for kernel.
         query = query.transpose(0, 2, 1, 3)
         key = key.transpose(0, 2, 1, 3)
         value = value.transpose(0, 2, 1, 3)
@@ -549,35 +560,107 @@ class GatedDeltaRuleOp(OperationImpl):
             if decay.ndim == 3:
                 decay = decay.transpose(0, 2, 1)
 
-        is_inference = seq_len == 1
+        # --- shard_map path: preserve sharding across internal transposes ---
+        if self.metadata.mesh is not None and mode is not None:
+            with self.metadata.mesh:
+                shardings_bhtd = self.metadata.get_shardings(mode, layout="bhtd")
 
-        if is_inference and recurrent_state is not None:
-            outputs, new_recurrent_state = _single_step_gated_delta_rule_fwd(
-                query=query,
-                key=key,
-                value=value,
-                beta=beta,
-                decay=decay,
-                recurrent_state=recurrent_state,
-                use_qk_l2norm=True,
-            )
+                # 4D specs [B, H, *, *]: preserve batch(0) and head(1) only.
+                query_spec = self.create_stable_sharding(
+                    shardings_bhtd.query,
+                    tensor=query,
+                    preserved_indices=[0, 1],
+                )
+                key_spec = self.create_stable_sharding(
+                    shardings_bhtd.key,
+                    tensor=key,
+                    preserved_indices=[0, 1],
+                )
+                value_spec = self.create_stable_sharding(
+                    shardings_bhtd.value,
+                    tensor=value,
+                    preserved_indices=[0, 1],
+                )
+
+                if query_spec is not None and key_spec is not None and value_spec is not None:
+                    # 3D spec [B, H, L] for beta/decay: take batch+head from query spec.
+                    beta_3d_source = Ps(
+                        shardings_bhtd.query[0],
+                        shardings_bhtd.query[1],
+                        shardings_bhtd.query[2],
+                    )
+                    beta_spec = self.create_stable_sharding(
+                        beta_3d_source,
+                        tensor=beta,
+                        preserved_indices=[0, 1],
+                    )
+                    # State [B, H, K, V]: same batch+head sharding as query.
+                    state_spec = query_spec
+                    output_spec = value_spec
+                    decay_spec = beta_spec
+
+                    # Materialize None args — shard_map needs concrete arrays.
+                    B, H = query.shape[0], query.shape[1]
+                    K_dim, V_dim = query.shape[-1], value.shape[-1]
+                    if decay is None:
+                        decay = jnp.zeros((B, H, seq_len), dtype=jnp.float32)
+                    if recurrent_state is None:
+                        recurrent_state = jnp.zeros(
+                            (B, H, K_dim, V_dim),
+                            dtype=jnp.float32,
+                        )
+
+                    def _gdr_kernel(q, k, v, b, d, s):
+                        return self._call_kernel(q, k, v, b, d, s, is_inference, chunk_size)
+
+                    outputs, new_recurrent_state = jax.shard_map(
+                        _gdr_kernel,
+                        mesh=self.metadata.mesh,
+                        in_specs=(
+                            query_spec,
+                            key_spec,
+                            value_spec,
+                            beta_spec,
+                            decay_spec,
+                            state_spec,
+                        ),
+                        out_specs=(output_spec, state_spec),
+                        check_vma=False,
+                    )(query, key, value, beta, decay, recurrent_state)
+                else:
+                    # Specs are None — fall back to direct call.
+                    outputs, new_recurrent_state = self._call_kernel(
+                        query,
+                        key,
+                        value,
+                        beta,
+                        decay,
+                        recurrent_state,
+                        is_inference,
+                        chunk_size,
+                    )
         else:
-            outputs, new_recurrent_state = _chunk_gated_delta_rule_fwd(
-                query=query,
-                key=key,
-                value=value,
-                beta=beta,
-                decay=decay,
-                chunk_size=chunk_size,
-                initial_state=recurrent_state,
-                use_qk_l2norm=True,
+            # No mesh — direct call.
+            outputs, new_recurrent_state = self._call_kernel(
+                query,
+                key,
+                value,
+                beta,
+                decay,
+                recurrent_state,
+                is_inference,
+                chunk_size,
             )
 
+        # Transpose output BHTD -> BTHD.
         outputs = outputs.transpose(0, 2, 1, 3)
 
-        if self.metadata.mesh is not None and shardings is not None:
+        if self.metadata.mesh is not None and shardings_bthd is not None:
             with self.metadata.mesh:
-                outputs = with_sharding_constraint(arr=outputs, sharding=shardings.output)
+                outputs = with_sharding_constraint(
+                    arr=outputs,
+                    sharding=shardings_bthd.output,
+                )
 
         return GatedDeltaRuleOutput(
             attention_outputs=outputs,
