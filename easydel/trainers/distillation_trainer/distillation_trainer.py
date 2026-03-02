@@ -157,9 +157,10 @@ class DistillationTrainer(Trainer):
             attention_layers,
             bool(self.arguments.attention_normalize),
             straight_through_emulator,
+            int(self.arguments.logits_chunk_size),
         )
 
-        static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+        static_argnames = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
         sharded_training_step_function = ejit(
             distillation_step,
             in_shardings=(self.state_shardings, empty_sharding, self.teacher_state.shardings),
@@ -183,6 +184,7 @@ class DistillationTrainer(Trainer):
             attention_layers,
             bool(self.arguments.attention_normalize),
             None,
+            int(self.arguments.logits_chunk_size),
         )
 
         sharded_evaluation_step_function = ejit(
