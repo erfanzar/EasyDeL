@@ -455,8 +455,13 @@ def distillation_step(
         teacher_kwargs = sanitize_model_call_kwargs(teacher_kwargs)
 
         @jax.checkpoint
-        def _teacher_fwd(kw):
-            out = teacher_state.model(**kw)
+        def _teacher_fwd(kw, t_graphstate):
+            # Merge a fresh teacher module at the current trace level.
+            # Calling teacher_state.model directly would fail with
+            # "Cannot mutate Param from a different trace level" because
+            # that module was created outside the grad/checkpoint scope.
+            teacher_module = teacher_state.merge(t_graphstate)
+            out = teacher_module(**kw)
             # Only return tensors we actually need — everything else is freed
             # by the checkpoint boundary (no backward since stop_gradient).
             results = {}
@@ -474,7 +479,10 @@ def distillation_step(
                     results["att"] = jax.lax.stop_gradient(jnp.stack(att, axis=1))
             return results
 
-        teacher_out = _teacher_fwd(teacher_kwargs)
+        teacher_out = _teacher_fwd(
+            teacher_kwargs,
+            jax.lax.stop_gradient(teacher_state.graphstate),
+        )
         if use_chunked:
             teacher_hidden_for_kl = teacher_out["h"]
         else:
