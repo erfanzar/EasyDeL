@@ -116,9 +116,7 @@ def xpo_step(
     )
     batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
-    ref_module = flax.nnx.merge(
-        reference_state.graphdef, reference_state.graphstate, reference_state.graphother
-    )
+    ref_module = reference_state.merge(reference_state.graphstate)
     batch = dict(batch)
     batch["_ref_on_policy"] = jax.lax.stop_gradient(
         _compute_logps(

@@ -295,6 +295,10 @@ class SDPOTrainer(GRPOTrainer):
         )
 
         def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef):
+            graphother = jax.tree_util.tree_map(
+                lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
+                graphother,
+            )
             apply = flax.nnx.merge(graphdef, graphtree, graphother)
             with apply.mesh:
                 ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)

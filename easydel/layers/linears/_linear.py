@@ -270,10 +270,12 @@ class ParallelLinear(nn.Module):
             kernel = self.kernel.value
         else:
             kernel = w
+        if kernel is None:
+            raise ValueError("ParallelLinear kernel is missing. This layer cannot run without kernel weights.")
 
         has_bias: bool = self.use_bias
         bias: Array | None
-        if has_bias:
+        if has_bias and self.bias is not None:
             bias = self.bias.value
         else:
             bias = None
@@ -359,15 +361,15 @@ class ParallelLinear(nn.Module):
         else:
             return {}
         mesh = _kwargs.get("mesh")
-        specs: dict[str, tp.Any] = {
-            "kernel": resolve_safe_sharding(
+        specs: dict[str, tp.Any] = {}
+        if self.kernel.value is not None:
+            specs["kernel"] = resolve_safe_sharding(
                 axes=kernel_spec,
                 shape=tuple(self.kernel.value.shape),
                 partition_manager=partition_manager,
                 mesh=mesh,
             )
-        }
-        if self.use_bias:
+        if self.use_bias and self.bias is not None and self.bias.value is not None:
             specs["bias"] = resolve_safe_sharding(
                 axes=Replicated,
                 shape=tuple(self.bias.value.shape),

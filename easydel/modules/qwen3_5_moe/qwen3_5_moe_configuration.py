@@ -212,6 +212,7 @@ class Qwen3_5MoeTextConfig(Qwen3NextConfig):
         output_router_logits: bool = False,
         router_aux_loss_coef: float = 0.001,
         mlp_only_layers: list[int] | None = None,
+        linear_attention_separate_proj: bool | None = None,
         **kwargs,
     ):
         rope_scaling = _normalize_rope_scaling_for_mrope(rope_scaling or rope_parameters)
@@ -257,9 +258,8 @@ class Qwen3_5MoeTextConfig(Qwen3NextConfig):
             mlp_only_layers=mlp_only_layers,
             **kwargs,
         )
-        # Qwen3.5-MoE linear attention uses split projections in HF:
-        # in_proj_qkv, in_proj_z, in_proj_b, in_proj_a.
-        self.linear_attention_separate_proj = True
+
+        self.linear_attention_separate_proj = bool(linear_attention_separate_proj)
         # Mirror HF naming for rope config interop.
         self.rope_parameters = rope_scaling
 

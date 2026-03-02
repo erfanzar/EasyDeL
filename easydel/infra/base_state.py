@@ -730,7 +730,11 @@ class EasyDeLState(struct.PyTreeNode):
             - :attr:`model`: Property that returns the reconstructed model.
             - :meth:`merge_to_state`: Update state with new parameters.
         """
-        return nn.merge(self.graphdef, tree, self.graphother)
+        other = jax.tree_util.tree_map(
+            lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
+            self.graphother,
+        )
+        return nn.merge(self.graphdef, tree, other)
 
     def merge_to_state(self: Self, tree) -> Self:
         """Create a new state with updated parameters.
