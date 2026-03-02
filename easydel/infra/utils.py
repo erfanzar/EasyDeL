@@ -624,7 +624,12 @@ def extract_static_parameters(module):
     obj = getattr(module, "__call__", None)  # noqa
     if isinstance(obj, (types.FunctionType, types.MethodType)):
         static_args = ()
-        signature = inspect.signature(obj)
+        try:
+            # Avoid inspect.unwrap() here; decorated callables can have cyclic
+            # __wrapped__ chains in some runtimes (seen with remat wrappers).
+            signature = inspect.signature(obj, follow_wrapped=False)
+        except (TypeError, ValueError):
+            return static_args
         for idx, (param_name, _param) in enumerate(signature.parameters.items()):
             if param_name in target_params:
                 static_args += (idx,)

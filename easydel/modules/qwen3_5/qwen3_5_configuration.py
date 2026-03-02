@@ -25,18 +25,29 @@ from easydel.modules.qwen3_next.qwen3_next_configuration import Qwen3NextConfig
 from easydel.modules.qwen3_vl.qwen3_vl_configuration import Qwen3VLVisionConfig
 
 
+def _hf_supports_mrope_rope_type() -> bool:
+    """Check whether the installed HF rope validator supports ``rope_type='mrope'``."""
+    try:
+        from transformers import modeling_rope_utils
+    except Exception:
+        return False
+
+    validators = getattr(modeling_rope_utils, "ROPE_VALIDATION_FUNCTIONS", None)
+    return isinstance(validators, Mapping) and "mrope" in validators
+
+
 def _normalize_rope_scaling_for_mrope(rope_scaling: dict | None) -> dict | None:
-    """Normalize RoPE config so mRoPE keys imply ``rope_type='mrope'``."""
+    """Normalize mRoPE config while remaining compatible with older HF validators."""
     if not isinstance(rope_scaling, dict):
         return rope_scaling
     normalized = dict(rope_scaling)
     has_mrope_keys = "mrope_section" in normalized or "mrope_interleaved" in normalized
     if has_mrope_keys:
         rope_type = normalized.get("rope_type", normalized.get("type"))
-        if rope_type in (None, "default"):
-            normalized["rope_type"] = "mrope"
-            if "type" in normalized:
-                normalized["type"] = "mrope"
+        if rope_type in (None, "default", "mrope"):
+            target_rope_type = "mrope" if _hf_supports_mrope_rope_type() else "default"
+            normalized["rope_type"] = target_rope_type
+            normalized["type"] = target_rope_type
     return normalized
 
 
