@@ -29,7 +29,9 @@ import functools
 
 import jax
 import jax.numpy as jnp
+from eformer import common_types
 from eformer.common_types import Replicated
+from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from einops import repeat
 from flax import nnx as nn
@@ -629,6 +631,12 @@ class FalconMambaMixer(nn.Module):
         hidden_states_t = jnp.swapaxes(hidden_states, 1, 2)
         gate_t = jnp.swapaxes(gate, 1, 2)
 
+        hidden_states_t = apply_logical_sharding(
+            hidden_states_t,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
+
         ssm_output = self.ssm_op(
             hidden_states=hidden_states_t,
             A=self.A_log.value,
@@ -646,7 +654,13 @@ class FalconMambaMixer(nn.Module):
         if cache_view is not None:
             cache_view = cache_view.replace(recurrent_state=ssm_output.ssm_state.astype(dtype))
 
-        contextualized_states = checkpoint_name(self.out_proj(jnp.swapaxes(y, 2, 1)), name="ssm_output_proj")
+        y_t = jnp.swapaxes(y, 2, 1)
+        y_t = apply_logical_sharding(
+            y_t,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        contextualized_states = checkpoint_name(self.out_proj(y_t), name="ssm_output_proj")
         return contextualized_states, cache_view
 
 
@@ -756,6 +770,11 @@ class FalconMambaBlock(nn.Module):
             cache_metadata=cache_metadata,
         )
         hidden_states = residual + hidden_states
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         return hidden_states, cache_params
 
 

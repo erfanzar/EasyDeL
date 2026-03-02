@@ -424,8 +424,18 @@ class GPTJMLP(nn.Module):
             Output hidden states with shape (batch_size, sequence_length, hidden_size) after
             processing through fc_in -> activation -> fc_out -> dropout.
         """
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         gate = checkpoint_name(self.act(self.fc_in(hidden_states)), "mlp_gate")
         hidden_states = checkpoint_name(self.dropout(self.fc_out(gate)), "mlp_output")
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         return hidden_states
 
 

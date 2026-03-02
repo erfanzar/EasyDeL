@@ -214,6 +214,21 @@ class MiniMaxLightningAttention(nn.Module):
         qkv_states = self.act_fn(checkpoint_name(self.qkv_proj(hidden_states), "attn_qkv"))
         qkv_states = qkv_states.reshape(batch_size, seq_len, self.num_attention_heads, 3 * self.head_dim)
         query_states, key_states, value_states = jnp.split(qkv_states, 3, axis=-1)
+        query_states = apply_logical_sharding(
+            query_states,
+            dynamic_axes=common_types.AttnQSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        key_states = apply_logical_sharding(
+            key_states,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        value_states = apply_logical_sharding(
+            value_states,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.partition_manager,
+        )
 
         query_states = jnp.transpose(query_states, (0, 2, 1, 3))
         key_states = jnp.transpose(key_states, (0, 2, 1, 3))
@@ -282,6 +297,11 @@ class MiniMaxLightningAttention(nn.Module):
         attn_output = attn_output.reshape(batch_size, seq_len, self.num_attention_heads * self.head_dim)
         attn_output = self.norm(attn_output)
         attn_output = jax.nn.sigmoid(checkpoint_name(self.output_gate(hidden_states), "attn_gate")) * attn_output
+        attn_output = apply_logical_sharding(
+            attn_output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         attn_output = checkpoint_name(self.out_proj(attn_output), "attn_output")
 
         if cache_view is not None:

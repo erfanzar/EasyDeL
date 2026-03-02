@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import Replicated
+from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
@@ -752,6 +753,12 @@ class FalconH1Mixer(nn.Module):
         ssm_b = ssm_b.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
         ssm_c = ssm_c.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
 
+        x = apply_logical_sharding(
+            x,
+            dynamic_axes=common_types.AttnQSharding,
+            partition_manager=self.config.partition_manager,
+        )
+
         # Prepare dt with bias
         dt = jax.nn.softplus(dt.astype(jnp.float32) + self.dt_bias.value.astype(jnp.float32))
         if q_mask is not None and seq_len > 1:
@@ -788,6 +795,11 @@ class FalconH1Mixer(nn.Module):
             assert gate is not None
             scan_output = y * jax.nn.silu(gate.astype(jnp.float32))  # pyright: ignore[reportOptionalOperand]
 
+        scan_output = apply_logical_sharding(
+            scan_output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         contextualized_states = checkpoint_name(self.out_proj(scan_output.astype(dtype)), name="ssm_output_proj")
         return contextualized_states, updated_cache_view
 
@@ -868,8 +880,18 @@ class FalconH1MLP(nn.Module):
         Returns:
             Array: Transformed tensor of shape (batch, seq_len, hidden_size).
         """
+        x = apply_logical_sharding(
+            x,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         y = self.up_proj(x) * self.act_fn(self.gate_proj(x) * self.gate_multiplier)
         y = self.down_proj(y) * self.down_multiplier
+        y = apply_logical_sharding(
+            y,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         return y
 
 
@@ -1051,6 +1073,12 @@ class FalconH1DecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.pre_ff_layernorm(hidden_states)
         hidden_states = residual + self.feed_forward(hidden_states)
+
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
 
         return DecoderLayerOutput(
             hidden_states=hidden_states,

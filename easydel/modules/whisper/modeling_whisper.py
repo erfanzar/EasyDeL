@@ -275,6 +275,7 @@ class WhisperAttention(AttentionModule):
         query_states = self._split_heads(query_states)
         key_states = self._split_heads(key_states)
         value_states = self._split_heads(value_states)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         init_attention_bias = lambda: None  # noqa
 
