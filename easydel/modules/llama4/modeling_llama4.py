@@ -356,9 +356,19 @@ class Llama4TextMLP(nn.Module):
         Returns:
             Transformed hidden states [batch, seq_len, hidden_dim].
         """
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         gate = checkpoint_name(self.activation_fn(self.gate_proj(hidden_states)), "mlp_gate")
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
         hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         return checkpoint_name(hidden_states, "mlp_output")
 
 
@@ -1348,6 +1358,7 @@ class Llama4VisionAttention(AttentionModule):
         query_states = query_states.reshape(*hidden_shape)
         key_states = key_states.reshape(*hidden_shape)
         value_states = value_states.reshape(*hidden_shape)
+        query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
         query_states, key_states = vision_apply_rotary_emb(
             query_states,
             key_states,

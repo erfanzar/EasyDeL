@@ -17,7 +17,9 @@ from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
+from eformer import common_types
 from eformer.common_types import Replicated
+from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import lax
@@ -554,6 +556,12 @@ class Mamba2Mixer(nn.Module):
         ssm_c = ssm_c.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).astype(jnp.float32)
         # Note: SSM2Op handles group expansion internally
 
+        x = apply_logical_sharding(
+            x,
+            dynamic_axes=common_types.AttnQSharding,
+            partition_manager=self.config.partition_manager,
+        )
+
         # Prepare dt with bias and clipping
         dt = dt.astype(jnp.float32)
         dt = jax.nn.softplus(dt + self.dt_bias.value.astype(jnp.float32))
@@ -585,6 +593,11 @@ class Mamba2Mixer(nn.Module):
             cache_view = cache_view.replace(recurrent_state=ssm_output.ssm_state.astype(dtype))
 
         scan_output = self.norm(y, gate)
+        scan_output = apply_logical_sharding(
+            scan_output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         contextualized_states = checkpoint_name(self.out_proj(scan_output.astype(dtype)), name="ssm_output_proj")
         return contextualized_states, cache_view
 
@@ -686,6 +699,11 @@ class Mamba2Block(nn.Module):
             attention_mask,
         )
         hidden_states = residual + hidden_states
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         return hidden_states, cache_params  # pyright: ignore[reportReturnType]
 
 

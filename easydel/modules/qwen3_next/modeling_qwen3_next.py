@@ -1270,6 +1270,22 @@ class Qwen3NextLinearAttention(nn.Module):
         key = conv_key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         value = conv_value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
+        query = apply_logical_sharding(
+            query,
+            dynamic_axes=common_types.AttnQSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        key = apply_logical_sharding(
+            key,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        value = apply_logical_sharding(
+            value,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.partition_manager,
+        )
+
         if expand_ratio > 1:
             query = jnp.repeat(query, expand_ratio, axis=2)
             key = jnp.repeat(key, expand_ratio, axis=2)
@@ -1298,6 +1314,11 @@ class Qwen3NextLinearAttention(nn.Module):
         output = output.reshape(z_shape_og)
 
         output = output.reshape(batch_size, seq_len, -1)
+        output = apply_logical_sharding(
+            output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         output = self.out_proj(output)
 
         new_cache_view = cache_view
@@ -1482,6 +1503,12 @@ class Qwen3NextDecoderLayer(nn.Module):
             feed_forward_output, router_logits = feed_forward_output
 
         hidden_states = checkpoint_name(hidden_states + feed_forward_output, "residual")
+
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
 
         return DecoderLayerOutput(
             hidden_states=checkpoint_name(hidden_states, "layer_output"),

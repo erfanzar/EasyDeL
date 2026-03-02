@@ -18,7 +18,9 @@ import typing as tp
 from functools import partial
 
 import jax.lax
+from eformer import common_types
 from eformer.common_types import Replicated
+from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import numpy as jnp
@@ -368,7 +370,12 @@ class RwkvSelfAttention(nn.Module):
         (aa, bb, pp), c_x = jax.lax.scan(step, (aa, bb, pp), xs)
         c_x = jnp.swapaxes(c_x, 0, 1)
 
-        out = checkpoint_name(self.output(receptance_state * c_x), "attn_output")
+        attn_prod = apply_logical_sharding(
+            receptance_state * c_x,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        out = checkpoint_name(self.output(attn_prod), "attn_output")
         next_state = (hidden[:, -1, :], aa, bb, pp)
         return out, next_state
 
@@ -500,7 +507,13 @@ class RwkvFeedForward(nn.Module):
         xr = hidden * self.time_mix_receptance.reshape(1, 1, -1) + sx * (1 - self.time_mix_receptance.reshape(1, 1, -1))
         r = checkpoint_name(nn.sigmoid(self.receptance(xr)), "mlp_gate")
         k = checkpoint_name(jnp.square(nn.relu(self.key(xk))), "mlp_up")
-        return checkpoint_name(r * self.value(k), "mlp_output"), hidden[:, -1, :]
+        output = checkpoint_name(r * self.value(k), "mlp_output")
+        output = apply_logical_sharding(
+            output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        return output, hidden[:, -1, :]
 
 
 class SingleStandRwkvBlock(nn.Module):
@@ -634,6 +647,11 @@ class SingleStandRwkvBlock(nn.Module):
 
         feed_forward, ffd_state = self.feed_forward(self.ln2(hidden), state=ffd_state)
         hidden = checkpoint_name(hidden + feed_forward, "layer_output")
+        hidden = apply_logical_sharding(
+            hidden,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
 
         if uses_global_state:
             state[0] = state[0].at[:, :, self.layer_id].set(ffd_state)

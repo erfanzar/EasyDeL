@@ -1192,6 +1192,21 @@ class KimiDeltaAttention(nn.Module):
         query = query.reshape(batch_size, seq_len, self.num_heads, self.head_k_dim)
         key = key.reshape(batch_size, seq_len, self.num_heads, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, self.num_heads, self.head_v_dim)
+        query = apply_logical_sharding(
+            query,
+            dynamic_axes=common_types.AttnQSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        key = apply_logical_sharding(
+            key,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        value = apply_logical_sharding(
+            value,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.partition_manager,
+        )
 
         f_hidden = jax.nn.silu(self.f_a_proj(hidden_states))
         gate = self.f_b_proj(f_hidden)
@@ -1227,6 +1242,11 @@ class KimiDeltaAttention(nn.Module):
         output = output.reshape(output_shape)
 
         output = output.reshape(batch_size, seq_len, -1)
+        output = apply_logical_sharding(
+            output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         output = self.o_proj(output)
 
         new_cache_view = cache_view

@@ -97,9 +97,18 @@ def distillation_loss(
         the teacher's relative confidence across all classes.
     """
     dtype = student_logits.dtype
-    teacher_probs = jax.nn.softmax(teacher_logits / temperature, axis=-1)
-    student_log_probs = jax.nn.log_softmax(student_logits / temperature, axis=-1)
-    per_token_kl = -jnp.sum(teacher_probs * student_log_probs, axis=-1)
+    alpha_s = jnp.array(alpha, dtype=dtype)
+    temp_sq = jnp.array(temperature * temperature, dtype=dtype)
+
+    # softmax / log_softmax need f32 for numerical stability over large vocab.
+    # teacher_logits already has stop_gradient so f32 has no backward cost.
+    # For student_logits, the explicit .astype(f32) means JAX's AD will
+    # produce bf16 gradients (matching the primal dtype of student_logits),
+    # so f32 stays contained in this loss function and does NOT leak into
+    # the model's backward pass.
+    teacher_probs = jax.nn.softmax(teacher_logits.astype(jnp.float32) / temperature, axis=-1)
+    student_log_probs = jax.nn.log_softmax(student_logits.astype(jnp.float32) / temperature, axis=-1)
+    per_token_kl = -jnp.sum(teacher_probs * student_log_probs, axis=-1).astype(dtype)
 
     if loss_mask is not None:
         mask = loss_mask.astype(dtype)
@@ -118,12 +127,15 @@ def distillation_loss(
         kl_loss = jnp.sum(masked_kl) / normalizer
     else:
         kl_loss = jnp.mean(per_token_kl)
-    kl_loss = kl_loss * (temperature**2)
-    total_loss = alpha * kl_loss
+    kl_loss = kl_loss * temp_sq
+    total_loss = alpha_s * kl_loss
     ce_loss = jnp.array(0.0, dtype=dtype)
     if use_hard_labels and labels is not None:
         safe_labels = jnp.where(labels == -100, 0, labels)
-        per_token_ce = optax.softmax_cross_entropy_with_integer_labels(student_logits, safe_labels)
+        per_token_ce = optax.softmax_cross_entropy_with_integer_labels(
+            student_logits.astype(jnp.float32),
+            safe_labels,
+        ).astype(dtype)
 
         if mask is not None:
             ce_loss = per_token_ce * mask
@@ -132,7 +144,7 @@ def distillation_loss(
         else:
             ce_loss = jnp.mean(per_token_ce)
 
-        total_loss += (1 - alpha) * ce_loss
+        total_loss = total_loss + (jnp.array(1.0, dtype=dtype) - alpha_s) * ce_loss
 
     metrics = {
         "kl_loss": jnp.asarray(kl_loss, dtype=dtype),
@@ -165,7 +177,7 @@ def _resolve_indices(
 def _masked_mse(values: jax.Array, targets: jax.Array, mask: jax.Array | None) -> jax.Array:
     if values.shape != targets.shape:
         raise ValueError(f"Mismatched tensor shapes for distillation: {values.shape} vs {targets.shape}.")
-    diff = (values - targets).astype(jnp.float32)
+    diff = values - targets
     if mask is not None:
         mask = mask.astype(diff.dtype)
         while mask.ndim < diff.ndim:
@@ -323,7 +335,7 @@ def distillation_step(
                     "Attention layer selections for student and teacher have different lengths. "
                     "Please align the requested layers across both models."
                 )
-            attn_mask = _build_attention_mask(attention_mask, dtype=jnp.float32)
+            attn_mask = _build_attention_mask(attention_mask, dtype=total_loss.dtype)
             attention_losses = []
             for s_idx, t_idx in zip(student_indices, teacher_indices, strict=True):
                 s_attn = student_attentions[s_idx]

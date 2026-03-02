@@ -276,6 +276,21 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         v = v.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        q = apply_logical_sharding(
+            q,
+            dynamic_axes=common_types.AttnQSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        k = apply_logical_sharding(
+            k,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        v = apply_logical_sharding(
+            v,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.partition_manager,
+        )
 
         attn_output = self.attention.forward(
             query_states=q,
@@ -287,6 +302,11 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         ).attention_outputs
 
         attn_output = attn_output.reshape(batch_size, seq_len, -1)
+        attn_output = apply_logical_sharding(
+            attn_output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         return self.out_proj(attn_output)
 
 
@@ -3060,6 +3080,21 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.reshape(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
         v = v.reshape(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+        q = apply_logical_sharding(
+            q,
+            dynamic_axes=common_types.AttnQSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        k = apply_logical_sharding(
+            k,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.partition_manager,
+        )
+        v = apply_logical_sharding(
+            v,
+            dynamic_axes=common_types.AttnKVSharding,
+            partition_manager=self.config.partition_manager,
+        )
 
         if self.sliding_window is not None:
             causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
@@ -3079,6 +3114,11 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
         ).attention_outputs
 
         attn_output = attn_output.reshape(batch_size, seq_len, -1)
+        attn_output = apply_logical_sharding(
+            attn_output,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         return self.o_proj(attn_output)
 
 

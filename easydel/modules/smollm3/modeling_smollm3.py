@@ -433,11 +433,21 @@ class SmolLM3MLP(nn.Module):
             Float[Array, "batch seq_len hidden_dim"]: Transformed hidden states with same
                 shape as input (batch_size, sequence_length, hidden_dim).
         """
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         # SwiGLU activation: silu(gate) * up
         gate = self.gate_proj(hidden_states)
         up = self.up_proj(hidden_states)
         hidden_states = nn.silu(gate) * up
         hidden_states = self.down_proj(hidden_states)
+        hidden_states = apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
         return hidden_states
 
 
