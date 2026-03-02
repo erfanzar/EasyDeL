@@ -454,6 +454,12 @@ def distillation_step(
         teacher_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, teacher_kwargs)
         teacher_kwargs = sanitize_model_call_kwargs(teacher_kwargs)
 
+        # Separate non-array kwargs (bools, ints, strings) from array kwargs.
+        # jax.checkpoint traces all pytree leaves — booleans become tracers,
+        # which then fail inside the model's `if apply_lm_head:` branches.
+        # Capturing them in the closure keeps them as concrete Python values.
+        _teacher_static_kw = {k: teacher_kwargs.pop(k) for k in list(teacher_kwargs) if not hasattr(teacher_kwargs[k], "shape")}
+
         @jax.checkpoint
         def _teacher_fwd(kw, t_graphstate):
             # Merge a fresh teacher module at the current trace level.
@@ -461,7 +467,7 @@ def distillation_step(
             # "Cannot mutate Param from a different trace level" because
             # that module was created outside the grad/checkpoint scope.
             teacher_module = teacher_state.merge(t_graphstate)
-            out = teacher_module(**kw)
+            out = teacher_module(**kw, **_teacher_static_kw)
             # Only return tensors we actually need — everything else is freed
             # by the checkpoint boundary (no backward since stop_gradient).
             results = {}
