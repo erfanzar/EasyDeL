@@ -884,6 +884,7 @@ class DistillationTrainerCfg(BaseTrainerCfg):
 
     temperature: NotRequired[float]
     alpha: NotRequired[float]
+    logits_chunk_size: NotRequired[int]
 
 
 class KTOTrainerCfg(BaseTrainerCfg):

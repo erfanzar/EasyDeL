@@ -145,6 +145,18 @@ class DistillationConfig(TrainingArguments):
             )
         },
     )
+    logits_chunk_size: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "When > 0, compute the KL-divergence distillation loss in chunks of this many "
+                "tokens instead of materialising the full [B, L, V] logits tensor. This trades "
+                "a small amount of extra compute (lm_head is recomputed per chunk during "
+                "backward) for a massive memory saving — peak logit memory drops from "
+                "O(B*L*V) to O(B*chunk_size*V). Recommended values: 128-512 for large vocabs."
+            )
+        },
+    )
 
     def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
         if self.completion_only_loss is not None:
