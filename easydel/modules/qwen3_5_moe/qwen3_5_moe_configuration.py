@@ -259,7 +259,13 @@ class Qwen3_5MoeTextConfig(Qwen3NextConfig):
             **kwargs,
         )
 
-        self.linear_attention_separate_proj = bool(linear_attention_separate_proj)
+        # HF Qwen3.5 checkpoints expose split linear-attention projections
+        # (`in_proj_qkv/z/b/a`). Keep that layout by default when the flag is
+        # omitted, while still honoring explicit user overrides.
+        if linear_attention_separate_proj is None:
+            self.linear_attention_separate_proj = True
+        else:
+            self.linear_attention_separate_proj = bool(linear_attention_separate_proj)
         # Mirror HF naming for rope config interop.
         self.rope_parameters = rope_scaling
 
