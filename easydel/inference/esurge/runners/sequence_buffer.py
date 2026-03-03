@@ -715,7 +715,8 @@ class SequenceBuffer:
             buffer reorganization operations. Modifies the buffer in-place.
         """
         req_id = self._req_ids[from_idx]
-        assert req_id is not None
+        if req_id is None:
+            return
 
         # Static bookkeeping
         self._req_ids[to_idx] = req_id
