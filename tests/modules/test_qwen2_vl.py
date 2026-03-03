@@ -1,7 +1,5 @@
 """Tests for Qwen2-VL model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import numpy as np
 import pytest
 import transformers
@@ -50,9 +48,11 @@ class TestQwen2VL:
 
         org_config.text_config.rope_scaling = hf_config.text_config.rope_scaling
         org_config.text_config.layer_types = [
-            "sliding_attention"
-            if org_config.text_config.sliding_window is not None and i >= org_config.text_config.max_window_layers
-            else "full_attention"
+            (
+                "sliding_attention"
+                if org_config.text_config.sliding_window is not None and i >= org_config.text_config.max_window_layers
+                else "full_attention"
+            )
             for i in range(org_config.text_config.num_hidden_layers)
         ]
 

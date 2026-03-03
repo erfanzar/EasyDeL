@@ -429,80 +429,51 @@ def distillation_step(
     request_attentions = attention_weight != 0.0
     use_chunked = logits_chunk_size > 0
 
+    teacher_call_kwargs = dict(batch)
+    teacher_call_kwargs.pop("labels", None)
+    teacher_call_kwargs.pop("completion_mask", None)
+    teacher_call_kwargs.pop("assistant_masks", None)
+    if use_chunked:
+        teacher_call_kwargs["apply_lm_head"] = False
+    if request_hidden_states:
+        teacher_call_kwargs["output_hidden_states"] = True
+    if request_attentions:
+        teacher_call_kwargs["output_attentions"] = True
+    teacher_call_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, teacher_call_kwargs)
+    teacher_call_kwargs = sanitize_model_call_kwargs(teacher_call_kwargs)
+    teacher_outputs = teacher_state.model(**teacher_call_kwargs)
+    teacher_outputs = _stop_gradient_tree(teacher_outputs)
+
+    batch = dict(batch)
+    if use_chunked:
+        batch["_teacher_hidden_state"] = teacher_outputs.last_hidden_state
+    else:
+        batch["_teacher_logits"] = teacher_outputs.logits
+    if request_hidden_states:
+        teacher_hidden = getattr(teacher_outputs, "hidden_states", None)
+        if teacher_hidden is not None:
+            batch["_teacher_hidden_states"] = jnp.stack(teacher_hidden, axis=1)
+    if request_attentions:
+        teacher_attns = getattr(teacher_outputs, "attentions", None)
+        if teacher_attns is not None:
+            batch["_teacher_attentions"] = jnp.stack(teacher_attns, axis=1)
+
     def loss_fn(tree, minibatch):
         if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = student_state.merge(tree)
-
-        # --- Teacher forward (per-minibatch, checkpointed) ---
-        # Running teacher inside loss_fn ensures its intermediate activations
-        # are created and freed per-minibatch rather than persisting across the
-        # entire student forward+backward.  jax.checkpoint tells XLA it may
-        # free ALL layer-internal activations once the output dict is produced.
-        # Combined with stop_gradient (applied inside), no recomputation ever
-        # occurs during backward — this purely reduces peak memory.
-        teacher_kwargs = dict(minibatch)
-        teacher_kwargs.pop("labels", None)
-        teacher_kwargs.pop("completion_mask", None)
-        teacher_kwargs.pop("assistant_masks", None)
-        if use_chunked:
-            teacher_kwargs["apply_lm_head"] = False
-        if request_hidden_states:
-            teacher_kwargs["output_hidden_states"] = True
-        if request_attentions:
-            teacher_kwargs["output_attentions"] = True
-        teacher_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, teacher_kwargs)
-        teacher_kwargs = sanitize_model_call_kwargs(teacher_kwargs)
-
-        # Separate non-array kwargs (bools, ints, strings) from array kwargs.
-        # jax.checkpoint traces all pytree leaves — booleans become tracers,
-        # which then fail inside the model's `if apply_lm_head:` branches.
-        # Capturing them in the closure keeps them as concrete Python values.
-        _teacher_static_kw = {k: teacher_kwargs.pop(k) for k in list(teacher_kwargs) if not hasattr(teacher_kwargs[k], "shape")}
-
-        @jax.checkpoint
-        def _teacher_fwd(kw, t_graphstate):
-            # Merge a fresh teacher module at the current trace level.
-            # Calling teacher_state.model directly would fail with
-            # "Cannot mutate Param from a different trace level" because
-            # that module was created outside the grad/checkpoint scope.
-            teacher_module = teacher_state.merge(t_graphstate)
-            out = teacher_module(**kw, **_teacher_static_kw)
-            # Only return tensors we actually need — everything else is freed
-            # by the checkpoint boundary (no backward since stop_gradient).
-            results = {}
-            if use_chunked:
-                results["h"] = jax.lax.stop_gradient(out.last_hidden_state)
-            else:
-                results["l"] = jax.lax.stop_gradient(out.logits)
-            if request_hidden_states:
-                hs = getattr(out, "hidden_states", None)
-                if hs is not None:
-                    results["hs"] = jax.lax.stop_gradient(jnp.stack(hs, axis=1))
-            if request_attentions:
-                att = getattr(out, "attentions", None)
-                if att is not None:
-                    results["att"] = jax.lax.stop_gradient(jnp.stack(att, axis=1))
-            return results
-
-        teacher_out = _teacher_fwd(
-            teacher_kwargs,
-            jax.lax.stop_gradient(teacher_state.graphstate),
-        )
-        if use_chunked:
-            teacher_hidden_for_kl = teacher_out["h"]
-        else:
-            teacher_logits = teacher_out["l"]
-        teacher_hidden_stacked = teacher_out.get("hs")
-        teacher_attentions_stacked = teacher_out.get("att")
-
-        # --- Student forward ---
         call_kwargs = dict(minibatch)
         call_kwargs.pop("labels", None)
         call_kwargs.pop("completion_mask", None)
         call_kwargs.pop("assistant_masks", None)
+        # Extract pre-computed teacher outputs from minibatch.
         if use_chunked:
+            teacher_hidden_for_kl = jax.lax.stop_gradient(call_kwargs.pop("_teacher_hidden_state"))
             call_kwargs["apply_lm_head"] = False
+        else:
+            teacher_logits = jax.lax.stop_gradient(call_kwargs.pop("_teacher_logits"))
+        teacher_hidden_stacked = call_kwargs.pop("_teacher_hidden_states", None)
+        teacher_attentions_stacked = call_kwargs.pop("_teacher_attentions", None)
         if request_hidden_states:
             call_kwargs["output_hidden_states"] = True
         if request_attentions:

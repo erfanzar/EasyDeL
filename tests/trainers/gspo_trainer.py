@@ -21,7 +21,6 @@ no KL regularization by default.
 
 from __future__ import annotations
 
-# pyright: reportPrivateLocalImportUsage=false
 import sys
 from pathlib import Path
 
@@ -66,9 +65,9 @@ def main():
     )
 
     # Verify GSPO-specific defaults are set correctly
-    assert trainer_args.importance_sampling_level == "sequence", (
-        f"Expected 'sequence', got {trainer_args.importance_sampling_level}"
-    )
+    assert (
+        trainer_args.importance_sampling_level == "sequence"
+    ), f"Expected 'sequence', got {trainer_args.importance_sampling_level}"
     assert trainer_args.epsilon == 3e-4, f"Expected 3e-4, got {trainer_args.epsilon}"
     assert trainer_args.epsilon_high == 4e-4, f"Expected 4e-4, got {trainer_args.epsilon_high}"
     assert trainer_args.beta == 0.0, f"Expected 0.0, got {trainer_args.beta}"

@@ -1,7 +1,5 @@
 """Tests for EXAONE4 model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

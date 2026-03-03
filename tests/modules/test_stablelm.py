@@ -1,7 +1,5 @@
 """Tests for StableLM model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import copy
 
 import pytest

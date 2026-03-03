@@ -1,7 +1,5 @@
 """Tests for PhiMoE model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

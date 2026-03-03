@@ -1,7 +1,5 @@
 """Tests for Aya Vision model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

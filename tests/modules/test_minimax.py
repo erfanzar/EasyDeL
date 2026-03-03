@@ -1,7 +1,5 @@
 """Tests for MiniMax Text V1 model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

@@ -1,7 +1,5 @@
 """Tests for Pixtral vision model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

@@ -99,7 +99,6 @@ class EngineRequestsMixin:
 
         self._touch_activity()
 
-        # ---- Config knobs ----
         max_model_len = int(self.runner.max_model_len)
 
         def _get_requested_new(sp):

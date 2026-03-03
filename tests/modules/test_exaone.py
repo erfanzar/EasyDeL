@@ -1,7 +1,5 @@
 """Tests for EXAONE model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 
 import easydel as ed

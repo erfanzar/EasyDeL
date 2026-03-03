@@ -1,7 +1,5 @@
 """Tests for Qwen3Next model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

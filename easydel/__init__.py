@@ -19,8 +19,8 @@ __version__ = "0.3.0"
 
 import os as _os
 import sys as _sys
-import typing as _tp
 import types as _types
+import typing as _tp
 from importlib import machinery as _machinery
 from importlib import util as _importlib_util
 from logging import getLogger as _getlogger
@@ -229,7 +229,6 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 
     _os.environ["TPU_LOG_DIR"] = "disabled"
     _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
 
     _os.environ["XLA_FLAGS"] = (
         _os.getenv("XLA_FLAGS", "") + " "
@@ -872,6 +871,8 @@ _import_structure = {
         "PPOTrainer",
         "XPOConfig",
         "XPOTrainer",
+        "OnPolicyDistillationConfig",
+        "OnPolicyDistillationTrainer",
         "ORPOConfig",
         "ORPOTrainer",
         "RayDistributedTrainer",
@@ -881,6 +882,10 @@ _import_structure = {
         "SDPOTrainer",
         "SFTConfig",
         "SFTTrainer",
+        "SeqKDConfig",
+        "SeqKDTrainer",
+        "SparseDistillationConfig",
+        "SparseDistillationTrainer",
         "Trainer",
         "TrainingArguments",
         "pack_sequences",
@@ -1204,6 +1209,8 @@ if _tp.TYPE_CHECKING:
         KTOTrainer,
         NashMDConfig,
         NashMDTrainer,
+        OnPolicyDistillationConfig,
+        OnPolicyDistillationTrainer,
         ORPOConfig,
         ORPOTrainer,
         RayDistributedTrainer,
@@ -1211,8 +1218,12 @@ if _tp.TYPE_CHECKING:
         RewardTrainer,
         SDPOConfig,
         SDPOTrainer,
+        SeqKDConfig,
+        SeqKDTrainer,
         SFTConfig,
         SFTTrainer,
+        SparseDistillationConfig,
+        SparseDistillationTrainer,
         Trainer,
         TrainingArguments,
         XPOConfig,

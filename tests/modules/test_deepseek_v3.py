@@ -1,7 +1,5 @@
 """Tests for DeepSeek V3 model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 
 import easydel as ed

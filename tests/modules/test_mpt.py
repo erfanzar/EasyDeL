@@ -1,7 +1,5 @@
 """Tests for MPT model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

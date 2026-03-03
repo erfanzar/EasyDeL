@@ -1,7 +1,5 @@
 """Tests for Grok-1 model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 
 import easydel as ed

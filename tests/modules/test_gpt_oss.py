@@ -1,7 +1,5 @@
 """Tests for GPT-OSS MoE model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

@@ -715,7 +715,6 @@ class FalconH1Mixer(nn.Module):
             contextualized_states = checkpoint_name(self.out_proj(scan_output.astype(dtype)), name="ssm_output_proj")
             return contextualized_states, updated_cache_view
 
-        # --- Standard path (prefill / single-token decode) ---
         updated_cache_view = cache_view
 
         # Convolution with cache support for decode mode

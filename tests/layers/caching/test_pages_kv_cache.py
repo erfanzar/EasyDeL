@@ -1,5 +1,4 @@
 """Test script to verify KV cache write functionality."""
-# pyright: reportPrivateLocalImportUsage=false
 
 import jax
 import jax.numpy as jnp

@@ -1,7 +1,5 @@
 """Tests for GLM46V model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import numpy as np
 import pytest
 import transformers

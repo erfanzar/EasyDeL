@@ -1,7 +1,5 @@
 """Tests for Phi model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

@@ -363,6 +363,9 @@ class BaseTrainerCfg(TypedDict, total=False):
             "nash_md",
             "nash-md",
             "xpo",
+            "on_policy_distillation",
+            "seq_kd",
+            "sparse_distillation",
         ]
     ]
     learning_rate: NotRequired[float]
@@ -887,6 +890,94 @@ class DistillationTrainerCfg(BaseTrainerCfg):
     logits_chunk_size: NotRequired[int]
 
 
+class OnPolicyDistillationTrainerCfg(DistillationTrainerCfg):
+    """Configuration for On-Policy Knowledge Distillation trainer.
+
+    On-policy distillation generates completions from prompts during training
+    and distills teacher knowledge on the student's own generated sequences,
+    keeping the training distribution on-policy.
+
+    This extends DistillationTrainerCfg with generation-specific parameters.
+
+    Attributes:
+        max_prompt_length: Maximum number of tokens for prompts.
+        max_completion_length: Maximum new tokens to generate per prompt.
+        num_generations_per_prompt: Completions to sample per prompt.
+        temperature_sampling: Sampling temperature for generation.
+        top_k: Top-k sampling parameter for generation.
+        top_p: Top-p sampling parameter for generation.
+        generate_with_teacher: If True, teacher generates completions.
+
+    Example:
+        >>> config: OnPolicyDistillationTrainerCfg = {
+        ...     "trainer_type": "on_policy_distillation",
+        ...     "learning_rate": 2e-5,
+        ...     "temperature": 3.0,
+        ...     "alpha": 0.9,
+        ...     "max_prompt_length": 512,
+        ...     "max_completion_length": 256,
+        ... }
+    """
+
+    max_prompt_length: NotRequired[int]
+    max_completion_length: NotRequired[int]
+    num_generations_per_prompt: NotRequired[int]
+    temperature_sampling: NotRequired[float]
+    top_k: NotRequired[int | None]
+    top_p: NotRequired[float]
+    generate_with_teacher: NotRequired[bool]
+
+
+class SeqKDTrainerCfg(BaseTrainerCfg):
+    """Configuration for Sequence-level Knowledge Distillation (SeqKD) trainer.
+
+    SeqKD is a black-box distillation method where the teacher generates
+    text completions and the student trains on them with standard CE loss.
+    No teacher logits are required.
+
+    Attributes:
+        max_prompt_length: Maximum number of tokens for prompts.
+        max_completion_length: Maximum new tokens to generate per prompt.
+        num_generations_per_prompt: Completions to sample per prompt.
+        temperature_sampling: Sampling temperature for generation.
+        top_k: Top-k sampling parameter for generation.
+        top_p: Top-p sampling parameter for generation.
+    """
+
+    max_prompt_length: NotRequired[int]
+    max_completion_length: NotRequired[int]
+    num_generations_per_prompt: NotRequired[int]
+    temperature_sampling: NotRequired[float]
+    top_k: NotRequired[int | None]
+    top_p: NotRequired[float]
+
+
+class SparseDistillationTrainerCfg(DistillationTrainerCfg):
+    """Configuration for Sparse (Gray-Box) Distillation trainer.
+
+    Sparse distillation uses only the teacher's top-k logprobs to compute
+    a partial KL divergence loss.  This is compatible with API-based
+    teachers that expose limited logprob information.
+
+    Attributes:
+        top_k_teacher: Number of top logprobs from the teacher.
+        max_prompt_length: Maximum number of tokens for prompts.
+        max_completion_length: Maximum new tokens to generate per prompt.
+        num_generations_per_prompt: Completions to sample per prompt.
+        temperature_sampling: Sampling temperature for generation.
+        top_k: Top-k sampling parameter for generation.
+        top_p: Top-p sampling parameter for generation.
+    """
+
+    top_k_teacher: NotRequired[int]
+    max_prompt_length: NotRequired[int]
+    max_completion_length: NotRequired[int]
+    num_generations_per_prompt: NotRequired[int]
+    temperature_sampling: NotRequired[float]
+    top_k: NotRequired[int | None]
+    top_p: NotRequired[float]
+
+
 class KTOTrainerCfg(BaseTrainerCfg):
     """Configuration for Kahneman-Tversky Optimization trainer (KTOConfig).
 
@@ -1164,6 +1255,9 @@ class TrainerConfig(
     SFTTrainerCfg,
     RewardTrainerCfg,
     DistillationTrainerCfg,
+    OnPolicyDistillationTrainerCfg,
+    SeqKDTrainerCfg,
+    SparseDistillationTrainerCfg,
     KTOTrainerCfg,
     BCOTrainerCfg,
     CPOTrainerCfg,
@@ -1386,6 +1480,42 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "trainer_prefix": "distillationtrainer",
         "temperature": 2.0,
         "alpha": 0.9,
+    },
+    "on_policy_distillation": {
+        "trainer_prefix": "onpolicydistillationtrainer",
+        "temperature": 2.0,
+        "alpha": 0.9,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "num_generations_per_prompt": 1,
+        "temperature_sampling": 0.7,
+        "top_p": 0.95,
+        "top_k": 50,
+        "generate_with_teacher": False,
+    },
+    "seq_kd": {
+        "trainer_prefix": "seqkdtrainer",
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "num_generations_per_prompt": 1,
+        "temperature_sampling": 0.7,
+        "top_p": 0.95,
+        "top_k": 50,
+    },
+    "sparse_distillation": {
+        "trainer_prefix": "sparsedistillationtrainer",
+        "temperature": 2.0,
+        "alpha": 0.9,
+        "top_k_teacher": 20,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "num_generations_per_prompt": 1,
+        "temperature_sampling": 0.7,
+        "top_p": 0.95,
+        "top_k": 50,
     },
     "kto": {
         "trainer_prefix": "ktotrainer",

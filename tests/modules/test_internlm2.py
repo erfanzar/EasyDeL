@@ -1,7 +1,5 @@
 """Tests for InternLM2 model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 
 import easydel as ed

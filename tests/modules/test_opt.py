@@ -1,7 +1,5 @@
 """Tests for OPT model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

@@ -1,7 +1,5 @@
 """Tests for Gemma3 vision-language model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

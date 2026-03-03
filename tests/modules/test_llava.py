@@ -1,7 +1,5 @@
 """Tests for LLaVA vision-language model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

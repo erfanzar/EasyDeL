@@ -116,6 +116,7 @@ class TestElargeDryRun:
             "dpo.yaml",
             "orpo.yaml",
             "distillation.yaml",
+            "on_policy_distillation.yaml",
             "reward.yaml",
             "bco.yaml",
             "cpo.yaml",
@@ -128,6 +129,8 @@ class TestElargeDryRun:
             "gspo.yaml",
             "xpo.yaml",
             "nash_md.yaml",
+            "seq_kd.yaml",
+            "sparse_distillation.yaml",
         ],
     )
     def test_dry_run(self, config_name: str):
@@ -174,6 +177,12 @@ class TestElargeTraining:
         assert result.returncode == 0, f"Distillation training failed:\n{result.stderr or result.stdout}"
 
     @pytest.mark.slow
+    def test_on_policy_distillation(self):
+        """Test on-policy distillation training via YAML config."""
+        result = run_elarge_config("on_policy_distillation.yaml")
+        assert result.returncode == 0, f"On-policy distillation training failed:\n{result.stderr or result.stdout}"
+
+    @pytest.mark.slow
     def test_sdpo(self):
         """Test SDPO training via YAML config."""
         result = run_elarge_config("sdpo.yaml")
@@ -200,6 +209,7 @@ if __name__ == "__main__":
         "dpo": "dpo.yaml",
         "orpo": "orpo.yaml",
         "distillation": "distillation.yaml",
+        "on_policy_distillation": "on_policy_distillation.yaml",
         "reward": "reward.yaml",
         "bco": "bco.yaml",
         "cpo": "cpo.yaml",
@@ -212,6 +222,8 @@ if __name__ == "__main__":
         "gspo": "gspo.yaml",
         "xpo": "xpo.yaml",
         "nash_md": "nash_md.yaml",
+        "seq_kd": "seq_kd.yaml",
+        "sparse_distillation": "sparse_distillation.yaml",
     }
 
     if args.config == "all":

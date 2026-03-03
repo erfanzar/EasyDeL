@@ -1,7 +1,5 @@
 """Tests for LLaMA model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

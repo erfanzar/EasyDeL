@@ -1,5 +1,3 @@
-# pyright: reportPrivateLocalImportUsage=false
-
 import os
 import time
 

@@ -1678,6 +1678,48 @@ class eLargeModel:
             trainer_kwargs["eval_dataset"] = eval_dataset
             trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
 
+        elif trainer_type == "on_policy_distillation":
+            if teacher_model is None:
+                teacher_model = self.build_teacher_model()
+
+            if teacher_model is not None and base_state_class is not None:
+                teacher_model = teacher_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["student_model"] = model
+            trainer_kwargs["teacher_model"] = teacher_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+
+        elif trainer_type == "seq_kd":
+            if teacher_model is None:
+                teacher_model = self.build_teacher_model()
+
+            if teacher_model is not None and base_state_class is not None:
+                teacher_model = teacher_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["student_model"] = model
+            trainer_kwargs["teacher_model"] = teacher_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+
+        elif trainer_type == "sparse_distillation":
+            if teacher_model is None:
+                teacher_model = self.build_teacher_model()
+
+            if teacher_model is not None and base_state_class is not None:
+                teacher_model = teacher_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["student_model"] = model
+            trainer_kwargs["teacher_model"] = teacher_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+
         else:
             trainer_kwargs["arguments"] = training_args
             trainer_kwargs["model"] = model

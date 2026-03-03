@@ -1,7 +1,5 @@
 """Tests for Mamba2 model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 from jax import numpy as jnp

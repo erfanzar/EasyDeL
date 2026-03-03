@@ -1,7 +1,5 @@
 """Tests for Whisper model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

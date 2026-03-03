@@ -1,7 +1,5 @@
 """Tests for Mixtral MoE model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 
