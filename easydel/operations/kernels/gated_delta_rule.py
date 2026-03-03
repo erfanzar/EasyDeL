@@ -210,9 +210,10 @@ def _chunk_gated_delta_rule_fwd(
         key = l2norm(key, axis=-1, eps=1e-6)
 
     # Keep query/key/value/beta in input dtype to reduce memory footprint.
-    # Only decay needs f32 for exp/cumsum numerical stability.
-    # Matmuls use lax.Precision.HIGHEST for f32 accumulation internally.
+    # Critical numerics (Neumann series, exp, scan state) use float32 to
+    # prevent NaN from compounding bf16 precision loss across iterations.
     input_dtype = query.dtype
+    compute_dtype = jnp.float32
 
     if decay is None:
         decay = jnp.zeros((B, H, L), dtype=jnp.float32)
@@ -253,8 +254,8 @@ def _chunk_gated_delta_rule_fwd(
     decay_mask = jnp.tril(decay_mask)
 
     attn = jnp.einsum("bhcik,bhcjk->bhcij", k_beta, key, precision=_MATMUL_PRECISION)
-    # Multiply by f32 decay_mask then immediately cast to input dtype.
-    attn = -(attn * decay_mask).astype(input_dtype)
+    # Keep attn in float32 for Neumann series — bf16 matrix squaring causes NaN.
+    attn = -(attn * decay_mask).astype(compute_dtype)
     attn = jnp.where(mask_triu, 0.0, attn)
 
     # Resolve (I - A)^{-1} via Neumann series with repeated squaring.
@@ -262,7 +263,7 @@ def _chunk_gated_delta_rule_fwd(
     #   (I - A)^{-1} = I + A + A^2 + ... + A^{n-1}
     # Uses O(log n) parallel batched matmuls instead of O(n) sequential scan,
     # eliminating the massive scan carry tensor entirely.
-    eye = jnp.eye(chunk_size, dtype=input_dtype)
+    eye = jnp.eye(chunk_size, dtype=compute_dtype)
     M = eye + attn
     P = attn
     for _ in range(math.ceil(math.log2(max(chunk_size, 2))) - 1):
@@ -273,19 +274,20 @@ def _chunk_gated_delta_rule_fwd(
     # Precompute all exp values once on full tensors instead of per-step in scan.
     # This moves exp out of the scan body, simplifying backward and allowing
     # XLA to parallelize exp across all chunks at once.
-    g_cumsum_exp = jnp.exp(g_cumsum).astype(input_dtype)  # (B, H, C, cs)
+    # Keep in float32 — bf16 exp can overflow (max ~65504) causing NaN.
+    g_cumsum_exp = jnp.exp(g_cumsum)  # (B, H, C, cs) — f32
     g_end = g_cumsum[:, :, :, -1]  # (B, H, C)
-    g_end_exp = jnp.exp(g_end).astype(input_dtype)  # (B, H, C)
-    g_diff_state_exp = jnp.exp(g_end[:, :, :, None] - g_cumsum).astype(input_dtype)
+    g_end_exp = jnp.exp(g_end)  # (B, H, C) — f32
+    g_diff_state_exp = jnp.exp(g_end[:, :, :, None] - g_cumsum)  # f32
 
     value_local = jnp.einsum("bhcij,bhcjv->bhciv", attn, v_beta, precision=_MATMUL_PRECISION)
     k_beta_scaled = k_beta * g_cumsum_exp[:, :, :, :, None]
     k_cumdecay = jnp.einsum("bhcij,bhcjk->bhcik", attn, k_beta_scaled, precision=_MATMUL_PRECISION)
 
     if initial_state is None:
-        initial_state = jnp.zeros((B, H, K_dim, V_dim), dtype=input_dtype)
+        initial_state = jnp.zeros((B, H, K_dim, V_dim), dtype=compute_dtype)
     else:
-        initial_state = initial_state.astype(input_dtype)
+        initial_state = initial_state.astype(compute_dtype)
 
     mask_triu_inner = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=bool), k=1)
 
@@ -297,7 +299,7 @@ def _chunk_gated_delta_rule_fwd(
         g_cumsum_exp.transpose(2, 0, 1, 3),  # (C, B, H, cs)
         g_end_exp.transpose(2, 0, 1),  # (C, B, H)
         g_diff_state_exp.transpose(2, 0, 1, 3),  # (C, B, H, cs)
-        decay_mask.astype(input_dtype).transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, cs)
+        decay_mask.transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, cs) — keep f32
     )
 
     def chunk_step(state, inputs):
@@ -366,25 +368,21 @@ def _single_step_gated_delta_rule_fwd(
         query = l2norm(query, axis=-1, eps=1e-6)
         key = l2norm(key, axis=-1, eps=1e-6)
 
+    # Pure inference (single token) — no iterative accumulation, so keep
+    # everything in the input dtype for speed. Only exp(decay) uses f32.
     query = query.squeeze(2)
     key = key.squeeze(2)
     value = value.squeeze(2)
     beta = beta.squeeze(2)
-
-    query = query.astype(jnp.float32)
-    key = key.astype(jnp.float32)
-    value = value.astype(jnp.float32)
-    beta = beta.astype(jnp.float32)
-    recurrent_state = recurrent_state.astype(jnp.float32)
 
     head_dim = query.shape[-1]
     scale = 1.0 / (head_dim**0.5)
     query = query * scale
 
     if decay is not None:
-        decay = decay.squeeze(2).astype(jnp.float32)
-        g_exp = jnp.exp(decay)[:, :, None, None]
-        recurrent_state = recurrent_state * g_exp
+        decay = decay.squeeze(2)
+        g_exp = jnp.exp(decay.astype(jnp.float32)).astype(recurrent_state.dtype)
+        recurrent_state = recurrent_state * g_exp[:, :, None, None]
 
     kv_mem = jnp.sum(recurrent_state * key[:, :, :, None], axis=-2)  # (B, H, V)
 
