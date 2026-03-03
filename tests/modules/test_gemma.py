@@ -1,7 +1,5 @@
 """Tests for Gemma model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

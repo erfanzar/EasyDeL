@@ -1,7 +1,5 @@
 """Tests for OLMo2 model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

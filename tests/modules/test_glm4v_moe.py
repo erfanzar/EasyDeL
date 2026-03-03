@@ -1,7 +1,5 @@
 """Tests for GLM4V-MoE model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import numpy as np
 import pytest
 import transformers

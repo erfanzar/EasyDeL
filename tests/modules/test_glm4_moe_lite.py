@@ -1,7 +1,5 @@
 """Tests for GLM4-MoE-Lite model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import types
 
 import pytest

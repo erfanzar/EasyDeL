@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-# pyright: reportPrivateLocalImportUsage=false
 import logging
 from collections.abc import Callable, Iterable
 from functools import lru_cache

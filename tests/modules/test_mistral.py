@@ -1,7 +1,5 @@
 """Tests for Mistral model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

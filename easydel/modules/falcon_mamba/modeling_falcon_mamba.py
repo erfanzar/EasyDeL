@@ -480,7 +480,6 @@ class FalconMambaMixer(nn.Module):
         if attention_mask is not None:
             hidden_states = hidden_states * jnp.expand_dims(attention_mask, 1)
 
-        # --- Packed state updates (eSurge decode) ---
         packed_query_start_loc = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
         packed_num_seqs = getattr(cache_metadata, "num_seqs", None) if cache_metadata is not None else None
         use_packed_state_updates = (
@@ -582,7 +581,6 @@ class FalconMambaMixer(nn.Module):
             contextualized_states = checkpoint_name(self.out_proj(y.astype(dtype)), name="ssm_output_proj")
             return contextualized_states, cache_view
 
-        # --- Standard path (prefill / single-token decode) ---
         cache_view = cache_params
         if cache_params is not None and cache_params.recurrent_state is not None:
             ssm_state0 = cache_params.recurrent_state.astype(jnp.float32)

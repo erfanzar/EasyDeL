@@ -1,7 +1,5 @@
 """Tests for DBRX MoE model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

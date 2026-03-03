@@ -25,6 +25,9 @@ Configs:
     - dpo.yaml: Direct Preference Optimization
     - orpo.yaml: Odds Ratio Preference Optimization
     - distillation.yaml: Knowledge Distillation
+    - on_policy_distillation.yaml: On-Policy Knowledge Distillation
+    - seq_kd.yaml: Sequence-level Knowledge Distillation (SeqKD)
+    - sparse_distillation.yaml: Sparse (Gray-Box) Distillation
     - sdpo.yaml: Self-Distillation Policy Optimization
 
 Usage:

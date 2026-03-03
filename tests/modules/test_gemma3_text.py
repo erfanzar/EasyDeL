@@ -1,7 +1,5 @@
 """Tests for Gemma3 text-only model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

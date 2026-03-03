@@ -25,6 +25,7 @@ from .group_sequence_policy_optimization import GSPOConfig, GSPOTrainer
 from .kto_trainer import KTOConfig, KTOTrainer
 from .nash_md_trainer import NashMDConfig, NashMDTrainer
 from .odds_ratio_preference_optimization_trainer import ORPOConfig, ORPOTrainer
+from .on_policy_distillation_trainer import OnPolicyDistillationConfig, OnPolicyDistillationTrainer
 from .packer import pack_sequences
 from .prompt_transforms import (
     BCOPreprocessTransform,
@@ -41,6 +42,8 @@ from .proximal_policy_optimization_trainer import PPOConfig, PPOTrainer
 from .ray_scaler import RayDistributedTrainer
 from .reward_trainer import RewardConfig, RewardTrainer
 from .self_distillation_policy_optimization import SDPOConfig, SDPOTrainer
+from .seq_kd_trainer import SeqKDConfig, SeqKDTrainer
+from .sparse_distillation_trainer import SparseDistillationConfig, SparseDistillationTrainer
 from .supervised_fine_tuning_trainer import SFTConfig, SFTTrainer
 from .trainer import Trainer
 from .training_configurations import TrainingArguments
@@ -76,6 +79,8 @@ __all__ = (
     "ORPOConfig",
     "ORPOPreprocessTransform",
     "ORPOTrainer",
+    "OnPolicyDistillationConfig",
+    "OnPolicyDistillationTrainer",
     "PPOConfig",
     "PPOPreprocessTransform",
     "PPOTrainer",
@@ -88,6 +93,10 @@ __all__ = (
     "SFTConfig",
     "SFTPreprocessTransform",
     "SFTTrainer",
+    "SeqKDConfig",
+    "SeqKDTrainer",
+    "SparseDistillationConfig",
+    "SparseDistillationTrainer",
     "Trainer",
     "TrainingArguments",
     "XPOConfig",

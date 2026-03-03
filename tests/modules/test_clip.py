@@ -1,7 +1,5 @@
 """Tests for CLIP model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import jax.numpy as jnp
 import numpy as np
 import pytest

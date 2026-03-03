@@ -1,7 +1,5 @@
 """Tests for SigLIP model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

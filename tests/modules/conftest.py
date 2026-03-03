@@ -4,8 +4,6 @@ This module provides reusable fixtures for testing EasyDeL models across differe
 configurations, attention mechanisms, and hardware setups.
 """
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import gc
 
 import jax

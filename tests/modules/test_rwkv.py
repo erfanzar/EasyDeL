@@ -1,7 +1,5 @@
 """Tests for RWKV model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

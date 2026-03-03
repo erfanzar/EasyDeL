@@ -1,7 +1,5 @@
 """Tests for Falcon model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

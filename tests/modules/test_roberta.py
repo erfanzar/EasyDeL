@@ -1,7 +1,5 @@
 """Tests for RoBERTa model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 
@@ -56,9 +54,9 @@ class TestRoBERTa:
             config=roberta_config,
             small_model_config=small_model_config,
         )
-        assert result.success, (
-            f"RoBERTa SEQUENCE_CLASSIFICATION failed: {result.error_message or result.comparison.details}"
-        )
+        assert (
+            result.success
+        ), f"RoBERTa SEQUENCE_CLASSIFICATION failed: {result.error_message or result.comparison.details}"
 
 
 if __name__ == "__main__":

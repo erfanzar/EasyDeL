@@ -1,7 +1,5 @@
 """Tests for Mistral3 model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import jax.numpy as jnp
 import pytest
 import transformers

@@ -1,7 +1,5 @@
 """Tests for GPT-J model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

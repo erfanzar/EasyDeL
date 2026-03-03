@@ -1,7 +1,5 @@
 """Tests for Qwen3-MoE model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

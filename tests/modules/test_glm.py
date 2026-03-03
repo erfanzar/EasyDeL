@@ -1,7 +1,5 @@
 """Tests for GLM model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

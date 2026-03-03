@@ -616,13 +616,10 @@ class AttentionMetadataBuilder:
         *,
         attention_mechanism: str | None = None,
         expected_cache_type: tp.Literal["auto", "transformer", "ragged", "recurrent"] = "auto",
-        # --- Transformer / hybrid fields ---
         postpadded: bool = False,
         starts: IntVectorLike | None = None,
         indexs: IntVectorLike | None = None,
-        # Optional cache view to infer starts/indexs when absent.
         cache_view: SupportsStartsIndexs | None = None,
-        # --- Ragged/paged fields ---
         pages_tables: IntMatrixLike | None = None,
         block_tables: IntMatrixLike | None = None,
         context_lens: IntVectorLike | None = None,
@@ -637,7 +634,6 @@ class AttentionMetadataBuilder:
         page_size: int = 128,
         prefill_chunk_size: int = 512,
         num_slices_per_kv_cache_update_page: int | None = None,
-        # --- Raw batch inputs for computing ragged fields ---
         scheduled_full: IntVectorLike | None = None,
         active_mask_full: BoolVectorLike | None = None,
         num_computed_tokens: IntVectorLike | None = None,

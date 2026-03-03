@@ -4,8 +4,6 @@ This module provides tester classes for different model task types,
 including CAUSAL_LM, BASE_MODULE, SEQUENCE_CLASSIFICATION, VLM, etc.
 """
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import traceback
 from dataclasses import dataclass, field
 from typing import Any

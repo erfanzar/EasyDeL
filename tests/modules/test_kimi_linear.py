@@ -1,7 +1,5 @@
 """Tests for Kimi Linear model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 
 import easydel as ed

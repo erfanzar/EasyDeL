@@ -560,7 +560,6 @@ class GatedDeltaRuleOp(OperationImpl):
             if decay.ndim == 3:
                 decay = decay.transpose(0, 2, 1)
 
-        # --- shard_map path: preserve sharding across internal transposes ---
         if self.metadata.mesh is not None and mode is not None:
             with self.metadata.mesh:
                 shardings_bhtd = self.metadata.get_shardings(mode, layout="bhtd")

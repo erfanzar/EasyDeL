@@ -1,7 +1,5 @@
 """Tests for Seed OSS model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 

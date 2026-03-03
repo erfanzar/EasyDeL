@@ -1,7 +1,5 @@
 """Tests for Qwen3OmniMoe model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 
 import easydel as ed

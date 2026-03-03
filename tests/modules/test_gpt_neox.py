@@ -1,7 +1,5 @@
 """Tests for GPT-NeoX model."""
 
-# pyright: reportPrivateLocalImportUsage=false
-
 import pytest
 import transformers
 
