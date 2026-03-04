@@ -1249,7 +1249,7 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_eformer_versions = ["0.0.98"]
+    _targeted_eformer_versions = ["0.0.99"]
     _targeted_ejkernel_versions = ["0.0.70"]
 
     from eformer import __version__ as _eform_version
