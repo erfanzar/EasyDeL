@@ -6,6 +6,7 @@ easydel.inference.esurge.core package
 
    binary_search
    coordinator
+   dp_sharding
    interface
    manager
    page_pool

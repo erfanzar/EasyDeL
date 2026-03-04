@@ -49,7 +49,7 @@ class NashMDConfig(GRPOConfig):
     """
 
     trainer_prefix: str | None = field(
-        default="nashmdtrainer",
+        default="NashMD",
         metadata={"help": "default prefix name for trainer."},
     )
 

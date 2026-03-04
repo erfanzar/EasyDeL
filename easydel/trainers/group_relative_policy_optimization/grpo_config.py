@@ -40,7 +40,7 @@ class GRPOConfig(TrainingArguments):
     """
 
     trainer_prefix: str | None = field(
-        default="grpotrainer",
+        default="GRPO",
         metadata={"help": "default prefix name for trainer."},
     )
     remove_unused_columns: bool | None = field(

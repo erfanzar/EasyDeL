@@ -122,7 +122,9 @@ def on_policy_distillation_step(
         teacher_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, teacher_kwargs)
         teacher_kwargs = sanitize_model_call_kwargs(teacher_kwargs)
 
-        _teacher_static_kw = {k: teacher_kwargs.pop(k) for k in list(teacher_kwargs) if not hasattr(teacher_kwargs[k], "shape")}
+        _teacher_static_kw = {
+            k: teacher_kwargs.pop(k) for k in list(teacher_kwargs) if not hasattr(teacher_kwargs[k], "shape")
+        }
 
         # prevent_cse=True prevents XLA from merging common subexpressions
         # (e.g. shared embedding lookups on the same input_ids) across the

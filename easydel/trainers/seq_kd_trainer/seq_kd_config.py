@@ -50,7 +50,7 @@ class SeqKDConfig(TrainingArguments):
     """
 
     trainer_prefix: str | None = field(
-        default="seqkdtrainer",
+        default="SeqKD",
         metadata={"help": "Prefix used for trainer logs, checkpoints, and wandb runs."},
     )
     remove_unused_columns: bool | None = field(

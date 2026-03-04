@@ -54,7 +54,7 @@ class SDPOConfig(GRPOConfig):
     """
 
     trainer_prefix: str | None = field(
-        default="sdpotrainer",
+        default="SDPO",
         metadata={"help": "Default prefix name for the trainer checkpoint directory."},
     )
 

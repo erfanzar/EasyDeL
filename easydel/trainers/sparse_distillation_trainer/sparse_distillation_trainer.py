@@ -122,9 +122,9 @@ class SparseDistillationTrainer(Trainer):
             tokenizer.pad_token = tokenizer.eos_token
 
         assert isinstance(arguments, SparseDistillationConfig), "passed argument must be a `SparseDistillationConfig`."
-        assert (
-            teacher_model is not None or teacher_fn is not None
-        ), "Either `teacher_model` or `teacher_fn` must be provided."
+        assert teacher_model is not None or teacher_fn is not None, (
+            "Either `teacher_model` or `teacher_fn` must be provided."
+        )
 
         self.arguments = arguments
 

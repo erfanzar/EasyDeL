@@ -46,7 +46,7 @@ class GKDConfig(SFTConfig):
     """
 
     trainer_prefix: str | None = field(
-        default="gkdtrainer",
+        default="GKD",
         metadata={"help": "Default prefix used for checkpoints and logs."},
     )
     temperature: float = field(

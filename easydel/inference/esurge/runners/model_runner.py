@@ -95,9 +95,7 @@ if typing.TYPE_CHECKING:
 logger = get_logger("eSurge")
 
 
-def _get_padded_num_reqs_with_upper_limit(
-    x: int, upper_limit: int, min_input_pad: int
-) -> int:  # pyright: ignore[reportUnusedFunction]
+def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:  # pyright: ignore[reportUnusedFunction]
     """Calculate padded request count for compilation efficiency.
 
     Pads the number of requests to powers of 2 (up to 8) or the nearest
@@ -703,12 +701,8 @@ class eSurgeRunner:
                 logger.debug(f"fill_slice skip ({pr_reqs}): {e}")
 
         try:
-            _ = swap_rows.lower(
-                token_ids, jnp.int32(0), jnp.int32(1)
-            ).compile()  # pyright: ignore[reportFunctionMemberAccess]
-            _ = move_row.lower(
-                token_ids, jnp.int32(0), jnp.int32(1)
-            ).compile()  # pyright: ignore[reportFunctionMemberAccess]
+            _ = swap_rows.lower(token_ids, jnp.int32(0), jnp.int32(1)).compile()  # pyright: ignore[reportFunctionMemberAccess]
+            _ = move_row.lower(token_ids, jnp.int32(0), jnp.int32(1)).compile()  # pyright: ignore[reportFunctionMemberAccess]
             logger.debug("swap_rows and move_row compiled")
         except Exception as e:
             logger.debug(f"swap_rows/move_row skip: {e}")

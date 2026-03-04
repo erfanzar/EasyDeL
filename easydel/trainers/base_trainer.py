@@ -1300,9 +1300,7 @@ class BaseTrainer(BaseTrainerProtocol):
             reserve_tokens = esurge_kwargs.get("reserve_tokens")
             if reserve_tokens is None:
                 reserve_tokens = esurge_kwargs.get("max_num_seqs", 0)
-            esurge_kwargs["max_model_len"] = (
-                sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)
-            )  # pyright: ignore[reportOptionalOperand]
+            esurge_kwargs["max_model_len"] = sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)  # pyright: ignore[reportOptionalOperand]
 
             logger.info_once(f"Creating eSurge {pprint.pformat(esurge_kwargs)}")
             logger.info_once(
@@ -1932,7 +1930,7 @@ class BaseTrainer(BaseTrainerProtocol):
         expected_total = sum(count * num_return_sequences for count in prompt_row_counts)
         if len(all_completions) != expected_total:
             log_debug_maybe(
-                "Preview generation completion count mismatch: " f"expected {expected_total}, got {len(all_completions)}"
+                f"Preview generation completion count mismatch: expected {expected_total}, got {len(all_completions)}"
             )
 
         needs_decoding = any(prepared.get("prompt_text") is None for prepared in prepared_prompts)

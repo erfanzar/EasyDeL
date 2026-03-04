@@ -44,7 +44,7 @@ class CPOConfig(TrainingArguments):
     """
 
     trainer_prefix: str | None = field(
-        default="cpotrainer",
+        default="CPO",
         metadata={"help": "Default prefix used when generating checkpoint names or logs."},
     )
     beta: float = field(

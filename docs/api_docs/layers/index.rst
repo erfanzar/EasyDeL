@@ -11,3 +11,4 @@ easydel.layers package
    norms/index
    quantization/index
    rotary/index
+   _sharding

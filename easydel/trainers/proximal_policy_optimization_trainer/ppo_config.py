@@ -46,7 +46,7 @@ class PPOConfig(TrainingArguments):
     """
 
     trainer_prefix: str | None = field(
-        default="ppotrainer",
+        default="PPO",
         metadata={"help": "Default prefix name for trainer outputs/checkpoints."},
     )
     remove_unused_columns: bool | None = field(

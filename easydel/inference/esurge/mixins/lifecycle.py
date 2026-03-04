@@ -151,7 +151,7 @@ class EngineLifecycleMixin:
                 return
             self._scheduler_heartbeat_last_warn = now
             logger.warning(
-                "Scheduler heartbeat stale: last update %.1fs ago " "(threshold=%.0fs). Possible hang or deadlock.",
+                "Scheduler heartbeat stale: last update %.1fs ago (threshold=%.0fs). Possible hang or deadlock.",
                 age,
                 _SCHEDULER_HEARTBEAT_WARN_S,
             )
@@ -501,7 +501,7 @@ class EngineLifecycleMixin:
         """
         if self.num_running_requests > 0 or self.num_pending_requests > 0:
             logger.warning(
-                "Skipping model-state release because requests are active or pending " "(running=%d, pending=%d).",
+                "Skipping model-state release because requests are active or pending (running=%d, pending=%d).",
                 self.num_running_requests,
                 self.num_pending_requests,
             )

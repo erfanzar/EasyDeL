@@ -214,9 +214,7 @@ def _count_kv_layers(text_config) -> int:
     layer_types = getattr(text_config, "layer_types", None)
     if layer_types is not None:
         num_kv_layers = sum(
-            1
-            for lt in layer_types
-            if "full" in lt or "sliding" in lt or lt == "attention" or lt == "parallel_hybrid"
+            1 for lt in layer_types if "full" in lt or "sliding" in lt or lt == "attention" or lt == "parallel_hybrid"
         )
         if num_kv_layers > 0:
             num_hidden_layers = num_kv_layers
@@ -3497,11 +3495,7 @@ class EasyGenerationMixin:
 
         # Freshly created engines already carry current model weights.
         # Re-refreshing immediately forces an unnecessary scheduler restart.
-        if (
-            not created_new_engine
-            and esurge.num_running_requests == 0
-            and esurge.num_pending_requests == 0
-        ):
+        if not created_new_engine and esurge.num_running_requests == 0 and esurge.num_pending_requests == 0:
             esurge.update_model_weights(self)
 
         # Auto-resume only after weights/model state are refreshed.

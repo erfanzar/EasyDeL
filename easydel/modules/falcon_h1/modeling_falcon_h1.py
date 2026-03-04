@@ -668,9 +668,9 @@ class FalconH1Mixer(nn.Module):
 
                 # 2) Split conv output into x, B, C
                 groups_time_state_size = self.n_groups * self.ssm_state_size
-                x_i = conv_out_i[:self.intermediate_size]
-                ssm_b_i = conv_out_i[self.intermediate_size:self.intermediate_size + groups_time_state_size]
-                ssm_c_i = conv_out_i[self.intermediate_size + groups_time_state_size:]
+                x_i = conv_out_i[: self.intermediate_size]
+                ssm_b_i = conv_out_i[self.intermediate_size : self.intermediate_size + groups_time_state_size]
+                ssm_c_i = conv_out_i[self.intermediate_size + groups_time_state_size :]
 
                 x_i = x_i.reshape(1, self.num_heads, self.head_dim)
                 ssm_b_i = ssm_b_i.reshape(1, self.n_groups, self.ssm_state_size)
@@ -680,19 +680,27 @@ class FalconH1Mixer(nn.Module):
                 # 3) SSM single step
                 ssm_state_i = jax.lax.dynamic_slice_in_dim(ssm_states_c, slot, 1, axis=0)  # [1, H, D, N]
                 y_i, new_ssm_state_i = _single_step_ssm2_fwd(
-                    x=x_i, A=A_real, B=ssm_b_i, C=ssm_c_i,
-                    D=D_val, dt=dt_i, ssm_state=ssm_state_i,
+                    x=x_i,
+                    A=A_real,
+                    B=ssm_b_i,
+                    C=ssm_c_i,
+                    D=D_val,
+                    dt=dt_i,
+                    ssm_state=ssm_state_i,
                     n_groups=self.n_groups,
                 )
 
                 # 4) Write back states
                 conv_states_c = jax.lax.dynamic_update_slice_in_dim(conv_states_c, conv_state_i, slot, axis=0)
-                ssm_states_c = jax.lax.dynamic_update_slice_in_dim(ssm_states_c, new_ssm_state_i.astype(ssm_states_c.dtype), slot, axis=0)
+                ssm_states_c = jax.lax.dynamic_update_slice_in_dim(
+                    ssm_states_c, new_ssm_state_i.astype(ssm_states_c.dtype), slot, axis=0
+                )
                 token_outputs_c = token_outputs_c.at[idx].set(y_i.reshape(self.intermediate_size))
                 return conv_states_c, ssm_states_c, token_outputs_c
 
             conv_states, ssm_states, token_outputs = jax.lax.fori_loop(
-                0, seq_len,
+                0,
+                seq_len,
                 _body,
                 (conv_states, ssm_states, token_outputs),
             )

@@ -48,7 +48,7 @@ class OnPolicyDistillationConfig(DistillationConfig):
     """
 
     trainer_prefix: str | None = field(
-        default="onpolicydistillationtrainer",
+        default="OnPolicyDistillation",
         metadata={"help": "Prefix used for trainer logs, checkpoints, and wandb runs."},
     )
     remove_unused_columns: bool | None = field(

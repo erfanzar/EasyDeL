@@ -417,9 +417,7 @@ class TrainingArguments:
     )
     esurge_max_num_seq_buckets: list[int] | None = field(
         default=None,
-        metadata={
-            "help": "Optional explicit sequence-capacity buckets for eSurge runner compilation."
-        },
+        metadata={"help": "Optional explicit sequence-capacity buckets for eSurge runner compilation."},
     )
     esurge_min_input_pad: int | None = field(
         default=None,
@@ -623,7 +621,7 @@ class TrainingArguments:
         metadata={"help": "The pattern to use to extract weight distribution."},
     )
     weight_distribution_log_steps: int = field(
-        default=50,
+        default=500,
         metadata={"help": "log weight distribution every X steps."},
     )
 
@@ -1236,19 +1234,16 @@ class TrainingArguments:
                 )
                 return None
             wandb_name = self.wandb_name
-            prefix = self.trainer_prefix
-            if prefix is None:
-                prefix = ""
-            else:
-                prefix = "-" + prefix
+            prefix = (self.trainer_prefix or "").strip()
+            project_suffix = f"-{prefix}" if prefix else ""
             resolved_model_name = self.model_name if isinstance(self.model_name, str) and self.model_name else "model"
             safe_model_name = resolved_model_name.lower().replace("/", "-")
             if wandb_name is None:
-                _time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                wandb_name = f"{safe_model_name}-{_time}"
-
+                wandb_name = self.build_wandb_run_name(safe_model_name)
+            else:
+                wandb_name = wandb_name + "-" + safe_model_name
             return wandb.init(
-                project=f"EasyDeL{prefix}-{safe_model_name}",
+                project=f"EasyDeL{project_suffix}",
                 config=self.to_dict(),
                 save_code=True,
                 name=wandb_name,
@@ -1256,6 +1251,39 @@ class TrainingArguments:
                 entity=self.wandb_entity,
             )
         return None
+
+    @staticmethod
+    def _wandb_token(value: tp.Any, fallback: str = "na") -> str:
+        """Normalize arbitrary config values into safe W&B name tokens."""
+        if value is None:
+            return fallback
+        if hasattr(value, "value"):
+            value = value.value
+        token = str(value).strip().lower()
+        token = token.replace("/", "-").replace(" ", "")
+        token = re.sub(r"[^a-z0-9._-]", "-", token)
+        token = re.sub(r"-{2,}", "-", token).strip("-")
+        return token or fallback
+
+    @staticmethod
+    def _wandb_float_token(value: float | int | None, fallback: str = "none") -> str:
+        if value is None:
+            return fallback
+        number = float(value)
+        token = f"{number:g}".replace("+", "")
+        return token
+
+    def build_wandb_run_name(self, model_name: str) -> str:
+        """Build a structured default W&B run name.
+
+        Format:
+            ``{trainer}-{model_name}-b{batch}-lr{lr}-tx-{optimizer}``
+        """
+        trainer = (self.trainer_prefix or "Trainer").strip()
+        batch = int(self.total_batch_size)
+        lr = self._wandb_float_token(self.learning_rate, fallback="none")
+        optimizer = self._wandb_token(self.optimizer, fallback="NA")
+        return f"{trainer}-{model_name}-b{batch}-lr{lr}-tx-{optimizer}"
 
     def ensure_training_time_limit(self, time_passed):
         if self.training_time_limit is not None and time_passed > self._time_to_seconds(self.training_time_limit):
