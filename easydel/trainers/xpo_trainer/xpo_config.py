@@ -44,7 +44,7 @@ class XPOConfig(GRPOConfig):
     """
 
     trainer_prefix: str | None = field(
-        default="xpotrainer",
+        default="XPO",
         metadata={"help": "default prefix name for trainer."},
     )
 

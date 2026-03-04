@@ -290,6 +290,7 @@ class Qwen3_5Model(Qwen3VLModel):
             precision=precision,
             rngs=rngs,
         )
+
     def __call__(
         self,
         input_ids: jax.Array | None = None,

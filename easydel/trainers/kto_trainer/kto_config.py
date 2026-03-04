@@ -28,7 +28,7 @@ class KTOConfig(TrainingArguments):
     """Configuration for the :class:`~easydel.trainers.KTOTrainer`."""
 
     trainer_prefix: str | None = field(
-        default="ktotrainer",
+        default="KTO",
         metadata={"help": "Default prefix used for checkpoints and experiment tracking."},
     )
     max_length: int | None = field(

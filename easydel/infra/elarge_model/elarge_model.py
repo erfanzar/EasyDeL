@@ -1884,7 +1884,9 @@ class eLargeModel:
         try:
             logger.info(f"Starting evaluation on tasks: {tasks}")
             logger.info("Using eSurge engine")
-            logger.info(f"Batch size: {batch_size}, Few-shot: {num_fewshot if num_fewshot is not None else 'task-default'}")
+            logger.info(
+                f"Batch size: {batch_size}, Few-shot: {num_fewshot if num_fewshot is not None else 'task-default'}"
+            )
 
             results = evaluator.simple_evaluate(
                 model=eval_adapter,

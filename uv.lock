@@ -739,9 +739,9 @@ requires-dist = [
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "eformer", specifier = "==0.0.98" },
     { name = "einops", specifier = "~=0.8.0" },
-    { name = "ejkernel", specifier = "==0.0.67" },
-    { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.67" },
-    { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.67" },
+    { name = "ejkernel", specifier = "==0.0.70" },
+    { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.70" },
+    { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.70" },
     { name = "eopod", marker = "extra == 'podutils'", specifier = "==0.0.35" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "flax", specifier = "==0.12.3" },
@@ -820,7 +820,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.67"
+version = "0.0.70"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beartype" },
@@ -832,9 +832,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c2/fc/e44dbb76b074abc619d70ad8b19307cba4269c19e8615c2e81e2ca5f096e/ejkernel-0.0.67.tar.gz", hash = "sha256:d1529686b8534c57808840c55ea9e437dea0ecb759333a6047cc3dadd8f61c52", size = 1488729, upload-time = "2026-03-02T10:57:21.567Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/2c/65/142b001e852dc74fa1725ca942b169d10e0a9631d49e6b1f15e7cc629d6b/ejkernel-0.0.70.tar.gz", hash = "sha256:baf74b88813cb92558404547718a50658533eb99c3e88a680d46974551dfed8d", size = 1520535, upload-time = "2026-03-04T02:20:10.626Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/66/6c/62bf167db3e1925b27d166e8ed6ca39680d039cea8b130b04941628f12b8/ejkernel-0.0.67-py3-none-any.whl", hash = "sha256:efff4a2d88050801dffb7d80b25b388e04a9cd13aa25de310d8e6055211e2aef", size = 3222822, upload-time = "2026-03-02T10:57:23.127Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/2c/6a398be72592d673a9b8a548129d3732421d20576ebe20bbbe9ea16a0115/ejkernel-0.0.70-py3-none-any.whl", hash = "sha256:5cab57ce47fcfd7dca4d3a7360583bef7fb7c218c1b7a7e69c382993000b5152", size = 3266591, upload-time = "2026-03-04T02:20:08.203Z" },
 ]
 
 [package.optional-dependencies]

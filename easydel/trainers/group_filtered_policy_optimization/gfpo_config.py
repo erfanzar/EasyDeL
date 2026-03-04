@@ -62,7 +62,7 @@ class GFPOConfig(GRPOConfig):
     """
 
     trainer_prefix: str | None = field(
-        default="gfpotrainer",
+        default="GFPO",
         metadata={"help": "default prefix name for trainer."},
     )
     num_remains_in_group: int | None = field(

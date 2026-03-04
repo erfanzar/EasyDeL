@@ -827,9 +827,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             try:
                 resolved_backend = jax.default_backend()
             except Exception as err:
-                logger.warning(
-                    f"Unable to resolve JAX default backend ({err}); falling back to 'cpu' for config init."
-                )
+                logger.warning(f"Unable to resolve JAX default backend ({err}); falling back to 'cpu' for config init.")
                 resolved_backend = "cpu"
 
         self.backend = getattr(self, "backend", resolved_backend)
@@ -995,8 +993,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             if known_product > 1:
                 normalized_axis_dims = tuple(-1 if dim == -1 else 1 for dim in axis_dims)
                 logger.warning(
-                    "Single-device runtime detected with multi-device sharding axis_dims=%s; "
-                    "normalizing to %s.",
+                    "Single-device runtime detected with multi-device sharding axis_dims=%s; normalizing to %s.",
                     axis_dims,
                     normalized_axis_dims,
                 )

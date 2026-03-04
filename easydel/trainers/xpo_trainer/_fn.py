@@ -120,14 +120,20 @@ def xpo_step(
     batch = dict(batch)
     batch["_ref_on_policy"] = jax.lax.stop_gradient(
         _compute_logps(
-            ref_module, batch["prompt_ids"], batch["prompt_mask"],
-            batch["policy_completion_ids"], batch["policy_completion_mask"],
+            ref_module,
+            batch["prompt_ids"],
+            batch["prompt_mask"],
+            batch["policy_completion_ids"],
+            batch["policy_completion_mask"],
         )
     )
     batch["_ref_on_ref"] = jax.lax.stop_gradient(
         _compute_logps(
-            ref_module, batch["prompt_ids"], batch["prompt_mask"],
-            batch["ref_completion_ids"], batch["ref_completion_mask"],
+            ref_module,
+            batch["prompt_ids"],
+            batch["prompt_mask"],
+            batch["ref_completion_ids"],
+            batch["ref_completion_mask"],
         )
     )
     del ref_module

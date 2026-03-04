@@ -96,9 +96,9 @@ class OnPolicyDistillationTrainer(Trainer):
             tokenizer = processing_class.tokenizer
         if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
             tokenizer.pad_token = tokenizer.eos_token
-        assert isinstance(
-            arguments, OnPolicyDistillationConfig
-        ), "passed argument must be an `OnPolicyDistillationConfig`."
+        assert isinstance(arguments, OnPolicyDistillationConfig), (
+            "passed argument must be an `OnPolicyDistillationConfig`."
+        )
 
         self.arguments = arguments
 

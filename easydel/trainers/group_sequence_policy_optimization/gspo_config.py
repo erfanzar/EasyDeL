@@ -58,7 +58,7 @@ class GSPOConfig(GRPOConfig):
     """
 
     trainer_prefix: str | None = field(
-        default="gspotrainer",
+        default="GSPO",
         metadata={"help": "default prefix name for trainer."},
     )
     importance_sampling_level: str = field(

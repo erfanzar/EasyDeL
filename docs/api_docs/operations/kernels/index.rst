@@ -8,6 +8,7 @@ easydel.operations.kernels package
    decode_attention
    flash_attention
    gated_delta_rule
+   glm_moe_dsa_indexer
    kda
    paged_flash_attention
    ragged_page_attention

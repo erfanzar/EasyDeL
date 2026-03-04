@@ -187,6 +187,7 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
             precision=precision,
             rngs=rngs,
         )
+
     def __call__(
         self,
         input_ids: jax.Array | None = None,

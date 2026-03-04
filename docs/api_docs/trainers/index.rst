@@ -15,10 +15,13 @@ easydel.trainers package
    kto_trainer/index
    nash_md_trainer/index
    odds_ratio_preference_optimization_trainer/index
+   on_policy_distillation_trainer/index
    proximal_policy_optimization_trainer/index
    ray_scaler/index
    reward_trainer/index
    self_distillation_policy_optimization/index
+   seq_kd_trainer/index
+   sparse_distillation_trainer/index
    supervised_fine_tuning_trainer/index
    trainer/index
    xpo_trainer/index

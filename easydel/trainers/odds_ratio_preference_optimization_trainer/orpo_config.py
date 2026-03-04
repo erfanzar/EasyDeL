@@ -77,7 +77,7 @@ class ORPOConfig(TrainingArguments):
     """
 
     trainer_prefix: str | None = field(
-        default="orpotrainer",
+        default="ORPO",
         metadata={"help": "default prefix name for trainer."},
     )
     learning_rate: float = field(

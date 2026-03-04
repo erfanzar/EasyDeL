@@ -53,7 +53,7 @@ class SparseDistillationConfig(DistillationConfig):
     """
 
     trainer_prefix: str | None = field(
-        default="sparsedistillationtrainer",
+        default="SparseDistillation",
         metadata={"help": "Prefix used for trainer logs, checkpoints, and wandb runs."},
     )
     remove_unused_columns: bool | None = field(

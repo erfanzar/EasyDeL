@@ -896,7 +896,7 @@ class ParallelHybridCacheView(BaseCacheView):
         val = getattr(self.transformer, name, None)
         if val is None and not self.is_ragged:
             raise AttributeError(
-                f"ParallelHybridCacheView.transformer ({type(self.transformer).__name__}) " f"has no attribute '{name}'"
+                f"ParallelHybridCacheView.transformer ({type(self.transformer).__name__}) has no attribute '{name}'"
             )
         return val
 

@@ -63,7 +63,7 @@ class DistillationConfig(TrainingArguments):
     """
 
     trainer_prefix: str | None = field(
-        default="distillationtrainer", metadata={"help": "Prefix used for trainer logs, checkpoints, and wandb runs."}
+        default="Distillation", metadata={"help": "Prefix used for trainer logs, checkpoints, and wandb runs."}
     )
     temperature: float = field(
         default=2.0,

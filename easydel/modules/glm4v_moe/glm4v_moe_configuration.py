@@ -54,6 +54,7 @@ def _patch_hf_glm4v_moe_router_logits_output() -> None:
         if num_experts_per_tok_attr is None or (
             isinstance(num_experts_per_tok_attr, property) and num_experts_per_tok_attr.fset is None
         ):
+
             def _get_num_experts_per_tok(self):
                 return getattr(
                     self,

@@ -70,7 +70,7 @@ class RewardConfig(TrainingArguments):
     """
 
     trainer_prefix: str | None = field(
-        default="rewardtrainer",
+        default="Reward",
         metadata={"help": "default prefix name for trainer."},
     )
     max_length: int | None = field(

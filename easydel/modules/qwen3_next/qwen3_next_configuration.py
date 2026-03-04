@@ -85,9 +85,8 @@ def _patch_hf_qwen3_next_load_balancing_loss() -> None:
     dynamic_cache_cls = getattr(hf_qwen3_next, "Qwen3NextDynamicCache", None)
     if dynamic_cache_cls is not None:
         original_get_seq_length = getattr(dynamic_cache_cls, "get_seq_length", None)
-        if (
-            original_get_seq_length is not None
-            and not getattr(original_get_seq_length, "_easydel_qwen3_next_cache_patch", False)
+        if original_get_seq_length is not None and not getattr(
+            original_get_seq_length, "_easydel_qwen3_next_cache_patch", False
         ):
 
             def _patched_get_seq_length(self, layer_idx: int | None = 0) -> int:  # type: ignore[override]

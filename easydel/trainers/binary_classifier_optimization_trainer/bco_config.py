@@ -29,7 +29,7 @@ class BCOConfig(TrainingArguments):
     """Configuration container for Binary Classifier Optimisation (BCO) training."""
 
     trainer_prefix: str | None = field(
-        default="bcotrainer",
+        default="BCO",
         metadata={"help": "Default prefix used when generating checkpoints or logging artifacts."},
     )
     beta: float = field(

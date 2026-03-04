@@ -48,7 +48,7 @@ class SFTConfig(TrainingArguments):
     """
 
     trainer_prefix: str | None = field(
-        default="sfttrainer",
+        default="SFT",
         metadata={"help": "default prefix name for trainer."},
     )
     dataset_text_field: str | None = field(
