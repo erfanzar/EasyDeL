@@ -75,6 +75,7 @@ from .flash_attention import FlashAttn
 from .gated_delta_rule import GatedDeltaRuleOp, GatedDeltaRuleOutput
 from .glm_moe_dsa_indexer import GlmMoeDsaIndexerOp, GlmMoeDsaIndexerOutput
 from .kda import KDAOutput, KernelDeltaAttnOp, fused_kda_gate
+from .multi_latent_ragged_page_attention import MultiLatentRaggedPageAttn
 from .paged_flash_attention import PagedFlashAttn
 from .ragged_page_attention import RaggedPageAttnV2, RaggedPageAttnV3
 from .ring_attention import RingAttn
@@ -94,6 +95,7 @@ __all__ = (
     "GlmMoeDsaIndexerOutput",
     "KDAOutput",
     "KernelDeltaAttnOp",
+    "MultiLatentRaggedPageAttn",
     "PagedFlashAttn",
     "RaggedPageAttnV2",
     "RaggedPageAttnV3",

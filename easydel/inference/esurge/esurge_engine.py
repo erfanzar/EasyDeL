@@ -111,6 +111,7 @@ MAX_CONSECUTIVE_SCHEDULER_ERRORS = int(os.environ.get("EASURGE_MAX_SCHEDULER_ERR
 WORKER_DRAIN_MAX_RETRIES = 3  # Maximum retry attempts for worker drain
 WORKER_DRAIN_INITIAL_DELAY = 0.1  # Initial retry delay in seconds
 SamplingCallable = typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None] | None
+MLA_RAGGED_ATTN_MECHANISM = "multi_latent_ragged_page_attention_v1"
 
 
 def _set_requested_new(sp, n: int):  # pyright: ignore[reportUnusedFunction]
@@ -132,6 +133,83 @@ def _normalize_data_parallelism_axis(axis: str) -> str:
     if not axis_name:
         raise ValueError("`data_parallelism_axis` must be a non-empty string.")
     return axis_name
+
+
+def _normalize_attn_mechanism_value(attn_mechanism: Any) -> str | None:
+    """Normalize attention mechanism enum/string to plain string."""
+    if attn_mechanism is None:
+        return None
+    if hasattr(attn_mechanism, "value"):
+        attn_mechanism = attn_mechanism.value
+    return str(attn_mechanism)
+
+
+def _text_config_uses_mla(text_config: Any) -> bool:
+    """Best-effort detection for MLA architectures from text config."""
+    if text_config is None:
+        return False
+
+    attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
+    if attn_mechanism == MLA_RAGGED_ATTN_MECHANISM:
+        return True
+    mla_attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "mla_attn_mechanism", None))
+    if mla_attn_mechanism == MLA_RAGGED_ATTN_MECHANISM:
+        return True
+
+    attention_type = getattr(text_config, "attention_type", None)
+    if attention_type is not None and str(attention_type).lower() == "mla":
+        return True
+
+    is_mla_attr = getattr(text_config, "is_mla", None)
+    try:
+        if callable(is_mla_attr):
+            if bool(is_mla_attr()):
+                return True
+        elif is_mla_attr is not None and bool(is_mla_attr):
+            return True
+    except Exception:
+        pass
+
+    kv_lora_rank = getattr(text_config, "kv_lora_rank", None)
+    if kv_lora_rank is None:
+        kv_lora_rank = getattr(text_config, "kv_lora_dim", None)
+
+    qk_rope_head_dim = getattr(text_config, "qk_rope_head_dim", None)
+    qk_nope_head_dim = getattr(text_config, "qk_nope_head_dim", None)
+
+    if kv_lora_rank is None or (qk_rope_head_dim is None and qk_nope_head_dim is None):
+        return False
+
+    try:
+        return int(kv_lora_rank) > 0
+    except Exception:
+        return True
+
+
+def _detect_mla_attention_mix(model: Any, text_config: Any = None) -> tuple[bool, bool]:
+    """Detect whether a model has MLA and/or non-MLA UnifiedAttention blocks."""
+    has_mla_attention = False
+    has_non_mla_attention = False
+
+    try:
+        from easydel.layers.attention import UnifiedAttention
+        from easydel.utils.traversals import iter_module_search
+
+        for _, module in iter_module_search(model, UnifiedAttention):
+            attention_type = str(getattr(module, "attention_type", "standard")).lower()
+            if attention_type == "mla":
+                has_mla_attention = True
+            else:
+                has_non_mla_attention = True
+            if has_mla_attention and has_non_mla_attention:
+                break
+    except Exception:
+        pass
+
+    if not has_mla_attention and not has_non_mla_attention and _text_config_uses_mla(text_config):
+        has_mla_attention = True
+
+    return has_mla_attention, has_non_mla_attention
 
 
 def _with_data_parallel_axis(partition_axis: Any, data_parallelism_axis: str) -> Any:
@@ -755,6 +833,54 @@ class eSurge(
                 ),
                 **{k: v for k, v in kwargs.items() if k not in ["attn_mechanism", "config_kwargs"]},
             )
+            text_config = model.config.get_text_config()
+            has_mla_attention, has_non_mla_attention = _detect_mla_attention_mix(model, text_config)
+
+            _num_heads = getattr(text_config, "num_attention_heads", 0) or 0
+            _mla_kernel_compatible = int(_num_heads) > 0
+
+            if has_mla_attention and _mla_kernel_compatible:
+                attn_value = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
+                mla_compatible = attn_value == MLA_RAGGED_ATTN_MECHANISM
+                if jax.default_backend() == "gpu":
+                    mla_compatible = mla_compatible or attn_value in {
+                        AttentionMechanisms.UNIFIED_ATTENTION.value,
+                        AttentionMechanisms.PAGED_FLASH_ATTENTION.value,
+                    }
+                if not mla_compatible:
+                    if has_non_mla_attention:
+                        logger.warning(
+                            "Mixed MLA and non-MLA full-attention layers detected, "
+                            "but forcing all inference layers to "
+                            f"{MLA_RAGGED_ATTN_MECHANISM!r}."
+                        )
+                    logger.info(
+                        "MLA architecture detected; forcing inference attention mechanism to "
+                        f"{MLA_RAGGED_ATTN_MECHANISM!r}."
+                    )
+                    compat_graphdef = model.new_graphdef(
+                        recursive_update=True,
+                        attn_mechanism=MLA_RAGGED_ATTN_MECHANISM,
+                        decode_attn_mechanism=MLA_RAGGED_ATTN_MECHANISM,
+                        mla_attn_mechanism=MLA_RAGGED_ATTN_MECHANISM,
+                    )
+                    model = model.merge_module(compat_graphdef, model.graphstate, model.graphother)
+            elif has_mla_attention and not _mla_kernel_compatible:
+                fallback_attn = (
+                    AttentionMechanisms.UNIFIED_ATTENTION
+                    if jax.default_backend() == "gpu"
+                    else AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3
+                )
+                logger.info(
+                    "MLA architecture detected but num_attention_heads <= 0; "
+                    f"falling back to {fallback_attn.value!r}."
+                )
+                compat_graphdef = model.new_graphdef(
+                    recursive_update=True,
+                    attn_mechanism=fallback_attn,
+                    decode_attn_mechanism=fallback_attn,
+                )
+                model = model.merge_module(compat_graphdef, model.graphstate, model.graphother)
 
         self._apply_data_parallel_axis_to_model(model)
 

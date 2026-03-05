@@ -165,6 +165,7 @@ _ATTN_ENUM_BY_MECHANISM_KEY: dict[str, str] = {
     "page_attention": "PAGED_ATTENTION",
     "ragged_page_attention_v2": "RAGGED_PAGE_ATTENTION_V2",
     "ragged_page_attention_v3": "RAGGED_PAGE_ATTENTION_V3",
+    "multi_latent_ragged_page_attention_v1": "MULTI_LATENT_RAGGED_PAGE_ATTENTION_V1",
     "unified_attention": "UNIFIED_ATTENTION",
     "autoregressive_decodeattn": "REGRESSIVE_DECODE",
     "autoregressive_decode": "REGRESSIVE_DECODE",
@@ -209,6 +210,7 @@ EASYDEL_TRAINER_README_TEMPLATE = """
     "page_attention": "PAGED_ATTENTION",
     "paged_flash_attention": "PAGED_FLASH_ATTENTION",
     "ragged_page_attention_v3": "RAGGED_PAGE_ATTENTION_V3", "ragged_page_attention_v2": "RAGGED_PAGE_ATTENTION_V2",
+    "multi_latent_ragged_page_attention_v1": "MULTI_LATENT_RAGGED_PAGE_ATTENTION_V1",
     "unified_attention": "UNIFIED_ATTENTION",
     "autoregressive_decodeattn": "REGRESSIVE_DECODE", "autoregressive_decode": "REGRESSIVE_DECODE"
 } %}

@@ -1277,13 +1277,12 @@ class TrainingArguments:
         """Build a structured default W&B run name.
 
         Format:
-            ``{trainer}-{model_name}-b{batch}-lr{lr}-tx-{optimizer}``
+            ``{model_name}-b{batch}-lr{lr}-tx-{optimizer}``
         """
-        trainer = (self.trainer_prefix or "Trainer").strip()
         batch = int(self.total_batch_size)
         lr = self._wandb_float_token(self.learning_rate, fallback="none")
         optimizer = self._wandb_token(self.optimizer, fallback="NA")
-        return f"{trainer}-{model_name}-b{batch}-lr{lr}-tx-{optimizer}"
+        return f"{model_name}-b{batch}-lr{lr}-tx-{optimizer}"
 
     def ensure_training_time_limit(self, time_passed):
         if self.training_time_limit is not None and time_passed > self._time_to_seconds(self.training_time_limit):

@@ -107,6 +107,7 @@ See Also:
 
 from __future__ import annotations
 
+import copy
 from typing import TYPE_CHECKING, ClassVar, Generic, Literal, TypeVar
 
 import jax
@@ -119,6 +120,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, DTypeLike, Float, Int, PRNGKeyArray
 
 from easydel.caching import (
+    MLARaggedPagesCacheView,
     OperationsMetadata,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -711,14 +713,35 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
 
         Override for custom attention dropout or softmax scale.
 
+        For MLA layers, if the config defines ``mla_attn_mechanism`` the performer
+        will use that mechanism instead of the global ``attn_mechanism``.  This
+        enables per-layer routing in mixed MLA / non-MLA models.
+
         Returns:
             FlexibleAttentionModule instance
         """
+        attn_mechanism = None
+        performer_config = config
+        if self.attention_type == "mla":
+            mla_mech = config.mla_attn_mechanism
+            if mla_mech is not None:
+                mla_mech_val = getattr(mla_mech, "value", mla_mech)
+                if str(mla_mech_val).lower() != "auto":
+                    attn_mechanism = mla_mech
+            mla_attn_dtype = getattr(config, "mla_attn_dtype", None)
+            mla_attn_softmax_dtype = getattr(config, "mla_attn_softmax_dtype", None)
+            if mla_attn_dtype is not None or mla_attn_softmax_dtype is not None:
+                performer_config = copy.copy(config)
+                if mla_attn_dtype is not None:
+                    performer_config.attn_dtype = mla_attn_dtype
+                if mla_attn_softmax_dtype is not None:
+                    performer_config.attn_softmax_dtype = mla_attn_softmax_dtype
         return FlexibleAttentionModule(
             rngs=rngs,
-            base_config=config,
+            base_config=performer_config,
             softmax_scale=self.head_dim**-0.5,
             dropout_prob=getattr(config, "attention_dropout", 0.0),
+            attn_mechanism=attn_mechanism,
         )
 
     def _create_q_norm(self, config: Cfg, dtype: DTypeLike, param_dtype: DTypeLike, rngs: nn.Rngs) -> RMSNorm:
@@ -1244,15 +1267,24 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         # Reshape k_pe for RoPE
         k_pe = k_pe.reshape(bsz, q_len, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
 
-        # Decompress KV
-        kv = (
-            self.mla_kv_b_proj(self.mla_kv_a_layernorm(compressed_kv))
-            .reshape(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            .transpose(0, 2, 1, 3)
-        )
+        _use_mla_ragged = isinstance(cache_view, MLARaggedPagesCacheView)
 
-        k_nope = kv[..., : self.qk_nope_head_dim]
-        value_states = kv[..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.v_head_dim]
+        if not _use_mla_ragged:
+            # Standard path: decompress KV through kv_b_proj
+            kv = (
+                self.mla_kv_b_proj(self.mla_kv_a_layernorm(compressed_kv))
+                .reshape(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+                .transpose(0, 2, 1, 3)
+            )
+            k_nope = kv[..., : self.qk_nope_head_dim]
+            value_states = kv[..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.v_head_dim]
+        else:
+            # MLA ragged path: apply layernorm to compressed_kv but skip kv_b_proj.
+            # Weight absorption: absorb W_k into query, apply W_v after attention.
+            compressed_kv = self.mla_kv_a_layernorm(compressed_kv)
+            # Placeholders for concatenate (not used by the MLA kernel path)
+            k_nope = None
+            value_states = None
 
         # Apply RoPE directly to MLA format [batch, heads, seq, rope_dim]
         if frequencies is not None:
@@ -1272,23 +1304,6 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             q_pe = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
             k_pe = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
 
-        # Recombine nope and pe parts for query
-        query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
-        query_states = query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
-        query_states = query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
-
-        # Recombine nope and pe parts for key
-        key_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), k_pe.dtype)
-        key_states = key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
-        key_states = key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
-
-        # Transpose back to [batch, seq, heads, dim]
-        query_states = query_states.transpose(0, 2, 1, 3)
-        key_states = key_states.transpose(0, 2, 1, 3)
-        value_states = value_states.transpose(0, 2, 1, 3)
-
-        # Concatenate with KV cache
-
         causal_for_kernel = self.causal
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
             causal_for_kernel = False
@@ -1297,42 +1312,155 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
             sliding_window_for_kernel = None
 
-        (
-            key_states,
-            value_states,
-            mask_info,
-            init_attention_bias,
-            cache_view,
-            cache_metadata,
-        ) = self.concatenate(
-            query=query_states,
-            key=key_states,
-            value=value_states,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-            mask_info=mask_info,
-        )
+        if _use_mla_ragged:
+            # Weight absorption: split kv_b_proj weight into W_k and W_v
+            # kv_b_weight: [kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim)]
+            kv_b_weight = self.mla_kv_b_proj.kernel.value
+            kv_b_weight = kv_b_weight.reshape(
+                self.kv_lora_rank, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            w_k = kv_b_weight[:, :, : self.qk_nope_head_dim]  # [kv_lora_rank, N, qk_nope_dim]
+            w_v = kv_b_weight[:, :, self.qk_nope_head_dim :]  # [kv_lora_rank, N, v_head_dim]
 
-        softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
-        softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+            # Absorb W_k into query: q_absorbed = q_nope @ W_k^T
+            # q_nope: [B, N, S, qk_nope_dim], w_k: [kv_lora_rank, N, qk_nope_dim]
+            # q_absorbed: [B, N, S, kv_lora_rank]
+            q_absorbed = jnp.einsum(
+                "bnsd,and->bnsa",
+                q_nope.astype(jnp.float32),
+                w_k.astype(jnp.float32),
+            ).astype(q_nope.dtype)
 
-        attentions = self.attention_performer.forward(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            mode=mode,
-            bias=None,
-            cache_metadata=cache_metadata,
-            cache_view=cache_view,
-            init_bias=init_attention_bias,
-            mask_info=mask_info,
-            causal=causal_for_kernel,
-            sliding_window=sliding_window_for_kernel,
-            softmax_aux=softmax_aux,
-        )
+            # Flatten for kernel: [B, S, N, kv_lora_rank] -> [total_tokens, N, kv_lora_rank]
+            mla_queries_nope = q_absorbed.transpose(0, 2, 1, 3)
+            # q_pe: [B, N, S, rope_dim] -> [B, S, N, rope_dim]
+            mla_queries_pe = q_pe.transpose(0, 2, 1, 3)
+            # compressed_kv: [B, S, kv_lora_rank] (already normed)
+            mla_keys_values = compressed_kv
+            # k_pe: [B, 1, S, rope_dim] -> [B, S, rope_dim]
+            mla_keys_pe = k_pe[:, 0, :, :]
 
-        # Merge heads and project output
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
+            # Use correct softmax_scale based on original qk dimensions, not latent dims
+            mla_softmax_scale = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
+
+            # Build dummy query/key/value for concatenate (cache update)
+            # The MLA cache concatenate needs compressed_kv and k_pe
+            # Build a combined key for cache: [B, S, 1, kv_lora_rank + rope_dim]
+            key_for_cache = jnp.concatenate(
+                [compressed_kv[:, :, None, :], k_pe.transpose(0, 2, 1, 3)],
+                axis=-1,
+            )  # [B, S, 1, kv_lora_rank + rope_dim]
+            # Dummy query/value for concatenate signature
+            query_for_concat = mla_queries_nope
+            value_for_cache = key_for_cache  # MLA: value pages = key pages
+
+            (
+                _,
+                _,
+                mask_info,
+                init_attention_bias,
+                cache_view,
+                cache_metadata,
+            ) = self.concatenate(
+                query=query_for_concat,
+                key=key_for_cache,
+                value=value_for_cache,
+                cache_view=cache_view,
+                cache_metadata=cache_metadata,
+                mask_info=mask_info,
+            )
+
+            softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
+            softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+
+            attentions = self.attention_performer.forward(
+                query_states=query_for_concat,
+                key_states=key_for_cache,
+                value_states=value_for_cache,
+                mode=mode,
+                bias=None,
+                cache_metadata=cache_metadata,
+                cache_view=cache_view,
+                init_bias=init_attention_bias,
+                mask_info=mask_info,
+                causal=causal_for_kernel,
+                sliding_window=sliding_window_for_kernel,
+                softmax_aux=softmax_aux,
+                queries_nope=mla_queries_nope,
+                queries_pe=mla_queries_pe,
+                keys_values=mla_keys_values,
+                keys_pe=mla_keys_pe,
+                softmax_scale=mla_softmax_scale,
+            )
+
+            # Kernel output: [total_tokens, N, kv_lora_rank]
+            # Project through W_v to get [total_tokens, N, v_head_dim]
+            attn_out = attentions.attention_outputs
+            attn_out = jnp.einsum(
+                "tna,anh->tnh",
+                attn_out.astype(jnp.float32),
+                w_v.astype(jnp.float32),
+            ).astype(attn_out.dtype)
+
+            # Reshape to [batch, seq, num_heads * v_head_dim] for output projection
+            batch_size = hidden_states.shape[0]
+            seq_len = hidden_states.shape[1]
+            attn_output = attn_out.reshape(batch_size, seq_len, -1)
+        else:
+            # Recombine nope and pe parts for query
+            query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
+            query_states = query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
+            query_states = query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
+
+            # Recombine nope and pe parts for key
+            key_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), k_pe.dtype)
+            key_states = key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
+            key_states = key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
+
+            # Transpose back to [batch, seq, heads, dim]
+            query_states = query_states.transpose(0, 2, 1, 3)
+            key_states = key_states.transpose(0, 2, 1, 3)
+            value_states = value_states.transpose(0, 2, 1, 3)
+
+            # Concatenate with KV cache
+            (
+                key_states,
+                value_states,
+                mask_info,
+                init_attention_bias,
+                cache_view,
+                cache_metadata,
+            ) = self.concatenate(
+                query=query_states,
+                key=key_states,
+                value=value_states,
+                cache_view=cache_view,
+                cache_metadata=cache_metadata,
+                mask_info=mask_info,
+            )
+
+            softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
+            softmax_aux = getattr(softmax_aux, "value", softmax_aux)
+
+            attentions = self.attention_performer.forward(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                mode=mode,
+                bias=None,
+                cache_metadata=cache_metadata,
+                cache_view=cache_view,
+                init_bias=init_attention_bias,
+                mask_info=mask_info,
+                causal=causal_for_kernel,
+                sliding_window=sliding_window_for_kernel,
+                softmax_aux=softmax_aux,
+            )
+
+            attn_out = attentions.attention_outputs
+            attn_output = self._merge_heads(attn_out)
+
+        attn_output = self.shard_attention_prod(attn_output)
         attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
 
         return AttentionLayerOutput(

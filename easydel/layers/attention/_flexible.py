@@ -131,6 +131,8 @@ class AttentionMechanisms(StrEnum):
         CUDA_FLASH_ATTN2: CUDA-specific FlashAttention-2.
         RAGGED_PAGE_ATTENTION_V3: Paged attention for efficient inference.
         RAGGED_PAGE_ATTENTION_V2: Paged attention for efficient inference.
+        MULTI_LATENT_RAGGED_PAGE_ATTENTION_V1: MLA ragged page attention for
+            compressed-KV inference.
         UNIFIED_ATTENTION: vLLM-style unified paged attention (Triton).
         PAGED_FLASH_ATTENTION: FlashAttention with paged KV cache (CUDA).
         REGRESSIVE_DECODE: Optimized autoregressive decoding.
@@ -148,6 +150,7 @@ class AttentionMechanisms(StrEnum):
     CUDA_FLASH_ATTN2: str = "cuda_flash_attn2"
     RAGGED_PAGE_ATTENTION_V3: str = "ragged_page_attention_v3"
     RAGGED_PAGE_ATTENTION_V2: str = "ragged_page_attention_v2"
+    MULTI_LATENT_RAGGED_PAGE_ATTENTION_V1: str = "multi_latent_ragged_page_attention_v1"
     PAGED_ATTENTION: str = "page_attention"
     UNIFIED_ATTENTION: str = "unified_attention"
     PAGED_FLASH_ATTENTION: str = "paged_flash_attention"
@@ -374,6 +377,7 @@ class FlexibleAttentionModule(nn.Module):
         mask_value: float | None = None,
         vmem_limit_bytes: int | None = None,
         policy: tp.Any | None = None,
+        **extra_op_kwargs: tp.Any,
     ) -> AttentionOutput:
         """
         Performs the attention computation using the selected backend implementation.
@@ -419,15 +423,35 @@ class FlexibleAttentionModule(nn.Module):
                              attention weights (depending on the backend).
         """
         if isinstance(cache_view, RaggedPagesCacheView):
-            assert self.config.attn_mechanism in [
-                AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2,
-                AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3,
-            ]
+            # Check the actual impl name rather than the global config.attn_mechanism
+            # to support per-layer mechanism routing (e.g., mixed MLA / non-MLA models).
+            _impl_name = getattr(self.impl, "get_impl_name", lambda: None)()
+            if isinstance(_impl_name, tuple):
+                _impl_names = set(_impl_name)
+            elif _impl_name is not None:
+                _impl_names = {_impl_name}
+            else:
+                _impl_names = set()
+            _ragged_impls = {
+                "ragged_page_attention_v2",
+                "ragged_page_attention_v3",
+                "multi_latent_ragged_page_attention_v1",
+            }
+            assert not _impl_names or _impl_names & _ragged_impls, (
+                f"RaggedPagesCacheView requires a ragged-page impl but got {_impl_names}"
+            )
         elif isinstance(cache_view, UnifiedAttentionCacheView):
-            assert self.config.attn_mechanism in [
-                AttentionMechanisms.UNIFIED_ATTENTION,
-                AttentionMechanisms.PAGED_FLASH_ATTENTION,
-            ]
+            _impl_name = getattr(self.impl, "get_impl_name", lambda: None)()
+            if isinstance(_impl_name, tuple):
+                _impl_names = set(_impl_name)
+            elif _impl_name is not None:
+                _impl_names = {_impl_name}
+            else:
+                _impl_names = set()
+            _unified_impls = {"unified_attention", "paged_flash_attention"}
+            assert not _impl_names or _impl_names & _unified_impls, (
+                f"UnifiedAttentionCacheView requires a unified impl but got {_impl_names}"
+            )
 
         if deterministic is None:
             deterministic_computed = self.deterministic
@@ -484,6 +508,7 @@ class FlexibleAttentionModule(nn.Module):
                 mask_value=mask_value,
                 vmem_limit_bytes=vmem_limit_bytes,
                 policy=policy_computed,
+                **extra_op_kwargs,
             )
             is_decode_mode: bool = mode == common_types.MODE_DECODE
             output: AttentionOutput

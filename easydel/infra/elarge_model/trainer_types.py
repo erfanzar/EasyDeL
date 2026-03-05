@@ -1375,7 +1375,7 @@ settings.
 # Trainer-specific defaults (only overrides, not full configs)
 TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
     "dpo": {
-        "trainer_prefix": "dpotrainer",
+        "trainer_prefix": "DPO",
         "learning_rate": 1e-6,
         "beta": 0.1,
         "label_smoothing": 0.0,
@@ -1393,7 +1393,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "ref_model_sync_steps": 64,
     },
     "orpo": {
-        "trainer_prefix": "orpotrainer",
+        "trainer_prefix": "ORPO",
         "learning_rate": 1e-6,
         "beta": 0.1,
         "max_length": 1024,
@@ -1403,7 +1403,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "generate_during_eval": False,
     },
     "grpo": {
-        "trainer_prefix": "grpotrainer",
+        "trainer_prefix": "GRPO",
         "learning_rate": 1e-6,
         "remove_unused_columns": False,
         "max_prompt_length": 512,
@@ -1419,7 +1419,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "temperature": 0.7,
     },
     "sdpo": {
-        "trainer_prefix": "sdpotrainer",
+        "trainer_prefix": "SDPO",
         "learning_rate": 1e-6,
         "remove_unused_columns": False,
         "max_prompt_length": 512,
@@ -1437,7 +1437,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "temperature": 0.7,
     },
     "ppo": {
-        "trainer_prefix": "ppotrainer",
+        "trainer_prefix": "PPO",
         "learning_rate": 1e-6,
         "remove_unused_columns": False,
         "max_length": 768,
@@ -1462,7 +1462,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "temperature": 0.7,
     },
     "sft": {
-        "trainer_prefix": "sfttrainer",
+        "trainer_prefix": "SFT",
         "learning_rate": 2e-5,
         "add_special_tokens": False,
         "packing": False,
@@ -1470,19 +1470,19 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "num_of_sequences": 1024,
     },
     "reward": {
-        "trainer_prefix": "rewardtrainer",
+        "trainer_prefix": "Reward",
         "max_length": 1024,
         "disable_dropout": True,
         "center_rewards_coefficient": 0.1,
         "remove_unused_columns": False,
     },
     "distillation": {
-        "trainer_prefix": "distillationtrainer",
+        "trainer_prefix": "Distillation",
         "temperature": 2.0,
         "alpha": 0.9,
     },
     "on_policy_distillation": {
-        "trainer_prefix": "onpolicydistillationtrainer",
+        "trainer_prefix": "OnPolicyDistillation",
         "temperature": 2.0,
         "alpha": 0.9,
         "remove_unused_columns": False,
@@ -1495,7 +1495,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "generate_with_teacher": False,
     },
     "seq_kd": {
-        "trainer_prefix": "seqkdtrainer",
+        "trainer_prefix": "SeqKD",
         "remove_unused_columns": False,
         "max_prompt_length": 512,
         "max_completion_length": 256,
@@ -1505,7 +1505,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "top_k": 50,
     },
     "sparse_distillation": {
-        "trainer_prefix": "sparsedistillationtrainer",
+        "trainer_prefix": "SparseDistillation",
         "temperature": 2.0,
         "alpha": 0.9,
         "top_k_teacher": 20,
@@ -1518,7 +1518,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "top_k": 50,
     },
     "kto": {
-        "trainer_prefix": "ktotrainer",
+        "trainer_prefix": "KTO",
         "learning_rate": 1e-6,
         "beta": 0.1,
         "desirable_weight": 1.0,
@@ -1531,7 +1531,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "precompute_ref_log_probs": False,
     },
     "bco": {
-        "trainer_prefix": "bcotrainer",
+        "trainer_prefix": "BCO",
         "learning_rate": 1e-6,
         "beta": 0.1,
         "label_pad_token_id": -100,
@@ -1545,7 +1545,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "max_density_ratio": 10.0,
     },
     "cpo": {
-        "trainer_prefix": "cpotrainer",
+        "trainer_prefix": "CPO",
         "learning_rate": 1e-6,
         "beta": 0.1,
         "label_smoothing": 0.0,
@@ -1559,7 +1559,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "max_prompt_length": 512,
     },
     "gkd": {
-        "trainer_prefix": "gkdtrainer",
+        "trainer_prefix": "GKD",
         "learning_rate": 2e-5,
         "temperature": 0.9,
         "lmbda": 0.5,
@@ -1573,7 +1573,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "num_of_sequences": 1024,
     },
     "nash_md": {
-        "trainer_prefix": "nashmdtrainer",
+        "trainer_prefix": "NashMD",
         "learning_rate": 1e-6,
         "remove_unused_columns": False,
         "max_prompt_length": 512,
@@ -1590,7 +1590,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "temperature": 0.7,
     },
     "nash-md": {
-        "trainer_prefix": "nashmdtrainer",
+        "trainer_prefix": "NashMD",
         "learning_rate": 1e-6,
         "remove_unused_columns": False,
         "max_prompt_length": 512,
@@ -1607,7 +1607,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "temperature": 0.7,
     },
     "xpo": {
-        "trainer_prefix": "xpotrainer",
+        "trainer_prefix": "XPO",
         "learning_rate": 1e-6,
         "remove_unused_columns": False,
         "max_prompt_length": 512,

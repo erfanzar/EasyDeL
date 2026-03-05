@@ -259,10 +259,14 @@ class AttentionMetadataBuilder:
         ... )
     """
 
-    _RAGGED_MECH_PREFIXES: tp.ClassVar[tuple[str, ...]] = ("ragged_page_attention",)
+    _RAGGED_MECH_PREFIXES: tp.ClassVar[tuple[str, ...]] = (
+        "ragged_page_attention",
+        "multi_latent_ragged_page_attention",
+    )
     _RAGGED_MECH_EXACT: tp.ClassVar[set[str]] = {
         "ragged_page_attention_v2",
         "ragged_page_attention_v3",
+        "multi_latent_ragged_page_attention_v1",
         "page_attention",
         "paged_attention",
         "unified_attention",

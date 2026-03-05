@@ -113,6 +113,7 @@ from .etils import (
     AVAILABLE_GRADIENT_CHECKPOINTS,
     AVAILABLE_MOE_METHODS,
     DEFAULT_ATTENTION_MECHANISM,
+    DEFAULT_MLA_ATTENTION_MECHANISM,
     EasyDeLBackends,
     EasyDeLGradientCheckPointers,
     EasyDeLPlatforms,
@@ -403,6 +404,9 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     sharding_axis_names: NotRequired[collections.abc.Sequence[str]]
     attn_mechanism: NotRequired[AVAILABLE_ATTENTION_MECHANISMS]
     decode_attn_mechanism: NotRequired[AVAILABLE_ATTENTION_MECHANISMS]
+    mla_attn_mechanism: NotRequired[AVAILABLE_ATTENTION_MECHANISMS]
+    mla_attn_dtype: NotRequired[jnp.dtype | str | None]
+    mla_attn_softmax_dtype: NotRequired[jnp.dtype | str | None]
     blocksize_k: NotRequired[int]
     blocksize_q: NotRequired[int]
     blocksize_b: NotRequired[int]
@@ -468,6 +472,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
         attn_mechanism: Attention implementation to use during training/forward passes.
         decode_attn_mechanism: Attention implementation to use during decoding
             (falls back to ``attn_mechanism`` if left as ``None``).
+        mla_attn_mechanism: Attention mechanism override for MLA layers.
+            Use ``"auto"`` to infer MLA-specific serving kernels (defaults to
+            ``"auto"``). Non-MLA layers ignore this field.
+        mla_attn_dtype: Optional MLA-specific attention activation dtype.
+            Defaults to ``attn_dtype`` when unset.
+        mla_attn_softmax_dtype: Optional MLA-specific attention softmax dtype.
+            Defaults to ``attn_softmax_dtype`` when unset.
         blocksize_k: Key block size for attention kernels. Defaults to ``128``.
         blocksize_q: Query block size for attention kernels. Defaults to ``128``.
         blocksize_b: Batch/block size used by some attention backends. Defaults to ``1``.
@@ -762,6 +773,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         sharding_axis_names: collections.abc.Sequence[str] = ("dp", "fsdp", "ep", "tp", "sp"),
         attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM,
         decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = None,
+        mla_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_MLA_ATTENTION_MECHANISM,
+        mla_attn_dtype: jnp.dtype | str | None = None,
+        mla_attn_softmax_dtype: jnp.dtype | str | None = None,
         blocksize_k: int = 128,
         blocksize_q: int = 128,
         blocksize_b: int = 1,
@@ -840,6 +854,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.easy_method = getattr(self, "easy_method", easy_method)
         self.attn_mechanism = getattr(self, "attn_mechanism", attn_mechanism)
         self.decode_attn_mechanism = getattr(self, "decode_attn_mechanism", decode_attn_mechanism)
+        self.mla_attn_mechanism = getattr(self, "mla_attn_mechanism", mla_attn_mechanism)
         self.blocksize_b = getattr(self, "blocksize_b", blocksize_b)
         self.blocksize_k = getattr(self, "blocksize_k", blocksize_k)
         self.blocksize_q = getattr(self, "blocksize_q", blocksize_q)
@@ -879,6 +894,16 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.attn_dtype = getattr(self, "attn_dtype", attn_dtype)
         self.kvdtype = getattr(self, "kvdtype", kvdtype if kvdtype is not None else self.attn_dtype)
         self.attn_softmax_dtype = getattr(self, "attn_softmax_dtype", attn_softmax_dtype)
+        self.mla_attn_dtype = getattr(
+            self,
+            "mla_attn_dtype",
+            mla_attn_dtype if mla_attn_dtype is not None else self.attn_dtype,
+        )
+        self.mla_attn_softmax_dtype = getattr(
+            self,
+            "mla_attn_softmax_dtype",
+            mla_attn_softmax_dtype if mla_attn_softmax_dtype is not None else self.attn_softmax_dtype,
+        )
         self.fcm_max_ratio = getattr(self, "fcm_max_ratio", fcm_max_ratio)
         self.fcm_min_ratio = getattr(self, "fcm_min_ratio", fcm_min_ratio)
         self.hardware_abstraction = getattr(self, "hardware_abstraction", hardware_abstraction)
@@ -1403,6 +1428,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "sharding_axis_names",
             "attn_mechanism",
             "decode_attn_mechanism",
+            "mla_attn_mechanism",
+            "mla_attn_dtype",
+            "mla_attn_softmax_dtype",
             "blocksize_k",
             "blocksize_q",
             "blocksize_b",
@@ -1456,6 +1484,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         sharding_axis_names: collections.abc.Sequence[str] = NOT_GIVEN,
         attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
         decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
+        mla_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
+        mla_attn_dtype: jnp.dtype | str | None = NOT_GIVEN,
+        mla_attn_softmax_dtype: jnp.dtype | str | None = NOT_GIVEN,
         blocksize_k: int = NOT_GIVEN,
         blocksize_q: int = NOT_GIVEN,
         blocksize_b: int = NOT_GIVEN,
@@ -1516,6 +1547,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
             sharding_axis_names: Mesh axis labels, default ``("dp", "fsdp", "ep", "tp", "sp")``.
             attn_mechanism: Attention mechanism to use (default ``"vanilla"``).
             decode_attn_mechanism: Optional decode-time attention mechanism.
+            mla_attn_mechanism: MLA-layer-specific attention mechanism override
+                (default ``"auto"``).
+            mla_attn_dtype: Optional MLA-specific attention activation dtype
+                (defaults to ``attn_dtype``).
+            mla_attn_softmax_dtype: Optional MLA-specific softmax dtype
+                (defaults to ``attn_softmax_dtype``).
             blocksize_k: Attention key block size, default ``512`` when unset.
             blocksize_q: Attention query block size, default ``512`` when unset.
             blocksize_b: Batch/block size used by attention kernels (default ``1``).
@@ -1577,6 +1614,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "platform", "jax", platform)
         set_attrs_smartly(self, "use_sharded_kv_caching", False, use_sharded_kv_caching)
         set_attrs_smartly(self, "attn_mechanism", "vanilla", attn_mechanism)
+        set_attrs_smartly(self, "mla_attn_mechanism", "auto", mla_attn_mechanism)
         set_attrs_smartly(self, "decode_attn_mechanism", None, decode_attn_mechanism)
 
         set_attrs_smartly(self, "easy_method", EasyMethod.TRAIN, easy_method)
@@ -1599,6 +1637,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "attn_dtype", jnp.float32, attn_dtype)
         set_attrs_smartly(self, "kvdtype", jnp.bfloat16, kvdtype if kvdtype is not None else self.attn_dtype)
         set_attrs_smartly(self, "attn_softmax_dtype", jnp.float32, attn_softmax_dtype)
+        set_attrs_smartly(self, "mla_attn_dtype", self.attn_dtype, mla_attn_dtype)
+        set_attrs_smartly(self, "mla_attn_softmax_dtype", self.attn_softmax_dtype, mla_attn_softmax_dtype)
         set_attrs_smartly(self, "hardware_abstraction", DEFAULT_HARDWARE_ABSTRACTION, hardware_abstraction)
         set_attrs_smartly(self, "pallas_m_block_size", DEFAULT_PALLAS_M_BLOCK_SIZE, pallas_m_block_size)
         set_attrs_smartly(self, "pallas_k_block_size", DEFAULT_PALLAS_K_BLOCK_SIZE, pallas_k_block_size)
@@ -1629,6 +1669,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         "sharding_axis_names",
         "attn_mechanism",
         "decode_attn_mechanism",
+        "mla_attn_mechanism",
+        "mla_attn_dtype",
+        "mla_attn_softmax_dtype",
         "blocksize_k",
         "blocksize_q",
         "blocksize_b",

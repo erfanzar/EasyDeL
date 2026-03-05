@@ -30,6 +30,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.caching import (
     HybridCache,
+    MLARaggedPagesCacheView,
     OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -880,6 +881,7 @@ class GlmMoeDsaAttention(UnifiedAttention):
         query_states = query_states.transpose(0, 2, 1, 3)
         key_states = key_states.transpose(0, 2, 1, 3)
         value_states = value_states.transpose(0, 2, 1, 3)
+        mla_value_states = value_states
 
         causal_for_kernel = self.causal
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
@@ -968,6 +970,15 @@ class GlmMoeDsaAttention(UnifiedAttention):
         softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
         softmax_aux = getattr(softmax_aux, "value", softmax_aux)
 
+        # Pass decompressed MLA tensors when using MLA ragged cache
+        mla_kwargs: dict = {}
+        if isinstance(cache_view, MLARaggedPagesCacheView):
+            mla_kwargs["queries_nope"] = q_nope.transpose(0, 2, 1, 3)
+            mla_kwargs["queries_pe"] = q_pe.transpose(0, 2, 1, 3)
+            mla_kwargs["keys_values"] = k_nope.transpose(0, 2, 1, 3)
+            mla_kwargs["values"] = mla_value_states
+            mla_kwargs["keys_pe"] = k_pe[:, 0, :, :]
+
         attentions = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -981,9 +992,37 @@ class GlmMoeDsaAttention(UnifiedAttention):
             causal=causal_for_kernel,
             sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
+            **mla_kwargs,
         )
 
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
+        attn_out = attentions.attention_outputs
+        if isinstance(cache_view, MLARaggedPagesCacheView) and attn_out.ndim == 3:
+            batch_size = hidden_states.shape[0]
+            seq_len = hidden_states.shape[1]
+            attn_output = attn_out.reshape(batch_size, seq_len, -1)
+        else:
+            attn_output = self._merge_heads(attn_out)
+        expected_attn_dim = self.num_heads * self.v_head_dim
+        if attn_output.shape[-1] != expected_attn_dim:
+            actual_attn_dim = int(attn_output.shape[-1])
+            if actual_attn_dim % self.num_heads == 0 and expected_attn_dim % self.num_heads == 0:
+                actual_head_dim = actual_attn_dim // self.num_heads
+                expected_head_dim = expected_attn_dim // self.num_heads
+                attn_output = attn_output.reshape(*attn_output.shape[:-1], self.num_heads, actual_head_dim)
+                if actual_head_dim > expected_head_dim:
+                    attn_output = attn_output[..., :expected_head_dim]
+                elif actual_head_dim < expected_head_dim:
+                    pad_width = [(0, 0)] * attn_output.ndim
+                    pad_width[-1] = (0, expected_head_dim - actual_head_dim)
+                    attn_output = jnp.pad(attn_output, pad_width)
+                attn_output = attn_output.reshape(*attn_output.shape[:-2], expected_attn_dim)
+            elif actual_attn_dim > expected_attn_dim:
+                attn_output = attn_output[..., :expected_attn_dim]
+            else:
+                pad_width = [(0, 0)] * attn_output.ndim
+                pad_width[-1] = (0, expected_attn_dim - actual_attn_dim)
+                attn_output = jnp.pad(attn_output, pad_width)
+        attn_output = self.shard_attention_prod(attn_output)
         attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
 
         return AttentionLayerOutput(
@@ -1364,7 +1403,7 @@ class GlmMoeDsaForCausalLM(BaseCausalLMModule[GlmMoeDsaModel, GlmMoeDsaConfig]):
         GLM-MoE-DSA uses MLA, where the runtime attention head width is
         ``qk_nope_head_dim + qk_rope_head_dim`` (not ``config.head_dim``).
         """
-        from easydel.caching import RaggedPagesCacheConfig
+        from easydel.caching import MLARaggedPagesCacheConfig, RaggedPagesCacheConfig
         from easydel.layers.attention import AttentionMechanisms
 
         text_config = self.config.get_text_config()
@@ -1379,6 +1418,28 @@ class GlmMoeDsaForCausalLM(BaseCausalLMModule[GlmMoeDsaModel, GlmMoeDsaConfig]):
                 version = "v2"
             case _:
                 version = "v3"
+
+        attn_mechanism = getattr(text_config, "attn_mechanism", None)
+        if hasattr(attn_mechanism, "value"):
+            attn_mechanism = attn_mechanism.value
+        is_mla_ragged = str(attn_mechanism) == "multi_latent_ragged_page_attention_v1"
+        if is_mla_ragged:
+            # Head-aware MLA kernel uses 128-aligned per-head channels in cache.
+            padded_qk_nope = ((self.config.qk_nope_head_dim + 127) // 128) * 128
+            padded_v = ((self.config.v_head_dim + 127) // 128) * 128
+            packed_per_head_kv = padded_qk_nope + padded_v
+            return MLARaggedPagesCacheConfig.create(
+                mesh=self.mesh,
+                partition_manager=text_config.partition_manager,
+                kvdtype=text_config.kvdtype if dtype is None else dtype,
+                max_model_length=max_length,
+                num_hidden_layers=self.config.num_hidden_layers,
+                num_kv_heads=self.config.num_attention_heads,
+                kv_lora_rank=self.config.num_attention_heads * packed_per_head_kv,
+                qk_rope_head_dim=self.config.qk_rope_head_dim,
+                hbm_utilization=hbm_utilization,
+                page_size=page_size,
+            )
 
         return RaggedPagesCacheConfig.create(
             mesh=self.mesh,
