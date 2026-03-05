@@ -51,6 +51,32 @@ from ..training_utils import (
 )
 
 
+def _per_token_xent(
+    teacher_logits: Array,
+    student_logits: Array,
+    temperature: float,
+    dtype: jnp.dtype,
+) -> tuple[Array, Array]:
+    """Compute per-token distillation cross-entropy and teacher entropy.
+
+    Teacher logits are processed first so their scaled intermediates can be
+    freed before student intermediates are materialised — peak vocab-sized
+    float32 tensors drops from 3x to 2x ``[..., V]``.
+
+    Returns ``(per_token_distill_xent, per_token_teacher_entropy)``.
+    """
+    teacher_scaled = jax.lax.stop_gradient(teacher_logits.astype(jnp.float32) / temperature)
+    teacher_logsumexp = jax.nn.logsumexp(teacher_scaled, axis=-1, keepdims=True)
+    teacher_log_probs = teacher_scaled - teacher_logsumexp
+    teacher_probs = jnp.exp(teacher_log_probs)
+    per_token_teacher_entropy = -jnp.sum(teacher_probs * teacher_log_probs, axis=-1).astype(dtype)
+
+    student_scaled = student_logits.astype(jnp.float32) / temperature
+    student_logsumexp = jax.nn.logsumexp(student_scaled, axis=-1)
+    per_token_distill_xent = (student_logsumexp - jnp.sum(teacher_probs * student_scaled, axis=-1)).astype(dtype)
+    return per_token_distill_xent, per_token_teacher_entropy
+
+
 def _compute_kl_and_ce(
     student_logits: Array,
     teacher_logits: Array,
@@ -65,17 +91,12 @@ def _compute_kl_and_ce(
     Returns ``(distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum)``,
     where all values are scalar accumulators.
     """
-    teacher_logits = jax.lax.stop_gradient(teacher_logits)
-    teacher_scaled_logits = teacher_logits.astype(jnp.float32) / temperature
-    t_probs = jax.nn.softmax(teacher_scaled_logits, axis=-1)
-    s_log_probs = jax.nn.log_softmax(student_logits.astype(jnp.float32) / temperature, axis=-1)
-    per_token_distill_xent = -jnp.sum(t_probs * s_log_probs, axis=-1).astype(dtype)
-    # Keep entropy in log-softmax form for numerical parity while avoiding
-    # a persistent full-vocab ``teacher_log_probs`` tensor in Python scope.
-    per_token_teacher_entropy = -jnp.sum(
-        t_probs * jax.nn.log_softmax(teacher_scaled_logits, axis=-1),
-        axis=-1,
-    ).astype(dtype)
+    per_token_distill_xent, per_token_teacher_entropy = _per_token_xent(
+        teacher_logits,
+        student_logits,
+        temperature,
+        dtype,
+    )
 
     distill_xent_sum = jnp.sum(per_token_distill_xent * mask)
     teacher_entropy_sum = jnp.sum(per_token_teacher_entropy * mask)
@@ -208,23 +229,12 @@ def distillation_loss(
     alpha_s = jnp.array(alpha, dtype=dtype)
     temp_sq = jnp.array(temperature * temperature, dtype=dtype)
 
-    # softmax / log_softmax need f32 for numerical stability over large vocab.
-    # teacher_logits is detached so f32 has no backward cost.
-    # For student_logits, the explicit .astype(f32) means JAX's AD will
-    # produce bf16 gradients (matching the primal dtype of student_logits),
-    # so f32 stays contained in this loss function and does NOT leak into
-    # the model's backward pass.
-    teacher_logits = jax.lax.stop_gradient(teacher_logits)
-    teacher_scaled_logits = teacher_logits.astype(jnp.float32) / temperature
-    teacher_probs = jax.nn.softmax(teacher_scaled_logits, axis=-1)
-    student_log_probs = jax.nn.log_softmax(student_logits.astype(jnp.float32) / temperature, axis=-1)
-    per_token_distill_xent = -jnp.sum(teacher_probs * student_log_probs, axis=-1).astype(dtype)
-    # Keep entropy in log-softmax form for numerical parity while avoiding
-    # a persistent full-vocab ``teacher_log_probs`` tensor in Python scope.
-    per_token_teacher_entropy = -jnp.sum(
-        teacher_probs * jax.nn.log_softmax(teacher_scaled_logits, axis=-1),
-        axis=-1,
-    ).astype(dtype)
+    per_token_distill_xent, per_token_teacher_entropy = _per_token_xent(
+        teacher_logits,
+        student_logits,
+        temperature,
+        dtype,
+    )
 
     if loss_mask is not None:
         mask = loss_mask.astype(dtype)
@@ -488,11 +498,12 @@ def distillation_step(
     if request_hidden_states:
         teacher_hidden = getattr(teacher_outputs, "hidden_states", None)
         if teacher_hidden is not None:
-            batch["_teacher_hidden_states"] = jnp.stack(teacher_hidden, axis=1)
+            batch["_teacher_hidden_states"] = tuple(teacher_hidden)
     if request_attentions:
         teacher_attns = getattr(teacher_outputs, "attentions", None)
         if teacher_attns is not None:
-            batch["_teacher_attentions"] = jnp.stack(teacher_attns, axis=1)
+            batch["_teacher_attentions"] = tuple(teacher_attns)
+    del teacher_outputs
 
     def loss_fn(tree, minibatch):
         if is_training and straight_through_emulator is not None:
@@ -508,8 +519,8 @@ def distillation_step(
             call_kwargs["apply_lm_head"] = False
         else:
             teacher_logits = jax.lax.stop_gradient(call_kwargs.pop("_teacher_logits"))
-        teacher_hidden_stacked = call_kwargs.pop("_teacher_hidden_states", None)
-        teacher_attentions_stacked = call_kwargs.pop("_teacher_attentions", None)
+        teacher_hiddens = call_kwargs.pop("_teacher_hidden_states", None)
+        teacher_attns = call_kwargs.pop("_teacher_attentions", None)
         if request_hidden_states:
             call_kwargs["output_hidden_states"] = True
         if request_attentions:
@@ -550,14 +561,13 @@ def distillation_step(
 
         if request_hidden_states:
             student_hidden = getattr(student_outputs, "hidden_states", None)
-            if student_hidden is None or teacher_hidden_stacked is None:
+            if student_hidden is None or teacher_hiddens is None:
                 raise ValueError(
                     "Hidden-state distillation requested but models did not return hidden states. "
                     "Please ensure `output_hidden_states` is supported."
                 )
-            teacher_hidden = [teacher_hidden_stacked[:, i] for i in range(teacher_hidden_stacked.shape[1])]
             student_indices = _resolve_indices(len(student_hidden), hidden_state_layers, default_all=False)
-            teacher_indices = _resolve_indices(len(teacher_hidden), hidden_state_layers, default_all=False)
+            teacher_indices = _resolve_indices(len(teacher_hiddens), hidden_state_layers, default_all=False)
             if len(student_indices) != len(teacher_indices):
                 raise ValueError(
                     "Hidden-state layer selections for student and teacher have different lengths. "
@@ -565,7 +575,7 @@ def distillation_step(
                 )
             hidden_losses = []
             for s_idx, t_idx in zip(student_indices, teacher_indices, strict=True):
-                hidden_losses.append(_masked_mse(student_hidden[s_idx], teacher_hidden[t_idx], attention_mask))
+                hidden_losses.append(_masked_mse(student_hidden[s_idx], teacher_hiddens[t_idx], attention_mask))
             hidden_loss_value = jnp.mean(jnp.stack(hidden_losses))
             hidden_loss_value = hidden_loss_value.astype(total_loss.dtype)
             total_loss = total_loss + jnp.asarray(hidden_state_weight, dtype=total_loss.dtype) * hidden_loss_value
@@ -573,14 +583,13 @@ def distillation_step(
 
         if request_attentions:
             student_attentions = getattr(student_outputs, "attentions", None)
-            if student_attentions is None or teacher_attentions_stacked is None:
+            if student_attentions is None or teacher_attns is None:
                 raise ValueError(
                     "Attention distillation requested but models did not return attention probabilities. "
                     "Please ensure `output_attentions` is supported."
                 )
-            teacher_attentions = [teacher_attentions_stacked[:, i] for i in range(teacher_attentions_stacked.shape[1])]
             student_indices = _resolve_indices(len(student_attentions), attention_layers, default_all=True)
-            teacher_indices = _resolve_indices(len(teacher_attentions), attention_layers, default_all=True)
+            teacher_indices = _resolve_indices(len(teacher_attns), attention_layers, default_all=True)
             if len(student_indices) != len(teacher_indices):
                 raise ValueError(
                     "Attention layer selections for student and teacher have different lengths. "
@@ -590,7 +599,7 @@ def distillation_step(
             attention_losses = []
             for s_idx, t_idx in zip(student_indices, teacher_indices, strict=True):
                 s_attn = student_attentions[s_idx]
-                t_attn = teacher_attentions[t_idx]
+                t_attn = teacher_attns[t_idx]
                 if attention_normalize:
                     s_attn = _normalize_attention(s_attn)
                     t_attn = _normalize_attention(t_attn)

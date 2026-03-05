@@ -1482,7 +1482,10 @@ class EasyDeLState(struct.PyTreeNode):
                 is_leaf=lambda x: x is None,
             )
 
-        state_for_shard = self.replace(graphother=materialize_meta_leaves(self.graphother, seed=42))
+        step = self.step
+        if not isinstance(step, jax.Array):
+            step = jnp.asarray(step, dtype=jnp.int32)
+        state_for_shard = self.replace(step=step, graphother=materialize_meta_leaves(self.graphother, seed=42))
         return appy_sharding_on_tree(state_for_shard)
 
     def gather_state(self) -> Self:
