@@ -2010,6 +2010,8 @@ class eLargeModel:
         if base_cfg:
             if "attn_mechanism" in base_cfg:
                 lines.append(_line(f"▸ attn: {_fmt(base_cfg['attn_mechanism'])}"))
+            if "mla_attn_mechanism" in base_cfg:
+                lines.append(_line(f"▸ mla_attn: {_fmt(base_cfg['mla_attn_mechanism'])}"))
             if "moe_method" in base_cfg:
                 lines.append(_line(f"▸ moe:  {_fmt(base_cfg['moe_method'])}"))
             if "gradient_checkpointing" in base_cfg:

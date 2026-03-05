@@ -201,7 +201,7 @@ def materialize_base_config(cfg: ELMConfig, prefer: tp.Literal["base", "sections
     raw_base = dict(cfg.get("base_config", {}).get("values", {}) or {})
 
     # Coerce dtype fields in base_config.values
-    dtype_fields = {"attn_dtype", "kvdtype", "attn_softmax_dtype"}
+    dtype_fields = {"attn_dtype", "kvdtype", "attn_softmax_dtype", "mla_attn_dtype", "mla_attn_softmax_dtype"}
     base = {}
     for k, v in raw_base.items():
         if k in dtype_fields and v is not None:

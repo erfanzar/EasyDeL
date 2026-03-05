@@ -84,6 +84,7 @@ from .hybrid import (
 )
 from .kda import KDACache, KDACacheConfig, KDACacheView, KDAMetadata
 from .lightning import LightningCache, LightningCacheConfig, LightningCacheView, LightningMetadata
+from .mla_ragged_page import MLARaggedPagesCache, MLARaggedPagesCacheConfig, MLARaggedPagesCacheView
 from .ragged_page import RaggedPagesCache, RaggedPagesCacheConfig, RaggedPagesCacheView, RaggedPagesMetadata
 from .recurrent import (
     LinearCache,
@@ -119,6 +120,9 @@ __all__ = (
     "LinearCacheConfig",
     "LinearCacheView",
     "LinearMetadata",
+    "MLARaggedPagesCache",
+    "MLARaggedPagesCacheConfig",
+    "MLARaggedPagesCacheView",
     "MambaSpec",
     "OperationsMetadata",
     "ParallelHybridCacheView",

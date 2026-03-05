@@ -1051,6 +1051,7 @@ class OperationCacheMixin:
             return result
 
         from easydel.caching import (
+            MLARaggedPagesCacheView,
             ParallelHybridCacheView,
             RaggedPagesCacheView,
             RecurrentCacheView,
@@ -1061,6 +1062,7 @@ class OperationCacheMixin:
         _parallel_hybrid_combos = [
             {TransformerCacheView, RecurrentCacheView},
             {RaggedPagesCacheView, RecurrentCacheView},
+            {MLARaggedPagesCacheView, RecurrentCacheView},
             {UnifiedAttentionCacheView, RecurrentCacheView},
         ]
 

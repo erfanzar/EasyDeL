@@ -419,7 +419,12 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
             attn_mechanism = attn_mechanism.value
         attn_mechanism = str(attn_mechanism).lower() if attn_mechanism is not None else ""
 
-        if attn_mechanism in {"ragged_page_attention_v2", "ragged_page_attention_v3", "paged_flash_attention"}:
+        if attn_mechanism in {
+            "ragged_page_attention_v2",
+            "ragged_page_attention_v3",
+            "multi_latent_ragged_page_attention_v1",
+            "paged_flash_attention",
+        }:
             try:
                 compat_graphdef = self.model.new_graphdef(
                     recursive_update=True,

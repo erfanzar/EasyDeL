@@ -1334,7 +1334,7 @@ class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config
         Returns:
             RaggedPagesCacheConfig: Configuration object for MLA-compatible paged cache.
         """
-        from easydel.caching import RaggedPagesCacheConfig
+        from easydel.caching import MLARaggedPagesCacheConfig, RaggedPagesCacheConfig
         from easydel.layers.attention import AttentionMechanisms
 
         config = self.config
@@ -1351,6 +1351,24 @@ class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config
                 version = "v2"
             case _:
                 version = "v3"
+
+        attn_mechanism = getattr(text_config, "attn_mechanism", None)
+        if hasattr(attn_mechanism, "value"):
+            attn_mechanism = attn_mechanism.value
+        is_mla_ragged = str(attn_mechanism) == "multi_latent_ragged_page_attention_v1"
+        if is_mla_ragged:
+            return MLARaggedPagesCacheConfig.create(
+                mesh=self.mesh,
+                partition_manager=text_config.partition_manager,
+                kvdtype=text_config.kvdtype,
+                max_model_length=max_length,
+                num_hidden_layers=config.num_hidden_layers,
+                num_kv_heads=config.num_attention_heads,
+                kv_lora_rank=config.kv_lora_rank,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                hbm_utilization=hbm_utilization,
+                page_size=page_size,
+            )
 
         return RaggedPagesCacheConfig.create(
             mesh=self.mesh,

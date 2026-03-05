@@ -223,6 +223,7 @@ OperationImplName = tp.Literal[
     "blocksparse",
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",
+    "multi_latent_ragged_page_attention_v1",
     "unified_attention",
     "paged_flash_attention",
     "sdpa",
@@ -242,6 +243,7 @@ Supported implementations:
     - "blocksparse": Block-sparse attention for long sequences.
     - "ragged_page_attention_v2": Paged attention v2 for variable-length batches.
     - "ragged_page_attention_v3": Paged attention v3 with improvements.
+    - "multi_latent_ragged_page_attention_v1": MLA ragged paged attention.
     - "unified_attention": vLLM-style unified paged attention.
     - "paged_flash_attention": Paged FlashAttention with block tables (CUDA).
     - "sdpa": Scaled dot-product attention (PyTorch-compatible).
@@ -279,6 +281,7 @@ class OperationConfigsDict(TypedDict, total=False):
             Controls page sizes and batch handling for variable-length sequences.
         ragged_page_attention_v3: Configuration for ragged paged attention v3.
             Improved version with additional optimization options.
+        multi_latent_ragged_page_attention_v1: Configuration for MLA ragged paged attention.
         unified_attention: Configuration for unified attention (vLLM-style).
             Controls paged attention parameters for inference serving.
         paged_flash_attention: Configuration for paged FlashAttention (CUDA).
@@ -306,6 +309,7 @@ class OperationConfigsDict(TypedDict, total=False):
     blocksparse: NotRequired["BaseOperationConfig | None"]
     ragged_page_attention_v2: NotRequired["BaseOperationConfig | None"]
     ragged_page_attention_v3: NotRequired["BaseOperationConfig | None"]
+    multi_latent_ragged_page_attention_v1: NotRequired["BaseOperationConfig | None"]
     unified_attention: NotRequired["BaseOperationConfig | None"]
     paged_flash_attention: NotRequired["BaseOperationConfig | None"]
     sdpa: NotRequired["BaseOperationConfig | None"]

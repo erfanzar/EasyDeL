@@ -66,6 +66,8 @@ from jaxtyping import Array
 from transformers.generation.configuration_utils import GenerationConfig
 
 from easydel.caching import (
+    MLARaggedPagesCache,
+    MLARaggedPagesCacheConfig,
     RaggedPagesCache,
     RaggedPagesCacheConfig,
     UnifiedAttentionCache,
@@ -95,6 +97,95 @@ if tp.TYPE_CHECKING:
     from easydel.inference.sampling_params import SamplingParams
 
 logger = get_logger(__name__)
+
+
+def _normalize_attn_mechanism_value(attn_mechanism: tp.Any) -> str | None:
+    """Normalize attention mechanism enum/string to plain string."""
+    if attn_mechanism is None:
+        return None
+    if hasattr(attn_mechanism, "value"):
+        attn_mechanism = attn_mechanism.value
+    return str(attn_mechanism)
+
+
+def _text_config_uses_mla(text_config: tp.Any) -> bool:
+    """Best-effort detection for MLA architectures from text config."""
+    if text_config is None:
+        return False
+
+    attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
+    if attn_mechanism == "multi_latent_ragged_page_attention_v1":
+        return True
+    mla_attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "mla_attn_mechanism", None))
+    if mla_attn_mechanism == "multi_latent_ragged_page_attention_v1":
+        return True
+
+    attention_type = getattr(text_config, "attention_type", None)
+    if attention_type is not None and str(attention_type).lower() == "mla":
+        return True
+
+    is_mla_attr = getattr(text_config, "is_mla", None)
+    try:
+        if callable(is_mla_attr):
+            if bool(is_mla_attr()):
+                return True
+        elif is_mla_attr is not None and bool(is_mla_attr):
+            return True
+    except Exception:
+        pass
+
+    kv_lora_rank = getattr(text_config, "kv_lora_rank", None)
+    if kv_lora_rank is None:
+        kv_lora_rank = getattr(text_config, "kv_lora_dim", None)
+
+    qk_rope_head_dim = getattr(text_config, "qk_rope_head_dim", None)
+    qk_nope_head_dim = getattr(text_config, "qk_nope_head_dim", None)
+
+    if kv_lora_rank is None or (qk_rope_head_dim is None and qk_nope_head_dim is None):
+        return False
+
+    try:
+        return int(kv_lora_rank) > 0
+    except Exception:
+        return True
+
+
+def _detect_mla_attention_mix(model: tp.Any, text_config: tp.Any = None) -> tuple[bool, bool]:
+    """Detect whether a model has MLA and/or non-MLA UnifiedAttention blocks."""
+    has_mla_attention = False
+    has_non_mla_attention = False
+
+    try:
+        from easydel.layers.attention import UnifiedAttention
+        from easydel.utils.traversals import iter_module_search
+
+        for _, module in iter_module_search(model, UnifiedAttention):
+            attention_type = str(getattr(module, "attention_type", "standard")).lower()
+            if attention_type == "mla":
+                has_mla_attention = True
+            else:
+                has_non_mla_attention = True
+            if has_mla_attention and has_non_mla_attention:
+                break
+    except Exception:
+        pass
+
+    # Fallback for implementations that do not expose UnifiedAttention modules.
+    if not has_mla_attention and not has_non_mla_attention and _text_config_uses_mla(text_config):
+        has_mla_attention = True
+
+    return has_mla_attention, has_non_mla_attention
+
+
+def _is_kv_attention_layer_type(layer_type: tp.Any) -> bool:
+    """Return True if a `layer_type` consumes KV pages."""
+    layer_type_norm = str(layer_type).lower()
+    return (
+        "full" in layer_type_norm
+        or "sliding" in layer_type_norm
+        or layer_type_norm == "attention"
+        or layer_type_norm == "parallel_hybrid"
+    )
 
 
 @auto_pytree
@@ -210,14 +301,12 @@ def _count_kv_layers(text_config) -> int:
     layers consume KV cache pages.  Returns the total ``num_hidden_layers``
     when no ``layer_types`` attribute is present.
     """
-    num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
+    num_hidden_layers = int(getattr(text_config, "num_hidden_layers", 1) or 1)
     layer_types = getattr(text_config, "layer_types", None)
-    if layer_types is not None:
-        num_kv_layers = sum(
-            1 for lt in layer_types if "full" in lt or "sliding" in lt or lt == "attention" or lt == "parallel_hybrid"
-        )
+    if isinstance(layer_types, (list, tuple)):
+        num_kv_layers = sum(1 for layer_type in layer_types if _is_kv_attention_layer_type(layer_type))
         if num_kv_layers > 0:
-            num_hidden_layers = num_kv_layers
+            return int(num_kv_layers)
     return num_hidden_layers
 
 
@@ -272,11 +361,11 @@ class EasyGenerationMixin:
 
     def init_ragged_pages(
         self,
-        config: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig | None = None,
+        config: RaggedPagesCacheConfig | MLARaggedPagesCacheConfig | UnifiedAttentionCacheConfig | None = None,
         page_size: int | None = None,
         hbm_utilization: float | None = None,
         max_model_length: int | None = None,
-    ) -> RaggedPagesCache | UnifiedAttentionCache:
+    ) -> RaggedPagesCache | MLARaggedPagesCache | UnifiedAttentionCache:
         """
         Initializes and returns the actual Paged Attention KV Cache tensors.
 
@@ -322,6 +411,13 @@ class EasyGenerationMixin:
 
         if isinstance(config, UnifiedAttentionCacheConfig):
             return UnifiedAttentionCache.init_cache(
+                mesh=text_config.mesh,
+                config=config,
+                partition_manager=text_config.partition_manager,
+                quantizer=quantizer,
+            )
+        if isinstance(config, MLARaggedPagesCacheConfig):
+            return MLARaggedPagesCache.init_cache(
                 mesh=text_config.mesh,
                 config=config,
                 partition_manager=text_config.partition_manager,
@@ -853,35 +949,19 @@ class EasyGenerationMixin:
             value_dim=value_dim,
         )
 
-    def create_ragged_page_cache_config(
+    def _create_standard_ragged_page_cache_config(
         self,
         max_length: int,
         *,
         page_size: int = 128,
         hbm_utilization: float = 0.9,
         dtype: jnp.dtype | None = None,
+        num_hidden_layers_override: int | None = None,
     ):
-        """Create RaggedPagesCacheConfig from model configuration.
-
-        Creates cache configuration for Paged Attention (vLLM-style) with ragged
-        page management. The batch size is determined dynamically based on HBM
-        utilization.
-
-        Args:
-            max_length (int): Maximum sequence length (max_model_length).
-            page_size (int): Number of tokens per page. Defaults to 128.
-            hbm_utilization (float): Target HBM memory utilization fraction (0.0-1.0).
-                Defaults to 0.9.
-            dtype (jnp.dtype | None): Data type for cache tensors. If None, uses
-                the model's kvdtype. Defaults to None.
-
-        Returns:
-            RaggedPagesCacheConfig: Cache configuration for paged attention.
-        """
+        """Create a non-MLA RaggedPagesCacheConfig."""
         from easydel.caching import RaggedPagesCacheConfig
 
         text_config = self.config.get_text_config()
-
         if dtype is None:
             dtype = getattr(text_config, "kvdtype", jnp.bfloat16)
             if isinstance(dtype, str):
@@ -895,33 +975,119 @@ class EasyGenerationMixin:
             if hidden_size and num_heads:
                 head_dim = hidden_size // num_heads
 
-        num_hidden_layers = _count_kv_layers(text_config)
-        # Pure recurrent models (e.g. falcon-mamba) have no attention heads.
-        # Use minimal dummy KV dimensions so the page infrastructure stays valid
-        # but allocates negligible memory — no layer actually stores KV data.
-        if num_kv_heads is None or num_kv_heads <= 0:
-            num_kv_heads = 1
-        if head_dim is None or head_dim <= 0:
-            head_dim = 1
+        num_hidden_layers = (
+            int(num_hidden_layers_override) if num_hidden_layers_override is not None else _count_kv_layers(text_config)
+        )
         if num_hidden_layers <= 0:
             num_hidden_layers = 1
-        if self.config.get_text_config().attn_mechanism == "ragged_page_attention_v3":
-            version = "v3"
-        elif self.config.get_text_config().attn_mechanism == "ragged_page_attention_v2":
-            version = "v2"
-        else:
-            version = "v3"
+        if num_kv_heads is None or int(num_kv_heads) <= 0:
+            num_kv_heads = 1
+        if head_dim is None or int(head_dim) <= 0:
+            head_dim = 1
+
+        attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
+        version = "v2" if attn_mechanism == "ragged_page_attention_v2" else "v3"
+
         return RaggedPagesCacheConfig.create(
             mesh=text_config.mesh,
             partition_manager=text_config.partition_manager,
             kvdtype=dtype,
-            num_hidden_layers=num_hidden_layers,
-            num_kv_heads=num_kv_heads,
+            num_hidden_layers=int(num_hidden_layers),
+            num_kv_heads=int(num_kv_heads),
             max_model_length=max_length,
-            kv_head_dim_size=head_dim,
+            kv_head_dim_size=int(head_dim),
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             version=version,
+        )
+
+    def _create_mla_ragged_page_cache_config(
+        self,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+        num_hidden_layers_override: int | None = None,
+    ):
+        """Create an MLA-specific MLARaggedPagesCacheConfig."""
+        from easydel.caching import MLARaggedPagesCacheConfig
+
+        text_config = self.config.get_text_config()
+        if dtype is None:
+            dtype = getattr(text_config, "kvdtype", jnp.bfloat16)
+            if isinstance(dtype, str):
+                dtype = getattr(jnp, dtype, jnp.bfloat16)
+
+        num_hidden_layers = (
+            int(num_hidden_layers_override) if num_hidden_layers_override is not None else _count_kv_layers(text_config)
+        )
+        if num_hidden_layers <= 0:
+            num_hidden_layers = 1
+
+        # ejkernel MLA kernel stores decompressed k_nope (qk_nope_head_dim) in
+        # cache pages, not compressed_kv (kv_lora_rank).  Use qk_nope_head_dim
+        # as the "kv_lora_rank" parameter so that the cache page dimension
+        # matches the kernel expectation: padded(qk_nope_head_dim) + padded(qk_rope_head_dim).
+        qk_nope_head_dim = getattr(text_config, "qk_nope_head_dim", None)
+        if qk_nope_head_dim is None:
+            # Fallback: some configs only expose kv_lora_rank.
+            qk_nope_head_dim = getattr(text_config, "kv_lora_rank", None)
+            if qk_nope_head_dim is None:
+                qk_nope_head_dim = getattr(text_config, "kv_lora_dim", None)
+        qk_rope_head_dim = getattr(text_config, "qk_rope_head_dim", None)
+        if qk_nope_head_dim is None or int(qk_nope_head_dim) <= 0:
+            raise ValueError(
+                "MLA ragged cache requires positive `qk_nope_head_dim` "
+                "(or `kv_lora_rank` / `kv_lora_dim`) on text config."
+            )
+        if qk_rope_head_dim is None or int(qk_rope_head_dim) < 0:
+            raise ValueError("MLA ragged cache requires non-negative `qk_rope_head_dim` on text config.")
+
+        mla_num_heads = getattr(text_config, "num_attention_heads", None)
+        if mla_num_heads is None:
+            mla_num_heads = getattr(text_config, "num_key_value_heads", None)
+        if mla_num_heads is None or int(mla_num_heads) <= 0:
+            mla_num_heads = 1
+
+        return MLARaggedPagesCacheConfig.create(
+            mesh=text_config.mesh,
+            partition_manager=text_config.partition_manager,
+            kvdtype=dtype,
+            num_hidden_layers=int(num_hidden_layers),
+            num_kv_heads=int(mla_num_heads),
+            max_model_length=max_length,
+            kv_lora_rank=int(qk_nope_head_dim),
+            qk_rope_head_dim=int(qk_rope_head_dim),
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+        )
+
+    def create_ragged_page_cache_config(
+        self,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+    ):
+        """Create paged-cache config for the active attention mechanism."""
+        text_config = self.config.get_text_config()
+        attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
+
+        if attn_mechanism == "multi_latent_ragged_page_attention_v1":
+            return self._create_mla_ragged_page_cache_config(
+                max_length=max_length,
+                page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                dtype=dtype,
+            )
+
+        return self._create_standard_ragged_page_cache_config(
+            max_length=max_length,
+            page_size=page_size,
+            hbm_utilization=hbm_utilization,
+            dtype=dtype,
         )
 
     def create_unified_attention_cache_config(
@@ -990,8 +1156,9 @@ class EasyGenerationMixin:
             page_size: Page size for RaggedPagesCache. Defaults to 128.
             hbm_utilization: HBM utilization for paged caches. Defaults to 0.9.
             dtype: Data type for cache tensors. If None, uses model's kvdtype.
-            ragged_config: Optional pre-configured RaggedPagesCacheConfig. If None
-                and needed, one will be created.
+            ragged_config: Optional pre-configured ragged config. Can be either
+                RaggedPagesCacheConfig or MLARaggedPagesCacheConfig. If None
+                and needed, one (or both, for mixed ragged models) will be created.
             unified_config: Optional pre-configured UnifiedAttentionCacheConfig.
                 If None and needed, one will be created.
 
@@ -1015,15 +1182,20 @@ class EasyGenerationMixin:
         from easydel.caching import (
             KDACacheView,
             LightningCacheView,
+            MLARaggedPagesCacheConfig,
+            MLARaggedPagesCacheView,
             ParallelHybridCacheView,
+            RaggedPagesCacheConfig,
             RaggedPagesCacheView,
             RecurrentCacheView,
             TransformerCacheView,
+            UnifiedAttentionCacheConfig,
             UnifiedAttentionCacheView,
         )
 
         text_config = self.config.get_text_config()
         cache_view_mapping = self.get_operations_cache_view()
+        cache_view_mapping_by_slot = self.get_operations_cache_view_by_slot()
 
         # Resolve dtype
         if dtype is None:
@@ -1031,33 +1203,99 @@ class EasyGenerationMixin:
             if isinstance(dtype, str):
                 dtype = getattr(jnp, dtype, jnp.bfloat16)
 
-        # Check if any layer needs paged caches and create shared configs.
-        shared_ragged_config = None
-        shared_unified_config = None
-        needs_ragged = any(view_class is RaggedPagesCacheView for view_class in cache_view_mapping.values())
+        num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
+        if num_hidden_layers is None:
+            num_hidden_layers = (max(cache_view_mapping.keys(), default=-1) + 1) if cache_view_mapping else 0
+
+        def _resolve_parallel_hybrid_attention_view_class(layer_idx: int) -> type:
+            slots = cache_view_mapping_by_slot.get(layer_idx, {})
+            attention_view_classes = {
+                cls
+                for cls in slots.values()
+                if cls
+                in (
+                    TransformerCacheView,
+                    RaggedPagesCacheView,
+                    MLARaggedPagesCacheView,
+                    UnifiedAttentionCacheView,
+                )
+            }
+            if len(attention_view_classes) != 1:
+                raise ValueError(
+                    f"ParallelHybrid layer {layer_idx} must expose exactly one attention cache view class; "
+                    f"got {attention_view_classes}."
+                )
+            return next(iter(attention_view_classes))
+
+        needs_standard_ragged = False
+        needs_mla_ragged = False
         needs_unified = any(view_class is UnifiedAttentionCacheView for view_class in cache_view_mapping.values())
-        # If caller explicitly provides a ragged/unified config, make it available
-        # even when all layers are ParallelHybridCacheView (e.g., FalconH1 in eSurge).
+
+        for layer_idx, view_class in cache_view_mapping.items():
+            if view_class is RaggedPagesCacheView:
+                needs_standard_ragged = True
+            elif view_class is MLARaggedPagesCacheView:
+                needs_mla_ragged = True
+            elif view_class is ParallelHybridCacheView:
+                attn_view_class = _resolve_parallel_hybrid_attention_view_class(layer_idx)
+                if attn_view_class is RaggedPagesCacheView:
+                    needs_standard_ragged = True
+                elif attn_view_class is MLARaggedPagesCacheView:
+                    needs_mla_ragged = True
+                elif attn_view_class is UnifiedAttentionCacheView:
+                    needs_unified = True
+
+        num_standard_ragged_layers = 0
+        num_mla_ragged_layers = 0
+        for layer_idx, view_class in cache_view_mapping.items():
+            if view_class is RaggedPagesCacheView:
+                num_standard_ragged_layers += 1
+            elif view_class is MLARaggedPagesCacheView:
+                num_mla_ragged_layers += 1
+            elif view_class is ParallelHybridCacheView:
+                attn_view_class = _resolve_parallel_hybrid_attention_view_class(layer_idx)
+                if attn_view_class is RaggedPagesCacheView:
+                    num_standard_ragged_layers += 1
+                elif attn_view_class is MLARaggedPagesCacheView:
+                    num_mla_ragged_layers += 1
+
+        shared_ragged_config: RaggedPagesCacheConfig | None = None
+        shared_mla_ragged_config: MLARaggedPagesCacheConfig | None = None
+        shared_unified_config: UnifiedAttentionCacheConfig | None = None
+
         if ragged_config is not None:
-            needs_ragged = True
-        if unified_config is not None:
-            needs_unified = True
+            # MLARaggedPagesCacheConfig subclasses RaggedPagesCacheConfig, so we must
+            # test it first to avoid downgrading an MLA config to "standard ragged".
+            if isinstance(ragged_config, MLARaggedPagesCacheConfig):
+                shared_mla_ragged_config = ragged_config
+                needs_mla_ragged = True
+            elif isinstance(ragged_config, RaggedPagesCacheConfig):
+                shared_ragged_config = ragged_config
+                needs_standard_ragged = True
+            else:
+                raise TypeError(
+                    "`ragged_config` must be a RaggedPagesCacheConfig or MLARaggedPagesCacheConfig, "
+                    f"got {type(ragged_config)}"
+                )
 
-        if needs_ragged:
-            from easydel.caching import RaggedPagesCacheConfig
-
-            if ragged_config is not None and not isinstance(ragged_config, RaggedPagesCacheConfig):
-                raise TypeError(f"`ragged_config` must be a RaggedPagesCacheConfig, got {type(ragged_config)}")
-            shared_ragged_config = ragged_config or self.create_ragged_page_cache_config(
+        if needs_standard_ragged and shared_ragged_config is None:
+            shared_ragged_config = self._create_standard_ragged_page_cache_config(
                 max_length=max_length,
                 page_size=page_size,
                 hbm_utilization=hbm_utilization,
                 dtype=dtype,
+                num_hidden_layers_override=max(1, num_standard_ragged_layers),
+            )
+        if needs_mla_ragged and shared_mla_ragged_config is None:
+            shared_mla_ragged_config = self._create_mla_ragged_page_cache_config(
+                max_length=max_length,
+                page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                dtype=dtype,
+                num_hidden_layers_override=max(1, num_mla_ragged_layers),
             )
 
         if needs_unified:
-            from easydel.caching import UnifiedAttentionCacheConfig
-
             if unified_config is not None and not isinstance(unified_config, UnifiedAttentionCacheConfig):
                 raise TypeError(f"`unified_config` must be a UnifiedAttentionCacheConfig, got {type(unified_config)}")
             shared_unified_config = unified_config or self.create_unified_attention_cache_config(
@@ -1067,10 +1305,6 @@ class EasyGenerationMixin:
                 dtype=dtype,
             )
         with self.mesh:
-            num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
-            if num_hidden_layers is None:
-                num_hidden_layers = (max(cache_view_mapping.keys(), default=-1) + 1) if cache_view_mapping else 0
-
             views_config = [None] * num_hidden_layers
 
             for idx in range(num_hidden_layers):
@@ -1082,13 +1316,23 @@ class EasyGenerationMixin:
                     )
 
                 if view_class is ParallelHybridCacheView:
-                    # Use ragged/unified config if available (eSurge mode), else standard transformer config.
-                    if shared_ragged_config is not None:
+                    attn_view_class = _resolve_parallel_hybrid_attention_view_class(idx)
+                    if attn_view_class is MLARaggedPagesCacheView:
+                        t_config = shared_mla_ragged_config
+                    elif attn_view_class is RaggedPagesCacheView:
                         t_config = shared_ragged_config
-                    elif shared_unified_config is not None:
+                    elif attn_view_class is UnifiedAttentionCacheView:
                         t_config = shared_unified_config
                     else:
-                        t_config = self.create_transformer_cache_config(batch_size=batch_size, max_length=max_length)
+                        t_config = self.create_transformer_cache_config(
+                            batch_size=batch_size,
+                            max_length=max_length,
+                        )
+                    if t_config is None:
+                        raise ValueError(
+                            f"Failed to resolve attention cache config for ParallelHybrid layer {idx} "
+                            f"(attention view class: {attn_view_class})."
+                        )
                     r_config = self.create_recurrent_cache_config(batch_size=batch_size)
                     views_config[idx] = (t_config, r_config)
                 elif view_class is TransformerCacheView:
@@ -1101,7 +1345,13 @@ class EasyGenerationMixin:
                     config = self.create_kda_cache_config(batch_size=batch_size)
                     views_config[idx] = config
                 elif view_class is RaggedPagesCacheView:
+                    if shared_ragged_config is None:
+                        raise ValueError(f"Missing RaggedPagesCacheConfig for layer {idx}.")
                     views_config[idx] = shared_ragged_config
+                elif view_class is MLARaggedPagesCacheView:
+                    if shared_mla_ragged_config is None:
+                        raise ValueError(f"Missing MLARaggedPagesCacheConfig for layer {idx}.")
+                    views_config[idx] = shared_mla_ragged_config
                 elif view_class is UnifiedAttentionCacheView:
                     views_config[idx] = shared_unified_config
                 elif view_class is LightningCacheView:
@@ -1161,6 +1411,7 @@ class EasyGenerationMixin:
             HybridCache,
             KDACacheView,
             LightningCacheView,
+            MLARaggedPagesCacheView,
             ParallelHybridCacheView,
             RaggedPagesCacheView,
             RecurrentCacheView,
@@ -1206,9 +1457,21 @@ class EasyGenerationMixin:
                     # The attention config can be ragged, unified, or standard transformer.
                     t_config = config_classes[0]
 
-                    from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
+                    from easydel.caching import (
+                        MLARaggedPagesCacheConfig,
+                        RaggedPagesCacheConfig,
+                        UnifiedAttentionCacheConfig,
+                    )
 
-                    if isinstance(t_config, RaggedPagesCacheConfig):
+                    if isinstance(t_config, MLARaggedPagesCacheConfig):
+                        attn_view = MLARaggedPagesCacheView.init(
+                            config=t_config,
+                            layer_index=idx,
+                            mesh=text_config.mesh,
+                            partition_manager=text_config.partition_manager,
+                            quantizer=quantizer,
+                        )
+                    elif isinstance(t_config, RaggedPagesCacheConfig):
                         attn_view = RaggedPagesCacheView.init(
                             config=t_config,
                             layer_index=idx,
@@ -1270,7 +1533,7 @@ class EasyGenerationMixin:
                         layer_index=idx,
                         dtype=dtype,
                     )
-                elif view_class is RaggedPagesCacheView:
+                elif view_class in (RaggedPagesCacheView, MLARaggedPagesCacheView):
                     view = view_class.init(
                         config=config_classes,
                         layer_index=idx,
@@ -1463,9 +1726,9 @@ class EasyGenerationMixin:
         if q_segment_ids is not None:
             return MaskInfo.from_segments(
                 q_segment_ids=q_segment_ids,
-                kv_segment_ids=kv_segment_ids
-                if kv_segment_ids is not None
-                else (q_segment_ids if is_self_attn else None),
+                kv_segment_ids=(
+                    kv_segment_ids if kv_segment_ids is not None else (q_segment_ids if is_self_attn else None)
+                ),
                 q_positions=q_positions,
                 kv_positions=kv_positions,
             )
@@ -1688,7 +1951,9 @@ class EasyGenerationMixin:
                 param = valid_params[name]
                 if param.annotation != inspect.Parameter.empty:
                     try:
-                        if getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None:  # pyright: ignore[reportDeprecated]
+                        if (
+                            getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None
+                        ):  # pyright: ignore[reportDeprecated]
                             expected_type = param.annotation.__args__[0]
                             if not isinstance(value, expected_type):
                                 print(
@@ -2992,9 +3257,25 @@ class EasyGenerationMixin:
         """
         gdef = self.graphdef
         backend = _resolve_backend_for_esurge(self.config)
-        attn_mechanism = self.config.attn_mechanism
-        if backend == "tpu":
-            compatible = attn_mechanism in ["ragged_page_attention_v2", "ragged_page_attention_v3"]
+        text_config = self.config.get_text_config()
+        attn_mechanism = _normalize_attn_mechanism_value(getattr(self.config, "attn_mechanism", None))
+        has_mla_attention, has_non_mla_attention = _detect_mla_attention_mix(self, text_config)
+        _num_heads = getattr(text_config, "num_attention_heads", 0) or 0
+        _mla_kernel_ok = int(_num_heads) > 0
+        is_mla_model = has_mla_attention and _mla_kernel_ok
+        if is_mla_model:
+            compatible = attn_mechanism == "multi_latent_ragged_page_attention_v1"
+            if backend == "gpu":
+                compatible = compatible or attn_mechanism in {
+                    "unified_attention",
+                    "paged_flash_attention",
+                }
+            target_attn = "multi_latent_ragged_page_attention_v1"
+        elif backend == "tpu":
+            compatible = attn_mechanism in [
+                "ragged_page_attention_v2",
+                "ragged_page_attention_v3",
+            ]
             target_attn = "ragged_page_attention_v3"
         elif backend == "gpu":
             compatible = attn_mechanism in [
@@ -3006,11 +3287,24 @@ class EasyGenerationMixin:
             target_attn = "unified_attention"
         else:
             # Unified/paged-flash kernels are not available on non-GPU backends.
-            compatible = attn_mechanism in ["ragged_page_attention_v2", "ragged_page_attention_v3"]
+            compatible = attn_mechanism in [
+                "ragged_page_attention_v2",
+                "ragged_page_attention_v3",
+            ]
             target_attn = "ragged_page_attention_v3"
 
         if not compatible:
-            gdef = self.new_graphdef(attn_mechanism=target_attn, recursive_update=True)
+            update_kwargs: dict[str, tp.Any] = dict(attn_mechanism=target_attn, recursive_update=True)
+            if is_mla_model:
+                if has_non_mla_attention:
+                    logger.warning(
+                        "Detected mixed MLA and non-MLA full-attention layers, "
+                        "forcing all inference layers to "
+                        "multi_latent_ragged_page_attention_v1."
+                    )
+                update_kwargs["decode_attn_mechanism"] = target_attn
+                update_kwargs["mla_attn_mechanism"] = target_attn
+            gdef = self.new_graphdef(**update_kwargs)
         return gdef
 
     @property
@@ -3039,10 +3333,28 @@ class EasyGenerationMixin:
             >>> outputs = esurge_model.esurge_generate("Hello world")
         """
         backend = _resolve_backend_for_esurge(self.config)
-        attn_mechanism = self.config.attn_mechanism
+        text_config = self.config.get_text_config()
+        attn_mechanism = _normalize_attn_mechanism_value(getattr(self.config, "attn_mechanism", None))
+        has_mla_attention, has_non_mla_attention = _detect_mla_attention_mix(self, text_config)
 
-        if backend == "tpu":
-            compatible = attn_mechanism in ["ragged_page_attention_v2", "ragged_page_attention_v3"]
+        _num_heads = getattr(text_config, "num_attention_heads", 0) or 0
+        _mla_kernel_ok = int(_num_heads) > 0
+
+        is_mla_model = has_mla_attention and _mla_kernel_ok
+
+        if is_mla_model:
+            compatible = attn_mechanism == "multi_latent_ragged_page_attention_v1"
+            if backend == "gpu":
+                compatible = compatible or attn_mechanism in {
+                    "unified_attention",
+                    "paged_flash_attention",
+                }
+            target_attn = "multi_latent_ragged_page_attention_v1"
+        elif backend == "tpu":
+            compatible = attn_mechanism in [
+                "ragged_page_attention_v2",
+                "ragged_page_attention_v3",
+            ]
             target_attn = "ragged_page_attention_v3"
         elif backend == "gpu":
             compatible = attn_mechanism in [
@@ -3053,13 +3365,26 @@ class EasyGenerationMixin:
             ]
             target_attn = "unified_attention"
         else:
-            compatible = attn_mechanism in ["ragged_page_attention_v2", "ragged_page_attention_v3"]
+            compatible = attn_mechanism in [
+                "ragged_page_attention_v2",
+                "ragged_page_attention_v3",
+            ]
             target_attn = "ragged_page_attention_v3"
 
         if compatible:
             return self
 
-        compat_graphdef = self.new_graphdef(attn_mechanism=target_attn, recursive_update=True)
+        update_kwargs: dict[str, tp.Any] = dict(attn_mechanism=target_attn, recursive_update=True)
+        if is_mla_model:
+            if has_non_mla_attention:
+                logger.warning(
+                    "Mixed MLA and non-MLA full-attention layers detected, "
+                    "forcing all inference layers to "
+                    "multi_latent_ragged_page_attention_v1."
+                )
+            update_kwargs["decode_attn_mechanism"] = target_attn
+            update_kwargs["mla_attn_mechanism"] = target_attn
+        compat_graphdef = self.new_graphdef(**update_kwargs)
 
         return self.merge_module(compat_graphdef, self.graphstate, self.graphother)
 

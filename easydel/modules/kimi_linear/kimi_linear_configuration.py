@@ -226,6 +226,8 @@ class KimiLinearConfig(EasyDeLBaseConfig):
             assert linear_attn_config.get("kda_layers") is not None
             assert linear_attn_config.get("full_attn_layers") is not None
         self.linear_attn_config = linear_attn_config
+        if kwargs.get("layer_types", None) is None:
+            kwargs["layer_types"] = list(self.get_layer_types())
 
         super().__init__(
             pad_token_id=pad_token_id,

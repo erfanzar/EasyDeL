@@ -29,6 +29,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from easydel.caching import (
     HybridCache,
+    MLARaggedPagesCacheView,
     OperationsMetadata,
     RaggedPagesCache,
     RaggedPagesCacheView,
@@ -664,6 +665,30 @@ class Glm4MoeLiteAttention(UnifiedAttention):
         softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
         softmax_aux = getattr(softmax_aux, "value", softmax_aux)
 
+        # Absorbed MLA: absorb kv_b_proj weights into queries so the kernel
+        # works directly on the compressed latent (non-head-aware path).
+        mla_kwargs: dict = {}
+        _absorbed_W_v = None
+        if isinstance(cache_view, MLARaggedPagesCacheView):
+            W = self.mla_kv_b_proj.kernel.value  # [kv_lora_rank, local_heads*(nope+v)]
+            local_heads = W.shape[1] // (self.qk_nope_head_dim + self.v_head_dim)
+            W = W.reshape(self.kv_lora_rank, local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            W_nope = W[:, :, : self.qk_nope_head_dim]  # [kv_lora_rank, local_heads, nope]
+            _absorbed_W_v = W[:, :, self.qk_nope_head_dim :]  # [kv_lora_rank, local_heads, v]
+
+            # q_nope: [bsz, heads, seq, nope] @ W_nope: [kv_lora_rank, heads, nope]
+            # -> q_absorbed: [bsz, heads, seq, kv_lora_rank]
+            q_absorbed = jnp.einsum("bhsd,khd->bhsk", q_nope, W_nope)
+
+            mla_kwargs["queries_nope"] = q_absorbed.transpose(0, 2, 1, 3)  # [bsz, seq, heads, kv_lora_rank]
+            mla_kwargs["queries_pe"] = q_pe.transpose(0, 2, 1, 3)  # [bsz, seq, heads, rope_dim]
+            # Store layernormed latent — kv_b_proj weights were trained against
+            # layernorm output, so the cached latent must match.
+            mla_kwargs["keys_values"] = self.mla_kv_a_layernorm(compressed_kv)  # [bsz, seq, kv_lora_rank]
+            mla_kwargs["keys_pe"] = k_pe[:, 0, :, :]  # [bsz, seq, rope_dim]
+            # Explicit softmax_scale: must use original q_head_dim, not absorbed dim
+            mla_kwargs["softmax_scale"] = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
+
         attentions = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -677,9 +702,46 @@ class Glm4MoeLiteAttention(UnifiedAttention):
             causal=causal_for_kernel,
             sliding_window=sliding_window_for_kernel,
             softmax_aux=softmax_aux,
+            **mla_kwargs,
         )
 
-        attn_output = self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
+        attn_out = attentions.attention_outputs
+        if _absorbed_W_v is not None and attn_out.ndim == 3:
+            # Absorbed MLA output: [total_tokens, heads, kv_lora_rank]
+            # Value up-projection: recover per-head v_head_dim
+            # _absorbed_W_v: [kv_lora_rank, heads, v_head_dim]
+            attn_out = jnp.einsum("thk,khv->thv", attn_out, _absorbed_W_v)
+            # attn_out: [total_tokens, heads, v_head_dim]
+            batch_size = hidden_states.shape[0]
+            seq_len = hidden_states.shape[1]
+            attn_output = attn_out.reshape(batch_size, seq_len, -1)
+        elif isinstance(cache_view, MLARaggedPagesCacheView) and attn_out.ndim == 3:
+            batch_size = hidden_states.shape[0]
+            seq_len = hidden_states.shape[1]
+            attn_output = attn_out.reshape(batch_size, seq_len, -1)
+        else:
+            attn_output = self._merge_heads(attn_out)
+        expected_attn_dim = self.num_heads * self.v_head_dim
+        if attn_output.shape[-1] != expected_attn_dim:
+            actual_attn_dim = int(attn_output.shape[-1])
+            if actual_attn_dim % self.num_heads == 0 and expected_attn_dim % self.num_heads == 0:
+                actual_head_dim = actual_attn_dim // self.num_heads
+                expected_head_dim = expected_attn_dim // self.num_heads
+                attn_output = attn_output.reshape(*attn_output.shape[:-1], self.num_heads, actual_head_dim)
+                if actual_head_dim > expected_head_dim:
+                    attn_output = attn_output[..., :expected_head_dim]
+                elif actual_head_dim < expected_head_dim:
+                    pad_width = [(0, 0)] * attn_output.ndim
+                    pad_width[-1] = (0, expected_head_dim - actual_head_dim)
+                    attn_output = jnp.pad(attn_output, pad_width)
+                attn_output = attn_output.reshape(*attn_output.shape[:-2], expected_attn_dim)
+            elif actual_attn_dim > expected_attn_dim:
+                attn_output = attn_output[..., :expected_attn_dim]
+            else:
+                pad_width = [(0, 0)] * attn_output.ndim
+                pad_width[-1] = (0, expected_attn_dim - actual_attn_dim)
+                attn_output = jnp.pad(attn_output, pad_width)
+        attn_output = self.shard_attention_prod(attn_output)
         attn_output = checkpoint_name(self.output_projection(attn_output), name="attn_output")
 
         return AttentionLayerOutput(
@@ -1022,7 +1084,7 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
         GLM4-MoE-Lite uses MLA, where the runtime attention head width is
         ``qk_nope_head_dim + qk_rope_head_dim`` (not ``config.head_dim``).
         """
-        from easydel.caching import RaggedPagesCacheConfig
+        from easydel.caching import MLARaggedPagesCacheConfig, RaggedPagesCacheConfig
         from easydel.layers.attention import AttentionMechanisms
 
         text_config = self.config.get_text_config()
@@ -1037,6 +1099,27 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
                 version = "v2"
             case _:
                 version = "v3"
+
+        attn_mechanism = getattr(text_config, "attn_mechanism", None)
+        if hasattr(attn_mechanism, "value"):
+            attn_mechanism = attn_mechanism.value
+        is_mla_ragged = str(attn_mechanism) == "multi_latent_ragged_page_attention_v1"
+        if is_mla_ragged:
+            # Absorbed MLA: store compressed latent (kv_lora_rank) directly in
+            # cache without per-head decompression.  Query absorption happens at
+            # forward time so the kernel runs in the simpler non-head-aware path.
+            return MLARaggedPagesCacheConfig.create(
+                mesh=self.mesh,
+                partition_manager=text_config.partition_manager,
+                kvdtype=text_config.kvdtype if dtype is None else dtype,
+                max_model_length=max_length,
+                num_hidden_layers=self.config.num_hidden_layers,
+                num_kv_heads=self.config.num_attention_heads,
+                kv_lora_rank=self.config.kv_lora_rank,
+                qk_rope_head_dim=self.config.qk_rope_head_dim,
+                hbm_utilization=hbm_utilization,
+                page_size=page_size,
+            )
 
         return RaggedPagesCacheConfig.create(
             mesh=self.mesh,

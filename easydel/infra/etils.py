@@ -326,6 +326,7 @@ AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
     "autoregressive_decodeattn",
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",
+    "multi_latent_ragged_page_attention_v1",
     "page_attention",
     "unified_attention",
     "paged_flash_attention",
@@ -334,6 +335,10 @@ AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
 # Default attention mechanism used when none is explicitly specified.
 # "vanilla" provides the most compatible standard attention implementation.
 DEFAULT_ATTENTION_MECHANISM = "vanilla"
+
+# Default MLA-specific attention mechanism. "auto" defers MLA kernel selection
+# to runtime-specific inference routing (for example eSurge compatibility paths).
+DEFAULT_MLA_ATTENTION_MECHANISM = "auto"
 
 # Type alias for sparse matrix format types.
 # bcoo: Batched Coordinate format
