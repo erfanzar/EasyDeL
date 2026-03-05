@@ -66,11 +66,16 @@ def _compute_kl_and_ce(
     where all values are scalar accumulators.
     """
     teacher_logits = jax.lax.stop_gradient(teacher_logits)
-    teacher_log_probs = jax.nn.log_softmax(teacher_logits.astype(jnp.float32) / temperature, axis=-1)
-    t_probs = jnp.exp(teacher_log_probs)
+    teacher_scaled_logits = teacher_logits.astype(jnp.float32) / temperature
+    t_probs = jax.nn.softmax(teacher_scaled_logits, axis=-1)
     s_log_probs = jax.nn.log_softmax(student_logits.astype(jnp.float32) / temperature, axis=-1)
     per_token_distill_xent = -jnp.sum(t_probs * s_log_probs, axis=-1).astype(dtype)
-    per_token_teacher_entropy = -jnp.sum(t_probs * teacher_log_probs, axis=-1).astype(dtype)
+    # Keep entropy in log-softmax form for numerical parity while avoiding
+    # a persistent full-vocab ``teacher_log_probs`` tensor in Python scope.
+    per_token_teacher_entropy = -jnp.sum(
+        t_probs * jax.nn.log_softmax(teacher_scaled_logits, axis=-1),
+        axis=-1,
+    ).astype(dtype)
 
     distill_xent_sum = jnp.sum(per_token_distill_xent * mask)
     teacher_entropy_sum = jnp.sum(per_token_teacher_entropy * mask)
@@ -210,11 +215,16 @@ def distillation_loss(
     # so f32 stays contained in this loss function and does NOT leak into
     # the model's backward pass.
     teacher_logits = jax.lax.stop_gradient(teacher_logits)
-    teacher_log_probs = jax.nn.log_softmax(teacher_logits.astype(jnp.float32) / temperature, axis=-1)
-    teacher_probs = jnp.exp(teacher_log_probs)
+    teacher_scaled_logits = teacher_logits.astype(jnp.float32) / temperature
+    teacher_probs = jax.nn.softmax(teacher_scaled_logits, axis=-1)
     student_log_probs = jax.nn.log_softmax(student_logits.astype(jnp.float32) / temperature, axis=-1)
     per_token_distill_xent = -jnp.sum(teacher_probs * student_log_probs, axis=-1).astype(dtype)
-    per_token_teacher_entropy = -jnp.sum(teacher_probs * teacher_log_probs, axis=-1).astype(dtype)
+    # Keep entropy in log-softmax form for numerical parity while avoiding
+    # a persistent full-vocab ``teacher_log_probs`` tensor in Python scope.
+    per_token_teacher_entropy = -jnp.sum(
+        teacher_probs * jax.nn.log_softmax(teacher_scaled_logits, axis=-1),
+        axis=-1,
+    ).astype(dtype)
 
     if loss_mask is not None:
         mask = loss_mask.astype(dtype)
