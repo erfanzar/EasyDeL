@@ -2638,7 +2638,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             if include_backward:
                 flops *= 3
         except Exception:
-            warnings.warn("Calculating Flops Failed!", stacklevel=1)
+            logger.warning_once("Calculating Flops Failed!")
             flops = 1
         return flops
 
