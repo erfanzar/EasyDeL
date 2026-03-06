@@ -377,12 +377,13 @@ class UnitaryCacheCoordinator(CacheCoordinator):
             enable_caching: Whether prefix caching is enabled.
 
         Raises:
-            AssertionError: If more than one cache group is provided.
+            ValueError: If more than one cache group is provided.
         """
         super().__init__(num_pages, kv_cache_groups, max_model_len, use_eagle, enable_caching)
         self.kv_cache_spec = self.kv_cache_groups[0].kv_cache_spec
         self.page_size = self.kv_cache_spec.page_size
-        assert len(self.kv_cache_groups) == 1, "UnitaryCacheCoordinator assumes only one kv cache group"
+        if len(self.kv_cache_groups) != 1:
+            raise ValueError("UnitaryCacheCoordinator assumes only one kv cache group")
 
     def find_longest_cache_hit(
         self,
@@ -488,23 +489,21 @@ class HybridCacheCoordinator(CacheCoordinator):
                 if full_attention_type_id is None:
                     full_attention_type_id = g.kv_cache_spec.type_id
                 else:
-                    assert full_attention_type_id == g.kv_cache_spec.type_id, (
-                        "HybridCacheCoordinator assumes exactly one type of full attention groups now."
-                    )
+                    if full_attention_type_id != g.kv_cache_spec.type_id:
+                        raise ValueError("HybridCacheCoordinator assumes exactly one type of full attention groups now.")
                 self.full_attention_group_ids.append(i)
             else:
                 if other_type_id is None:
                     other_type_id = g.kv_cache_spec.type_id
                 else:
-                    assert other_type_id == g.kv_cache_spec.type_id, (
-                        "HybridCacheCoordinator assumes exactly one other type of groups now."
-                    )
+                    if other_type_id != g.kv_cache_spec.type_id:
+                        raise ValueError("HybridCacheCoordinator assumes exactly one other type of groups now.")
                 self.other_group_ids.append(i)
 
-        assert full_attention_type_id is not None, (
-            "HybridCacheCoordinator assumes exactly one type of full attention groups now."
-        )
-        assert other_type_id is not None, "HybridCacheCoordinator assumes exactly one type of other groups now."
+        if full_attention_type_id is None:
+            raise ValueError("HybridCacheCoordinator assumes exactly one type of full attention groups now.")
+        if other_type_id is None:
+            raise ValueError("HybridCacheCoordinator assumes exactly one type of other groups now.")
 
         self.full_attention_manager_cls = FullAttentionManager
         self.other_attention_cls = self.single_type_managers[self.other_group_ids[0]].__class__
@@ -517,9 +516,10 @@ class HybridCacheCoordinator(CacheCoordinator):
 
         if self.enable_caching:
             divisible = self.other_page_size % self.full_attention_page_size
-            assert divisible == 0, (
-                "CacheCoordinator assumes the page_size of full attention layers is divisible by other layers now."
-            )
+            if divisible != 0:
+                raise ValueError(
+                    "CacheCoordinator assumes the page_size of full attention layers is divisible by other layers now."
+                )
 
         if max(self.full_attention_group_ids) < min(self.other_group_ids):
             self.full_attn_first = True
@@ -586,7 +586,10 @@ class HybridCacheCoordinator(CacheCoordinator):
         )
         hit_length = len(hit_pages_other_attn[0]) * self.other_page_size
 
-        assert hit_length % self.full_attention_page_size == 0
+        if hit_length % self.full_attention_page_size != 0:
+            raise RuntimeError(
+                f"hit_length ({hit_length}) must be divisible by full_attention_page_size ({self.full_attention_page_size})"
+            )
 
         for group_hit_pages in hit_pages_full_attn:
             del group_hit_pages[hit_length // self.full_attention_page_size :]

@@ -143,7 +143,8 @@ class OperationExecutor:
         if prefill_reqs is None and decode_reqs is None:
             return OperationRequirements.default()
         if prefill_reqs is None:
-            assert decode_reqs is not None
+            if decode_reqs is None:
+                raise RuntimeError("decode_reqs must not be None when prefill_reqs is None")
             return decode_reqs
         if decode_reqs is None:
             return prefill_reqs

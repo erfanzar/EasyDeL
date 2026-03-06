@@ -53,7 +53,7 @@ from jaxtyping import Array, Float
 from easydel.caching import RecurrentCacheView
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import (
     CacheType,
     ExecutionMode,
@@ -122,15 +122,6 @@ class GatedDeltaRuleOp(OperationImpl):
             Tuple of names: ("gated_delta_rule", "gdr")
         """
         return ("gated_delta_rule", "gdr")
-
-    def get_impl_metadata(self) -> OperationMetadata:
-        """Returns the metadata associated with this operation instance.
-
-        Returns:
-            The OperationMetadata provided during initialization.
-        """
-        assert self.metadata is not None
-        return self.metadata
 
     @classmethod
     def get_requirements(

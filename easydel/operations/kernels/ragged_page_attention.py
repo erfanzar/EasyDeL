@@ -94,7 +94,7 @@ from easydel.caching import RaggedPagesCacheView, RaggedPagesMetadata
 from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import (
     CacheType,
     ExecutionMode,
@@ -169,16 +169,6 @@ class _RaggedPageAttn(OperationImpl):
             tp.Union[str, tp.Tuple[str]]: The name "ragged_page_attention_v3" or "ragged_page_attention_v2".
         """
         raise NotImplementedError()
-
-    def get_impl_metadata(self) -> OperationMetadata:
-        """
-        Retrieves the metadata associated with this attention implementation instance.
-
-        Returns:
-            OperationMetadata: The metadata object provided during initialization.
-        """
-        assert self.metadata is not None
-        return self.metadata
 
     def forward_v2(
         self,

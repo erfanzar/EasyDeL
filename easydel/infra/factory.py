@@ -70,6 +70,8 @@ See Also:
     - :class:`EasyDeLBaseModule`: Base class for all module implementations.
 """
 
+from __future__ import annotations
+
 import inspect
 import typing as tp
 from enum import StrEnum
@@ -77,9 +79,14 @@ from enum import StrEnum
 from eformer.pytree import auto_pytree
 
 from .base_config import EasyDeLBaseConfig
-from .base_module import EasyDeLBaseModule
+
+if tp.TYPE_CHECKING:
+    from .base_module import EasyDeLBaseModule
+else:
+    EasyDeLBaseModule = tp.Any
 
 T = tp.TypeVar("T")
+_SENTINEL = object()
 
 
 class ConfigType(StrEnum):
@@ -378,8 +385,8 @@ class Registry:
                 """
                 _stre = f"{obj.__name__}(\n"
                 for key in list(inspect.signature(obj.__init__).parameters.keys()):
-                    attrb = getattr(self, key, "EMT_ATTR_EPLkey")
-                    if attrb != "EMT_ATTR_EPLkey":
+                    attrb = getattr(self, key, _SENTINEL)
+                    if attrb is not _SENTINEL:
                         if hasattr(attrb, "__str__") and not isinstance(
                             attrb,
                             str | int | float | bool | list | dict | tuple,
@@ -391,7 +398,7 @@ class Registry:
                 return _stre + ")"
 
             obj.__str__ = _str
-            obj.__repr__ = lambda self: repr(_str(self))
+            obj.__repr__ = lambda self: _str(self)
             self._config_registry[config_field][config_type] = obj
             return obj
 
@@ -614,9 +621,11 @@ class Registry:
                 )
         """
         task_in = self._task_registry.get(task_type, None)
-        assert task_in is not None, f"task type {task_type} is not defined."
+        if task_in is None:
+            raise KeyError(f"task type {task_type} is not defined.")
         type_in = task_in.get(model_type, None)
-        assert type_in is not None, f"model type {model_type} is not defined. (upper task {task_type})"
+        if type_in is None:
+            raise KeyError(f"model type {model_type} is not defined. (upper task {task_type})")
 
         return type_in
 

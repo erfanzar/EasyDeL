@@ -28,7 +28,7 @@ Classes:
     Phi3LongRoPEScaledRotaryEmbedding: RoPE with Phi-3 LongRoPE scaling.
     Llama3RotaryEmbedding: RoPE with Llama-3 wavelength-based scaling.
 
-The `rope_wraper` decorator registers each class in `AVAILABLE_ROPE_TYPES`
+The `rope_wrapper` decorator registers each class in `AVAILABLE_ROPE_TYPES`
 for dynamic lookup by rope type name.
 
 Example:
@@ -79,7 +79,7 @@ AVAILABLE_ROPE_TYPES = {}
 _T = tp.TypeVar("_T")
 
 
-def rope_wraper(type: str) -> tp.Callable[[_T], _T]:  # noqa
+def rope_wrapper(type: str) -> tp.Callable[[_T], _T]:  # noqa
     """
     A decorator factory that registers a RotaryEmbedding class under a specific type name.
 
@@ -114,7 +114,7 @@ def rope_wraper(type: str) -> tp.Callable[[_T], _T]:  # noqa
     return w
 
 
-@rope_wraper("default")
+@rope_wrapper("default")
 class RotaryEmbedding(nn.Module):
     """
     Standard Rotary Positional Embedding (RoPE) module.
@@ -214,7 +214,7 @@ class RotaryEmbedding(nn.Module):
         return {}
 
 
-@rope_wraper("mrope")
+@rope_wrapper("mrope")
 class MultiModalRotaryEmbedding(RotaryEmbedding):
     """Multi-dimensional RoPE (MRoPE) with interleaved THW layout for Qwen2/3-VL models.
 
@@ -493,7 +493,7 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
             return q_embed.astype(self.dtype), k_embed.astype(self.dtype)
 
 
-@rope_wraper("linear")
+@rope_wrapper("linear")
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
     """
     RotaryEmbedding extended with Linear Scaling.
@@ -587,7 +587,7 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
             )
 
 
-@rope_wraper("dynamic")
+@rope_wrapper("dynamic")
 class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
     """
     RotaryEmbedding extended with Dynamic NTK scaling.
@@ -682,7 +682,7 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
             )
 
 
-@rope_wraper("yarn")
+@rope_wrapper("yarn")
 class YaRNScalingRotaryEmbedding(RotaryEmbedding):
     """
     RotaryEmbedding extended with the YaRN (Yet another RoPE extensioN method) scaling.
@@ -806,7 +806,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
             )
 
 
-@rope_wraper("deepseek_yarn")
+@rope_wrapper("deepseek_yarn")
 class DeepseekScalingRotaryEmbedding(nn.Module):
     """
     RotaryEmbedding implementing a YaRN-like scaling method, potentially from Deepseek models.
@@ -952,7 +952,7 @@ class DeepseekScalingRotaryEmbedding(nn.Module):
         return query, key
 
 
-@rope_wraper("longrope")
+@rope_wrapper("longrope")
 class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
     """
     RotaryEmbedding using the Phi-3 LongRoPE scaling method.
@@ -1067,7 +1067,7 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
             )
 
 
-@rope_wraper("llama3")
+@rope_wrapper("llama3")
 class Llama3RotaryEmbedding(RotaryEmbedding):
     """
     RotaryEmbedding implementing the Llama-3 scaling method.

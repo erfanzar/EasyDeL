@@ -323,7 +323,7 @@ class EasyQuantizer:
         - quantize: Low-level array quantization function
     """
 
-    def __init__(self, quantization_config: QuantizationConfig | QuantizationConfig | None = None) -> None:
+    def __init__(self, quantization_config: QuantizationConfig | None = None) -> None:
         """Initialize the EasyQuantizer with a configuration.
 
         Args:

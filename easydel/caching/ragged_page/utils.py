@@ -223,7 +223,7 @@ def kv_cache_update(
         jax.Array: Updated KV cache pages with same shape as kv_cache_pages.
 
     Raises:
-        AssertionError: If dimensions are incompatible or alignment is wrong.
+        ValueError: If dimensions are incompatible or alignment is wrong.
 
     Note:
         - Requires TPU backend for hardware acceleration
@@ -246,13 +246,15 @@ def kv_cache_update(
         local_flat_cache_positions=kv_cache_pages.shape[0],
         page_shard_index=page_shard_index,
     )
-    assert slice_indices.shape[1] % slices_per_processing_page == 0, (
-        f"{slices_per_processing_page=}, {slice_indices.shape[1]=}"
-    )
+    if slice_indices.shape[1] % slices_per_processing_page != 0:
+        raise ValueError(f"{slices_per_processing_page=}, {slice_indices.shape[1]=}")
     _, num_kv_heads, head_dimension = new_kv_tokens.shape
-    assert kv_cache_pages.shape[1] == num_kv_heads
-    assert kv_cache_pages.shape[2] == head_dimension, f"{kv_cache_pages.shape[2]=}!={head_dimension=}"
-    assert head_dimension % 128 == 0
+    if kv_cache_pages.shape[1] != num_kv_heads:
+        raise ValueError(f"kv_cache_pages num_kv_heads mismatch: {kv_cache_pages.shape[1]=} != {num_kv_heads=}")
+    if kv_cache_pages.shape[2] != head_dimension:
+        raise ValueError(f"{kv_cache_pages.shape[2]=}!={head_dimension=}")
+    if head_dimension % 128 != 0:
+        raise ValueError(f"head_dimension must be divisible by 128, got {head_dimension=}")
 
     prefetch_scalars = [slice_indices]
     vmem_scratch_buffer = pltpu.VMEM(

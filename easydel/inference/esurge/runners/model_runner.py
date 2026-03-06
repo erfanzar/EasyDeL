@@ -95,9 +95,7 @@ if typing.TYPE_CHECKING:
 logger = get_logger("eSurge")
 
 
-def _get_padded_num_reqs_with_upper_limit(
-    x: int, upper_limit: int, min_input_pad: int
-) -> int:  # pyright: ignore[reportUnusedFunction]
+def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:  # pyright: ignore[reportUnusedFunction]
     """Calculate padded request count for compilation efficiency.
 
     Pads the number of requests to powers of 2 (up to 8) or the nearest
@@ -799,9 +797,12 @@ class eSurgeRunner:
             raise RuntimeError("Cannot update model weights while requests are active")
 
         if model is None:
-            assert graphdef is not None
-            assert graphstate is not None
-            assert graphother is not None
+            if graphdef is None:
+                raise ValueError("graphdef must not be None when model is None")
+            if graphstate is None:
+                raise ValueError("graphstate must not be None when model is None")
+            if graphother is None:
+                raise ValueError("graphother must not be None when model is None")
             model = flax.nnx.merge(graphdef, graphstate, graphother)
 
         model = model.esurge_compatible_model
@@ -940,7 +941,6 @@ class eSurgeRunner:
 
         if getattr(info, "deepstack_visual_embeds", None) is not None:
             ds_list = []
-            assert info.deepstack_visual_embeds is not None
             for arr in info.deepstack_visual_embeds:
                 ds_list.append(np.asarray(jax.device_get(arr)))
             req_state.prefill_deepstack_visual_embeds = ds_list
@@ -1042,7 +1042,8 @@ class eSurgeRunner:
         # 4) Add new requests to tracking
         req_ids_to_add: list[str] = []
         for new_req_data in scheduler_output.scheduled_new_reqs:
-            assert new_req_data.sampling_params is not None, "Pooling not supported in TPU"
+            if new_req_data.sampling_params is None:
+                raise ValueError("Pooling not supported in TPU")
             req_id = new_req_data.req_id
             self.requests[req_id] = CachedRequestState(
                 req_id=req_id,
@@ -1235,12 +1236,14 @@ class eSurgeRunner:
                 continue
 
             req_idx = self.sequence_buffer.req_id_to_index[req_id]
-            assert req_state is self.requests[req_id], "Request state mismatch"
+            if req_state is not self.requests[req_id]:
+                raise RuntimeError("Request state mismatch")
 
             # Update token_ids array (replace placeholder)
             end_idx = self.sequence_buffer.num_tokens_no_spec[req_idx]
             start_idx = end_idx - 1
-            assert end_idx <= self.max_model_len, f"Token count {end_idx} exceeds max_model_len {self.max_model_len}"
+            if end_idx > self.max_model_len:
+                raise ValueError(f"Token count {end_idx} exceeds max_model_len {self.max_model_len}")
 
             self.sequence_buffer.token_ids[req_idx, start_idx:end_idx] = sampled_ids
             # Replace placeholder in output_token_ids
@@ -1281,10 +1284,11 @@ class eSurgeRunner:
             start_idx = self.sequence_buffer.num_tokens_no_spec[req_idx]
             end_idx = start_idx + 1  # Assume 1 token (no spec decode yet)
 
-            assert end_idx <= self.max_model_len, (
-                f"Sampled token IDs exceed the max model length. "
-                f"Total number of tokens: {end_idx} > max_model_len: {self.max_model_len}"
-            )
+            if end_idx > self.max_model_len:
+                raise ValueError(
+                    f"Sampled token IDs exceed the max model length. "
+                    f"Total number of tokens: {end_idx} > max_model_len: {self.max_model_len}"
+                )
 
             # Update buffer state
             self.sequence_buffer.num_tokens_no_spec[req_idx] = end_idx

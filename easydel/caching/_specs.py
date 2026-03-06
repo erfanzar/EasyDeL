@@ -208,15 +208,14 @@ class KVCacheSpec:
                 requirements of all input specifications.
 
         Raises:
-            AssertionError: If specs have incompatible type_ids.
+            ValueError: If specs have incompatible type_ids.
 
         Note:
             The default implementation returns a copy of the first spec.
             Subclasses may override to merge specific parameters.
         """
-        assert all(spec.type_id == specs[0].type_id for spec in specs[1:]), (
-            "All layers in the same KV cache group must share the same type_id."
-        )
+        if not all(spec.type_id == specs[0].type_id for spec in specs[1:]):
+            raise ValueError("All layers in the same KV cache group must share the same type_id.")
         return copy.deepcopy(specs[0])
 
 
@@ -345,9 +344,10 @@ class FullAttentionSpec(AttentionSpec):
 
         merged_spec.sliding_window = cls.merge_window_sizes(sliding_window)
         merged_spec.attention_chunk_size = cls.merge_window_sizes(attention_chunk_size)
-        assert (merged_spec.sliding_window is not None) + (merged_spec.attention_chunk_size is not None) <= 1, (
-            "Model with both sliding window layers and chunked local attention layers is not supported."
-        )
+        if (merged_spec.sliding_window is not None) + (merged_spec.attention_chunk_size is not None) > 1:
+            raise ValueError(
+                "Model with both sliding window layers and chunked local attention layers is not supported."
+            )
         return merged_spec
 
 
@@ -422,9 +422,10 @@ class SlidingWindowSpec(AttentionSpec):
         """Validate sliding window configuration.
 
         Raises:
-            AssertionError: If MLA is enabled (not supported).
+            ValueError: If MLA is enabled (not supported).
         """
-        assert not self.use_mla, "MLA is not supported for sliding window"
+        if self.use_mla:
+            raise ValueError("MLA is not supported for sliding window")
 
     @property
     def type_id(self) -> str:
@@ -503,11 +504,14 @@ class MambaSpec(KVCacheSpec):
                  exact size based on num_elements * dtype_size.
 
         Raises:
-            AssertionError: If page_size_padded is less than required size.
+            ValueError: If page_size_padded is less than required size.
         """
         page_size = self.num_elements * (jax.numpy.finfo(self.dtype).bits // 8)
         if self.page_size_padded is not None:
-            assert self.page_size_padded >= page_size
+            if self.page_size_padded < page_size:
+                raise ValueError(
+                    f"page_size_padded ({self.page_size_padded}) must be >= required page_size ({page_size})"
+                )
             return self.page_size_padded
         return page_size
 

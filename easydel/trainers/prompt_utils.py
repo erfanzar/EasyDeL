@@ -928,7 +928,8 @@ class _SegmentTree:
         self.tree = [0] * (2 * self.tree_size)
 
     def add(self, val):
-        assert 0 < val <= self.maxval
+        if not (0 < val <= self.maxval):
+            raise ValueError(f"val must satisfy 0 < val <= {self.maxval}, got {val}")
         i = self.tree_size + val - 1
         self.tree[i] = val
         while i > 1:
@@ -938,7 +939,8 @@ class _SegmentTree:
             self.tree[i] = left if left >= right else right
 
     def remove(self, val):
-        assert 0 < val <= self.maxval
+        if not (0 < val <= self.maxval):
+            raise ValueError(f"val must satisfy 0 < val <= {self.maxval}, got {val}")
         i = self.tree_size + val - 1
         self.tree[i] = 0
         while i > 1:
@@ -948,7 +950,8 @@ class _SegmentTree:
             self.tree[i] = left if left >= right else right
 
     def search(self, val):
-        assert 0 < val <= self.maxval
+        if not (0 < val <= self.maxval):
+            raise ValueError(f"val must satisfy 0 < val <= {self.maxval}, got {val}")
         i = 1
         while i < self.tree_size:
             if self.tree[i << 1] >= val:
@@ -971,7 +974,8 @@ def _pack_bfd(examples: pa.Table, seq_length: int) -> pa.Table:
     examples = pa.Table.from_arrays(columns, names=examples.column_names)
 
     ids = np.arange(len(examples))
-    assert list_column_idx is not None
+    if list_column_idx is None:
+        raise ValueError("No list-type column found in the table; cannot determine sequence lengths for packing")
     lengths = pc.list_value_length(examples[list_column_idx]).combine_chunks()
     examples = examples.append_column("seq_lengths", lengths)
     lengths = pc.make_struct(lengths, ids)
@@ -1005,7 +1009,8 @@ def _pack_bfd(examples: pa.Table, seq_length: int) -> pa.Table:
     offsets = np.array([0] + [bin["length"] for bin in bins])  # noqa
     offsets = np.cumsum(offsets)
 
-    assert all(column.num_chunks == 1 for column in examples.columns)
+    if not all(column.num_chunks == 1 for column in examples.columns):
+        raise RuntimeError("Expected all columns to have exactly 1 chunk after pc.take, but found multi-chunk columns")
 
     lengths = examples["seq_lengths"].chunks[0]
     examples = examples.drop_columns("seq_lengths")

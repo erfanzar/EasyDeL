@@ -13,6 +13,8 @@
 # limitations under the License.
 from __future__ import annotations
 
+import ast
+import collections.abc
 import datetime
 import functools
 import json
@@ -92,6 +94,51 @@ def get_safe_arr(xs):
             return xs.item()
         return xs
     return xs
+
+
+def _normalize_partition_spec_entry(value: tp.Any) -> tp.Any:
+    if isinstance(value, list):
+        return tuple(_normalize_partition_spec_entry(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_normalize_partition_spec_entry(item) for item in value)
+    return value
+
+
+def _parse_partition_spec(value: tp.Any) -> PartitionSpec:
+    if isinstance(value, PartitionSpec):
+        return value
+    if value is None:
+        return PartitionSpec()
+
+    parsed = value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return PartitionSpec()
+        try:
+            if stripped.startswith("PartitionSpec(") and stripped.endswith(")"):
+                inner = stripped[len("PartitionSpec(") : -1].strip()
+                parsed = [] if not inner else ast.literal_eval(f"[{inner}]")
+            else:
+                parsed = ast.literal_eval(stripped)
+        except (SyntaxError, ValueError) as exc:
+            raise ValueError(f"Invalid `step_partition_spec` value: {value!r}") from exc
+
+    if isinstance(parsed, PartitionSpec):
+        return parsed
+    if isinstance(parsed, (list, tuple)):
+        return PartitionSpec(*tuple(_normalize_partition_spec_entry(item) for item in parsed))
+    return PartitionSpec(_normalize_partition_spec_entry(parsed))
+
+
+def _apply_training_args_legacy_aliases(data: dict[str, tp.Any]) -> dict[str, tp.Any]:
+    data = dict(data)
+    if "quantization_block" in data:
+        if "quantization_group_size" not in data:
+            data["quantization_group_size"] = data["quantization_block"]
+        # Drop deprecated alias for constructor calls built from serialized configs.
+        data.pop("quantization_block", None)
+    return data
 
 
 # Constants
@@ -584,7 +631,7 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Whether to track memory usage. If a float, it sets the memory tracking interval in seconds."},
     )
-    use_data_collactor: bool = field(
+    use_data_collator: bool = field(
         default=True,
         metadata={"help": "Whether to use a data collator."},
     )
@@ -707,7 +754,11 @@ class TrainingArguments:
             stacklevel=2,
         )
 
-    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
         """
         Post-initialization setup and validation.
 
@@ -721,7 +772,7 @@ class TrainingArguments:
 
         Raises:
             ValueError: If configuration validation fails
-            AssertionError: If required conditions are not met
+            ValueError: If required conditions are not met
         """
         self._handle_deprecated_max_sequence_length(max_sequence_length)
         self._handle_deprecated_quantization_block(quantization_block)
@@ -743,10 +794,10 @@ class TrainingArguments:
         - Other configuration constraints are met
 
         Raises:
-            AssertionError: If gradient_accumulation_steps < 1
-            ValueError: If backend is not recognized
+            ValueError: If gradient_accumulation_steps < 1 or backend is not recognized
         """
-        assert self.gradient_accumulation_steps > 0, "`gradient_accumulation_steps` can't be lower than 1."
+        if self.gradient_accumulation_steps <= 0:
+            raise ValueError("`gradient_accumulation_steps` can't be lower than 1.")
 
         if self.backend not in AVAILABLE_BACKENDS:
             raise ValueError(f"Backend {self.backend} is not recognized. Available backends: {AVAILABLE_BACKENDS}")
@@ -939,10 +990,7 @@ class TrainingArguments:
                 f"`quantization_mode` must be one of {STE_QAT_QUANTIZATION_MODES_DOC}, got {self.quantization_mode!r}."
             )
 
-        if isinstance(self.step_partition_spec, str):
-            self.step_partition_spec = eval(self.step_partition_spec)
-        elif not isinstance(self.step_partition_spec, PartitionSpec):
-            self.step_partition_spec = PartitionSpec(*tuple(self.step_partition_spec))
+        self.step_partition_spec = _parse_partition_spec(self.step_partition_spec)
 
         self.step_start_point = self.step_start_point or 0
         self.eval_batch_size = self.eval_batch_size if self.eval_batch_size is not None else self.total_batch_size
@@ -969,14 +1017,45 @@ class TrainingArguments:
                 if fallback_value is not None and fallback_value is not False:
                     setattr(self, attr, fallback_value)
 
+        _inherit_generation_attr("generation_num_return_sequences", "num_generations_per_prompt")
         _inherit_generation_attr("generation_num_return_sequences", "num_return_sequences")
+        _inherit_generation_attr("generation_top_p", "top_p")
+        _inherit_generation_attr("generation_top_k", "top_k")
+        _inherit_generation_attr("generation_temperature", "temperature_sampling")
         _inherit_generation_attr("generation_max_new_tokens", "max_completion_length")
 
-        if self.generation_num_return_sequences is not None:
-            try:
-                self.generation_num_return_sequences = int(self.generation_num_return_sequences)
-            except (TypeError, ValueError):  # pragma: no cover - keep original value if conversion fails
-                ...
+        self.generation_top_p = _coerce_float(self.generation_top_p)
+        self.generation_temperature = _coerce_float(self.generation_temperature)
+        self.generation_top_k = _coerce_int(self.generation_top_k)
+        self.generation_num_return_sequences = _coerce_int(self.generation_num_return_sequences)
+        self.generation_max_new_tokens = _coerce_int(self.generation_max_new_tokens)
+
+        if self.generation_extra_kwargs is not None and not isinstance(
+            self.generation_extra_kwargs, collections.abc.Mapping
+        ):
+            raise TypeError(
+                "`generation_extra_kwargs` must be a mapping when provided, got "
+                f"{type(self.generation_extra_kwargs).__name__}: {self.generation_extra_kwargs!r}"
+            )
+        generation_extra_kwargs = dict(self.generation_extra_kwargs or {})
+
+        generation_kwargs = getattr(self, "generation_kwargs", None)
+        if generation_kwargs is not None:
+            if not isinstance(generation_kwargs, collections.abc.Mapping):
+                raise TypeError(
+                    "`generation_kwargs` must be a mapping when provided, got "
+                    f"{type(generation_kwargs).__name__}: {generation_kwargs!r}"
+                )
+            generation_extra_kwargs.update(generation_kwargs)
+
+        for attr_name, kwarg_name in (
+            ("min_p", "min_p"),
+            ("repetition_penalty", "repetition_penalty"),
+        ):
+            value = getattr(self, attr_name, None)
+            if value is not None and kwarg_name not in generation_extra_kwargs:
+                generation_extra_kwargs[kwarg_name] = value
+        self.generation_extra_kwargs = generation_extra_kwargs or None
 
         if self.generation_do_sample is None:
             if any(
@@ -1084,8 +1163,8 @@ class TrainingArguments:
             gradient clipping, weight decay, and other transformations.
         """
 
-        self.optimizer_kwargs["steps"] = steps or self.optimizer_kwargs["steps"]
         optimizer_kwargs = deepcopy(self.optimizer_kwargs)
+        optimizer_kwargs["steps"] = steps or optimizer_kwargs["steps"]
         scheduler = optimizer_kwargs.pop("scheduler", None)
         if scheduler == "none":
             scheduler = None
@@ -1390,7 +1469,7 @@ class TrainingArguments:
                 self.log_metrics(metrics, step)
 
         except Exception as e:
-            logger.warn(f"Failed to log weight distribution {e}...")
+            logger.warning(f"Failed to log weight distribution {e}...")
 
     def _log_to_wandb(
         self,
@@ -1554,12 +1633,7 @@ class TrainingArguments:
         Returns:
             TrainingArguments: A new instance created from the dictionary.
         """
-        data = dict(data)
-        if "quantization_block" in data:
-            if "quantization_group_size" not in data:
-                data["quantization_group_size"] = data["quantization_block"]
-            # Drop deprecated alias for constructor calls built from dictionaries.
-            data.pop("quantization_block", None)
+        data = _apply_training_args_legacy_aliases(data)
 
         processed_data = {}
         type_hints = tp.get_type_hints(cls)
@@ -1621,17 +1695,13 @@ class TrainingArguments:
 
     @classmethod
     def load_from_json(cls, config_dict):
-        config_dict = dict(config_dict)
-        if "quantization_block" in config_dict:
-            if "quantization_group_size" not in config_dict:
-                config_dict["quantization_group_size"] = config_dict["quantization_block"]
-            # Drop deprecated alias for constructor calls built from JSON payloads.
-            config_dict.pop("quantization_block", None)
+        config_dict = _apply_training_args_legacy_aliases(config_dict)
         if "trainer_config_class" in config_dict.keys():
             import easydel as ed
 
             cls = getattr(ed, config_dict.pop("trainer_config_class"))
-            assert cls is not None, "We couldn't clearify the trainer config class from provided json."
+            if cls is None:
+                raise ValueError("We couldn't clarify the trainer config class from provided json.")
         return cls(**config_dict)
 
     def save_arguments(self, json_file_path: str | os.PathLike | ePathLike):

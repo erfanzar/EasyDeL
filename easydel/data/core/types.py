@@ -126,10 +126,11 @@ class BaseDatasetInform:
                     inferred_type = DatasetType.infer_from_path(os.fspath(first_file))
             if inferred_type:
                 self.type = inferred_type
-            assert self.type is not None, (
-                "we couldn't automatically find type based on data files, "
-                "please provide correct type or format for data files"
-            )
+            if self.type is None:
+                raise ValueError(
+                    "we couldn't automatically find type based on data files, "
+                    "please provide correct type or format for data files"
+                )
         if isinstance(self.type, str):
             try:
                 self.type = DatasetType.from_string(self.type)

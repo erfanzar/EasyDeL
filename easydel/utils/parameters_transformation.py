@@ -46,9 +46,13 @@ if tp.TYPE_CHECKING:
 
 mem_ops = SMPMemoryMonitor(5)
 logger = get_logger(__name__)
-EASYDEL_PERFRED_HOST_COPY_INDEX = int(os.getenv("EASYDEL_PERFRED_HOST_COPY_INDEX", "0"))
-_perfred_host_copy_raw = str(os.getenv("EASYDEL_PERFRED_HOST_COPY", "cpu")).lower()
-EASYDEL_PERFRED_HOST_COPY: str | None = None if _perfred_host_copy_raw == "none" else _perfred_host_copy_raw
+EASYDEL_PREFERRED_HOST_COPY_INDEX = int(
+    os.getenv("EASYDEL_PREFERRED_HOST_COPY_INDEX", os.getenv("EASYDEL_PERFRED_HOST_COPY_INDEX", "0"))
+)
+_preferred_host_copy_raw = str(
+    os.getenv("EASYDEL_PREFERRED_HOST_COPY", os.getenv("EASYDEL_PERFRED_HOST_COPY", "cpu"))
+).lower()
+EASYDEL_PREFERRED_HOST_COPY: str | None = None if _preferred_host_copy_raw == "none" else _preferred_host_copy_raw
 
 
 class DtypeHandler:
@@ -155,7 +159,7 @@ class TensorConverter:
                 dl_pack_jax = dlpack.to_dlpack(
                     jax.device_put(
                         jax.device_get(x),
-                        jax.devices(EASYDEL_PERFRED_HOST_COPY)[EASYDEL_PERFRED_HOST_COPY_INDEX],
+                        jax.devices(EASYDEL_PREFERRED_HOST_COPY)[EASYDEL_PREFERRED_HOST_COPY_INDEX],
                     ),
                     stream=None,
                 )
@@ -356,16 +360,19 @@ class StateDictConverter:
 
         import torch
 
-        assert moe_path is not None
-        assert moe_names is not None
-        assert moe_block_path is not None
+        if moe_path is None:
+            raise ValueError("moe_path cannot be None")
+        if moe_names is None:
+            raise ValueError("moe_names cannot be None")
+        if moe_block_path is None:
+            raise ValueError("moe_block_path cannot be None")
 
-        excepted_expert_name = moe_path[0].split(".")[-2]
-        expert_prefix = f".{excepted_expert_name}."
+        expected_expert_name = moe_path[0].split(".")[-2]
+        expert_prefix = f".{expected_expert_name}."
 
         moe_names_set = set(moe_names)
         moe_stacked_paths = {
-            f"{block_path}.{excepted_expert_name}.{moe_name}" for block_path in moe_block_path for moe_name in moe_names
+            f"{block_path}.{expected_expert_name}.{moe_name}" for block_path in moe_block_path for moe_name in moe_names
         }
 
         new_state_dict = {}
@@ -397,7 +404,7 @@ class StateDictConverter:
                     moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
 
                     if moe_name in moe_names_set:
-                        target_path = f"{block_path}.{excepted_expert_name}.{moe_name}"
+                        target_path = f"{block_path}.{expected_expert_name}.{moe_name}"
                         moe_groups[target_path][expert_idx] = value
                         is_moe_expert = True
                         break
@@ -444,7 +451,7 @@ class StateDictConverter:
                 logger.error(f"Failed to stack MoE tensors for {target_path}: {e}")
                 for idx, tensor in expert_dict.items():
                     fallback_key = (
-                        f"{target_path.replace(f'.{excepted_expert_name}.', f'.{excepted_expert_name}.{idx}.')}.weight"
+                        f"{target_path.replace(f'.{expected_expert_name}.', f'.{expected_expert_name}.{idx}.')}.weight"
                     )
                     new_state_dict[fallback_key] = tensor
 
@@ -525,12 +532,14 @@ class StateDictConverter:
         if not all([moe_block_names, moe_names, moe_block_path]):
             return state_dict
 
-        assert moe_names is not None
-        assert moe_block_path is not None
+        if moe_names is None:
+            raise ValueError("moe_names cannot be None")
+        if moe_block_path is None:
+            raise ValueError("moe_block_path cannot be None")
 
         new_state_dict = {}
         processed_keys = set()
-        excepted_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
+        expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
 
         for key, value in state_dict.items():
             is_stacked_moe = False
@@ -540,7 +549,7 @@ class StateDictConverter:
                     parts = remainder.split(".")
                     if (
                         len(parts) == 3
-                        and parts[0] == excepted_expert_name
+                        and parts[0] == expected_expert_name
                         and parts[1] in moe_names
                         and parts[2] == "weight"
                     ):
@@ -553,7 +562,7 @@ class StateDictConverter:
                                 expert_tensor = value[expert_idx]
                                 if tensor_transform is not None:
                                     expert_tensor = tensor_transform(expert_tensor)
-                                new_key = f"{block_path}.{excepted_expert_name}.{expert_idx}.{moe_name}.weight"
+                                new_key = f"{block_path}.{expected_expert_name}.{expert_idx}.{moe_name}.weight"
                                 new_state_dict[new_key] = expert_tensor
 
                             processed_keys.add(key)

@@ -616,7 +616,8 @@ class DataCollatorForCompletionOnlyLM:
                     batch["labels"][i, :] = self.ignore_index
 
                 human_token_ids = self.instruction_token_ids
-                assert human_token_ids is not None
+                if human_token_ids is None:
+                    raise RuntimeError("instruction_token_ids must not be None when using instruction_template")
                 for human_idx in jnp.where(batch["labels"][i] == human_token_ids[0])[0]:
                     if human_token_ids == batch["labels"][i][human_idx : human_idx + len(human_token_ids)].tolist():
                         human_token_ids_idxs.append(human_idx)
@@ -1617,7 +1618,7 @@ def shift_and_pad(mask, *tensors):
 
 def pad(
     tensors: list[jnp.ndarray],
-    max_lenght: int | None,
+    max_length: int | None,
     padding_value: int = 0,
     padding_side: str = "right",
 ) -> jnp.ndarray:
@@ -1625,7 +1626,7 @@ def pad(
 
     Args:
         tensors: List of JAX arrays to pad.
-        max_lenght: Target length for padding. If None, uses maximum length
+        max_length: Target length for padding. If None, uses maximum length
                    found in tensors.
         padding_value: Value to use for padding (default 0).
         padding_side: Where to add padding - 'left' or 'right' (default 'right').
@@ -1643,11 +1644,12 @@ def pad(
     """
     output_shape = tensors[0].shape[:-1]
     current_max = tensors[0].shape[-1]
-    if max_lenght is None:
-        max_lenght = current_max
-    assert isinstance(max_lenght, int)
-    x_lenght = max(current_max, max_lenght)
-    output_shape += (x_lenght,)
+    if max_length is None:
+        max_length = current_max
+    if not isinstance(max_length, int):
+        raise TypeError(f"max_length must be an int, got {type(max_length)}")
+    x_length = max(current_max, max_length)
+    output_shape += (x_length,)
     output = jnp.full((len(tensors), *output_shape), padding_value, dtype=tensors[0].dtype)
     for i, t in enumerate(tensors):
         if padding_side == "left":
@@ -1661,9 +1663,9 @@ def pad(
         output = output.at[slices].set(t)
 
     if padding_side == "left":
-        output = output[..., -max_lenght:]
+        output = output[..., -max_length:]
     elif padding_side == "right":
-        output = output[..., :max_lenght]
+        output = output[..., :max_length]
     else:
         raise ValueError("padding_side must be 'left' or 'right'")
     return output
@@ -1719,7 +1721,7 @@ def pad_single(
 
 def np_pad(
     tensors: list[np.ndarray],
-    max_lenght: int | None,
+    max_length: int | None,
     padding_value: int = 0,
     padding_side: str = "right",
 ) -> np.ndarray:
@@ -1729,7 +1731,7 @@ def np_pad(
 
     Args:
         tensors: List of NumPy arrays to pad.
-        max_lenght: Target length for padding. If None, uses current max.
+        max_length: Target length for padding. If None, uses current max.
         padding_value: Value to use for padding (default 0).
         padding_side: Where to add padding - 'left' or 'right' (default 'right').
 
@@ -1741,11 +1743,12 @@ def np_pad(
     """
     output_shape = tensors[0].shape[:-1]
     current_max = tensors[0].shape[-1]
-    if max_lenght is None:
-        max_lenght = current_max
-    assert isinstance(max_lenght, int)
-    x_lenght = max(current_max, max_lenght)
-    output_shape += (x_lenght,)
+    if max_length is None:
+        max_length = current_max
+    if not isinstance(max_length, int):
+        raise TypeError(f"max_length must be an int, got {type(max_length)}")
+    x_length = max(current_max, max_length)
+    output_shape += (x_length,)
     output = np.full((len(tensors), *output_shape), padding_value, dtype=tensors[0].dtype)
     for i, t in enumerate(tensors):
         if padding_side == "left":
@@ -1759,9 +1762,9 @@ def np_pad(
         output[slices] = t
 
     if padding_side == "left":
-        output = output[..., -max_lenght:]
+        output = output[..., -max_length:]
     elif padding_side == "right":
-        output = output[..., :max_lenght]
+        output = output[..., :max_length]
     else:
         raise ValueError("padding_side must be 'left' or 'right'")
     return output

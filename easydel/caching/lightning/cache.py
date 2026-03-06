@@ -223,113 +223,24 @@ class LightningCacheView(BaseCacheView):
         Float[Array, "batch seq_len num_value_heads value_dim"],
         Bool[Array, "batch 1 query_len seq_len"],
     ]:
-        """Update cache with new key/value states for Lightning attention.
+        """Not implemented for Lightning attention.
 
-        Concatenates new key and value states to the cache using Lightning's
-        unified KV representation. This method is called during each forward
-        pass to update the cache with newly computed states.
-
-        Note: This implementation appears to need refactoring as it references
-        attributes (self.index, self.key, self.value) that don't exist in the
-        current class definition. The actual Lightning implementation would
-        use the unified self.key_value tensor.
-
-        Args:
-            query: Query tensor with shape [batch, query_len, num_heads, head_dim].
-                Used to determine update dimensions.
-            key: Key tensor with shape [batch, query_len, num_key_heads, key_dim].
-                New keys to add to the cache.
-            value: Value tensor with shape [batch, query_len, num_value_heads, value_dim].
-                New values to add to the cache.
-            attention_mask: Boolean or float mask with shape [batch, 1, query_len, seq_len].
-                Defines which positions can attend to which.
-            kv_sharding: JAX PartitionSpec for sharding the KV cache.
-            quantizer: Quantization function for cache compression.
-            causal_mask: Optional causal mask for autoregressive attention.
-                Can be boolean array or boolean value.
-            token_type_ids: Optional token type IDs for segment-level masking.
-                Shape [batch, query_len].
-
-        Returns:
-            Tuple containing:
-                - Updated key cache: Float[Array, "batch seq_len num_key_heads key_dim"]
-                - Updated value cache: Float[Array, "batch seq_len num_value_heads value_dim"]
-                - Updated attention mask: Bool[Array, "batch 1 query_len seq_len"]
+        Lightning attention uses a unified key_value tensor and requires a
+        dedicated implementation that does not rely on separate key/value/index
+        attributes.
 
         Raises:
-            NotImplementedError: Current implementation needs refactoring to properly
-                use Lightning's unified KV representation.
+            NotImplementedError: Always raised; this method is not yet implemented.
         """
-        num_updated_cache_vectors = query.shape[1]
-        end_index = self.index[0]
-
-        *batch_dims, max_length, _num_heads, _depth_per_head = self.value.shape
-
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-
-        if causal_mask is not None:
-            if hasattr(causal_mask, "value"):
-                causal_mask = causal_mask.value
-            causal_mask = jax.lax.dynamic_slice(
-                causal_mask,
-                (0, 0, end_index, 0),
-                (1, 1, num_updated_cache_vectors, max_length),
-            )
-            if token_type_ids is not None and num_updated_cache_vectors != 1:
-                token_type_mask = jnp.equal(
-                    jnp.expand_dims(token_type_ids, 2),
-                    jnp.expand_dims(token_type_ids, 1),
-                )
-
-                token_type_mask = jnp.where(token_type_ids == 0, False, token_type_mask)
-                token_type_mask = jnp.expand_dims(token_type_mask, 1)
-                sequence_length = token_type_ids.shape[1]
-                masked_portion = jnp.logical_or(
-                    token_type_mask[:, :, :num_updated_cache_vectors, :],
-                    causal_mask[:, :, :, :sequence_length],
-                )
-                causal_mask = causal_mask.at[:, :, :, :sequence_length].set(masked_portion)
-
-            causal_mask = jnp.broadcast_to(causal_mask, (query.shape[0], *causal_mask.shape[1:]))
-
-            attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
-            attention_mask = jnp.logical_and(attention_mask, causal_mask)
-
-        slice_indices = (0, end_index % self.value.shape[1], 0, 0)
-
-        value_cache = es.with_sharding_constraint(
-            jax.lax.dynamic_update_slice(
-                self.value,
-                value.astype(self.value.dtype),
-                slice_indices,
-            ),
-            sharding=kv_sharding,
+        raise NotImplementedError(
+            "LightningCacheView.concatenate_to_cache is not implemented. "
+            "Lightning attention uses a unified key_value tensor and requires "
+            "a dedicated implementation that does not rely on separate key/value/index attributes."
         )
-        key_cache = es.with_sharding_constraint(
-            jax.lax.dynamic_update_slice(
-                self.key,
-                key.astype(self.key.dtype),
-                slice_indices,
-            ),
-            sharding=kv_sharding,
-        )
-        pad_mask = jnp.broadcast_to(
-            jnp.arange(max_length) < end_index + num_updated_cache_vectors,
-            (*tuple(batch_dims), 1, num_updated_cache_vectors, max_length),
-        )
-        attention_mask = jnp.logical_and(pad_mask, attention_mask)
-
-        self.key = quantizer(key_cache)
-        self.value = quantizer(value_cache)
-
-        self.index = self.index + num_updated_cache_vectors
-        return key_cache, value_cache, attention_mask
 
     def __repr__(self) -> str:
-        return (
-            self.__class__.__name__ + f"(key={self.key.shape}, value={self.value.shape}, layer_index={self.layer_index})"
-        )
+        kv_shape = self.key_value.shape if self.key_value is not None else None
+        return self.__class__.__name__ + f"(key_value={kv_shape}, layer_index={self.layer_index})"
 
     __str__ = __repr__
 

@@ -47,7 +47,7 @@ TP = common_types.TP
 SP = common_types.SP
 
 EP_DISPATCH = os.getenv("EP_DISPATCH", "auto")
-EP_AUTO_TRESHOLD = int(os.getenv("EP_AUTO_TRESHOLD", 0))
+EP_AUTO_THRESHOLD = int(os.getenv("EP_AUTO_THRESHOLD", os.getenv("EP_AUTO_TRESHOLD", "0")))
 GMM_PLATFORM = None
 
 
@@ -256,7 +256,8 @@ def sort_activations(inputs: jax.Array, sort_indices: jax.Array, use_custom_vjp:
         >>> sorted_x = sort_activations(x, indices)
         >>> # sorted_x = [[5, 6], [1, 2], [3, 4]]
     """
-    assert inputs.shape[0] == sort_indices.shape[0], "Input and indices dimensions must match"
+    if inputs.shape[0] != sort_indices.shape[0]:
+        raise ValueError("Input and indices dimensions must match")
 
     if use_custom_vjp:
         return sort_activations_custom(inputs, sort_indices)
@@ -414,7 +415,7 @@ class MoeFusedHooks:
     before_combine: Callable | None = None
     finalize_output: Callable | None = None
 
-    def _hash__(self) -> int:
+    def __hash__(self) -> int:
         """Makes the hooks dataclass hashable for NNX graph hashing.
 
         Returns:

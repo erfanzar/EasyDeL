@@ -326,7 +326,8 @@ class Trainer(BaseTrainer):
 
         if initial_step > 0:
             pbar.update(initial_step)
-            assert self.max_training_steps is not None, "max_training_steps must be set before training"
+            if self.max_training_steps is None:
+                raise RuntimeError("max_training_steps must be set before training")
             steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
 
             if self.arguments.use_grain:
@@ -482,7 +483,8 @@ class Trainer(BaseTrainer):
             def data_collator(x):
                 return x
 
-        assert self.max_training_steps is not None, "max_training_steps must be set before training"
+        if self.max_training_steps is None:
+            raise RuntimeError("max_training_steps must be set before training")
         steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
         run_exception: Exception | None = None
 
@@ -494,8 +496,8 @@ class Trainer(BaseTrainer):
                 batch, train_iter = self._get_next_batch(train_iter, train_dataset)
                 step_metrics.start_step()
                 state = self.on_step_start(state=state, step=current_step)
-            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, StopIteration) as exect:
-                return state, exect, train_iter
+            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, StopIteration) as exc:
+                return state, exc, train_iter
 
             # Execute training step
             with self.train_tracker.trace_compilation():
@@ -540,7 +542,7 @@ class Trainer(BaseTrainer):
                 try:
                     self.maybe_generate(state=state, step=current_step, metrics=metrics)
                 except Exception as exc:  # pragma: no cover - preview must not interrupt training
-                    logger.warn(f"Preview generation hook failed: {exc}")
+                    logger.warning(f"Preview generation hook failed: {exc}")
 
                 def checkpoint_callback(dest, mesh, meta, s=state):
                     self._save_state(
@@ -606,7 +608,8 @@ class Trainer(BaseTrainer):
         Yields:
             dict: A dictionary of evaluation metrics for each evaluation step.
         """
-        assert eval_dataset is not None, "Make sure to pass eval dataset to trainer or set `do_eval` to `False`."
+        if eval_dataset is None:
+            raise ValueError("Make sure to pass eval dataset to trainer or set `do_eval` to `False`.")
         data_collator = self.data_collator
         if data_collator is None:
 
@@ -860,7 +863,7 @@ class Trainer(BaseTrainer):
                 - Additional model-specific metrics
 
         Raises:
-            AssertionError: If evaluation dataloader is not configured
+            ValueError: If evaluation dataloader is not configured
 
         Example:
             >>> for metrics in trainer.eval(model_state):

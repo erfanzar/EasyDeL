@@ -186,7 +186,8 @@ def get_rope(
             )
         elif scaling_type == "yarn":
             scaling_factor = rope_scaling.get("factor", rope_scaling.get("scaling_factor"))
-            assert scaling_factor is not None
+            if scaling_factor is None:
+                raise ValueError("YaRN rope_scaling must contain 'factor' or 'scaling_factor' key")
             original_max_position = rope_scaling.get("original_max_position_embeddings", max_position)
             extra_kwargs = {
                 k: v

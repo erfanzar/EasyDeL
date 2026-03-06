@@ -128,7 +128,11 @@ class ORPOConfig(TrainingArguments):
         metadata={"help": "Number of processes to use for dataset processing."},
     )
 
-    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
         """
         Post-initialization processing.
 
@@ -147,6 +151,9 @@ class ORPOConfig(TrainingArguments):
 
         # Call the post_init of the parent class if it exists.
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=None, quantization_block=quantization_block)
+            super().__post_init__(
+                max_sequence_length=None,
+                quantization_block=quantization_block,
+            )
 
     __hash__ = hash_fn

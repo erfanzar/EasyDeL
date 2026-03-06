@@ -77,7 +77,6 @@ import collections.abc
 import contextlib
 import os
 import pickle
-import traceback
 import typing as tp
 from typing import Self
 
@@ -318,8 +317,10 @@ class EasyDeLState(struct.PyTreeNode):
             - :meth:`create`: Create state with optimizer initialization.
             - :meth:`init_tx`: Initialize optimizer for existing state.
         """
-        assert self.opt_state is not None
-        assert self.tx is not None
+        if self.opt_state is None:
+            raise RuntimeError("Optimizer state is not initialized. Call `init_tx()` first.")
+        if self.tx is None:
+            raise RuntimeError("Optimizer (tx) is not set. Call `init_tx()` first.")
 
         updates, new_opt_state = self.tx.update(updates=grads, state=self.opt_state, params=self.graphstate)
 
@@ -676,7 +677,8 @@ class EasyDeLState(struct.PyTreeNode):
             - :meth:`shard_optimizer_state`: Reverse operation to shard state.
             - :meth:`gather_state`: Gather entire state including model.
         """
-        assert self.opt_state is not None, "Optimizer state is not initialized."
+        if self.opt_state is None:
+            raise RuntimeError("Optimizer state is not initialized.")
         partition_rules = self.model._get_partition_rules(partition_rules)
         mesh = self.model._get_mesh(None)
 
@@ -950,7 +952,7 @@ class EasyDeLState(struct.PyTreeNode):
                 logger.info(f"Optimizer state loaded from {load_directory} (step {step}).")
                 return self.replace(opt_state=opt_state, step=jnp.asarray(step))
             except Exception:
-                traceback.print_exc()
+                logger.exception("Failed to load optimizer state via TensorStore format.")
 
         try:
             if not AsyncCheckpointManager.is_tensorstore(optim_path):
@@ -980,9 +982,9 @@ class EasyDeLState(struct.PyTreeNode):
                     opt_state, step = new_method(tx_template)
                     return self.replace(opt_state=opt_state, step=jnp.asarray(step))
                 except Exception:
-                    ...
+                    logger.warning("Fallback optimizer load also failed.", exc_info=True)
             logger.error(f"Optimizer load failed: {e!s}")
-            raise e
+            raise
 
     def save_optimizer(
         self,
@@ -1452,7 +1454,7 @@ class EasyDeLState(struct.PyTreeNode):
         rules = partition_rules or self.model._get_partition_rules(None)
         mesh = mesh or self.model._get_mesh(None)
 
-        def appy_sharding_on_tree(tree):
+        def apply_sharding_on_tree(tree):
             """Apply sharding functions to a pytree."""
             partition_specs = match_partition_rules(rules, tree)
             partition_specs, adjusted = _sanitize_partition_specs_for_shape_tree(
@@ -1486,7 +1488,7 @@ class EasyDeLState(struct.PyTreeNode):
         if not isinstance(step, jax.Array):
             step = jnp.asarray(step, dtype=jnp.int32)
         state_for_shard = self.replace(step=step, graphother=materialize_meta_leaves(self.graphother, seed=42))
-        return appy_sharding_on_tree(state_for_shard)
+        return apply_sharding_on_tree(state_for_shard)
 
     def gather_state(self) -> Self:
         """Gather the entire state from distributed devices.
@@ -1640,7 +1642,7 @@ class EasyDeLState(struct.PyTreeNode):
         rules = partition_rules or self.model._get_partition_rules(None)
         mesh = mesh or self.model._get_mesh(None)
 
-        def appy_sharding_on_tree(tree):
+        def apply_sharding_on_tree(tree):
             """Apply sharding functions to a pytree."""
             from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 
@@ -1656,8 +1658,8 @@ class EasyDeLState(struct.PyTreeNode):
             shard_fns, _ = make_shard_and_gather_fns(partition_specs, mesh)
             return jax.tree_util.tree_map(lambda f, o: f(o), shard_fns, tree)
 
-        graphstate = appy_sharding_on_tree(self.graphstate)
-        graphother = appy_sharding_on_tree(self.graphother)
+        graphstate = apply_sharding_on_tree(self.graphstate)
+        graphother = apply_sharding_on_tree(self.graphother)
 
         self = self.replace(graphstate=graphstate, graphother=graphother)
         return self

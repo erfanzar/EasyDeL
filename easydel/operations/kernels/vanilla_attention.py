@@ -98,16 +98,6 @@ class VanillaAttn(OperationImpl):
         """
         return "vanilla"
 
-    def get_impl_metadata(self) -> OperationMetadata:
-        """
-        Returns the metadata associated with this attention implementation instance.
-
-        Returns:
-            The `OperationMetadata` provided during initialization.
-        """
-        assert self.metadata is not None
-        return self.metadata
-
     @classmethod
     def get_requirements(
         cls,
@@ -168,7 +158,8 @@ class VanillaAttn(OperationImpl):
             AttentionOutput containing attention outputs and weights.
         """
         mesh = self.metadata.mesh
-        assert mesh is not None, "VanillaAttn requires a mesh to be set on metadata"
+        if mesh is None:
+            raise ValueError("VanillaAttn requires a mesh to be set on metadata")
         with mesh:
             model_mode = self.get_mode(query=query, BTHD=True)
             shardings = self.metadata.get_shardings(model_mode, layout="bthd")

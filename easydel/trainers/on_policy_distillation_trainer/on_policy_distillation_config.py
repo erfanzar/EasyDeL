@@ -94,7 +94,11 @@ class OnPolicyDistillationConfig(DistillationConfig):
         metadata={"help": "Whether to skip chat template application on prompts."},
     )
 
-    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
         default_completion = type(self).__dataclass_fields__["max_completion_length"].default
         if self.max_length is not None:
             if self.max_length < self.max_prompt_length:
@@ -114,6 +118,9 @@ class OnPolicyDistillationConfig(DistillationConfig):
         self.max_length = self.max_prompt_length + self.max_completion_length
 
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=None, quantization_block=quantization_block)
+            super().__post_init__(
+                max_sequence_length=None,
+                quantization_block=quantization_block,
+            )
 
     __hash__ = hash_fn

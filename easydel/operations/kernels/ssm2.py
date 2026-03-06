@@ -161,11 +161,6 @@ class SSM2Op(OperationImpl):
         """Returns the registered names of this operation."""
         return ("ssm2", "mamba2")
 
-    def get_impl_metadata(self) -> OperationMetadata:
-        """Returns the metadata associated with this operation instance."""
-        assert self.metadata is not None
-        return self.metadata
-
     @classmethod
     def get_requirements(
         cls,

@@ -111,12 +111,13 @@ class GSPOTrainer(GRPOTrainer):
             data_tokenize_fn: Optional custom tokenization function.
 
         Raises:
-            AssertionError: If arguments is not a GSPOConfig instance.
+            TypeError: If arguments is not a GSPOConfig instance.
         """
-        assert isinstance(arguments, GSPOConfig), (
-            f"arguments must be `GSPOConfig` but got {type(arguments)}. "
-            "Use GSPOConfig for GSPO training or GRPOConfig for GRPO training."
-        )
+        if not isinstance(arguments, GSPOConfig):
+            raise TypeError(
+                f"arguments must be `GSPOConfig` but got {type(arguments)}. "
+                "Use GSPOConfig for GSPO training or GRPOConfig for GRPO training."
+            )
         super().__init__(
             arguments=arguments,
             model=model,

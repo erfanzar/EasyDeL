@@ -1748,8 +1748,8 @@ class EasyBridgeMixin(PushToHubMixin):
         reform_param = transformer.keywords.get("reform_param")
 
         moe_names_set = set(moe_names or [])
-        excepted_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
-        expert_prefix = f".{excepted_expert_name}."
+        expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
+        expert_prefix = f".{expected_expert_name}."
 
         consolidated_moe_keys: set[str] = set()
         moe_groups: dict[str, dict[int, str]] = {}
@@ -1776,7 +1776,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
                 if moe_name not in moe_names_set:
                     continue
-                target_path = f"{block_path}.{excepted_expert_name}.{moe_name}"
+                target_path = f"{block_path}.{expected_expert_name}.{moe_name}"
                 moe_groups.setdefault(target_path, {})[expert_idx] = k
                 moe_expert_keys.add(k)
                 return
@@ -2253,8 +2253,8 @@ class EasyBridgeMixin(PushToHubMixin):
         uses_tie_word_embedding = getattr(hf_config, "tie_word_embeddings", False)
 
         moe_names_set = set(moe_names or [])
-        excepted_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
-        expert_prefix = f".{excepted_expert_name}."
+        expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
+        expert_prefix = f".{expected_expert_name}."
 
         consolidated_moe_keys: set[str] = set()
         moe_groups: dict[str, dict[int, str]] = {}
@@ -2281,7 +2281,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 moe_name = moe_name_part[:-7] if moe_name_part.endswith(".weight") else moe_name_part
                 if moe_name not in moe_names_set:
                     continue
-                target_path = f"{block_path}.{excepted_expert_name}.{moe_name}"
+                target_path = f"{block_path}.{expected_expert_name}.{moe_name}"
                 moe_groups.setdefault(target_path, {})[expert_idx] = k
                 expert_key_to_group[k] = (target_path, expert_idx)
                 return

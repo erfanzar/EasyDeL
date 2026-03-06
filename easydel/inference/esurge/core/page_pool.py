@@ -72,9 +72,10 @@ class PagePool:
             enable_caching: Whether to enable prefix caching functionality.
 
         Raises:
-            AssertionError: If num_pages is not a positive integer.
+            ValueError: If num_pages is not a positive integer.
         """
-        assert isinstance(num_pages, int) and num_pages > 0
+        if not isinstance(num_pages, int) or num_pages <= 0:
+            raise ValueError("num_pages must be a positive integer")
         self.num_pages = num_pages
         self.enable_caching = enable_caching
 
@@ -120,7 +121,8 @@ class PagePool:
             dp_size = int(data_parallel_size)
             shard_idx = int(dp_shard_hint) % dp_size
             pages_per_shard = pages_per_dp_shard(self.num_pages, dp_size)
-            assert pages_per_shard is not None
+            if pages_per_shard is None:
+                raise RuntimeError("pages_per_dp_shard returned None despite prior check")
             page_lo, page_hi = dp_shard_page_bounds(shard_idx, pages_per_shard)
 
         cached_pages = []
@@ -173,7 +175,8 @@ class PagePool:
         if num_cached_pages == num_full_pages:
             return
         new_full_pages = pages[num_cached_pages:num_full_pages]
-        assert len(page_hashes) >= num_cached_pages
+        if len(page_hashes) < num_cached_pages:
+            raise ValueError(f"page_hashes length ({len(page_hashes)}) must be >= num_cached_pages ({num_cached_pages})")
         new_page_hashes = page_hashes[num_cached_pages:]
 
         if num_cached_pages == 0:
@@ -189,7 +192,10 @@ class PagePool:
                     break
 
         for i, blk in enumerate(new_full_pages):
-            assert blk.page_hash is None
+            if blk.page_hash is not None:
+                raise RuntimeError(
+                    f"Expected page_hash to be None for new full page at index {i}, but got {blk.page_hash}"
+                )
 
             if i < len(new_page_hashes):
                 page_hash = new_page_hashes[i]
@@ -198,11 +204,12 @@ class PagePool:
                 start_token_idx = blk_idx * page_size
                 end_token_idx = (blk_idx + 1) * page_size
                 page_tokens = request.all_token_ids[start_token_idx:end_token_idx]
-                assert len(page_tokens) == page_size, (
-                    f"Expected {page_size} tokens, got "
-                    f"{len(page_tokens)} at {blk_idx}th page for request "
-                    f"{request.request_id}({request})"
-                )
+                if len(page_tokens) != page_size:
+                    raise RuntimeError(
+                        f"Expected {page_size} tokens, got "
+                        f"{len(page_tokens)} at {blk_idx}th page for request "
+                        f"{request.request_id}({request})"
+                    )
                 page_hash = hash_page_tokens(hash, prev_page_hash_value, page_tokens, None)
                 page_hashes.append(page_hash)
 
@@ -245,7 +252,8 @@ class PagePool:
             dp_size = int(data_parallel_size)
             shard_idx = int(dp_shard_hint) % dp_size
             pages_per_shard = pages_per_dp_shard(self.num_pages, dp_size)
-            assert pages_per_shard is not None
+            if pages_per_shard is None:
+                raise RuntimeError("pages_per_dp_shard returned None despite prior check")
             page_lo, page_hi = dp_shard_page_bounds(shard_idx, pages_per_shard)
 
             selected: list[CachePage] = []
@@ -266,15 +274,12 @@ class PagePool:
         else:
             ret = self.free_page_queue.popleft_n(num_pages)
 
-        if self.enable_caching:
-            for page in ret:
+        for page in ret:
+            if self.enable_caching:
                 self._maybe_evict_cached_page(page)
-                assert page.ref_cnt == 0
-                page.ref_cnt += 1
-        else:
-            for page in ret:
-                assert page.ref_cnt == 0
-                page.ref_cnt += 1
+            if page.ref_cnt != 0:
+                raise RuntimeError(f"Expected ref_cnt to be 0 for free page {page.page_id}, but got {page.ref_cnt}")
+            page.ref_cnt += 1
         return ret
 
     def _maybe_evict_cached_page(self, page: CachePage) -> bool:

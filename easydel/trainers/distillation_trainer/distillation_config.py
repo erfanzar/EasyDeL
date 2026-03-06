@@ -158,7 +158,11 @@ class DistillationConfig(TrainingArguments):
         },
     )
 
-    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
         if self.completion_only_loss is not None:
             self.assistant_only_loss = bool(self.completion_only_loss)
         self.completion_only_loss = bool(self.assistant_only_loss)
@@ -171,6 +175,9 @@ class DistillationConfig(TrainingArguments):
         if float(self.temperature) <= 0.0:
             raise ValueError("`temperature` must be strictly positive.")
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=max_sequence_length, quantization_block=quantization_block)
+            super().__post_init__(
+                max_sequence_length=max_sequence_length,
+                quantization_block=quantization_block,
+            )
 
     __hash__ = hash_fn

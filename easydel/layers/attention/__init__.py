@@ -16,7 +16,7 @@ from ._flexible import (
     get_optimal_config,
     tpu_version_check,
 )
-from ._unified import UnifiedAttention, apply_rotary_pos_emb, yarn_get_mscale
+from ._unified import UnifiedAttention
 
 __all__ = (
     "AttentionMechanisms",
@@ -25,9 +25,7 @@ __all__ = (
     "FlexibleAttentionModule",
     "MaskInfo",
     "UnifiedAttention",
-    "apply_rotary_pos_emb",
     "block_wise_ffn",
     "get_optimal_config",
     "tpu_version_check",
-    "yarn_get_mscale",
 )

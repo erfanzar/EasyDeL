@@ -105,6 +105,29 @@ else:
     HybridMetadata = object
 
 
+def _maybe_materialize(x: JAXArray | ImplicitArray | None) -> JAXArray:
+    """Materialize an ImplicitArray if needed, or return a regular JAXArray.
+
+    Args:
+        x: A JAXArray, ImplicitArray, or None.
+
+    Returns:
+        The materialized JAXArray.
+
+    Raises:
+        ValueError: If x is None.
+        RuntimeError: If ImplicitArray.materialize() returns None.
+    """
+    if x is None:
+        raise ValueError("Cannot materialize None")
+    if isinstance(x, ImplicitArray):
+        result = x.materialize()
+        if result is None:
+            raise RuntimeError("ImplicitArray.materialize() returned None")
+        return result
+    return x
+
+
 @auto_pytree
 class AttnMaskDetail:
     """Configuration for attention masking patterns.
@@ -607,15 +630,6 @@ class TransformerCacheView(BaseCacheView):
             axes = getattr(self, "kv_sharding_axes", (BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM))
             return apply_logical_sharding(x, axes=axes, **sharding_statics)
 
-        def _maybe_materialize(x: JAXArray | ImplicitArray | None) -> JAXArray:
-            if x is None:
-                raise ValueError("Cannot materialize None")
-            if isinstance(x, ImplicitArray):
-                result = x.materialize()
-                assert result is not None
-                return result
-            return x
-
         @partial(jax.vmap, in_axes=(0, 0, 0), out_axes=(0))
         def _update_kv(
             old: Float[JAXArray, "seq_len num_heads head_dim"],
@@ -882,15 +896,6 @@ class TransformerCache(BaseCache):
         Returns:
             TransformerCache: Updated cache instance.
         """
-
-        def _maybe_materialize(x: ImplicitArray | JAXArray | None) -> JAXArray:
-            if x is None:
-                raise ValueError("Cannot materialize None")
-            if isinstance(x, ImplicitArray):
-                result = x.materialize()
-                assert result is not None
-                return result
-            return x
 
         for idx in range(len(self.views)):
             view = self.views[idx]

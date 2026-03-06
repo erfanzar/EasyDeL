@@ -96,9 +96,8 @@ class OnPolicyDistillationTrainer(Trainer):
             tokenizer = processing_class.tokenizer
         if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
             tokenizer.pad_token = tokenizer.eos_token
-        assert isinstance(arguments, OnPolicyDistillationConfig), (
-            "passed argument must be an `OnPolicyDistillationConfig`."
-        )
+        if not isinstance(arguments, OnPolicyDistillationConfig):
+            raise TypeError("passed argument must be an `OnPolicyDistillationConfig`.")
 
         self.arguments = arguments
 
@@ -114,18 +113,6 @@ class OnPolicyDistillationTrainer(Trainer):
         if pad_token_id is None and hasattr(processing_class, "tokenizer"):
             pad_token_id = getattr(processing_class.tokenizer, "pad_token_id", None)
         self.padding_value = 0 if pad_token_id is None else int(pad_token_id)
-
-        # Wire generation config into arguments for generate_unified
-        if getattr(self.arguments, "generation_num_return_sequences", None) is None:
-            self.arguments.generation_num_return_sequences = arguments.num_generations_per_prompt
-        if getattr(self.arguments, "generation_top_p", None) is None:
-            self.arguments.generation_top_p = arguments.top_p
-        if getattr(self.arguments, "generation_top_k", None) is None:
-            self.arguments.generation_top_k = arguments.top_k
-        if getattr(self.arguments, "generation_temperature", None) is None:
-            self.arguments.generation_temperature = arguments.temperature_sampling
-        if getattr(self.arguments, "generation_extra_kwargs", None) is None:
-            self.arguments.generation_extra_kwargs = {}
 
         super().__init__(
             arguments=arguments,

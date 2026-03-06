@@ -1630,8 +1630,8 @@ def fixed_cross_entropy(
         accuracy = jnp.sum(correct) / jnp.maximum(norm, 1e-8)
 
     elif (
-        loss_factor is SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS
-        or loss_factor is SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS.value
+        loss_factor == SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS
+        or loss_factor == SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS.value
     ):
         loss, accuracy = cross_entropy_loss_and_accuracy(
             source.astype(compute_dtype), target, mask.astype(compute_dtype)
@@ -1666,7 +1666,7 @@ def fixed_cross_entropy(
                 z_loss=config.z_loss,
                 reduction="sum",
                 chunk_size=config.chunk_vocab_size,
-                ccompute_dtype=compute_dtype,
+                compute_dtype=compute_dtype,
             )
         elif use_chunk_tokens:
             total_loss, total_z_loss, weight_sum, accuracy = sparse_cross_entropy_chunked_tokens(
@@ -1889,19 +1889,20 @@ def ForSequenceClassificationLoss(
             raise ValueError(f"num_labels must be an int, got {num_labels!r}") from exc
     if num_labels is None:
         raise ValueError("num_labels must be set for sequence classification loss")
-    if config.problem_type is None and config.classification_problem_type is not None:
-        config.problem_type = config.classification_problem_type
-    if config.problem_type is None:
+    problem_type = config.problem_type
+    if problem_type is None and config.classification_problem_type is not None:
+        problem_type = config.classification_problem_type
+    if problem_type is None:
         if num_labels == 1:
-            config.problem_type = "regression"
+            problem_type = "regression"
         elif num_labels > 1 and (labels.dtype == jnp.int32 or labels.dtype == jnp.int64):
-            config.problem_type = "single_label_classification"
+            problem_type = "single_label_classification"
         else:
-            config.problem_type = "multi_label_classification"
+            problem_type = "multi_label_classification"
 
-    if config.problem_type == "regression":
+    if problem_type == "regression":
         loss = jnp.mean((logits.squeeze() - labels.squeeze()) ** 2)
-    elif config.problem_type == "single_label_classification":
+    elif problem_type == "single_label_classification":
         # `attention_mask` is typically token-level (batch, seq_len) for encoder models.
         # Sequence classification loss is computed per-sequence, so masking should not be applied here.
         if attention_mask is not None and attention_mask.ndim != 1:
@@ -1914,7 +1915,7 @@ def ForSequenceClassificationLoss(
             batch=batch,
             **kwargs,
         )
-    elif config.problem_type == "multi_label_classification":
+    elif problem_type == "multi_label_classification":
         loss = jnp.mean(
             sigmoid_cross_entropy_with_logits(
                 logits=logits,
@@ -1923,7 +1924,7 @@ def ForSequenceClassificationLoss(
             )
         )
     else:
-        raise ValueError(f"Invalid problem_type: {config.problem_type}")
+        raise ValueError(f"Invalid problem_type: {problem_type}")
     return LossMetrics(loss=loss)
 
 

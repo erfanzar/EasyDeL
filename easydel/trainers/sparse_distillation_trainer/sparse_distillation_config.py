@@ -100,7 +100,11 @@ class SparseDistillationConfig(DistillationConfig):
         metadata={"help": "Whether to skip chat template application on prompts."},
     )
 
-    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
         if self.top_k_teacher < 1:
             raise ValueError(f"`top_k_teacher` must be >= 1, got {self.top_k_teacher}.")
 
@@ -123,6 +127,9 @@ class SparseDistillationConfig(DistillationConfig):
         self.max_length = self.max_prompt_length + self.max_completion_length
 
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=None, quantization_block=quantization_block)
+            super().__post_init__(
+                max_sequence_length=None,
+                quantization_block=quantization_block,
+            )
 
     __hash__ = hash_fn

@@ -116,6 +116,20 @@ class OperationImpl(BaseOperation):
         """
         self.metadata = metadata
 
+    def get_impl_metadata(self) -> OperationMetadata:
+        """
+        Returns the metadata associated with this attention implementation instance.
+
+        Returns:
+            The `OperationMetadata` provided during initialization.
+
+        Raises:
+            RuntimeError: If metadata has not been set.
+        """
+        if self.metadata is None:
+            raise RuntimeError("metadata must be set before calling this method")
+        return self.metadata
+
     def get_instance_requirements(
         self,
         mode: ExecutionMode = ExecutionMode.MIXED,
@@ -162,8 +176,8 @@ class OperationImpl(BaseOperation):
             query: The query tensor.
             BTHD: Boolean indicating tensor layout (True for B, T, H, D; False for B, H, T, D).
         """
-        ingeneration = query.shape[1] == 1 if BTHD else query.shape[2] == 1
-        return common_types.MODE_DECODE if ingeneration else common_types.MODE_TRAIN
+        in_generation = query.shape[1] == 1 if BTHD else query.shape[2] == 1
+        return common_types.MODE_DECODE if in_generation else common_types.MODE_TRAIN
 
     @staticmethod
     def _split_attention_mask(

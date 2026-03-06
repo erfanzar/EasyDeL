@@ -98,7 +98,11 @@ class SDPOConfig(GRPOConfig):
         },
     )
 
-    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
         if self.distillation_type not in ("kl", "jsd"):
             raise ValueError(f"`distillation_type` must be 'kl' or 'jsd', got '{self.distillation_type}'.")
         super().__post_init__(

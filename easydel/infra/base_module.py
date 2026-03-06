@@ -76,7 +76,6 @@ from re import Pattern
 from typing import Self, Unpack
 
 import flax
-import flax.nnx
 import flax.struct
 import jax
 import jax.tree_util
@@ -183,7 +182,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
     EasyDeLBaseModule provides the foundational functionality for all EasyDeL models,
     including parameter management, distributed training support, quantization,
     LoRA adaptation, and integration with HuggingFace models. It inherits from
-    flax.nnx.Module and multiple mixins that provide additional capabilities.
+    nn.Module and multiple mixins that provide additional capabilities.
 
     This class should be subclassed to create specific model architectures. Subclasses
     must implement the __call__ method and may override various hooks for customization.
@@ -529,7 +528,8 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             ('dp', 'fsdp', 'tp', 'sp')
         """
         result = self.config.mesh
-        assert result is not None, "mesh is not configured"
+        if result is None:
+            raise ValueError("mesh is not configured")
         return result
 
     @property
@@ -544,7 +544,8 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 self.config.explicit_mesh.
         """
         result = self.config.explicit_mesh
-        assert result is not None, "explicit_mesh is not configured"
+        if result is None:
+            raise ValueError("explicit_mesh is not configured")
         return result
 
     @property
@@ -559,7 +560,8 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 self.config.manual_mesh.
         """
         result = self.config.manual_mesh
-        assert result is not None, "manual_mesh is not configured"
+        if result is None:
+            raise ValueError("manual_mesh is not configured")
         return result
 
     def mesh_call(self: Self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
@@ -1427,57 +1429,46 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             gather_fns.update(overlay_fns)
         return self._apply_sharding_fns(gather_fns)
 
+    def _make_shard_and_gather(self: Self):
+        """Build sanitized shard and gather functions from partition rules.
+
+        Returns:
+            tuple: A pair (shard_fns, gather_fns).
+        """
+        mesh = self._get_mesh(None)
+        partition_specs = match_partition_rules(
+            rules=self._get_partition_rules(None),
+            tree=self.graphtree_params_shape,
+        )
+        partition_specs, _ = sanitize_partition_specs_for_shape_tree(
+            partition_specs=partition_specs,
+            shape_tree=self.graphtree_params_shape,
+            mesh=mesh,
+        )
+        return make_shard_and_gather_fns(
+            partition_specs=partition_specs,
+            mesh=mesh,
+        )
+
     @property
     def _shard_fns(self: Self):
         """Generate sharding functions based on the module's configuration.
-
-        Creates a dictionary of sharding functions that can be used to
-        distribute parameters across devices according to the partition rules.
 
         Returns:
             Mapping: A mapping from flattened parameter paths to sharding
                 functions that transform arrays to their sharded form.
         """
-        mesh = self._get_mesh(None)
-        partition_specs = match_partition_rules(
-            rules=self._get_partition_rules(None),
-            tree=self.graphtree_params_shape,
-        )
-        partition_specs, _ = sanitize_partition_specs_for_shape_tree(
-            partition_specs=partition_specs,
-            shape_tree=self.graphtree_params_shape,
-            mesh=mesh,
-        )
-        return make_shard_and_gather_fns(
-            partition_specs=partition_specs,
-            mesh=mesh,
-        )[0]
+        return self._make_shard_and_gather()[0]
 
     @property
     def _gather_fns(self: Self):
         """Generate gathering functions based on the module's configuration.
 
-        Creates a dictionary of gathering functions that can be used to
-        collect distributed parameters back to a single device.
-
         Returns:
             Mapping: A mapping from flattened parameter paths to gathering
                 functions that collect sharded arrays.
         """
-        mesh = self._get_mesh(None)
-        partition_specs = match_partition_rules(
-            rules=self._get_partition_rules(None),
-            tree=self.graphtree_params_shape,
-        )
-        partition_specs, _ = sanitize_partition_specs_for_shape_tree(
-            partition_specs=partition_specs,
-            shape_tree=self.graphtree_params_shape,
-            mesh=mesh,
-        )
-        return make_shard_and_gather_fns(
-            partition_specs=partition_specs,
-            mesh=mesh,
-        )[1]
+        return self._make_shard_and_gather()[1]
 
     def apply_out_shardings(self, out_shardings):
         """Apply output sharding specifications to the module state.
@@ -1954,10 +1945,10 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         def _shard(x):
             return x
 
-        rng = kwargs.get("rngs", flax.nnx.Rngs(44))
+        rng = kwargs.get("rngs", nn.Rngs(44))
         lazy_model = cls.lazy_init(**kwargs)
         partition_rules = lazy_model._get_partition_rules(None)
-        for path, module in iter_module_search(lazy_model, (flax.nnx.Module, ArrayParam)):
+        for path, module in iter_module_search(lazy_model, (nn.Module, ArrayParam)):
             if not path:
                 continue
             joined_path = "/".join([str(p) for p in path])
@@ -2005,7 +1996,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                     dtype=module.kernel.value.dtype,
                 )
                 arr = jax.jit(_shard, out_shardings=shardings["kernel"])(arr)
-                if isinstance(module.kernel, flax.nnx.Param):
+                if isinstance(module.kernel, nn.Param):
                     module.kernel.value = arr
                 else:
                     module.kernel = arr
@@ -2345,6 +2336,39 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                     reform_param[full_key] = new_value
         return reform_param
 
+    def _build_transform_fn(self, shard_fns=None):
+        """Build a HuggingFace-to-EasyDeL transformation function.
+
+        Args:
+            shard_fns: Optional sharding functions. If None, no sharding is applied.
+
+        Returns:
+            Callable: A partial function (StateDictConverter.huggingface_to_easydel).
+        """
+        from easydel.layers import BaseMoeModule, Embed, ParallelMoELinear
+        from easydel.utils import traversals
+        from easydel.utils.parameters_transformation import StateDictConverter
+
+        embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.Embed)]
+        embedding_path.extend([".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, Embed)])
+        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, LayerNorm)]
+        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
+        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
+
+        kwargs = dict(
+            embedding_layer_names=embedding_path,
+            layernorm_names=layernorm_path,
+            moe_names=list(set([names.split(".")[-1] for names in moe_path])),
+            moe_block_names=list(set([names.split(".")[-1] for names in moe_block_path])),
+            moe_block_path=moe_block_path,
+            moe_path=moe_path,
+            dtype=self.param_dtype,
+            reform_param=self._get_reform_param(),
+        )
+        if shard_fns is not None:
+            kwargs["shard_fns"] = shard_fns
+        return partial(StateDictConverter.huggingface_to_easydel, **kwargs)
+
     @property
     def transform_fn(self):
         """Create a transformation function for HuggingFace to EasyDeL conversion.
@@ -2360,28 +2384,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> transform_fn = model.transform_fn
             >>> easydel_params = transform_fn(hf_state_dict)
         """
-        from easydel.layers import BaseMoeModule, Embed, ParallelMoELinear
-        from easydel.utils import traversals
-        from easydel.utils.parameters_transformation import StateDictConverter
-
-        embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.Embed)]
-        embedding_path.extend([".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, Embed)])
-        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, LayerNorm)]
-        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
-        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
-
-        return partial(
-            StateDictConverter.huggingface_to_easydel,
-            embedding_layer_names=embedding_path,
-            layernorm_names=layernorm_path,
-            moe_names=list(set([names.split(".")[-1] for names in moe_path])),
-            moe_block_names=list(set([names.split(".")[-1] for names in moe_block_path])),
-            moe_block_path=moe_block_path,
-            moe_path=moe_path,
-            dtype=self.param_dtype,
-            shard_fns=self._shard_fns,
-            reform_param=self._get_reform_param(),
-        )
+        return self._build_transform_fn(shard_fns=self._shard_fns)
 
     @property
     def _generate_compatible_graphdef(self: Self):
@@ -2679,27 +2682,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             >>> # Convert without sharding
             >>> easydel_params = transform_fn(hf_state_dict, shard_fns=None)
         """
-        from easydel.layers import BaseMoeModule, Embed, ParallelMoELinear
-        from easydel.utils import traversals
-        from easydel.utils.parameters_transformation import StateDictConverter
-
-        embedding_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, nn.Embed)]
-        embedding_path.extend([".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, Embed)])
-        layernorm_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, LayerNorm)]
-        moe_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, ParallelMoELinear)]
-        moe_block_path = [".".join(tuple(map(str, pa))) for pa, _ in traversals.iter_module_search(self, BaseMoeModule)]
-
-        return partial(
-            StateDictConverter.huggingface_to_easydel,
-            embedding_layer_names=embedding_path,
-            layernorm_names=layernorm_path,
-            moe_names=list(set([names.split(".")[-1] for names in moe_path])),
-            moe_block_names=list(set([names.split(".")[-1] for names in moe_block_path])),
-            moe_block_path=moe_block_path,
-            moe_path=moe_path,
-            dtype=self.param_dtype,
-            reform_param=self._get_reform_param(),
-        )
+        return self._build_transform_fn(shard_fns=None)
 
     @property
     def _default_loss_config(self: Self) -> LossConfig | None:
@@ -2712,18 +2695,6 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             LossConfig | None: The default loss configuration, or None.
         """
         return None
-
-    @_default_loss_config.setter
-    def _default_loss_config(self, val):
-        """Setter for the default loss config (internal use).
-
-        Args:
-            val: The value to set (not actually stored, just for API compatibility).
-
-        Returns:
-            The input value.
-        """
-        return val
 
     def compute_loss(
         self,
@@ -2774,13 +2745,15 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
 
         if self.loss_function.__name__ == ForSequenceClassificationLoss.__name__:
             if loss_config is None:
-                assert hasattr(self.config, "num_labels"), (
-                    "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach"
-                    " `num_labels` to model `config`"
-                )
+                if not hasattr(self.config, "num_labels"):
+                    raise ValueError(
+                        "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach"
+                        " `num_labels` to model `config`"
+                    )
                 loss_config = LossConfig(num_labels=self.config.num_labels)
 
-        assert labels is not None, "`labels` can not be `None` for computing loss."
+        if labels is None:
+            raise ValueError("`labels` can not be `None` for computing loss.")
         loss_kwargs = loss_kwargs or {}
         forward_batch = batch
         try:

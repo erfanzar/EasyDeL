@@ -241,7 +241,8 @@ def compute_linear_frequencies(
         offsets.append(offset)
         cache_list.append(cache)
 
-    assert len(scaling_factors) == len(offsets)
+    if len(scaling_factors) != len(offsets):
+        raise ValueError(f"scaling_factors length ({len(scaling_factors)}) must match offsets length ({len(offsets)})")
     return jnp.concatenate(cache_list, axis=0)
 
 

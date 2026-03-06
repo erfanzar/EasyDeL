@@ -151,9 +151,10 @@ class OperationMetadata:
         # fmt:on
         if self._stored_mesh is NOT_GIVEN and self.base_config is None:
             mesh: jax.sharding.Mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
-            assert not mesh.empty, (
-                "You should pass 'mesh' to `OperationMetadata` or at least create that under mesh context manager"
-            )
+            if mesh.empty:
+                raise ValueError(
+                    "You should pass 'mesh' to `OperationMetadata` or at least create that under mesh context manager"
+                )
             self._stored_mesh = mesh
         self._safety_check()
         if self.backend is None:
@@ -224,8 +225,8 @@ class OperationMetadata:
                 "bhtd" (batch, heads, time, dim).
             qkv_mni_sharding: If True, use HEAD/HEAD_DIM for K/V instead of KV_HEAD/KV_HEAD_DIM.
                 Useful for multi-head attention (MHA) vs grouped-query attention (GQA/MQA).
-            softmax_aux_2d: If True, create sharding for 2D softmax auxiliary outputs
-                (e.g., log-sum-exp, max values) with shape [batch, num_heads].
+            softmax_aux: If provided, create sharding for softmax auxiliary outputs
+                (e.g., log-sum-exp, max values).
 
         Returns:
             AttnShardingRules: Named tuple containing PartitionSpecs for all attention tensors:

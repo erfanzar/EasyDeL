@@ -124,10 +124,11 @@ def get_num_slices_per_kv_cache_update_page(page_size_bytes: int) -> int:
         int: Number of slices per processing page (power of 2, max 64).
 
     Raises:
-        AssertionError: If page_size_bytes is too large (slices <= 0).
+        ValueError: If page_size_bytes is too large (slices <= 0).
     """
     num_slices_per_page = (16 * 1024 * 1024) // page_size_bytes
-    assert num_slices_per_page > 0, "Number of slices should be positive"
+    if num_slices_per_page <= 0:
+        raise ValueError("Number of slices should be positive")
     num_slices_per_page = previous_power_of_2(num_slices_per_page)
     if num_slices_per_page > 64:
         num_slices_per_page = 64
@@ -148,7 +149,7 @@ def get_dtype_packing(dtype: jnp.dtype) -> int:
     """
     bits = jnp.finfo(dtype).bits
     if 32 % bits != 0:
-        raise ValueError(f"The bit width must be divisible by 32, but got bits={bits}, dtype={{dtype}}")
+        raise ValueError(f"The bit width must be divisible by 32, but got bits={bits}, dtype={dtype}")
     return 32 // bits
 
 
@@ -373,13 +374,15 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
 
         Raises:
             ValueError: If required dimensions are non-positive.
-            AssertionError: If head dimensions are not provided.
+            ValueError: If head dimensions are not provided.
         """
         if k_headdim is None:
-            assert kv_head_dim_size is not None, "Either `k_headdim` or `kv_head_dim_size` must be provided"
+            if kv_head_dim_size is None:
+                raise ValueError("Either `k_headdim` or `kv_head_dim_size` must be provided")
             k_headdim = kv_head_dim_size
         if v_headdim is None:
-            assert kv_head_dim_size is not None, "Either `v_headdim` or `kv_head_dim_size` must be provided"
+            if kv_head_dim_size is None:
+                raise ValueError("Either `v_headdim` or `kv_head_dim_size` must be provided")
             v_headdim = kv_head_dim_size
         if num_hidden_layers <= 0:
             raise ValueError("`num_hidden_layers` must be positive")
@@ -408,7 +411,8 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             f"Creating PagesCacheConfig with {num_pages=} {page_bytes=} "
             f"sequence_capacity={int((num_pages * page_size) / 1000)}K"
         )
-        assert version in ["v3", "v2"], f"got unknown version {version} it should be v3/v2."
+        if version not in ["v3", "v2"]:
+            raise ValueError(f"got unknown version {version} it should be v3/v2.")
         return cls(
             num_hidden_layers=num_hidden_layers,
             max_model_length=max_model_length,

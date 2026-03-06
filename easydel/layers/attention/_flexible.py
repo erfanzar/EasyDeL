@@ -437,9 +437,8 @@ class FlexibleAttentionModule(nn.Module):
                 "ragged_page_attention_v3",
                 "multi_latent_ragged_page_attention_v1",
             }
-            assert not _impl_names or _impl_names & _ragged_impls, (
-                f"RaggedPagesCacheView requires a ragged-page impl but got {_impl_names}"
-            )
+            if _impl_names and not (_impl_names & _ragged_impls):
+                raise ValueError(f"RaggedPagesCacheView requires a ragged-page impl but got {_impl_names}")
         elif isinstance(cache_view, UnifiedAttentionCacheView):
             _impl_name = getattr(self.impl, "get_impl_name", lambda: None)()
             if isinstance(_impl_name, tuple):
@@ -449,9 +448,8 @@ class FlexibleAttentionModule(nn.Module):
             else:
                 _impl_names = set()
             _unified_impls = {"unified_attention", "paged_flash_attention"}
-            assert not _impl_names or _impl_names & _unified_impls, (
-                f"UnifiedAttentionCacheView requires a unified impl but got {_impl_names}"
-            )
+            if _impl_names and not (_impl_names & _unified_impls):
+                raise ValueError(f"UnifiedAttentionCacheView requires a unified impl but got {_impl_names}")
 
         if deterministic is None:
             deterministic_computed = self.deterministic
@@ -513,8 +511,8 @@ class FlexibleAttentionModule(nn.Module):
             is_decode_mode: bool = mode == common_types.MODE_DECODE
             output: AttentionOutput
             if is_decode_mode:
-                cache_view_is_none: bool = cache_view is None
-                assert not cache_view_is_none
+                if cache_view is None:
+                    raise ValueError("Decode mode requires a cache_view, but None was provided.")
                 has_decode_impl: bool = self.impl_decode is not None
                 callable_attn: tp.Any = self.impl_decode if has_decode_impl else self.impl
                 output = callable_attn(**input_dict)

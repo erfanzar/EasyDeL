@@ -126,12 +126,13 @@ class GFPOTrainer(GRPOTrainer):
                 filtering.
 
         Raises:
-            AssertionError: If arguments is not a GFPOConfig instance.
+            TypeError: If arguments is not a GFPOConfig instance.
         """
-        assert isinstance(arguments, GFPOConfig), (
-            f"arguments must be `GFPOConfig` but got {type(arguments)}. "
-            "Use GFPOConfig for GFPO training or GRPOConfig for GRPO training."
-        )
+        if not isinstance(arguments, GFPOConfig):
+            raise TypeError(
+                f"arguments must be `GFPOConfig` but got {type(arguments)}. "
+                "Use GFPOConfig for GFPO training or GRPOConfig for GRPO training."
+            )
 
         self.group_filter_func = group_filter_func
 

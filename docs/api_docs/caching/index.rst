@@ -7,6 +7,7 @@ easydel.caching package
    hybrid/index
    kda/index
    lightning/index
+   mla_ragged_page/index
    ragged_page/index
    recurrent/index
    transformer/index

@@ -231,15 +231,15 @@ class RayDistributedTrainer:
             config_variables: Fixed configuration variables
 
         Raises:
-            AssertionError: If model class cannot be resolved or parameters are inconsistent
+            ValueError: If model class cannot be resolved or parameters are inconsistent
         """
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
 
         if model_task is None or model_type is None:
-            assert model_task is None and model_type is None, (
-                "If one of model_task or model_type is None, both must be None."
-            )
-            assert model_class is not None, "model_class must be provided when model_task/model_type are omitted."
+            if not (model_task is None and model_type is None):
+                raise ValueError("If one of model_task or model_type is None, both must be None.")
+            if model_class is None:
+                raise ValueError("model_class must be provided when model_task/model_type are omitted.")
             model_type = model_class._model_type
             model_task = model_class._model_task
         elif model_class is not None:
@@ -250,11 +250,11 @@ class RayDistributedTrainer:
             model_task = model_class._model_task
 
         if model_class is None:
-            assert model_type is not None and model_task is not None, (
-                "model_type and model_task must be provided if model_class is not specified."
-            )
+            if model_type is None or model_task is None:
+                raise ValueError("model_type and model_task must be provided if model_class is not specified.")
             _, resolved_class = get_modules_by_type(model_type=model_type, task_type=model_task)
-            assert resolved_class is not None, f"Could not resolve model class for {model_type}/{model_task}"
+            if resolved_class is None:
+                raise RuntimeError(f"Could not resolve model class for {model_type}/{model_task}")
             self.model_class = resolved_class
         else:
             self.model_class = model_class
@@ -605,7 +605,7 @@ class RayDistributedTrainer:
             - Checkpoint loading respects the priority order above
 
         Raises:
-            AssertionError: If no valid model state can be obtained
+            RuntimeError: If no valid model state can be obtained
         """
         if state is None and model is None:
             if self.bucket_path is not None:
@@ -638,7 +638,8 @@ class RayDistributedTrainer:
         elif model is not None and state is None:
             state = self.convert_model_to_state(model)
 
-        assert state is not None, "Unable to obtain a valid model state."
+        if state is None:
+            raise RuntimeError("Unable to obtain a valid model state.")
 
         return self.create_trainer(
             arguments=arguments,

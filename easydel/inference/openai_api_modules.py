@@ -589,20 +589,6 @@ class FunctionCall(OpenAIBaseModel):
     arguments: str  # JSON string of arguments
 
 
-class Function(OpenAIBaseModel):
-    """Function definition for OpenAI-compatible function calling.
-
-    Attributes:
-        name: The name of the function.
-        description: Human-readable description of the function.
-        parameters: JSON Schema defining function parameters.
-    """
-
-    name: str
-    description: str | None = None
-    parameters: dict[str, tp.Any] = Field(default_factory=dict)
-
-
 class ToolCall(OpenAIBaseModel):
     """Represents a tool call in responses.
 

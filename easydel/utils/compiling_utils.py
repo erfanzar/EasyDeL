@@ -252,7 +252,7 @@ def get_safe_hash_int(text, algorithm="md5"):
     except AttributeError as e:
         raise ValueError(f"Unsupported hash algorithm: {algorithm}") from e
     except Exception as e:
-        raise Exception(f"Error generating hash: {e!s}") from e
+        raise RuntimeError(f"Error generating hash: {e!s}") from e
 
 
 def get_hash_of_lowering(lowered_func: Lowered):

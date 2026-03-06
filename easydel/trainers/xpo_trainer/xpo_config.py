@@ -77,13 +77,20 @@ class XPOConfig(GRPOConfig):
         },
     )
 
-    def __post_init__(self, max_sequence_length: int | None, quantization_block: int | None):
+    def __post_init__(
+        self,
+        max_sequence_length: int | None,
+        quantization_block: int | None,
+    ):
         self._handle_deprecated_max_sequence_length(max_sequence_length)
         if isinstance(self.alpha, collections.abc.Sequence) and len(self.alpha) == 1:
             self.alpha = self.alpha[0]
         if isinstance(self.beta, collections.abc.Sequence) and len(self.beta) == 1:
             self.beta = self.beta[0]
         if hasattr(super(), "__post_init__"):
-            super().__post_init__(max_sequence_length=None, quantization_block=quantization_block)
+            super().__post_init__(
+                max_sequence_length=None,
+                quantization_block=quantization_block,
+            )
 
     __hash__ = hash_fn

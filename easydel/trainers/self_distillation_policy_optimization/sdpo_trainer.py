@@ -180,7 +180,8 @@ class SDPOTrainer(GRPOTrainer):
         data_tokenize_fn: tp.Callable | None = None,
         feedback_func: FeedbackFunc | None = None,
     ):
-        assert isinstance(arguments, SDPOConfig), f"arguments must be SDPOConfig, got {type(arguments)}"
+        if not isinstance(arguments, SDPOConfig):
+            raise TypeError(f"arguments must be SDPOConfig, got {type(arguments)}")
 
         self.feedback_func = feedback_func
         self._effective_feedback_length = arguments.max_feedback_length
