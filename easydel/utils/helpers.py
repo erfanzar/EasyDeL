@@ -234,7 +234,8 @@ class Timers:
         return self.timers[name]
 
     def write(self, names, iteration, normalizer=1.0, reset=False):
-        assert normalizer > 0.0
+        if normalizer <= 0.0:
+            raise ValueError("normalizer must be greater than 0.0")
         for name in names:
             value = self.timers[name].elapsed_time(reset=reset) / normalizer
 
@@ -252,7 +253,8 @@ class Timers:
                     wandb.log({f"timers/{name}": value}, step=iteration)
 
     def log(self, names, normalizer=1.0, reset=True):
-        assert normalizer > 0.0
+        if normalizer <= 0.0:
+            raise ValueError("normalizer must be greater than 0.0")
 
         if isinstance(names, str):
             names = [names]

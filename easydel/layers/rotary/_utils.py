@@ -226,7 +226,8 @@ def _apply_rotary_emb(  # pyright: ignore[reportUnusedFunction]
     """
     cos = cos[:, :, None].astype(x.dtype)
     sin = sin[:, :, None].astype(x.dtype)
-    assert sin.ndim == x.ndim
+    if sin.ndim != x.ndim:
+        raise ValueError(f"sin.ndim ({sin.ndim}) must match x.ndim ({x.ndim})")
     if is_neox_style:
         x1, x2 = jnp.split(x, 2, axis=-1)
     else:

@@ -776,8 +776,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         mla_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_MLA_ATTENTION_MECHANISM,
         mla_attn_dtype: jnp.dtype | str | None = None,
         mla_attn_softmax_dtype: jnp.dtype | str | None = None,
-        blocksize_k: int = 128,
-        blocksize_q: int = 128,
+        blocksize_k: int = 512,
+        blocksize_q: int = 512,
         blocksize_b: int = 1,
         moe_tiling_size_batch: int = 4,
         moe_tiling_size_seqlen: int = 128,
@@ -1227,32 +1227,47 @@ class EasyDeLBaseConfig(PretrainedConfig):
             axis_types=(jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto),
         )
 
+    def _propagate_mesh_to_sub_configs(
+        self,
+        mesh: common_types.Mesh,
+        attr_name_on_self: str,
+        setter_method_name: str,
+    ):
+        """Propagate a mesh to all sub-configurations.
+
+        Args:
+            mesh: JAX device mesh to propagate.
+            attr_name_on_self: The hidden attribute name to set (e.g. '_hidden_mesh').
+            setter_method_name: The setter method name on sub-configs (e.g. 'set_model_mesh').
+        """
+        setattr(self, attr_name_on_self, mesh)
+
+        sub_configs = getattr(self, "sub_configs", None)
+        if not isinstance(sub_configs, dict):
+            return
+
+        for cfg_key in sub_configs.keys():
+            sub_cfg = getattr(self, cfg_key, None)
+            if sub_cfg is None:
+                continue
+            try:
+                if hasattr(sub_cfg, setter_method_name):
+                    getattr(sub_cfg, setter_method_name)(mesh)
+                else:
+                    setattr(sub_cfg, attr_name_on_self, mesh)
+            except (AttributeError, TypeError):
+                try:
+                    setattr(sub_cfg, attr_name_on_self, mesh)
+                except (AttributeError, TypeError):
+                    pass
+
     def set_model_mesh(self, mesh: common_types.Mesh):
         """Sets a custom mesh for the model, overriding the auto-generated one.
 
         Args:
             mesh: JAX device mesh to use for this model.
         """
-        self._hidden_mesh = mesh
-
-        sub_configs = getattr(self, "sub_configs", None)
-        if not isinstance(sub_configs, dict):
-            return
-
-        for attr_name in sub_configs.keys():
-            sub_cfg = getattr(self, attr_name, None)
-            if sub_cfg is None:
-                continue
-            try:
-                if hasattr(sub_cfg, "set_model_mesh"):
-                    sub_cfg.set_model_mesh(mesh)
-                else:
-                    sub_cfg._hidden_mesh = mesh
-            except Exception:
-                try:
-                    sub_cfg._hidden_mesh = mesh
-                except Exception:
-                    pass
+        self._propagate_mesh_to_sub_configs(mesh, "_hidden_mesh", "set_model_mesh")
 
     def set_explicit_mesh(self, mesh: common_types.Mesh):
         """Sets a custom explicit-axis mesh for the model.
@@ -1260,26 +1275,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         Args:
             mesh: JAX device mesh to use for this model.
         """
-        self._hidden_explicit_mesh = mesh
-
-        sub_configs = getattr(self, "sub_configs", None)
-        if not isinstance(sub_configs, dict):
-            return
-
-        for attr_name in sub_configs.keys():
-            sub_cfg = getattr(self, attr_name, None)
-            if sub_cfg is None:
-                continue
-            try:
-                if hasattr(sub_cfg, "set_explicit_mesh"):
-                    sub_cfg.set_explicit_mesh(mesh)
-                else:
-                    sub_cfg._hidden_explicit_mesh = mesh
-            except Exception:
-                try:
-                    sub_cfg._hidden_explicit_mesh = mesh
-                except Exception:
-                    pass
+        self._propagate_mesh_to_sub_configs(mesh, "_hidden_explicit_mesh", "set_explicit_mesh")
 
     def set_manual_mesh(self, mesh: common_types.Mesh):
         """Sets a custom manual-axis mesh for the model.
@@ -1287,26 +1283,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         Args:
             mesh: JAX device mesh to use for this model.
         """
-        self._hidden_manual_mesh = mesh
-
-        sub_configs = getattr(self, "sub_configs", None)
-        if not isinstance(sub_configs, dict):
-            return
-
-        for attr_name in sub_configs.keys():
-            sub_cfg = getattr(self, attr_name, None)
-            if sub_cfg is None:
-                continue
-            try:
-                if hasattr(sub_cfg, "set_manual_mesh"):
-                    sub_cfg.set_manual_mesh(mesh)
-                else:
-                    sub_cfg._hidden_manual_mesh = mesh
-            except Exception:
-                try:
-                    sub_cfg._hidden_manual_mesh = mesh
-                except Exception:
-                    pass
+        self._propagate_mesh_to_sub_configs(mesh, "_hidden_manual_mesh", "set_manual_mesh")
 
     def jax_mesh(self):
         """Deprecated method for getting the JAX mesh.
@@ -1619,7 +1596,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         set_attrs_smartly(self, "easy_method", EasyMethod.TRAIN, easy_method)
         set_attrs_smartly(self, "bits", None, bits)
-        set_attrs_smartly(self, "scan_attention_layers", True, scan_attention_layers)
+        set_attrs_smartly(self, "scan_attention_layers", False, scan_attention_layers)
         set_attrs_smartly(self, "scan_ring_attention", True, scan_ring_attention)
         set_attrs_smartly(self, "use_scan_mlp", False, use_scan_mlp)
         set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
@@ -1634,7 +1611,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "qmm_platform_override", None, qmm_platform_override)
         set_attrs_smartly(self, "qmm_tpu_path_override", None, qmm_tpu_path_override)
         set_attrs_smartly(self, "flash_attention_backward_pass_impl", "triton", flash_attention_backward_pass_impl)
-        set_attrs_smartly(self, "attn_dtype", jnp.float32, attn_dtype)
+        set_attrs_smartly(self, "attn_dtype", jnp.bfloat16, attn_dtype)
         set_attrs_smartly(self, "kvdtype", jnp.bfloat16, kvdtype if kvdtype is not None else self.attn_dtype)
         set_attrs_smartly(self, "attn_softmax_dtype", jnp.float32, attn_softmax_dtype)
         set_attrs_smartly(self, "mla_attn_dtype", self.attn_dtype, mla_attn_dtype)
@@ -2338,8 +2315,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 Falls back to `max_position_embeddings` if `freq_max_position_embeddings`
                 is not set.
         """
-        result = getattr(self, "freq_max_position_embeddings", self.max_position_embeddings)
-        assert result is not None, "max_position_embeddings must be set"
+        result = getattr(self, "freq_max_position_embeddings", getattr(self, "max_position_embeddings", None))
+        if result is None:
+            raise ValueError("`max_position_embeddings` must be set before requesting rope cache bounds.")
         return result
 
     @property
@@ -2355,8 +2333,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 Falls back to `max_position_embeddings` if `mask_max_position_embeddings`
                 is not set.
         """
-        result = getattr(self, "mask_max_position_embeddings", self.max_position_embeddings)
-        assert result is not None, "max_position_embeddings must be set"
+        result = getattr(self, "mask_max_position_embeddings", getattr(self, "max_position_embeddings", None))
+        if result is None:
+            raise ValueError("`max_position_embeddings` must be set before requesting mask cache bounds.")
         return result
 
     def _get_rope_config(self) -> RopeConfig:

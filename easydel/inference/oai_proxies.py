@@ -64,9 +64,6 @@ from pydantic import BaseModel, Field
 
 from .openai_api_modules import ChatCompletionRequest, CompletionRequest, ResponsesRequest
 
-if tp.TYPE_CHECKING:
-    from pydantic import BaseModel
-
 TIMEOUT_KEEP_ALIVE = 5.0
 
 

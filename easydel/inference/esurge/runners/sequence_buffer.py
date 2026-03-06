@@ -458,7 +458,8 @@ class SequenceBuffer:
 
         # Sampling params
         sampling_params = request.sampling_params
-        assert sampling_params is not None, "pooling requests not supported yet"
+        if sampling_params is None:
+            raise ValueError("pooling requests not supported yet")
         self._process_sampling_params(sampling_params, req_id, req_index)
         self._process_optional_params(request, sampling_params, req_id, req_index)
         self._update_request_distribution()
@@ -621,14 +622,17 @@ class SequenceBuffer:
             i2: Index of the second request.
 
         Raises:
-            AssertionError: If either index doesn't contain a valid request.
+            RuntimeError: If either index doesn't contain a valid request.
 
         Note:
             This method modifies the buffer in-place.
             Useful for buffer reorganization and optimization.
         """
         old_id_i1, old_id_i2 = self._req_ids[i1], self._req_ids[i2]
-        assert old_id_i1 is not None and old_id_i2 is not None
+        if old_id_i1 is None or old_id_i2 is None:
+            raise RuntimeError(
+                f"both indices must contain valid requests, but got req_id at i1={old_id_i1}, req_id at i2={old_id_i2}"
+            )
         self._req_ids[i1], self._req_ids[i2] = old_id_i2, old_id_i1
         self.req_output_token_ids[i1], self.req_output_token_ids[i2] = (
             self.req_output_token_ids[i2],
@@ -708,14 +712,15 @@ class SequenceBuffer:
             to_idx: Destination index for the request.
 
         Raises:
-            AssertionError: If from_idx doesn't contain a valid request.
+            RuntimeError: If from_idx doesn't contain a valid request.
 
         Note:
             This is an internal method used by condense() and other
             buffer reorganization operations. Modifies the buffer in-place.
         """
         req_id = self._req_ids[from_idx]
-        assert req_id is not None
+        if req_id is None:
+            raise RuntimeError(f"from_idx {from_idx} does not contain a valid request")
 
         # Static bookkeeping
         self._req_ids[to_idx] = req_id
@@ -974,7 +979,8 @@ class SequenceBuffer:
             max_prompt_len,
             self.vocab_size,
         )
-        assert isinstance(result, jax.Array)
+        if not isinstance(result, jax.Array):
+            raise RuntimeError(f"pack_prompts must return a jax.Array, but got {type(result)}")
         return result
 
     def get_request_indices_with_penalty(self) -> jax.Array:

@@ -50,7 +50,7 @@ from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
 from easydel.utils.traversals import deepcopy_model
 
-from ..prompt_transforms import GRPOPreprocessTransform, is_conversational
+from ..prompt_transforms import GRPOPreprocessTransform
 from ..prompt_utils import apply_chat_template
 from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
@@ -155,11 +155,13 @@ class PPOTrainer(Trainer):
             data_tokenize_fn: Optional custom tokenization function.
 
         Raises:
-            AssertionError: If arguments is None or not a PPOConfig.
-            ValueError: If model is None or reward weights don't match reward funcs.
+            ValueError: If arguments is None or model is None or reward weights don't match reward funcs.
+            TypeError: If arguments is not a PPOConfig.
         """
-        assert arguments is not None, "PPOTrainer requires `arguments`."
-        assert isinstance(arguments, PPOConfig), f"arguments type must be `PPOConfig` but got {type(arguments)}"
+        if arguments is None:
+            raise ValueError("PPOTrainer requires `arguments`.")
+        if not isinstance(arguments, PPOConfig):
+            raise TypeError(f"arguments type must be `PPOConfig` but got {type(arguments)}")
         self.arguments = arguments
 
         if model is None:
@@ -200,7 +202,8 @@ class PPOTrainer(Trainer):
                 raise ValueError("The number of reward processing classes must match the number of reward functions.")
 
         empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=model.model.mesh)
-        assert isinstance(reward_processing_classes, list)
+        if not isinstance(reward_processing_classes, list):
+            raise TypeError(f"reward_processing_classes must be a list, got {type(reward_processing_classes)}")
 
         for i, (reward_processing_class, reward_func) in enumerate(
             zip(reward_processing_classes, reward_funcs, strict=False)
@@ -251,58 +254,7 @@ class PPOTrainer(Trainer):
         self.num_generations = arguments.num_generations
         self.reward_processing_classes = reward_processing_classes
         self.reward_funcs = reward_funcs
-
-        if getattr(self.arguments, "generation_num_return_sequences", None) is None:
-            self.arguments.generation_num_return_sequences = self.num_generations
-        if getattr(self.arguments, "generation_top_p", None) is None:
-            self.arguments.generation_top_p = self.arguments.top_p
-        if getattr(self.arguments, "generation_top_k", None) is None:
-            self.arguments.generation_top_k = self.arguments.top_k
-        if getattr(self.arguments, "generation_temperature", None) is None:
-            self.arguments.generation_temperature = self.arguments.temperature
-        if getattr(self.arguments, "generation_extra_kwargs", None) is None:
-            self.arguments.generation_extra_kwargs = {}
-        if self.arguments.generation_kwargs is not None:
-            self.arguments.generation_extra_kwargs.update(self.arguments.generation_kwargs)
-        for key, value in (
-            ("min_p", self.arguments.min_p),
-            ("repetition_penalty", self.arguments.repetition_penalty),
-        ):
-            if value is not None and key not in self.arguments.generation_extra_kwargs:
-                self.arguments.generation_extra_kwargs[key] = value  # pyright: ignore[reportOptionalSubscript]
-
-        def _peek_first_example(dataset):
-            if dataset is None:
-                return None
-            if isinstance(dataset, dict):
-                for item in dataset.values():
-                    return _peek_first_example(item)
-                return None
-            try:
-                return dataset[0]
-            except Exception:
-                pass
-            try:
-                return next(iter(dataset))
-            except Exception:
-                pass
-            try:
-                shard_names = getattr(dataset, "shard_names", None)
-                open_shard = getattr(dataset, "open_shard", None)
-                if shard_names and open_shard:
-                    return next(iter(open_shard(shard_names[0])))
-            except Exception:
-                pass
-            return None
-
-        self.train_is_conversational = False
-        self.eval_is_conversational = False
-        train_sample = _peek_first_example(train_dataset)
-        if train_sample is not None:
-            self.train_is_conversational = is_conversational(train_sample)
-        eval_sample = _peek_first_example(eval_dataset)
-        if eval_sample is not None:
-            self.eval_is_conversational = is_conversational(eval_sample)
+        self._initialize_conversational_flags(train_dataset, eval_dataset)
 
         self.data_tokenize_fn = data_tokenize_fn
         log_table = None

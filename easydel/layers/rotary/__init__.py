@@ -113,7 +113,6 @@ __all__ = (
     "compute_phi3_frequencies",
     "compute_yarn_frequencies",
     "compute_yarn_inv_frequencies",
-    "compute_yarn_inv_frequencies",
     "get_frequencies",
     "get_inv_frequencies",
     "get_rope",

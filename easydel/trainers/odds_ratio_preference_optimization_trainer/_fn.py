@@ -90,7 +90,8 @@ def concatenated_forward(
                 - chosen_nll_loss: Negative log-likelihood loss for the chosen examples.
                 - chosen_accuracy: Accuracy metric computed on the chosen examples.
     """
-    assert padding_value is not None, "`padding_value` can not be set as `None` it must be an integer."
+    if padding_value is None:
+        raise ValueError("`padding_value` can not be set as `None` it must be an integer.")
 
     # Concatenate inputs from chosen and rejected examples.
     concatenated_batch = concatenated_inputs(batch, is_encoder_decoder)

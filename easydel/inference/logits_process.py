@@ -494,7 +494,8 @@ class ForceTokensLogitsProcessor(LogitsProcessor):
     """
 
     def __init__(self, force_token_map):
-        assert isinstance(force_token_map, dict)
+        if not isinstance(force_token_map, dict):
+            raise TypeError(f"force_token_map must be a dict, got {type(force_token_map)}")
         force_token_array = jnp.ones((max(force_token_map.keys()) + 1), dtype=jnp.int32) * -1
         for index, token in force_token_map.items():
             if token is not None:
@@ -788,9 +789,9 @@ class MinPLogitsWarper(LogitsWarper):
             batch_size, vocab_size = x.shape
             sorted_logits, sorted_indices = lax.top_k(x, k=vocab_size)
             sorted_probs = jax.nn.softmax(sorted_logits, axis=-1)
-            cumulative_probs = jnp.cumsum(sorted_probs, axis=-1)
-            shifted_cum_probs = jnp.pad(cumulative_probs[:, :-1], ((0, 0), (1, 0)), constant_values=0.0)
-            sorted_indices_to_remove_mask = shifted_cum_probs >= min_p
+            max_prob = sorted_probs[:, 0:1]
+            threshold = min_p * max_prob
+            sorted_indices_to_remove_mask = sorted_probs < threshold
             min_keep_mask = jnp.arange(vocab_size) < self.min_tokens_to_keep
             sorted_indices_to_remove_mask = sorted_indices_to_remove_mask & (~min_keep_mask)
             indices_to_remove_mask = jnp.zeros_like(x, dtype=jnp.bool_)

@@ -225,7 +225,8 @@ class ParallelMoELinear(nn.Module):
         self.bias_init = bias_init
         self.weight_modif_fn = weight_modif_fn
         if direction is not None:
-            assert direction in ["row", "column"]
+            if direction not in ("row", "column"):
+                raise ValueError(f"direction must be 'row' or 'column', got '{direction}'")
             self._direction = direction
         kshape = (num_experts, out_features, in_features) if out_first else (num_experts, in_features, out_features)
         self.kernel = nn.Param(kernel_init(rngs.param(), kshape, param_dtype))

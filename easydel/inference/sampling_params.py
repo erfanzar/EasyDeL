@@ -574,7 +574,8 @@ class SamplingParams:
             raise ValueError(f"n must be at least 1, got {self.n}.")
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise ValueError(f"presence_penalty must be in [-2, 2], got {self.presence_penalty}.")
-        assert self.temperature is not None, "temperature must be set before validation"
+        if self.temperature is None:
+            raise ValueError("temperature must be set before validation")
         if self.temperature < 0.0:
             raise ValueError(f"temperature must be non-negative, got {self.temperature}.")
         if not 0.0 < self.top_p <= 1.0:
@@ -706,7 +707,7 @@ class SamplingParams:
             RuntimeError: If bad_words is set but update_with_tokenizer() was not called.
         """
         if self.bad_words and self._bad_words_token_ids is None:
-            raise RuntimeError("Must call `with_tokenizer()` before `make_jitable()` when `bad_words` is set.")
+            raise RuntimeError("Must call `update_with_tokenizer()` before `make_jitable()` when `bad_words` is set.")
         return JitableSamplingParams.from_host_params(self)
 
     def clone(self) -> SamplingParams:

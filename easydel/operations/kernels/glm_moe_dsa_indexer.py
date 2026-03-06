@@ -21,7 +21,7 @@ from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
-from .._operation_impl import OperationImpl, OperationMetadata, OperationOutput, OperationRegistry
+from .._operation_impl import OperationImpl, OperationOutput, OperationRegistry
 from ..requirements import CacheType, ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
 
 
@@ -40,10 +40,6 @@ class GlmMoeDsaIndexerOp(OperationImpl):
     @classmethod
     def get_impl_name(cls) -> str | tuple[str, ...]:
         return ("glm_moe_dsa_indexer", "dsa_indexer")
-
-    def get_impl_metadata(self) -> OperationMetadata:
-        assert self.metadata is not None
-        return self.metadata
 
     @classmethod
     def get_requirements(

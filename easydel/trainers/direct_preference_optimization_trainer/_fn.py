@@ -56,22 +56,7 @@ from ..training_utils import (
     update_state_respectfully,
 )
 from ..utils import pad_to_length
-
-# Define allowed loss function variants.
-LOSS_FN_VARIENTS = tp.Literal[
-    "sigmoid",
-    "hinge",
-    "ipo",
-    "exo_pair",
-    "nca_pair",
-    "robust",
-    "bco_pair",
-    "sppo_hard",
-    "aot",
-    "aot_pair",
-    "apo_zero",
-    "apo_down",
-]
+from .dpo_config import LOSS_FN_VARIANTS
 
 
 def concatenated_inputs(
@@ -167,7 +152,7 @@ def concatenated_inputs(
 
 
 def get_loss_function(
-    loss_type: LOSS_FN_VARIENTS,
+    loss_type: LOSS_FN_VARIANTS,
     beta: float,
     label_smoothing: float | int,
 ):
@@ -178,7 +163,7 @@ def get_loss_function(
     to a corresponding loss function implementation that computes the DPO (Direct Preference Optimization) loss.
 
     Args:
-        loss_type (LOSS_FN_VARIENTS): The type of loss function to return.
+        loss_type (LOSS_FN_VARIANTS): The type of loss function to return.
         beta (float): A scaling factor applied to the loss computation.
         label_smoothing (tp.Union[float, int]): A value for label smoothing used in some loss functions.
 
@@ -610,7 +595,8 @@ def get_loss_function(
         "apo_down": _apo_down_dpo_loss,
         "discopop": _discopop_dpo_loss,
     }.get(loss_type, None)
-    assert loss_function is not None, f"given loss_type({loss_function}) is not valid"
+    if loss_function is None:
+        raise ValueError(f"given loss_type({loss_type}) is not valid")
     return loss_function
 
 
@@ -789,7 +775,7 @@ def training_step(
     concatenated_forward: tp.Callable,
     beta: float = 0.1,
     label_smoothing: float = 0,
-    loss_type: LOSS_FN_VARIENTS = "sigmoid",
+    loss_type: LOSS_FN_VARIANTS = "sigmoid",
     reference_free: bool = False,
     loss_config: LossConfig | None = None,
     partition_spec: PartitionSpec | None = None,
@@ -811,7 +797,7 @@ def training_step(
         concatenated_forward (tp.Callable): Function to perform a forward pass on concatenated inputs.
         beta (float, optional): Scaling factor for loss computation. Defaults to 0.1.
         label_smoothing (float, optional): Label smoothing factor. Defaults to 0.
-        loss_type (LOSS_FN_VARIENTS, optional): Type of loss function to use. Defaults to "sigmoid".
+        loss_type (LOSS_FN_VARIANTS, optional): Type of loss function to use. Defaults to "sigmoid".
         ref_precalculated (bool, optional): If True, uses precalculated reference log probabilities from the batch.
             Defaults to True.
         loss_config (tp.Optional[LossConfig], optional): Additional configuration for loss. Defaults to None.
@@ -916,7 +902,7 @@ def evaluation_step(
     concatenated_forward: tp.Callable,
     beta: float = 0.1,
     label_smoothing: float = 0,
-    loss_type: LOSS_FN_VARIENTS = "sigmoid",
+    loss_type: LOSS_FN_VARIANTS = "sigmoid",
     reference_free: bool = False,
     partition_spec: PartitionSpec | None = None,
 ) -> LossMetrics:
@@ -933,7 +919,7 @@ def evaluation_step(
         reference_state (EasyDeLState, optional): A reference model state. Defaults to None.
         beta (float, optional): Scaling factor for loss computation. Defaults to 0.1.
         label_smoothing (float, optional): Label smoothing factor. Defaults to 0.
-        loss_type (LOSS_FN_VARIENTS, optional): Type of loss function to use. Defaults to "sigmoid".
+        loss_type (LOSS_FN_VARIANTS, optional): Type of loss function to use. Defaults to "sigmoid".
         reference_free (bool, optional): If True, ignores reference log probabilities. Defaults to False.
         partition_spec (tp.Optional[PartitionSpec], optional): Partitioning specification for sharding the batch.
             Defaults to None.

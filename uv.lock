@@ -724,8 +724,8 @@ tensorflow = [
 ]
 torch = [
     { name = "tensorboard" },
-    { name = "torch", version = "2.8.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
-    { name = "torch", version = "2.8.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "torch", version = "2.8.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra != 'extra-7-easydel-cuda') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
+    { name = "torch", version = "2.8.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra != 'extra-7-easydel-cuda') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
 ]
 tpu = [
     { name = "ejkernel", extra = ["tpu"], marker = "(extra == 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-torch') or (extra != 'extra-7-easydel-torch' and extra == 'extra-7-easydel-tpu') or (extra != 'extra-7-easydel-cuda' and extra == 'extra-7-easydel-tpu')" },
@@ -737,7 +737,7 @@ tpu = [
 requires-dist = [
     { name = "cryptography", specifier = ">=45.0.6" },
     { name = "datasets", specifier = ">=3.6.0" },
-    { name = "eformer", specifier = "==0.0.99" },
+    { name = "eformer", specifier = "==0.0.99.1" },
     { name = "einops", specifier = "~=0.8.0" },
     { name = "ejkernel", specifier = "==0.0.71" },
     { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.71" },
@@ -782,7 +782,7 @@ provides-extras = ["torch", "cuda", "tpu", "tensorflow", "lm-eval", "profile", "
 
 [[package]]
 name = "eformer"
-version = "0.0.99"
+version = "0.0.99.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "braceexpand" },
@@ -804,9 +804,9 @@ dependencies = [
     { name = "tensorstore" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/60/10/bc075346cbda68482a75af68d6dda55b180aa4876235768bbe965dd30a69/eformer-0.0.99.tar.gz", hash = "sha256:796b0a4a4331a0882b0e2d7324e731dd838e84aae04a1bfdcc0f7730fff2a8ee", size = 274846, upload-time = "2026-03-04T12:50:27.374Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/10/6f/730b26090f411cc0a10a0bd5d9d17dd29786a20752262e86e9379ebe2e42/eformer-0.0.99.1.tar.gz", hash = "sha256:7a70053c4dce0fb07c6b1b097e9773694cda9baf44fb8ed810c03c602bb94804", size = 275503, upload-time = "2026-03-06T02:13:40.049Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/27/84/39e9db063297151f9460a22cc263d038201f3340faee8d2269f57beb2439/eformer-0.0.99-py3-none-any.whl", hash = "sha256:8bd39d89ec03e854e2f2256fbd509a5550d6e6a9485706bdde89c37a1b6aa99b", size = 336004, upload-time = "2026-03-04T12:50:29.307Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/c4/5c27318d52c0a589f66aee6f11b79593ece3df8015f0294ac2af9e87b68f/eformer-0.0.99.1-py3-none-any.whl", hash = "sha256:2db96bf866d9286fd6167b995458f432e7b6c4473e3715cfe3205a360f9398ab", size = 336708, upload-time = "2026-03-06T02:13:38.234Z" },
 ]
 
 [[package]]
@@ -4847,7 +4847,7 @@ wheels = [
 
 [[package]]
 name = "xprof-nightly"
-version = "2.22.3a20251216"
+version = "2.23.0a20260303"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cheroot" },
@@ -4861,11 +4861,12 @@ dependencies = [
     { name = "werkzeug" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d2/7e/495ad7589362f320236861967867dd62d08596f89a60fb072679f763e2fd/xprof_nightly-2.22.3a20251216-cp311-none-manylinux2014_x86_64.whl", hash = "sha256:680ea6af72dcd633555483c0ab691c58f27d7d2eed1101fcfb7c40a04f9a0cd0", size = 21299177, upload-time = "2025-12-16T12:19:55.084Z" },
-    { url = "https://files.pythonhosted.org/packages/3a/00/1c6c5c33993e7c9d9e2ea64d9a9ed289ea2351a12d390957b88764dd64af/xprof_nightly-2.22.3a20251216-cp312-none-macosx_12_0_arm64.whl", hash = "sha256:b4a022aee00e666615410f9699b4e3afda53368be75bda4fb9d759535e73a1a4", size = 19177128, upload-time = "2025-12-16T10:41:38.249Z" },
-    { url = "https://files.pythonhosted.org/packages/3f/7d/4a029192c9c2eb8d4498ed9a668ba519e1701b05635ec7ed14ec0930ba99/xprof_nightly-2.22.3a20251216-cp312-none-manylinux2014_x86_64.whl", hash = "sha256:bc602d692d978504e19867e4ebee2c3e5221bbceb5435e89a4581c84ef6df843", size = 21299485, upload-time = "2025-12-16T12:09:32.448Z" },
-    { url = "https://files.pythonhosted.org/packages/f5/1a/e988d777363abd1738ab1cac05436e0a003c863ca5616c1db186fa4ee9b1/xprof_nightly-2.22.3a20251216-cp313-none-macosx_12_0_arm64.whl", hash = "sha256:9132d37b8a2a77ef487b08e6a1b295fcdfc7b94f90b996667f408c4f7a5f9a48", size = 19177305, upload-time = "2025-12-16T10:52:53.296Z" },
-    { url = "https://files.pythonhosted.org/packages/59/38/ccafca38f1d04d5b646aecb18b2fb7f3e9627be34ff11bda586b6d6cd817/xprof_nightly-2.22.3a20251216-cp313-none-manylinux2014_x86_64.whl", hash = "sha256:8a69b11bfcb7cb9e08bfeb8250034477baa3a4f235f2aae8f831109aba667d9a", size = 21298703, upload-time = "2025-12-16T12:16:47.844Z" },
+    { url = "https://files.pythonhosted.org/packages/ad/76/6810b98f763d7a3f7314ac5e1cbbc1e6f73af1139a23912b83ee17919b79/xprof_nightly-2.23.0a20260303-cp311-none-manylinux_2_27_x86_64.whl", hash = "sha256:c0dc339a531b26ce1bdb5946b3e7dd4378d7706cdb498fb7ebf21116758d5327", size = 23874481, upload-time = "2026-03-03T10:12:24.952Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/da/d59b0ff9d1cd010cb9bf8d1d45b4c39d176900c8eea7d56b6e6080ecd6bc/xprof_nightly-2.23.0a20260303-cp311-none-manylinux_2_35_aarch64.whl", hash = "sha256:f79f421a11fe8080938fd8847eba5eea0f229df9808dabf4dedf0e9803899c4f", size = 24806409, upload-time = "2026-03-03T10:19:54.046Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/08/c4de587174b78366d200939e3bba5a53b07c209a83cc4888345dd40174bc/xprof_nightly-2.23.0a20260303-cp312-none-manylinux_2_27_x86_64.whl", hash = "sha256:d16b5d21fb9a2a5455d237d467e9a3cb41bc729bc58f7c70b5d156fc23fb50d2", size = 23874750, upload-time = "2026-03-03T10:08:14.956Z" },
+    { url = "https://files.pythonhosted.org/packages/75/51/274392fb7bcda975d162b8b39eb3274802391fb36c7e7307b785ccbaf050/xprof_nightly-2.23.0a20260303-cp312-none-manylinux_2_35_aarch64.whl", hash = "sha256:9b12b2a4505eda8b388ddbdbada71b30ff7fcac9dcf82703bfc60c61e8058954", size = 24805799, upload-time = "2026-03-03T10:09:30.155Z" },
+    { url = "https://files.pythonhosted.org/packages/5e/c0/aa2183f34512f58c0184b8268381d71f9197242d0edd8957fbecc1c918b1/xprof_nightly-2.23.0a20260303-cp313-none-manylinux_2_27_x86_64.whl", hash = "sha256:4494c0549c4c7af2dbca2d6c3b5a0111cbd07913d7232377f357db4298c6bf41", size = 23875592, upload-time = "2026-03-03T10:10:06.163Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/08/1b6ae676d3854197e636ea7f03890f884bb6197595e0c8bddf30c0ca00df/xprof_nightly-2.23.0a20260303-cp313-none-manylinux_2_35_aarch64.whl", hash = "sha256:f5d73585bbd0c944c34c2c57b25d45b81abc7f56f16c202071315aa8c4425d58", size = 24805611, upload-time = "2026-03-03T10:11:38.804Z" },
 ]
 
 [[package]]

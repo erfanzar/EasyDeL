@@ -67,7 +67,7 @@ from easydel.caching import TransformerCacheView
 from easydel.caching.transformer import TransformerMetadata
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import (
     CacheType,
     ExecutionMode,
@@ -101,16 +101,6 @@ class AutoRegressiveDecodeAttn(OperationImpl):
             The string "autoregressive_decodeattn".
         """
         return "autoregressive_decodeattn"
-
-    def get_impl_metadata(self) -> OperationMetadata:
-        """
-        Returns the metadata associated with this attention implementation instance.
-
-        Returns:
-            The `OperationMetadata` provided during initialization.
-        """
-        assert self.metadata is not None
-        return self.metadata
 
     @classmethod
     def get_requirements(
@@ -190,7 +180,8 @@ class AutoRegressiveDecodeAttn(OperationImpl):
         head_dim: int = query.shape[-1]
         softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
         model_mode: common_types.RUNTIME_MODE_TYPES = self.get_mode(query=query, BTHD=True)  # type: ignore
-        assert model_mode == common_types.MODE_DECODE, "AutoRegressiveDecodeAttn requires decode mode"
+        if model_mode != common_types.MODE_DECODE:
+            raise ValueError("AutoRegressiveDecodeAttn requires decode mode")
 
         shardings = self.metadata.get_shardings(model_mode, layout="bthd")
 

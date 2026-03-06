@@ -123,16 +123,6 @@ class BlockSparseAttn(OperationImpl):
         """
         return "blocksparse"
 
-    def get_impl_metadata(self) -> OperationMetadata:
-        """
-        Returns the metadata associated with this attention implementation instance.
-
-        Returns:
-            The `OperationMetadata` provided during initialization.
-        """
-        assert self.metadata is not None
-        return self.metadata
-
     @classmethod
     def get_requirements(
         cls,
@@ -176,7 +166,7 @@ class BlockSparseAttn(OperationImpl):
             query: Query tensor (B, T, Hq, D).
             key: Key tensor (B, S, Hkv, D).
             value: Value tensor (B, S, Hkv, Dv).
-            attention_mask: Optional boolean attention attention_mask (broadcastable to B, 1, T, S).
+            attention_mask: Optional boolean attention_mask (broadcastable to B, 1, T, S).
                 Used to generate segment IDs if provided.
             causal: If True, applies causal masking via the kernel's attention_mask configuration.
                 If False, falls back to VanillaAttn.
@@ -473,10 +463,10 @@ class BlockSparseAttn(OperationImpl):
             query: Query tensor.
             key: Key tensor.
             value: Value tensor.
-            attention_mask: Optional attention attention_mask.
+            attention_mask: Optional attention_mask.
             causal: If True, applies causal masking. Affects fallback logic and
                 kernel configuration.
-                        cache_metadata: cache view for current layer.
+            cache_metadata: Cache view for current layer.
             **ignore: Additional ignored keyword arguments.
 
         Returns:

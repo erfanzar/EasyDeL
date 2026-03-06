@@ -28,7 +28,7 @@ from easydel.caching import MLARaggedPagesCacheView, RaggedPagesMetadata
 from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import (
     CacheType,
     ExecutionMode,
@@ -283,15 +283,6 @@ class MultiLatentRaggedPageAttn(OperationImpl):
         """Return the registered operation name for this implementation."""
         return "multi_latent_ragged_page_attention_v1"
 
-    def get_impl_metadata(self) -> OperationMetadata:
-        """Return the ``OperationMetadata`` attached to this instance.
-
-        Raises:
-            AssertionError: If metadata has not been set.
-        """
-        assert self.metadata is not None
-        return self.metadata
-
     def forward_v1(
         self,
         queries_nope: Float[Array, "total_tokens num_q_heads qk_nope_dim"],
@@ -347,7 +338,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
         """
         if keys_pe is None:
             raise ValueError(
-                "multi_latent_ragged_page_attention requires `keys_pe`." " Pass it as `keys_pe=` (or `k_pe=`)."
+                "multi_latent_ragged_page_attention requires `keys_pe`. Pass it as `keys_pe=` (or `k_pe=`)."
             )
 
         queries_nope = _reshape_query_tensor(queries_nope, "queries_nope")
@@ -366,7 +357,7 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                 f"rank-3 [total_tokens, num_kv_heads, kv_lora_rank]. Got shape={keys_values.shape}."
             )
         if keys_pe.ndim != 2:
-            raise ValueError("`keys_pe` must be rank-2 [total_tokens, qk_pe_dim]. " f"Got shape={keys_pe.shape}.")
+            raise ValueError(f"`keys_pe` must be rank-2 [total_tokens, qk_pe_dim]. Got shape={keys_pe.shape}.")
         if keys_values.shape[0] != queries_nope.shape[0]:
             raise ValueError(
                 "`keys_values` token dimension must match `queries_nope` token dimension. "

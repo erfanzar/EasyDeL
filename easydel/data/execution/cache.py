@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import pickle
 import time
 import typing as tp
@@ -37,6 +38,9 @@ if tp.TYPE_CHECKING:
     from datasets import Dataset, DatasetDict, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
     DatasetLike = Dataset | IterableDataset | DatasetDict
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -272,7 +276,16 @@ class DiskCache(CacheLayer):
             try:
                 metadata = CacheMetadata.from_dict(json.loads(meta_path.read_text()))
             except Exception:
-                pass
+                logger.warning(
+                    "Failed to read cache metadata for key %s from %s; discarding stale metadata.",
+                    key,
+                    meta_path,
+                    exc_info=True,
+                )
+                try:
+                    meta_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.debug("Failed to delete invalid cache metadata at %s.", meta_path, exc_info=True)
 
         # Load data
         try:
@@ -280,6 +293,13 @@ class DiskCache(CacheLayer):
             data = pickle.loads(self._decompress(compressed))
             return (data, metadata)
         except Exception:
+            logger.warning(
+                "Failed to read cached value for key %s from %s; invalidating cache entry.",
+                key,
+                data_path,
+                exc_info=True,
+            )
+            self.invalidate(key)
             return None
 
     def put(
@@ -491,6 +511,13 @@ class DatasetCache:
         try:
             return load_from_disk(str(path))
         except Exception:
+            logger.warning(
+                "Failed to load cached dataset for key %s from %s; invalidating cache entry.",
+                key,
+                path,
+                exc_info=True,
+            )
+            self.invalidate(key)
             return None
 
     def put(self, key: str, dataset: "DatasetLike") -> None:

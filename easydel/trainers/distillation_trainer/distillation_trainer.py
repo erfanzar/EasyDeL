@@ -96,7 +96,8 @@ class DistillationTrainer(Trainer):
             tokenizer = processing_class.tokenizer
         if getattr(tokenizer, "pad_token", None) is None and hasattr(tokenizer, "eos_token"):
             tokenizer.pad_token = tokenizer.eos_token
-        assert isinstance(arguments, DistillationConfig), "passed argument must be a `DistillationConfig`."
+        if not isinstance(arguments, DistillationConfig):
+            raise TypeError("passed argument must be a `DistillationConfig`.")
 
         self.arguments = arguments
 

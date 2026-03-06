@@ -86,9 +86,9 @@ class ConstantList(Generic[T], Sequence):
             item: Item that would be appended.
 
         Raises:
-            Exception: Always raised as list is immutable.
+            TypeError: Always raised as list is immutable.
         """
-        raise Exception("Cannot append to a constant list")
+        raise TypeError("Cannot append to a constant list")
 
     def extend(self, item):
         """Prevent extending the list.
@@ -97,31 +97,32 @@ class ConstantList(Generic[T], Sequence):
             item: Items that would be added.
 
         Raises:
-            Exception: Always raised as list is immutable.
+            TypeError: Always raised as list is immutable.
         """
-        raise Exception("Cannot extend a constant list")
+        raise TypeError("Cannot extend a constant list")
 
-    def insert(self, item):
+    def insert(self, index, item):
         """Prevent inserting into the list.
 
         Args:
+            index: Position to insert at.
             item: Item that would be inserted.
 
         Raises:
-            Exception: Always raised as list is immutable.
+            TypeError: Always raised as list is immutable.
         """
-        raise Exception("Cannot insert into a constant list")
+        raise TypeError("Cannot insert into a constant list")
 
-    def pop(self, item):
+    def pop(self, index=-1):
         """Prevent popping from the list.
 
         Args:
-            item: Index to pop from.
+            index: Index to pop from.
 
         Raises:
-            Exception: Always raised as list is immutable.
+            TypeError: Always raised as list is immutable.
         """
-        raise Exception("Cannot pop from a constant list")
+        raise TypeError("Cannot pop from a constant list")
 
     def remove(self, item):
         """Prevent removing from the list.
@@ -130,17 +131,17 @@ class ConstantList(Generic[T], Sequence):
             item: Item that would be removed.
 
         Raises:
-            Exception: Always raised as list is immutable.
+            TypeError: Always raised as list is immutable.
         """
-        raise Exception("Cannot remove from a constant list")
+        raise TypeError("Cannot remove from a constant list")
 
     def clear(self):
         """Prevent clearing the list.
 
         Raises:
-            Exception: Always raised as list is immutable.
+            TypeError: Always raised as list is immutable.
         """
-        raise Exception("Cannot clear a constant list")
+        raise TypeError("Cannot clear a constant list")
 
     def index(self, item: T, start: int = 0, stop: int | None = None) -> int:
         """Find the index of an item in the list.
@@ -189,9 +190,9 @@ class ConstantList(Generic[T], Sequence):
             value: Value that would be set.
 
         Raises:
-            Exception: Always raised as list is immutable.
+            TypeError: Always raised as list is immutable.
         """
-        raise Exception("Cannot set item in a constant list")
+        raise TypeError("Cannot set item in a constant list")
 
     def __delitem__(self, item):
         """Prevent deleting items from the list.
@@ -200,9 +201,9 @@ class ConstantList(Generic[T], Sequence):
             item: Index to delete.
 
         Raises:
-            Exception: Always raised as list is immutable.
+            TypeError: Always raised as list is immutable.
         """
-        raise Exception("Cannot delete item from a constant list")
+        raise TypeError("Cannot delete item from a constant list")
 
     def __iter__(self):
         """Return an iterator over the list.
@@ -276,6 +277,7 @@ def is_list_of(
         return len(value) == 0 or isinstance(value[0], typ)
     elif check == "all":
         return all(isinstance(v, typ) for v in value)
+    return False
 
 
 def chunk_list(lst: list[T], chunk_size: int):
@@ -417,7 +419,7 @@ def round_down(x: int, y: int) -> int:
     return (x // y) * y
 
 
-def get_dtype_size(dtype: jnp.ndarray) -> int:
+def get_dtype_size(dtype: jnp.dtype) -> int:
     """Get the size of a JAX/NumPy data type in bytes.
 
     Args:

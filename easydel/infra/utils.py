@@ -357,7 +357,7 @@ def block_wise_ffn(remat_ffn: tp.Callable, inputs: jax.Array, chunk_size: int) -
     except Exception as e:
         raise EasyDeLBlockWiseFFNError(
             "You Are using BlockWise FFN from near-infinite-context length paper and you might be passing "
-            "input arguments in wrong way in case that you don'position_ids want to use this just pass "
+            "input arguments in wrong way in case that you don't want to use this just pass "
             "`use_scan_mlp=False` in "
             "model config or in config_kwargs in AutoEasyDeLModelFor... or change `scan_mlp_chunk_size` "
             f"in configs for more information read Docs.\nOriginal Error\n{e}"
@@ -376,7 +376,7 @@ def is_flatten(pytree: dict):
         True if the pytree is a flattened tree, and false otherwise
     """
     mpl = next(iter(pytree.keys()))
-    return True if isinstance(mpl, tuple) else False
+    return isinstance(mpl, tuple)
 
 
 def quantize_linear_layers(
@@ -522,9 +522,10 @@ def unwrap_lora_to_layers(
     """
     from easydel.utils.traversals import get_module_from_path, iter_module_search, set_module_from_path
 
+    lora_paths = [p[0] for p in iter_module_search(model, nn.LoRA)]
     with tqdm(
-        total=len([p[0] for p in iter_module_search(model, ParallelLinear)]),
-        desc="Unwarping LoRA Layers",
+        total=len(lora_paths),
+        desc="Unwrapping LoRA Layers",
         disable=not verbose,
     ) as pbar:
         for path, _ in iter_module_search(model, nn.LoRA):
@@ -539,7 +540,7 @@ def unwrap_lora_to_layers(
                 path=path,
                 new_value=base_module.base_module,
             )
-        pbar.update(1)
+            pbar.update(1)
 
     return model
 
@@ -560,7 +561,8 @@ def apply_sparsity_to_params(
         "coo": sparse.COO,
         "csr": sparse.CSR,
     }.get(sparsify_module, None)
-    assert sparser is not None, f"unkown type of sparser {sparsify_module}"
+    if sparser is None:
+        raise ValueError(f"unknown type of sparser {sparsify_module}")
 
     def _path_to_str(path):
         path_keys = []
@@ -1311,21 +1313,7 @@ class AttnMaskDetail:
     bricks: int | None = None
 
 
-class TaskType(StrEnum):
-    CAUSAL_LM = "causal-language-model"
-    VISION_LM = "vision-language-model"
-    DIFFUSION_LM = "diffusion-language-model"
-    IMAGE_TEXT_TO_TEXT = "image-text-to-text"
-    BASE_MODULE = "base-module"
-    BASE_VISION = "vision-module"
-    SEQUENCE_TO_SEQUENCE = "sequence-to-sequence"
-    SPEECH_SEQUENCE_TO_SEQUENCE = "speech-sequence-to-sequence"
-    ZERO_SHOT_IMAGE_CLASSIFICATION = "zero-shot-image-classification"
-    SEQUENCE_CLASSIFICATION = "sequence-classification"
-    AUDIO_CLASSIFICATION = "audio-classification"
-    IMAGE_CLASSIFICATION = "image-classification"
-    ANY_TO_ANY = "any-to-any"
-    AUTO_BIND = "auto-bind"
+from easydel.infra.factory import TaskType  # noqa: E402
 
 
 @dataclass

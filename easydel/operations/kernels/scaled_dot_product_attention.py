@@ -113,16 +113,6 @@ class ScaledDotProductAttn(OperationImpl):
         """
         return "sdpa", "cudnn", "cuda_flash_attn2"
 
-    def get_impl_metadata(self) -> OperationMetadata:
-        """
-        Returns the metadata associated with this attention implementation instance.
-
-        Returns:
-            The `OperationMetadata` provided during initialization.
-        """
-        assert self.metadata is not None
-        return self.metadata
-
     @classmethod
     def get_requirements(cls, mode: ExecutionMode = ExecutionMode.MIXED) -> OperationRequirements:
         """Returns requirements for ScaledDotProductAttn.
@@ -162,7 +152,7 @@ class ScaledDotProductAttn(OperationImpl):
             query: Query tensor (B, T, H, D).
             key: Key tensor (B, S, H_kv, D).
             value: Value tensor (B, S, H_kv, D_v).
-            attention_mask: Optional boolean attention attention_mask (broadcastable to B, 1, T, S).
+            attention_mask: Optional boolean attention_mask (broadcastable to B, 1, T, S).
                 Passed directly to the primitive.
             bias: Optional attention bias tensor (broadcastable to B, H, T, S).
                 Passed directly to the primitive. If bias is provided, `causal` is forced to False.
@@ -330,7 +320,7 @@ class ScaledDotProductAttn(OperationImpl):
             query: Query tensor.
             key: Key tensor.
             value: Value tensor.
-            attention_mask: Optional attention attention_mask.
+            attention_mask: Optional attention_mask.
             bias: Optional attention bias.
             init_bias: Optional callable to initialize bias.
             causal: Boolean indicating if causal masking should be applied.

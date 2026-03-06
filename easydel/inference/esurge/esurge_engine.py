@@ -872,8 +872,7 @@ class eSurge(
                     else AttentionMechanisms.RAGGED_PAGE_ATTENTION_V3
                 )
                 logger.info(
-                    "MLA architecture detected but num_attention_heads <= 0; "
-                    f"falling back to {fallback_attn.value!r}."
+                    f"MLA architecture detected but num_attention_heads <= 0; falling back to {fallback_attn.value!r}."
                 )
                 compat_graphdef = model.new_graphdef(
                     recursive_update=True,

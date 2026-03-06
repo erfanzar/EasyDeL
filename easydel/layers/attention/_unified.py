@@ -59,9 +59,6 @@ Functions:
     apply_rotary_pos_emb:
         Apply rotary position embeddings to query and key tensors.
 
-    yarn_get_mscale:
-        Calculate YaRN (Yet another RoPE extensioN) mscale factor.
-
 Example:
     Creating a standard attention layer::
 
@@ -207,35 +204,6 @@ def apply_rotary_pos_emb(
     q_embed: Float[Array, "batch_size num_heads seq_len head_dim"] = (q * cos_expanded) + (q_rotated * sin_expanded)
     k_embed: Float[Array, "batch_size num_kv_heads seq_len head_dim"] = (k * cos_expanded) + (k_rotated * sin_expanded)
     return q_embed, k_embed
-
-
-def yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
-    """Calculate YaRN (Yet another RoPE extensioN) mscale factor.
-
-    Computes the magnitude scaling factor used in YaRN to maintain
-    attention score magnitudes when extending context length beyond
-    the original training length.
-
-    The formula is: mscale = 0.1 * mscale * log(scale) + 1.0
-
-    Args:
-        scale: Context length scaling factor (extended_length / original_length).
-            When scale <= 1, returns 1.0 (no scaling needed).
-        mscale: Base magnitude scale coefficient. Higher values increase
-            the scaling effect. Defaults to 1.0.
-
-    Returns:
-        Computed mscale factor to multiply attention scores by.
-        Returns 1.0 when scale <= 1 (no extension needed).
-
-    Example:
-        >>> # Extending from 4K to 32K context
-        >>> mscale = yarn_get_mscale(scale=8.0, mscale=1.0)
-        >>> # Use mscale to adjust attention: attn_scores * mscale
-    """
-    if scale <= 1:
-        return 1.0
-    return float(0.1 * mscale * jnp.log(scale) + 1.0)
 
 
 class UnifiedAttention(AttentionModule, Generic[Cfg]):
@@ -1316,9 +1284,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             # Weight absorption: split kv_b_proj weight into W_k and W_v
             # kv_b_weight: [kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim)]
             kv_b_weight = self.mla_kv_b_proj.kernel.value
-            kv_b_weight = kv_b_weight.reshape(
-                self.kv_lora_rank, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
+            kv_b_weight = kv_b_weight.reshape(self.kv_lora_rank, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
             w_k = kv_b_weight[:, :, : self.qk_nope_head_dim]  # [kv_lora_rank, N, qk_nope_dim]
             w_v = kv_b_weight[:, :, self.qk_nope_head_dim :]  # [kv_lora_rank, N, v_head_dim]
 

@@ -468,15 +468,6 @@ class KernelDeltaAttnOp(OperationImpl):
         """
         return ("kda", "kernel_delta_attention")
 
-    def get_impl_metadata(self) -> OperationMetadata:
-        """Returns the metadata associated with this operation instance.
-
-        Returns:
-            The OperationMetadata provided during initialization.
-        """
-        assert self.metadata is not None
-        return self.metadata
-
     @classmethod
     def get_requirements(
         cls,

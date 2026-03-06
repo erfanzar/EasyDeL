@@ -52,6 +52,11 @@ def test_training_arguments_load_from_json_maps_legacy_quantization_block():
     assert cfg.quantization_group_size == 8
 
 
+def test_training_arguments_accepts_use_data_collator():
+    cfg = TrainingArguments(**_base_training_args(), use_data_collator=False)
+    assert cfg.use_data_collator is False
+
+
 def test_resolve_straight_through_emulator_supports_legacy_alias_with_warning():
     with pytest.warns(FutureWarning, match="quantization_block"):
         emulator = resolve_straight_through_emulator(

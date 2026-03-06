@@ -17,12 +17,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 from .types import CacheType, ExecutionMode, MetadataField
-
-if TYPE_CHECKING:
-    pass
 
 __all__ = ["CacheRequirements", "MetadataRequirements", "ModeSpecificRequirements", "OperationRequirements"]
 

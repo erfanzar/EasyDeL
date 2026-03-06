@@ -102,7 +102,8 @@ def string_key_to_int(xs):
 
 def _dict_flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None, fumap=False):
     if not fumap:
-        assert isinstance(xs, dict), f"expected dict; got {type(xs)}"
+        if not isinstance(xs, dict):
+            raise TypeError(f"expected dict; got {type(xs)}")
 
     def _key(path):
         if sep is None:
@@ -132,7 +133,8 @@ def is_iterable(obj):
 
 
 def _dict_unflatten_dict(xs, sep=None):
-    assert isinstance(xs, dict), f"input is not a dict; it is a {type(xs)}"
+    if not isinstance(xs, dict):
+        raise TypeError(f"input is not a dict; it is a {type(xs)}")
     result = {}
     for path, value in xs.items():
         if sep is not None:
@@ -269,7 +271,7 @@ def create_graphdef(
     )[0]
 
 
-def init_garphstate(
+def init_graphstate(
     module: nnx.Module,
     _add_rngs: bool = True,
     _rng_key: str = "rngs",
@@ -320,7 +322,7 @@ def validate_state(state: dict[str, tp.Any], init_state: dict[str, tp.Any]) -> S
     )
 
 
-def diffrentiate_state(
+def differentiate_state(
     state: dict[str, tp.Any],
     init_state: dict[str, tp.Any],
     validate: bool = True,
@@ -381,7 +383,8 @@ def redefine_state(state: dict, missings: dict[str, nnx.VariableState]) -> dict:
     _state_rngs: jax.random.PRNGKey = jax.random.PRNGKey(42)
     for key, value in missings.items():
         if isinstance(type(value), nnx.Param) or issubclass(type(value), nnx.Param):
-            assert value.value is None, "there's missing parameter in state which can't be None."
+            if value.value is not None:
+                raise ValueError("there's missing parameter in state which can't be None.")
             state[key] = value
         elif isinstance(type(value), nnx.RngCount) or issubclass(type(value), nnx.RngCount):
             state[key] = nnx.VariableState(
@@ -393,7 +396,7 @@ def redefine_state(state: dict, missings: dict[str, nnx.VariableState]) -> dict:
             state[key] = nnx.VariableState(nnx.RngKey, _state_rngs)
             _state_rngs = jax.random.split(_state_rngs)[0]
         else:
-            raise AttributeError(f"Unexcepted type({type(value)}) found which cannot be redefined.")
+            raise AttributeError(f"Unexpected type({type(value)}) found which cannot be redefined.")
     return state
 
 

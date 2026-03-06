@@ -967,7 +967,8 @@ class BaseMoeModule(nn.Module, ABC):
         tp_size = expert_mesh.shape[tensor_axis_name]
 
         if self.config.use_expert_tensor_mode:
-            assert tp_size == 1, "if using `ExpertTensorMode` Expert Parallel size should be 1."
+            if tp_size != 1:
+                raise ValueError("if using `ExpertTensorMode` Expert Parallel size should be 1.")
 
         # Simplified partition specs using 3D expert_mesh
         input_ps = jax.sharding.PartitionSpec(dp_axis_name, None, None)
@@ -1197,21 +1198,6 @@ class BaseMoeModule(nn.Module, ABC):
                     dtype=self.dtype,
                 )
             return output
-
-        # print(
-        #     wi_kernel.shape,
-        #     wikps,
-        #     wi_bias.shape,
-        #     wibps,
-        #     wu_kernel.shape,
-        #     wukps,
-        #     wu_bias.shape,
-        #     wubps,
-        #     wd_kernel.shape,
-        #     wdkps,
-        #     wd_bias.shape,
-        #     wdbps,
-        # )
 
         output = _sparse_call(
             hidden_state,

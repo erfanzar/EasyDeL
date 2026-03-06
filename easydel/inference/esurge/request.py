@@ -160,7 +160,8 @@ class EngineRequest:
         self.use_structured_output = self.structured_output_request is not None
 
         if sampling_params is not None:
-            assert sampling_params.max_tokens is not None
+            if sampling_params.max_tokens is None:
+                raise ValueError("sampling_params.max_tokens must not be None")
             self.max_tokens = sampling_params.max_tokens
 
             if sampling_params.extra_args is not None:

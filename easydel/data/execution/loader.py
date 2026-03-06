@@ -27,7 +27,7 @@ import asyncio
 import logging
 import typing as tp
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from queue import Empty, Queue
 from threading import Event, Thread
 
@@ -175,7 +175,7 @@ class ShardingSpec:
     """Specification for sharding batch arrays across devices."""
 
     mesh: tp.Any = None  # jax.sharding.Mesh
-    partition_specs: dict[str, tp.Any] = None  # field -> PartitionSpec
+    partition_specs: dict[str, tp.Any] = field(default_factory=dict)  # field -> PartitionSpec
 
     def apply(self, batch: dict[str, np.ndarray]) -> dict[str, tp.Any]:
         """Apply sharding to a batch.

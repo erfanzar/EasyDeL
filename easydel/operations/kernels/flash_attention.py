@@ -93,16 +93,6 @@ class FlashAttn(OperationImpl):
         """
         return "flash_attn2"
 
-    def get_impl_metadata(self) -> OperationMetadata:
-        """
-        Returns the metadata associated with this attention implementation instance.
-
-        Returns:
-            The `OperationMetadata` provided during initialization.
-        """
-        assert self.metadata is not None
-        return self.metadata
-
     @classmethod
     def get_requirements(
         cls,
@@ -450,6 +440,7 @@ if __name__ == "__main__":
     vanilla = VanillaAttn(metadata)
     fout = attn(query=query, key=key, value=value, attention_mask=a, causal=False).attention_outputs
     vout = vanilla(query=query, key=key, value=value, attention_mask=a).attention_outputs
-    assert fout is not None and vout is not None
+    if fout is None or vout is None:
+        raise RuntimeError("attention outputs must not be None")
     print(fout[-1, -1, -1, -5:])
     print(vout[-1, -1, -1, -5:])

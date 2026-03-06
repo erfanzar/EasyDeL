@@ -310,6 +310,26 @@ def _count_kv_layers(text_config) -> int:
     return num_hidden_layers
 
 
+def _validate_paged_cache_init_args(
+    *,
+    page_size: int | None,
+    hbm_utilization: float | None,
+    max_model_length: int | None,
+) -> None:
+    missing = [
+        name
+        for name, value in (
+            ("page_size", page_size),
+            ("hbm_utilization", hbm_utilization),
+            ("max_model_length", max_model_length),
+        )
+        if value is None
+    ]
+    if missing:
+        missing_names = ", ".join(f"`{name}`" for name in missing)
+        raise ValueError(f"{missing_names} must be provided when `config` is not passed.")
+
+
 class EasyGenerationMixin:
     """Mixin class providing text generation capabilities for EasyDeL models.
 
@@ -396,9 +416,11 @@ class EasyGenerationMixin:
         """
         text_config = self.config.get_text_config()
         if config is None:
-            assert page_size is not None, "if your not passing config you should pass `page_size`"
-            assert hbm_utilization is not None, "if your not passing config you should pass `hbm_utilization`"
-            assert max_model_length is not None, "if your not passing config you should pass `max_model_length`"
+            _validate_paged_cache_init_args(
+                page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                max_model_length=max_model_length,
+            )
 
             config = self.create_ragged_page_cache_config(
                 max_length=max_model_length,
@@ -470,9 +492,11 @@ class EasyGenerationMixin:
         """
         text_config = self.config.get_text_config()
         if config is None:
-            assert page_size is not None, "if your not passing config you should pass `page_size`"
-            assert hbm_utilization is not None, "if your not passing config you should pass `hbm_utilization`"
-            assert max_model_length is not None, "if your not passing config you should pass `max_model_length`"
+            _validate_paged_cache_init_args(
+                page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                max_model_length=max_model_length,
+            )
 
             config = self.create_unified_attention_cache_config(
                 max_length=max_model_length,
@@ -1951,9 +1975,7 @@ class EasyGenerationMixin:
                 param = valid_params[name]
                 if param.annotation != inspect.Parameter.empty:
                     try:
-                        if (
-                            getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None
-                        ):  # pyright: ignore[reportDeprecated]
+                        if getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None:  # pyright: ignore[reportDeprecated]
                             expected_type = param.annotation.__args__[0]
                             if not isinstance(value, expected_type):
                                 print(
@@ -2592,7 +2614,7 @@ class EasyGenerationMixin:
 
     def _greedy_search(
         self,
-        input_ids: None,
+        input_ids: Array,
         max_length: int | None = None,
         pad_token_id: int | None = None,
         eos_token_id: int | None = None,
@@ -2731,7 +2753,7 @@ class EasyGenerationMixin:
 
     def _sample(
         self,
-        input_ids: None,
+        input_ids: Array,
         max_length: int | None = None,
         pad_token_id: int | None = None,
         eos_token_id: int | None = None,
@@ -2887,7 +2909,7 @@ class EasyGenerationMixin:
 
     def _beam_search(
         self,
-        input_ids: None,
+        input_ids: Array,
         max_length: int | None = None,
         pad_token_id: int | None = None,
         eos_token_id: int | None = None,

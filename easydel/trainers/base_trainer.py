@@ -173,9 +173,10 @@ class BaseTrainer(BaseTrainerProtocol):
 
         Raises:
             ValueError: If both model and model_state are provided, or if neither is provided
-            AssertionError: If arguments is None
+            ValueError: If arguments is None
         """
-        assert arguments is not None, "training argument must be passed to Trainers."
+        if arguments is None:
+            raise ValueError("training argument must be passed to Trainers.")
         if model_state is not None and model is not None:
             raise ValueError("Either model or model_state should be passed, not both.")
         elif model_state is None and model is None:
@@ -231,7 +232,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self.finetune = finetune
         self.processing_class = processing_class
 
-        if self.data_collator is None and getattr(self.arguments, "use_data_collactor", True):
+        if self.data_collator is None and getattr(self.arguments, "use_data_collator", True):
             base_collator = self.create_collect_function(
                 max_sequence_length=self.arguments.max_length,
                 truncation_mode=self.arguments.truncation_mode,
@@ -372,6 +373,45 @@ class BaseTrainer(BaseTrainerProtocol):
         if pad_token:
             prompt = prompt.replace(pad_token, "")
         return prompt
+
+    @staticmethod
+    def _peek_first_example(dataset: tp.Any) -> tp.Any | None:
+        if dataset is None:
+            return None
+        if isinstance(dataset, dict):
+            for item in dataset.values():
+                return BaseTrainer._peek_first_example(item)
+            return None
+        try:
+            return dataset[0]
+        except Exception:
+            pass
+        try:
+            return next(iter(dataset))
+        except Exception:
+            pass
+        try:
+            shard_names = getattr(dataset, "shard_names", None)
+            open_shard = getattr(dataset, "open_shard", None)
+            if shard_names and open_shard:
+                return next(iter(open_shard(shard_names[0])))
+        except Exception:
+            pass
+        return None
+
+    def _initialize_conversational_flags(self, train_dataset: tp.Any, eval_dataset: tp.Any) -> None:
+        from .prompt_transforms import is_conversational
+
+        self.train_is_conversational = False
+        self.eval_is_conversational = False
+
+        train_sample = self._peek_first_example(train_dataset)
+        if train_sample is not None:
+            self.train_is_conversational = is_conversational(train_sample)
+
+        eval_sample = self._peek_first_example(eval_dataset)
+        if eval_sample is not None:
+            self.eval_is_conversational = is_conversational(eval_sample)
 
     @property
     def model(self):
@@ -1703,7 +1743,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 return None
         elif isinstance(prompt, str):
             if processor is None:
-                logger.warn("No tokenizer/processor available; cannot tokenize prompt text.")
+                logger.warning("No tokenizer/processor available; cannot tokenize prompt text.")
                 return None
             prompt_text = prompt
 
@@ -2402,12 +2442,12 @@ class BaseTrainer(BaseTrainerProtocol):
             tf.config.set_visible_devices([], "GPU")
             visible_devices = tf.config.get_visible_devices()
             for device in visible_devices:
-                assert device.device_type != "GPU"
+                if device.device_type == "GPU":
+                    logger.warning("TensorFlow may be hogging GPU memory.")
+                    break
         except RuntimeError as e:
             # Invalid device or cannot modify virtual devices once initialized.
             logger.error(f"Failed to disable GPU devices: {e}")
-        except AssertionError:
-            logger.warning("TensorFlow may be hogging GPU memory.")
 
         def create_tf_dataset(dataset: Dataset, is_train: bool) -> collections.abc.Iterator[np.ndarray]:
             """

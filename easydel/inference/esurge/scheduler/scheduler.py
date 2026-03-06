@@ -157,7 +157,7 @@ class Scheduler(SchedulerInterface):
 
         Raises:
             ValueError: If an unknown scheduling policy is specified.
-            AssertionError: If num_pages is not positive.
+            ValueError: If num_pages is not positive.
 
         Example:
             >>> scheduler = Scheduler(
@@ -182,7 +182,8 @@ class Scheduler(SchedulerInterface):
             self.max_num_scheduled_tokens = self.max_model_len
         self.data_parallel_size = 1
         num_pages = self.cache_config.num_pages
-        assert num_pages is not None and num_pages > 0
+        if num_pages is None or num_pages <= 0:
+            raise ValueError(f"num_pages must be a positive integer, got {num_pages}")
 
         self.page_size = self.cache_config.page_size
         safety_margin = self.scheduler_config.token_safety_margin
@@ -396,7 +397,8 @@ class Scheduler(SchedulerInterface):
         if self._token_budget_manager:
             token_budget = self._token_budget_manager.begin_cycle(self.kv_cache_manager, len(self.running))
         else:
-            assert self.max_num_scheduled_tokens is not None
+            if self.max_num_scheduled_tokens is None:
+                raise ValueError("max_num_scheduled_tokens must not be None when token budget manager is disabled")
             token_budget = self.max_num_scheduled_tokens
 
         dp_size = max(1, int(getattr(self, "data_parallel_size", 1) or 1))
@@ -551,7 +553,8 @@ class Scheduler(SchedulerInterface):
             if not can_schedule:
                 req_index += 1
                 continue
-            assert new_pages is not None
+            if new_pages is None:
+                raise RuntimeError("new_pages must not be None after successful page allocation")
 
             scheduled_running_reqs.append(request)
             req_to_new_page_ids[request.request_id] = new_pages.get_page_ids()
@@ -614,7 +617,8 @@ class Scheduler(SchedulerInterface):
                     num_computed_tokens = request.num_computed_tokens
 
                 if load_kv_async:
-                    assert num_external_computed_tokens > 0
+                    if num_external_computed_tokens <= 0:
+                        raise RuntimeError("num_external_computed_tokens must be positive when load_kv_async is enabled")
                     num_new_tokens = 0
 
                 else:
@@ -718,11 +722,24 @@ class Scheduler(SchedulerInterface):
 
         self._ensure_capacity(len(self.running))
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert self.max_num_scheduled_tokens is None or total_num_scheduled_tokens <= self.max_num_scheduled_tokens
-        assert token_budget >= 0
-        assert len(self.running) <= self._current_seq_bucket
+        if self.max_num_scheduled_tokens is not None and total_num_scheduled_tokens > self.max_num_scheduled_tokens:
+            raise RuntimeError(
+                f"total_num_scheduled_tokens ({total_num_scheduled_tokens}) exceeds "
+                f"max_num_scheduled_tokens ({self.max_num_scheduled_tokens})"
+            )
+        if token_budget < 0:
+            raise RuntimeError(f"token_budget must be non-negative, got {token_budget}")
+        if len(self.running) > self._current_seq_bucket:
+            raise RuntimeError(
+                f"running queue length ({len(self.running)}) exceeds "
+                f"current sequence bucket ({self._current_seq_bucket})"
+            )
 
-        assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs) <= len(self.running)
+        total_scheduled = len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs)
+        if total_scheduled > len(self.running):
+            raise RuntimeError(
+                f"total scheduled requests ({total_scheduled}) exceeds running queue length ({len(self.running)})"
+            )
 
         num_common_prefix_pages = [0] * len(self.kv_cache_config.kv_cache_groups)
         scheduled_req_count = len(num_scheduled_tokens)
@@ -897,7 +914,10 @@ class Scheduler(SchedulerInterface):
         stopped_running_reqs: set[EngineRequest] = set()
         stopped_preempted_reqs: set[EngineRequest] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
-            assert num_tokens_scheduled > 0
+            if num_tokens_scheduled <= 0:
+                raise RuntimeError(
+                    f"num_tokens_scheduled must be positive, got {num_tokens_scheduled} for request {req_id}"
+                )
             request = self.requests.get(req_id)
             if request is None:
                 continue
@@ -1035,7 +1055,8 @@ class Scheduler(SchedulerInterface):
             finished_status: The finished status to assign. Must be a
                 finished status (e.g., FINISHED_ABORTED).
         """
-        assert EngineRequestStatus.is_finished(finished_status)
+        if not EngineRequestStatus.is_finished(finished_status):
+            raise ValueError(f"finished_status must be a finished status, got {finished_status}")
         if isinstance(request_ids, str):
             request_ids = (request_ids,)
         else:
@@ -1074,7 +1095,8 @@ class Scheduler(SchedulerInterface):
             request: The finished request to free. Must have is_finished()
                 return True.
         """
-        assert request.is_finished()
+        if not request.is_finished():
+            raise RuntimeError(f"request {request.request_id} must be finished before freeing resources")
 
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
@@ -1092,7 +1114,8 @@ class Scheduler(SchedulerInterface):
         Args:
             request: The finished request whose pages should be freed.
         """
-        assert request.is_finished()
+        if not request.is_finished():
+            raise RuntimeError(f"request {request.request_id} must be finished before freeing pages")
         self.kv_cache_manager.free(request)
         self.kv_cache_manager.free_page_hashes(request)
         self.req_id_to_row_index.pop(request.request_id, None)

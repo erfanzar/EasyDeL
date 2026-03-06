@@ -178,7 +178,7 @@ def dynamic_sample_tokens(
         logits = processors(tokens.reshape(1, -1), logits, length)
         return sample_top_p_efficient(logits, top_p, temperature, rngs)[:, None]
 
-    def _gready_sampling_fn(
+    def _greedy_sampling_fn(
         tokens,
         length,
         logits,
@@ -194,7 +194,7 @@ def dynamic_sample_tokens(
     return jax.lax.cond(
         random_sampling,
         _random_sampling_fn,
-        _gready_sampling_fn,
+        _greedy_sampling_fn,
         tokens,
         length,
         logits,

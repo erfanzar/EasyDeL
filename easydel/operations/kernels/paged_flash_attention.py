@@ -36,7 +36,7 @@ from easydel.caching import OperationsMetadata, RaggedPagesMetadata, UnifiedAtte
 from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
-from .._operation_impl import OperationImpl, OperationMetadata, OperationRegistry
+from .._operation_impl import OperationImpl, OperationRegistry
 from ..requirements import CacheType, ExecutionMode, MetadataField, OperationRequirements, RequirementsBuilder
 
 ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
@@ -81,10 +81,6 @@ class PagedFlashAttn(OperationImpl):
     @classmethod
     def get_impl_name(cls) -> str | tuple[str, ...]:
         return "paged_flash_attention"
-
-    def get_impl_metadata(self) -> OperationMetadata:
-        assert self.metadata is not None
-        return self.metadata
 
     @classmethod
     def get_requirements(cls, mode: ExecutionMode = ExecutionMode.MIXED) -> OperationRequirements:

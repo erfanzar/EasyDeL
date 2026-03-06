@@ -173,7 +173,7 @@ class LossConfig(TypedDict, total=False):
             "AVERAGE_PER_SEQUENCE",
         ]
     ]
-    num_labels: NotRequired[str | None]
+    num_labels: NotRequired[int | None]
     problem_type: NotRequired[str | None]
     divide_weight_sum: NotRequired[bool]
     shift_tokens: NotRequired[bool]
@@ -236,7 +236,7 @@ class BaseTrainerCfg(TypedDict, total=False):
         ids_to_pop_from_dataset: List of column names to explicitly remove from dataset.
         shuffle_train_dataset: Whether to shuffle the training dataset.
         shuffle_seed_train: Random seed for dataset shuffling.
-        use_data_collactor: Whether to use a data collator for batch preparation.
+        use_data_collator: Whether to use a data collator for batch preparation.
         use_grain: Whether to use Grain for efficient data loading.
         grain_shard_index: Shard index for Grain-based data loading.
         grain_shard_count: Total number of shards for Grain-based data loading.
@@ -392,7 +392,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     ids_to_pop_from_dataset: NotRequired[list[str] | None]
     shuffle_train_dataset: NotRequired[bool]
     shuffle_seed_train: NotRequired[int]
-    use_data_collactor: NotRequired[bool]
+    use_data_collator: NotRequired[bool]
     use_grain: NotRequired[bool]
     grain_shard_index: NotRequired[int | None]
     grain_shard_count: NotRequired[int | None]
@@ -1308,7 +1308,7 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "remove_unused_columns": True,
     "shuffle_train_dataset": True,
     "shuffle_seed_train": 64871,
-    "use_data_collactor": True,
+    "use_data_collator": True,
     "use_grain": True,
     "offload_dataset": False,
     "offload_device_type": "cpu",
@@ -1571,23 +1571,6 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "packing": False,
         "dataset_batch_size": 1000,
         "num_of_sequences": 1024,
-    },
-    "nash_md": {
-        "trainer_prefix": "NashMD",
-        "learning_rate": 1e-6,
-        "remove_unused_columns": False,
-        "max_prompt_length": 512,
-        "max_completion_length": 256,
-        "beta": 0.1,
-        "mixture_coef": 0.5,
-        "sync_ref_model": False,
-        "ref_model_mixup_alpha": 0.9,
-        "ref_model_sync_steps": 64,
-        "skip_apply_chat_template": False,
-        "num_return_sequences": 1,
-        "top_p": 0.95,
-        "top_k": 50,
-        "temperature": 0.7,
     },
     "nash-md": {
         "trainer_prefix": "NashMD",

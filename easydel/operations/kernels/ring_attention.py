@@ -111,15 +111,6 @@ class RingAttn(OperationImpl):
         """
         return "ring"
 
-    def get_impl_metadata(self) -> OperationMetadata:
-        """Get the metadata configuration for this attention instance.
-
-        Returns:
-            OperationMetadata: Configuration including dtype, mesh, etc.
-        """
-        assert self.metadata is not None
-        return self.metadata
-
     @classmethod
     def get_requirements(
         cls,
@@ -394,7 +385,8 @@ if __name__ == "__main__":
     vout = ring(query=q, key=k, value=v, mask_info=mask_info).attention_outputs
 
     print(out[-1, -1, -1, -5:], out[-1, 0, -1, -5:])
-    assert vout is not None
+    if vout is None:
+        raise RuntimeError("ring attention returned None for attention_outputs")
     print(vout[-1, -1, -1, -5:], vout[-1, 0, -1, -5:])
 
     print(jnp.allclose(out, vout, atol=0.125))

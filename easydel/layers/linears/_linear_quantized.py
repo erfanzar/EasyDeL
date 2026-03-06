@@ -792,10 +792,7 @@ class ParallelLinearQuantized(nn.Module):
         elif self._direction == "column":
             linear_class = ColumnParallelLinear
         else:
-            raise ValueError(
-                "unknown direction detected Try To use module with Known "
-                "direction in ur impls to stop getting such errors."
-            )
+            raise ValueError(f"Unknown direction '{self._direction}'. Use 'row' or 'column'.")
         linear = nn.eval_shape(
             lambda r: linear_class(
                 in_features=self.in_features,
