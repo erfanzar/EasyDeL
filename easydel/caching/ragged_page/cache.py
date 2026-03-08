@@ -167,7 +167,16 @@ def align_to_multiple(value: int, multiple: int) -> int:
 
 
 def _mesh_axis_size(mesh: Mesh, axis: str | tuple[str, ...] | list[str] | None) -> int:
-    """Return product of mesh sizes for a semantic axis mapping."""
+    """Return product of mesh sizes for a semantic axis mapping.
+
+    Args:
+        mesh: JAX device mesh containing axis name to size mappings.
+        axis: Axis name, tuple/list of axis names, or None.
+
+    Returns:
+        int: Product of mesh sizes for the given axes. Returns 1 if
+            axis is None, EMPTY, or not found in mesh.
+    """
     if axis is None or axis is EMPTY:
         return 1
     if isinstance(axis, tuple | list):

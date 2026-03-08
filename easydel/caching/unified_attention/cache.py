@@ -150,7 +150,16 @@ def _previous_power_of_2(n: int) -> int:
 
 
 def _mesh_axis_size(mesh: Mesh, axis: str | tuple[str, ...] | list[str] | None) -> int:
-    """Return product of mesh sizes for a semantic axis mapping."""
+    """Return product of mesh sizes for a semantic axis mapping.
+
+    Args:
+        mesh: JAX device mesh containing axis name to size mappings.
+        axis: Axis name, tuple/list of axis names, or None.
+
+    Returns:
+        int: Product of mesh sizes for the given axes. Returns 1 if
+            axis is None, EMPTY, or not found in mesh.
+    """
     if axis is None or axis is EMPTY:
         return 1
     if isinstance(axis, tuple | list):
@@ -163,7 +172,19 @@ def _mesh_axis_size(mesh: Mesh, axis: str | tuple[str, ...] | list[str] | None) 
 
 
 def _axis_index(axis: str | tuple[str, ...] | list[str] | None) -> jax.Array:
-    """Return a linearized axis index over one or more mesh axes."""
+    """Return a linearized axis index over one or more mesh axes.
+
+    Computes a single integer index that uniquely identifies the current
+    device's position along one or more mesh axes. For multi-axis cases,
+    indices are combined using a row-major linearization scheme.
+
+    Args:
+        axis: Axis name, tuple/list of axis names, or None. If None,
+            returns 0 (single-device case).
+
+    Returns:
+        jax.Array: Scalar int32 array with the linearized axis index.
+    """
     if axis is None:
         return jnp.int32(0)
     if isinstance(axis, tuple | list):

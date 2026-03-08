@@ -149,40 +149,6 @@ class GatedDeltaRuleOp(OperationImpl):
             .build()
         )
 
-    def _call_kernel(
-        self,
-        query,
-        key,
-        value,
-        beta,
-        decay,
-        state,
-        is_inference,
-        chunk_size,
-        cfg=None,
-        mesh=None,
-        in_specs=None,
-        out_specs=None,
-    ):
-        """Dispatch to ejkernel GDR module API."""
-
-        return gated_delta_rule(
-            query,
-            key,
-            value,
-            beta,
-            decay,
-            state,
-            chunk_size=int(chunk_size),
-            use_qk_l2norm=True,
-            use_chunked=not bool(is_inference),
-            return_state=True,
-            cfg=cfg,
-            mesh=mesh,
-            in_specs=in_specs,
-            out_specs=out_specs,
-        )
-
     @jax.named_scope("easydel-gated-delta-rule-native")
     def forward_native(
         self,
@@ -193,7 +159,7 @@ class GatedDeltaRuleOp(OperationImpl):
         decay: Float[Array, "num_heads head_dim"] | None = None,
         conv_state: Float[Array, "batch d_inner d_conv"] | None = None,
         recurrent_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
-        chunk_size: int = 64,
+        use_qk_l2norm: bool = True,
         **kwargs,
     ) -> GatedDeltaRuleOutput:
         """Forward pass for gated delta rule attention via ejkernel.
@@ -307,19 +273,25 @@ class GatedDeltaRuleOp(OperationImpl):
             )
             out_specs = (output_sharding, state_out_sharding)
 
-        outputs, new_recurrent_state = self._call_kernel(
-            query=query,
-            key=key,
-            value=value,
-            beta=beta,
-            decay=decay,
-            state=recurrent_state,
-            is_inference=is_inference,
-            chunk_size=int(chunk_size),
+        platform = None
+        if jax.default_backend() == "tpu":
+            platform = "pallas"
+
+        outputs, new_recurrent_state = gated_delta_rule(
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            recurrent_state,
+            use_qk_l2norm=use_qk_l2norm,
+            use_chunked=not bool(is_inference),
+            return_state=True,
             cfg=kernel_cfg,
             mesh=self.metadata.mesh,
             in_specs=in_specs,
             out_specs=out_specs,
+            platform=platform,
         )
 
         if self.metadata.mesh is not None:
@@ -362,7 +334,7 @@ class GatedDeltaRuleOp(OperationImpl):
         decay: Float[Array, "num_heads head_dim"] | None = None,
         conv_state: Float[Array, "batch d_inner d_conv"] | None = None,
         recurrent_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
-        chunk_size: int = 64,
+        use_qk_l2norm: bool = True,
         **kwargs,
     ) -> GatedDeltaRuleOutput:
         """Execute the gated delta rule operation.
@@ -395,6 +367,6 @@ class GatedDeltaRuleOp(OperationImpl):
             decay=decay,
             conv_state=conv_state,
             recurrent_state=recurrent_state,
-            chunk_size=chunk_size,
+            use_qk_l2norm=use_qk_l2norm,
             **kwargs,
         )

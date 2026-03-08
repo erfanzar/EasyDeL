@@ -25,6 +25,21 @@ from ..metrics import get_metrics_collector, initialize_metrics
 
 
 class EngineMonitoringMixin:
+    """Mixin providing monitoring and observability for the eSurge engine.
+
+    Manages Prometheus metrics exporting, Grafana dashboard provisioning
+    (via local binary or Docker), and runtime performance metric collection.
+    Supports auto-starting a Grafana instance pre-configured with a
+    Prometheus data source for visualizing inference throughput, latency,
+    and resource utilization.
+
+    Methods:
+        start_monitoring: Initialize Prometheus exporter and optional Grafana.
+        stop_monitoring: Shut down all monitoring services.
+        get_metrics_summary: Retrieve current performance metrics snapshot.
+        monitoring_active: Property indicating whether monitoring is running.
+    """
+
     def _prepare_grafana_provisioning(
         self,
         datasource_name: str,

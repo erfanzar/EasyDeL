@@ -322,6 +322,7 @@ class BaseInferenceApiServer(ABC):
         """
 
         def custom_openapi():
+            """Generate a custom OpenAPI schema with Bearer auth security scheme."""
             if self.app.openapi_schema:
                 return self.app.openapi_schema
 
@@ -604,6 +605,17 @@ class BaseInferenceApiServer(ABC):
         logger.info("Thread pool shut down")
 
     def extract_tools(self, request: ChatCompletionRequest) -> list[dict] | None:
+        """Extract tool/function definitions from a chat completion request.
+
+        Resolves tool definitions from the request's tools field, handling
+        both Pydantic model objects and raw dictionaries.
+
+        Args:
+            request: The chat completion request containing tool definitions.
+
+        Returns:
+            List of tool function dictionaries, or None if no tools are defined.
+        """
         resolved_tools = []
         if request.tools is not None:
             for tool in request.tools:

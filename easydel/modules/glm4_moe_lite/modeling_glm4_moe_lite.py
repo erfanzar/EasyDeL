@@ -62,7 +62,12 @@ from .glm4_moe_lite_configuration import Glm4MoeLiteConfig
 
 
 class Glm4MoeLiteMLP(nn.Module):
-    """Dense MLP block for GLM-4-MoE-Lite layers."""
+    """Dense MLP block for GLM-4-MoE-Lite layers.
+
+    Implements the standard gated feedforward network with separate gate and up
+    projections, used in dense layers of the GLM-4-MoE-Lite hybrid architecture.
+    Supports configurable hidden and intermediate sizes.
+    """
 
     def __init__(
         self,
@@ -122,7 +127,12 @@ class Glm4MoeLiteMLP(nn.Module):
 
 
 class Glm4MoeLiteMLPStack(nn.Module):
-    """MoE expert MLP stack for GLM-4-MoE-Lite."""
+    """Expert MLP stack for GLM-4-MoE-Lite using parallel MoE linear layers.
+
+    Implements the feedforward network for multiple experts using efficient
+    batched computation with ColumnParallelMoELinear and RowParallelMoELinear
+    layers. Supports expert tensor mode for optimized expert computation.
+    """
 
     reform_param: typing.ClassVar = {
         "gate_up_proj$": {
@@ -223,7 +233,12 @@ class Glm4MoeLiteMLPStack(nn.Module):
 
 
 class Glm4MoeLiteTopKRouter(nn.Module):
-    """Router module for GLM-4-MoE-Lite grouped top-k gating."""
+    """Top-K expert router for GLM-4-MoE-Lite with grouped expert selection.
+
+    Implements routing using a learned weight matrix and e-score correction bias
+    for improved load balancing. Computes router logits via matrix multiplication
+    in float32 precision for numerical stability.
+    """
 
     def __init__(
         self,
@@ -261,7 +276,13 @@ class Glm4MoeLiteTopKRouter(nn.Module):
 
 
 class Glm4MoeLiteMoE(BaseMoeModule):
-    """Mixture-of-experts feed-forward block for GLM-4-MoE-Lite."""
+    """Mixture-of-Experts feed-forward module for GLM-4-MoE-Lite.
+
+    Combines the Top-K router, expert MLP stack, and shared experts into
+    a unified MoE layer. Routes tokens to selected experts using grouped
+    routing with sigmoid scoring and e-score correction, then combines
+    outputs with shared expert outputs.
+    """
 
     def __init__(
         self,
@@ -382,7 +403,13 @@ class Glm4MoeLiteMoE(BaseMoeModule):
 
 
 class Glm4MoeLiteAttention(UnifiedAttention):
-    """Multi-head Latent Attention for GLM-4-MoE-Lite."""
+    """Multi-head Latent Attention (MLA) for GLM-4-MoE-Lite.
+
+    Implements attention with low-rank KV/Q compression using LoRA-style
+    projections. Queries are compressed via q_a_proj/q_b_proj and KV pairs
+    via kv_a_proj/kv_b_proj, with separate nope and rope head dimensions.
+    Supports YaRN-based mscale softmax scaling for extended context.
+    """
 
     projection_mapping: ClassVar[dict[str, str]] = {
         "mla_q_proj": "q_proj",
@@ -752,7 +779,13 @@ class Glm4MoeLiteAttention(UnifiedAttention):
 
 
 class Glm4MoeLiteDecoderLayer(nn.Module):
-    """Single decoder layer for GLM-4-MoE-Lite."""
+    """Single decoder layer for GLM-4-MoE-Lite.
+
+    Combines Multi-head Latent Attention (MLA) and either dense MLP or MoE
+    feedforward networks with RMS normalization and residual connections.
+    Uses dense MLP for layers marked as "dense" in mlp_layer_types and
+    sparse MoE for layers marked as "sparse".
+    """
 
     def __init__(
         self,
@@ -884,7 +917,13 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
 
 @register_module(TaskType.BASE_MODULE, config=Glm4MoeLiteConfig, model_type="glm4_moe_lite")
 class Glm4MoeLiteModel(EasyDeLBaseModule):
-    """Base GLM-4-MoE-Lite model."""
+    """GLM-4-MoE-Lite base model implementation.
+
+    Implements the GLM-4-MoE-Lite architecture, a lightweight sparse mixture-of-experts
+    transformer model featuring Multi-head Latent Attention (MLA) with low-rank KV/Q
+    compression, grouped top-k MoE routing with shared experts, and a configurable
+    dense-to-sparse MLP schedule across layers.
+    """
 
     def __init__(
         self,
@@ -1044,7 +1083,12 @@ class Glm4MoeLiteModel(EasyDeLBaseModule):
 
 @register_module(TaskType.CAUSAL_LM, config=Glm4MoeLiteConfig, model_type="glm4_moe_lite")
 class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteConfig]):  # type: ignore
-    """GLM-4-MoE-Lite model with causal LM head."""
+    """GLM-4-MoE-Lite model with a language modeling head for causal language modeling.
+
+    Combines the GLM-4-MoE-Lite base model with a linear language modeling head
+    for autoregressive text generation. Uses the sparse MoE architecture with
+    MLA attention for efficient inference and training.
+    """
 
     _task_type = TaskType.CAUSAL_LM
     _model_type = "glm4_moe_lite"

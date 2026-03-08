@@ -23,6 +23,21 @@ from ..request import EngineRequestStatus
 
 
 class EngineParsingMixin:
+    """Mixin for output parsing, stop-string detection, and token processing.
+
+    Handles the pipeline from raw engine token outputs to structured text
+    with reasoning extraction, tool call parsing, and stop-string trimming.
+    Coordinates incremental decoding with interval-based batching to reduce
+    tokenizer overhead during streaming, and signals per-request events
+    for streaming consumers.
+
+    Methods:
+        _process_engine_outputs: Core method that processes scheduler outputs
+            into decoded text, applies parsers, and updates request state.
+        _run_output_parsers: Runs reasoning and tool parsers on decoded text.
+        _apply_stop_string_policy: Trims text at stop-string boundaries.
+    """
+
     @staticmethod
     def _find_first_stop_string(text: str, stop_sequences: list[str]) -> tuple[int, str] | None:
         """Return the earliest stop-string match in text, if any."""

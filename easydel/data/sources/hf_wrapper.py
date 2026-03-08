@@ -76,7 +76,14 @@ class HFDatasetShardedSource(ShardedDataSource[dict]):
 
     @staticmethod
     def _check_is_iterable(dataset) -> bool:
-        """Check if dataset is an IterableDataset."""
+        """Check if the dataset is a streaming IterableDataset.
+
+        Args:
+            dataset: HuggingFace dataset object to check.
+
+        Returns:
+            True if the dataset is an IterableDataset.
+        """
         try:
             from datasets import IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 

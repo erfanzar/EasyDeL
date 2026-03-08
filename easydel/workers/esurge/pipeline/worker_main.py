@@ -53,6 +53,14 @@ class FastIncrementalDecoder:
     """
 
     def __init__(self, tokenizer, *, context_window: int = 4):
+        """Initialize the incremental decoder.
+
+        Args:
+            tokenizer: A HuggingFace tokenizer instance used for decoding.
+            context_window: Number of preceding tokens to include as context
+                when decoding, which helps tokenizers that depend on surrounding
+                tokens (e.g. WordPiece, SentencePiece). Defaults to 4.
+        """
         self.tokenizer = tokenizer
         self.context_window = max(0, int(context_window))
 

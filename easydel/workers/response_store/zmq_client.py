@@ -23,7 +23,17 @@ import zmq
 
 
 class ResponseStoreWorkerClient:
-    """Client for communicating with a response store worker process via ZMQ."""
+    """Thread-safe ZMQ client for communicating with a response store worker.
+
+    Provides methods to get, put, and delete responses and conversations
+    from a remote ``FileResponseStore`` running in a separate process.
+
+    Args:
+        endpoint: ZeroMQ endpoint of the response store worker.
+
+    Raises:
+        ValueError: If ``endpoint`` is empty.
+    """
 
     def __init__(self, endpoint: str):
         if not endpoint:
@@ -43,41 +53,93 @@ class ResponseStoreWorkerClient:
             return resp
 
     def get_response(self, response_id: str) -> dict[str, tp.Any] | None:
+        """Retrieve a response record by ID from the remote store.
+
+        Args:
+            response_id: Unique response identifier.
+
+        Returns:
+            The response record dict, or ``None`` if not found.
+        """
         resp = self._request({"cmd": "get_response", "response_id": response_id})
         record = resp.get("record")
         return tp.cast(dict[str, tp.Any], record) if isinstance(record, dict) else None
 
     def put_response(self, response_id: str, record: dict[str, tp.Any]) -> None:
+        """Store or update a response record in the remote store.
+
+        Args:
+            response_id: Unique response identifier.
+            record: The response data to persist.
+        """
         self._request({"cmd": "put_response", "response_id": response_id, "record": record})
 
     def delete_response(self, response_id: str) -> bool:
+        """Delete a response record from the remote store.
+
+        Args:
+            response_id: Unique response identifier.
+
+        Returns:
+            ``True`` if the record was found and deleted, ``False`` otherwise.
+        """
         resp = self._request({"cmd": "delete_response", "response_id": response_id})
         return bool(resp.get("success"))
 
     def get_conversation(self, conversation_id: str) -> list[dict[str, tp.Any]] | None:
+        """Retrieve a conversation history by ID from the remote store.
+
+        Args:
+            conversation_id: Unique conversation identifier.
+
+        Returns:
+            List of message dicts, or ``None`` if not found.
+        """
         resp = self._request({"cmd": "get_conversation", "conversation_id": conversation_id})
         history = resp.get("history")
         return tp.cast(list[dict[str, tp.Any]], history) if isinstance(history, list) else None
 
     def put_conversation(self, conversation_id: str, history: list[dict[str, tp.Any]]) -> None:
+        """Store or update a conversation history in the remote store.
+
+        Args:
+            conversation_id: Unique conversation identifier.
+            history: List of message dicts representing the conversation.
+        """
         self._request({"cmd": "put_conversation", "conversation_id": conversation_id, "history": history})
 
     def delete_conversation(self, conversation_id: str) -> bool:
+        """Delete a conversation record from the remote store.
+
+        Args:
+            conversation_id: Unique conversation identifier.
+
+        Returns:
+            ``True`` if the record was found and deleted, ``False`` otherwise.
+        """
         resp = self._request({"cmd": "delete_conversation", "conversation_id": conversation_id})
         return bool(resp.get("success"))
 
     def stats(self) -> dict[str, tp.Any]:
+        """Retrieve store statistics from the remote worker.
+
+        Returns:
+            Dictionary with counts of stored responses/conversations,
+            their capacity limits, and storage directory path.
+        """
         resp = self._request({"cmd": "stats"})
         stats = resp.get("stats")
         return tp.cast(dict[str, tp.Any], stats) if isinstance(stats, dict) else {}
 
     def shutdown(self) -> None:
+        """Send a shutdown command to the worker and close the connection."""
         try:
             self._request({"cmd": "shutdown"})
         finally:
             self.close()
 
     def close(self) -> None:
+        """Close the ZeroMQ socket without sending a shutdown command."""
         self._socket.close(0)
 
     @property

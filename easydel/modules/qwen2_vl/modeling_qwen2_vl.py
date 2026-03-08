@@ -665,7 +665,16 @@ class Qwen2VLVisionAttention(UnifiedAttention):
         self.head_dim = dim // num_heads
 
         class ConfigAdapter:
+            """Adapts Qwen2VL vision config to a format compatible with UnifiedAttention."""
+
             def __init__(self, config, dim, num_heads):
+                """Create adapter by mapping vision config fields to attention-compatible names.
+
+                Args:
+                    config: Original vision encoder configuration.
+                    dim: Hidden dimension for attention.
+                    num_heads: Number of attention heads.
+                """
                 self.hidden_size = dim
                 self.num_attention_heads = num_heads
                 self.num_key_value_heads = num_heads

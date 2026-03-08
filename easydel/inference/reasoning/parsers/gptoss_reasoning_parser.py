@@ -35,6 +35,11 @@ class GptOssReasoningParser(ReasoningParser):
     MESSAGE_TAG = "<|message|>"
 
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize and resolve channel/message tag token IDs from vocabulary.
+
+        Args:
+            tokenizer: Tokenizer used to resolve tag token IDs and decode outputs.
+        """
         super().__init__(tokenizer)
         self._channel_token_id = self.vocab.get(self.CHANNEL_TAG)
         self._message_token_id = self.vocab.get(self.MESSAGE_TAG)
@@ -42,17 +47,20 @@ class GptOssReasoningParser(ReasoningParser):
         self._reasoning_done = False
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
+        """Check if the <|message|> token is present, signaling end of reasoning."""
         if self._message_token_id is not None:
             return self._message_token_id in input_ids
         return False
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
+        """Extract token IDs after the <|message|> delimiter."""
         if self._message_token_id is None or self._message_token_id not in input_ids:
             return list(input_ids)
         idx = input_ids.index(self._message_token_id)
         return input_ids[idx + 1 :]
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
+        """Split output at <|channel|> and <|message|> tags into reasoning and content."""
         if self.CHANNEL_TAG not in model_output:
             return None, model_output
 
@@ -74,6 +82,7 @@ class GptOssReasoningParser(ReasoningParser):
         delta_token_ids: Sequence[int],
         request=None,
     ) -> DeltaMessage | None:
+        """Stream reasoning/content by tracking <|channel|> and <|message|> state."""
         if not delta_text:
             return None
 

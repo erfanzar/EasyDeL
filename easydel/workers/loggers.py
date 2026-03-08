@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -67,6 +67,13 @@ _LOGGING_LEVELS: dict[str, int] = {
 
 
 class ColorFormatter(logging.Formatter):
+    """Logging formatter that adds ANSI color codes to log output.
+
+    Colorizes the log level name and prepends a timestamp with the logger
+    name to each line of the message. Multi-line messages are formatted so
+    that every line receives the colored prefix.
+    """
+
     def format(self, record: logging.LogRecord) -> str:
         orig_levelname = record.levelname
         color = LEVEL_COLORS.get(record.levelname, COLORS["RESET"])
@@ -83,6 +90,18 @@ class ColorFormatter(logging.Formatter):
 
 
 class eLogger:
+    """Lazy-initializing logger that defers handler setup until first use.
+
+    This avoids creating log handlers at import time, which can cause issues
+    when modules are imported but never actually log. The underlying
+    ``logging.Logger`` is created and configured on the first call to any
+    logging method (``info``, ``debug``, ``warning``, etc.).
+
+    Attributes:
+        name: The logger name.
+        level: The logging level (numeric).
+    """
+
     def __init__(self, name: str, level: int | None = None):
         if level is None:
             env_level = os.getenv("LOGGING_LEVEL_ED", "INFO")

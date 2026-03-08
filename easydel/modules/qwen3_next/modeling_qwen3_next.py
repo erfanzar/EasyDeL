@@ -986,6 +986,18 @@ class Qwen3NextLinearAttention(nn.Module):
         self.gdr_op = GatedDeltaRuleOp(metadata)
 
     def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specifications for non-standard parameters.
+
+        Marks A_log and dt_bias as replicated across all devices since they are
+        small per-head parameters that do not benefit from sharding.
+
+        Args:
+            partition_manager: Partition manager (unused, for interface compatibility).
+            **_kwargs: Additional keyword arguments (unused).
+
+        Returns:
+            dict[str, object]: Mapping of parameter names to sharding specifications.
+        """
         return {"A_log": Replicated, "dt_bias": Replicated}
 
     def fix_query_key_value_ordering(

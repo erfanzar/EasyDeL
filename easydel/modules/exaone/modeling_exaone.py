@@ -497,6 +497,17 @@ class ExaoneModel(EasyDeLBaseModule):
 
     @functools.cached_property
     def frequencies(self):
+        """Compute and cache rotary position embedding frequencies.
+
+        Generates sinusoidal frequency tensors used for Rotary Position
+        Embeddings (RoPE). The frequencies are computed based on the head
+        size and optional partial rotary factor, then cached for reuse
+        across forward passes.
+
+        Returns:
+            Array: Precomputed frequency tensor for RoPE of shape
+                (max_position_embeddings, rotary_dim).
+        """
         return self.config.get_basic_frequencies(
             head_size=self.config.hidden_size // self.config.num_attention_heads,
             rotary_dim=int(

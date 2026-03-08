@@ -131,7 +131,18 @@ class ChatTemplateTransform(Transform):
         self._template_kwargs = template_kwargs
 
     def __call__(self, example: Example) -> Example:
-        """Apply chat template to the example."""
+        """Apply chat template to convert messages to formatted text.
+
+        Looks for messages in the configured field (with fallbacks to
+        "conversations" and "conversation"), applies the tokenizer's chat
+        template, and stores the result in the output field.
+
+        Args:
+            example: Input example with a messages field.
+
+        Returns:
+            Example with formatted text in the output field.
+        """
         result = example.copy()
 
         # Handle alternate field names
@@ -211,7 +222,14 @@ class MaybeApplyChatTemplate(Transform):
         self._chat_transform = ChatTemplateTransform(tokenizer, **chat_template_kwargs)
 
     def __call__(self, example: Example) -> Example:
-        """Apply chat template if example is conversational."""
+        """Apply chat template only if the example is in conversational format.
+
+        Args:
+            example: Input example to conditionally transform.
+
+        Returns:
+            Transformed example if conversational, original example otherwise.
+        """
         if is_conversational(example):
             return self._chat_transform(example)
         return example
@@ -266,7 +284,14 @@ class ConvertInputOutputToChatML(Transform):
         self._assistant_role = assistant_role
 
     def __call__(self, example: Example) -> Example:
-        """Convert the example to ChatML format."""
+        """Convert input/output conversation pairs to ChatML messages format.
+
+        Args:
+            example: Input example with input/output conversation turns.
+
+        Returns:
+            Example with messages in ChatML role/content format.
+        """
         result = example.copy()
 
         # Find conversation field
@@ -375,7 +400,17 @@ class ConvertToChatML(Transform):
             self._role_mapping = role_mapping or {}
 
     def __call__(self, example: Example) -> Example:
-        """Convert the example to ChatML format."""
+        """Convert from/value format messages to standard ChatML format.
+
+        Normalizes role names using the configured role mapping and converts
+        "from"/"value" keys to "role"/"content" keys.
+
+        Args:
+            example: Input example with conversations in from/value format.
+
+        Returns:
+            Example with messages in standard role/content ChatML format.
+        """
         result = example.copy()
 
         # Find messages field

@@ -103,11 +103,18 @@ class Gemma2RMSNorm(nn.Module):
 
 
 class Gemma2Attention(UnifiedAttention):
-    """Multi-head attention layer with RoPE embeddings for Gemma2 models.
+    """Multi-head attention layer for Gemma2 with sliding window and softcapping support.
 
-    Inherits from UnifiedAttention with Gemma2-specific customizations:
-    - Sliding window attention (layer-specific)
-    - Custom query pre-attention scalar
+    Extends UnifiedAttention with Gemma2-specific features:
+    - Layer-specific attention type: alternates between sliding window (odd layers)
+      and full attention (even layers) based on config.layer_types
+    - Custom query pre-attention scaling via query_pre_attn_scalar
+    - Optional attention logit softcapping
+
+    Attributes:
+        config (Gemma2Config): Model configuration.
+        head_dim (int): Dimensionality of each attention head.
+        attention_softmax_in_fp32 (bool): Whether to compute softmax in float32.
     """
 
     def __init__(
@@ -194,10 +201,18 @@ class Gemma2Attention(UnifiedAttention):
 
 
 class Gemma2MLP(nn.Module):
-    """Multi-Layer Perceptron module for Gemma2 models.
+    """Gated MLP (GeGLU) feedforward network for Gemma2 models.
 
-    Implements the feedforward network component of the transformer architecture
-    with gated linear units and optional activation functions.
+    Implements the gated linear unit feedforward network:
+    ``down_proj(act(gate_proj(x)) * up_proj(x))``. Uses approximate GeLU
+    (gelu_pytorch_tanh) by default, matching Google's Gemma2 implementation.
+
+    Attributes:
+        config (Gemma2Config): Model configuration.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Numerical precision for matrix operations.
+        act: Activation function applied to the gate projection.
     """
 
     def __init__(
@@ -294,10 +309,23 @@ class Gemma2MLP(nn.Module):
 
 
 class Gemma2DecoderLayer(nn.Module):
-    """Single decoder layer for Gemma2 models.
+    """Single decoder layer for Gemma2 models with post-norm architecture.
 
-    Combines multi-head attention and feedforward networks with residual connections
-    and layer normalization to form a complete transformer decoder layer.
+    Implements a transformer decoder layer with both pre- and post-normalization:
+    ``x + post_attn_norm(attn(pre_attn_norm(x)))`` followed by
+    ``x + post_ff_norm(mlp(pre_ff_norm(x)))``. The additional post-normalization
+    layers improve training stability compared to standard pre-norm.
+
+    Attributes:
+        config (Gemma2Config): Model configuration.
+        layer_idx (int): Index of this layer; determines sliding vs full attention.
+        is_sliding (bool): Whether this layer uses sliding window attention.
+        input_layernorm (Gemma2RMSNorm): Pre-attention normalization.
+        post_attention_layernorm (Gemma2RMSNorm): Post-attention normalization.
+        pre_feedforward_layernorm (Gemma2RMSNorm): Pre-MLP normalization.
+        post_feedforward_layernorm (Gemma2RMSNorm): Post-MLP normalization.
+        self_attn (Gemma2Attention): Multi-head attention module.
+        mlp (Gemma2MLP): Feedforward network module.
     """
 
     def __init__(

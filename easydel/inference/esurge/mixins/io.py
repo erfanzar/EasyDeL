@@ -26,6 +26,19 @@ if TYPE_CHECKING:
 
 
 class EngineIOMixin:
+    """Mixin providing input/output operations for the eSurge engine.
+
+    Handles blocking and streaming generation interfaces, multimodal chat
+    support, and orphaned request recovery. This mixin implements the
+    user-facing generate(), stream(), and chat() methods that coordinate
+    with the background scheduler to produce completions.
+
+    Methods:
+        generate: Blocking batch generation for one or more prompts.
+        stream: Streaming token-by-token generation with incremental output.
+        chat: High-level chat interface with multimodal and tool support.
+    """
+
     def _ensure_scheduler_running(self, *, context: str) -> None:
         """Raise a clear error when scheduler is unavailable.
 

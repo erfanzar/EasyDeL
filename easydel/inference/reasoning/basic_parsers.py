@@ -49,6 +49,12 @@ class BaseThinkingReasoningParser(ReasoningParser):
     end_token: str = "</think>"
 
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize with tokenizer and resolve start/end token IDs from vocabulary.
+
+        Args:
+            tokenizer: Tokenizer instance used to resolve delimiter token IDs
+                and decode token sequences.
+        """
         super().__init__(tokenizer)
         self._start_token_id: int | None = self.vocab.get(self.start_token)
         self._end_token_id: int | None = self.vocab.get(self.end_token)
@@ -73,6 +79,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
         return self._prompt_started_reasoning or self.assume_reasoning
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
+        """Check if the end-of-reasoning token is present in the token IDs."""
         if self._end_token_id is not None:
             return self._end_token_id in input_ids
         return False
@@ -84,6 +91,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
         return False
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
+        """Extract content token IDs by removing everything up to and including the end token."""
         if self._end_token_id is None or self._end_token_id not in input_ids:
             return input_ids
         end_idx = input_ids.index(self._end_token_id)
@@ -94,6 +102,14 @@ class BaseThinkingReasoningParser(ReasoningParser):
         model_output: str,
         request=None,
     ) -> tuple[str | None, str | None]:
+        """Extract reasoning and content by splitting on start/end token delimiters.
+
+        Handles both explicit delimiter mode (start_token in output) and
+        prompt-gated asymmetric mode (start_token injected by chat template).
+
+        Returns:
+            Tuple of (reasoning_content, visible_content). Either may be None.
+        """
         if self.start_token not in model_output:
             if self._is_prompt_reasoning_active():
                 # Prompt-aware asymmetric mode: start token came from prompt.
@@ -135,6 +151,16 @@ class BaseThinkingReasoningParser(ReasoningParser):
         delta_token_ids: Sequence[int],
         request=None,
     ) -> DeltaMessage | None:
+        """Extract reasoning content from a streaming text delta.
+
+        Uses state tracking to determine whether the current delta belongs
+        to the reasoning section, content section, or straddles a boundary.
+        Supports prompt-gated mode where the start token was in the prompt.
+
+        Returns:
+            DeltaMessage with reasoning_content and/or content set,
+            or None if the delta is a boundary token with no text to emit.
+        """
         if not delta_text:
             return None
 

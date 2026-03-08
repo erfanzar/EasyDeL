@@ -737,11 +737,11 @@ tpu = [
 requires-dist = [
     { name = "cryptography", specifier = ">=45.0.6" },
     { name = "datasets", specifier = ">=3.6.0" },
-    { name = "eformer", specifier = "==0.0.99.1" },
+    { name = "eformer", specifier = "==0.0.99.3" },
     { name = "einops", specifier = "~=0.8.0" },
-    { name = "ejkernel", specifier = "==0.0.71" },
-    { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.71" },
-    { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.71" },
+    { name = "ejkernel", specifier = "==0.0.72" },
+    { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.72" },
+    { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.72" },
     { name = "eopod", marker = "extra == 'podutils'", specifier = "==0.0.35" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "flax", specifier = "==0.12.3" },
@@ -782,7 +782,7 @@ provides-extras = ["torch", "cuda", "tpu", "tensorflow", "lm-eval", "profile", "
 
 [[package]]
 name = "eformer"
-version = "0.0.99.1"
+version = "0.0.99.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "braceexpand" },
@@ -804,9 +804,9 @@ dependencies = [
     { name = "tensorstore" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/10/6f/730b26090f411cc0a10a0bd5d9d17dd29786a20752262e86e9379ebe2e42/eformer-0.0.99.1.tar.gz", hash = "sha256:7a70053c4dce0fb07c6b1b097e9773694cda9baf44fb8ed810c03c602bb94804", size = 275503, upload-time = "2026-03-06T02:13:40.049Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/be/64/21461175308cfacc0aeb433a02a3127cd48a17352917e8030f3c34ed69ac/eformer-0.0.99.3.tar.gz", hash = "sha256:5636c5ea1629c7314495c21f1a2fc4d0f7cacaa519903496630506d946181044", size = 275698, upload-time = "2026-03-08T01:25:32.509Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/c4/5c27318d52c0a589f66aee6f11b79593ece3df8015f0294ac2af9e87b68f/eformer-0.0.99.1-py3-none-any.whl", hash = "sha256:2db96bf866d9286fd6167b995458f432e7b6c4473e3715cfe3205a360f9398ab", size = 336708, upload-time = "2026-03-06T02:13:38.234Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/76/a12c6c10639725333260ddc80c40f25ef9251744d281d427214e523c59d7/eformer-0.0.99.3-py3-none-any.whl", hash = "sha256:7609dc7c1a1afe75ff7cf442e508408cd4aaf964b03d41a0d4d7968cfffc5cb1", size = 336923, upload-time = "2026-03-08T01:25:31.001Z" },
 ]
 
 [[package]]
@@ -820,7 +820,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.71"
+version = "0.0.72"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beartype" },
@@ -832,9 +832,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/11/75/65db423fdb2ac75c0e1e76e659eef6d47cc8abc0efd81898999336a04926/ejkernel-0.0.71.tar.gz", hash = "sha256:68cfb4cd77014cd10f3f13244deac301578858f51bd66594d5c484411f6e8184", size = 1521203, upload-time = "2026-03-05T01:33:19.787Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/96/1b/168cd79f02aa9d43d00c3e38de16016b687264303cf40e6dcbf855c11cf9/ejkernel-0.0.72.tar.gz", hash = "sha256:98d30dc900808803640e1c1bdf24ef58e98f7ced1b1780f16d9d1bc2f91175f0", size = 1528067, upload-time = "2026-03-08T01:07:57.03Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/86/49/1cfe9316937f94ec1db57d2180a5a23802e950d7506041f9d9308a7cf299/ejkernel-0.0.71-py3-none-any.whl", hash = "sha256:1f95f878e953f9da39b17ed6b52dad3dcd4c1863f6e75d6169f048ca7113140b", size = 3267252, upload-time = "2026-03-05T01:33:17.994Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/40/7fd956748caff7b0c9b7327b4d51347b7f85e5522ab826f3436f64468750/ejkernel-0.0.72-py3-none-any.whl", hash = "sha256:91f76930507aea2befdf165763a25c8d735fdf940c598fc12a42dbadb584d071", size = 3278277, upload-time = "2026-03-08T01:07:54.572Z" },
 ]
 
 [package.optional-dependencies]

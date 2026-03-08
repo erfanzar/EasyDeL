@@ -53,7 +53,9 @@ class Identity(nn.Module):
     when certain normalization or processing layers are conditionally disabled.
     """
 
-    def __init__(self): ...
+    def __init__(self):
+        """Initialize the Identity module (no parameters)."""
+        ...
 
     def __call__(self, x):
         """Pass through input unchanged.
@@ -74,7 +76,9 @@ class PostCross(nn.Module):
     while preserving gradient flow for most values.
     """
 
-    def __init__(self): ...
+    def __init__(self):
+        """Initialize the PostCross module (no parameters)."""
+        ...
 
     def __call__(self, x):
         """Apply bounded tanh transformation.
@@ -618,6 +622,12 @@ class XerxesModel(EasyDeLBaseModule):
 
     @functools.cached_property
     def default_frequencies(self):
+        """Compute and cache RoPE frequency tensor for position encoding.
+
+        Returns:
+            ModuleCaches: Cached rotary position embedding frequencies computed
+                from the model's head dimension and base frequency configuration.
+        """
         from easydel.infra.utils import ModuleCaches
         from easydel.layers import get_frequencies
 

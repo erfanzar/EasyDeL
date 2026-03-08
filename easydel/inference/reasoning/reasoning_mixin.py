@@ -119,6 +119,15 @@ class ReasoningMixin:
         return DeltaMessage(content=delta_text)
 
     def get_reasoning_parser_for_model(self, model_name: str) -> ReasoningParser | None:
+        """Get the reasoning parser instance for a specific model.
+
+        Args:
+            model_name: Name of the model to look up.
+
+        Returns:
+            The ReasoningParser for the model, or None if not found or
+            reasoning parsers are not initialized.
+        """
         if not hasattr(self, "reasoning_parsers"):
             return None
         return self.reasoning_parsers.get(model_name)

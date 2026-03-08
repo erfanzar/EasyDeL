@@ -41,18 +41,28 @@ logger = get_logger(__name__)
 
 
 class MetaValueRecreator:
-    """Helper class for recreating meta values with state tracking"""
+    """Helper for recreating nnx meta values (RNG keys/counts) deterministically.
+
+    Maintains an internal counter and PRNG key that advance on each call,
+    producing reproducible sequences for RNG count and key state variables.
+
+    Attributes:
+        _count: Monotonically increasing counter for ``RngCount`` variables.
+        _rng: Current PRNG key, split on each ``get_rng`` call.
+    """
 
     def __init__(self, seed: int = 42):
         self._count = 0
         self._rng = jax.random.PRNGKey(seed)
 
     def get_count(self) -> jnp.ndarray:
+        """Return the next counter value as a uint32 array and increment."""
         count = self._count
         self._count += 1
         return jnp.array(count, dtype=jnp.uint32)
 
     def get_rng(self) -> jax.random.PRNGKey:
+        """Split the internal PRNG key and return one half."""
         key, self._rng = jax.random.split(self._rng)
         return key
 
@@ -64,6 +74,14 @@ class _EmptyNode:
 
 @auto_pytree
 class StateValidationResult:
+    """Result of validating a state dictionary against a reference.
+
+    Attributes:
+        is_valid: ``True`` if no missing keys or type mismatches were found.
+        missing_keys: Keys present in the reference but absent in the state.
+        invalid_types: Mapping of keys whose value types differ from the reference.
+    """
+
     is_valid: bool
     missing_keys: set
     invalid_types: dict[str, type]
@@ -74,6 +92,14 @@ M = tp.TypeVar("M")
 
 
 def int_key_to_string(xs):
+    """Convert all integer keys in a (possibly nested) dictionary to strings.
+
+    Args:
+        xs: Dictionary, possibly nested or already flattened.
+
+    Returns:
+        Dictionary with the same structure but all integer keys cast to strings.
+    """
     flatten = False
     if not is_flatten(xs):
         flatten = True
@@ -87,6 +113,14 @@ def int_key_to_string(xs):
 
 
 def string_key_to_int(xs):
+    """Convert digit-only string keys in a dictionary back to integers.
+
+    Args:
+        xs: Dictionary, possibly nested or already flattened.
+
+    Returns:
+        Dictionary with digit-string keys converted to ``int`` where possible.
+    """
     flatten = False
     if not is_flatten(xs):
         flatten = True
@@ -129,6 +163,7 @@ def _dict_flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None, fumap
 
 
 def is_iterable(obj):
+    """Check whether ``obj`` is an iterable (excluding strings)."""
     return isinstance(obj, Iterable)
 
 
@@ -195,6 +230,15 @@ def flatten_dict(
 
 
 def unflatten_dict(xs, sep=None):
+    """Reconstruct a nested dictionary from a flattened one.
+
+    Args:
+        xs: Flattened dictionary with tuple or separated-string keys.
+        sep: Separator used in string keys, or ``None`` for tuple keys.
+
+    Returns:
+        Nested dictionary.
+    """
     if isinstance(xs, dict):
         return _dict_unflatten_dict(xs=xs, sep=sep)
     return traversals.unflatten_mapping(xs, sep=sep)
@@ -312,7 +356,18 @@ def init_graphstate(
 
 
 def validate_state(state: dict[str, tp.Any], init_state: dict[str, tp.Any]) -> StateValidationResult:
-    """Validates state against init_state before differentiation."""
+    """Validate a state dictionary against a reference init state.
+
+    Checks for missing keys and type mismatches between ``state`` and
+    ``init_state``.
+
+    Args:
+        state: State dictionary to validate.
+        init_state: Reference state dictionary.
+
+    Returns:
+        ``StateValidationResult`` with validation outcome details.
+    """
     missing_keys = set(init_state.keys()) - set(state.keys())
     invalid_types = {k: type(v) for k, v in state.items() if k in init_state and not isinstance(v, type(init_state[k]))}
     return StateValidationResult(

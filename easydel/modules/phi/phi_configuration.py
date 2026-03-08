@@ -116,6 +116,10 @@ class PhiConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ) -> None:
+        """Initialize PhiConfig with model architecture hyperparameters.
+
+        See class docstring for detailed parameter descriptions.
+        """
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size

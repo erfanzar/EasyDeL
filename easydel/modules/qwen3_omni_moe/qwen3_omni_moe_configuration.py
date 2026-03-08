@@ -89,6 +89,10 @@ class Qwen3OmniMoeAudioEncoderConfig(EasyDeLBaseConfig):
         downsample_hidden_size: int = 480,
         **kwargs,
     ):
+        """Initialize audio encoder configuration.
+
+        See class docstring for detailed parameter descriptions.
+        """
         super().__init__(**kwargs)
         self.num_mel_bins = num_mel_bins
         self.d_model = d_model
@@ -159,6 +163,10 @@ class Qwen3OmniMoeVisionEncoderConfig(EasyDeLBaseConfig):
         initializer_range: float = 0.02,
         **kwargs,
     ):
+        """Initialize vision encoder configuration.
+
+        See class docstring for detailed parameter descriptions.
+        """
         if deepstack_visual_indexes is None:
             deepstack_visual_indexes = [8, 16, 24]
         super().__init__(**kwargs)
@@ -255,6 +263,10 @@ class Qwen3OmniMoeTextConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize text decoder configuration with MoE parameters.
+
+        See class docstring for detailed parameter descriptions.
+        """
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -362,6 +374,10 @@ class Qwen3OmniMoeThinkerConfig(EasyDeLBaseConfig):
         initializer_range: float = 0.02,
         **kwargs,
     ):
+        """Initialize Thinker configuration with audio, vision, and text sub-configs.
+
+        See class docstring for detailed parameter descriptions.
+        """
         super().__init__(**kwargs)
         self.user_token_id = user_token_id
         self.position_id_per_seconds = position_id_per_seconds
@@ -468,6 +484,10 @@ class Qwen3OmniMoeTalkerCodePredictorConfig(EasyDeLBaseConfig):
         num_code_groups: int = 32,
         **kwargs,
     ):
+        """Initialize Talker code predictor configuration.
+
+        See class docstring for detailed parameter descriptions.
+        """
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -568,6 +588,10 @@ class Qwen3OmniMoeTalkerTextConfig(EasyDeLBaseConfig):
         shared_expert_intermediate_size: int = 2048,
         **kwargs,
     ):
+        """Initialize Talker text decoder configuration with MoE parameters.
+
+        See class docstring for detailed parameter descriptions.
+        """
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -660,6 +684,10 @@ class Qwen3OmniMoeTalkerConfig(EasyDeLBaseConfig):
         spatial_merge_size: int = 2,
         **kwargs,
     ):
+        """Initialize Talker configuration with text model and code predictor sub-configs.
+
+        See class docstring for detailed parameter descriptions.
+        """
         super().__init__(**kwargs)
 
         if code_predictor_config is None:
@@ -768,6 +796,10 @@ class Qwen3OmniMoeCode2WavConfig(EasyDeLBaseConfig):
         decoder_dim: int = 1536,
         **kwargs,
     ):
+        """Initialize Code2Wav vocoder configuration.
+
+        See class docstring for detailed parameter descriptions.
+        """
         super().__init__(**kwargs)
         self.codebook_size = codebook_size
         self.hidden_size = hidden_size
@@ -857,6 +889,10 @@ class Qwen3OmniMoeConfig(EasyDeLBaseConfig):
         assistant_token_id: int = 77091,
         **kwargs,
     ):
+        """Initialize top-level Qwen3OmniMoe config with thinker, talker, and vocoder sub-configs.
+
+        See class docstring for detailed parameter descriptions.
+        """
         super().__init__(**kwargs)
 
         if thinker_config is None:

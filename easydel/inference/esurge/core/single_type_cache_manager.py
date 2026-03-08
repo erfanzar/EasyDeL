@@ -340,6 +340,7 @@ class FullAttentionManager(SingleTypeCacheManager):
         dp_shard_hint: int | None = None,
         data_parallel_size: int | None = None,
     ) -> tuple[list[CachePage], ...]:
+        """Find the longest prefix cache hit by scanning pages sequentially from the start."""
         assert isinstance(kv_cache_spec, FullAttentionSpec | ChunkedLocalAttentionSpec), (
             "FullAttentionManager can only be used for full attention and chunked local attention groups"
         )
@@ -444,6 +445,7 @@ class SlidingWindowManager(SingleTypeCacheManager):
         dp_shard_hint: int | None = None,
         data_parallel_size: int | None = None,
     ) -> tuple[list[CachePage], ...]:
+        """Find the longest cache hit within the sliding window by scanning pages backward."""
         assert isinstance(kv_cache_spec, SlidingWindowSpec), (
             "SlidingWindowManager can only be used for sliding window groups"
         )
@@ -696,6 +698,7 @@ class MambaManager(SingleTypeCacheManager):
         dp_shard_hint: int | None = None,
         data_parallel_size: int | None = None,
     ) -> tuple[list[CachePage], ...]:
+        """Return empty pages (Mamba state is never prefix-cached)."""
         assert isinstance(kv_cache_spec, MambaSpec), "MambaManager can only be used for mamba groups"
 
         computed_pages: tuple[list[CachePage], ...] = tuple([] for _ in range(len(kv_cache_group_ids)))

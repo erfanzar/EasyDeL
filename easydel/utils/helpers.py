@@ -163,6 +163,7 @@ class Timer:
         self.started = False
 
     def reset(self):
+        """Reset the timer, clearing all accumulated elapsed time."""
         self.elapsed = 0.0
         self.started = False
         self.start_time = 0.0
@@ -234,6 +235,21 @@ class Timers:
         return self.timers[name]
 
     def write(self, names, iteration, normalizer=1.0, reset=False):
+        """Write timer values to configured logging backends.
+
+        Logs normalized elapsed times for the specified timers to
+        TensorBoard and/or Weights & Biases.
+
+        Args:
+            names: Iterable of timer names to write.
+            iteration: Training/evaluation step number for the log entry.
+            normalizer: Divisor applied to elapsed times (e.g., number
+                of accumulation steps). Must be positive.
+            reset: Whether to reset each timer after reading.
+
+        Raises:
+            ValueError: If ``normalizer`` is not positive.
+        """
         if normalizer <= 0.0:
             raise ValueError("normalizer must be greater than 0.0")
         for name in names:
@@ -253,6 +269,19 @@ class Timers:
                     wandb.log({f"timers/{name}": value}, step=iteration)
 
     def log(self, names, normalizer=1.0, reset=True):
+        """Log timer values to the console with color-coded formatting.
+
+        Prints elapsed times in human-readable units (ms/sec/min/hr) with
+        color coding based on magnitude.
+
+        Args:
+            names: Timer name or iterable of timer names to log.
+            normalizer: Divisor applied to elapsed times. Must be positive.
+            reset: Whether to reset each timer after reading.
+
+        Raises:
+            ValueError: If ``normalizer`` is not positive.
+        """
         if normalizer <= 0.0:
             raise ValueError("normalizer must be greater than 0.0")
 
@@ -280,6 +309,16 @@ class Timers:
 
     @contextlib.contextmanager
     def timed(self, name, log=True, reset=True):
+        """Context manager that times a block and optionally logs the result.
+
+        Args:
+            name: Timer name.
+            log: Whether to print the elapsed time on exit.
+            reset: Whether to reset the timer after logging.
+
+        Yields:
+            The ``Timer`` instance for the given name.
+        """
         timer = self(name)
         try:
             timer.start()

@@ -42,7 +42,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PackedSequence:
-    """A packed sequence with metadata."""
+    """A packed sequence combining multiple examples with metadata.
+
+    Attributes:
+        input_ids: Token IDs array of shape (seq_length,).
+        attention_mask: Optional attention mask of shape (seq_length,).
+        segment_ids: Optional segment IDs for tracking which tokens belong
+            to which original example, used for attention masking.
+        source_ids: Optional list of source identifiers for each segment.
+        num_segments: Number of original examples packed into this sequence.
+    """
 
     input_ids: np.ndarray
     attention_mask: np.ndarray | None = None
@@ -51,7 +60,12 @@ class PackedSequence:
     num_segments: int = 0
 
     def to_dict(self) -> dict[str, np.ndarray]:
-        """Convert to dictionary for training."""
+        """Convert to a dictionary suitable for training loops.
+
+        Returns:
+            Dictionary with "input_ids" and optionally "attention_mask"
+            and "segment_ids" as numpy arrays.
+        """
         result = {"input_ids": self.input_ids}
         if self.attention_mask is not None:
             result["attention_mask"] = self.attention_mask
@@ -156,7 +170,14 @@ class GreedyPacker:
         return result
 
     def flush_final(self) -> PackedSequence | None:
-        """Flush any remaining tokens with padding."""
+        """Flush any remaining tokens in the buffer with padding.
+
+        Pads the remaining buffer to seq_length and returns the final
+        packed sequence with an attention mask indicating valid positions.
+
+        Returns:
+            PackedSequence with padding, or None if buffer is empty.
+        """
         if not self._buffer:
             return None
 
@@ -251,7 +272,11 @@ class PoolPacker:
         return results
 
     def flush_all(self) -> list[PackedSequence]:
-        """Flush all packers."""
+        """Flush all packers in the pool, returning their remaining sequences.
+
+        Returns:
+            List of PackedSequences from all packers with remaining data.
+        """
         results = []
         for packer in self._packers:
             result = packer.flush_final()
@@ -374,12 +399,22 @@ class FirstFitPacker:
         return results
 
     def flush_all(self) -> list[PackedSequence]:
-        """Flush remaining pending sequences."""
+        """Flush remaining pending sequences through first-fit packing.
+
+        Returns:
+            List of PackedSequences from all remaining buffered data.
+        """
         return self._pack_buffer()
 
 
 class PackedShardedSource(ShardedDataSource[dict]):
-    """Sharded source that packs sequences from another source."""
+    """Sharded source that packs sequences from another source.
+
+    Wraps an underlying ShardedDataSource and packs its tokenized examples
+    into fixed-length sequences using a configurable packing strategy
+    (greedy, pool, or first_fit). Optionally shuffles the output using
+    reservoir sampling.
+    """
 
     def __init__(
         self,
@@ -455,7 +490,17 @@ class PackedShardedSource(ShardedDataSource[dict]):
             )
 
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
-        """Open the packed shard."""
+        """Open the packed shard and iterate over packed sequences.
+
+        Reads all examples from the underlying source, packs them into
+        fixed-length sequences, and optionally shuffles the output.
+
+        Args:
+            shard_name: Shard identifier (ignored, single virtual shard).
+
+        Yields:
+            Dictionaries with packed "input_ids" and optional "segment_ids".
+        """
         if self._seed is not None:
             random.seed(self._seed)
 
@@ -539,7 +584,12 @@ class PackedShardedSource(ShardedDataSource[dict]):
 
 
 class PackStage(BaseStage):
-    """Pipeline stage for packing sequences."""
+    """Pipeline stage for packing tokenized sequences into fixed-length chunks.
+
+    When enabled, wraps each dataset source with a PackedShardedSource that
+    concatenates multiple tokenized examples into fixed-length sequences,
+    reducing padding waste and improving training throughput.
+    """
 
     def __init__(self, config: PackStageConfig | None = None):
         """Initialize PackStage.

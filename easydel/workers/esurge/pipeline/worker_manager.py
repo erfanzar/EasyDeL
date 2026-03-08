@@ -59,6 +59,18 @@ class WorkerManager:
         startup_timeout: float = 30.0,
         ipc_dir: str | None = None,
     ) -> None:
+        """Initialize the worker manager.
+
+        Args:
+            tokenizer_source: HuggingFace tokenizer identifier or local path.
+                Required when worker endpoints are not supplied to ``start()``.
+            tokenizer_kwargs: Extra keyword arguments forwarded to
+                ``AutoTokenizer.from_pretrained``.
+            startup_timeout: Seconds to wait for each worker to bind its
+                ZMQ endpoint.
+            ipc_dir: Directory for IPC socket files. Defaults to the
+                system temp directory.
+        """
         self._tokenizer_source = tokenizer_source
         self._tokenizer_kwargs = tokenizer_kwargs or {}
         self._startup_timeout = startup_timeout
@@ -91,6 +103,25 @@ class WorkerManager:
         tokenizer_endpoint: str | None,
         detokenizer_endpoint: str | None,
     ) -> tuple[TokenizerWorkerClient, DetokenizerWorkerClient]:
+        """Start or connect to tokenizer and detokenizer workers.
+
+        Args:
+            detokenizer_max_states: Maximum number of concurrent decode
+                states the detokenizer worker should maintain.
+            tokenizer_endpoint: Optional existing tokenizer ZMQ endpoint.
+                When ``None``, a new tokenizer worker is spawned.
+            detokenizer_endpoint: Optional existing detokenizer ZMQ endpoint.
+                When ``None``, a new detokenizer worker is spawned.
+
+        Returns:
+            Tuple of (TokenizerWorkerClient, DetokenizerWorkerClient).
+
+        Raises:
+            RuntimeError: If workers have already been started.
+            ValueError: If tokenizer_source was not provided and endpoints
+                are not supplied.
+            TimeoutError: If a spawned worker does not bind within the timeout.
+        """
         if self._tokenizer_client or self._detokenizer_client:
             raise RuntimeError("WorkerManager has already started clients.")
 
@@ -138,6 +169,11 @@ class WorkerManager:
         return self._tokenizer_client, self._detokenizer_client
 
     def shutdown(self) -> None:
+        """Shut down all managed workers and release resources.
+
+        Sends shutdown commands to owned workers, terminates their
+        processes, and cleans up IPC socket files.
+        """
         self._shutdown_client("_tokenizer_client", "_tokenizer_owned", "_tokenizer_process", self._tokenizer_endpoint)
         self._shutdown_client(
             "_detokenizer_client", "_detokenizer_owned", "_detokenizer_process", self._detokenizer_endpoint

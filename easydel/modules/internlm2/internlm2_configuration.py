@@ -41,6 +41,9 @@ class InternLM2Config(EasyDeLBaseConfig):
         num_key_value_heads (`int`, *optional*):
             Number of key and value heads for each attention layer in the Transformer encoder. Will default to
             `number_rep_kv * num_attention_heads` if not set.
+        head_dim (`int`, *optional*):
+            Dimensionality of each attention head. If not provided, defaults to
+            ``hidden_size // num_attention_heads``.
         max_position_embeddings (`int`, *optional*, defaults to 2048):
             The maximum sequence length that this model might ever be used with. Typically set this to something large
             just in case (e.g., 2048 or 4096).
@@ -97,6 +100,7 @@ class InternLM2Config(EasyDeLBaseConfig):
         num_hidden_layers: int = 32,
         num_attention_heads: int = 32,
         num_key_value_heads: int | None = None,
+        head_dim: int | None = None,
         hidden_act: str = "silu",
         max_position_embeddings: int = 2048,
         initializer_range: float = 0.02,
@@ -156,6 +160,7 @@ class InternLM2Config(EasyDeLBaseConfig):
         self.vocab_size = vocab_size
 
         self.hidden_size = hidden_size
+        self.head_dim = head_dim or hidden_size // num_attention_heads
         self.initializer_range = initializer_range
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers

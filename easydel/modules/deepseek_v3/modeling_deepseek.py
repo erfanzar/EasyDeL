@@ -207,6 +207,16 @@ class MoEGate(nn.Module):
             )
 
     def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specifications for MoEGate parameters.
+
+        When expert tensor mode is enabled, the gate kernel is replicated
+        across all devices. Otherwise, it is sharded column-wise for
+        distributed routing computation. The score correction bias (used
+        with noaux_tc routing) is always replicated.
+
+        Returns:
+            dict[str, object]: Mapping of parameter names to sharding specs.
+        """
         kernel_spec = Replicated if self.config.use_expert_tensor_mode else ColumnWise
         specs = {"kernel": kernel_spec}
         if hasattr(self, "e_score_correction_bias"):

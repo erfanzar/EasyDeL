@@ -52,7 +52,12 @@ class TokenizerConfig:
     trust_remote_code: bool = True
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary for tokenizer kwargs."""
+        """Convert tokenizer configuration to a dictionary of keyword arguments.
+
+        Returns:
+            Dictionary containing tokenization parameters suitable for
+            passing to a HuggingFace tokenizer call.
+        """
         return {
             "max_length": self.max_length,
             "truncation": self.truncation,
@@ -129,7 +134,15 @@ class DatasetConfig:
             raise ValueError("data_files is required")
 
     def get_tokenizer_config(self) -> TokenizerConfig | None:
-        """Get tokenizer configuration, normalizing string to TokenizerConfig."""
+        """Get tokenizer configuration, normalizing string to TokenizerConfig.
+
+        If the tokenizer attribute is a plain string, wraps it into a
+        TokenizerConfig with default settings. Returns None if no tokenizer
+        is configured.
+
+        Returns:
+            TokenizerConfig instance, or None if no tokenizer is set.
+        """
         if self.tokenizer is None:
             return None
         if isinstance(self.tokenizer, str):
@@ -200,7 +213,15 @@ class CacheStageConfig:
 
 @dataclass
 class WeightSchedulePoint:
-    """A point in the weight schedule for dynamic mixing."""
+    """A single checkpoint in a dynamic weight schedule for dataset mixing.
+
+    Defines the target mixing weights at a specific training step. Multiple
+    points form a schedule that can be interpolated (step, linear, cosine).
+
+    Attributes:
+        step: Training step at which these weights apply.
+        weights: Dictionary mapping dataset names to their weights (must sum to 1.0).
+    """
 
     step: int
     weights: dict[str, float]
@@ -427,7 +448,14 @@ class PipelineConfig:
                 ds.name = f"dataset_{i}"
 
     def get_dataset_by_name(self, name: str) -> DatasetConfig | None:
-        """Get a dataset configuration by name."""
+        """Get a dataset configuration by its unique name.
+
+        Args:
+            name: Dataset name to search for.
+
+        Returns:
+            Matching DatasetConfig, or None if not found.
+        """
         for ds in self.datasets:
             if ds.name == name:
                 return ds
@@ -463,7 +491,15 @@ class PipelineConfig:
 
 
 def get_dataset_name(ds_cfg: DatasetConfig, index: int) -> str:
-    """Get a unique name for a dataset configuration."""
+    """Get a unique name for a dataset configuration.
+
+    Args:
+        ds_cfg: Dataset configuration.
+        index: Fallback index used to generate a name if none is set.
+
+    Returns:
+        The dataset's name, or "dataset_{index}" if no name is configured.
+    """
     return ds_cfg.name if ds_cfg.name else f"dataset_{index}"
 
 
@@ -474,7 +510,17 @@ def merge_tokenizer_config(
 ) -> TokenizerConfig | None:
     """Merge tokenizer configuration from multiple sources.
 
-    Priority: dataset > stage default > global default
+    Resolves the tokenizer config with the following priority order:
+    dataset-level > stage default > global default.
+
+    Args:
+        ds_cfg: Per-dataset configuration (highest priority).
+        global_tokenizer: Global fallback tokenizer name/path (lowest priority).
+        stage_cfg: Stage-level tokenization configuration (middle priority).
+
+    Returns:
+        Resolved TokenizerConfig, or None if no tokenizer is configured
+        at any level.
     """
     # Check dataset-level tokenizer
     tok_cfg = ds_cfg.get_tokenizer_config()

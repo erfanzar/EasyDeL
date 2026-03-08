@@ -153,6 +153,7 @@ class MinimaxToolParser(ToolParser):
         """
 
         def remove_tool_calls_from_think(match):
+            """Strip <tool_calls> blocks from inside a <think> match group."""
             think_content = match.group(1)
             cleaned_content = re.sub(r"<tool_calls>.*?</tool_calls>", "", think_content, flags=re.DOTALL)
             return f"<think>{cleaned_content}</think>"

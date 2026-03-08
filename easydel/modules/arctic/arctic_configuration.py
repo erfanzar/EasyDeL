@@ -42,6 +42,9 @@ class ArcticConfig(EasyDeLBaseConfig):
         num_key_value_heads (`int`, *optional*):
             Number of key and value heads for each attention layer in the Transformer encoder. Will default to
             `num_attention_heads` if not set.
+        head_dim (`int`, *optional*):
+            Dimensionality of each attention head. If not provided, defaults to
+            ``hidden_size // num_attention_heads``.
         hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
             The non-linear activation function (function or string) to use in the encoder and pooler. If string,
             `"gelu"`, `"relu"`, `"swish"` and `"gelu_new"` are supported.
@@ -114,6 +117,7 @@ class ArcticConfig(EasyDeLBaseConfig):
         num_hidden_layers: int = 32,
         num_attention_heads: int = 32,
         num_key_value_heads: int | None = None,
+        head_dim: int | None = None,
         hidden_act: str = "silu",
         max_position_embeddings: int = 4096,
         initializer_range: float = 0.02,
@@ -158,6 +162,7 @@ class ArcticConfig(EasyDeLBaseConfig):
             num_key_value_heads = num_attention_heads
 
         self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim or hidden_size // num_attention_heads
         self.hidden_act = hidden_act
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps

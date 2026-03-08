@@ -45,7 +45,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CacheMetadata:
-    """Metadata stored alongside cached data for validation and invalidation."""
+    """Metadata stored alongside cached data for validation and invalidation.
+
+    Attributes:
+        version: Schema version for forward compatibility.
+        created_at: Unix timestamp when the cache entry was created.
+        source_hash: Hash of the source data for change detection.
+        tokenizer_hash: Hash of the tokenizer config, if applicable.
+        transform_hash: Hash of the transform pipeline, if applicable.
+        num_examples: Number of examples in the cached dataset.
+        config_hash: Hash of the pipeline configuration used.
+        extra: Additional metadata as key-value pairs.
+    """
 
     version: str = "1.0"
     created_at: float = field(default_factory=time.time)
@@ -57,7 +68,11 @@ class CacheMetadata:
     extra: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        """Serialize to dictionary."""
+        """Serialize metadata to a plain dictionary for JSON storage.
+
+        Returns:
+            Dictionary representation of this metadata.
+        """
         return {
             "version": self.version,
             "created_at": self.created_at,
@@ -71,7 +86,14 @@ class CacheMetadata:
 
     @classmethod
     def from_dict(cls, data: dict) -> "CacheMetadata":
-        """Deserialize from dictionary."""
+        """Deserialize metadata from a dictionary.
+
+        Args:
+            data: Dictionary containing metadata fields.
+
+        Returns:
+            CacheMetadata instance with values from the dictionary.
+        """
         return cls(
             version=data.get("version", "1.0"),
             created_at=data.get("created_at", time.time()),
@@ -84,7 +106,15 @@ class CacheMetadata:
         )
 
     def is_valid_for(self, config_hash: str, source_hash: str | None = None) -> bool:
-        """Check if this cache entry is valid for the given configuration."""
+        """Check if this cache entry is still valid for the given configuration.
+
+        Args:
+            config_hash: Hash of the current pipeline configuration.
+            source_hash: Optional hash of the current source data.
+
+        Returns:
+            True if the cache entry matches the provided hashes.
+        """
         if self.config_hash != config_hash:
             return False
         if source_hash is not None and self.source_hash != source_hash:
@@ -93,7 +123,11 @@ class CacheMetadata:
 
 
 class CacheLayer(ABC):
-    """Abstract interface for a cache layer."""
+    """Abstract interface for a single cache layer.
+
+    Defines the contract for cache backends (memory, disk, etc.)
+    used within the hierarchical TreeCacheManager.
+    """
 
     @abstractmethod
     def get(self, key: str) -> tuple[tp.Any, CacheMetadata | None] | None:
@@ -111,21 +145,45 @@ class CacheLayer(ABC):
         value: tp.Any,
         metadata: CacheMetadata | None = None,
     ) -> None:
-        """Store item in cache."""
+        """Store an item in cache with optional metadata.
+
+        Args:
+            key: Cache key.
+            value: Data to cache.
+            metadata: Optional metadata for validation and tracking.
+        """
         ...
 
     @abstractmethod
     def contains(self, key: str) -> bool:
-        """Check if key exists in cache."""
+        """Check if a key exists in the cache.
+
+        Args:
+            key: Cache key to look up.
+
+        Returns:
+            True if the key is present and valid in the cache.
+        """
         ...
 
     @abstractmethod
     def invalidate(self, key: str | None = None) -> None:
-        """Invalidate a key or entire cache if key is None."""
+        """Invalidate a specific key or the entire cache.
+
+        Args:
+            key: Cache key to invalidate, or None to clear the entire cache.
+        """
         ...
 
     def get_metadata(self, key: str) -> CacheMetadata | None:
-        """Get metadata for a key without loading data."""
+        """Get metadata for a key without loading the full data.
+
+        Args:
+            key: Cache key.
+
+        Returns:
+            CacheMetadata if the key exists, None otherwise.
+        """
         result = self.get(key)
         return result[1] if result else None
 
@@ -137,12 +195,18 @@ class MemoryCache(CacheLayer):
     """
 
     def __init__(self, max_size: int = 1000):
+        """Initialize MemoryCache.
+
+        Args:
+            max_size: Maximum number of items to store before evicting oldest.
+        """
         self.max_size = max_size
         self._cache: OrderedDict[str, tuple[tp.Any, CacheMetadata | None]] = OrderedDict()
         self._hits = 0
         self._misses = 0
 
     def get(self, key: str) -> tuple[tp.Any, CacheMetadata | None] | None:
+        """Retrieve an item from memory, promoting it to most-recently-used."""
         if key in self._cache:
             self._cache.move_to_end(key)
             self._hits += 1
@@ -156,6 +220,7 @@ class MemoryCache(CacheLayer):
         value: tp.Any,
         metadata: CacheMetadata | None = None,
     ) -> None:
+        """Store an item, evicting the oldest entry if at capacity."""
         if key in self._cache:
             self._cache.move_to_end(key)
         self._cache[key] = (value, metadata)
@@ -165,9 +230,11 @@ class MemoryCache(CacheLayer):
             self._cache.popitem(last=False)
 
     def contains(self, key: str) -> bool:
+        """Check if key exists in memory cache."""
         return key in self._cache
 
     def invalidate(self, key: str | None = None) -> None:
+        """Remove a specific key or clear the entire memory cache."""
         if key is None:
             self._cache.clear()
         elif key in self._cache:
@@ -201,6 +268,13 @@ class DiskCache(CacheLayer):
         compression: str = "none",
         expiry_seconds: int | None = None,
     ):
+        """Initialize DiskCache.
+
+        Args:
+            cache_dir: Directory path for storing cache files.
+            compression: Compression algorithm - "none", "gzip", "lz4", or "zstd".
+            expiry_seconds: Time-to-live in seconds, or None for no expiry.
+        """
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.compression = compression
@@ -258,6 +332,7 @@ class DiskCache(CacheLayer):
         return data
 
     def get(self, key: str) -> tuple[tp.Any, CacheMetadata | None] | None:
+        """Load data and metadata from disk, checking expiry and decompressing."""
         data_path, meta_path = self._get_paths(key)
 
         if not data_path.exists():
@@ -308,6 +383,7 @@ class DiskCache(CacheLayer):
         value: tp.Any,
         metadata: CacheMetadata | None = None,
     ) -> None:
+        """Serialize, compress, and write data to disk with optional metadata."""
         data_path, meta_path = self._get_paths(key)
 
         # Save data
@@ -320,6 +396,7 @@ class DiskCache(CacheLayer):
             meta_path.write_text(json.dumps(metadata.to_dict()))
 
     def contains(self, key: str) -> bool:
+        """Check if key exists on disk and has not expired."""
         data_path, _ = self._get_paths(key)
         if not data_path.exists():
             return False
@@ -333,6 +410,7 @@ class DiskCache(CacheLayer):
         return True
 
     def invalidate(self, key: str | None = None) -> None:
+        """Remove cached files from disk for a key, or clear the entire cache directory."""
         if key is None:
             # Clear entire cache
             import shutil
@@ -363,6 +441,14 @@ class TreeCacheManager:
         disk_expiry: int | None = 86400,  # 24 hours
         compression: str = "none",
     ):
+        """Initialize TreeCacheManager.
+
+        Args:
+            cache_dir: Base directory for disk cache storage.
+            memory_size: Maximum items in the in-memory LRU cache.
+            disk_expiry: Disk cache TTL in seconds, or None for no expiry.
+            compression: Compression algorithm for disk cache ("none", "gzip", "lz4", "zstd").
+        """
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -375,7 +461,17 @@ class TreeCacheManager:
         self._layers = [self._memory, self._disk]
 
     def get(self, key: str) -> tuple[tp.Any, CacheMetadata | None] | None:
-        """Get from cache, checking layers in order."""
+        """Get from cache, checking layers from fastest to slowest.
+
+        On a hit in a lower layer, the data is promoted to all higher
+        (faster) layers for subsequent access.
+
+        Args:
+            key: Cache key.
+
+        Returns:
+            Tuple of (data, metadata) if found, None otherwise.
+        """
         for i, layer in enumerate(self._layers):
             result = layer.get(key)
             if result is not None:
@@ -391,16 +487,33 @@ class TreeCacheManager:
         value: tp.Any,
         metadata: CacheMetadata | None = None,
     ) -> None:
-        """Store in all cache layers."""
+        """Store data in all cache layers simultaneously.
+
+        Args:
+            key: Cache key.
+            value: Data to cache.
+            metadata: Optional metadata for validation and tracking.
+        """
         for layer in self._layers:
             layer.put(key, value, metadata)
 
     def contains(self, key: str) -> bool:
-        """Check if key exists in any layer."""
+        """Check if key exists in any cache layer.
+
+        Args:
+            key: Cache key.
+
+        Returns:
+            True if the key is found in any layer.
+        """
         return any(layer.contains(key) for layer in self._layers)
 
     def invalidate(self, key: str | None = None) -> None:
-        """Invalidate key from all layers."""
+        """Invalidate a key from all cache layers.
+
+        Args:
+            key: Cache key to invalidate, or None to clear all layers.
+        """
         for layer in self._layers:
             layer.invalidate(key)
 
@@ -492,16 +605,35 @@ class DatasetCache:
     """
 
     def __init__(self, cache_dir: str | Path):
+        """Initialize DatasetCache.
+
+        Args:
+            cache_dir: Directory for storing cached datasets in Arrow format.
+        """
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_dataset_path(self, key: str) -> Path:
-        """Get path for a cached dataset."""
+        """Get the filesystem path for a cached dataset.
+
+        Args:
+            key: Cache key.
+
+        Returns:
+            Path where the dataset would be stored.
+        """
         safe_key = hashlib.sha256(key.encode()).hexdigest()[:32]
         return self.cache_dir / safe_key
 
     def get(self, key: str) -> "DatasetLike | None":
-        """Load a cached dataset."""
+        """Load a cached dataset from disk.
+
+        Args:
+            key: Cache key for the dataset.
+
+        Returns:
+            Loaded Dataset or DatasetDict, or None if not cached.
+        """
         from datasets import load_from_disk  # pyright: ignore[reportMissingTypeStubs]
 
         path = self._get_dataset_path(key)
@@ -521,19 +653,35 @@ class DatasetCache:
             return None
 
     def put(self, key: str, dataset: "DatasetLike") -> None:
-        """Save a dataset to cache."""
+        """Save a dataset to the disk cache.
+
+        Args:
+            key: Cache key for the dataset.
+            dataset: HuggingFace Dataset to cache (must support save_to_disk).
+        """
         path = self._get_dataset_path(key)
 
         if hasattr(dataset, "save_to_disk"):
             dataset.save_to_disk(str(path))
 
     def contains(self, key: str) -> bool:
-        """Check if dataset is cached."""
+        """Check if a dataset is cached on disk.
+
+        Args:
+            key: Cache key.
+
+        Returns:
+            True if a cached dataset exists for the key.
+        """
         path = self._get_dataset_path(key)
         return path.exists()
 
     def invalidate(self, key: str | None = None) -> None:
-        """Invalidate cached dataset(s)."""
+        """Invalidate cached dataset(s) by removing them from disk.
+
+        Args:
+            key: Cache key to invalidate, or None to clear all cached datasets.
+        """
         import shutil
 
         if key is None:

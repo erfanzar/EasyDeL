@@ -185,7 +185,22 @@ class LlamaConfig(EasyDeLBaseConfig):
 
 
 class VisionLlamaConfig(LlamaConfig):
-    """Configuration for Llama models augmented with a vision vocabulary."""
+    """Configuration for Llama models extended with a discrete vision token vocabulary.
+
+    Inherits all text decoder parameters from ``LlamaConfig`` and adds vision-specific
+    settings for models that encode images as discrete tokens (e.g., for image generation
+    or vision-language tasks with tokenized visual inputs).
+
+    Args:
+        vision_vocab_size (`int`, *optional*, defaults to 8448):
+            Size of the vision token vocabulary used for encoding images.
+        tie_vision_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie the vision input and output embedding weights.
+        sample_mode (`str`, *optional*, defaults to `"all"`):
+            Sampling mode for vision tokens during generation.
+        **kwargs:
+            Additional arguments passed to ``LlamaConfig``.
+    """
 
     def __init__(
         self,

@@ -45,12 +45,26 @@ if tp.TYPE_CHECKING:
 
 
 def _is_pathlike(s: str) -> bool:
-    """Check if a string represents a path-like structure."""
+    """Check if a string represents a filesystem path or URL.
+
+    Args:
+        s: String to check.
+
+    Returns:
+        True if the string looks like a path (contains "://", starts with "/", "./", or "../").
+    """
     return "://" in s or s.startswith("/") or s.startswith("./") or s.startswith("../")
 
 
 def _fix_missing_dot(pattern: str) -> str:
-    """Fix common glob pattern typos where dots are missing before extensions."""
+    """Fix common glob pattern typos where dots are missing before extensions.
+
+    Args:
+        pattern: Glob pattern to fix (e.g., "*parquet" becomes "*.parquet").
+
+    Returns:
+        Corrected glob pattern.
+    """
     fixes = {
         "*parquet": "*.parquet",
         "*jsonl": "*.jsonl",
@@ -67,7 +81,14 @@ def _fix_missing_dot(pattern: str) -> str:
 
 
 def _detect_format(files: list[str]) -> str:
-    """Detect file format from a list of files."""
+    """Detect the dataset file format from a list of file paths.
+
+    Args:
+        files: List of file paths to analyze by extension.
+
+    Returns:
+        Detected format string ("json", "parquet", "csv", "txt", or "arrow").
+    """
     exts_priority = [".arrow", ".parquet", ".jsonl", ".json", ".csv", ".pq", ".txt"]
 
     for f in files:
@@ -88,7 +109,17 @@ def _detect_format(files: list[str]) -> str:
 
 
 def _coerce_example(example: tp.Any) -> dict[str, tp.Any]:
-    """Normalize dataset rows to dictionary examples."""
+    """Normalize dataset rows to plain dictionary examples.
+
+    Args:
+        example: A mapping-like object (dict, Mapping, or object with items()).
+
+    Returns:
+        Plain dictionary representation of the example.
+
+    Raises:
+        TypeError: If the example cannot be converted to a dictionary.
+    """
     if isinstance(example, dict):
         return example
     if isinstance(example, Mapping):
@@ -144,7 +175,12 @@ def expand_data_files(data_files: str | os.PathLike | list[str | os.PathLike]) -
 
 @dataclass
 class ParquetShardInfo(ShardInfo):
-    """Extended shard info for Parquet files."""
+    """Extended shard info for Parquet files.
+
+    Attributes:
+        num_row_groups: Number of row groups in the Parquet file, used
+            for efficient seeking during resumption.
+    """
 
     num_row_groups: int = 0
 
@@ -193,7 +229,16 @@ class ParquetShardedSource(ShardedDataSource[dict]):
 
     @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def get_shard_info(self, shard_name: str) -> ParquetShardInfo:
-        """Get metadata about a Parquet shard."""
+        """Get metadata about a Parquet shard including row group count.
+
+        Results are cached to avoid repeated file reads.
+
+        Args:
+            shard_name: Path or URL to the Parquet file.
+
+        Returns:
+            ParquetShardInfo with file metadata.
+        """
         if shard_name in self._shard_info_cache:
             return self._shard_info_cache[shard_name]
 
@@ -212,7 +257,16 @@ class ParquetShardedSource(ShardedDataSource[dict]):
 
     @with_retry(max_retries=3, initial_delay=1.0)  # pyright: ignore[reportUntypedFunctionDecorator]
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
-        """Open a Parquet shard and iterate over rows."""
+        """Open a Parquet shard and iterate over rows.
+
+        Reads row groups sequentially and yields individual rows as dictionaries.
+
+        Args:
+            shard_name: Path or URL to the Parquet file.
+
+        Yields:
+            Individual rows as dictionaries.
+        """
         import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
         with self._open_file(shard_name) as fh:
@@ -229,7 +283,15 @@ class ParquetShardedSource(ShardedDataSource[dict]):
     def open_shard_at_row(self, shard_name: str, row: int) -> "Iterator[dict]":
         """Open a Parquet shard starting at a specific row.
 
-        Uses row group metadata for efficient seeking.
+        Uses row group metadata to skip directly to the relevant row group,
+        avoiding sequential scanning of earlier rows.
+
+        Args:
+            shard_name: Path or URL to the Parquet file.
+            row: Zero-based row index to start from.
+
+        Yields:
+            Rows starting from the specified position.
         """
         import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
 
@@ -749,16 +811,20 @@ def _detect_builder_and_files(data_files: str | os.PathLike | list[str | os.Path
 
 
 def load_for_inform(inform, mixture):
-    """Legacy function for backward compatibility.
+    """Load a HuggingFace dataset based on inform and mixture configuration.
 
-    Load a dataset based on the provided inform configuration.
+    Handles both HuggingFace Hub datasets and local file-based datasets.
+    Falls back to a streaming Parquet reader when the standard HF loader
+    fails with schema incompatibilities.
 
     Args:
-        inform: Dataset information object containing loading configuration.
-        mixture: DatasetMixture object containing global settings.
+        inform: Dataset information object (TextDatasetInform or VisualDatasetInform)
+            containing data files, type, split, and other loading parameters.
+        mixture: DatasetMixture object containing global settings like cache_dir,
+            streaming mode, and seed.
 
     Returns:
-        Loaded Dataset or IterableDataset.
+        Loaded Dataset or IterableDataset ready for further processing.
     """
     from datasets import IterableDataset, load_dataset  # pyright: ignore[reportMissingTypeStubs]
 

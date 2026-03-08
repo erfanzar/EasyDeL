@@ -611,7 +611,22 @@ class GRPOTrainer(Trainer):
         metrics: MetricsType,
         step: int,
     ) -> tuple[EasyDeLState, MetricsType]:
-        """hook process to call in start of the step."""
+        """Post-step hook that optionally synchronizes the reference model.
+
+        When ``sync_ref_model`` is enabled in the training arguments, this
+        method performs an exponential moving average (EMA) update of the
+        reference model parameters toward the current policy parameters
+        every ``ref_model_sync_steps`` steps.
+
+        Args:
+            state: The current model state after the training step.
+            metrics: Metrics collected during the training step.
+            step: The current global training step number.
+
+        Returns:
+            tuple[EasyDeLState, MetricsType]: The (possibly unchanged) state
+                and metrics, passed through for further processing.
+        """
 
         if (
             self.arguments.sync_ref_model

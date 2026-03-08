@@ -97,6 +97,33 @@ class GlmMoeDsaIndexerOp(OperationImpl):
         indexer_rope_interleave: bool = False,
         **ignore,
     ) -> GlmMoeDsaIndexerOutput:
+        """Compute DSA top-k token indices for dynamic sparse attention.
+
+        Applies optional RoPE to query and key states, optionally
+        concatenates with cached keys, computes per-head attention scores
+        weighted by ``head_weights``, applies masking, and returns the
+        top-k token indices per query position.
+
+        Args:
+            query_states: Query tensor [batch, seq, n_heads, head_dim].
+            key_states: Key tensor [batch, seq, head_dim] (single-head).
+            head_weights: Per-head weighting [batch, seq, n_heads].
+            position_ids: Position indices [batch, seq] for RoPE.
+            qk_rope_head_dim: Number of head dimensions to apply RoPE to.
+            index_topk: Number of top-k indices to return per query token.
+            softmax_scale: Scaling factor for attention scores.
+            frequencies: Precomputed RoPE frequencies. None skips RoPE.
+            attention_mask: Optional boolean or float mask [batch, seq, kv].
+            cached_keys: Previously cached keys for incremental indexing.
+            use_cache: Whether to update and return cached keys.
+            reset_cache: Whether to discard existing cached keys.
+            indexer_rope_interleave: Use interleaved RoPE layout if True.
+            **ignore: Additional ignored keyword arguments.
+
+        Returns:
+            GlmMoeDsaIndexerOutput with ``topk_indices`` and optionally
+            updated ``cached_keys``.
+        """
         del ignore
 
         query_states_f32 = query_states.astype(jnp.float32)
@@ -187,18 +214,23 @@ class GlmMoeDsaIndexerOp(OperationImpl):
         )
 
     def forward_tpu(self, *args, **kwargs) -> GlmMoeDsaIndexerOutput:
+        """TPU forward pass. Delegates to ``forward_native``."""
         return self.forward_native(*args, **kwargs)
 
     def forward_gpu(self, *args, **kwargs) -> GlmMoeDsaIndexerOutput:
+        """GPU forward pass. Delegates to ``forward_native``."""
         return self.forward_native(*args, **kwargs)
 
     def forward_cpu(self, *args, **kwargs) -> GlmMoeDsaIndexerOutput:
+        """CPU forward pass. Delegates to ``forward_native``."""
         return self.forward_native(*args, **kwargs)
 
     def forward_cuda(self, *args, **kwargs) -> GlmMoeDsaIndexerOutput:
+        """CUDA forward pass. Delegates to ``forward_native``."""
         return self.forward_native(*args, **kwargs)
 
     def forward_rocm(self, *args, **kwargs) -> GlmMoeDsaIndexerOutput:
+        """ROCm forward pass. Delegates to ``forward_native``."""
         return self.forward_native(*args, **kwargs)
 
     def __call__(
@@ -218,6 +250,27 @@ class GlmMoeDsaIndexerOp(OperationImpl):
         indexer_rope_interleave: bool = False,
         **kwargs,
     ) -> GlmMoeDsaIndexerOutput:
+        """Execute the DSA indexer by dispatching to the appropriate backend.
+
+        Args:
+            query_states: Query tensor [batch, seq, n_heads, head_dim].
+            key_states: Key tensor [batch, seq, head_dim].
+            head_weights: Per-head weighting [batch, seq, n_heads].
+            position_ids: Position indices [batch, seq].
+            qk_rope_head_dim: RoPE dimension count.
+            index_topk: Number of top-k indices to select.
+            softmax_scale: Attention score scaling factor.
+            frequencies: Optional RoPE frequencies.
+            attention_mask: Optional attention mask.
+            cached_keys: Optional previously cached keys.
+            use_cache: Whether to maintain a key cache.
+            reset_cache: Whether to discard existing cache.
+            indexer_rope_interleave: Use interleaved RoPE layout.
+            **kwargs: Additional keyword arguments passed to the backend.
+
+        Returns:
+            GlmMoeDsaIndexerOutput with top-k indices and cached keys.
+        """
         return super().__call__(
             query_states=query_states,
             key_states=key_states,

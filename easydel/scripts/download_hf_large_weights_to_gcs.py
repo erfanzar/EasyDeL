@@ -74,12 +74,25 @@ PYTORCH_WEIGHT_GLOBS = (
 
 @dataclass(frozen=True)
 class RepoFile:
+    """Metadata for a single file in a HuggingFace repository.
+
+    Attributes:
+        name: Relative filename within the repository.
+        size: File size in bytes, or ``None`` if unknown.
+    """
+
     name: str
     size: int | None
 
 
 @dataclass
 class LargeWeightsArgs:
+    """Command-line arguments for downloading large HF weight files.
+
+    Controls repository selection (individual repos, files, or HF collections),
+    file filtering (size threshold, glob patterns), and download behavior.
+    """
+
     out_root: str = field(metadata={"help": "Output root directory (e.g. /mnt/gcs/weights)."})
 
     repo_id: str = field(default_factory=list, metadata={"action": "append", "help": "Model repo id (repeatable)."})
@@ -133,6 +146,14 @@ class LargeWeightsArgs:
 
 
 def _read_models_file(path: str | os.PathLike) -> list[str]:
+    """Read repository IDs from a text file (one per line, ``#`` comments allowed).
+
+    Args:
+        path: Path to the models file.
+
+    Returns:
+        List of repository ID strings.
+    """
     text = Path(path).read_text(encoding="utf-8")
     repo_ids: list[str] = []
     for raw_line in text.splitlines():
@@ -144,6 +165,18 @@ def _read_models_file(path: str | os.PathLike) -> list[str]:
 
 
 def _parse_collection(value: str) -> tuple[str, str]:
+    """Parse a HuggingFace collection identifier or URL.
+
+    Args:
+        value: Either a URL (``https://huggingface.co/collections/owner/slug``)
+            or an ``owner/slug`` string.
+
+    Returns:
+        Tuple of (owner, slug).
+
+    Raises:
+        ValueError: If the value cannot be parsed.
+    """
     value = value.strip()
     if not value:
         raise ValueError("Empty collection value")
@@ -162,6 +195,16 @@ def _parse_collection(value: str) -> tuple[str, str]:
 
 
 def _fetch_collection_repo_ids(owner: str, slug: str, *, timeout_s: int = 30) -> list[str]:
+    """Fetch model repository IDs from a HuggingFace collection via the API.
+
+    Args:
+        owner: Collection owner username or organization.
+        slug: Collection slug identifier.
+        timeout_s: HTTP request timeout in seconds.
+
+    Returns:
+        List of model repository ID strings in the collection.
+    """
     url = f"https://huggingface.co/api/collections/{owner}/{slug}"
     data = requests.get(url, timeout=timeout_s).json()
     repo_ids: list[str] = []
@@ -204,6 +247,18 @@ def _repo_out_dir(out_root: Path, repo_id: str) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Download large non-PyTorch weight files from HuggingFace repos.
+
+    Iterates over specified repos and downloads files that meet the size
+    threshold and glob filters. By default, PyTorch weights and small
+    metadata files are excluded.
+
+    Args:
+        argv: Command-line arguments. Uses ``sys.argv`` when ``None``.
+
+    Returns:
+        Exit code: 0 on success, 2 if any downloads failed.
+    """
     parser = DataClassArgumentParser(
         LargeWeightsArgs,
         description="Download large (non-PyTorch) weight files from Hugging Face into a GCS (or local) directory.",

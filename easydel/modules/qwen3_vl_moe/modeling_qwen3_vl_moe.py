@@ -616,6 +616,15 @@ class Qwen3VLMoeVisionAttention(UnifiedAttention):
         precision: jax.lax.PrecisionLike,
         rngs: nn.Rngs,
     ) -> None:
+        """Define the QKV and output projection layers for vision attention.
+
+        Args:
+            config: Vision encoder configuration.
+            dtype: Data type for computation.
+            param_dtype: Data type for parameters.
+            precision: Numerical precision for matrix operations.
+            rngs: Random number generator state.
+        """
         self.qkv = ColumnParallelLinear(
             self.hidden_size,
             self.hidden_size * 3,

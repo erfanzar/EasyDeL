@@ -112,6 +112,7 @@ class BaseDatasetInform:
     format_fields: dict[str, str] | None = None
 
     def __post_init__(self):
+        """Validate and auto-detect dataset type from file extension if not provided."""
         if self.type is None:
             # Convert PathLike to string for type inference
             inferred_type = None
@@ -291,6 +292,7 @@ class DatasetMixture:
     mixture_weights: dict[str, float] | None = None
 
     def __post_init__(self):
+        """Ensure cache directory exists, converting string paths to ePath."""
         if isinstance(self.cache_dir, str):
             self.cache_dir = ePath(self.cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)

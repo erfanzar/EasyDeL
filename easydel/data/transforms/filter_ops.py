@@ -47,7 +47,14 @@ class FilterTransform(Transform):
         self._predicate = predicate
 
     def __call__(self, example: Example) -> Example | None:
-        """Return example if predicate is True, else None."""
+        """Return example if predicate is True, else None.
+
+        Args:
+            example: Input example dictionary.
+
+        Returns:
+            The example if it passes the predicate, None otherwise.
+        """
         return example if self._predicate(example) else None
 
     @property
@@ -83,7 +90,16 @@ class FilterByField(Transform):
         self._predicate = predicate
 
     def __call__(self, example: Example) -> Example | None:
-        """Return example if field matches predicate, else None."""
+        """Return example if the specified field's value matches the predicate.
+
+        Returns None if the field is missing or the predicate returns False.
+
+        Args:
+            example: Input example dictionary.
+
+        Returns:
+            The example if the field passes the predicate, None otherwise.
+        """
         if self._field not in example:
             return None
         return example if self._predicate(example[self._field]) else None
@@ -118,7 +134,16 @@ class FilterNonEmpty(Transform):
         self._fields = fields
 
     def __call__(self, example: Example) -> Example | None:
-        """Return example if all fields are non-empty, else None."""
+        """Return example if all specified fields are non-empty.
+
+        Checks for None, empty string "", empty list [], and missing fields.
+
+        Args:
+            example: Input example dictionary.
+
+        Returns:
+            The example if all fields are non-empty, None otherwise.
+        """
         for field in self._fields:
             value = example.get(field)
             if value is None or value == "" or value == []:

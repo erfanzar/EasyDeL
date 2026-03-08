@@ -39,6 +39,19 @@ except ImportError:
 
 
 class SMPMemoryMonitor:
+    """Simple memory monitor for JAX devices.
+
+    Tracks memory usage across all local JAX devices, maintains a history
+    of measurements, and provides reporting utilities. Can run in the
+    background to log periodic snapshots.
+
+    Attributes:
+        check_interval: Seconds between automatic checks.
+        quiet: If True, suppresses printed output during monitoring.
+        running: Whether background monitoring is active.
+        history: List of memory analysis dictionaries.
+    """
+
     def __init__(self, check_interval: int = 60, quiet: bool = False):
         """
         Initialize the memory monitor.
@@ -246,6 +259,20 @@ class DeviceStats:
 
 
 class MemoryMonitorServer:
+    """TCP server that collects device memory statistics from remote clients.
+
+    Receives serialized ``DeviceStats`` objects over TCP, stores them, and
+    analyzes trends for high utilization or fragmentation warnings.
+
+    Attributes:
+        host: Address to bind the server socket to.
+        port: Port to listen on.
+        stats_queue: Thread-safe queue for incoming stats.
+        running: Whether the server is active.
+        data_store: In-memory list of received ``DeviceStats``.
+        lock: Threading lock for ``data_store`` access.
+    """
+
     def __init__(self, host="0.0.0.0", port=5000):
         self.host = host
         self.port = port
@@ -323,6 +350,20 @@ class MemoryMonitorServer:
 
 
 class MemoryMonitorClient:
+    """Client that monitors local JAX device memory and reports to a server.
+
+    Periodically collects memory statistics from all local JAX devices,
+    packages them as ``DeviceStats``, and sends them to a
+    ``MemoryMonitorServer`` over TCP.
+
+    Attributes:
+        server_host: Hostname or IP of the monitoring server.
+        server_port: Port of the monitoring server.
+        interval: Seconds between monitoring cycles.
+        running: Whether monitoring is active.
+        hostname: Local hostname for identification.
+    """
+
     def __init__(self, server_host, server_port=5000, interval=60):
         self.server_host = server_host
         self.server_port = server_port
@@ -399,12 +440,25 @@ class MemoryMonitorClient:
 
 
 def start_server():
+    """Create and start a ``MemoryMonitorServer`` on the default address.
+
+    Returns:
+        The running ``MemoryMonitorServer`` instance.
+    """
     server = MemoryMonitorServer()
     server.start()
     return server
 
 
 def start_client(server_host):
+    """Create and start a ``MemoryMonitorClient`` that reports to the given host.
+
+    Args:
+        server_host: Hostname or IP address of the monitoring server.
+
+    Returns:
+        The running ``MemoryMonitorClient`` instance.
+    """
     client = MemoryMonitorClient(server_host)
     client.start_monitoring()
     return client

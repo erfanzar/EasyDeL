@@ -504,6 +504,12 @@ class OPTLearnedPositionalEmbedding(nn.Module):
             )
 
     def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specifications for positional embedding parameters.
+
+        Returns:
+            dict[str, object]: Mapping of parameter names to sharding specs.
+                The kernel is replicated across all devices.
+        """
         return {"kernel": Replicated}
 
     def __call__(self, inputs: Array) -> Array:

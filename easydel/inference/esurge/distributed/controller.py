@@ -152,6 +152,27 @@ class DistributedController:
         config_fingerprint: str,
         execute_step: Any | None,
     ) -> None:
+        """Initialize the distributed controller with cluster configuration.
+
+        Stores all configuration parameters and initializes internal state for
+        cluster discovery, worker connections, and step coordination.
+
+        Args:
+            enabled: Whether distributed mode is active.
+            role: ``"leader"`` or ``"worker"``.
+            rank: This host's rank within the cluster.
+            world_size: Total number of hosts expected.
+            service_name: DNS name for cluster discovery.
+            control_port: TCP port for ZeroMQ control-plane sockets.
+            control_bind_host: Interface address for worker server binding.
+            advertise_addr: Address advertised to the leader; auto-detected if None.
+            auth_token: Shared secret for control-plane authentication.
+            step_timeout_s: Timeout in seconds for step completion.
+            connect_timeout_s: Timeout in seconds for initial connections.
+            verify_sampling_digest: Whether to compare sampled-token digests.
+            config_fingerprint: SHA-256 config digest for compatibility checks.
+            execute_step: Worker callback for model step execution; None on leader.
+        """
         self.enabled = bool(enabled)
         self.role = str(role)
         self.rank = int(rank)

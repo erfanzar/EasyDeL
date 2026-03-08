@@ -1109,8 +1109,29 @@ class BaseTrainer(BaseTrainerProtocol):
         all_gather: bool = False,
         **generate_kwargs,
     ):
-        """
-        Convenience wrapper around the compiled generation function.
+        """Convenience wrapper around the compiled generation function.
+
+        Handles generation configuration merging, function creation/caching,
+        and optional all-gather across devices.
+
+        Args:
+            input_ids: Token IDs for the prompt.
+            attention_mask: Optional attention mask. Defaults to all ones.
+            state: Model state to use. Defaults to self.model_state.
+            generation_config: Optional generation configuration override.
+            shard_inputs: Whether to shard inputs across devices.
+            config_overrides: Dictionary of generation config attribute overrides.
+            return_metadata: If True, returns (sequences, prompt_ids, prompt_mask).
+            all_gather: Whether to gather results from all devices.
+            **generate_kwargs: Additional kwargs passed to generate.
+
+        Returns:
+            jax.Array: Generated sequences if return_metadata is False.
+            tuple[jax.Array, jax.Array, jax.Array]: (sequences, prompt_ids, prompt_mask)
+                if return_metadata is True.
+
+        Raises:
+            RuntimeError: If model state is not initialized.
         """
 
         if state is None:
@@ -2953,6 +2974,19 @@ class BaseTrainer(BaseTrainerProtocol):
         easystate_to_huggingface_model_kwargs: dict | None = None,
         torch_save_pretrained_kwargs: dict | None = None,
     ):
+        """Save the model in either EasyDeL state format or PyTorch format.
+
+        Args:
+            state: The model state to save.
+            save_directory: Directory to save to. If None, uses default from arguments.
+            gather_fns: Optional gather functions for distributed parameter collection.
+            to_torch: If True, converts and saves as a HuggingFace PyTorch model.
+            easystate_to_huggingface_model_kwargs: Extra kwargs for EasyDeL-to-HF conversion.
+            torch_save_pretrained_kwargs: Extra kwargs for HF save_pretrained.
+
+        Returns:
+            str or HuggingFace model: Path to saved checkpoint (EasyDeL) or HF model instance (PyTorch).
+        """
         save_directory = save_directory or self.arguments.get_path()
         save_directory = ePath(save_directory)
         if to_torch:
@@ -3041,6 +3075,21 @@ class BaseTrainer(BaseTrainerProtocol):
         return sum(n.size for n in jax.tree_util.tree_flatten(prm)[0])
 
     def apply_training_hooks(self, metrics: LossMetrics) -> LossMetrics:
+        """Apply training hooks to check for stopping conditions.
+
+        Checks for NaN loss (if configured) and time limits, raising appropriate
+        exceptions to interrupt training when conditions are met.
+
+        Args:
+            metrics: The loss metrics from the current training step.
+
+        Returns:
+            LossMetrics: The unmodified metrics if no stopping condition is triggered.
+
+        Raises:
+            EasyDeLBreakRequest: If NaN loss is detected and break_on_nan is enabled.
+            EasyDeLTimerError: If training has exceeded the configured time limit.
+        """
         if self.arguments.loss_config is not None and self.arguments.loss_config.break_on_nan:
             if jnp.isnan(metrics.loss):
                 info = "Prevent Running Model Due to NaN Loss"
@@ -3331,7 +3380,18 @@ class BaseTrainer(BaseTrainerProtocol):
         step: int,
         mode: str = "train",
     ):
-        """Log metrics and update progress bar."""
+        """Log metrics to configured backends and update the progress bar.
+
+        Metrics are logged at intervals defined by log_steps (for progress bar)
+        and report_steps (for W&B/TensorBoard). MLPerf and grad_norm metrics
+        are filtered from the progress bar display.
+
+        Args:
+            metrics: Dictionary of metric names to values.
+            pbar: Progress bar instance to update.
+            step: Current training/evaluation step.
+            mode: Either 'train' or 'eval' to prefix metrics.
+        """
 
         if step % self.arguments.log_steps == 0:
             if step == 0:

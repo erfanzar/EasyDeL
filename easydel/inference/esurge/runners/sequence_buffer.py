@@ -112,6 +112,15 @@ def build_sampling_arrays(temperature, min_p, top_p, top_k, num_reqs, padded_num
     """
 
     def fill(arr, fill_val):
+        """Create a padded array filled with a default value and active entries copied in.
+
+        Args:
+            arr: Source array containing active sampling parameter values.
+            fill_val: Default value used for padding slots beyond num_reqs.
+
+        Returns:
+            Padded array of shape (padded_num_reqs,) with active values at the front.
+        """
         out = jnp.full((padded_num_reqs,), fill_val, dtype=arr.dtype)
         return out.at[:num_reqs].set(arr[:num_reqs])
 
@@ -332,10 +341,12 @@ class SequenceBuffer:
 
     @property
     def req_ids(self) -> list[str | None]:
+        """List of request IDs indexed by row slot, with None for empty slots."""
         return self._req_ids
 
     @property
     def num_reqs(self) -> int:
+        """Number of active requests currently in the buffer."""
         return len(self.req_id_to_index)
 
     @property
@@ -345,26 +356,32 @@ class SequenceBuffer:
 
     @property
     def all_greedy(self) -> bool:
+        """Whether all active requests use greedy (deterministic) sampling."""
         return len(self.random_reqs) == 0
 
     @property
     def all_random(self) -> bool:
+        """Whether all active requests use random (stochastic) sampling."""
         return len(self.greedy_reqs) == 0
 
     @property
     def no_top_p(self) -> bool:
+        """Whether no active requests use top-p (nucleus) sampling."""
         return len(self.top_p_reqs) == 0
 
     @property
     def no_top_k(self) -> bool:
+        """Whether no active requests use top-k sampling."""
         return len(self.top_k_reqs) == 0
 
     @property
     def no_min_p(self) -> bool:
+        """Whether no active requests use min-p sampling."""
         return len(self.min_p_reqs) == 0
 
     @property
     def no_penalties(self) -> bool:
+        """Whether no active requests use any penalty (presence, frequency, or repetition)."""
         return (
             len(self.presence_penalties_reqs) == 0
             and len(self.frequency_penalties_reqs) == 0
@@ -373,14 +390,17 @@ class SequenceBuffer:
 
     @property
     def max_num_logprobs(self) -> int | None:
+        """Maximum number of log probabilities requested across all active requests, or None if none."""
         return max(self.num_logprobs.values()) if self.num_logprobs else None
 
     @property
     def no_prompt_logprob(self) -> bool:
+        """Whether no active requests need prompt log probabilities."""
         return not self.num_prompt_logprobs
 
     @property
     def no_allowed_token_ids(self) -> bool:
+        """Whether no active requests have constrained token ID sets."""
         return len(self.has_allowed_token_ids) == 0
 
     def _ensure_logit_bias_capacity(self, upto_idx: int) -> None:

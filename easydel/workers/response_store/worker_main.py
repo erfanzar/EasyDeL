@@ -39,6 +39,20 @@ def _worker(
     max_stored_conversations: int,
     compression_level: int,
 ) -> None:
+    """Run the response store worker event loop.
+
+    Binds a ZMQ REP socket to ``endpoint`` and serves requests to get,
+    put, and delete response/conversation records backed by a
+    ``FileResponseStore``.
+
+    Args:
+        endpoint: ZeroMQ endpoint to bind to (e.g. ``ipc:///tmp/store.sock``).
+        storage_dir: Directory for persistent file storage. Defaults to
+            ``~/.cache/easydel-response-store`` when ``None``.
+        max_stored_responses: Maximum number of response records to retain.
+        max_stored_conversations: Maximum number of conversation records to retain.
+        compression_level: zlib compression level (0-9) for stored data.
+    """
     if storage_dir is None:
         storage_dir = str(Path.home() / ".cache" / "easydel-response-store")
     store = FileResponseStore(
@@ -122,6 +136,11 @@ def _worker(
 
 
 def main() -> None:
+    """CLI entry point for the response store worker process.
+
+    Parses command-line arguments and starts the ZMQ worker loop. Intended
+    to be invoked as a subprocess by ``ResponseStoreWorkerManager``.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--storage-dir", default=None)

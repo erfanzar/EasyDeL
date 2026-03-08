@@ -91,6 +91,15 @@ class RobertaEmbeddings(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RoBERTa embeddings layer.
+
+        Args:
+            config: RoBERTa model configuration.
+            dtype: Data type for computation. Defaults to jnp.float32.
+            param_dtype: Data type for parameters. Defaults to jnp.float32.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -198,6 +207,19 @@ class RobertaSelfAttention(AttentionModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RoBERTa self-attention module.
+
+        Args:
+            config: RoBERTa model configuration.
+            causal: Whether to apply causal (unidirectional) masking. Defaults to False.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+
+        Raises:
+            ValueError: If hidden_size is not divisible by num_attention_heads.
+        """
         super().__init__(config)
         self.causal = causal
         self.dtype = dtype
@@ -395,6 +417,15 @@ class RobertaSelfOutput(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RoBERTa self-output projection layer.
+
+        Args:
+            config: RoBERTa model configuration.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -462,6 +493,16 @@ class RobertaAttention(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RoBERTa attention module.
+
+        Args:
+            config: RoBERTa model configuration.
+            causal: Whether to apply causal masking. Defaults to False.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+        """
         self.config = config
         self.causal = causal
         self.dtype = dtype
@@ -553,6 +594,15 @@ class RobertaIntermediate(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RoBERTa intermediate (up-projection) layer.
+
+        Args:
+            config: RoBERTa model configuration.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -612,6 +662,15 @@ class RobertaOutput(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RoBERTa output (down-projection) layer.
+
+        Args:
+            config: RoBERTa model configuration.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -684,6 +743,15 @@ class RobertaLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize a single RoBERTa encoder layer.
+
+        Args:
+            config: RoBERTa model configuration.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -820,6 +888,15 @@ class RobertaEncoder(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the RoBERTa encoder layer stack.
+
+        Args:
+            config: RoBERTa model configuration.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -964,6 +1041,15 @@ class RobertaPooler(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RoBERTa pooler layer.
+
+        Args:
+            config: RoBERTa model configuration.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -1026,6 +1112,15 @@ class RobertaLMHead(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RoBERTa language modeling head.
+
+        Args:
+            config: RoBERTa model configuration.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -1122,6 +1217,15 @@ class RobertaClassificationHead(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RoBERTa classification head.
+
+        Args:
+            config: RoBERTa model configuration with num_labels attribute.
+            dtype: Data type for computation. Defaults to jnp.bfloat16.
+            param_dtype: Data type for parameters. Defaults to jnp.bfloat16.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+        """
         self.config = config
         self.dtype = dtype
         self.param_dtype = param_dtype
@@ -1207,6 +1311,16 @@ class RobertaModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the RoBERTa base model.
+
+        Args:
+            config: RoBERTa model configuration.
+            dtype: Data type for computation. Defaults to jnp.float32.
+            param_dtype: Data type for parameters. Defaults to jnp.float32.
+            precision: JAX precision setting for operations. Defaults to None.
+            add_pooling_layer: Whether to add a pooling layer on top. Defaults to True.
+            rngs: Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1420,6 +1534,15 @@ class RobertaForSequenceClassification(BaseSequenceClassificationModule[RobertaM
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RoBERTa for sequence classification.
+
+        Args:
+            config: RoBERTa model configuration with num_labels attribute.
+            dtype: Data type for computation. Defaults to jnp.float32.
+            param_dtype: Data type for parameters. Defaults to jnp.float32.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+        """
         roberta = RobertaModel(
             config=config,
             dtype=dtype,
@@ -1549,6 +1672,15 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RoBERTa for multiple-choice classification.
+
+        Args:
+            config: RoBERTa model configuration.
+            dtype: Data type for computation. Defaults to jnp.float32.
+            param_dtype: Data type for parameters. Defaults to jnp.float32.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -1686,6 +1818,15 @@ class RobertaForTokenClassification(BaseTokenClassificationModule[RobertaModel, 
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RoBERTa for token classification.
+
+        Args:
+            config: RoBERTa model configuration with num_labels attribute.
+            dtype: Data type for computation. Defaults to jnp.float32.
+            param_dtype: Data type for parameters. Defaults to jnp.float32.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+        """
         roberta = RobertaModel(
             config=config,
             dtype=dtype,
@@ -1818,6 +1959,16 @@ class RobertaForQuestionAnswering(BaseQuestionAnsweringModule[RobertaModel, Robe
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RoBERTa for extractive question answering.
+
+        Args:
+            config: RoBERTa model configuration with num_labels=2 for
+                start/end span prediction.
+            dtype: Data type for computation. Defaults to jnp.float32.
+            param_dtype: Data type for parameters. Defaults to jnp.float32.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+        """
         roberta = RobertaModel(
             config=config,
             dtype=dtype,
@@ -1954,6 +2105,15 @@ class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):  # ty
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize RoBERTa for causal language modeling.
+
+        Args:
+            config: RoBERTa model configuration.
+            dtype: Data type for computation. Defaults to jnp.float32.
+            param_dtype: Data type for parameters. Defaults to jnp.float32.
+            precision: JAX precision setting for operations. Defaults to None.
+            rngs: Random number generator state.
+        """
         roberta = RobertaModel(
             config=config,
             add_pooling_layer=False,

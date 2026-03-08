@@ -164,7 +164,7 @@ class PrefetchIterator:
         return item
 
     def close(self):
-        """Stop prefetching and cleanup."""
+        """Stop the prefetch worker thread and clean up resources."""
         self._stop_event.set()
         if self._worker is not None:
             self._worker.join(timeout=1.0)
@@ -172,7 +172,12 @@ class PrefetchIterator:
 
 @dataclass
 class ShardingSpec:
-    """Specification for sharding batch arrays across devices."""
+    """Specification for sharding batch arrays across JAX devices.
+
+    Attributes:
+        mesh: JAX device mesh for distributed sharding.
+        partition_specs: Mapping of field names to PartitionSpec objects.
+    """
 
     mesh: tp.Any = None  # jax.sharding.Mesh
     partition_specs: dict[str, tp.Any] = field(default_factory=dict)  # field -> PartitionSpec
@@ -372,7 +377,11 @@ class AsyncDataLoader(AsyncDataset[dict]):
 
 
 class LoadStage(BaseStage):
-    """Pipeline stage for data loading."""
+    """Pipeline stage for creating data loaders from sources.
+
+    Wraps ShardedDataSource instances into AsyncDataLoader instances with
+    batching, prefetching, and optional sharding support.
+    """
 
     def __init__(self, config: LoadStageConfig | None = None):
         """Initialize LoadStage.

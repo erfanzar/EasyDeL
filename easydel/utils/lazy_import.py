@@ -23,7 +23,19 @@ IMPORT_STRUCTURE_T = dict[BACKENDS_T, dict[str, set[str]]]
 
 
 class LazyModule(ModuleType):
-    # copy pasted from huggingface lazy module
+    """Module subclass that defers sub-module imports until first access.
+
+    Used as the top-level ``__init__`` module for EasyDeL packages so that
+    ``import easydel`` is fast and only imports sub-packages on demand.
+    Adapted from the HuggingFace ``transformers`` lazy module pattern.
+
+    Attributes:
+        _modules: Set of known sub-module names.
+        _class_to_module: Mapping from exported class name to its sub-module.
+        _import_structure: Flattened mapping of module -> list of exported names.
+        _objects: Extra objects injected at construction time.
+    """
+
     def __init__(
         self,
         name: str,

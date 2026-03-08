@@ -122,6 +122,14 @@ class GlmMoeDsaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> Array:
+        """Applies the gated MLP transformation.
+
+        Args:
+            hidden_states: Input tensor of shape ``(batch, seq_len, hidden_dim)``.
+
+        Returns:
+            Transformed hidden states with the same shape as input.
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -272,6 +280,16 @@ class GlmMoeDsaMLPStack(nn.Module):
         group_sizes: Array,
         sorted_experts: Array | None = None,
     ) -> Array:
+        """Applies the gated MLP across all experts in a fused manner.
+
+        Args:
+            hidden_states: Token representations, pre-sorted by expert assignment.
+            group_sizes: Number of tokens assigned to each expert.
+            sorted_experts: Expert indices for sorted token ordering.
+
+        Returns:
+            Transformed hidden states after expert-parallel MLP.
+        """
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -336,6 +354,14 @@ class GlmMoeDsaTopKRouter(nn.Module):
         return {"kernel": kernel_spec, "e_score_correction_bias": Replicated}
 
     def __call__(self, hidden_states: Float[Array, "tokens hidden_dim"]) -> Array:
+        """Computes per-expert routing logits for all tokens.
+
+        Args:
+            hidden_states: Flattened token representations.
+
+        Returns:
+            Router logits of shape ``(tokens, n_routed_experts)``.
+        """
         hidden_states = hidden_states.reshape(-1, self.config.hidden_size)
         return checkpoint_name(
             jnp.matmul(hidden_states.astype(jnp.float32), self.kernel.value.astype(jnp.float32)),
@@ -462,6 +488,14 @@ class GlmMoeDsaMoE(BaseMoeModule):
         return topk_weights, topk_indices
 
     def __call__(self, hidden_states: Float[Array, "batch seq_len hidden_dim"]) -> tuple[Array, Array]:
+        """Routes tokens through selected experts and combines outputs.
+
+        Args:
+            hidden_states: Input tensor of shape ``(batch, seq_len, hidden_dim)``.
+
+        Returns:
+            Tuple of (combined expert output, router logits).
+        """
         out, router_logits = self.moe_call(
             hidden_state=hidden_states,
             gate_layer=self.gate,
@@ -669,6 +703,18 @@ class GlmMoeDsaAttention(UnifiedAttention):
         precision: jax.lax.Precision,
         rngs: nn.Rngs,
     ):
+        """Creates all projection layers, rotary embeddings, attention performer, and DSA indexer.
+
+        Builds query/key/value projections with optional LoRA decomposition for
+        queries and compressed KV projections for Multi-head Latent Attention.
+
+        Args:
+            config: Model configuration.
+            dtype: Computation dtype.
+            param_dtype: Parameter storage dtype.
+            precision: JAX matmul precision.
+            rngs: PRNG key container.
+        """
         if not self.use_mla_lora:
             setattr(
                 self,
@@ -1247,6 +1293,7 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
 
     @functools.cached_property
     def frequencies(self):
+        """Computes and caches RoPE frequency tensor for the model's rope head dimension."""
         return self.config.get_basic_frequencies(
             head_size=self.config.qk_rope_head_dim,
             rotary_dim=self.config.qk_rope_head_dim,

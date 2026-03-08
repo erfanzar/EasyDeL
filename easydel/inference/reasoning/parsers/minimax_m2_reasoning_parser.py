@@ -37,6 +37,7 @@ class MiniMaxM2ReasoningParser(BaseThinkingReasoningParser):
     end_token = "</think>"
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
+        """Extract reasoning by splitting at </think> (no start token required)."""
         if self.end_token not in model_output:
             return None, model_output
         # Everything before end token is reasoning (even without start token)
@@ -55,6 +56,7 @@ class MiniMaxM2ReasoningParser(BaseThinkingReasoningParser):
         delta_token_ids: Sequence[int],
         request=None,
     ) -> DeltaMessage | None:
+        """Stream reasoning (all text before </think>) and content (after)."""
         if not delta_text:
             return None
 
@@ -90,6 +92,7 @@ class MiniMaxM2AppendThinkReasoningParser(BaseThinkingReasoningParser):
     end_token = "</think>"
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
+        """Prepend <think> if missing, then delegate to base parser."""
         if self.start_token not in model_output:
             model_output = self.start_token + model_output
         return super().extract_reasoning(model_output, request)

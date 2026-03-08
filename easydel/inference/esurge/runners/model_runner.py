@@ -994,6 +994,12 @@ class eSurgeRunner:
         pages_per_shard = int(pages_per_shard_opt or 0) if use_dp_local_rows else 0
 
         def infer_req_shard(page_ids: tuple[list[int], ...]) -> int | None:
+            """Infer the DP shard index that owns a request based on its page IDs.
+
+            Examines page IDs across all cache groups and returns the shard
+            index if all non-null pages belong to the same shard. Returns
+            None if DP-local rows are disabled or pages span multiple shards.
+            """
             if not use_dp_local_rows or pages_per_shard <= 0:
                 return None
             inferred: int | None = None

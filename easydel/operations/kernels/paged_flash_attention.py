@@ -112,6 +112,38 @@ class PagedFlashAttn(OperationImpl):
         precision: lax.PrecisionLike = lax.Precision.DEFAULT,
         **ignore,
     ) -> AttentionOutput:
+        """Forward pass for paged flash attention on GPU.
+
+        Reads key/value data from a paged cache via block tables and computes
+        flash attention. Falls back to ``UnifiedAttn`` when batch dimensions
+        of query and block tables disagree.
+
+        Args:
+            query: Query tensor [batch, seq_len_q, num_heads, head_dim].
+            key: Key tensor (unused directly; keys come from cache_view).
+            value: Value tensor (unused directly; values come from cache_view).
+            cache_view: Paged KV cache view containing key/value page pools.
+            cache_metadata: Metadata with ``pages_tables`` (block tables).
+            mask_info: Optional mask information (segment IDs not supported).
+            bias: Optional attention bias [batch, num_heads, seq_q, seq_k].
+            softmax_scale: Scaling factor for logits. Defaults to 1/sqrt(head_dim).
+            dropout_prob: Attention dropout probability.
+            causal: Whether to apply causal masking.
+            dropout_seed: Seed for dropout RNG.
+            sliding_window: Window size for local/sliding-window attention.
+            logits_soft_cap: Soft capping value for attention logits.
+            softmax_aux: Auxiliary tensor for sink-token attention.
+            normalize_output: Whether to normalize the attention output.
+            precision: JAX precision setting for matmuls.
+            **ignore: Additional ignored keyword arguments.
+
+        Returns:
+            AttentionOutput with attended values and no explicit weights.
+
+        Raises:
+            NotImplementedError: If backend is not GPU.
+            ValueError: If cache_view, cache_metadata, or pages_tables is missing.
+        """
         if jax.default_backend() != "gpu":
             raise NotImplementedError("PagedFlashAttn requires a GPU backend (CUDA).")
 
@@ -233,16 +265,21 @@ class PagedFlashAttn(OperationImpl):
         return AttentionOutput(attention_weights=None, attention_outputs=attn_sharded)
 
     def forward_cuda(self, *args, **kwargs) -> AttentionOutput:
+        """CUDA forward pass. Delegates to ``forward_gpu``."""
         return self.forward_gpu(*args, **kwargs)
 
     def forward_tpu(self, *args, **kwargs) -> AttentionOutput:
+        """TPU forward pass. Delegates to ``forward_native``."""
         return self.forward_native(*args, **kwargs)
 
     def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
+        """CPU forward pass. Delegates to ``forward_native``."""
         return self.forward_native(*args, **kwargs)
 
     def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
+        """GPU forward pass. Delegates to ``forward_native``."""
         return self.forward_native(*args, **kwargs)
 
     def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
+        """ROCm forward pass. Delegates to ``forward_native``."""
         return self.forward_native(*args, **kwargs)

@@ -80,7 +80,10 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
     need_top_k = jnp.any(sampling_metadata.top_ks > 0)
 
     def apply_topk(legi):
+        """Apply top-k filtering to each sample in the batch."""
+
         def topk_per_sample(logits_i, k_i):
+            """Apply top-k mask to a single sample if k > 0."""
             return lax.cond(k_i > 0, lambda: apply_topk_mask(logits_i[None, :], k_i, min_val)[0], lambda: logits_i)
 
         return jax.vmap(topk_per_sample)(legi, sampling_metadata.top_ks)
@@ -91,7 +94,10 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
     need_top_p = jnp.any(sampling_metadata.top_ps < 1.0)
 
     def apply_topp(legi):
+        """Apply top-p (nucleus) filtering to each sample in the batch."""
+
         def topp_per_sample(logits_i, p_i):
+            """Apply top-p mask to a single sample if p < 1.0."""
             return lax.cond(p_i < 1.0, lambda: apply_topp_mask(logits_i[None, :], p_i, min_val)[0], lambda: logits_i)
 
         return jax.vmap(topp_per_sample)(legi, sampling_metadata.top_ps)
@@ -102,6 +108,7 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
     need_temp = jnp.any(sampling_metadata.temperatures != 1.0)
 
     def apply_temp(legi):
+        """Scale logits by per-sample temperature values."""
         return legi / sampling_metadata.temperatures
 
     logits = lax.cond(need_temp, apply_temp, lambda legi: legi, logits)
@@ -118,6 +125,7 @@ def _regular_sample(logits: jax.Array, sampling_metadata: SamplingMetadata, rng:
     batch_size = logits.shape[0]
 
     def sample_one(i):
+        """Sample a single token from the i-th sample's filtered logit distribution."""
         per_sample_rng = jax.random.fold_in(rng, i)
         return jax.random.categorical(per_sample_rng, logits[i]).astype(jnp.int32)
 

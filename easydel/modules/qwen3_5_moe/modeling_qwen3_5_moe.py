@@ -81,6 +81,15 @@ class Qwen3_5MoeForCausalLM(Qwen3NextForCausalLM):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Qwen3.5-MoE text causal LM.
+
+        Args:
+            config: Qwen3.5-MoE text configuration.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX matmul precision.
+            rngs: PRNG key container.
+        """
         BaseCausalLMModule.__init__(
             self,
             config=config,
@@ -122,6 +131,15 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Qwen3.5-MoE multimodal model with vision encoder and MoE text decoder.
+
+        Args:
+            config: Qwen3.5-MoE multimodal configuration.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX matmul precision.
+            rngs: PRNG key container.
+        """
         bootstrap_text_config = Qwen3VLMoeTextConfig(
             vocab_size=config.text_config.vocab_size,
             hidden_size=config.text_config.hidden_size,
@@ -211,6 +229,14 @@ class Qwen3_5MoeModel(Qwen3VLMoeModel):
         cache_position: jax.Array | None = None,  # compatibility no-op
         mm_token_type_ids: jax.Array | None = None,
     ) -> Qwen3VLMoeModelOutputWithPast:
+        """Forward pass through the Qwen3.5-MoE multimodal model.
+
+        Encodes image/video inputs via the vision tower, merges them into
+        the text embedding stream, and runs the MoE language model decoder.
+
+        Returns:
+            Qwen3VLMoeModelOutputWithPast: Model outputs including logits, hidden states, and router logits.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:
@@ -322,6 +348,18 @@ class Qwen3_5MoeForConditionalGeneration(BaseVisionLanguageModule[Qwen3_5MoeMode
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Qwen3.5 MoE vision-language model for conditional generation.
+
+        Sets up the MoE text backbone with vision encoder integration for
+        multimodal understanding. Uses spatial merge for image/video token merging.
+
+        Args:
+            config: Vision-language model configuration with text and vision configs.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX numerical precision.
+            rngs: Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Qwen3_5MoeModel,

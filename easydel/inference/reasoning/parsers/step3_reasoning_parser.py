@@ -32,6 +32,7 @@ class Step3ReasoningParser(BaseThinkingReasoningParser):
     end_token = "</think>"
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
+        """Extract reasoning by splitting at </think> (everything before is reasoning)."""
         if self.end_token not in model_output:
             # No end token: entire output could be reasoning-in-progress or just content
             return None, model_output
@@ -51,6 +52,7 @@ class Step3ReasoningParser(BaseThinkingReasoningParser):
         delta_token_ids: Sequence[int],
         request=None,
     ) -> DeltaMessage | None:
+        """Stream all text as reasoning until </think> appears, then switch to content."""
         if not delta_text:
             return None
 

@@ -53,6 +53,9 @@ class Olmo2Config(EasyDeLBaseConfig):
             by meanpooling all the original heads within that group. For more details checkout [this
             paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to
             `num_attention_heads`.
+        head_dim (`int`, *optional*):
+            Dimensionality of each attention head. If not provided, defaults to
+            ``hidden_size // num_attention_heads``.
         hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
             The non-linear activation function (function or string) in the decoder.
         max_position_embeddings (`int`, *optional*, defaults to 2048):
@@ -112,6 +115,7 @@ class Olmo2Config(EasyDeLBaseConfig):
         num_hidden_layers: int = 32,
         num_attention_heads: int = 32,
         num_key_value_heads: int | None = None,
+        head_dim: int | None = None,
         hidden_act: str = "silu",
         max_position_embeddings: int = 2048,
         initializer_range: float = 0.02,
@@ -155,6 +159,7 @@ class Olmo2Config(EasyDeLBaseConfig):
             num_key_value_heads = num_attention_heads
 
         self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim or hidden_size // num_attention_heads
         self.hidden_act = hidden_act
         self.initializer_range = initializer_range
         self.use_cache = use_cache
