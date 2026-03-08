@@ -70,6 +70,10 @@ class Qwen2VLVisionConfig(EasyDeLBaseConfig):
         initializer_range: float = 0.02,
         **kwargs,
     ):
+        """Initialize Qwen2VL vision encoder configuration.
+
+        See class docstring for detailed parameter descriptions.
+        """
         super().__init__(**kwargs)
 
         self.depth = depth
@@ -87,7 +91,58 @@ class Qwen2VLVisionConfig(EasyDeLBaseConfig):
 
 @register_config("qwen2_vl_text")
 class Qwen2VLTextConfig(EasyDeLBaseConfig):
-    """Configuration for the Qwen2-VL text decoder stack."""
+    """Configuration for the Qwen2-VL text decoder backbone.
+
+    Stores parameters for the decoder-only transformer used as the language backbone
+    in Qwen2-VL. Supports multi-rope (mRoPE) position embeddings for joint
+    spatial-temporal-text positioning, grouped query attention, and optional
+    sliding window attention.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 152064):
+            Vocabulary size of the Qwen2-VL text model.
+        hidden_size (`int`, *optional*, defaults to 8192):
+            Dimensionality of the hidden layers.
+        intermediate_size (`int`, *optional*, defaults to 29568):
+            Dimensionality of the MLP intermediate layer.
+        num_hidden_layers (`int`, *optional*, defaults to 80):
+            Number of transformer decoder layers.
+        num_attention_heads (`int`, *optional*, defaults to 64):
+            Number of attention heads for each attention layer.
+        num_key_value_heads (`int`, *optional*):
+            Number of key-value heads for grouped query attention. Defaults to
+            ``num_attention_heads`` (MHA) if ``None``.
+        hidden_act (`str`, *optional*, defaults to `"silu"`):
+            Activation function used in the MLP layers.
+        max_position_embeddings (`int`, *optional*, defaults to 32768):
+            Maximum sequence length this model supports.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            Standard deviation for weight initialization.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-5):
+            Epsilon for RMS normalization layers.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether to return past key/values for caching during generation.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie input and output word embeddings.
+        rope_theta (`float`, *optional*, defaults to 1000000.0):
+            Base frequency for rotary position embeddings.
+        use_sliding_window (`bool`, *optional*, defaults to `False`):
+            Whether to enable sliding window attention.
+        sliding_window (`int`, *optional*, defaults to 4096):
+            Sliding window size (set to ``None`` internally when disabled).
+        max_window_layers (`int`, *optional*, defaults to 80):
+            Layers at or above this index use sliding window attention.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            Dropout rate for attention weights.
+        rope_scaling (`dict`, *optional*):
+            RoPE scaling configuration. Automatically detects ``mrope`` type when
+            ``mrope_section`` is present.
+        rope_parameters (`dict`, *optional*):
+            Alternative name for ``rope_scaling`` (HF compatibility).
+        layer_types (`list[str]`, *optional*):
+            Per-layer attention type. Auto-derived from sliding window settings
+            if not provided.
+    """
 
     model_type = "qwen2_vl_text"
     base_config_key = "text_config"
@@ -117,6 +172,10 @@ class Qwen2VLTextConfig(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize Qwen2VL text decoder configuration.
+
+        See class docstring for detailed parameter descriptions.
+        """
         super().__init__(**kwargs)
 
         self.vocab_size = vocab_size
@@ -200,6 +259,10 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
         vision_end_token_id: int = 151653,
         **kwargs,
     ):
+        """Initialize Qwen2VL composite configuration with text and vision sub-configs.
+
+        See class docstring for detailed parameter descriptions.
+        """
         super().__init__(**kwargs)
 
         if isinstance(vision_config, dict):

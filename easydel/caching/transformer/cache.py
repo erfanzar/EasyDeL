@@ -166,7 +166,17 @@ MODE_PREFILL = common_types.MODE_PREFILL
 
 
 def _mesh_partition_product(mesh: Mesh, axis_spec: object) -> int:
-    """Return the number of shards implied by a PartitionSpec entry for a given mesh."""
+    """Return the number of shards implied by a PartitionSpec entry for a given mesh.
+
+    Args:
+        mesh: JAX device mesh containing axis name to size mappings.
+        axis_spec: A PartitionSpec entry, which can be None, a single
+            axis name string, or a tuple of axis name strings.
+
+    Returns:
+        int: Product of mesh axis sizes for the given spec. Returns 1
+            if axis_spec is None.
+    """
     if axis_spec is None:
         return 1
     if isinstance(axis_spec, tuple):
@@ -187,10 +197,20 @@ def _sanitize_sharding_axes_for_shape(
 ) -> tuple[object | None, ...]:
     """Disable incompatible sharding axes for a given shape.
 
-    Some logical axes (e.g., KV_HEAD) may map to a mesh axis whose size is larger than
-    the corresponding dimension (or not divisible). In that case, JAX raises at array
-    creation / sharding constraint time. We conservatively fall back to replication for
-    those dimensions by replacing the logical axis with None.
+    Some logical axes (e.g., KV_HEAD) may map to a mesh axis whose size
+    larger than or not evenly dividing the corresponding tensor dimension.
+    This function replaces such axes with None (replication) to prevent
+    JAX sharding errors.
+
+    Args:
+        mesh: JAX device mesh for axis size lookups.
+        partition_manager: Manager to resolve logical axes to PartitionSpec.
+        axes: List of logical axis names (or None for replicated dims).
+        mode: Runtime mode (e.g., MODE_PREFILL) for partition resolution.
+        shape: Tensor shape to validate axis compatibility against.
+
+    Returns:
+        tuple: Sanitized axes with incompatible entries replaced by None.
     """
     spec = partition_manager.resolve(axes=axes, mode=mode, shape=shape)
     safe: list[object | None] = []
@@ -369,27 +389,31 @@ class TransformerCacheConfig(BaseCacheConfig):
         create_attention_bias: bool = True,
         sliding_window: int | None = None,
     ) -> TransformerCacheConfig:
-        """
-        Create a TransformerCacheConfig instance with validation.
+        """Create a TransformerCacheConfig instance with validation.
 
-        Arguments:
-            batch_size: Size of the batch.
-            sequence_length: Length of the sequence.
-            num_hidden_layers: number of hidden layers.
-            num_heads: Number of attention heads.
-            head_dim: Dimension of each head.
-            key_heads: Number of key heads.
-            value_heads: Number of value heads.
-            key_dim: Dimension of keys.
-            value_dim: Dimension of values.
-            update_causal_mask: Whether to update causal mask.
-            create_attention_bias: Whether to create attention bias.
+        Args:
+            batch_size: Number of sequences in the batch. Must be positive.
+            sequence_length: Maximum sequence length to cache. Must be positive.
+            num_hidden_layers: Number of transformer layers in the model.
+            pad_token_id: Token ID used for padding. Default: -100.
+            num_heads: Number of attention heads (for standard MHA).
+                Either num_heads or both key_heads and value_heads must be set.
+            head_dim: Dimension of each attention head. Either head_dim
+                or both key_dim and value_dim must be set.
+            key_heads: Number of key heads (for MQA/GQA). Defaults to num_heads.
+            value_heads: Number of value heads (for MQA/GQA). Defaults to num_heads.
+            key_dim: Dimension of key projections. Defaults to head_dim.
+            value_dim: Dimension of value projections. Defaults to head_dim.
+            update_causal_mask: Whether to update causal masks dynamically.
+            create_attention_bias: Whether to create attention bias terms.
+            sliding_window: Optional sliding window size for local attention.
 
         Returns:
-            TransformerCacheConfig instance
+            TransformerCacheConfig: Validated configuration instance.
 
         Raises:
-            ValueError: If required parameters are missing or invalid.
+            ValueError: If batch_size or sequence_length are non-positive,
+                or if head dimensions cannot be determined.
         """
 
         if batch_size <= 0:
@@ -586,24 +610,34 @@ class TransformerCacheView(BaseCacheView):
         TransformerCacheView,
         AttnMaskDetail | None,
     ]:
-        """
-        Updates the KV cache functionally and returns the updated tensors along with the appropriate attention mask.
+        """Update the KV cache functionally and return updated tensors with attention mask.
+
+        Inserts new key/value states into the cache at the current position,
+        advances position indices, and applies appropriate masking. Supports
+        both standard and sliding-window attention patterns.
 
         Args:
             query: Current query states.
+                Shape: [batch, query_len, num_heads, head_dim]
             key: Current key states to add to the cache.
+                Shape: [batch, query_len, num_key_heads, key_dim]
             value: Current value states to add to the cache.
-            cache_metadata: Optional metadata. If provided and contains slot/length info, enables pooled caching.
-            attention_mask: Base attention mask.
-            quantizer: Quantizer for the cache.
-            causal_mask: Optional causal mask.
-            token_type_ids: Optional token type IDs for segment masking.
+                Shape: [batch, query_len, num_value_heads, value_dim]
+            mode: Runtime mode (e.g., MODE_PREFILL) for sharding resolution.
+            quantizer: Quantizer to apply to stored cache tensors.
+            cache_metadata: Runtime metadata (TransformerMetadata,
+                OperationsMetadata, or HybridMetadata). Unwrapped internally.
+            mask_info: MaskInfo object with attention mask configuration.
+                KV dimension is expanded automatically if needed.
+            partition_manager: Manager for tensor sharding.
 
         Returns:
-            Tuple[Array, Array, Array]:
-                - Updated key cache tensor (functional update).
-                - Updated value cache tensor (functional update).
-                - Final attention mask to be used (either original or calculated).
+            tuple: Five-element tuple containing:
+                - key_cache: Updated key cache in runtime dtype.
+                - value_cache: Updated value cache in runtime dtype.
+                - mask_info: Updated MaskInfo with applied KV lengths.
+                - updated_view: New TransformerCacheView with advanced positions.
+                - masking_details: AttnMaskDetail for attention computation.
         """
         from easydel.infra.utils import AttnMaskType
 
@@ -748,6 +782,24 @@ class TransformerCache(BaseCache):
         quantizer: EasyQuantizer | None = None,
         mask_type_details: dict[int, AttnMaskDetail] | None = None,
     ):
+        """Initialize a complete transformer cache with views for all layers.
+
+        Creates a fully initialized KV cache with allocated storage for each
+        transformer layer, applying consistent sharding and quantization.
+
+        Args:
+            mesh: JAX device mesh for distributed execution.
+            config: TransformerCacheConfig with cache dimensions and behavior.
+            partition_manager: Manager for tensor partitioning/sharding.
+            dtype: Data type for cache tensors. Defaults to jnp.bfloat16.
+            starts: Initial starting positions per batch sequence.
+            quantizer: Optional quantizer to apply to cache tensors.
+            mask_type_details: Per-layer attention mask configuration, keyed
+                by layer index.
+
+        Returns:
+            TransformerCache: Fully initialized cache ready for inference.
+        """
         from easydel.layers.quantization._quants import EasyQuantizer
 
         quantizer = quantizer or EasyQuantizer(quantization_config=None)
@@ -947,6 +999,16 @@ class TransformerCache(BaseCache):
 
     @classmethod
     def init_empty(cls, num_hidden_layers: int) -> TransformerCache:
+        """Initialize an empty transformer cache without allocated storage.
+
+        Creates a cache structure with None views that can be populated later.
+
+        Args:
+            num_hidden_layers: Number of layers to create placeholders for.
+
+        Returns:
+            TransformerCache: Cache instance with uninitialized (None) views.
+        """
         return cls(views=[None for _ in range(num_hidden_layers)])
 
     def __repr__(self):

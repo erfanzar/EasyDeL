@@ -82,7 +82,14 @@ def parse_size(size: str | int) -> int:
 
 @dataclass
 class WriteStats:
-    """Statistics from a write operation."""
+    """Statistics from a dataset write operation.
+
+    Attributes:
+        num_examples: Total number of examples written.
+        num_shards: Number of output shard files created.
+        total_bytes: Total bytes written across all shards.
+        output_paths: List of paths to the created shard files.
+    """
 
     num_examples: int = 0
     num_shards: int = 0
@@ -95,7 +102,12 @@ class WriteStats:
 
 
 class DatasetWriter:
-    """Base class for dataset writers."""
+    """Base class for dataset writers.
+
+    Provides the common interface and configuration for writing
+    ShardedDataSource data to disk in various formats with configurable
+    sharding and compression.
+    """
 
     def __init__(
         self,
@@ -133,10 +145,21 @@ class DatasetWriter:
 
 
 class ParquetWriter(DatasetWriter):
-    """Writer for Parquet format."""
+    """Writer for Apache Parquet columnar format.
+
+    Writes data in sharded Parquet files with configurable compression
+    (default: snappy). Supports cloud storage via fsspec.
+    """
 
     def write(self, source: ShardedDataSource) -> WriteStats:
-        """Write source to Parquet files."""
+        """Write all data from source to sharded Parquet files.
+
+        Args:
+            source: Data source to write.
+
+        Returns:
+            WriteStats with counts and paths of written shards.
+        """
         import fsspec  # pyright: ignore[reportMissingTypeStubs]
         import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
         import pyarrow.parquet as pq  # pyright: ignore[reportMissingTypeStubs]
@@ -195,10 +218,20 @@ class ParquetWriter(DatasetWriter):
 
 
 class ArrowWriter(DatasetWriter):
-    """Writer for Arrow IPC format."""
+    """Writer for Apache Arrow IPC (Feather) format.
+
+    Writes data in sharded Arrow IPC files. Supports cloud storage via fsspec.
+    """
 
     def write(self, source: ShardedDataSource) -> WriteStats:
-        """Write source to Arrow IPC files."""
+        """Write all data from source to sharded Arrow IPC files.
+
+        Args:
+            source: Data source to write.
+
+        Returns:
+            WriteStats with counts and paths of written shards.
+        """
         import fsspec  # pyright: ignore[reportMissingTypeStubs]
         import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
         import pyarrow.ipc as ipc  # pyright: ignore[reportMissingTypeStubs]
@@ -254,10 +287,21 @@ class ArrowWriter(DatasetWriter):
 
 
 class JsonlWriter(DatasetWriter):
-    """Writer for JSONL format."""
+    """Writer for JSON Lines format.
+
+    Writes data in sharded JSONL files with optional gzip compression.
+    Supports cloud storage via fsspec.
+    """
 
     def write(self, source: ShardedDataSource) -> WriteStats:
-        """Write source to JSONL files."""
+        """Write all data from source to sharded JSONL files.
+
+        Args:
+            source: Data source to write.
+
+        Returns:
+            WriteStats with counts and paths of written shards.
+        """
         import fsspec  # pyright: ignore[reportMissingTypeStubs]
 
         fs, path = fsspec.core.url_to_fs(self.output_path)
@@ -364,9 +408,11 @@ def create_writer(
 
 
 class SaveStage(BaseStage):
-    """Pipeline stage for saving datasets.
+    """Pipeline stage for saving processed datasets to disk.
 
-    Supports per-dataset save paths and formats.
+    Supports per-dataset save paths and formats, with optional
+    push to HuggingFace Hub. Each dataset can override the global
+    save path and format through its DatasetConfig.
     """
 
     def __init__(self, config: SaveStageConfig | None = None):
@@ -528,6 +574,8 @@ def save_iterator(
 
     # Wrap iterator as a simple sharded source
     class IteratorSource(ShardedDataSource[dict]):
+        """Adapter wrapping a plain iterator as a single-shard ShardedDataSource."""
+
         def __init__(self, it):
             self._it = it
 

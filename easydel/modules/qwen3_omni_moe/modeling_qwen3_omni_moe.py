@@ -602,15 +602,19 @@ class Qwen3OmniMoeAudioEncoder(EasyDeLBaseModule):
         return BaseModelOutput(last_hidden_state=hidden_states)
 
     def get_encoder(self):
+        """Returns the encoder (the audio encoder itself)."""
         return self
 
     def get_decoder(self):
+        """Returns the decoder (not applicable for encoder-only audio model)."""
         raise NotImplementedError("Audio encoder does not have a decoder.")
 
     def get_lm_head(self):
+        """Returns the language model head (not applicable for audio encoder)."""
         raise NotImplementedError("Audio encoder does not have a language model head.")
 
     def get_embedding(self):
+        """Returns the initial convolution layer used for mel-spectrogram embedding."""
         return self.conv2d1
 
 
@@ -1206,15 +1210,19 @@ class Qwen3OmniMoeVisionEncoder(EasyDeLBaseModule):
         return self.merger(hidden_states)
 
     def get_encoder(self):
+        """Returns the encoder (the vision encoder itself)."""
         return self
 
     def get_decoder(self):
+        """Returns the decoder (not applicable for encoder-only vision model)."""
         raise NotImplementedError("Vision model does not have a decoder.")
 
     def get_lm_head(self):
+        """Returns the language model head (not applicable for vision encoder)."""
         raise NotImplementedError("Vision model does not have a language model head.")
 
     def get_embedding(self):
+        """Returns the patch embedding layer used for image tokenization."""
         return self.patch_embed
 
 
@@ -2323,6 +2331,16 @@ class Qwen3OmniMoeTalkerCodePredictorAttention(UnifiedAttention):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize code predictor attention with Q/K normalization and sliding window.
+
+        Args:
+            config: Code predictor configuration.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX numerical precision.
+            rngs: Random number generator state.
+            layer_idx: Index of this layer in the stack.
+        """
         super().__init__(
             config,
             dtype,
@@ -2353,6 +2371,16 @@ class Qwen3OmniMoeTalkerCodePredictorDecoderLayer(nn.Module):
         rngs: nn.Rngs,
         layer_idx: int,
     ):
+        """Initialize code predictor decoder layer with attention and MLP.
+
+        Args:
+            config: Code predictor configuration.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX numerical precision.
+            rngs: Random number generator state.
+            layer_idx: Index of this layer in the stack.
+        """
         self.config = config
         self.layer_idx = layer_idx
 
@@ -2408,6 +2436,21 @@ class Qwen3OmniMoeTalkerCodePredictorDecoderLayer(nn.Module):
         output_attentions: bool = False,
         frequencies: Array | None = None,
     ) -> DecoderLayerOutput:
+        """Run the decoder layer: self-attention followed by MLP with residual connections.
+
+        Args:
+            hidden_states: Input hidden states.
+            mask_info: Attention mask information.
+            position_ids: Position IDs for RoPE.
+            mode: Runtime mode (train, decode, etc.).
+            cache_view: KV cache view for this layer.
+            cache_metadata: Cache metadata for efficient caching.
+            output_attentions: Whether to return attention weights.
+            frequencies: Precomputed RoPE frequencies.
+
+        Returns:
+            DecoderLayerOutput with updated hidden states and optional attention weights.
+        """
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
             mask_info,
@@ -2448,6 +2491,15 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize code predictor model with codec embeddings and decoder layers.
+
+        Args:
+            config: Code predictor configuration.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX numerical precision.
+            rngs: Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -2504,6 +2556,22 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ) -> BaseModelOutput:
+        """Forward pass through the code predictor transformer.
+
+        Args:
+            inputs_embeds: Input embeddings [batch, seq_len, hidden_dim].
+            attention_mask: Optional attention mask for padding.
+            mask_info: Mask information for efficient attention.
+            position_ids: Position IDs for RoPE.
+            mode: Runtime mode (train, decode, etc.).
+            past_key_values: Cached key-value states for generation.
+            cache_metadata: Cache metadata for efficient caching.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return all hidden states.
+
+        Returns:
+            BaseModelOutput with last hidden state and optional intermediate outputs.
+        """
         sequence_length = inputs_embeds.shape[1]
         mask_info = MaskInfo.dynamic_init(
             mask_info=mask_info,
@@ -2557,15 +2625,19 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
+        """Returns the encoder (not applicable for decoder-only model)."""
         raise NotImplementedError("This is a decoder-only model.")
 
     def get_decoder(self):
+        """Returns the decoder (the code predictor model itself)."""
         return self
 
     def get_lm_head(self):
+        """Returns the language model head (not applicable, use ForConditionalGeneration variant)."""
         raise NotImplementedError("Use Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration for LM head.")
 
     def get_embedding(self):
+        """Returns the first codec embedding layer if available."""
         return self.codec_embedding[0] if self.codec_embedding else None
 
 
@@ -2583,6 +2655,18 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize code predictor with per-group LM heads for codec token prediction.
+
+        Creates one linear head per code group (num_code_groups - 1) to predict
+        codec tokens independently for each quantizer group.
+
+        Args:
+            config: Code predictor configuration.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX numerical precision.
+            rngs: Random number generator state.
+        """
         super().__init__(
             config=config,
             base_model_class=Qwen3OmniMoeTalkerCodePredictorModel,
@@ -2623,6 +2707,25 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ) -> MoeCausalLMOutput:
+        """Forward pass through code predictor with per-group logit computation.
+
+        Runs the transformer backbone and applies each per-group LM head to produce
+        stacked logits of shape [batch, seq_len, num_groups, vocab_size].
+
+        Args:
+            inputs_embeds: Input embeddings [batch, seq_len, hidden_dim].
+            attention_mask: Optional attention mask for padding.
+            mask_info: Mask information for efficient attention.
+            position_ids: Position IDs for RoPE.
+            mode: Runtime mode (train, decode, etc.).
+            past_key_values: Cached key-value states for generation.
+            cache_metadata: Cache metadata for efficient caching.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return all hidden states.
+
+        Returns:
+            MoeCausalLMOutput with stacked per-group logits.
+        """
         outputs = self.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -2645,15 +2748,19 @@ class Qwen3OmniMoeTalkerCodePredictorForConditionalGeneration(
         )
 
     def get_encoder(self):
+        """Returns the encoder (not applicable for decoder-only model)."""
         raise NotImplementedError("This is a decoder-only model.")
 
     def get_decoder(self):
+        """Returns the decoder from the underlying code predictor model."""
         return self.model.get_decoder()
 
     def get_lm_head(self):
+        """Returns the per-group language model heads."""
         return self.lm_head
 
     def get_embedding(self):
+        """Returns the embedding layer from the underlying code predictor model."""
         return self.model.get_embedding()
 
 
@@ -2669,6 +2776,15 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize the Talker text model with codec embedding and decoder layers.
+
+        Args:
+            config: Talker text configuration.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX numerical precision.
+            rngs: Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -2722,6 +2838,27 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
         output_hidden_states: bool = False,
         output_router_logits: bool = False,
     ) -> VLMCausalLMOutput:
+        """Forward pass through the Talker text model.
+
+        Embeds codec tokens (or uses provided embeddings) and processes them
+        through the decoder layers with optional MoE routing.
+
+        Args:
+            input_ids: Codec token IDs [batch, seq_len].
+            inputs_embeds: Pre-computed embeddings (overrides input_ids).
+            attention_mask: Attention mask for padding.
+            mask_info: Mask information for efficient attention.
+            position_ids: Position IDs for RoPE.
+            mode: Runtime mode (train, decode, etc.).
+            past_key_values: Cached key-value states for generation.
+            cache_metadata: Cache metadata for efficient caching.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return all hidden states.
+            output_router_logits: Whether to return MoE router logits.
+
+        Returns:
+            VLMCausalLMOutput with hidden states and optional router logits.
+        """
         if inputs_embeds is None:
             inputs_embeds = self.codec_embedding(input_ids.astype("i4"))
 
@@ -2790,15 +2927,19 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
+        """Returns the encoder (not applicable for decoder-only talker model)."""
         raise NotImplementedError("This is a decoder-only model.")
 
     def get_decoder(self):
+        """Returns the decoder (the talker model itself)."""
         return self
 
     def get_lm_head(self):
+        """Returns the language model head (not applicable for base talker model)."""
         raise NotImplementedError("Base model does not have a language model head.")
 
     def get_embedding(self):
+        """Returns the codec embedding layer."""
         return self.codec_embedding
 
 
@@ -2820,6 +2961,19 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize full Talker model with text model, code predictor, and projections.
+
+        Combines the talker text model, a code predictor for multi-group codec
+        token generation, text/hidden projections, and a codec head for
+        first-group token prediction.
+
+        Args:
+            config: Talker configuration with text and code predictor configs.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX numerical precision.
+            rngs: Random number generator state.
+        """
         talker_model = Qwen3OmniMoeTalkerModel(
             config=config.text_config,
             dtype=dtype,
@@ -2888,6 +3042,29 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         output_router_logits: bool = False,
         apply_codec_head: bool = True,
     ) -> MoeCausalLMOutput:
+        """Forward pass through the full Talker model.
+
+        Projects thinker hidden states (if provided), runs the talker text model,
+        and optionally applies the codec head for first-group token logits.
+
+        Args:
+            input_ids: Codec token IDs [batch, seq_len].
+            inputs_embeds: Pre-computed embeddings (overrides input_ids and thinker_hidden_states).
+            thinker_hidden_states: Hidden states from the Thinker model to project.
+            attention_mask: Attention mask for padding.
+            mask_info: Mask information for efficient attention.
+            position_ids: Position IDs for RoPE.
+            mode: Runtime mode (train, decode, etc.).
+            past_key_values: Cached key-value states for generation.
+            cache_metadata: Cache metadata for efficient caching.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return all hidden states.
+            output_router_logits: Whether to return MoE router logits.
+            apply_codec_head: Whether to apply the codec head for logits.
+
+        Returns:
+            MoeCausalLMOutput with codec logits and optional intermediate outputs.
+        """
         if thinker_hidden_states is not None and inputs_embeds is None:
             inputs_embeds = self.text_projection(thinker_hidden_states)
 
@@ -2919,15 +3096,19 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         )
 
     def get_encoder(self):
+        """Returns the encoder (not applicable for decoder-only talker model)."""
         raise NotImplementedError("This is a decoder-only model.")
 
     def get_decoder(self):
+        """Returns the decoder from the underlying talker model."""
         return self.model.get_decoder()
 
     def get_lm_head(self):
+        """Returns the codec head used for acoustic token prediction."""
         return self.codec_head
 
     def get_embedding(self):
+        """Returns the embedding layer from the underlying talker model."""
         return self.model.get_embedding()
 
 
@@ -2946,15 +3127,40 @@ class Qwen3OmniMoeCode2WavLayerScale(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize learnable per-channel scale parameter.
+
+        Args:
+            dim: Number of channels to scale.
+            init_value: Initial scale value for each channel.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            rngs: Random number generator state.
+        """
         self.scale = nn.Param(
             jnp.full((dim,), init_value, dtype=param_dtype),
         )
         self.dtype = dtype
 
     def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specifications for the scale parameter.
+
+        Marks the scale parameter as replicated since it is a small
+        per-channel vector that does not benefit from sharding.
+
+        Returns:
+            dict[str, object]: Mapping of parameter names to sharding specs.
+        """
         return {"scale": Replicated}
 
     def __call__(self, x: Array) -> Array:
+        """Apply per-channel scaling to the input tensor.
+
+        Args:
+            x: Input tensor to scale.
+
+        Returns:
+            Scaled tensor with same shape as input.
+        """
         return x * self.scale.value.astype(self.dtype)
 
 
@@ -2970,6 +3176,15 @@ class Qwen3OmniMoeCode2WavMLP(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize gated MLP with gate, up, and down projections.
+
+        Args:
+            config: Code2Wav configuration.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX numerical precision.
+            rngs: Random number generator state.
+        """
         self.config = config
         column_linear = partial(
             ColumnParallelLinear,
@@ -2994,6 +3209,14 @@ class Qwen3OmniMoeCode2WavMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def __call__(self, hidden_states: Array) -> Array:
+        """Apply gated MLP: down_proj(act(gate_proj(x)) * up_proj(x)).
+
+        Args:
+            hidden_states: Input hidden states.
+
+        Returns:
+            Transformed hidden states with same hidden dimension.
+        """
         gate = self.act_fn(self.gate_proj(hidden_states))
         up = self.up_proj(hidden_states)
         return self.down_proj(gate * up)
@@ -3012,6 +3235,19 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize sliding window attention with Q/K/V/O projections.
+
+        Uses causal attention with optional sliding window masking for
+        localized context in audio waveform generation.
+
+        Args:
+            config: Code2Wav configuration.
+            layer_idx: Index of this layer in the stack.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX numerical precision.
+            rngs: Random number generator state.
+        """
         self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
@@ -3071,6 +3307,16 @@ class Qwen3OmniMoeCode2WavAttention(nn.Module):
         attention_mask: Array | None = None,
         position_ids: Array | None = None,
     ) -> Array:
+        """Apply sliding window causal attention.
+
+        Args:
+            hidden_states: Input hidden states [batch, seq_len, hidden_dim].
+            attention_mask: Optional attention mask.
+            position_ids: Optional position IDs (unused, included for interface compatibility).
+
+        Returns:
+            Attention output with same shape as input hidden states.
+        """
         batch_size, seq_len, _ = hidden_states.shape
 
         q = self.q_proj(hidden_states)
@@ -3135,6 +3381,16 @@ class Qwen3OmniMoeCode2WavTransformerLayer(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize transformer layer with attention, MLP, and LayerScale branches.
+
+        Args:
+            config: Code2Wav configuration.
+            layer_idx: Index of this layer in the stack.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX numerical precision.
+            rngs: Random number generator state.
+        """
         self.config = config
         self.layer_idx = layer_idx
 
@@ -3189,6 +3445,16 @@ class Qwen3OmniMoeCode2WavTransformerLayer(nn.Module):
         attention_mask: Array | None = None,
         position_ids: Array | None = None,
     ) -> Array:
+        """Run pre-norm transformer layer with LayerScale on both residual branches.
+
+        Args:
+            hidden_states: Input hidden states [batch, seq_len, hidden_dim].
+            attention_mask: Optional attention mask.
+            position_ids: Optional position IDs.
+
+        Returns:
+            Updated hidden states with same shape as input.
+        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         attn_output = self.self_attn(hidden_states, attention_mask, position_ids)
@@ -3214,6 +3480,15 @@ class Qwen3OmniMoeCode2WavTransformerModel(nn.Module):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize transformer model with stacked layers and final norm.
+
+        Args:
+            config: Code2Wav configuration.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX numerical precision.
+            rngs: Random number generator state.
+        """
         self.config = config
 
         self.layers = nn.List(
@@ -3244,6 +3519,16 @@ class Qwen3OmniMoeCode2WavTransformerModel(nn.Module):
         attention_mask: Array | None = None,
         position_ids: Array | None = None,
     ) -> BaseModelOutput:
+        """Forward pass through all transformer layers followed by final norm.
+
+        Args:
+            inputs_embeds: Input embeddings [batch, seq_len, hidden_dim].
+            attention_mask: Optional attention mask.
+            position_ids: Optional position IDs.
+
+        Returns:
+            BaseModelOutput with normalized last hidden state.
+        """
         hidden_states = inputs_embeds
 
         for layer in self.layers:
@@ -3270,6 +3555,18 @@ class Qwen3OmniMoeCode2Wav(EasyDeLBaseModule):
         *,
         rngs: nn.Rngs,
     ):
+        """Initialize Code2Wav vocoder with codec embeddings and transformer.
+
+        Uses offset-based indexing for a single shared embedding across all
+        quantizers, followed by a pre-transformer for feature processing.
+
+        Args:
+            config: Code2Wav vocoder configuration.
+            dtype: Computation data type.
+            param_dtype: Parameter storage data type.
+            precision: JAX numerical precision.
+            rngs: Random number generator state.
+        """
         super().__init__(
             config=config,
             dtype=dtype,
@@ -3323,15 +3620,19 @@ class Qwen3OmniMoeCode2Wav(EasyDeLBaseModule):
         return outputs
 
     def get_encoder(self):
+        """Returns the encoder (not applicable for Code2Wav vocoder)."""
         raise NotImplementedError("Code2Wav is a decoder-only model.")
 
     def get_decoder(self):
+        """Returns the decoder (the Code2Wav model itself)."""
         return self
 
     def get_lm_head(self):
+        """Returns the language model head (not applicable, Code2Wav uses upsampling)."""
         raise NotImplementedError("Code2Wav uses upsampling blocks, not an LM head.")
 
     def get_embedding(self):
+        """Returns the code embedding layer for codec token encoding."""
         return self.code_embedding
 
 
@@ -3512,12 +3813,15 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
         )
 
     def get_input_embeddings(self):
+        """Returns the token embedding layer."""
         return self.embed_tokens
 
     def set_input_embeddings(self, value):
+        """Sets the token embedding layer to a new value."""
         self.embed_tokens = value
 
     def get_embedding(self):
+        """Returns the token embedding layer."""
         return self.embed_tokens
 
 
@@ -3628,6 +3932,32 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         video_embeds: Array | None = None,
         **kwargs,
     ) -> Array:
+        """Compute embeddings by merging text, audio, image, and video inputs.
+
+        Processes token IDs into text embeddings, then merges in any multimodal
+        embeddings (audio, image, video) at their respective placeholder positions.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+            inputs_embeds: Pre-computed text embeddings. If None, computed from input_ids.
+            input_features: Raw audio features (mel-spectrogram) to encode.
+            audio_embeds: Pre-computed audio embeddings to merge.
+            pixel_values: Raw image pixel values to encode via vision encoder.
+            image_grid_thw: Grid dimensions (temporal, height, width) for each image.
+            image_max_grid_size: Maximum grid size for image position embeddings.
+            image_embeds: Pre-computed image embeddings to merge.
+            pixel_values_videos: Raw video pixel values to encode via vision encoder.
+            video_grid_thw: Grid dimensions (temporal, height, width) for each video.
+            video_max_grid_size: Maximum grid size for video position embeddings.
+            video_embeds: Pre-computed video embeddings to merge.
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            Array: Merged embeddings of shape (batch_size, sequence_length, hidden_size).
+
+        Raises:
+            ValueError: If input_ids is None when multimodal inputs are provided.
+        """
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(super().compute_embedding(input_ids), "embeddings")
 
@@ -3712,6 +4042,34 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         past_key_values: TransformerCache | RaggedPagesCache | HybridCache | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
     ) -> VLMCausalLMOutput:
+        """Forward pass through the base Qwen3OmniMoe model with multimodal embedding fusion.
+
+        Computes embeddings from text, audio, image, and video inputs, then
+        processes them through the MoE transformer decoder.
+
+        Args:
+            input_ids: Input token IDs [batch, seq_len].
+            inputs_embeds: Pre-computed embeddings (overrides input_ids).
+            attention_mask: Attention mask for padding.
+            mask_info: Mask information for efficient attention.
+            position_ids: Position IDs for RoPE.
+            input_features: Audio mel-spectrogram features.
+            pixel_values: Image pixel values.
+            image_grid_thw: Grid dimensions for image patches.
+            image_max_grid_size: Maximum grid size for images.
+            pixel_values_videos: Video pixel values.
+            video_grid_thw: Grid dimensions for video patches.
+            video_max_grid_size: Maximum grid size for videos.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return all hidden states.
+            output_router_logits: Whether to return MoE router logits.
+            mode: Runtime mode (train, decode, etc.).
+            past_key_values: Cached key-value states for generation.
+            cache_metadata: Cache metadata for efficient caching.
+
+        Returns:
+            VLMCausalLMOutput with hidden states and optional router logits.
+        """
         text_config = self.config.text_config
         output_router_logits = (
             output_router_logits if output_router_logits is not None else text_config.output_router_logits
@@ -3808,15 +4166,19 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
         )
 
     def get_encoder(self):
+        """Returns the encoder (not applicable for decoder-only model)."""
         raise NotImplementedError("This is a decoder-only model.")
 
     def get_decoder(self):
+        """Returns the decoder (the base Qwen3OmniMoe model itself)."""
         return self
 
     def get_lm_head(self):
+        """Returns the language model head (not applicable for base model)."""
         raise NotImplementedError("Base model does not have a language model head.")
 
     def get_embedding(self):
+        """Returns the token embedding layer."""
         return self.embed_tokens
 
 
@@ -3946,6 +4308,33 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         video_embeds: Array | None = None,
         **kwargs,
     ) -> Array:
+        """Compute embeddings by merging text, audio, image, and video inputs.
+
+        Delegates text embedding to the underlying text model, then merges
+        multimodal embeddings (audio, image, video) at placeholder positions
+        using the top-level audio_tower and visual encoders.
+
+        Args:
+            input_ids: Input token IDs of shape (batch_size, sequence_length).
+            inputs_embeds: Pre-computed text embeddings. If None, computed from input_ids.
+            input_features: Raw audio features (mel-spectrogram) to encode.
+            audio_embeds: Pre-computed audio embeddings to merge.
+            pixel_values: Raw image pixel values to encode via vision encoder.
+            image_grid_thw: Grid dimensions (temporal, height, width) for each image.
+            image_max_grid_size: Maximum grid size for image position embeddings.
+            image_embeds: Pre-computed image embeddings to merge.
+            pixel_values_videos: Raw video pixel values to encode via vision encoder.
+            video_grid_thw: Grid dimensions (temporal, height, width) for each video.
+            video_max_grid_size: Maximum grid size for video position embeddings.
+            video_embeds: Pre-computed video embeddings to merge.
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            Array: Merged embeddings of shape (batch_size, sequence_length, hidden_size).
+
+        Raises:
+            ValueError: If input_ids is None when multimodal inputs are provided.
+        """
         if inputs_embeds is None:
             inputs_embeds = checkpoint_name(self.model.compute_embedding(input_ids), "embeddings")
 
@@ -4031,6 +4420,35 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         apply_lm_head: bool = True,
     ) -> MoeCausalLMOutput:
+        """Forward pass through the Thinker for multimodal conditional generation.
+
+        Fuses audio, vision, and text embeddings, runs the text decoder, and
+        optionally applies the LM head for next-token prediction.
+
+        Args:
+            input_ids: Input token IDs [batch, seq_len].
+            inputs_embeds: Pre-computed embeddings (overrides input_ids).
+            attention_mask: Attention mask for padding.
+            mask_info: Mask information for efficient attention.
+            position_ids: Position IDs for RoPE.
+            input_features: Audio mel-spectrogram features.
+            pixel_values: Image pixel values.
+            image_grid_thw: Grid dimensions for image patches.
+            image_max_grid_size: Maximum grid size for images.
+            pixel_values_videos: Video pixel values.
+            video_grid_thw: Grid dimensions for video patches.
+            video_max_grid_size: Maximum grid size for videos.
+            output_attentions: Whether to return attention weights.
+            output_hidden_states: Whether to return all hidden states.
+            output_router_logits: Whether to return MoE router logits.
+            mode: Runtime mode (train, decode, etc.).
+            past_key_values: Cached key-value states for generation.
+            cache_metadata: Cache metadata for efficient caching.
+            apply_lm_head: Whether to apply the LM head for logits.
+
+        Returns:
+            MoeCausalLMOutput with logits (if apply_lm_head) and model outputs.
+        """
         if input_ids is None and inputs_embeds is None:
             raise ValueError("You must provide either `input_ids` or `inputs_embeds`.")
 
@@ -4082,27 +4500,35 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         )
 
     def get_encoder(self):
+        """Returns the vision encoder component."""
         return self.visual
 
     def get_decoder(self):
+        """Returns the text decoder model."""
         return self.model
 
     def get_embedding(self):
+        """Returns the token embedding layer from the text model."""
         return self.model.embed_tokens
 
     def get_input_embeddings(self):
+        """Returns the input token embedding layer."""
         return self.model.embed_tokens
 
     def set_input_embeddings(self, value):
+        """Sets the input token embedding layer to a new value."""
         self.model.embed_tokens = value
 
     def get_lm_head(self):
+        """Returns the language model head for text generation."""
         return self.lm_head
 
     def get_vision_tower(self) -> nn.Module:
+        """Returns the vision encoder tower."""
         return self.visual
 
     def get_language_model(self) -> nn.Module:
+        """Returns the language model (text decoder)."""
         return self.model
 
     def get_image_features(
@@ -4254,6 +4680,16 @@ class Qwen3OmniMoeForConditionalGeneration(
         return self.thinker.audio
 
     def compute_embedding(self, input_ids, *args, **kwargs):
+        """Delegate embedding computation to the Thinker component.
+
+        Args:
+            input_ids: Input token IDs.
+            *args: Positional arguments forwarded to thinker.compute_embedding.
+            **kwargs: Keyword arguments forwarded to thinker.compute_embedding.
+
+        Returns:
+            Array: Merged multimodal embeddings from the Thinker.
+        """
         return self.thinker.compute_embedding(input_ids, *args, **kwargs)
 
     def __call__(
@@ -4302,12 +4738,15 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
 
     def get_encoder(self):
+        """Returns the encoder (not applicable for the top-level omni model)."""
         raise NotImplementedError("This is a decoder-only model.")
 
     def get_decoder(self):
+        """Returns the text decoder from the Thinker component."""
         return self.thinker.get_decoder()
 
     def get_embedding(self):
+        """Returns the token embedding layer from the Thinker component."""
         return self.thinker.get_embedding()
 
     def get_image_features(

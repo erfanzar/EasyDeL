@@ -68,6 +68,17 @@ class WorkerRpcClient:
         connect_timeout_s: float,
         step_timeout_s: float,
     ) -> None:
+        """Initialize the RPC client and connect to a worker endpoint.
+
+        Creates and configures a ZeroMQ REQ socket with the specified timeouts,
+        then connects to the worker's control-plane endpoint.
+
+        Args:
+            endpoint: ``tcp://<host>:<port>`` address of the worker.
+            auth_token: Shared secret for authenticating requests.
+            connect_timeout_s: Timeout for connection and non-step requests.
+            step_timeout_s: Timeout for step completion responses.
+        """
         self.endpoint = str(endpoint)
         self._auth_token = str(auth_token)
         self._step_timeout_ms = max(1, int(float(step_timeout_s) * 1000.0))

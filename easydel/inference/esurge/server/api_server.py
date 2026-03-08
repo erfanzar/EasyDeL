@@ -163,6 +163,12 @@ class eSurgeAdapter(InferenceEngineAdapter):
     """
 
     def __init__(self, esurge_instance: eSurge, model_name: str):
+        """Initialize the adapter with an eSurge engine and model name.
+
+        Args:
+            esurge_instance: The eSurge inference engine to wrap.
+            model_name: Display name for the model in API responses.
+        """
         self.esurge = esurge_instance
         self._model_name = model_name
 
@@ -527,6 +533,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         candidates: list[str] = []
 
         def add_candidate(value: tp.Any) -> None:
+            """Append a non-empty, stripped string to the candidates list if unique."""
             if isinstance(value, str):
                 stripped = value.strip()
                 if stripped and stripped not in candidates:
@@ -614,6 +621,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         candidate_keys: list[str] = []
 
         def add_candidate(value: tp.Any) -> None:
+            """Append a non-empty, stripped string to the candidate_keys list if unique."""
             if isinstance(value, str):
                 stripped = value.strip()
                 if stripped and stripped not in candidate_keys:
@@ -1603,6 +1611,12 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                 return response_obj
 
             async def generate_stream():
+                """Async generator yielding SSE events for Responses API streaming.
+
+                Streams reasoning, tool call, and message output items as they
+                are produced, emitting incremental delta events compatible with
+                the OpenAI Responses API streaming protocol.
+                """
                 async with self._acquire_generation_slot():
                     previous_text = ""
                     previous_token_ids: list[int] = []
@@ -2364,6 +2378,11 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         tools = self.extract_tools(request=request)
 
         async def generate_stream():
+            """Async generator yielding SSE events for chat completion streaming.
+
+            Streams incremental token deltas, tool call chunks, and reasoning
+            content as they are produced by the eSurge engine.
+            """
             async with self._acquire_generation_slot():
                 prompt_tokens = 0
                 tool_parser = self.get_tool_parser_for_model(request.model)
@@ -2727,6 +2746,11 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         sampling_params = self._prepare_sampling_params(request, esurge)
 
         async def generate_stream():
+            """Async generator yielding SSE events for text completion streaming.
+
+            Streams incremental text deltas as they are produced by the
+            eSurge engine for the /v1/completions endpoint.
+            """
             async with self._acquire_generation_slot():
                 prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
                 previous_text = ""

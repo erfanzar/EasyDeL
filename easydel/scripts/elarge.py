@@ -62,11 +62,30 @@ logger = get_logger("eLargeScript")
 
 @dataclass
 class ElargeArgs:
+    """Command-line arguments for the eLargeModel YAML runner.
+
+    Attributes:
+        config: Path to the YAML configuration file.
+        dry_run: If ``True``, parse and print the config/actions without
+            executing them.
+    """
+
     config: str | None = field(default=None, metadata={"help": "Path to YAML config.", "aliases": ["-c"]})
     dry_run: bool = field(default=False, metadata={"help": "Parse and print config/actions, then exit."})
 
 
 def _load_yaml(path: str) -> dict[str, Any]:
+    """Load and parse a YAML configuration file.
+
+    Args:
+        path: Path to the YAML file.
+
+    Returns:
+        Parsed YAML content as a dictionary.
+
+    Raises:
+        SystemExit: If PyYAML is not installed or the file is malformed.
+    """
     try:
         import yaml
     except ImportError as exc:
@@ -86,6 +105,20 @@ def _load_yaml(path: str) -> dict[str, Any]:
 
 
 def _extract_config_and_actions(doc: dict[str, Any]) -> tuple[dict[str, Any], list[Any]]:
+    """Extract the eLargeModel config and action list from a parsed YAML document.
+
+    Supports multiple layout conventions: ``config:`` key, ``elarge_model:``
+    key, ``elm:`` key, or all top-level keys except ``actions:``.
+
+    Args:
+        doc: Parsed YAML document as a dictionary.
+
+    Returns:
+        Tuple of (config_dict, actions_list).
+
+    Raises:
+        SystemExit: If ``actions`` key is missing or has an invalid type.
+    """
     actions = doc.get("actions")
     if actions is None:
         raise SystemExit("Config YAML must contain an `actions:` list.")
@@ -111,6 +144,22 @@ def _extract_config_and_actions(doc: dict[str, Any]) -> tuple[dict[str, Any], li
 
 
 def _parse_action(item: Any) -> tuple[str, Any | None]:
+    """Parse a single action entry from the YAML actions list.
+
+    Handles three formats:
+    - A plain string (e.g. ``"train"``).
+    - A single-key dict (e.g. ``{eval: {tasks: [...]}}``)
+    - A dict with one ``None``-valued key (common YAML indentation mistake).
+
+    Args:
+        item: Raw action item from the YAML actions list.
+
+    Returns:
+        Tuple of (action_name, optional_parameters).
+
+    Raises:
+        SystemExit: If the action item cannot be parsed.
+    """
     if isinstance(item, str):
         return item, None
     if isinstance(item, dict):
@@ -152,6 +201,19 @@ def _require_str(value: Any, *, ctx: str) -> str:
 
 
 def _run_action(elm: Any, name: str, value: Any | None) -> None:
+    """Execute a single named action on an eLargeModel instance.
+
+    Supported actions: ``validate``, ``print``/``show``, ``dump_config``,
+    ``to_json``, ``to_yaml``, ``train``, ``eval``, ``serve``.
+
+    Args:
+        elm: An ``eLargeModel`` instance.
+        name: Action name string.
+        value: Optional parameters for the action (from YAML).
+
+    Raises:
+        SystemExit: If the action is unknown or parameters are invalid.
+    """
     action = name.strip().lower().replace("-", "_")
 
     if action == "validate":
@@ -300,6 +362,14 @@ def _run_action(elm: Any, name: str, value: Any | None) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Entry point for the eLargeModel YAML runner.
+
+    Parses a YAML config file, constructs an ``eLargeModel`` instance,
+    and executes the declared actions in order.
+
+    Args:
+        argv: Command-line arguments. Uses ``sys.argv`` when ``None``.
+    """
     parser = DataClassArgumentParser(
         ElargeArgs,
         description="Unified YAML runner for easydel.infra.eLargeModel.",

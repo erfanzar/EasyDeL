@@ -64,6 +64,7 @@ def add_start_docstrings(*docstr):
     """
 
     def docstring_decorator(fn):
+        """Prepend the given docstring fragments to the function's existing docstring."""
         fn.__doc__ = "".join(docstr) + (fn.__doc__ if fn.__doc__ is not None else "")
         return fn
 
@@ -175,6 +176,16 @@ class EmptyProcessor(LogitsProcessor):
     """
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Return scores unchanged (no-op processor).
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Unmodified scores.
+        """
         return scores
 
 
@@ -244,6 +255,16 @@ class TemperatureLogitsWarper(LogitsWarper):
     temperature: jnp.ndarray
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Scale logits by dividing by the temperature value.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Temperature-scaled scores, or unmodified scores if temperature is -1.
+        """
         return jax.lax.cond(
             self.temperature != -1,
             lambda x, temp: x / temp.astype(x.dtype),
@@ -279,6 +300,19 @@ class TopPLogitsWarper(LogitsWarper):
     min_tokens_to_keep: int = 1
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Apply top-p (nucleus) filtering to scores.
+
+        Keeps the smallest set of tokens whose cumulative probability exceeds
+        top_p, masking all others with filter_value.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Filtered scores with low-probability tokens masked.
+        """
         top_p = jnp.asarray(self.top_p)
         min_keep = self.min_tokens_to_keep
 
@@ -321,6 +355,19 @@ class TopKLogitsWarper(LogitsWarper):
     min_tokens_to_keep: int = 1
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Apply top-k filtering to scores.
+
+        Retains only the top-k highest-scoring tokens, masking all others
+        with filter_value. Respects min_tokens_to_keep.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Filtered scores with only top-k tokens retained.
+        """
         k_val = jnp.asarray(self.top_k)
         vocab_size = scores.shape[-1]
         effective_k = jnp.maximum(k_val, self.min_tokens_to_keep)
@@ -365,6 +412,16 @@ class ForcedBOSTokenLogitsProcessor(LogitsProcessor):
     bos_token_id: int
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Force the BOS token at the first generation step.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Modified scores forcing BOS at step 1, unchanged otherwise.
+        """
         new_scores = jnp.full(scores.shape, -float("inf"))
         apply_penalty = 1 - jnp.bool_(cur_len - 1)
         scores = jnp.where(apply_penalty, new_scores.at[:, self.bos_token_id].set(0), scores)
@@ -390,6 +447,16 @@ class ForcedEOSTokenLogitsProcessor(LogitsProcessor):
     eos_token_id: int
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Force the EOS token when generation reaches max_length.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Modified scores forcing EOS at max_length - 1, unchanged otherwise.
+        """
         new_scores = jnp.full(scores.shape, -float("inf"))
         apply_penalty = 1 - jnp.bool_(cur_len - self.max_length + 1)
         scores = jnp.where(apply_penalty, new_scores.at[:, self.eos_token_id].set(0), scores)
@@ -422,6 +489,16 @@ class MinLengthLogitsProcessor(LogitsProcessor):
             raise ValueError(f"`eos_token_id` has to be a positive integer, but is {self.eos_token_id},")
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Suppress the EOS token until min_length tokens have been generated.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Scores with EOS suppressed if cur_len < min_length, unchanged otherwise.
+        """
         apply_penalty = 1 - jnp.clip(cur_len - self.min_length, 0, 1)
         scores = jnp.where(apply_penalty, scores.at[:, self.eos_token_id].set(-float("inf")), scores)
         return scores
@@ -449,6 +526,16 @@ class SuppressTokensAtBeginLogitsProcessor(LogitsProcessor):
     begin_index: int
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Suppress specified tokens at the begin_index generation step.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Scores with suppressed tokens at begin_index, unchanged otherwise.
+        """
         apply_penalty = 1 - jnp.bool_(cur_len - self.begin_index)
         scores = jnp.where(apply_penalty, scores.at[:, self.begin_suppress_tokens].set(-float("inf")), scores)
         return scores
@@ -470,6 +557,16 @@ class SuppressTokensLogitsProcessor(LogitsProcessor):
     suppress_tokens: list
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Suppress specified tokens at every generation step.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Scores with suppressed token logits set to -infinity.
+        """
         if len(self.suppress_tokens) != 0:
             scores = scores.at[..., self.suppress_tokens].set(-float("inf"))
         return scores
@@ -494,6 +591,15 @@ class ForceTokensLogitsProcessor(LogitsProcessor):
     """
 
     def __init__(self, force_token_map):
+        """Initialize with a mapping from generation indices to forced token IDs.
+
+        Args:
+            force_token_map: Dict mapping generation step index to the token ID
+                to force at that step. Non-None values are stored in a JAX array.
+
+        Raises:
+            TypeError: If force_token_map is not a dict.
+        """
         if not isinstance(force_token_map, dict):
             raise TypeError(f"force_token_map must be a dict, got {type(force_token_map)}")
         force_token_array = jnp.ones((max(force_token_map.keys()) + 1), dtype=jnp.int32) * -1
@@ -503,6 +609,17 @@ class ForceTokensLogitsProcessor(LogitsProcessor):
         self.force_token_array = jnp.int32(force_token_array)
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Force a specific token at predefined generation steps.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Scores forcing the mapped token at matching steps, unchanged otherwise.
+        """
+
         def _force_token(generation_idx):
             batch_size = scores.shape[0]
             current_token = self.force_token_array[generation_idx]
@@ -558,6 +675,14 @@ class WhisperTimeStampLogitsProcessor(LogitsProcessor):
     """
 
     def __init__(self, generate_config, model_config, decoder_input_length):
+        """Initialize Whisper timestamp processor from generation and model configs.
+
+        Args:
+            generate_config: Whisper generation config with eos_token_id,
+                no_timestamps_token_id, is_multilingual, and max_initial_timestamp_index.
+            model_config: Model config used as fallback for vocab_size.
+            decoder_input_length: Length of the decoder prompt (affects begin_index).
+        """
         self.eos_token_id = generate_config.eos_token_id
         self.no_timestamps_token_id = generate_config.no_timestamps_token_id
         self.timestamp_begin = generate_config.no_timestamps_token_id + 1
@@ -574,10 +699,24 @@ class WhisperTimeStampLogitsProcessor(LogitsProcessor):
             self.max_initial_timestamp_index = model_config.vocab_size
 
     def __call__(self, input_ids, scores, cur_len):
+        """Apply Whisper timestamp constraints to scores.
+
+        Enforces timestamp alternation rules, initial timestamp limits,
+        and probability-based timestamp forcing for ASR decoding.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Scores with Whisper timestamp constraints applied.
+        """
         # suppress <|notimestamps|> which is handled by without_timestamps
         scores = scores.at[:, self.no_timestamps_token_id].set(-float("inf"))
 
         def handle_pairs(input_ids_k, scores_k):
+            """Apply timestamp pairing constraints for a single sequence."""
             last_was_timestamp = jnp.where((cur_len - self.begin_index) >= 1, True, False)
             last_was_timestamp = jnp.where(
                 input_ids_k[cur_len - 1] >= self.timestamp_begin,
@@ -623,6 +762,7 @@ class WhisperTimeStampLogitsProcessor(LogitsProcessor):
         logprobs = jax.nn.log_softmax(scores, axis=-1)
 
         def handle_cumulative_probs(logprobs_k, scores_k):
+            """Force timestamp sampling when timestamp probability exceeds text token probability."""
             timestamp_logprob = jax.nn.logsumexp(logprobs_k[self.timestamp_begin :], axis=-1)
             max_text_token_logprob = jnp.max(logprobs_k[: self.timestamp_begin])
             return jnp.where(
@@ -654,6 +794,17 @@ class PresencePenaltyLogitsProcessor(LogitsProcessor):
     presence_penalty: float
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Subtract a fixed penalty from logits of tokens present in input_ids.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Penalized scores, or unmodified scores if presence_penalty is 0.
+        """
+
         def _apply(x, ids, presence_penalty):
             org_dtype = x.dtype
             _batch_size, vocab_size = x.shape
@@ -691,6 +842,17 @@ class FrequencyPenaltyLogitsProcessor(LogitsProcessor):
     frequency_penalty: float
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Subtract a count-proportional penalty from logits of repeated tokens.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Penalized scores, or unmodified scores if frequency_penalty is 0.
+        """
+
         def _apply(x, ids, frequency_penalty):
             org_dtype = x.dtype
             _batch_size, vocab_size = x.shape
@@ -736,6 +898,20 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
     repetition_penalty: float
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Apply multiplicative repetition penalty to previously seen tokens.
+
+        Divides positive logits and multiplies negative logits by the penalty
+        factor for tokens present in input_ids.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Penalized scores, or unmodified scores if repetition_penalty is 1.0.
+        """
+
         def _apply(x, ids, repetition_penalty):
             org_dtype = x.dtype
             _batch_size, vocab_size = x.shape
@@ -783,6 +959,17 @@ class MinPLogitsWarper(LogitsWarper):
     min_tokens_to_keep: int = 1
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Apply min-p filtering, removing tokens below min_p times the peak probability.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Filtered scores with low-probability tokens masked, or unchanged
+            if min_p is 0 or >= 1.
+        """
         min_p = jnp.asarray(self.min_p)
 
         def _apply(x):
@@ -824,13 +1011,31 @@ class NoRepeatNGramLogitsProcessor(LogitsProcessor):
     ngram_size: int
 
     def forward(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Apply no-repeat n-gram filtering to scores.
+
+        Builds a sparse n-gram index from the generated sequence and masks
+        out any token that would complete a repeated n-gram.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits to filter [batch_size, vocab_size].
+            cur_len: Current generation position.
+
+        Returns:
+            Filtered scores with repeated n-gram completions set to -inf.
+        """
+
         def true_fn():
+            """Compute and apply n-gram ban when sequence is long enough."""
+
             def get_previous_ngrams(input_ids: jnp.ndarray, vocab_size: int, cur_len: int):
+                """Build a sparse tensor indexing all previously seen n-grams."""
                 batch_size, seq_len = input_ids.shape
                 seq_ngrams = seq_len - (self.ngram_size - 1)
                 cur_ngrams = cur_len - (self.ngram_size - 1)
 
                 def body_fun(i, val):
+                    """Record the n-gram at position i in the sparse index tensor."""
                     b = i % batch_size
                     pos = i // batch_size
                     return val.at[i].set(
@@ -864,6 +1069,7 @@ class NoRepeatNGramLogitsProcessor(LogitsProcessor):
                 @sparse.sparsify
                 @jax.vmap
                 def inner_fn(latest_tokens, previous_ngrams):
+                    """Look up whether the latest n-1 tokens form a banned n-gram prefix."""
                     return previous_ngrams[tuple(latest_tokens)]
 
                 return sparse.bcoo_todense(inner_fn(latest_tokens, previous_ngrams))
@@ -890,6 +1096,19 @@ class NoRepeatNGramLogitsProcessor(LogitsProcessor):
         return output
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        """Apply no-repeat n-gram filtering if ngram_size is non-zero.
+
+        Delegates to forward() when ngram_size > 0, otherwise returns
+        scores unchanged.
+
+        Args:
+            input_ids: Token IDs generated so far [batch_size, seq_len].
+            scores: Logits for next token [batch_size, vocab_size].
+            cur_len: Current generation length.
+
+        Returns:
+            Filtered scores with repeated n-gram completions masked.
+        """
         return jax.lax.cond(
             self.ngram_size != 0,
             lambda a, b, c: self.forward(a, b, c),

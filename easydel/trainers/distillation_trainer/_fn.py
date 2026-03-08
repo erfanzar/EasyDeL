@@ -461,6 +461,56 @@ def distillation_step(
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
     logits_chunk_size: int = 0,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
+    """Perform a single knowledge-distillation training or evaluation step.
+
+    Runs the teacher model on the batch (with gradients stopped), then
+    computes the distillation loss between student and teacher outputs.
+    Optionally includes hidden-state MSE and attention-matrix MSE losses
+    for deeper distillation.  When ``logits_chunk_size > 0``, uses a
+    memory-efficient chunked strategy that avoids materialising the full
+    ``[B, L, V]`` logit tensor.
+
+    During training the function also computes student gradients via
+    minibatch accumulation and updates the student state.
+
+    Args:
+        student_state: Current state of the student model.
+        batch: Input batch mapping. Must contain at minimum ``input_ids``
+            and ``attention_mask``. May also include ``labels`` and
+            ``completion_mask``.
+        teacher_state: Frozen state of the teacher model.
+        loss_config: Optional loss configuration for gradient clipping etc.
+        learning_rate_fn: Learning rate schedule function.
+        partition_spec: Sharding specification for the batch tensors.
+        gradient_accumulation_steps: Number of minibatch accumulation steps.
+        is_training: If True, compute gradients and update the student.
+            If False, only compute evaluation metrics.
+        temperature: Temperature for softening probability distributions
+            in the KL-divergence computation.
+        alpha: Weight balancing distillation loss vs supervised CE loss.
+            1.0 means pure distillation, 0.0 means pure supervised.
+        hidden_state_weight: Coefficient for hidden-state MSE loss.
+            Set to 0.0 to disable.
+        hidden_state_layers: Which transformer layers to distill hidden
+            states from. ``None`` defaults to the final layer.
+        hidden_state_loss: Distance metric for hidden-state distillation.
+            Currently only ``"mse"`` is supported.
+        attention_weight: Coefficient for attention-matrix MSE loss.
+            Set to 0.0 to disable.
+        attention_layers: Which attention layers to distill. ``None``
+            defaults to all layers.
+        attention_normalize: Whether to L1-normalize attention matrices
+            before computing the distillation loss.
+        straight_through_emulator: Optional function for quantization-aware
+            straight-through gradient estimation.
+        logits_chunk_size: When > 0, compute the KL loss in chunks of this
+            many tokens to save memory. 0 uses the standard full-logits path.
+
+    Returns:
+        tuple[EasyDeLState, LossMetrics] | LossMetrics: When ``is_training``
+            is True, returns the updated student state and loss metrics.
+            When False, returns only the loss metrics.
+    """
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,
         gradient_accumulation_steps=gradient_accumulation_steps,

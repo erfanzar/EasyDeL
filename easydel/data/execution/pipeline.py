@@ -282,7 +282,11 @@ class Pipeline:
         return self._stages.copy()
 
     def _ensure_data(self):
-        """Ensure data has been loaded."""
+        """Ensure data has been loaded by calling source() first.
+
+        Raises:
+            RuntimeError: If source() has not been called yet.
+        """
         if self._data is None:
             raise RuntimeError("Call source() before other pipeline stages")
 

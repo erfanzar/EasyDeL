@@ -77,6 +77,9 @@ class PhiMoeConfig(EasyDeLBaseConfig):
             converting a multi-head checkpoint to a GQA checkpoint, each group key and value head should be constructed
             by meanpooling all the original heads within that group. For more details checkout [this
             paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to `8`.
+        head_dim (`int`, *optional*):
+            Dimensionality of each attention head. If not provided, defaults to
+            ``hidden_size // num_attention_heads``.
         hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
             The non-linear activation function (function or string) in the decoder.
         max_position_embeddings (`int`, *optional*, defaults to `4096*32`):
@@ -137,6 +140,7 @@ class PhiMoeConfig(EasyDeLBaseConfig):
         num_hidden_layers=32,
         num_attention_heads=32,
         num_key_value_heads: int | None = 8,
+        head_dim: int | None = None,
         hidden_act="silu",
         max_position_embeddings=4096 * 32,
         initializer_range=0.02,
@@ -164,6 +168,10 @@ class PhiMoeConfig(EasyDeLBaseConfig):
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         **kwargs,
     ) -> None:
+        """Initialize PhiMoeConfig with MoE architecture hyperparameters.
+
+        See class docstring for detailed parameter descriptions.
+        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -178,6 +186,7 @@ class PhiMoeConfig(EasyDeLBaseConfig):
             num_key_value_heads = num_attention_heads
 
         self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim or hidden_size // num_attention_heads
         self.hidden_act = hidden_act
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps

@@ -48,7 +48,16 @@ DatasetLike = "Dataset | IterableDataset | Iterator[dict]"
 
 @dataclass
 class ShardInfo:
-    """Metadata about a data shard."""
+    """Metadata about a data shard.
+
+    Attributes:
+        shard_id: Numerical index of the shard.
+        shard_name: Unique string identifier for the shard (path or URL).
+        num_rows: Number of rows in the shard, if known.
+        byte_size: Size of the shard in bytes, if known.
+        url: URL or path for the shard data.
+        checksum: Integrity checksum of the shard data.
+    """
 
     shard_id: int
     shard_name: str
@@ -289,13 +298,24 @@ class ShardedDataSource(ABC, Generic[T_co]):
 
 
 class MappedShardedDataSource(ShardedDataSource[T], Generic[T]):
-    """Lazily mapped sharded data source."""
+    """Lazily mapped sharded data source.
+
+    Wraps an existing ShardedDataSource and applies a mapping function
+    to each example during iteration. The mapping is applied lazily,
+    so no data is transformed until iteration occurs.
+    """
 
     def __init__(
         self,
         source: ShardedDataSource,
         fn: tp.Callable[[Any], T],
     ):
+        """Initialize MappedShardedDataSource.
+
+        Args:
+            source: Underlying data source to map over.
+            fn: Function to apply to each example during iteration.
+        """
         self._source = source
         self._fn = fn
 
@@ -437,9 +457,19 @@ class PipelineStage(Protocol):
 
 
 class BaseStage(ABC):
-    """Base class for pipeline stages with common functionality."""
+    """Base class for pipeline stages with common functionality.
+
+    Provides shared infrastructure for all pipeline stages including
+    configuration storage, metrics tracking, and dataset config lookup.
+    Subclasses must implement the `name` property and `process` method.
+    """
 
     def __init__(self, config: dict | None = None):
+        """Initialize BaseStage.
+
+        Args:
+            config: Stage configuration dictionary.
+        """
         self._config = config or {}
         self._metrics: dict[str, Any] = {}
 
@@ -459,11 +489,22 @@ class BaseStage(ABC):
         ...
 
     def validate_config(self, config: dict) -> bool:
-        """Validate configuration. Override for custom validation."""
+        """Validate stage configuration. Override for custom validation.
+
+        Args:
+            config: Configuration dictionary to validate.
+
+        Returns:
+            True if configuration is valid, False otherwise.
+        """
         return True
 
     def get_metrics(self) -> dict[str, Any]:
-        """Return stage metrics."""
+        """Return a copy of all recorded stage metrics.
+
+        Returns:
+            Dictionary of metric names to values.
+        """
         return self._metrics.copy()
 
     def _update_metric(self, key: str, value: Any):
@@ -506,7 +547,14 @@ class PipelineContext:
     _cache_manager: Any = field(default=None, repr=False)
 
     def get_tokenizer(self, name_or_path: str) -> Any:
-        """Get or create a tokenizer (cached)."""
+        """Get or create a tokenizer, cached for reuse across stages.
+
+        Args:
+            name_or_path: HuggingFace tokenizer name or local path.
+
+        Returns:
+            Loaded PreTrainedTokenizer instance.
+        """
         if name_or_path not in self._tokenizers:
             from transformers import AutoTokenizer
 
@@ -517,21 +565,39 @@ class PipelineContext:
         return self._tokenizers[name_or_path]
 
     def update_step(self, step: int):
-        """Update current pipeline step."""
+        """Update the current pipeline step counter.
+
+        Args:
+            step: New step value.
+        """
         self.step = step
 
     def update_epoch(self, epoch: int):
-        """Update current epoch."""
+        """Update the current epoch counter.
+
+        Args:
+            epoch: New epoch value.
+        """
         self.epoch = epoch
 
     def record_metric(self, stage: str, key: str, value: Any):
-        """Record a metric for a stage."""
+        """Record a metric for a specific pipeline stage.
+
+        Args:
+            stage: Name of the pipeline stage.
+            key: Metric key.
+            value: Metric value.
+        """
         if stage not in self.metrics:
             self.metrics[stage] = {}
         self.metrics[stage][key] = value
 
     def get_metrics(self) -> dict[str, dict[str, Any]]:
-        """Get all recorded metrics."""
+        """Get all recorded metrics across all stages.
+
+        Returns:
+            Nested dictionary mapping stage names to their metric dictionaries.
+        """
         return self.metrics.copy()
 
     @property

@@ -67,6 +67,17 @@ logger = get_logger("Convertor")
 
 
 def _parse_dtype(value: str):
+    """Parse a dtype string into a JAX dtype.
+
+    Args:
+        value: Dtype name (e.g. ``bf16``, ``float32``).
+
+    Returns:
+        Corresponding ``jnp.dtype``.
+
+    Raises:
+        ValueError: If the dtype name is not recognized.
+    """
     v = value.strip().lower()
     mapping = {
         "bf16": jnp.bfloat16,
@@ -84,6 +95,18 @@ def _parse_dtype(value: str):
 
 
 def _parse_int_list(value: str, *, expected_len: int | None = None) -> tuple[int, ...]:
+    """Parse a comma-separated string of integers.
+
+    Args:
+        value: Comma-separated integer string (e.g. ``"1,-1,1,1,1"``).
+        expected_len: If set, validate that exactly this many ints are present.
+
+    Returns:
+        Tuple of parsed integers.
+
+    Raises:
+        ValueError: If parsing fails or length does not match.
+    """
     parts = [p.strip() for p in value.split(",") if p.strip() != ""]
     try:
         ints = tuple(int(p) for p in parts)
@@ -95,6 +118,18 @@ def _parse_int_list(value: str, *, expected_len: int | None = None) -> tuple[int
 
 
 def _parse_str_list(value: str, *, expected_len: int | None = None) -> tuple[str, ...]:
+    """Parse a comma-separated string into a tuple of strings.
+
+    Args:
+        value: Comma-separated string (e.g. ``"dp,fsdp,ep,tp,sp"``).
+        expected_len: If set, validate that exactly this many items are present.
+
+    Returns:
+        Tuple of parsed strings.
+
+    Raises:
+        ValueError: If length does not match ``expected_len``.
+    """
     parts = tuple(p.strip() for p in value.split(",") if p.strip() != "")
     if expected_len is not None and len(parts) != expected_len:
         raise ValueError(f"Expected {expected_len} items, got {len(parts)}: {value!r}")
@@ -120,6 +155,12 @@ TorchStreamingCache = Literal["hf_cache", "temp"]
 
 @dataclass
 class ConvertArgs:
+    """Command-line arguments for HuggingFace-to-EasyDeL model conversion.
+
+    Configures source/destination, model task, conversion strategy (sequential
+    vs. from_pretrained), sharding mesh, dtype, and HuggingFace Hub options.
+    """
+
     source: str = field(metadata={"help": "HF repo id (e.g. meta-llama/Llama-3.1-8B) or local path"})
     out: str = field(metadata={"help": "Output directory (local path; GCSFuse mount works)"})
 
@@ -193,6 +234,19 @@ class ConvertArgs:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Convert a HuggingFace PyTorch checkpoint to EasyDeL format.
+
+    Supports two conversion modes:
+    - ``sequential``: Streams weight shards one at a time and writes a
+      TensorStore checkpoint without loading the full parameter tree.
+    - ``from_pretrained``: Loads the model via ``AutoEasyDeLModel*.from_pretrained``
+      then saves with ``save_pretrained``.
+
+    Optionally pushes the converted checkpoint to the HuggingFace Hub.
+
+    Args:
+        argv: Command-line arguments. Uses ``sys.argv`` when ``None``.
+    """
     parser = DataClassArgumentParser(
         ConvertArgs,
         description="Download/convert a HuggingFace PyTorch checkpoint to EasyDeL and optionally push to HF Hub.",

@@ -89,6 +89,14 @@ FIXED_QUANTIZATION_BITS_BY_MODE: dict[QuantizationMode, int] = {
 
 
 def get_safe_arr(xs):
+    """Convert single-element arrays to Python scalars for safe logging.
+
+    Args:
+        xs: Value to normalize. Can be a numpy/JAX array or scalar.
+
+    Returns:
+        Python scalar if input is a size-1 array, otherwise the original value.
+    """
     if isinstance(xs, np.generic | jax.Array):
         if xs.size == 1:  # Only try .item() on size-1 arrays
             return xs.item()
@@ -1134,6 +1142,17 @@ class TrainingArguments:
         path.mkdir(parents=True, exist_ok=True)
 
     def get_tx_template(self, possible_max: int | None = None) -> GradientTransformation:
+        """Get the optimizer transformation without a specific step count.
+
+        Useful for creating a template optimizer when the total number of
+        training steps is not yet known (e.g., during checkpoint loading).
+
+        Args:
+            possible_max: Maximum step count to use. Defaults to 2^63-1.
+
+        Returns:
+            GradientTransformation: The configured Optax optimizer chain.
+        """
         if possible_max is None:
             possible_max = 2**63 - 1
         return self.get_optimizer_and_scheduler(possible_max)[0]
@@ -1352,18 +1371,35 @@ class TrainingArguments:
         token = f"{number:g}".replace("+", "")
         return token
 
-    def build_wandb_run_name(self, model_name: str) -> str:
+    def build_wandb_run_name(
+        self,
+        model_name: str,
+        size_in_billion: float | None = None,
+    ) -> str:
         """Build a structured default W&B run name.
 
-        Format:
+        Format (when size_in_billion is provided):
+            ``{model_name}-{size}b-b{batch}-lr{lr}-tx-{optimizer}``
+        Format (when size_in_billion is None):
             ``{model_name}-b{batch}-lr{lr}-tx-{optimizer}``
         """
         batch = int(self.total_batch_size)
         lr = self._wandb_float_token(self.learning_rate, fallback="none")
         optimizer = self._wandb_token(self.optimizer, fallback="NA")
+        if size_in_billion is not None:
+            size = self._wandb_float_token(size_in_billion)
+            return f"{model_name}-{size}b-b{batch}-lr{lr}-tx-{optimizer}"
         return f"{model_name}-b{batch}-lr{lr}-tx-{optimizer}"
 
     def ensure_training_time_limit(self, time_passed):
+        """Check if training has exceeded the configured time limit.
+
+        Args:
+            time_passed: Elapsed training time in seconds.
+
+        Raises:
+            EasyDeLTimerError: If elapsed time exceeds training_time_limit.
+        """
         if self.training_time_limit is not None and time_passed > self._time_to_seconds(self.training_time_limit):
             raise EasyDeLTimerError("Time Out")
 
@@ -1695,6 +1731,18 @@ class TrainingArguments:
 
     @classmethod
     def load_from_json(cls, config_dict):
+        """Reconstruct a TrainingArguments instance from a parsed JSON dictionary.
+
+        Args:
+            config_dict: Dictionary parsed from a JSON configuration file.
+                May contain a 'trainer_config_class' key for subclass resolution.
+
+        Returns:
+            TrainingArguments: Reconstructed configuration object.
+
+        Raises:
+            ValueError: If the trainer config class cannot be resolved.
+        """
         config_dict = _apply_training_args_legacy_aliases(config_dict)
         if "trainer_config_class" in config_dict.keys():
             import easydel as ed

@@ -48,7 +48,14 @@ class RenameFields(Transform):
         self._mapping = mapping
 
     def __call__(self, example: Example) -> Example:
-        """Rename fields according to the mapping."""
+        """Rename fields according to the mapping.
+
+        Args:
+            example: Input example dictionary.
+
+        Returns:
+            New dictionary with fields renamed per the mapping.
+        """
         result = {}
         for key, value in example.items():
             new_key = self._mapping.get(key, key)
@@ -77,7 +84,14 @@ class SelectFields(Transform):
         self._fields = set(fields)
 
     def __call__(self, example: Example) -> Example:
-        """Keep only the specified fields."""
+        """Keep only the specified fields, dropping all others.
+
+        Args:
+            example: Input example dictionary.
+
+        Returns:
+            New dictionary containing only the selected fields.
+        """
         return {k: v for k, v in example.items() if k in self._fields}
 
     def __repr__(self) -> str:
@@ -102,7 +116,14 @@ class DropFields(Transform):
         self._fields = set(fields)
 
     def __call__(self, example: Example) -> Example:
-        """Remove the specified fields."""
+        """Remove the specified fields from the example.
+
+        Args:
+            example: Input example dictionary.
+
+        Returns:
+            New dictionary without the dropped fields.
+        """
         return {k: v for k, v in example.items() if k not in self._fields}
 
     def __repr__(self) -> str:
@@ -143,7 +164,14 @@ class ExtractField(Transform):
         self._default = default
 
     def __call__(self, example: Example) -> Example:
-        """Extract the nested value to a new field."""
+        """Extract the nested value and add it as a new top-level field.
+
+        Args:
+            example: Input example dictionary.
+
+        Returns:
+            Copy of the example with the extracted field added.
+        """
         result = example.copy()
         value = self._extract_path(example, self._source_path)
         result[self._target_field] = value if value is not None else self._default
@@ -218,7 +246,14 @@ class CombineFields(Transform):
         self._drop_sources = drop_sources
 
     def __call__(self, example: Example) -> Example:
-        """Combine the specified fields."""
+        """Combine the specified fields into a single target field.
+
+        Args:
+            example: Input example dictionary.
+
+        Returns:
+            Copy of the example with the combined field added.
+        """
         values = [example.get(f) for f in self._source_fields]
 
         if self._combiner:
@@ -275,7 +310,14 @@ class AddField(Transform):
         self._value = value
 
     def __call__(self, example: Example) -> Example:
-        """Add the new field to the example."""
+        """Add the new field to the example.
+
+        Args:
+            example: Input example dictionary.
+
+        Returns:
+            Copy of the example with the new field added.
+        """
         result = example.copy()
 
         if callable(self._value):

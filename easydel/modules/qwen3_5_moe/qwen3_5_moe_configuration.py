@@ -215,6 +215,10 @@ class Qwen3_5MoeTextConfig(Qwen3NextConfig):
         linear_attention_separate_proj: bool | None = None,
         **kwargs,
     ):
+        """Initialize Qwen3.5-MoE text config with hybrid attention and MoE parameters.
+
+        See class docstring for detailed parameter descriptions.
+        """
         rope_scaling = _normalize_rope_scaling_for_mrope(rope_scaling or rope_parameters)
         if rope_theta is None and isinstance(rope_scaling, dict):
             rope_theta = rope_scaling.get("rope_theta")
@@ -298,6 +302,10 @@ class Qwen3_5MoeVisionConfig(Qwen3VLMoeVisionConfig):
         deepstack_visual_indexes: list[int] | None = None,
         **kwargs,
     ):
+        """Initialize Qwen3.5-MoE vision config with optional deepstack layer indexes.
+
+        See class docstring for detailed parameter descriptions.
+        """
         # Keep explicit empty list as empty (Qwen3.5-MoE does not use deepstack mergers).
         requested_indexes = [] if deepstack_visual_indexes is None else list(deepstack_visual_indexes)
         bootstrap_indexes = requested_indexes if requested_indexes else [0]
@@ -348,6 +356,10 @@ class Qwen3_5MoeConfig(EasyDeLBaseConfig):
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
+        """Initialize Qwen3.5-MoE composite configuration with text and vision sub-configs.
+
+        See class docstring for detailed parameter descriptions.
+        """
         if isinstance(text_config, dict):
             self.text_config = self.sub_configs["text_config"](**self._fix_parent_kws(text_config, kwargs))
         elif text_config is None:

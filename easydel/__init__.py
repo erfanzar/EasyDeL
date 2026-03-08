@@ -15,6 +15,19 @@
 # pyright:reportUnusedImport=none
 # pyright:reportImportCycles=none
 
+"""EasyDeL: JAX/Flax library for training and serving large language models.
+
+Provides lazy-loaded access to all EasyDeL modules, model implementations,
+trainers, inference engines, and utilities. Configures default environment
+variables and JAX/XLA flags for optimal performance on TPU and GPU
+backends when ``EASYDEL_AUTO`` is enabled (the default).
+
+At import time this module also applies compatibility patches for
+HuggingFace Transformers remote-code models that would otherwise fail
+to load on newer Transformers versions or in environments lacking
+optional dependencies (e.g. ``deepspeed``).
+"""
+
 __version__ = "0.3.0"
 
 import os as _os
@@ -93,7 +106,13 @@ _patch_transformers_import_utils()
 
 
 def _patch_transformers_rope_scaling_property() -> None:
-    """Normalize HF rope_scaling access for legacy DeepSeek remote modules."""
+    """Normalize HF ``rope_scaling`` property for legacy DeepSeek remote modules.
+
+    DeepSeek v2/v3 remote configs may store ``rope_scaling`` with a ``type``
+    or ``rope_type`` of ``"default"`` or ``None``, which triggers validation
+    errors in newer HF Transformers. This patch returns ``None`` for those
+    cases, effectively disabling rope scaling (the default behavior).
+    """
     try:
         from transformers.configuration_utils import PretrainedConfig as _HFPretrainedConfig
     except Exception:
@@ -128,7 +147,13 @@ _patch_transformers_rope_scaling_property()
 
 
 def _patch_transformers_init_weights_tie_signature() -> None:
-    """Handle legacy remote-model `tie_weights()` signatures on new HF versions."""
+    """Handle legacy remote-model ``tie_weights()`` signature changes.
+
+    Older remote-model code may call ``tie_weights()`` without the
+    ``recompute_mapping`` parameter introduced in newer HF Transformers.
+    This patch catches the resulting ``TypeError`` and falls back to the
+    no-argument call.
+    """
     try:
         from transformers.modeling_utils import PreTrainedModel as _HFPreTrainedModel
     except Exception:
@@ -154,7 +179,13 @@ _patch_transformers_init_weights_tie_signature()
 
 
 def _patch_transformers_autoconfig_gated_repo_skip() -> None:
-    """Convert gated-repo config load failures to pytest skips."""
+    """Convert gated-repo config load failures to ``pytest.skip``.
+
+    When running under pytest (``PYTEST_CURRENT_TEST`` is set), an
+    ``OSError`` raised by ``AutoConfig.from_pretrained`` for gated
+    HuggingFace repos is caught and re-raised as ``unittest.SkipTest``
+    so the test is skipped rather than failing.
+    """
     try:
         from transformers import AutoConfig as _HFAutoConfig
     except Exception:
@@ -1249,8 +1280,8 @@ else:
         extra_objects={"__version__": __version__},
     )
 
-    _targeted_eformer_versions = ["0.0.99.1"]
-    _targeted_ejkernel_versions = ["0.0.71"]
+    _targeted_eformer_versions = ["0.0.99.3"]
+    _targeted_ejkernel_versions = ["0.0.72"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version

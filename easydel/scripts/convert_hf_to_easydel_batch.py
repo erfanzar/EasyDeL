@@ -51,6 +51,14 @@ from eformer.aparser import DataClassArgumentParser
 
 @dataclass(frozen=True)
 class ModelJob:
+    """A single model conversion job specification.
+
+    Attributes:
+        source: HuggingFace source model identifier or local path.
+        repo_id: Target HuggingFace repository ID for the converted model.
+        out_dir: Local output directory for the conversion.
+    """
+
     source: str
     repo_id: str
     out_dir: Path
@@ -128,6 +136,12 @@ def _default_convert_script() -> Path:
 
 @dataclass
 class BatchArgs:
+    """Command-line arguments for batch model conversion.
+
+    Extends the single-model converter by supporting a models file and
+    forwarding extra flags to the per-model conversion script.
+    """
+
     out_root: str = field(metadata={"help": "Output root directory; each model writes to <out-root>/<repo-name>."})
     source: str = field(
         default_factory=list,
@@ -165,6 +179,20 @@ class BatchArgs:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run batch model conversion from HuggingFace to EasyDeL format.
+
+    Reads model specifications from ``--source`` flags and/or a
+    ``--models-file``, then invokes ``convert_hf_to_easydel.py`` for
+    each model as a subprocess. Unknown flags are forwarded to the
+    per-model conversion script.
+
+    Args:
+        argv: Command-line arguments. Uses ``sys.argv`` when ``None``.
+
+    Returns:
+        Exit code: 0 on success, 2 if any conversions failed, or the
+        failing subprocess exit code if ``--continue-on-error`` is not set.
+    """
     parser = DataClassArgumentParser(
         BatchArgs,
         description="Batch wrapper around scripts/convert_hf_to_easydel.py",

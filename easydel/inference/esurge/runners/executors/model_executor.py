@@ -333,6 +333,11 @@ class ModelStepExecutor:
             return None
 
         def wrapped(graphstate_, graphother_, kv_pages_, metadata_):
+            """Execute the model step function and trigger JIT tracing on first call.
+
+            This wrapper is called once to produce the initial output and is then
+            cached so that subsequent calls use the JIT-compiled version.
+            """
             return self._model_step_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
 
         out = wrapped(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)

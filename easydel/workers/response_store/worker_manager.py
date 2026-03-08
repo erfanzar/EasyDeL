@@ -32,7 +32,17 @@ logger = get_logger(__name__)
 
 
 class ResponseStoreWorkerManager:
-    """Spawns and manages a response store worker process and client."""
+    """Spawns and manages a response store worker process and ZMQ client.
+
+    When an explicit endpoint is supplied to ``start()``, the manager
+    connects to an existing worker. Otherwise it spawns a new worker
+    subprocess and manages its lifecycle (startup, health check,
+    shutdown, IPC cleanup).
+
+    Attributes:
+        endpoint: The ZMQ endpoint of the running worker, or ``None``.
+        client: The connected ``ResponseStoreWorkerClient``, or ``None``.
+    """
 
     def __init__(
         self,
@@ -44,6 +54,16 @@ class ResponseStoreWorkerManager:
         startup_timeout: float = 30.0,
         ipc_dir: str | None = None,
     ) -> None:
+        """Initialize the worker manager.
+
+        Args:
+            storage_dir: Directory for persistent file storage.
+            max_stored_responses: Maximum response records to retain.
+            max_stored_conversations: Maximum conversation records to retain.
+            compression_level: zlib compression level (0-9).
+            startup_timeout: Seconds to wait for the worker to bind.
+            ipc_dir: Directory for IPC socket files.
+        """
         self._storage_dir = storage_dir
         self._max_stored_responses = max_stored_responses
         self._max_stored_conversations = max_stored_conversations
@@ -65,6 +85,19 @@ class ResponseStoreWorkerManager:
         return self._client
 
     def start(self, *, endpoint: str | None = None) -> ResponseStoreWorkerClient:
+        """Start or connect to a response store worker.
+
+        Args:
+            endpoint: Optional existing ZMQ endpoint to connect to.
+                When ``None``, a new worker subprocess is spawned.
+
+        Returns:
+            A connected ``ResponseStoreWorkerClient``.
+
+        Raises:
+            RuntimeError: If the worker has already been started.
+            TimeoutError: If the spawned worker does not bind within the timeout.
+        """
         if self._client:
             raise RuntimeError("Response store worker has already started.")
 
@@ -85,6 +118,11 @@ class ResponseStoreWorkerManager:
         return self._client
 
     def shutdown(self) -> None:
+        """Shut down the worker and release all resources.
+
+        If the worker was spawned by this manager, it sends a shutdown
+        command and terminates the process. IPC socket files are cleaned up.
+        """
         if self._client is None:
             return
 

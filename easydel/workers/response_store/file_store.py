@@ -55,6 +55,19 @@ class FileResponseStore:
         max_stored_conversations: int = 1_000,
         compression_level: int = 3,
     ) -> None:
+        """Initialize the file-backed response store.
+
+        Args:
+            storage_dir: Root directory for persistent storage files.
+            max_stored_responses: Maximum number of response records to keep.
+                Oldest entries are evicted when the limit is exceeded.
+                Set to 0 to disable response storage.
+            max_stored_conversations: Maximum number of conversation records
+                to keep. Oldest entries are evicted when the limit is exceeded.
+                Set to 0 to disable conversation storage.
+            compression_level: zlib compression level (0-9). 0 disables
+                compression, 9 is maximum compression.
+        """
         self.storage_dir = Path(storage_dir)
         self.responses_dir = self.storage_dir / "responses"
         self.conversations_dir = self.storage_dir / "conversations"
@@ -221,6 +234,14 @@ class FileResponseStore:
             self._dirty = True
 
     def get_response(self, response_id: str) -> dict[str, tp.Any] | None:
+        """Retrieve a stored response record by its ID.
+
+        Args:
+            response_id: Unique identifier of the response.
+
+        Returns:
+            The response record dict, or ``None`` if not found.
+        """
         if not response_id:
             return None
         entry = self._responses.get(response_id)
@@ -238,6 +259,15 @@ class FileResponseStore:
         return tp.cast(dict[str, tp.Any], record) if isinstance(record, dict) else None
 
     def put_response(self, response_id: str, record: dict[str, tp.Any]) -> None:
+        """Store or update a response record.
+
+        Writes the record to disk, evicts old entries if the capacity limit
+        is reached, and flushes the index.
+
+        Args:
+            response_id: Unique identifier for the response.
+            record: The response data to persist.
+        """
         if not response_id or self._max_stored_responses == 0:
             return
 
@@ -259,6 +289,14 @@ class FileResponseStore:
         self._flush_index()
 
     def delete_response(self, response_id: str) -> bool:
+        """Delete a response record from the store.
+
+        Args:
+            response_id: Unique identifier of the response to delete.
+
+        Returns:
+            ``True`` if the record was found and deleted, ``False`` otherwise.
+        """
         if not response_id:
             return False
         entry = self._responses.pop(response_id, None)
@@ -273,6 +311,15 @@ class FileResponseStore:
         return True
 
     def get_conversation(self, conversation_id: str) -> list[dict[str, tp.Any]] | None:
+        """Retrieve a stored conversation history by its ID.
+
+        Args:
+            conversation_id: Unique identifier of the conversation.
+
+        Returns:
+            The conversation history as a list of message dicts, or ``None``
+            if not found.
+        """
         if not conversation_id:
             return None
         entry = self._conversations.get(conversation_id)
@@ -291,6 +338,12 @@ class FileResponseStore:
         return tp.cast(list[dict[str, tp.Any]], history) if isinstance(history, list) else None
 
     def put_conversation(self, conversation_id: str, history: list[dict[str, tp.Any]]) -> None:
+        """Store or update a conversation history.
+
+        Args:
+            conversation_id: Unique identifier for the conversation.
+            history: List of message dicts representing the conversation.
+        """
         if not conversation_id or self._max_stored_conversations == 0:
             return
 
@@ -308,6 +361,14 @@ class FileResponseStore:
         self._flush_index()
 
     def delete_conversation(self, conversation_id: str) -> bool:
+        """Delete a conversation record from the store.
+
+        Args:
+            conversation_id: Unique identifier of the conversation to delete.
+
+        Returns:
+            ``True`` if the record was found and deleted, ``False`` otherwise.
+        """
         if not conversation_id:
             return False
         entry = self._conversations.pop(conversation_id, None)
@@ -322,6 +383,12 @@ class FileResponseStore:
         return True
 
     def stats(self) -> dict[str, tp.Any]:
+        """Return store statistics.
+
+        Returns:
+            Dictionary with counts of stored responses and conversations,
+            their capacity limits, and the storage directory path.
+        """
         return {
             "responses": len(self._responses),
             "conversations": len(self._conversations),
@@ -331,6 +398,7 @@ class FileResponseStore:
         }
 
     def close(self) -> None:
+        """Flush the index to disk and release resources."""
         try:
             self._flush_index()
         except Exception:

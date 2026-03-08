@@ -85,13 +85,21 @@ def get_per_token_logps(model, input_ids, attention_mask, prompt_length):
 
 
 def compute_per_token_logps(logits, input_ids, prompt_length):
-    """
-    Compute per-token log probabilities in a vectorized way.
+    """Compute per-token log probabilities in a vectorized way.
+
+    Converts raw logits to log-softmax probabilities, then gathers the
+    log probability corresponding to each actual target token in the
+    completion portion of the sequence.
 
     Args:
-        logits: Pre-trimmed logits [batch_size, seq_len, vocab_size]
-        input_ids: Input token ids [batch_size, seq_len]
-        prompt_length: Length of the prompt
+        logits: Pre-trimmed logits of shape ``[batch_size, seq_len, vocab_size]``.
+        input_ids: Full input token IDs of shape ``[batch_size, seq_len]``.
+        prompt_length: Number of prompt tokens. Targets are extracted from
+            ``input_ids[:, prompt_length:]``.
+
+    Returns:
+        jax.Array: Per-token log probabilities for the completion portion,
+            shape ``[batch_size, completion_len]``.
     """
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     target_ids = input_ids[:, prompt_length:]
@@ -105,7 +113,26 @@ def compute_per_token_logps(logits, input_ids, prompt_length):
 
 
 def get_per_token_logps_and_entropies(model, input_ids, attention_mask, prompt_length):
-    """Return per-token log probabilities and entropies for the completion portion."""
+    """Compute per-token log probabilities and entropy for the completion portion.
+
+    Similar to ``get_per_token_logps``, but also returns the per-token entropy
+    of the predicted distribution. Entropy is used by GRPO variants that apply
+    entropy-based filtering (e.g., top-entropy quantile masking).
+
+    Args:
+        model: The language model to run the forward pass on.
+        input_ids: Input token IDs including prompt and completion.
+            Shape: ``[batch_size, seq_len]``.
+        attention_mask: Binary mask indicating valid tokens (1) vs padding (0).
+            Shape: ``[batch_size, seq_len]``.
+        prompt_length: Number of tokens in the prompt. Log probabilities and
+            entropies are computed only for tokens after this position.
+
+    Returns:
+        tuple[jax.Array, jax.Array]: A pair of arrays:
+            - Per-token log probabilities, shape ``[batch_size, completion_len]``.
+            - Per-token entropy of the predicted distribution, same shape.
+    """
     logits = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -140,6 +167,49 @@ def grpo_step(
     top_entropy_quantile: float = 1.0,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
+    """Perform a single GRPO training or evaluation step.
+
+    Computes the group-relative policy optimization loss on a batch of
+    pre-processed data (prompt IDs, completion IDs, advantages, and
+    optionally reference log-probs). During training the function also
+    computes gradients via minibatch accumulation and updates the model state.
+
+    The function supports several loss variants controlled by ``loss_type``:
+        - ``"grpo"``: Standard GRPO with per-sequence normalization.
+        - ``"bnpo"``: Batch-normalized policy optimization.
+        - ``"dr_grpo"``: Denominator-regularized GRPO.
+        - ``"dapo"``: Dynamic advantage policy optimization (default).
+        - ``"cispo"``: Clipped importance-sampling policy optimization.
+
+    Args:
+        state: Current model state including parameters and optimizer.
+        batch: Mapping containing at minimum ``prompt_ids``, ``prompt_mask``,
+            ``completion_ids``, ``completion_mask``, ``advantages``, and
+            optionally ``ref_per_token_logps`` and ``old_per_token_logps``.
+        num_generations: Number of completions generated per prompt.
+        beta: KL divergence penalty coefficient. Set to 0.0 to disable.
+        loss_config: Optional loss configuration for gradient clipping etc.
+        learning_rate_fn: Learning rate schedule function.
+        partition_spec: Sharding specification for the batch.
+        gradient_accumulation_steps: Number of minibatch accumulation steps.
+        is_training: If True, compute and apply gradients. If False, only
+            compute metrics (evaluation mode).
+        loss_type: Which loss variant to use (see above).
+        epsilon: Lower clipping bound for importance-sampling ratios.
+        epsilon_high: Upper clipping bound for importance-sampling ratios.
+        delta: Optional upper cap on un-clipped importance weights.
+        importance_sampling_level: ``"token"`` for per-token or ``"sequence"``
+            for per-sequence importance weighting.
+        top_entropy_quantile: Fraction of highest-entropy tokens to keep in
+            the loss. 1.0 disables filtering.
+        straight_through_emulator: Optional function for quantization-aware
+            straight-through gradient estimation.
+
+    Returns:
+        tuple[EasyDeLState, LossMetrics] | LossMetrics: When ``is_training``
+            is True, returns the updated state and loss metrics. When False,
+            returns only the loss metrics.
+    """
     # Determine batch size, minibatch size, and enforce partition spec.
     _batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
         batch=batch,

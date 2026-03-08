@@ -39,7 +39,14 @@ def register_attention_data_parallel_axis(
     *,
     generation_axis_rule: tp.Any = NOT_GIVEN,
 ) -> None:
-    """Register the semantic axis used for attention/KV-cache data parallelism."""
+    """Register the semantic axis used for attention/KV-cache data parallelism.
+
+    Args:
+        axis_rule: The partition axis rule to use for attention data
+            parallelism during training. Defaults to ``DP``.
+        generation_axis_rule: Optional separate axis rule to use during
+            generation/inference. When ``NOT_GIVEN``, uses ``axis_rule``.
+    """
     PartitionAxis.register(
         ATTN_DP,
         _normalize_axis_rule(axis_rule),
@@ -49,7 +56,11 @@ def register_attention_data_parallel_axis(
 
 
 def reset_attention_data_parallel_axis() -> None:
-    """Reset ``ATTN_DP`` to follow ``PartitionAxis.data_parallel_axis``."""
+    """Reset ``ATTN_DP`` to follow ``PartitionAxis.data_parallel_axis``.
+
+    Restores the default behavior where attention data parallelism
+    uses the same axis rule as the global ``DP`` partition axis.
+    """
     register_attention_data_parallel_axis(_DEFAULT_ATTN_DP_RULE)
 
 

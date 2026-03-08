@@ -80,6 +80,20 @@ class WorkerControlServer:
         config_fingerprint: str,
         execute_step: tp.Callable[[tp.Any], tp.Any],
     ) -> None:
+        """Initialize the worker control server with binding and auth configuration.
+
+        Stores configuration and creates threading primitives for the server
+        loop. The server is not started until ``start()`` is called.
+
+        Args:
+            bind_host: Interface address to bind the ZeroMQ socket on.
+            port: TCP port number for the REP socket.
+            auth_token: Shared secret for authenticating leader requests.
+            rank: This worker's rank within the cluster.
+            world_size: Total number of hosts in the cluster.
+            config_fingerprint: SHA-256 config digest for compatibility checks.
+            execute_step: Callback invoked for each step command from the leader.
+        """
         self._bind_host = str(bind_host)
         self._port = int(port)
         self._auth_token = str(auth_token)

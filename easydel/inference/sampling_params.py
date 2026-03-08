@@ -224,6 +224,7 @@ class JitableSamplingParams:
         self = self.view_1d()
 
         def update_idx1d(x, y):
+            """Update array x at the given slot with values from y, preserving sharding."""
             sharding = getattr(x, "sharding", PartitionSpec())
             return with_sharding_constraint(jax.lax.dynamic_update_slice(x, y, (slot,)), sharding)
 

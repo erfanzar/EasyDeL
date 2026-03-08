@@ -104,9 +104,16 @@ class GemmaRMSNorm(nn.Module):
 
 
 class GemmaAttention(UnifiedAttention):
-    """Multi-head attention layer with RoPE embeddings for Gemma models.
+    """Multi-head attention layer for Gemma models with rotary position embeddings.
 
-    Inherits from UnifiedAttention.
+    Implements standard multi-head attention (MHA) or grouped query attention (GQA)
+    with rotary position embeddings (RoPE). Inherits from UnifiedAttention for
+    efficient attention computation with support for KV caching and various
+    attention backends.
+
+    Attributes:
+        config (GemmaConfig): Model configuration with attention parameters.
+        head_dim (int): Dimensionality of each attention head.
     """
 
     def __init__(
@@ -155,10 +162,18 @@ class GemmaAttention(UnifiedAttention):
 
 
 class GemmaMLP(nn.Module):
-    """Multi-Layer Perceptron module for Gemma models.
+    """Gated MLP (GeGLU) feedforward network for Gemma models.
 
-    Implements the feedforward network component of the transformer architecture
-    with gated linear units and optional activation functions.
+    Implements a gated linear unit feedforward network:
+    ``down_proj(act(gate_proj(x)) * up_proj(x))``. Uses approximate GeLU
+    (gelu_pytorch_tanh) by default, matching Google's Gemma implementation.
+
+    Attributes:
+        config (GemmaConfig): Model configuration with MLP parameters.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Numerical precision for matrix operations.
+        act: Activation function applied to the gate projection.
     """
 
     def __init__(
@@ -273,8 +288,19 @@ class GemmaMLP(nn.Module):
 class GemmaDecoderLayer(nn.Module):
     """Single decoder layer for Gemma models.
 
-    Combines multi-head attention and feedforward networks with residual connections
-    and layer normalization to form a complete transformer decoder layer.
+    Implements a pre-normalization transformer decoder layer with residual connections:
+    ``x + attn(norm(x))`` followed by ``x + mlp(norm(x))``. Uses RMSNorm for
+    normalization and supports gradient checkpointing.
+
+    Attributes:
+        config (GemmaConfig): Model configuration.
+        dtype (jnp.dtype): Data type for computation.
+        param_dtype (jnp.dtype): Data type for parameters.
+        precision: Numerical precision for matrix operations.
+        input_layernorm (GemmaRMSNorm): Pre-attention normalization.
+        post_attention_layernorm (GemmaRMSNorm): Pre-MLP normalization.
+        self_attn (GemmaAttention): Multi-head attention module.
+        mlp (GemmaMLP): Feedforward network module.
     """
 
     def __init__(

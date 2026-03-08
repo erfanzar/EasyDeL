@@ -37,6 +37,20 @@ def _set_requested_new(sp, n: int):
 
 
 class EngineRequestsMixin:
+    """Mixin for request lifecycle management in the eSurge engine.
+
+    Handles adding new requests to the scheduler queue with context length
+    management (prompt truncation, token reservation), request ID generation,
+    request abortion, and n>1 parallel sampling support. Implements
+    intelligent prompt truncation strategies (left/right/middle) and
+    automatic max_tokens inference to fit within model constraints.
+
+    Methods:
+        abort_request: Cancel an in-progress request and notify waiters.
+        num_pending_requests: Property returning count of queued requests.
+        num_running_requests: Property returning count of active requests.
+    """
+
     def _configure_reasoning_parser_for_prompt(
         self,
         reasoning_parser: Any | None,

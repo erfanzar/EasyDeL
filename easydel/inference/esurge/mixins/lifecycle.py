@@ -37,6 +37,24 @@ if typing.TYPE_CHECKING:
 
 
 class EngineLifecycleMixin:
+    """Mixin managing the scheduler lifecycle for the eSurge engine.
+
+    Provides methods to start, stop, pause, and resume the background
+    scheduler thread that drives inference. Also handles error classification,
+    fatal abort propagation, model weight hot-swapping, JAX profiling,
+    and signal-based diagnostics for debugging hangs or OOM kills.
+
+    Methods:
+        initiate: Start the background scheduler thread.
+        terminate: Stop the scheduler gracefully.
+        pause: Temporarily pause scheduling without clearing state.
+        resume: Resume a paused scheduler.
+        update_model_weights: Hot-swap model weights while idle.
+        start_profiling: Begin a JAX profiler trace.
+        stop_profiling: End the active profiler trace.
+        release_model_state: Free model weights to reduce memory usage.
+    """
+
     @staticmethod
     def _is_nonrecoverable_scheduler_error(exc: BaseException) -> bool:
         """Classify scheduler errors that should abort immediately.

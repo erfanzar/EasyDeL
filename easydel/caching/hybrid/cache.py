@@ -937,6 +937,24 @@ class ParallelHybridCacheView(BaseCacheView):
 
     @classmethod
     def init(cls, metadata: BaseCacheConfig, *args, **kwargs) -> "ParallelHybridCacheView":
+        """Initialize a ParallelHybridCacheView from transformer and recurrent views.
+
+        Args:
+            metadata: Unused (present for interface compatibility).
+            *args: Unused.
+            **kwargs: Must contain:
+                - transformer: Attention cache view (TransformerCacheView,
+                    RaggedPagesCacheView, or UnifiedAttentionCacheView).
+                - recurrent: RecurrentCacheView for SSM state.
+                - layer_index: Optional layer index.
+
+        Returns:
+            ParallelHybridCacheView: Initialized view wrapping both caches.
+
+        Raises:
+            ValueError: If transformer or recurrent kwargs are missing.
+            TypeError: If unexpected kwargs are provided.
+        """
         del metadata, args
         transformer = kwargs.pop("transformer", None)
         recurrent = kwargs.pop("recurrent", None)
@@ -948,6 +966,29 @@ class ParallelHybridCacheView(BaseCacheView):
         return cls(transformer=transformer, recurrent=recurrent, layer_index=layer_index)
 
     def concatenate_to_cache(self, *args, **kwargs):
+        """Update the appropriate inner cache based on the provided arguments.
+
+        Dispatches to the transformer or recurrent cache view based on
+        which keyword arguments are provided:
+        - Ragged call: key + value (without mask_info) -> updates transformer (ragged/unified)
+        - Transformer call: query or key+value+mask_info -> updates transformer KV cache
+        - Recurrent call: conv_state or recurrent_state -> updates recurrent state
+
+        Args:
+            *args: Unused.
+            **kwargs: Arguments forwarded to the inner cache view's
+                concatenate_to_cache method.
+
+        Returns:
+            Varies by call type:
+            - Ragged: updated ParallelHybridCacheView
+            - Transformer: (key_cache, value_cache, mask_info, updated_view, masking_details)
+            - Recurrent: (conv_state, recurrent_state, updated_view)
+
+        Raises:
+            TypeError: If mixed transformer + recurrent args are provided,
+                or if no recognized argument pattern is found.
+        """
         del args
 
         # Dispatch based on the inner cache view type when possible,

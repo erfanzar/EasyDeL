@@ -226,7 +226,22 @@ def save_compiled_fn(path: str | os.PathLike, fn: Compiled, prefix: str | None =
 
 
 def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):
-    """Load a compiled function from disk."""
+    """Load a previously saved compiled JAX function from disk.
+
+    Deserializes the compiled function along with its input/output tree
+    structures so it can be executed without re-compilation.
+
+    Args:
+        path: Directory containing the saved compiled function.
+        prefix: Optional filename prefix matching the one used in
+            ``save_compiled_fn``.
+
+    Returns:
+        The deserialized compiled JAX function.
+
+    Raises:
+        FileNotFoundError: If the compiled executable file does not exist.
+    """
     prefix = prefix or ""
     filename = path / (prefix + "-" + COMPILED_FILE_NAME)
     (serialized, in_tree, out_tree) = pickle.load(open(filename, "rb"))
@@ -238,13 +253,35 @@ def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):
 
 
 def hash_fn(self) -> int:
-    """Generate a hash for an object based on its dictionary values."""
+    """Generate a deterministic hash for an object based on its ``__dict__`` values.
+
+    Concatenates all scalar and collection attribute values into a string
+    and produces an integer hash via ``get_safe_hash_int``.
+
+    Args:
+        self: The object to hash.
+
+    Returns:
+        Integer hash derived from the object's attributes.
+    """
     shu = "".join(str(cu) for cu in self.__dict__.values() if isinstance(cu, float | int | bool | dict | list))
     return get_safe_hash_int(shu)
 
 
 def get_safe_hash_int(text, algorithm="md5"):
-    """Generate a hash of text using specified algorithm with safety checks."""
+    """Generate an integer hash of text using the specified algorithm.
+
+    Args:
+        text: Input value (will be converted to string).
+        algorithm: Name of the hashlib algorithm to use (default: ``"md5"``).
+
+    Returns:
+        Integer representation of the hash digest.
+
+    Raises:
+        ValueError: If the specified algorithm is not supported by hashlib.
+        RuntimeError: If hashing fails for any other reason.
+    """
     try:
         text_str = str(text)
         hash_object = getattr(hashlib, algorithm)(text_str.encode())
@@ -256,6 +293,17 @@ def get_safe_hash_int(text, algorithm="md5"):
 
 
 def get_hash_of_lowering(lowered_func: Lowered):
+    """Compute a SHA-256 hash of a lowered JAX function's text representation.
+
+    This provides a stable fingerprint for the lowered HLO, enabling
+    cache invalidation when the computation graph changes.
+
+    Args:
+        lowered_func: A lowered JAX function (output of ``jitted.lower(...)``).
+
+    Returns:
+        Hex-encoded SHA-256 digest string.
+    """
     text_representation = lowered_func.as_text()
     hash_object = hashlib.sha256(text_representation.encode("utf-8"))
     hash_digest = hash_object.hexdigest()
@@ -268,7 +316,23 @@ def smart_compile(
     verbose: bool = True,
     cache_key: tuple[str, tuple] | None = None,
 ) -> tuple[Compiled, tuple[str, tuple] | None]:
-    """Compile a lowered JAX function with caching."""
+    """Compile a lowered JAX function with two-level (disk + memory) caching.
+
+    Attempts to load a previously compiled version from disk. On cache miss
+    the function is compiled normally, and optionally saved to disk for
+    future runs when ``EASYDEL_CACHE_COMPILES`` is enabled.
+
+    Args:
+        lowered_func: A lowered JAX function to compile.
+        tag: Optional human-readable tag prepended to the cache directory
+            name for easier identification.
+        verbose: Whether to emit warnings on cache load/save failures.
+        cache_key: Optional key stored alongside the compiled function to
+            enable external signature verification.
+
+    Returns:
+        A tuple of ``(compiled_function, cache_key)``.
+    """
     func_hash = get_hash_of_lowering(lowered_func)
     foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"
     func_dir = COMPILE_FUNC_DIR / foldername

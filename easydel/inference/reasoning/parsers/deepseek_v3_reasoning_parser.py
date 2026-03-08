@@ -38,6 +38,15 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
     """
 
     def __init__(self, tokenizer):
+        """Initialize and select delegate parser based on tokenizer chat template.
+
+        Inspects the tokenizer's chat template for thinking/enable_thinking
+        support. If found, uses DeepSeekR1ReasoningParser; otherwise falls
+        back to IdentityReasoningParser.
+
+        Args:
+            tokenizer: Tokenizer whose chat template determines the delegate.
+        """
         super().__init__(tokenizer)
         # Check if tokenizer's chat template supports thinking
         chat_template = getattr(tokenizer, "chat_template", "") or ""
@@ -56,6 +65,7 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
         self._delegate.assume_reasoning = self.assume_reasoning
 
     def configure_prompt_context(self, prompt_text: str, prompt_token_ids: Sequence[int]) -> None:
+        """Configure prompt context; may upgrade Identity delegate to R1 if prompt starts reasoning."""
         super().configure_prompt_context(prompt_text, prompt_token_ids)
         if isinstance(self._delegate, IdentityReasoningParser):
             start_token = DeepSeekR1ReasoningParser.start_token
@@ -70,14 +80,17 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
         self._delegate.configure_prompt_context(prompt_text, prompt_token_ids)
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
+        """Delegate reasoning-end check to the selected parser."""
         self._sync_delegate_state()
         return self._delegate.is_reasoning_end(input_ids)
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
+        """Delegate content ID extraction to the selected parser."""
         self._sync_delegate_state()
         return self._delegate.extract_content_ids(input_ids)
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
+        """Delegate batch reasoning extraction to the selected parser."""
         self._sync_delegate_state()
         return self._delegate.extract_reasoning(model_output, request)
 
@@ -91,6 +104,7 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
         delta_token_ids: Sequence[int],
         request=None,
     ) -> DeltaMessage | None:
+        """Delegate streaming reasoning extraction to the selected parser."""
         self._sync_delegate_state()
         return self._delegate.extract_reasoning_streaming(
             previous_text,

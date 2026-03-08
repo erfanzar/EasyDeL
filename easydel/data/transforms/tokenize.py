@@ -50,6 +50,7 @@ class TokenizerManager:
     _cache: dict[str, "PreTrainedTokenizer"]
 
     def __init__(self):
+        """Initialize TokenizerManager with an empty cache."""
         self._cache = {}
 
     def get_tokenizer(
@@ -142,9 +143,11 @@ class TokenizerManager:
 
 
 class TokenizedShardedSource(ShardedDataSource[dict]):
-    """Sharded source that wraps another source with tokenization.
+    """Sharded source that wraps another source with on-the-fly tokenization.
 
-    Applies tokenization lazily as examples are iterated.
+    Applies tokenization lazily as examples are iterated, with optional
+    format callbacks and field renaming applied before tokenization.
+    Preserves specified additional fields alongside the tokenized output.
     """
 
     def __init__(
@@ -224,12 +227,28 @@ class TokenizedShardedSource(ShardedDataSource[dict]):
         return result
 
     def open_shard(self, shard_name: str) -> "Iterator[dict]":
-        """Open a shard and tokenize examples on the fly."""
+        """Open a shard and tokenize examples on the fly.
+
+        Args:
+            shard_name: Name of the shard to open.
+
+        Yields:
+            Tokenized examples as dictionaries with input_ids and
+            optionally attention_mask and additional fields.
+        """
         for example in self._source.open_shard(shard_name):
             yield self._tokenize_example(example)
 
     def open_shard_at_row(self, shard_name: str, row: int) -> "Iterator[dict]":
-        """Open a shard at a specific row with tokenization."""
+        """Open a shard at a specific row and tokenize from that position.
+
+        Args:
+            shard_name: Name of the shard to open.
+            row: Row index to start from in the underlying source.
+
+        Yields:
+            Tokenized examples starting from the specified row.
+        """
         for example in self._source.open_shard_at_row(shard_name, row):
             yield self._tokenize_example(example)
 
@@ -305,9 +324,12 @@ def batched_tokenize_iterator(
 
 
 class TokenizeStage(BaseStage):
-    """Pipeline stage for tokenization.
+    """Pipeline stage for tokenizing text data in each dataset.
 
-    Supports per-dataset tokenizer configuration and caching.
+    Supports per-dataset tokenizer configuration (different tokenizers
+    for different datasets), with fallback to stage-level and global
+    defaults. Wraps each source as a TokenizedShardedSource for lazy
+    on-the-fly tokenization.
     """
 
     def __init__(self, config: TokenizeStageConfig | None = None):

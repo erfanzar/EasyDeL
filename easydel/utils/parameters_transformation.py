@@ -181,7 +181,22 @@ class StateDictConverter:
 
     @staticmethod
     def process_tensor(key: str, tensor: tp.Any, config: dict[str, tp.Any]) -> list[tuple[tuple, jnp.ndarray]] | None:
-        """Process a single tensor and return its processed key and value."""
+        """Process a single PyTorch tensor into EasyDeL format.
+
+        Applies key renaming (e.g., ``.weight`` -> ``.kernel``), axis
+        transposition for dense layers, embedding/layernorm detection,
+        and optional ``reform_param`` splitting rules.
+
+        Args:
+            key: Dot-separated PyTorch parameter name.
+            tensor: PyTorch tensor to convert.
+            config: Conversion configuration containing ``embedding_layer_names``,
+                ``layernorm_names``, ``dtype``, ``reform_param``, etc.
+
+        Returns:
+            List of ``(key_tuple, jax_array)`` pairs, or ``None`` if the
+            parameter should be skipped.
+        """
         new_key = key
 
         reform_param = config.get("reform_param", None)
@@ -279,7 +294,33 @@ class StateDictConverter:
         reform_param: dict | None = None,
         **kwargs,
     ) -> dict[str, tp.Any]:
-        """Base conversion function from PyTorch state dict to EasyDeL format."""
+        """Base conversion from a PyTorch state dict to EasyDeL nested dict format.
+
+        Iterates over all keys in ``state_dict``, applies per-tensor
+        processing (key renaming, axis transposition, dtype casting),
+        optional shard functions, and a user callback.
+
+        Args:
+            state_dict: PyTorch model ``state_dict()``.
+            device: Target JAX device for parameter placement.
+            embedding_layer_names: Parameter name substrings identifying embeddings.
+            layernorm_names: Parameter name substrings identifying layer norms.
+            moe_block_names: Names of MoE block modules.
+            moe_names: Names of individual MoE expert sub-modules.
+            shard_fns: Optional mapping of key tuples to sharding functions.
+            dtype: Target JAX dtype for converted parameters.
+            verbose: Whether to display a progress bar.
+            callback: Optional function called on each converted array.
+            remove_state_dict: Whether to delete the input dict after conversion.
+            lm_head_name: Name of the language model head parameter.
+            uses_tie_word_embedding: Whether embeddings are tied with lm_head.
+            consolidated_moe_keys: Set of keys that were consolidated from
+                per-expert weights.
+            reform_param: Optional parameter splitting/merging rules.
+
+        Returns:
+            Nested EasyDeL parameter dictionary.
+        """
         try:
             import torch
 
@@ -478,7 +519,33 @@ class StateDictConverter:
         reform_param: dict | None = None,
         **kwargs,
     ) -> dict[str, tp.Any]:
-        """Convert PyTorch state dict to EasyDeL format with MoE transformations."""
+        """Convert a PyTorch state dict to EasyDeL format with MoE support.
+
+        If MoE parameters are present, first stacks per-expert weights into
+        consolidated tensors, then delegates to ``_base_huggingface_to_easydel``
+        for the standard conversion pipeline.
+
+        Args:
+            state_dict: PyTorch model ``state_dict()``.
+            device: Target JAX device.
+            embedding_layer_names: Substrings identifying embedding layers.
+            layernorm_names: Substrings identifying layer norm layers.
+            moe_block_names: Names of MoE block modules.
+            moe_names: Names of individual expert sub-modules.
+            moe_block_path: Full dot-paths to MoE blocks in the model.
+            moe_path: Full dot-paths to expert modules.
+            shard_fns: Optional sharding functions per key tuple.
+            dtype: Target JAX dtype.
+            verbose: Whether to show progress.
+            callback: Optional per-array callback.
+            remove_state_dict: Whether to delete input dict after conversion.
+            lm_head_name: Language model head parameter name.
+            uses_tie_word_embedding: Whether embeddings are tied.
+            reform_param: Optional splitting/merging rules.
+
+        Returns:
+            Nested EasyDeL parameter dictionary.
+        """
         consolidated_moe_keys = set()
         if moe_block_names is not None and moe_names is not None:
             state_dict, consolidated_moe_keys = StateDictConverter.apply_moe_transformations(
@@ -576,7 +643,20 @@ class StateDictConverter:
     def easydel_to_torch(
         module: EasyDeLBaseModule, dtype: jnp.dtype | None = jnp.float16, **kwargs
     ) -> dict[str, tp.Any]:
-        """Convert EasyDeL module to PyTorch state dict."""
+        """Convert an EasyDeL module's parameters to a PyTorch state dict.
+
+        Flattens the module's parameter tree, transposes weight axes back
+        to PyTorch conventions, renames keys (``.kernel`` -> ``.weight``,
+        ``.embedding`` -> ``.weight``, ``.scale`` -> ``.weight``), and
+        un-stacks MoE expert weights if present.
+
+        Args:
+            module: EasyDeL module whose parameters will be exported.
+            dtype: Target dtype for the exported tensors.
+
+        Returns:
+            Dictionary mapping PyTorch-style parameter names to tensors.
+        """
         if dtype is None:
             dtype = module.param_dtype
 
@@ -724,7 +804,26 @@ class ModelConverter:
         reform_param: dict | None = None,
         **kw,
     ) -> tp.Any:
-        """Convert EasyDeL module to HuggingFace model."""
+        """Convert an EasyDeL module to a HuggingFace ``PreTrainedModel``.
+
+        Creates a HuggingFace model instance, converts the EasyDeL
+        parameters to a PyTorch state dict via ``easydel_to_torch``,
+        and loads the weights into the HuggingFace model.
+
+        Args:
+            module: Source EasyDeL module.
+            config: EasyDeL configuration to derive the HuggingFace config.
+            base_huggingface_module: HuggingFace model class to instantiate.
+            base_huggingface_module_kwarguments: Extra kwargs for the HF
+                model constructor.
+            dtype: Target dtype for the conversion.
+            use_meta_torch: Whether to use ``torch.device("meta")`` for
+                memory-efficient model construction.
+            reform_param: Optional parameter splitting/merging rules.
+
+        Returns:
+            Instantiated HuggingFace model with loaded weights.
+        """
 
         import torch
 

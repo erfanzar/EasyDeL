@@ -24,12 +24,15 @@ class IdentityReasoningParser(ReasoningParser):
     """Pass-through parser: no reasoning extraction, all text is content."""
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
+        """Always returns True (no reasoning to end)."""
         return True
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
+        """Return all token IDs unchanged (no reasoning tokens to strip)."""
         return list(input_ids)
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
+        """Return (None, full_output) -- all text is content."""
         return None, model_output
 
     def extract_reasoning_streaming(
@@ -42,4 +45,5 @@ class IdentityReasoningParser(ReasoningParser):
         delta_token_ids: Sequence[int],
         request=None,
     ) -> DeltaMessage | None:
+        """Return delta as content (no reasoning extraction)."""
         return DeltaMessage(content=delta_text) if delta_text else None

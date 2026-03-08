@@ -61,12 +61,26 @@ GiB = 1024**3
 
 @dataclass(frozen=True)
 class DownloadItem:
+    """A single file to download from a HuggingFace repository.
+
+    Attributes:
+        path: Relative file path within the repository.
+        size: File size in bytes.
+    """
+
     path: str
     size: int
 
 
 @dataclass
 class ChunkedDownloadArgs:
+    """Command-line arguments for the chunked HF repo downloader.
+
+    Controls repository selection, filtering, batching, staging, and
+    destination settings for downloading large directory-style weights
+    (e.g. Zarr) from HuggingFace Hub.
+    """
+
     out_root: str = field(
         metadata={"help": "Destination root: a local path (including gcsfuse mount) or a gs://bucket/prefix URI."}
     )
@@ -119,6 +133,14 @@ class ChunkedDownloadArgs:
 
 
 def _read_repos_file(path: str | os.PathLike) -> list[str]:
+    """Read repository IDs from a text file (one per line, ``#`` comments allowed).
+
+    Args:
+        path: Path to the repos file.
+
+    Returns:
+        List of repository ID strings.
+    """
     text = Path(path).read_text(encoding="utf-8")
     repo_ids: list[str] = []
     for raw_line in text.splitlines():
@@ -298,6 +320,18 @@ def _download_batch(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the chunked HuggingFace repository downloader.
+
+    Downloads files from one or more HF repos in size-limited batches,
+    syncs each batch to a local or GCS destination, then cleans up the
+    staging area before proceeding to the next batch.
+
+    Args:
+        argv: Command-line arguments. Uses ``sys.argv`` when ``None``.
+
+    Returns:
+        Exit code: 0 on success, 2 if any downloads failed.
+    """
     parser = DataClassArgumentParser(
         ChunkedDownloadArgs,
         description=(

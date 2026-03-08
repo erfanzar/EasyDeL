@@ -348,6 +348,24 @@ class RwkvSelfAttention(nn.Module):
         value_states = checkpoint_name(self.value(value_x), "attn_value")
 
         def step(in_state, kv):
+            """Perform one recurrent WKV (Weighted Key-Value) step.
+
+            Computes the time-mixed output for a single timestep using
+            exponential gating with numerically stable log-sum-exp.
+            Designed to be scanned over the sequence dimension via
+            ``jax.lax.scan``.
+
+            Args:
+                in_state: Tuple ``(aa, bb, p)`` representing the accumulated
+                    numerator, denominator, and log-normalizer of the running
+                    WKV state.
+                kv: Tuple ``(key, value)`` for the current timestep.
+
+            Returns:
+                Tuple of ``(next_state, output)`` where *next_state* has the
+                same structure as *in_state* and *output* is the context
+                vector for this timestep.
+            """
             (inner_aa, inner_bb, inner_p), (kk, vv) = in_state, kv
             ww = self.time_first.reshape(-1) + kk
             p = jnp.maximum(inner_p, ww)
@@ -915,6 +933,13 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):  # type: ignor
 
     @property
     def transform_fn(self):
+        """Get the state dict transformation function for HuggingFace weight conversion.
+
+        Returns:
+            Callable: A partial function configured with StateDictConverter.huggingface_to_easydel
+                that handles embedding, layernorm, and RWKV-specific parameter conversions
+                (e.g., keeping time_decay and time_first in float32).
+        """
         from easydel.layers import BaseMoeModule, ParallelMoELinear
         from easydel.utils import traversals
         from easydel.utils.parameters_transformation import StateDictConverter

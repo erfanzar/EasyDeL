@@ -78,6 +78,12 @@ class SiglipOutput(ModelOutput):
     vision_model_output: BaseModelOutputWithPooling = None
 
     def to_tuple(self) -> tuple[tp.Any]:
+        """Convert output to a tuple, recursively converting sub-model outputs.
+
+        Returns:
+            tuple: All output fields as a tuple, with text_model_output and
+                vision_model_output recursively converted to tuples.
+        """
         return tuple(
             self[k] if k not in ["text_model_output", "vision_model_output"] else getattr(self, k).to_tuple()
             for k in self.keys()

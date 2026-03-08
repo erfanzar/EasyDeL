@@ -88,6 +88,10 @@ class PixtralVisionConfig(EasyDeLBaseConfig):
         initializer_range: int = 0.02,
         **kwargs,
     ):
+        """Initialize PixtralVisionConfig with vision encoder hyperparameters.
+
+        See class docstring for detailed parameter descriptions.
+        """
         super().__init__(**kwargs)
 
         self.hidden_size = hidden_size

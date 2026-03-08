@@ -43,6 +43,12 @@ class GraniteReasoningParser(ReasoningParser):
     """Reasoning parser for Granite models using text delimiters."""
 
     def __init__(self, tokenizer: AnyTokenizer):
+        """Initialize with tokenizer and compile regex for thought/response delimiters.
+
+        Args:
+            tokenizer: Tokenizer used for decoding token sequences to text
+                for delimiter matching.
+        """
         super().__init__(tokenizer)
         thought_pattern = "|".join(re.escape(s) for s in _THOUGHT_STARTERS)
         response_pattern = "|".join(re.escape(s) for s in _RESPONSE_STARTERS)
@@ -56,13 +62,16 @@ class GraniteReasoningParser(ReasoningParser):
         self._reasoning_done = False
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
+        """Check if a response starter phrase appears in decoded text."""
         text = self.model_tokenizer.decode(list(input_ids), skip_special_tokens=False)
         return any(s in text for s in self._response_starters)
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
+        """Return all token IDs (Granite uses text-level delimiter splitting)."""
         return list(input_ids)
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
+        """Extract reasoning and content using thought/response text delimiters."""
         match = self._regex.search(model_output)
         if not match:
             return None, model_output
@@ -80,6 +89,7 @@ class GraniteReasoningParser(ReasoningParser):
         delta_token_ids: Sequence[int],
         request=None,
     ) -> DeltaMessage | None:
+        """Stream reasoning/content by tracking thought/response text delimiters."""
         if not delta_text:
             return None
 

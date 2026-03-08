@@ -34,7 +34,30 @@ from ..deepseek_v3.deepseek_configuration import DeepseekV3Config
 
 @register_config("moonvit")
 class MoonViTConfig(EasyDeLBaseConfig):
-    """Configuration for the MoonViT vision tower used by Kimi-VL."""
+    """Configuration for the MoonViT vision encoder used in Kimi-VL.
+
+    MoonViT is a vision transformer that processes images into patch embeddings
+    with learnable 2D positional embeddings and a spatial merge step that
+    downsamples the patch grid.
+
+    Args:
+        patch_size (`int`, *optional*, defaults to 14):
+            Size of each image patch for the vision transformer.
+        init_pos_emb_height (`int`, *optional*, defaults to 64):
+            Initial height of the 2D positional embedding grid.
+        init_pos_emb_width (`int`, *optional*, defaults to 64):
+            Initial width of the 2D positional embedding grid.
+        num_attention_heads (`int`, *optional*, defaults to 16):
+            Number of attention heads in the vision encoder.
+        num_hidden_layers (`int`, *optional*, defaults to 27):
+            Number of transformer layers in the vision encoder.
+        hidden_size (`int`, *optional*, defaults to 1152):
+            Dimensionality of the hidden layers in the vision encoder.
+        intermediate_size (`int`, *optional*, defaults to 4304):
+            Dimensionality of the MLP intermediate layer.
+        merge_kernel_size (`tuple[int, int]`, *optional*, defaults to `(2, 2)`):
+            Kernel size for spatial merge (downsampling) of patch features.
+    """
 
     model_type = "moonvit"
     base_config_key = "vision_config"
@@ -77,7 +100,30 @@ class MoonViTConfig(EasyDeLBaseConfig):
 
 @register_config("kimi_vl")
 class KimiVLConfig(EasyDeLBaseConfig):
-    """Configuration for KimiVLForConditionalGeneration."""
+    """Top-level configuration for the Kimi-VL vision-language model.
+
+    Combines a ``MoonViTConfig`` vision encoder with a ``DeepseekV3Config`` text
+    decoder. The vision encoder output is projected into the text decoder's
+    embedding space via a multi-modal projector.
+
+    See: `moonshotai/Kimi-VL-A3B-Instruct <https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct>`_
+
+    Args:
+        vision_config (`dict` or `MoonViTConfig`, *optional*):
+            Configuration for the MoonViT vision encoder. Defaults to
+            ``MoonViTConfig()`` if not provided.
+        text_config (`dict` or `DeepseekV3Config`, *optional*):
+            Configuration for the DeepSeek-V3 text decoder. Defaults to
+            ``DeepseekV3Config()`` if not provided.
+        ignore_index (`int`, *optional*, defaults to -100):
+            Label index to ignore in the cross-entropy loss.
+        media_placeholder_token_id (`int`, *optional*, defaults to 163605):
+            Token index used as a placeholder for image embeddings in the input.
+        pad_token_id (`int`, *optional*, defaults to 0):
+            Index of the padding token.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie input and output word embeddings.
+    """
 
     model_type = "kimi_vl"
     sub_configs: tp.ClassVar = {"vision_config": MoonViTConfig, "text_config": DeepseekV3Config}

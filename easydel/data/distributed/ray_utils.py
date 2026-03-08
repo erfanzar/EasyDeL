@@ -41,7 +41,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TokenizeBatch:
-    """A batch of texts to tokenize."""
+    """A batch of texts to tokenize.
+
+    Attributes:
+        texts: List of text strings to tokenize.
+        metadata: Optional list of metadata dictionaries for each text.
+    """
 
     texts: list[str]
     metadata: list[dict] | None = None
@@ -49,7 +54,13 @@ class TokenizeBatch:
 
 @dataclass
 class TokenizedBatch:
-    """Result of tokenization."""
+    """Result of a batch tokenization operation.
+
+    Attributes:
+        input_ids: List of token ID sequences, one per input text.
+        attention_masks: Optional list of attention masks, one per input text.
+        metadata: Optional list of metadata dictionaries carried from input.
+    """
 
     input_ids: list[list[int]]
     attention_masks: list[list[int]] | None = None

@@ -517,6 +517,15 @@ class DbrxExpertGLU(nn.Module):
         self.activation_fn = ACT2FN[self.config.ffn_config.ffn_act_fn["name"]]
 
     def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specifications for DbrxExpertGLU parameters.
+
+        Gate (w1) and up (v1) projections are sharded column-wise to
+        split the intermediate dimension across devices. The down
+        projection (w2) is sharded row-wise to reduce across devices.
+
+        Returns:
+            dict[str, object]: Mapping of parameter names to sharding specs.
+        """
         return {"w1": ColumnWise, "v1": ColumnWise, "w2": RowWise}
 
     def __call__(self, x: Array, expert_idx: int) -> Array:

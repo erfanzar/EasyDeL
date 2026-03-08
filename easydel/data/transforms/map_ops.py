@@ -44,7 +44,14 @@ class MapTransform(Transform):
         self._fn = fn
 
     def __call__(self, example: Example) -> Example:
-        """Apply the function to the example."""
+        """Apply the mapping function to the example.
+
+        Args:
+            example: Input example dictionary.
+
+        Returns:
+            Transformed example dictionary.
+        """
         return self._fn(example)
 
     def __repr__(self) -> str:
@@ -85,7 +92,16 @@ class MapField(Transform):
         self._output_field = output_field or field
 
     def __call__(self, example: Example) -> Example:
-        """Apply the function to the specified field."""
+        """Apply the function to the specified field.
+
+        If the field is missing from the example, returns the example unchanged.
+
+        Args:
+            example: Input example dictionary.
+
+        Returns:
+            Copy of the example with the field value transformed.
+        """
         if self._field not in example:
             return example
 

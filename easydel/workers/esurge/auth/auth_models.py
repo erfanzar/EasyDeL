@@ -23,7 +23,14 @@ from enum import StrEnum
 
 
 class ApiKeyRole(StrEnum):
-    """Role-based access control levels for API keys."""
+    """Role-based access control levels for API keys.
+
+    Attributes:
+        ADMIN: Full access including key management operations.
+        USER: Standard access to inference endpoints.
+        READONLY: Read-only access (metrics, health, list models).
+        SERVICE: Service account with specific custom permissions.
+    """
 
     ADMIN = "admin"  # Full access including key management
     USER = "user"  # Standard access to inference endpoints
@@ -32,7 +39,14 @@ class ApiKeyRole(StrEnum):
 
 
 class ApiKeyStatus(StrEnum):
-    """API key lifecycle status."""
+    """API key lifecycle status.
+
+    Attributes:
+        ACTIVE: Key is active and can authorize requests.
+        SUSPENDED: Key is temporarily disabled (can be reactivated).
+        EXPIRED: Key has passed its expiration date.
+        REVOKED: Key is permanently disabled.
+    """
 
     ACTIVE = "active"
     SUSPENDED = "suspended"
@@ -42,7 +56,19 @@ class ApiKeyStatus(StrEnum):
 
 @dataclass
 class RateLimitConfig:
-    """Rate limiting configuration for an API key."""
+    """Rate limiting configuration for an API key.
+
+    All limits are optional. When set to ``None``, no limit is enforced
+    for that window.
+
+    Attributes:
+        requests_per_minute: Max requests allowed per minute.
+        requests_per_hour: Max requests allowed per hour.
+        requests_per_day: Max requests allowed per day.
+        tokens_per_minute: Max tokens allowed per minute.
+        tokens_per_hour: Max tokens allowed per hour.
+        tokens_per_day: Max tokens allowed per day.
+    """
 
     requests_per_minute: int | None = None
     requests_per_hour: int | None = None
@@ -52,6 +78,7 @@ class RateLimitConfig:
     tokens_per_day: int | None = None
 
     def as_dict(self) -> dict[str, tp.Any]:
+        """Serialize the rate limit config to a plain dictionary."""
         return {
             "requests_per_minute": self.requests_per_minute,
             "requests_per_hour": self.requests_per_hour,
@@ -64,7 +91,17 @@ class RateLimitConfig:
 
 @dataclass
 class QuotaConfig:
-    """Usage quota limits for an API key."""
+    """Usage quota limits for an API key.
+
+    All limits are optional. When set to ``None``, no quota is enforced
+    for that metric.
+
+    Attributes:
+        max_total_tokens: Lifetime cumulative token limit.
+        max_total_requests: Lifetime cumulative request limit.
+        monthly_token_limit: Monthly token limit (resets each calendar month).
+        monthly_request_limit: Monthly request limit (resets each calendar month).
+    """
 
     max_total_tokens: int | None = None  # Lifetime token limit
     max_total_requests: int | None = None  # Lifetime request limit
@@ -72,6 +109,7 @@ class QuotaConfig:
     monthly_request_limit: int | None = None
 
     def as_dict(self) -> dict[str, tp.Any]:
+        """Serialize the quota config to a plain dictionary."""
         return {
             "max_total_tokens": self.max_total_tokens,
             "max_total_requests": self.max_total_requests,
@@ -82,7 +120,19 @@ class QuotaConfig:
 
 @dataclass
 class ApiKeyPermissions:
-    """Granular permissions for an API key."""
+    """Granular permissions for an API key.
+
+    ``None`` values for list fields mean "no restriction" (all allowed).
+
+    Attributes:
+        allowed_models: Allowlist of model names. ``None`` allows all.
+        allowed_endpoints: Allowlist of API endpoints. ``None`` allows all.
+        allowed_ip_addresses: IP allowlist. ``None`` means no IP restriction.
+        blocked_ip_addresses: IP blocklist (checked before allowlist).
+        enable_streaming: Whether streaming responses are permitted.
+        enable_function_calling: Whether function calling is permitted.
+        max_tokens_per_request: Per-request token ceiling.
+    """
 
     allowed_models: list[str] | None = None  # None = all models allowed
     allowed_endpoints: list[str] | None = None  # None = all endpoints allowed
@@ -93,6 +143,7 @@ class ApiKeyPermissions:
     max_tokens_per_request: int | None = None
 
     def as_dict(self) -> dict[str, tp.Any]:
+        """Serialize the permissions to a plain dictionary."""
         return {
             "allowed_models": self.allowed_models,
             "allowed_endpoints": self.allowed_endpoints,
@@ -106,7 +157,38 @@ class ApiKeyPermissions:
 
 @dataclass
 class ApiKeyMetadata:
-    """Extended metadata for an API key."""
+    """Complete metadata record for a managed API key.
+
+    Combines identification, lifecycle state, usage tracking, rate limits,
+    quotas, and granular permissions in a single dataclass. Instances are
+    stored in-memory by ``EnhancedApiKeyManager`` and persisted to disk
+    via ``AuthStorage``.
+
+    Attributes:
+        key_id: Internal unique identifier (e.g. ``key_abc123...``).
+        key_prefix: Display-safe prefix of the raw key (e.g. ``sk-abc123...``).
+        hashed_key: SHA-256 hex digest of the raw key.
+        name: Human-readable name.
+        description: Optional description.
+        role: Access control role.
+        status: Current lifecycle status.
+        created_at: Unix timestamp of creation.
+        created_by: Creator user or service name.
+        expires_at: Optional expiration timestamp.
+        last_used_at: Timestamp of last authorized request.
+        last_rotated_at: Timestamp of last key rotation.
+        total_requests: Lifetime request count.
+        total_prompt_tokens: Lifetime prompt token count.
+        total_completion_tokens: Lifetime completion token count.
+        monthly_requests: Current month's request count.
+        monthly_tokens: Current month's token count.
+        last_reset_month: Month number of the last monthly counter reset.
+        rate_limits: Rate limiting configuration.
+        quota: Usage quota configuration.
+        permissions: Granular permissions.
+        tags: Organizational tags.
+        metadata: Arbitrary user-defined metadata.
+    """
 
     key_id: str  # Internal unique identifier
     key_prefix: str  # First 8 chars for display (e.g., "sk-abc123...")
@@ -200,7 +282,17 @@ class ApiKeyMetadata:
 
 @dataclass
 class AuditLogEntry:
-    """Audit log entry for tracking API key operations."""
+    """Audit log entry for tracking API key operations.
+
+    Attributes:
+        timestamp: Unix timestamp of the event.
+        key_id: API key ID involved, if applicable.
+        action: Action name (e.g. ``key_created``, ``request_authorized``).
+        actor: User or service that performed the action.
+        ip_address: Client IP address, if available.
+        details: Additional context about the event.
+        success: Whether the action succeeded.
+    """
 
     timestamp: float = field(default_factory=time.time)
     key_id: str | None = None
@@ -211,6 +303,7 @@ class AuditLogEntry:
     success: bool = True
 
     def as_dict(self) -> dict[str, tp.Any]:
+        """Serialize the audit log entry to a plain dictionary."""
         return {
             "timestamp": self.timestamp,
             "key_id": self.key_id,

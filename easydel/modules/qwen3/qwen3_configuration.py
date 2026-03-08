@@ -25,7 +25,58 @@ logger = get_logger(__name__)
 
 @register_config("qwen3")
 class Qwen3Config(EasyDeLBaseConfig):
-    """Configuration container for the Qwen3 decoder architecture."""
+    """Configuration for the Qwen3 decoder-only transformer architecture.
+
+    Qwen3 is a decoder-only transformer featuring grouped query attention (GQA),
+    SiLU-gated MLP, RMS normalization, and optional sliding window attention.
+    Supports RoPE scaling for extended context lengths.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 151936):
+            Vocabulary size of the Qwen3 model.
+        hidden_size (`int`, *optional*, defaults to 4096):
+            Dimensionality of the hidden layers.
+        intermediate_size (`int`, *optional*, defaults to 22016):
+            Dimensionality of the MLP intermediate layer.
+        num_hidden_layers (`int`, *optional*, defaults to 32):
+            Number of transformer decoder layers.
+        num_attention_heads (`int`, *optional*, defaults to 32):
+            Number of attention heads for each attention layer.
+        num_key_value_heads (`int`, *optional*, defaults to 32):
+            Number of key-value heads for grouped query attention. Falls back to
+            ``num_attention_heads`` (MHA) if ``None``.
+        head_dim (`int`, *optional*, defaults to 128):
+            Dimensionality of each attention head.
+        hidden_act (`str`, *optional*, defaults to `"silu"`):
+            Activation function used in the MLP layers.
+        max_position_embeddings (`int`, *optional*, defaults to 32768):
+            Maximum sequence length this model supports.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            Standard deviation for weight initialization.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-6):
+            Epsilon for RMS normalization layers.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether to return past key/values for caching during generation.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie input and output word embeddings.
+        rope_theta (`float`, *optional*, defaults to 10000.0):
+            Base frequency for rotary position embeddings.
+        rope_scaling (`dict`, *optional*):
+            RoPE scaling configuration (e.g., ``{"type": "yarn", "factor": 4.0}``).
+        attention_bias (`bool`, *optional*, defaults to `False`):
+            Whether to use bias in QKV and output projection layers.
+        use_sliding_window (`bool`, *optional*, defaults to `False`):
+            Whether to enable sliding window attention for lower layers.
+        sliding_window (`int`, *optional*, defaults to 4096):
+            Sliding window size (only used when ``use_sliding_window=True``).
+        max_window_layers (`int`, *optional*, defaults to 28):
+            Layers at or above this index use sliding window attention.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            Dropout rate for attention weights.
+        layer_types (`list[str]`, *optional*):
+            Per-layer attention type (``"full_attention"`` or ``"sliding_attention"``).
+            Auto-derived from sliding window settings if not provided.
+    """
 
     model_type = "qwen3"
 
@@ -54,6 +105,10 @@ class Qwen3Config(EasyDeLBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize Qwen3Config with model architecture hyperparameters.
+
+        See class docstring for detailed parameter descriptions.
+        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size

@@ -193,6 +193,10 @@ class Qwen3NextConfig(EasyDeLBaseConfig):
         mlp_only_layers: list[int] | None = None,
         **kwargs,
     ):
+        """Initialize Qwen3NextConfig with hybrid attention and MoE hyperparameters.
+
+        See class docstring for detailed parameter descriptions.
+        """
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size

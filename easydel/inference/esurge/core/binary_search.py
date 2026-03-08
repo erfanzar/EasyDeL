@@ -66,6 +66,7 @@ def int32_bsearch(batch_shape: Sequence[int], predicate: Callable[[jnp.ndarray],
     del midpoint, predicate_satisfied
 
     def loop_body(i, current_bits):
+        """Test bit `i` and set it in the result based on the predicate."""
         bit_index = 30 - i
         bit = jnp.int32(1 << bit_index)
         midpoint = current_bits | bit
@@ -135,6 +136,7 @@ def apply_float32_bsearch(batch_shape, predicate):
     exponent_bits = jnp.int32((1 << 31) - (1 << (31 - 8)))
 
     def int32_predicate(x):
+        """Convert int32 bit pattern to float32 and evaluate the user predicate."""
         x = _monotonic_int32_to_float32_bit_pattern(x)
         is_finite = (x & exponent_bits) != exponent_bits
 
@@ -182,6 +184,7 @@ def apply_topk_mask_bf16(x: jnp.ndarray, k: jax.Array, replace_val: float) -> jn
         reduce_axis = x_f32.ndim - 2
 
     def predicate(threshold):
+        """Return True if at least k values exceed the negated threshold."""
         threshold = -threshold
         threshold = lax.expand_dims(threshold, (reduce_axis,))
         count_gt = jnp.sum(x_for_loop > threshold, axis=reduce_axis)
@@ -229,6 +232,7 @@ def apply_topk_mask(x: jnp.ndarray, k: jax.Array, replace_val: float) -> jnp.nda
         reduce_axis = x.ndim - 2
 
     def predicate(threshold):
+        """Return True if at least k values exceed the negated threshold (int32 variant)."""
         threshold = -threshold
         threshold = lax.expand_dims(threshold, (reduce_axis,))
         count_gt = jnp.sum(x_for_loop > threshold, axis=reduce_axis)
@@ -276,6 +280,7 @@ def apply_topp_mask_bf16(logits: jnp.ndarray, p: jax.Array, replace_val: float) 
         reduce_axis = probs_for_reduction.ndim - 2
 
     def predicate(threshold):
+        """Return True if cumulative probability above the threshold is less than p."""
         threshold = lax.expand_dims(threshold, (reduce_axis,))
         probability_mass = jnp.sum(
             jnp.where(probs_for_reduction >= threshold, probs_for_reduction, 0.0),
@@ -330,6 +335,7 @@ def apply_topp_mask(logits: jnp.ndarray, p: jax.Array, replace_val: float) -> jn
         reduce_axis = probs_for_reduction.ndim - 2
 
     def predicate(threshold):
+        """Return True if cumulative probability above the threshold is less than p (logits variant)."""
         threshold = lax.expand_dims(threshold, (reduce_axis,))
         probability_mass = jnp.sum(
             jnp.where(probs_for_reduction >= threshold, probs_for_reduction, 0.0),

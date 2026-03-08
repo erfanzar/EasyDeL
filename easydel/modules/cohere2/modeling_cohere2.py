@@ -107,6 +107,14 @@ class Cohere2LayerNorm(nn.Module):
         return (x - mean) * jax.lax.rsqrt(variance + self.eps)
 
     def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specifications for Cohere2LayerNorm parameters.
+
+        Marks the kernel weight as replicated across all devices since
+        normalization parameters are small and needed on every device.
+
+        Returns:
+            dict[str, object]: Mapping of parameter names to sharding specs.
+        """
         return {"kernel": Replicated}
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:

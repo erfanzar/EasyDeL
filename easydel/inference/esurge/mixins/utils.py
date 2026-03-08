@@ -32,6 +32,17 @@ WORKER_DRAIN_INITIAL_DELAY = 0.1
 
 
 class EngineUtilsMixin:
+    """Mixin providing utility helpers for the eSurge engine.
+
+    Contains shared helper methods for JSON/mapping coercion, chat template
+    normalization, tokenization, detokenization, streaming delta computation,
+    sampling parameter preparation, worker pipeline management, idle-reset
+    monitoring, and KV cache event logging.
+
+    These utilities are used across other engine mixins and the main engine
+    class to support robust input processing and output formatting.
+    """
+
     @staticmethod
     def _coerce_mapping_like(value: Any) -> Any:
         """Coerce JSON-string payloads into mapping-like objects when possible."""
