@@ -2868,6 +2868,36 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                         # Skip read-only attributes/properties while applying broad overrides.
                         continue
 
+    @staticmethod
+    def _normalize_rebuild_quantization_config(config: EasyDeLBaseConfig):
+        quantization_config = getattr(config, "quantization_config", None)
+        if quantization_config is None:
+            return None
+
+        from easydel.layers import QuantizationConfig
+
+        if isinstance(quantization_config, dict):
+            quantization_config = QuantizationConfig(**quantization_config)
+            config.quantization_config = quantization_config
+        return quantization_config
+
+    def _lazy_init_rebuilt_module(self, config: EasyDeLBaseConfig):
+        module = self.lazy_init(
+            config=config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            rngs=self.rngs,
+        )
+
+        quantization_config = self._normalize_rebuild_quantization_config(config)
+        if quantization_config is None or not self.is_quantized:
+            return module
+
+        from easydel.layers import EasyQuantizer
+
+        return EasyQuantizer(quantization_config=quantization_config).apply_quantization(module, verbose=False)
+
     def update_module(
         self,
         recursive_update: bool = False,
@@ -2907,13 +2937,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             setattr(config, k, v)
         if recursive_update:
             self._apply_recursive_config_updates(config, kwargs)
-        module = self.lazy_init(
-            config=config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-            rngs=self.rngs,
-        )
+        module = self._lazy_init_rebuilt_module(config)
         self = self.merge_module(module.graphdef, self.graphstate, self.graphother)
         return self
 
@@ -2950,13 +2974,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             setattr(config, k, v)
         if recursive_update:
             self._apply_recursive_config_updates(config, kwargs)
-        module = self.lazy_init(
-            config=config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-            rngs=self.rngs,
-        )
+        module = self._lazy_init_rebuilt_module(config)
         return module.graphdef
 
     def __hash__(self):

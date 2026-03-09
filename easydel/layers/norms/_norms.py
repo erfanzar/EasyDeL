@@ -271,6 +271,75 @@ class RMSNorm(nn.Module):
         return {"kernel": Replicated}
 
 
+class RMSNormGated(nn.Module):
+    """Gated Root Mean Square normalization layer.
+
+    Applies RMSNorm with a SiLU gating mechanism::
+
+        output = silu(gate) * (kernel * RMSNorm(x))
+
+    All computation is performed in float32 for numerical stability,
+    including the kernel multiplication and the SiLU activation on the
+    gate, before casting back to the original input dtype.
+
+    This layer is used in the output path of linear-attention blocks
+    (KDA, GatedDeltaNet) for improved gradient flow and expressiveness.
+
+    Attributes:
+        hidden_size: Dimension of the input features (last axis size).
+        eps: Small constant for numerical stability.
+        dtype: Data type for computation.
+        param_dtype: Data type for learnable parameters.
+        kernel: Learnable scale parameters of shape ``(hidden_size,)``.
+    """
+
+    kernel_init = staticmethod(nn.initializers.ones)
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        dtype: DTypeLike = jnp.bfloat16,
+        param_dtype: DTypeLike = jnp.bfloat16,
+        *,
+        rngs: nn.Rngs,
+    ):
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.kernel = nn.Param(
+            RMSNormGated.kernel_init(rngs.params(), (hidden_size,), param_dtype),
+        )
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Return sharding specs for normalization parameters."""
+        return {"kernel": Replicated}
+
+    @jax.named_scope("easydel-rmsnorm-gated")
+    def __call__(
+        self,
+        hidden_states: Float[Array, "... hidden_size"],
+        gate: Float[Array, "... hidden_size"],
+    ) -> Float[Array, "... hidden_size"]:
+        """Apply gated RMSNorm normalization.
+
+        Args:cle
+            hidden_states: Input tensor of shape ``(..., hidden_size)``.
+            gate: Gate tensor of shape ``(..., hidden_size)``.
+
+        Returns:
+            Gated normalized tensor of the same shape and dtype as input.
+        """
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.astype(jnp.float32)
+        variance = jnp.mean(hidden_states**2, axis=-1, keepdims=True)
+        hidden_states = hidden_states * lax.rsqrt(variance + self.eps)
+        hidden_states = self.kernel.value.astype(jnp.float32) * hidden_states
+        hidden_states = hidden_states * jax.nn.silu(gate.astype(jnp.float32))
+        return hidden_states.astype(input_dtype)
+
+
 class BatchNorm(nn.Module):
     """Batch Normalization layer.
 

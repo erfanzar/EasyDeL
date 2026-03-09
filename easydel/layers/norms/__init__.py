@@ -52,6 +52,6 @@ See Also:
     - :data:`lowfloats`: Supported low-precision float types.
 """
 
-from ._norms import BatchNorm, LayerNorm, RMSNorm, lowfloats
+from ._norms import BatchNorm, LayerNorm, RMSNorm, RMSNormGated, lowfloats
 
-__all__ = ("BatchNorm", "LayerNorm", "RMSNorm", "lowfloats")
+__all__ = ("BatchNorm", "LayerNorm", "RMSNorm", "RMSNormGated", "lowfloats")

@@ -35,6 +35,8 @@ import typing as tp
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from ejkernel.loggings import get_logger
+
 from ..core.protocols import ShardedDataSource, ShardInfo
 from ..utils import glob_files, with_retry
 
@@ -42,6 +44,8 @@ if tp.TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
     from ..core.config import DatasetConfig
+
+logger = get_logger(__name__)
 
 
 def _is_pathlike(s: str) -> bool:
@@ -831,9 +835,31 @@ def load_for_inform(inform, mixture):
     t = str(inform.get_str_type())
     df = inform.data_files
 
+    def _apply_num_rows_limit(dataset):
+        num_rows = getattr(inform, "num_rows", None)
+        if num_rows is None:
+            return dataset
+
+        limit = int(num_rows)
+        if limit < 0:
+            raise ValueError("num_rows must be >= 0")
+
+        if mixture.streaming:
+            if hasattr(dataset, "take"):
+                return dataset.take(limit)
+            logger.warning("num_rows=%d requested but dataset has no .take() method; returning unlimited.", limit)
+            return dataset
+
+        if hasattr(dataset, "select"):
+            return dataset.select(range(min(limit, len(dataset))))
+
+        if hasattr(dataset, "take"):
+            return dataset.take(limit)
+        return dataset
+
     # Create source and convert to HF dataset
     if t in {"huggingface", "hf"} and isinstance(df, str) and not _is_pathlike(df):
-        return load_dataset(
+        dataset = load_dataset(
             path=df,
             name=inform.dataset_split_name,
             split=inform.split or "train",
@@ -841,6 +867,7 @@ def load_for_inform(inform, mixture):
             streaming=mixture.streaming,
             num_proc=None if mixture.streaming else 1,
         )
+        return _apply_num_rows_limit(dataset)
 
     # File-based loading
     builder, files = _detect_builder_and_files(df)
@@ -864,7 +891,7 @@ def load_for_inform(inform, mixture):
                         yield {k: v[i] for k, v in cols.items()}
 
     try:
-        return load_dataset(
+        dataset = load_dataset(
             path="json" if builder in {"json", "jsonl"} else builder,
             data_files=files,
             split=inform.split or "train",
@@ -872,8 +899,10 @@ def load_for_inform(inform, mixture):
             streaming=mixture.streaming,
             num_proc=None if mixture.streaming else 1,
         )
+        return _apply_num_rows_limit(dataset)
     except ValueError as e:
         msg = str(e)
         if builder == "parquet" and ("Feature type 'List' not found" in msg or "from_dict" in msg):
-            return IterableDataset.from_generator(lambda: _iter_parquet_rows(files))
+            dataset = IterableDataset.from_generator(lambda: _iter_parquet_rows(files))
+            return _apply_num_rows_limit(dataset)
         raise

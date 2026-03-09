@@ -1,6 +1,9 @@
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from eformer.common_types import ColumnWise, Replicated, RowWise
 from flax import nnx as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -9,9 +12,15 @@ from easydel.layers.linears._linear import ColumnParallelLinear
 from easydel.layers.linears._linear_quantized import (
     ColumnParallelLinearQuantized,
     RowParallelLinearQuantized,
+    _effective_ejkernel_group_size,
 )
 from easydel.layers.quantization._configs import QuantizationConfig, QuantizationType
 from easydel.layers.quantization._quants import EasyQuantizer
+
+
+def test_effective_ejkernel_group_size_rejects_non_divisible_local_shards():
+    with pytest.raises(ValueError, match="No supported ejkernel group_size divides the local grouping axis"):
+        _effective_ejkernel_group_size("affine", 64, (8, 24))
 
 
 def test_row_parallel_affine_quantized_craft_sharding():
@@ -44,6 +53,36 @@ def test_column_parallel_nf4_quantized_craft_sharding():
     assert specs["quant_scales"] is ColumnWise
     assert "quant_biases" not in specs
     assert specs["bias"] is Replicated
+
+
+def test_quantized_craft_sharding_keeps_kernel_sharded_when_scales_fallback():
+    class _FakePartitionManager:
+        def resolve(self, axes=None, mode=None, shape=None):
+            rank = len(shape or ())
+            if axes is Replicated:
+                return PartitionSpec(*((None,) * rank))
+            if axes is ColumnWise:
+                return PartitionSpec(None, "tp") if rank == 2 else PartitionSpec("tp")
+            if axes is RowWise:
+                return PartitionSpec("tp", None) if rank == 2 else PartitionSpec("tp")
+            return axes
+
+    layer = ColumnParallelLinearQuantized(
+        in_features=128,
+        out_features=96,
+        config=QuantizationConfig(dtype=QuantizationType.INT8, group_size=64),
+        use_bias=False,
+        rngs=nn.Rngs(0),
+    )
+
+    specs = layer.craft_sharding(
+        partition_manager=_FakePartitionManager(),
+        mesh=SimpleNamespace(shape={"tp": 4}, empty=False),
+    )
+
+    assert specs["quant_kernel"] == PartitionSpec(None, "tp")
+    assert specs["quant_scales"] == PartitionSpec(None, None)
+    assert specs["quant_biases"] == PartitionSpec(None, None)
 
 
 def test_quantized_linear_uses_shard_map_for_sharded_params(monkeypatch):

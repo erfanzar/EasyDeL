@@ -56,7 +56,7 @@ from .pack import (
     pack_constant_length,
     pack_pre_tokenized,
 )
-from .source import TransformedShardedSource
+from .source import LimitedShardedSource, TransformedShardedSource
 from .tokenize import (
     TokenizedShardedSource,
     TokenizerManager,
@@ -115,6 +115,7 @@ __all__ = [
     "GRPOPreprocessTransform",
     "GreedyPacker",
     "KTOPreprocessTransform",
+    "LimitedShardedSource",
     "MapField",
     "MapTransform",
     "MaybeApplyChatTemplate",

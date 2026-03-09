@@ -375,31 +375,62 @@ def _single_step_kda_fwd(
     Float[Array, "batch num_heads 1 d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
 ]:
-    """Single-step recurrent forward pass for inference.
+    """Single-step recurrent forward pass for BHTD-layout decode inputs."""
+    output, new_state = _single_step_kda_core(
+        query=query.squeeze(2),
+        key=key.squeeze(2),
+        value=value.squeeze(2),
+        beta=beta.squeeze(2),
+        decay=None if decay is None else decay.squeeze(2),
+        recurrent_state=recurrent_state,
+        use_qk_l2norm=use_qk_l2norm,
+    )
+    return output[:, :, None, :], new_state
 
-    Optimized for single-token generation during autoregressive decoding.
 
-    Args:
-        query: Query tensor [batch, num_heads, 1, head_dim]
-        key: Key tensor [batch, num_heads, 1, head_dim]
-        value: Value tensor [batch, num_heads, 1, d_state]
-        beta: Gating tensor [batch, num_heads, 1]
-        decay: Per-token decay [batch, num_heads, 1]
-        recurrent_state: Previous state [batch, num_heads, head_dim, d_state]
-        use_qk_l2norm: Whether to apply L2 normalization to query and key
+def _single_step_kda_fwd_bthd(
+    query: Float[Array, "batch 1 num_heads head_dim"],
+    key: Float[Array, "batch 1 num_heads head_dim"],
+    value: Float[Array, "batch 1 num_heads d_state"],
+    beta: Float[Array, "batch 1 num_heads"],
+    decay: Float[Array, "batch 1 num_heads"] | None,
+    recurrent_state: Float[Array, "batch num_heads head_dim d_state"],
+    use_qk_l2norm: bool = True,
+) -> tuple[
+    Float[Array, "batch 1 num_heads d_state"],
+    Float[Array, "batch num_heads head_dim d_state"],
+]:
+    """Single-step recurrent forward pass for BTHD-layout decode inputs."""
+    output, new_state = _single_step_kda_core(
+        query=query[:, 0, :, :],
+        key=key[:, 0, :, :],
+        value=value[:, 0, :, :],
+        beta=beta[:, 0, :],
+        decay=None if decay is None else decay[:, 0, :],
+        recurrent_state=recurrent_state,
+        use_qk_l2norm=use_qk_l2norm,
+    )
+    return output[:, None, :, :], new_state
 
-    Returns:
-        Tuple of (output, new_state)
-    """
+
+def _single_step_kda_core(
+    query: Float[Array, "batch num_heads head_dim"],
+    key: Float[Array, "batch num_heads head_dim"],
+    value: Float[Array, "batch num_heads d_state"],
+    beta: Float[Array, "batch num_heads"],
+    decay: Float[Array, "batch num_heads"] | None,
+    recurrent_state: Float[Array, "batch num_heads head_dim d_state"],
+    use_qk_l2norm: bool = True,
+) -> tuple[
+    Float[Array, "batch num_heads d_state"],
+    Float[Array, "batch num_heads head_dim d_state"],
+]:
+    """Shared single-step KDA math over squeezed decode tensors."""
     if use_qk_l2norm:
         query = l2norm(query, axis=-1, eps=1e-6)
         key = l2norm(key, axis=-1, eps=1e-6)
 
-    query = query.squeeze(2)
-    key = key.squeeze(2)
-    value = value.squeeze(2)
-    beta = beta.squeeze(2)
-
+    input_dtype = query.dtype
     query = query.astype(jnp.float32)
     key = key.astype(jnp.float32)
     value = value.astype(jnp.float32)
@@ -411,20 +442,14 @@ def _single_step_kda_fwd(
     query = query * scale
 
     if decay is not None:
-        decay = decay.squeeze(2).astype(jnp.float32)
-        g_exp = jnp.exp(decay)[:, :, None, None]
-        recurrent_state = recurrent_state * g_exp
+        decay = decay.astype(jnp.float32)
+        recurrent_state = recurrent_state * jnp.exp(decay)[:, :, None, None]
 
-    kv_mem = jnp.sum(recurrent_state * key[:, :, :, None], axis=-2)  # (B, H, V)
-
-    beta_scaled = beta[:, :, None]
-    delta = (value - kv_mem) * beta_scaled
-
+    kv_mem = jnp.sum(recurrent_state * key[:, :, :, None], axis=-2)
+    delta = (value - kv_mem) * beta[:, :, None]
     new_state = recurrent_state + key[:, :, :, None] * delta[:, :, None, :]
-
     output = jnp.sum(new_state * query[:, :, :, None], axis=-2)
-    output = output[:, :, None, :]
-    return output, new_state
+    return output.astype(input_dtype), new_state
 
 
 @OperationRegistry.register
@@ -541,28 +566,19 @@ class KernelDeltaAttnOp(OperationImpl):
                 key = with_sharding_constraint(arr=key, sharding=shardings.key)
                 value = with_sharding_constraint(arr=value, sharding=shardings.value)
 
-        query = query.transpose(0, 2, 1, 3)
-        key = key.transpose(0, 2, 1, 3)
-        value = value.transpose(0, 2, 1, 3)
-
         runtime_dtype = self.metadata.runtime_dtype
         query = query.astype(runtime_dtype)
         key = key.astype(runtime_dtype)
         value = value.astype(runtime_dtype)
 
         beta = beta.astype(runtime_dtype)
-        if beta.ndim == 3:
-            beta = beta.transpose(0, 2, 1)
-
         if decay is not None:
             decay = decay.astype(runtime_dtype)
-            if decay.ndim == 3:
-                decay = decay.transpose(0, 2, 1)
 
         is_inference = seq_len == 1
 
         if is_inference and recurrent_state is not None:
-            outputs, new_recurrent_state = _single_step_kda_fwd(
+            outputs, new_recurrent_state = _single_step_kda_fwd_bthd(
                 query=query,
                 key=key,
                 value=value,
@@ -572,6 +588,16 @@ class KernelDeltaAttnOp(OperationImpl):
                 use_qk_l2norm=True,
             )
         else:
+            query = query.transpose(0, 2, 1, 3)
+            key = key.transpose(0, 2, 1, 3)
+            value = value.transpose(0, 2, 1, 3)
+
+            if beta.ndim == 3:
+                beta = beta.transpose(0, 2, 1)
+
+            if decay is not None and decay.ndim == 3:
+                decay = decay.transpose(0, 2, 1)
+
             outputs, new_recurrent_state = _chunk_kda_fwd(
                 query=query,
                 key=key,
@@ -583,7 +609,7 @@ class KernelDeltaAttnOp(OperationImpl):
                 use_qk_l2norm=True,
             )
 
-        outputs = outputs.transpose(0, 2, 1, 3)
+            outputs = outputs.transpose(0, 2, 1, 3)
 
         if self.metadata.mesh is not None and shardings is not None:
             with self.metadata.mesh:
