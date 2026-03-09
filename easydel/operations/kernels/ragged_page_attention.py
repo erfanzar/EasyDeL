@@ -80,6 +80,7 @@ from functools import partial
 
 import jax
 from eformer import common_types as ct
+from ejkernel.loggings import get_logger
 from ejkernel.modules import (  # pyright: ignore[reportMissingTypeStubs]
     ragged_page_attention_v2,
     ragged_page_attention_v3,
@@ -92,9 +93,6 @@ from jaxtyping import Array, DTypeLike, Float
 from easydel.axis import ATTN_DP
 from easydel.caching import RaggedPagesCacheView, RaggedPagesMetadata
 from easydel.utils.helpers import check_bool_flag
-from ejkernel.loggings import get_logger
-
-logger = get_logger(__name__)
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationRegistry
@@ -106,6 +104,7 @@ from ..requirements import (
     RequirementsBuilder,
 )
 
+logger = get_logger(__name__)
 USE_SHARDMAP = True
 ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
 
