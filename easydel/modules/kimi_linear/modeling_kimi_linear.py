@@ -70,36 +70,18 @@ from easydel.layers import (
     Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    RMSNormGated,
     RowParallelLinear,
     RowParallelMoELinear,
 )
 from easydel.layers.attention import UnifiedAttention
+from easydel.layers.linear_attention import apply_conv_with_state, apply_mask_to_padding_states
+from easydel.layers.norms import lowfloats
 from easydel.modules._base import BaseCausalLMModule
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import KDAOutput, KernelDeltaAttnOp, fused_kda_gate
 
 from .kimi_linear_configuration import KimiLinearConfig
-
-
-def apply_mask_to_padding_states(hidden_states: Array, attention_mask: Array | None) -> Array:
-    """Apply attention mask to hidden states by zeroing out padding positions.
-
-    Args:
-        hidden_states (Array): Hidden state tensor of shape (batch, seq_len, hidden_dim).
-        attention_mask (Array | None): Boolean or float mask of shape (batch, seq_len).
-
-    Returns:
-        Array: Masked hidden states with padding positions zeroed out.
-    """
-    if (
-        attention_mask is not None
-        and attention_mask.shape[0] == hidden_states.shape[0]
-        and attention_mask.shape[1] == hidden_states.shape[1]
-        and attention_mask.shape[1] > 1
-    ):
-        dtype = hidden_states.dtype
-        return (hidden_states * attention_mask[:, :, None]).astype(dtype)
-    return hidden_states
 
 
 class KimiRMSNorm(nn.Module):
@@ -158,73 +140,6 @@ class KimiRMSNorm(nn.Module):
         variance = jnp.mean(hidden_states**2, axis=-1, keepdims=True)
         hidden_states = hidden_states * jax.lax.rsqrt(variance + self.eps)
         return (self.kernel.value * hidden_states).astype(input_dtype)
-
-
-class KimiRMSNormGated(nn.Module):
-    """Gated RMSNorm for Kimi Linear KDA attention.
-
-    Applies RMSNorm with a gating mechanism: output = silu(gate) * RMSNorm(x).
-    This is used in the output path of KDA (Kernel Delta Attention) layers
-    for improved gradient flow and expressiveness.
-
-    Attributes:
-        hidden_size: Dimension of the input features.
-        eps: Small constant for numerical stability.
-    """
-
-    kernel_init = staticmethod(nn.initializers.ones)
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        *,
-        rngs: nn.Rngs,
-    ):
-        """Initialize KimiRMSNormGated layer.
-
-        Args:
-            hidden_size (int): Dimension of the input features.
-            eps (float, optional): Small constant for numerical stability. Defaults to 1e-6.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            rngs (nn.Rngs): Random number generator state.
-        """
-        self.hidden_size = hidden_size
-        self.eps = eps
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.kernel = nn.Param(
-            KimiRMSNormGated.kernel_init(rngs.params(), (hidden_size,), param_dtype),
-        )
-
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for normalization parameters."""
-        return {"kernel": Replicated}
-
-    def __call__(
-        self,
-        hidden_states: Float[Array, "... hidden_size"],
-        gate: Float[Array, "... hidden_size"],
-    ) -> Float[Array, "... hidden_size"]:
-        """Apply gated RMSNorm normalization.
-
-        Args:
-            hidden_states (Array): Input tensor of shape (..., hidden_size).
-            gate (Array): Gate tensor of shape (..., hidden_size) for gating mechanism.
-
-        Returns:
-            Array: Gated normalized tensor of the same shape as input.
-        """
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.astype(jnp.float32)
-        variance = jnp.mean(hidden_states**2, axis=-1, keepdims=True)
-        hidden_states = hidden_states * jax.lax.rsqrt(variance + self.eps)
-        hidden_states = self.kernel.value * hidden_states.astype(input_dtype)
-        hidden_states = hidden_states * jax.nn.silu(gate.astype(jnp.float32))
-        return hidden_states.astype(input_dtype)
 
 
 class KimiMLP(nn.Module):
@@ -1063,7 +978,7 @@ class KimiDeltaAttention(nn.Module):
             rngs=rngs,
         )
 
-        self.o_norm = KimiRMSNormGated(
+        self.o_norm = RMSNormGated(
             self.head_v_dim,
             eps=config.rms_norm_eps,
             dtype=dtype,
@@ -1100,52 +1015,6 @@ class KimiDeltaAttention(nn.Module):
             "dt_bias": Replicated,
         }
 
-    def _apply_conv_with_state(
-        self,
-        x: Float[Array, "batch seq_len dim"],
-        conv_layer: nn.Conv,
-        conv_state: Float[Array, "batch dim d_conv"] | None,
-        is_inference: bool,
-    ) -> tuple[Float[Array, "batch seq_len dim"], Float[Array, "batch dim d_conv"] | None]:
-        """Apply convolution with optional state management for inference.
-
-        Args:
-            x: Input tensor [batch, seq_len, dim]
-            conv_layer: Convolution layer
-            conv_state: Previous convolution state [batch, dim, d_conv]
-            is_inference: Whether in inference mode (single token)
-
-        Returns:
-            Tuple of (output, new_conv_state)
-        """
-        _, seq_len, _ = x.shape
-
-        if is_inference and conv_state is not None:
-            new_state = jnp.concatenate([conv_state[:, :, 1:], x.transpose(0, 2, 1)], axis=-1)
-
-            kernel = conv_layer.kernel.value
-            kernel = kernel.squeeze(1).T
-            output = jnp.sum(new_state * kernel[None, :, :], axis=-1)
-            output = output[:, None, :]
-
-            return output, new_state
-        else:
-            output = conv_layer(x)
-
-            if seq_len >= self.d_conv:
-                new_state = x[:, -self.d_conv :, :].transpose(0, 2, 1)
-            else:
-                pad_len = self.d_conv - seq_len
-                if conv_state is not None:
-                    new_state = jnp.concatenate(
-                        [conv_state[:, :, seq_len:], x.transpose(0, 2, 1)],
-                        axis=-1,
-                    )
-                else:
-                    new_state = jnp.pad(x.transpose(0, 2, 1), ((0, 0), (0, 0), (pad_len, 0)))
-
-            return output, new_state
-
     def __call__(
         self,
         hidden_states: Float[Array, "batch seq_len hidden_dim"],
@@ -1181,13 +1050,34 @@ class KimiDeltaAttention(nn.Module):
         k_conv_state = cache_view.k_conv_state if cache_view is not None else None
         v_conv_state = cache_view.v_conv_state if cache_view is not None else None
 
-        query, new_q_conv_state = self._apply_conv_with_state(query, self.q_conv1d, q_conv_state, is_inference)
-        key, new_k_conv_state = self._apply_conv_with_state(key, self.k_conv1d, k_conv_state, is_inference)
-        value, new_v_conv_state = self._apply_conv_with_state(value, self.v_conv1d, v_conv_state, is_inference)
-
-        query = jax.nn.silu(query)
-        key = jax.nn.silu(key)
-        value = jax.nn.silu(value)
+        conv_output_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
+        query, new_q_conv_state = apply_conv_with_state(
+            query,
+            self.q_conv1d,
+            q_conv_state,
+            is_inference=is_inference,
+            d_conv=self.d_conv,
+            output_dtype=conv_output_dtype,
+            reuse_partial_state=True,
+        )
+        key, new_k_conv_state = apply_conv_with_state(
+            key,
+            self.k_conv1d,
+            k_conv_state,
+            is_inference=is_inference,
+            d_conv=self.d_conv,
+            output_dtype=conv_output_dtype,
+            reuse_partial_state=True,
+        )
+        value, new_v_conv_state = apply_conv_with_state(
+            value,
+            self.v_conv1d,
+            v_conv_state,
+            is_inference=is_inference,
+            d_conv=self.d_conv,
+            output_dtype=conv_output_dtype,
+            reuse_partial_state=True,
+        )
 
         query = query.reshape(batch_size, seq_len, self.num_heads, self.head_k_dim)
         key = key.reshape(batch_size, seq_len, self.num_heads, self.head_k_dim)
@@ -1235,12 +1125,8 @@ class KimiDeltaAttention(nn.Module):
 
         output = kda_output.attention_outputs
 
-        output_shape = output.shape
-        output = output.reshape(-1, self.head_v_dim)
-        output_gate_flat = output_gate.reshape(-1, self.head_v_dim)
-        output = self.o_norm(output, output_gate_flat)
-        output = output.reshape(output_shape)
-
+        # o_norm operates on last dim — skip flatten/unflatten.
+        output = self.o_norm(output, output_gate)
         output = output.reshape(batch_size, seq_len, -1)
         output = apply_logical_sharding(
             output,

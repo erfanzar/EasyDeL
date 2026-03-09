@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import jax.numpy as jnp
 
-from easydel.trainers.distillation_trainer.distillation_trainer import DistillationTrainer
 from easydel.trainers.binary_classifier_optimization_trainer._fn import (
     concatenated_forward as bco_concatenated_forward,
 )
@@ -14,6 +13,7 @@ from easydel.trainers.contrastive_preference_optimization_trainer._fn import (
 from easydel.trainers.direct_preference_optimization_trainer._fn import (
     concatenated_forward as dpo_concatenated_forward,
 )
+from easydel.trainers.distillation_trainer.distillation_trainer import DistillationTrainer
 from easydel.trainers.odds_ratio_preference_optimization_trainer._fn import (
     concatenated_forward as orpo_concatenated_forward,
 )

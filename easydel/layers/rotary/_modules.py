@@ -58,6 +58,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx as nn
 
+from easydel.layers.norms import lowfloats
+
 from ._compute_fns import (
     apply_basic_rope,
     apply_phi3_rope,
@@ -77,6 +79,17 @@ AVAILABLE_ROPE_TYPES = {}
 
 
 _T = tp.TypeVar("_T")
+
+
+def _promote_rotary_operands(*operands: jax.Array) -> tuple[jax.Array, ...]:
+    """Promote rotary operands explicitly when low-precision dtypes are involved."""
+    if any(operand.dtype in lowfloats for operand in operands):
+        compute_dtype = jnp.float32
+    else:
+        compute_dtype = operands[0].dtype
+        for operand in operands[1:]:
+            compute_dtype = jnp.promote_types(compute_dtype, operand.dtype)
+    return tuple(operand.astype(compute_dtype) for operand in operands)
 
 
 def rope_wrapper(type: str) -> tp.Callable[[_T], _T]:  # noqa
@@ -463,6 +476,7 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         if self.repetition_style:
             q_rot = query[..., :rotary_dim]
             k_rot = key[..., :rotary_dim]
+            q_rot, k_rot, cos, sin = _promote_rotary_operands(q_rot, k_rot, cos, sin)
 
             q_pass = None
             k_pass = None
@@ -475,20 +489,21 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
             k_rot = (k_rot * cos) + (rotate_fn(k_rot) * sin)
 
             if q_pass is not None:
-                q_rot = jnp.concatenate([q_rot, q_pass], axis=-1)
-                k_rot = jnp.concatenate([k_rot, k_pass], axis=-1)
+                q_rot = jnp.concatenate([q_rot, q_pass.astype(q_rot.dtype)], axis=-1)
+                k_rot = jnp.concatenate([k_rot, k_pass.astype(k_rot.dtype)], axis=-1)
 
             return q_rot.astype(self.dtype), k_rot.astype(self.dtype)
         else:
             q_rot = query[..., :rotary_dim]
             k_rot = key[..., :rotary_dim]
+            q_rot, k_rot, cos, sin = _promote_rotary_operands(q_rot, k_rot, cos, sin)
 
             q_embed = (q_rot * cos) + (_rotate_neox(q_rot) * sin)
             k_embed = (k_rot * cos) + (_rotate_neox(k_rot) * sin)
 
             if rotary_dim < query.shape[-1]:
-                q_embed = jnp.concatenate([q_embed, query[..., rotary_dim:]], axis=-1)
-                k_embed = jnp.concatenate([k_embed, key[..., rotary_dim:]], axis=-1)
+                q_embed = jnp.concatenate([q_embed, query[..., rotary_dim:].astype(q_embed.dtype)], axis=-1)
+                k_embed = jnp.concatenate([k_embed, key[..., rotary_dim:].astype(k_embed.dtype)], axis=-1)
 
             return q_embed.astype(self.dtype), k_embed.astype(self.dtype)
 

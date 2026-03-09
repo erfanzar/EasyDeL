@@ -1312,9 +1312,15 @@ def _create_source_from_inform(
         TextShardedSource,
         expand_data_files,
     )
+    from easydel.data.transforms import LimitedShardedSource
 
     data_files = inform_cfg.get("data_files")
     source_type_raw = inform_cfg.get("type") or ""
+    num_rows = inform_cfg.get("num_rows")
+    if num_rows is not None:
+        num_rows = int(num_rows)
+        if num_rows < 0:
+            raise ValueError("num_rows must be >= 0")
 
     if data_files is None:
         if isinstance(source_type_raw, str):
@@ -1350,13 +1356,14 @@ def _create_source_from_inform(
         streaming = inform_cfg.get("streaming")
         if streaming is None:
             streaming = mixture_cfg.get("streaming", True)
-        return HuggingFaceShardedSource(
+        source = HuggingFaceShardedSource(
             dataset_name=data_files,
             split=split,
             subset=dataset_split_name,
             streaming=streaming,
             cache_dir=mixture_cfg.get("cache_dir"),
         )
+        return LimitedShardedSource(source, num_rows) if num_rows is not None else source
 
     # Expand files
     try:
@@ -1367,13 +1374,14 @@ def _create_source_from_inform(
             streaming = inform_cfg.get("streaming")
             if streaming is None:
                 streaming = mixture_cfg.get("streaming", True)
-            return HuggingFaceShardedSource(
+            source = HuggingFaceShardedSource(
                 dataset_name=data_files,
                 split=split,
                 subset=dataset_split_name,
                 streaming=streaming,
                 cache_dir=mixture_cfg.get("cache_dir"),
             )
+            return LimitedShardedSource(source, num_rows) if num_rows is not None else source
         raise
 
     if not files:
@@ -1395,17 +1403,18 @@ def _create_source_from_inform(
 
     # Create appropriate source
     if source_type in ("json", "jsonl"):
-        return JsonShardedSource(files)
+        source = JsonShardedSource(files)
     elif source_type == "parquet":
-        return ParquetShardedSource(files)
+        source = ParquetShardedSource(files)
     elif source_type == "arrow":
-        return ArrowShardedSource(files)
+        source = ArrowShardedSource(files)
     elif source_type in ("csv", "tsv"):
-        return CsvShardedSource(files)
+        source = CsvShardedSource(files)
     elif source_type in ("txt", "text"):
-        return TextShardedSource(files)
+        source = TextShardedSource(files)
     else:
         raise ValueError(f"Unsupported dataset type: {source_type}")
+    return LimitedShardedSource(source, num_rows) if num_rows is not None else source
 
 
 def build_sharded_source(cfg_like: ELMConfig | Mapping[str, Any]) -> "ShardedDataSource | None":

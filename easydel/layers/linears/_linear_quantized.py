@@ -52,6 +52,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from eformer.common_types import ColumnWise, Replicated, RowWise
+from ejkernel.loggings import get_logger
 from ejkernel.modules.operations import (  # pyright: ignore[reportMissingTypeStubs]
     quantized_matmul as ej_quantized_matmul,
 )
@@ -69,6 +70,8 @@ from easydel.layers.quantization._quants import quantize
 
 from ._linear import ColumnParallelLinear, RowParallelLinear
 
+logger = get_logger(__name__)
+
 if tp.TYPE_CHECKING:
     from easydel.layers.quantization._configs import QuantizationConfig
 
@@ -81,6 +84,7 @@ default_kernel_init = initializers.lecun_normal()
 default_bias_init = initializers.zeros_init()
 
 _QMM_NON_AFFINE_MODES = frozenset({"nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"})
+_EJKERNEL_GROUP_SIZES = (1024, 512, 256, 128, 64, 32, 16)
 _QMM_DEFAULT_POLICY_TABLE: dict[str, tp.Any] = {
     "tpu": {
         "affine": {
@@ -162,6 +166,42 @@ def _lookup_qmm_policy_entry(
     return dict(size_table) if isinstance(size_table, dict) else {}
 
 
+def _effective_ejkernel_group_size(mode: str, requested_group_size: int, array_shape: tuple[int, ...]) -> int:
+    """Clamp ejkernel group size to the local packed weight layout when possible."""
+    if requested_group_size <= 0:
+        raise ValueError(f"`group_size` must be > 0, got {requested_group_size}.")
+    if len(array_shape) == 0:
+        return requested_group_size
+
+    group_dim = int(array_shape[-1])
+    if requested_group_size <= group_dim and group_dim % requested_group_size == 0:
+        return requested_group_size
+
+    if mode in {"affine", "nf4"}:
+        for candidate in _EJKERNEL_GROUP_SIZES:
+            if candidate > requested_group_size:
+                continue
+            if candidate <= group_dim and group_dim % candidate == 0:
+                logger.warning(
+                    "Adjusted ejkernel group_size from %d to %d for mode=%r "
+                    "(group_dim=%d is not divisible by requested size).",
+                    requested_group_size,
+                    candidate,
+                    mode,
+                    group_dim,
+                )
+                return candidate
+        raise ValueError(
+            "No supported ejkernel group_size divides the local grouping axis. "
+            f"got mode={mode!r}, requested_group_size={requested_group_size}, group_dim={group_dim}, "
+            f"supported_group_sizes={_EJKERNEL_GROUP_SIZES}."
+        )
+
+    # Other modes (mxfp4, mxfp8, nvfp4, etc.) have different layout constraints;
+    # return as-is and let the backend validate.
+    return requested_group_size
+
+
 def _mesh_matches(lhs: jax.sharding.Mesh, rhs: jax.sharding.Mesh) -> bool:
     if lhs.axis_names != rhs.axis_names:
         return False
@@ -214,6 +254,46 @@ def _spec_for_mesh(array: jax.Array | None, mesh: jax.sharding.Mesh) -> jax.shar
     if isinstance(sharding, jax.sharding.NamedSharding) and _mesh_matches(sharding.mesh, mesh):
         return sharding.spec
     return jax.sharding.PartitionSpec()
+
+
+def _mesh_partition_product(mesh: jax.sharding.Mesh, axis_spec: tp.Any) -> int:
+    if axis_spec is None:
+        return 1
+    if isinstance(axis_spec, (list, tuple)):
+        product = 1
+        for axis_name in axis_spec:
+            if axis_name is None:
+                continue
+            product *= int(mesh.shape.get(str(axis_name), 1))
+        return int(product)
+    return int(mesh.shape.get(str(axis_spec), 1))
+
+
+def _sanitize_spec_for_shape(
+    spec: jax.sharding.PartitionSpec,
+    shape: tuple[int, ...],
+    mesh: jax.sharding.Mesh,
+) -> jax.sharding.PartitionSpec:
+    axes = list(tuple(spec))
+    changed = False
+    for dim_index, axis_spec in enumerate(axes):
+        if axis_spec is None or dim_index >= len(shape):
+            continue
+        shard_factor = _mesh_partition_product(mesh, axis_spec)
+        if shard_factor > 1 and int(shape[dim_index]) % shard_factor != 0:
+            logger.warning(
+                "Dropping partition axis %r on dim %d: shape[%d]=%d is not divisible by shard_factor=%d.",
+                axis_spec,
+                dim_index,
+                dim_index,
+                int(shape[dim_index]),
+                shard_factor,
+            )
+            axes[dim_index] = None
+            changed = True
+    if not changed:
+        return spec
+    return jax.sharding.PartitionSpec(*axes)
 
 
 def _spec_is_sharded(spec: jax.sharding.PartitionSpec) -> bool:
@@ -556,6 +636,8 @@ class ParallelLinearQuantized(nn.Module):
         self.qmm_policy_table = qmm_policy_table
         self.qmm_allow_input_all_gather = bool(qmm_allow_input_all_gather)
         self.rngs = rngs
+        # Set by _quantize_array during __init__; used by _resolve_ejkernel_params afterwards.
+        self._ej_group_size: int | None = None
 
         kernel = kernel_init(rngs.params(), (in_features, out_features), param_dtype)
         quant_kernel, quant_scales, quant_biases = self._quantize_array(kernel)
@@ -667,7 +749,10 @@ class ParallelLinearQuantized(nn.Module):
 
     def _resolve_ejkernel_params(self) -> tuple[str, int, int, bool]:
         """Resolve ejkernel quantization parameters from config."""
-        return resolve_ejkernel_quant_params(self.config)
+        mode, group_size, bits, needs_biases = resolve_ejkernel_quant_params(self.config)
+        if self._ej_group_size is not None:
+            group_size = int(self._ej_group_size)
+        return mode, group_size, bits, needs_biases
 
     def _quantize_array(self, array: jax.Array):
         """Quantize an array according to the configured quantization type.
@@ -690,6 +775,8 @@ class ParallelLinearQuantized(nn.Module):
             ValueError: If the configured quantization dtype is not supported.
         """
         mode, group_size, bits, needs_biases = self._resolve_ejkernel_params()
+        group_size = _effective_ejkernel_group_size(mode, group_size, tuple(array.shape))
+        self._ej_group_size = int(group_size)
         if needs_biases:
             wq, scales, biases = prepack_quantized_weights(
                 array,
@@ -897,6 +984,11 @@ class ParallelLinearQuantized(nn.Module):
                         bias_spec = jax.sharding.PartitionSpec()
                 else:
                     bias_spec = jax.sharding.PartitionSpec()
+
+                kernel_spec = _sanitize_spec_for_shape(kernel_spec, tuple(kernel_value.shape), mesh)
+                scale_spec = _sanitize_spec_for_shape(scale_spec, tuple(scale_value.shape), mesh)
+                if bias_value is not None:
+                    bias_spec = _sanitize_spec_for_shape(bias_spec, tuple(bias_value.shape), mesh)
 
         if not use_forced_layout:
             if not any(_spec_is_sharded(s) for s in (input_spec, kernel_spec, scale_spec, bias_spec)):

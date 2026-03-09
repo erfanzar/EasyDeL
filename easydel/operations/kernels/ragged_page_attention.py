@@ -92,6 +92,9 @@ from jaxtyping import Array, DTypeLike, Float
 from easydel.axis import ATTN_DP
 from easydel.caching import RaggedPagesCacheView, RaggedPagesMetadata
 from easydel.utils.helpers import check_bool_flag
+from ejkernel.loggings import get_logger
+
+logger = get_logger(__name__)
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationRegistry
@@ -262,6 +265,17 @@ class _RaggedPageAttn(OperationImpl):
         **ignore,
     ) -> AttentionOutput:
         kv_pages = cache_view.kv_pages
+        kv_cache_dtype = getattr(kv_pages, "dtype", None)
+        if kv_cache_dtype is not None and (key.dtype != kv_cache_dtype or value.dtype != kv_cache_dtype):
+            if jnp.dtype(kv_cache_dtype).itemsize < max(jnp.dtype(key.dtype).itemsize, jnp.dtype(value.dtype).itemsize):
+                logger.warning(
+                    "Casting key/value from %s to lower-precision KV cache dtype %s; "
+                    "this may reduce numerical fidelity.",
+                    key.dtype,
+                    kv_cache_dtype,
+                )
+            key = key.astype(kv_cache_dtype)
+            value = value.astype(kv_cache_dtype)
         manager = self.metadata.partition_manager
         resolve = manager.resolve
         request_distribution = cache_metadata.request_distribution

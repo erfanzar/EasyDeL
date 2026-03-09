@@ -51,6 +51,7 @@ from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float
 
 from easydel.caching import RecurrentCacheView
+from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
 from .._operation_impl import OperationImpl, OperationRegistry
@@ -274,8 +275,9 @@ class GatedDeltaRuleOp(OperationImpl):
             out_specs = (output_sharding, state_out_sharding)
 
         platform = None
-        if jax.default_backend() == "tpu":
-            platform = "pallas"
+        if jax.default_backend() == "tpu" and kernel_cfg is None:
+            if not check_bool_flag("EASYDEL_XLA_GDR", False):
+                platform = "pallas"
 
         outputs, new_recurrent_state = gated_delta_rule(
             query,

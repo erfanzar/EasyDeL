@@ -233,11 +233,11 @@ def resolve_ejkernel_quant_params(config: QuantizationConfig) -> tuple[str, int,
         if config.bits is not None:
             bits = int(config.bits)
         group_size = 64 if config.group_size is None else int(config.group_size)
-        if group_size not in {32, 64, 128}:
+        if group_size not in {16, 32, 64, 128, 256, 512, 1024}:
             if dtype == QuantizationType.INT8 and config.group_size is None:
                 group_size = 64
             else:
-                raise ValueError("affine mode supports group_size in {32, 64, 128}.")
+                raise ValueError("affine mode supports group_size in {16, 32, 64, 128, 256, 512, 1024}.")
         if bits not in {2, 3, 4, 5, 6, 7, 8}:
             raise ValueError("affine mode supports bits in {2, 3, 4, 5, 6, 7, 8}.")
         return "affine", group_size, bits, True
@@ -246,6 +246,8 @@ def resolve_ejkernel_quant_params(config: QuantizationConfig) -> tuple[str, int,
         if bits != 4:
             raise ValueError("nf4 requires bits=4.")
         group_size = 64 if config.group_size is None else int(config.group_size)
+        if group_size not in {16, 32, 64, 128, 256, 512, 1024}:
+            raise ValueError("nf4 mode supports group_size in {16, 32, 64, 128, 256, 512, 1024}.")
         return "nf4", group_size, 4, False
     if dtype == QuantizationType.MXFP4:
         group_size = 32 if config.group_size is None else int(config.group_size)

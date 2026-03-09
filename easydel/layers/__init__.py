@@ -48,7 +48,7 @@ from .moe import (
     MoeRoutingStrategy,
     get_moe_partition_spec,
 )
-from .norms import RMSNorm
+from .norms import RMSNorm, RMSNormGated
 from .quantization import (
     EasyDeLQuantizationConfig,
     EasyQuantizer,
@@ -113,6 +113,7 @@ __all__ = [
     "QuantizationConfig",
     "QuantizationType",
     "RMSNorm",
+    "RMSNormGated",
     "RopeConfig",
     "RotaryEmbedding",
     "RowParallelLinear",

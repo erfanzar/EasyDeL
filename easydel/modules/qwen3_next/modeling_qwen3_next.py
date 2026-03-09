@@ -31,7 +31,13 @@ import jax
 import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import Replicated
-from eformer.escale import apply_logical_sharding
+from eformer.escale import (
+    PartitionAxis,
+    PartitionManager,
+    apply_logical_sharding,
+    get_corrected_named_sharding,
+    with_sharding_constraint,
+)
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
@@ -66,10 +72,18 @@ from easydel.layers import (
     Embed,
     MoeLoadBalancingStrategy,
     MoeRoutingStrategy,
+    RMSNormGated,
     RowParallelLinear,
     RowParallelMoELinear,
 )
 from easydel.layers.attention import UnifiedAttention
+from easydel.layers.linear_attention import (
+    apply_conv_with_state,
+    apply_manual_depthwise_conv,
+    apply_mask_to_padding_states,
+    shift_conv_state_left,
+)
+from easydel.layers.norms import lowfloats
 from easydel.modules._base import BaseCausalLMModule
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import GatedDeltaRuleOp, GatedDeltaRuleOutput
@@ -77,29 +91,90 @@ from easydel.operations.kernels import GatedDeltaRuleOp, GatedDeltaRuleOutput
 from .qwen3_next_configuration import Qwen3NextConfig
 
 
-def apply_mask_to_padding_states(hidden_states: Array, attention_mask: Array | None) -> Array:
-    """Zero out hidden states at padding positions.
+def l2norm_decode(
+    x: Array,
+    *,
+    axis: int = -1,
+    eps: float = 1e-6,
+) -> Array:
+    """Match ejkernel's decode-time L2 normalization."""
+    inv_norm = jax.lax.rsqrt(jnp.sum(x * x, axis=axis, keepdims=True) + eps)
+    return x * inv_norm
 
-    Applies the attention mask to hidden states by multiplying,
-    effectively zeroing out hidden states at padding positions.
 
-    Args:
-        hidden_states: Hidden state tensor of shape (batch, seq_len, hidden_dim).
-        attention_mask: Boolean or binary mask of shape (batch, seq_len) indicating
-            valid positions. None means no masking.
+def _preserve_array_sharding(
+    value: Array,
+    *,
+    partition_manager: PartitionManager | None,
+    partition_axis: PartitionAxis | None,
+) -> Array:
+    """Apply recurrent-state sharding even when grouped decode bypasses the op kernel."""
+    if partition_manager is None or partition_axis is None:
+        return value
 
-    Returns:
-        Masked hidden states with padding positions zeroed out.
+    spec = partition_manager.resolve(
+        axes=[common_types.BATCH, common_types.HEAD, common_types.EMPTY, common_types.EMPTY],
+        mode=common_types.MODE_PREFILL,
+        shape=value.shape,
+    )
+    sharding = get_corrected_named_sharding(tuple(value.shape), spec, raise_mesh_error=False)
+    return with_sharding_constraint(value, sharding)
+
+
+def apply_grouped_single_step_gdr(
+    query: Float[Array, "batch 1 num_k_heads head_dim"],
+    key: Float[Array, "batch 1 num_k_heads head_dim"],
+    value: Float[Array, "batch 1 num_v_heads value_dim"],
+    beta: Float[Array, "batch 1 num_v_heads"],
+    decay: Float[Array, "batch 1 num_v_heads"] | None,
+    recurrent_state: Float[Array, "batch num_v_heads head_dim value_dim"],
+    *,
+    use_qk_l2norm: bool = True,
+) -> tuple[
+    Float[Array, "batch 1 num_v_heads value_dim"],
+    Float[Array, "batch num_v_heads head_dim value_dim"],
+]:
+    """Decode-only GDR step for Qwen's repeated-q/k head layout.
+
+    Qwen linear attention stores one recurrent state per value head, but the
+    query/key heads are shared across groups of value heads. This helper keeps
+    the recurrent-state layout unchanged while avoiding materializing repeated
+    q/k heads during single-token decode.
     """
-    if (
-        attention_mask is not None
-        and attention_mask.shape[0] == hidden_states.shape[0]
-        and attention_mask.shape[1] == hidden_states.shape[1]
-        and attention_mask.shape[1] > 1
-    ):
-        dtype = hidden_states.dtype
-        return (hidden_states * attention_mask[:, :, None]).astype(dtype)
-    return hidden_states
+    batch_size, _, num_k_heads, head_dim = query.shape
+    num_v_heads = value.shape[2]
+    if num_v_heads % num_k_heads != 0:
+        raise ValueError(f"num_v_heads ({num_v_heads}) must be divisible by num_k_heads ({num_k_heads})")
+    expand_ratio = num_v_heads // num_k_heads
+
+    if use_qk_l2norm:
+        query = l2norm_decode(query, axis=-1, eps=1e-6)
+        key = l2norm_decode(key, axis=-1, eps=1e-6)
+
+    input_dtype = query.dtype
+    query = query[:, 0, :, :].astype(jnp.float32)
+    key = key[:, 0, :, :].astype(jnp.float32)
+    value = value[:, 0, :, :].astype(jnp.float32).reshape(batch_size, num_k_heads, expand_ratio, -1)
+    beta = beta[:, 0, :].astype(jnp.float32).reshape(batch_size, num_k_heads, expand_ratio)
+    recurrent_state = recurrent_state.astype(jnp.float32)
+
+    query = query * jnp.asarray(head_dim**-0.5, dtype=jnp.float32)
+
+    grouped_state = recurrent_state.reshape(batch_size, num_k_heads, expand_ratio, head_dim, -1)
+    if decay is not None:
+        grouped_decay = decay[:, 0, :].astype(jnp.float32).reshape(batch_size, num_k_heads, expand_ratio)
+        grouped_state = grouped_state * jnp.exp(grouped_decay)[:, :, :, None, None]
+
+    grouped_key = key[:, :, None, :, None]
+    kv_mem = jnp.sum(grouped_state * grouped_key, axis=-2)
+    delta = (value - kv_mem) * beta[:, :, :, None]
+    new_grouped_state = grouped_state + grouped_key * delta[:, :, :, None, :]
+    output = jnp.sum(new_grouped_state * query[:, :, None, :, None], axis=-2)
+
+    return (
+        output.reshape(batch_size, 1, num_v_heads, -1).astype(input_dtype),
+        new_grouped_state.reshape(batch_size, num_v_heads, head_dim, -1),
+    )
 
 
 class Qwen3NextRMSNorm(nn.Module):
@@ -170,70 +245,6 @@ class Qwen3NextRMSNorm(nn.Module):
         output = self._norm(hidden_states)
         output = output * (1.0 + self.kernel.value.astype(jnp.float32))
         return output.astype(org_dtype)
-
-
-class Qwen3NextRMSNormGated(nn.Module):
-    """Gated RMSNorm for Qwen3Next linear attention.
-
-    Applies RMSNorm with a gating mechanism: output = z * RMSNorm(x)
-    where z is a gating signal passed along with the input.
-
-    Attributes:
-        hidden_size: Dimension of the input features.
-        eps: Small constant for numerical stability.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-        dtype: jnp.dtype = jnp.bfloat16,
-        param_dtype: jnp.dtype = jnp.bfloat16,
-        *,
-        rngs: nn.Rngs,
-    ):
-        """Initialize Qwen3NextRMSNormGated layer.
-
-        Args:
-            hidden_size (int): Dimension of the input features.
-            eps (float, optional): Small constant for numerical stability. Defaults to 1e-6.
-            dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.bfloat16.
-            param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.bfloat16.
-            rngs (nn.Rngs): Random number generator state.
-        """
-        self.hidden_size = hidden_size
-        self.eps = eps
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-
-        self.kernel = nn.Param(jnp.ones((hidden_size,), dtype=param_dtype))
-
-    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
-        """Return sharding specs for normalization parameters."""
-        return {"kernel": Replicated}
-
-    def __call__(
-        self,
-        hidden_states: Float[Array, "... hidden_size"],
-        gate: Float[Array, "... hidden_size"],
-    ) -> Float[Array, "... hidden_size"]:
-        """Apply gated RMSNorm.
-
-        Args:
-            hidden_states: Input tensor to normalize.
-            gate: Gating signal to multiply with normalized output.
-
-        Returns:
-            Gated normalized tensor.
-        """
-        input_dtype = hidden_states.dtype
-
-        hidden_states = hidden_states.astype(jnp.float32)
-        variance = jnp.mean(hidden_states**2, axis=-1, keepdims=True)
-        hidden_states = hidden_states * jax.lax.rsqrt(variance + self.eps)
-        hidden_states = self.kernel.value * hidden_states.astype(input_dtype)
-        hidden_states = hidden_states * jax.nn.silu(gate.astype(jnp.float32))
-        return hidden_states.astype(input_dtype)
 
 
 class Qwen3NextMLP(nn.Module):
@@ -553,9 +564,16 @@ class Qwen3NextSparseMoeBlock(BaseMoeModule):
         )
 
         shared_out = self.shared_expert(hidden_states)
-        gate = jax.nn.sigmoid(self.shared_expert_gate(hidden_states))
-        shared_out = shared_out * gate
-        out = out + shared_out
+        needs_upcast = self.dtype in lowfloats
+        gate_input = self.shared_expert_gate(hidden_states)
+        if needs_upcast:
+            gate = jax.nn.sigmoid(gate_input.astype(jnp.float32))
+            shared_out = shared_out.astype(jnp.float32) * gate
+            out = (out.astype(jnp.float32) + shared_out).astype(self.dtype)
+        else:
+            gate = jax.nn.sigmoid(gate_input)
+            shared_out = shared_out * gate
+            out = out + shared_out
         return checkpoint_name(out, "moe_expert_output"), checkpoint_name(router_logits, "moe_router_logits")
 
 
@@ -788,7 +806,12 @@ class Qwen3NextFullAttention(UnifiedAttention):
             partition_manager=self.config.partition_manager,
         )
 
-        attn_output = attn_output * jax.nn.sigmoid(gate)
+        if attn_output.dtype in lowfloats or gate.dtype in lowfloats:
+            attn_output_dtype = attn_output.dtype
+            attn_output = attn_output.astype(jnp.float32) * jax.nn.sigmoid(gate.astype(jnp.float32))
+            attn_output = attn_output.astype(attn_output_dtype)
+        else:
+            attn_output = attn_output * jax.nn.sigmoid(gate)
 
         attn_output = self._merge_heads(attn_output)
         attn_output = self.shard_attention_prod(attn_output)
@@ -944,7 +967,7 @@ class Qwen3NextLinearAttention(nn.Module):
             kernel_init=jax.nn.initializers.normal(config.initializer_range),
         )
 
-        self.norm = Qwen3NextRMSNormGated(
+        self.norm = RMSNormGated(
             self.head_v_dim,
             eps=config.rms_norm_eps,
             dtype=dtype,
@@ -1103,7 +1126,6 @@ class Qwen3NextLinearAttention(nn.Module):
         decay = A[None, None, :] * jax.nn.softplus(alpha_biased)
         beta = jax.nn.sigmoid(beta)
 
-        conv_state = None
         new_conv_state = None
 
         packed_query_start_loc = getattr(cache_metadata, "query_start_loc", None) if cache_metadata is not None else None
@@ -1120,6 +1142,8 @@ class Qwen3NextLinearAttention(nn.Module):
         if use_packed_state_updates:
             conv_states = cache_view.conv_state
             recurrent_states = cache_view.recurrent_state
+            # bf16 is the smallest dtype that preserves silu precision for conv outputs.
+            conv_output_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
 
             query_start_loc = jnp.asarray(packed_query_start_loc, dtype=jnp.int32)
             num_seqs_arr = jnp.asarray(packed_num_seqs, dtype=jnp.int32).reshape(-1)
@@ -1149,11 +1173,13 @@ class Qwen3NextLinearAttention(nn.Module):
                     recurrent_state_i = jax.lax.dynamic_slice_in_dim(recurrent_states_i, slot, 1, axis=0)
                     conv_token = jax.lax.dynamic_slice_in_dim(conv_input, idx, 1, axis=1)[:, 0, :]
 
-                    conv_state_i = jnp.roll(conv_state_i, shift=-1, axis=-1)
-                    conv_state_i = conv_state_i.at[:, :, -1].set(conv_token.astype(conv_state_i.dtype))
+                    conv_state_i = shift_conv_state_left(conv_state_i, conv_token.astype(conv_state_i.dtype))
 
-                    conv_output_i = jnp.sum(conv_state_i * kernel[None, :, :], axis=-1)
-                    conv_output_i = jax.nn.silu(conv_output_i)
+                    conv_output_i = apply_manual_depthwise_conv(
+                        conv_state_i,
+                        kernel,
+                        output_dtype=conv_output_dtype,
+                    )
 
                     # Reshape into BTHD layout for GatedDeltaRuleOp
                     query_i = conv_output_i[:, : self.key_dim].reshape(1, 1, self.num_k_heads, self.head_k_dim)
@@ -1162,24 +1188,30 @@ class Qwen3NextLinearAttention(nn.Module):
                     )
                     value_i = conv_output_i[:, self.key_dim * 2 :].reshape(1, 1, self.num_v_heads, self.head_v_dim)
 
-                    if expand_ratio > 1:
-                        query_i = jnp.repeat(query_i, expand_ratio, axis=2)
-                        key_i = jnp.repeat(key_i, expand_ratio, axis=2)
-
                     # Index beta/decay into [B, T, H] for GatedDeltaRuleOp
                     beta_i = beta[0, idx].reshape(1, 1, self.num_v_heads)
                     decay_i = decay[0, idx].reshape(1, 1, self.num_v_heads)
 
-                    gdr_out_i: GatedDeltaRuleOutput = self.gdr_op(
-                        query=query_i,
-                        key=key_i,
-                        value=value_i,
-                        beta=beta_i,
-                        decay=decay_i,
-                        recurrent_state=recurrent_state_i,
-                    )
-                    out_i = gdr_out_i.attention_outputs
-                    new_rec_i = gdr_out_i.recurrent_state
+                    if expand_ratio > 1:
+                        out_i, new_rec_i = apply_grouped_single_step_gdr(
+                            query=query_i,
+                            key=key_i,
+                            value=value_i,
+                            beta=beta_i,
+                            decay=decay_i,
+                            recurrent_state=recurrent_state_i,
+                        )
+                    else:
+                        gdr_out_i: GatedDeltaRuleOutput = self.gdr_op(
+                            query=query_i,
+                            key=key_i,
+                            value=value_i,
+                            beta=beta_i,
+                            decay=decay_i,
+                            recurrent_state=recurrent_state_i,
+                        )
+                        out_i = gdr_out_i.attention_outputs
+                        new_rec_i = gdr_out_i.recurrent_state
 
                     conv_states_i = jax.lax.dynamic_update_slice_in_dim(conv_states_i, conv_state_i, slot, axis=0)
                     recurrent_states_i = jax.lax.dynamic_update_slice_in_dim(
@@ -1210,59 +1242,23 @@ class Qwen3NextLinearAttention(nn.Module):
                 recurrent_state=recurrent_states,
             )
 
-        elif is_inference and cache_view.conv_state is not None:
-            # Inference mode: use cached conv_state for incremental convolution
-            # conv_state shape: [batch, conv_dim, d_conv]
-            conv_state = cache_view.conv_state
-
-            # Roll the conv_state to make room for new input and insert new hidden state
-            # conv_input has shape [batch, 1, conv_dim], squeeze seq dim
-            new_hidden = conv_input[:, 0, :]  # [batch, conv_dim]
-            conv_state = jnp.roll(conv_state, shift=-1, axis=-1)
-            conv_state = conv_state.at[:, :, -1].set(new_hidden)
-            new_conv_state = conv_state
-
-            # Manual depthwise convolution: sum(conv_state * kernel)
-            # kernel shape from nn.Conv: [kernel_size, in_features, out_features]
-            # For depthwise (feature_group_count=conv_dim): kernel is [kernel_size, 1, conv_dim]
-            kernel = self.conv1d.kernel.value  # [kernel_size, 1, conv_dim]
-            kernel = jnp.squeeze(kernel, axis=1)  # [kernel_size, conv_dim]
-            kernel = kernel.T  # [conv_dim, kernel_size]
-
-            # conv_state: [batch, conv_dim, d_conv], kernel: [conv_dim, kernel_size]
-            # Element-wise multiply and sum over the conv dimension
-            conv_output = jnp.sum(conv_state * kernel[None, :, :], axis=-1)  # [batch, conv_dim]
-            conv_output = jax.nn.silu(conv_output)
-            conv_output = conv_output[:, None, :]  # [batch, 1, conv_dim]
+        elif cache_view is not None:
+            conv_output_dtype = jnp.bfloat16 if self.dtype in lowfloats else self.dtype
+            conv_output, new_conv_state = apply_conv_with_state(
+                conv_input,
+                self.conv1d,
+                cache_view.conv_state,
+                is_inference=is_inference,
+                d_conv=self.config.linear_conv_kernel_dim,
+                output_dtype=conv_output_dtype,
+                reuse_partial_state=False,
+            )
         else:
-            # Training/prefill mode: use full convolution
-            # conv1d expects [batch, seq, features], outputs same shape with causal padding
+            # Training/prefill without cache: use the full convolution directly.
             conv_output = jax.nn.silu(self.conv1d(conv_input))
 
-            # Save conv_state for future inference: last d_conv-1 inputs + zero padding
-            if cache_view is not None:
-                d_conv = self.config.linear_conv_kernel_dim
-                # conv_input: [batch, seq_len, conv_dim] -> need [batch, conv_dim, d_conv]
-                conv_input_transposed = conv_input.transpose(0, 2, 1)  # [batch, conv_dim, seq_len]
-                if seq_len >= d_conv:
-                    # Take last d_conv elements
-                    new_conv_state = conv_input_transposed[:, :, -d_conv:]
-                else:
-                    # Pad with zeros on the left
-                    pad_width = d_conv - seq_len
-                    new_conv_state = jnp.pad(
-                        conv_input_transposed,
-                        ((0, 0), (0, 0), (pad_width, 0)),
-                        mode="constant",
-                        constant_values=0,
-                    )
-
         if use_packed_state_updates:
-            z_shape_og = z.shape
-            output = output.reshape(-1, output.shape[-1])
-            z_flat = z.reshape(-1, z.shape[-1])
-            output = self.norm(output, z_flat)
-            output = output.reshape(z_shape_og)
+            output = self.norm(output, z)
             output = output.reshape(batch_size, seq_len, -1)
             output = self.out_proj(output)
 
@@ -1292,33 +1288,48 @@ class Qwen3NextLinearAttention(nn.Module):
             partition_manager=self.config.partition_manager,
         )
 
-        if expand_ratio > 1:
-            query = jnp.repeat(query, expand_ratio, axis=2)
-            key = jnp.repeat(key, expand_ratio, axis=2)
-
         recurrent_state = None
         if cache_view is not None and cache_view.recurrent_state is not None:
             recurrent_state = cache_view.recurrent_state
 
+        if expand_ratio > 1:
+            grouped_decode = is_inference and recurrent_state is not None
+        else:
+            grouped_decode = False
+
+        if expand_ratio > 1 and not grouped_decode:
+            query = jnp.repeat(query, expand_ratio, axis=2)
+            key = jnp.repeat(key, expand_ratio, axis=2)
+
         if not use_packed_state_updates:
-            gdr_output: GatedDeltaRuleOutput = self.gdr_op(
-                query=query,
-                key=key,
-                value=value,
-                beta=beta,
-                decay=decay,
-                conv_state=None,  # conv_state is handled separately above
-                recurrent_state=recurrent_state,
-            )
+            if grouped_decode:
+                output, new_recurrent_state = apply_grouped_single_step_gdr(
+                    query=query,
+                    key=key,
+                    value=value,
+                    beta=beta,
+                    decay=decay,
+                    recurrent_state=recurrent_state,
+                )
+                new_recurrent_state = _preserve_array_sharding(
+                    new_recurrent_state,
+                    partition_manager=self.config.partition_manager,
+                    partition_axis=self.config.partition_axis,
+                )
+            else:
+                gdr_output: GatedDeltaRuleOutput = self.gdr_op(
+                    query=query,
+                    key=key,
+                    value=value,
+                    beta=beta,
+                    decay=decay,
+                    conv_state=None,  # conv_state is handled separately above
+                    recurrent_state=recurrent_state,
+                )
+                output = gdr_output.attention_outputs
+                new_recurrent_state = gdr_output.recurrent_state
 
-            output = gdr_output.attention_outputs
-
-        z_shape_og = z.shape
-        output = output.reshape(-1, output.shape[-1])
-        z_flat = z.reshape(-1, z.shape[-1])
-        output = self.norm(output, z_flat)
-        output = output.reshape(z_shape_og)
-
+        output = self.norm(output, z)
         output = output.reshape(batch_size, seq_len, -1)
         output = apply_logical_sharding(
             output,
@@ -1331,10 +1342,12 @@ class Qwen3NextLinearAttention(nn.Module):
         if cache_view is not None and not use_packed_state_updates:
             new_cache_view = cache_view.replace(
                 conv_state=new_conv_state if new_conv_state is not None else cache_view.conv_state,
-                recurrent_state=gdr_output.recurrent_state,
+                recurrent_state=new_recurrent_state,
             )
 
-        return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)  # pyright: ignore[reportReturnType]
+        return AttentionLayerOutput(
+            attention_output=output, attention_weight=None, cache_view=new_cache_view
+        )  # pyright: ignore[reportReturnType]
 
 
 class Qwen3NextDecoderLayer(nn.Module):

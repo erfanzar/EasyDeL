@@ -188,6 +188,66 @@ def _mesh_axis_size(mesh: Mesh, axis: str | tuple[str, ...] | list[str] | None) 
     return int(mesh.shape[axis]) if axis in mesh.shape else 1
 
 
+def _storage_num_combined_kv_heads_for_dtype(num_kv_heads: int, k_headdim: int, kvdtype: jnp.dtype) -> int:
+    """Return packed combined KV heads for a given cache dtype."""
+    packing = get_dtype_packing(kvdtype)
+    if k_headdim == 64:
+        return align_to_multiple(num_kv_heads, packing)
+    return align_to_multiple(num_kv_heads * 2, packing)
+
+
+def _canonicalize_dtype(dtype: jnp.dtype) -> type:
+    """Normalize dtype objects/classes to the scalar type form used by eformer maps."""
+    return jnp.dtype(dtype).type
+
+
+def _dtype_to_string(dtype: jnp.dtype) -> str:
+    """Convert a dtype to the stable cache-config string representation."""
+    dtype = _canonicalize_dtype(dtype)
+    return DTYPE_TO_STRING_MAP.get(dtype, str(jnp.dtype(dtype)))
+
+
+def _select_compatible_v3_kv_cache_dtype(
+    kvdtype: jnp.dtype,
+    *,
+    num_kv_heads: int,
+    k_headdim: int,
+    kv_head_shards: int,
+) -> jnp.dtype:
+    """Upcast packed v3 cache storage when TP sharding would otherwise be invalid."""
+    kvdtype = _canonicalize_dtype(kvdtype)
+    if kv_head_shards <= 1:
+        return kvdtype
+
+    def _storage_groups(dtype: jnp.dtype) -> int:
+        return _storage_num_combined_kv_heads_for_dtype(num_kv_heads, k_headdim, dtype) // get_dtype_packing(dtype)
+
+    storage_groups = _storage_groups(kvdtype)
+    if storage_groups % kv_head_shards == 0:
+        return kvdtype
+
+    for candidate_dtype in (jnp.bfloat16, jnp.float32):
+        if candidate_dtype == kvdtype:
+            continue
+        candidate_groups = _storage_groups(candidate_dtype)
+        if candidate_groups % kv_head_shards == 0:
+            logger.warning(
+                "Upcasting ragged-page v3 KV cache dtype from %s to %s because "
+                "packed storage groups (%d) do not divide kv_head shards (%d).",
+                _dtype_to_string(kvdtype),
+                _dtype_to_string(candidate_dtype),
+                storage_groups,
+                kv_head_shards,
+            )
+            return _canonicalize_dtype(candidate_dtype)
+
+    raise ValueError(
+        "Ragged-page v3 KV cache layout is incompatible with the current kv_head sharding. "
+        f"got kvdtype={_dtype_to_string(kvdtype)}, "
+        f"num_kv_heads={num_kv_heads}, k_headdim={k_headdim}, kv_head_shards={kv_head_shards}."
+    )
+
+
 def get_page_size_bytes(
     page_size: int,
     num_kv_heads: int,
@@ -400,6 +460,15 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         if kv_head_dim_size is None or kv_head_dim_size <= 0:
             raise ValueError("`kv_head_dim_size` must be positive")
         data_parallel_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
+        kv_head_size = _mesh_axis_size(mesh, partition_manager.paxis.kv_head_axis)
+        kvdtype = _canonicalize_dtype(kvdtype)
+        if version == "v3":
+            kvdtype = _select_compatible_v3_kv_cache_dtype(
+                kvdtype,
+                num_kv_heads=num_kv_heads,
+                k_headdim=k_headdim,
+                kv_head_shards=kv_head_size,
+            )
         if data_parallel_size > 1:
             logger.info(f"Scaling KV page budget by data-parallel page axis: {data_parallel_size=}.")
         free = cls._compute_free_hbm(
@@ -442,7 +511,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
                 )
             ),
             version=version,
-            _kvdtype_str=DTYPE_TO_STRING_MAP[kvdtype],
+            _kvdtype_str=_dtype_to_string(kvdtype),
         )
 
     @property

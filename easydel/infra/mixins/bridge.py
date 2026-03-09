@@ -893,6 +893,7 @@ class EasyBridgeMixin(PushToHubMixin):
                     prepack_quantized_weights,
                     static_argnames=["group_size", "bits", "mode", "transpose"],
                 )
+                from easydel.layers.linears._linear_quantized import _effective_ejkernel_group_size
                 from easydel.layers.quantization._configs import resolve_ejkernel_quant_params
 
                 if kernel_map:
@@ -908,6 +909,7 @@ class EasyBridgeMixin(PushToHubMixin):
                             continue
                         kernel_value = state.pop(kernel_key)
                         mode, group_size, bits, needs_biases = resolve_ejkernel_quant_params(quantization_config)
+                        group_size = _effective_ejkernel_group_size(mode, group_size, tuple(kernel_value.shape))
                         if needs_biases:
                             quant_kernel, quant_scales, quant_biases = prepack_quantized_weights(
                                 kernel_value,
