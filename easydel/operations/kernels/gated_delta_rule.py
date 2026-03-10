@@ -276,7 +276,9 @@ class GatedDeltaRuleOp(OperationImpl):
 
         platform = None
         if jax.default_backend() == "tpu" and kernel_cfg is None:
-            if not check_bool_flag("EASYDEL_XLA_GDR", False):
+            if check_bool_flag("EASYDEL_XLA_GDR", False):
+                platform = "xla"
+            else:
                 platform = "pallas"
 
         outputs, new_recurrent_state = gated_delta_rule(
