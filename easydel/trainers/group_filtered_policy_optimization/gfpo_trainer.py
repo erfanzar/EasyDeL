@@ -183,6 +183,8 @@ class GFPOTrainer(GRPOTrainer):
                 self.delta,
                 self.importance_sampling_level,
                 self.top_entropy_quantile,
+                self.arguments.completion_chunk_size,
+                self.arguments.max_loss_completion_tokens,
                 straight_through_emulator,
             )
 
@@ -200,6 +202,8 @@ class GFPOTrainer(GRPOTrainer):
                 self.delta,
                 self.importance_sampling_level,
                 self.top_entropy_quantile,
+                self.arguments.completion_chunk_size,
+                self.arguments.max_loss_completion_tokens,
                 straight_through_emulator,
             )
 

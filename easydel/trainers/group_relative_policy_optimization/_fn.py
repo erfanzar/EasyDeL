@@ -29,7 +29,6 @@ All functions are JAX-compatible and support distributed training through shardi
 """
 
 import collections.abc
-import os
 import typing as tp
 
 import jax
@@ -58,8 +57,6 @@ from ..training_utils import (
 RewardFunc = EasyDeLState | tp.Callable[[list, list], list[float]]
 
 PER_TOKEN_LOGPROB_VOCAB_CHUNK_SIZE = 2048
-GRPO_COMPLETION_CHUNK_SIZE = max(int(os.getenv("EASYDEL_GRPO_COMPLETION_CHUNK_SIZE", "0") or "0"), 0)
-GRPO_MAX_LOSS_COMPLETION_TOKENS = max(int(os.getenv("EASYDEL_GRPO_MAX_LOSS_COMPLETION_TOKENS", "0") or "0"), 0)
 
 
 def _compute_token_logps_and_entropies(
@@ -330,6 +327,8 @@ def grpo_step(
     delta: float | None = None,
     importance_sampling_level: str = "token",
     top_entropy_quantile: float = 1.0,
+    completion_chunk_size: int = 0,
+    max_loss_completion_tokens: int = 0,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Perform a single GRPO training or evaluation step.
@@ -367,6 +366,10 @@ def grpo_step(
             for per-sequence importance weighting.
         top_entropy_quantile: Fraction of highest-entropy tokens to keep in
             the loss. 1.0 disables filtering.
+        completion_chunk_size: Chunk size for memory-saving chunked completion
+            loss. Set to 0 to disable chunking.
+        max_loss_completion_tokens: Optional cap on completion tokens used by
+            the GRPO loss. Set to 0 to disable truncation.
         straight_through_emulator: Optional function for quantization-aware
             straight-through gradient estimation.
 
@@ -403,9 +406,9 @@ def grpo_step(
         )
 
         completion_was_truncated = False
-        if GRPO_MAX_LOSS_COMPLETION_TOKENS > 0 and completion_ids.shape[1] > GRPO_MAX_LOSS_COMPLETION_TOKENS:
-            completion_ids = completion_ids[:, :GRPO_MAX_LOSS_COMPLETION_TOKENS]
-            completion_mask = completion_mask[:, :GRPO_MAX_LOSS_COMPLETION_TOKENS]
+        if max_loss_completion_tokens > 0 and completion_ids.shape[1] > max_loss_completion_tokens:
+            completion_ids = completion_ids[:, :max_loss_completion_tokens]
+            completion_mask = completion_mask[:, :max_loss_completion_tokens]
             completion_was_truncated = True
 
         # Use runtime batch shapes so filtered-group trainers (e.g. GFPO) can
@@ -437,8 +440,8 @@ def grpo_step(
         completion_lengths = jnp.sum(completion_mask, axis=1)
 
         use_chunked_completion_loss = (
-            GRPO_COMPLETION_CHUNK_SIZE > 0
-            and completion_ids.shape[0] > GRPO_COMPLETION_CHUNK_SIZE
+            completion_chunk_size > 0
+            and completion_ids.shape[0] > completion_chunk_size
             and top_entropy_quantile >= 1.0
         )
         if use_chunked_completion_loss:
@@ -464,8 +467,8 @@ def grpo_step(
             cispo_clip_num = jnp.array(0.0, dtype=jnp.float32)
             cispo_clip_den = jnp.array(0.0, dtype=jnp.float32)
 
-            for start in range(0, completion_batch_size, GRPO_COMPLETION_CHUNK_SIZE):
-                end = min(start + GRPO_COMPLETION_CHUNK_SIZE, completion_batch_size)
+            for start in range(0, completion_batch_size, completion_chunk_size):
+                end = min(start + completion_chunk_size, completion_batch_size)
                 chunk_completion_ids = completion_ids[start:end]
                 chunk_completion_mask = completion_mask[start:end]
                 chunk_prompt_ids = expanded_prompt_ids[start:end]

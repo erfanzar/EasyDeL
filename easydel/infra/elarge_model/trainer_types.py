@@ -672,6 +672,10 @@ class GRPOTrainerCfg(BaseTrainerCfg):
         num_return_sequences: Number of completions to generate per prompt.
         ref_logps_chunk_size: Chunk size for reference-model log-prob computation.
             Set to 0 to disable chunking.
+        completion_chunk_size: Chunk size for completion-loss computation.
+            Set to 0 to disable chunking.
+        max_loss_completion_tokens: Optional cap on completion tokens used by
+            the GRPO loss. Set to 0 to disable truncation.
         top_p: Top-p (nucleus) sampling probability threshold.
         top_k: Top-k sampling parameter.
         temperature: Sampling temperature for generation diversity.
@@ -698,6 +702,8 @@ class GRPOTrainerCfg(BaseTrainerCfg):
     skip_apply_chat_template: NotRequired[bool]
     num_return_sequences: NotRequired[int]
     ref_logps_chunk_size: NotRequired[int]
+    completion_chunk_size: NotRequired[int]
+    max_loss_completion_tokens: NotRequired[int]
     top_p: NotRequired[float]
     top_k: NotRequired[int]
     temperature: NotRequired[float]

@@ -358,10 +358,12 @@ class GRPOTrainer(Trainer):
             self.delta,
             self.importance_sampling_level,
             self.top_entropy_quantile,
+            self.arguments.completion_chunk_size,
+            self.arguments.max_loss_completion_tokens,
             straight_through_emulator,
         )
 
-        static_argnames = tuple(range(2, 16))
+        static_argnames = tuple(range(2, 18))
 
         sharded_training_step_function = ejit(
             grpo_step,
@@ -385,6 +387,8 @@ class GRPOTrainer(Trainer):
             self.delta,
             self.importance_sampling_level,
             self.top_entropy_quantile,
+            self.arguments.completion_chunk_size,
+            self.arguments.max_loss_completion_tokens,
             straight_through_emulator,
         )
 
