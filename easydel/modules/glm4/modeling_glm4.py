@@ -190,16 +190,7 @@ class Glm4DecoderLayer(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.layer_idx = layer_idx
-        attn_block = Glm4Attention
-        mlp_block = Glm4MLP
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.self_attn = attn_block(
+        self.self_attn = Glm4Attention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -207,7 +198,7 @@ class Glm4DecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.mlp = mlp_block(
+        self.mlp = Glm4MLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -365,9 +356,15 @@ class Glm4Model(EasyDeLBaseModule):
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            Glm4DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Glm4DecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=layer_idx,
                     dtype=dtype,

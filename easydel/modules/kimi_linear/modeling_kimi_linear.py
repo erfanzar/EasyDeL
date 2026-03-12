@@ -1202,18 +1202,8 @@ class KimiDecoderLayer(nn.Module):
         self.is_kda_layer = config.is_kda_layer(layer_idx)
         self.is_moe_layer = config.is_moe_layer(layer_idx)
 
-        mla_block, kda_block, mlp_block, moe_block = auto_remat(
-            KimiMLAAttention,
-            KimiDeltaAttention,
-            KimiMLP,
-            KimiSparseMoeBlock,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
         if self.is_kda_layer:
-            self.self_attn = kda_block(
+            self.self_attn = KimiDeltaAttention(
                 config=config,
                 layer_idx=layer_idx,
                 dtype=dtype,
@@ -1222,7 +1212,7 @@ class KimiDecoderLayer(nn.Module):
                 rngs=rngs,
             )
         elif config.is_mla:
-            self.self_attn = mla_block(
+            self.self_attn = KimiMLAAttention(
                 config=config,
                 layer_idx=layer_idx,
                 dtype=dtype,
@@ -1234,7 +1224,7 @@ class KimiDecoderLayer(nn.Module):
             raise NotImplementedError
 
         if self.is_moe_layer:
-            self.mlp = moe_block(
+            self.mlp = KimiSparseMoeBlock(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1242,7 +1232,7 @@ class KimiDecoderLayer(nn.Module):
                 rngs=rngs,
             )
         else:
-            self.mlp = mlp_block(
+            self.mlp = KimiMLP(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1404,9 +1394,15 @@ class KimiLinearModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            KimiDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                KimiDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=layer_idx,
                     dtype=dtype,

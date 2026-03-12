@@ -427,14 +427,6 @@ class XerxesDecoderLayer(nn.Module):
 
         mlp_block = XerxesSparseMoeBlock if self.config.xe_moe else XerxesMLP
         attn_block = XerxesAttention
-
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
         self.self_attn = attn_block(
             self.config,
             layer_idx=self.layer_idx,
@@ -599,9 +591,15 @@ class XerxesModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            XerxesDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                XerxesDecoderLayer(
+                remat_layer_block(
                     self.config,
                     layer_idx=i,
                     dtype=dtype,

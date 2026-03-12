@@ -383,16 +383,7 @@ class Phi3DecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        attn_block = Phi3Attention
-        mlp_block = Phi3MLP
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.self_attn = attn_block(
+        self.self_attn = Phi3Attention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -400,7 +391,7 @@ class Phi3DecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.mlp = mlp_block(
+        self.mlp = Phi3MLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -561,9 +552,15 @@ class Phi3Model(EasyDeLBaseModule):
         )
 
         self.embed_dropout = nn.Dropout(config.embd_pdrop)
+        remat_layer_block = auto_remat(
+            Phi3DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Phi3DecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=idx,
                     dtype=dtype,

@@ -359,17 +359,8 @@ class CohereBlock(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        attn_block = CohereAttention
-        mlp_block = CohereMLP
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.self_attn = attn_block(
+        self.self_attn = CohereAttention(
             config,
             layer_idx=layer_idx,
             dtype=dtype,
@@ -378,7 +369,7 @@ class CohereBlock(nn.Module):
             rngs=rngs,
         )
 
-        self.mlp = mlp_block(
+        self.mlp = CohereMLP(
             config,
             layer_idx=layer_idx,
             dtype=dtype,
@@ -517,9 +508,15 @@ class CohereModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            CohereBlock,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                CohereBlock(
+                remat_layer_block(
                     config=config,
                     layer_idx=i,
                     dtype=dtype,

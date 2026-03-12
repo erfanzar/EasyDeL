@@ -17,6 +17,8 @@ from easydel.trainers.distillation_trainer.distillation_trainer import Distillat
 from easydel.trainers.odds_ratio_preference_optimization_trainer._fn import (
     concatenated_forward as orpo_concatenated_forward,
 )
+from easydel.trainers.supervised_fine_tuning_trainer.sft_config import SFTConfig
+from easydel.trainers.supervised_fine_tuning_trainer.sft_trainer import SFTTrainer
 from easydel.trainers.trainer import Trainer
 
 
@@ -174,3 +176,47 @@ def test_distillation_preprocess_converts_and_drops_assistant_masks(monkeypatch)
     assert "assistant_masks" not in processed
     assert "completion_mask" in processed
     assert jnp.array_equal(processed["completion_mask"], batch["assistant_masks"])
+
+
+def test_sft_preprocess_converts_and_drops_assistant_masks(monkeypatch):
+    trainer = SFTTrainer.__new__(SFTTrainer)
+
+    def _fake_base_preprocess(self, state, batch, is_train):
+        del self, state, is_train
+        return dict(batch), {}
+
+    monkeypatch.setattr(Trainer, "_preprocess_batch_input", _fake_base_preprocess)
+
+    batch = {
+        "input_ids": jnp.array([[1, 2, 3]], dtype=jnp.int32),
+        "attention_mask": jnp.array([[1, 1, 1]], dtype=jnp.int32),
+        "assistant_masks": jnp.array([[0, 1, 1]], dtype=jnp.int32),
+    }
+    processed, _ = SFTTrainer._preprocess_batch_input(
+        trainer,
+        state=None,
+        batch=batch,
+        is_train=True,
+    )
+
+    assert "assistant_masks" not in processed
+    assert "completion_mask" in processed
+    assert jnp.array_equal(processed["completion_mask"], batch["assistant_masks"])
+
+
+def test_sft_transform_uses_assistant_only_loss():
+    trainer = SFTTrainer.__new__(SFTTrainer)
+    trainer.processing_class = SimpleNamespace(
+        chat_template="plain chat template",
+        pad_token_id=0,
+        eos_token_id=2,
+    )
+    trainer.arguments = SFTConfig(max_length=16, assistant_only_loss=True)
+    trainer._formatting_func = None
+    trainer._dataset_text_field = None
+    trainer._is_pretokenized = lambda: False
+
+    transform = SFTTrainer._get_preprocess_transform(trainer)
+
+    assert transform is not None
+    assert transform._mask_prompt is True

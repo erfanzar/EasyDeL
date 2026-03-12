@@ -909,8 +909,7 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         try:
             signature = inspect.signature(self.base_model.prepare_inputs_for_generation)
             accepts_var_kwargs = any(
-                parameter.kind == inspect.Parameter.VAR_KEYWORD
-                for parameter in signature.parameters.values()
+                parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()
             )
             forwarded_kwargs = {
                 key: value

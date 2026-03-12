@@ -433,15 +433,6 @@ class MptBlock(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        attn_block = MptAttention
-        mlp_block = MptMLP
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
 
         self.norm_1 = LayerNorm(
             config.hidden_size,
@@ -451,7 +442,7 @@ class MptBlock(nn.Module):
             use_bias=config.use_norm_bias,
             rngs=rngs,
         )
-        self.attn = attn_block(
+        self.attn = MptAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -468,7 +459,7 @@ class MptBlock(nn.Module):
             use_bias=config.use_norm_bias,
             rngs=rngs,
         )
-        self.ffn = mlp_block(
+        self.ffn = MptMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -635,9 +626,15 @@ class MptModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
         )
 
+        remat_layer_block = auto_remat(
+            MptBlock,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.blocks = nn.List(
             [
-                MptBlock(
+                remat_layer_block(
                     config=config,
                     layer_idx=i,
                     dtype=dtype,

@@ -531,24 +531,14 @@ class GiddLayer(nn.Module):
         self.precision = precision
         self.resid_scale = resid_scale
 
-        attn_block = GiddAttention
-        mlp_block = GiddMLP
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn: GiddAttention = attn_block(
+        self.self_attn: GiddAttention = GiddAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
-        self.mlp: GiddMLP = mlp_block(
+        self.mlp: GiddMLP = GiddMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -682,9 +672,15 @@ class GiddModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            GiddLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                GiddLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,
@@ -924,14 +920,7 @@ class GiddForDiffusionLM(EasyDeLBaseModule):
         )
 
         # Initialize language modeling head
-        lm_head_block = ColumnParallelLinear
-        lm_head_block = auto_remat(
-            lm_head_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.lm_head = lm_head_block(
+        self.lm_head = ColumnParallelLinear(
             config.hidden_size,
             config.vocab_size,
             dtype=dtype,

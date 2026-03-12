@@ -1331,22 +1331,19 @@ def _stack_prompt_aligned_arrays(
     if key in SHARED_GENERATION_MODEL_INPUT_KEYS:
         first = np.asarray(arrays[0])
         if not all(np.array_equal(np.asarray(array), first) for array in arrays[1:]):
-            raise ValueError(
-                f"GRPO batches require a single shared value for `{key}` across the batch."
-            )
+            raise ValueError(f"GRPO batches require a single shared value for `{key}` across the batch.")
         return jnp.asarray(first)
 
     jax_arrays = [jnp.asarray(array) for array in arrays]
     first = jax_arrays[0]
-    if key == "position_ids" and first.ndim >= 2 and first.shape[0] == 3 and all(
-        array.shape == first.shape for array in jax_arrays
-    ):
-        return jnp.stack(jax_arrays, axis=1)
     if (
-        first.ndim >= 1
-        and first.shape[0] == 1
+        key == "position_ids"
+        and first.ndim >= 2
+        and first.shape[0] == 3
         and all(array.shape == first.shape for array in jax_arrays)
     ):
+        return jnp.stack(jax_arrays, axis=1)
+    if first.ndim >= 1 and first.shape[0] == 1 and all(array.shape == first.shape for array in jax_arrays):
         return jnp.concatenate(jax_arrays, axis=0)
     return jnp.stack(jax_arrays, axis=0)
 

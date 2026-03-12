@@ -193,17 +193,8 @@ class LlamaDecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        attn_block = LlamaAttention
-        mlp_block = LlamaMLP
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
 
-        self.self_attn = attn_block(
+        self.self_attn = LlamaAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -212,7 +203,7 @@ class LlamaDecoderLayer(nn.Module):
             layer_idx=layer_idx,
         )
 
-        self.mlp = mlp_block(
+        self.mlp = LlamaMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -350,9 +341,15 @@ class LlamaModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop, rngs=rngs)
+        remat_layer_block = auto_remat(
+            LlamaDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                LlamaDecoderLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,

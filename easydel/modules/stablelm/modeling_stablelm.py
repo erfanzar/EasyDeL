@@ -450,17 +450,8 @@ class StableLmDecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        attn_block = StableLmAttention
-        mlp_block = StableLmMLP
         self.use_parallel_residual = self.config.use_parallel_residual
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.self_attn = attn_block(
+        self.self_attn = StableLmAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -468,7 +459,7 @@ class StableLmDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.mlp = mlp_block(
+        self.mlp = StableLmMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -627,9 +618,15 @@ class StableLmModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            StableLmDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                StableLmDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=idx,
                     dtype=dtype,

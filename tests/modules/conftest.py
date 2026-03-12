@@ -55,7 +55,7 @@ def small_model_config():
         "rope_theta": 10000.0,
         "attention_bias": False,
         "tie_word_embeddings": False,
-        "gradient_checkpointing": EasyDeLGradientCheckPointers.NONE,
+        "gradient_checkpointing": EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
         "fcm_min_ratio": -1,
         "fcm_max_ratio": -1,
         "rope_scaling": None,

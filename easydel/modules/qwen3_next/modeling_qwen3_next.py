@@ -1345,9 +1345,7 @@ class Qwen3NextLinearAttention(nn.Module):
                 recurrent_state=new_recurrent_state,
             )
 
-        return AttentionLayerOutput(
-            attention_output=output, attention_weight=None, cache_view=new_cache_view
-        )  # pyright: ignore[reportReturnType]
+        return AttentionLayerOutput(attention_output=output, attention_weight=None, cache_view=new_cache_view)  # pyright: ignore[reportReturnType]
 
 
 class Qwen3NextDecoderLayer(nn.Module):
@@ -1392,18 +1390,8 @@ class Qwen3NextDecoderLayer(nn.Module):
         self.is_full_attention = config.is_full_attention_layer(layer_idx)
         self.is_moe = config.is_moe_layer(layer_idx)
 
-        full_attn_block, linear_attn_block, mlp_block, moe_block = auto_remat(
-            Qwen3NextFullAttention,
-            Qwen3NextLinearAttention,
-            Qwen3NextMLP,
-            Qwen3NextSparseMoeBlock,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
         if self.is_full_attention:
-            self.self_attn = full_attn_block(
+            self.self_attn = Qwen3NextFullAttention(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1412,7 +1400,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 layer_idx=layer_idx,
             )
         else:
-            self.linear_attn = linear_attn_block(
+            self.linear_attn = Qwen3NextLinearAttention(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1422,7 +1410,7 @@ class Qwen3NextDecoderLayer(nn.Module):
             )
 
         if self.is_moe:
-            self.mlp = moe_block(
+            self.mlp = Qwen3NextSparseMoeBlock(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1430,7 +1418,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 rngs=rngs,
             )
         else:
-            self.mlp = mlp_block(
+            self.mlp = Qwen3NextMLP(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1585,9 +1573,15 @@ class Qwen3NextModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            Qwen3NextDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Qwen3NextDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=layer_idx,
                     dtype=dtype,

@@ -291,15 +291,14 @@ def strip_prompt_only_scoring_model_kwargs(
     """
 
     compact_kwargs = compact_generation_model_kwargs(kwargs)
-    if compact_kwargs.get("deepstack_visual_embeds", None) is not None and compact_kwargs.get("visual_pos_masks", None) is not None:
+    if (
+        compact_kwargs.get("deepstack_visual_embeds", None) is not None
+        and compact_kwargs.get("visual_pos_masks", None) is not None
+    ):
         excluded_keys = PROMPT_ONLY_SCORING_MODEL_INPUT_KEYS - {"visual_pos_masks"}
     else:
         excluded_keys = PROMPT_ONLY_SCORING_MODEL_INPUT_KEYS
-    return {
-        key: value
-        for key, value in compact_kwargs.items()
-        if key not in excluded_keys
-    }
+    return {key: value for key, value in compact_kwargs.items() if key not in excluded_keys}
 
 
 def extract_generation_model_kwargs(

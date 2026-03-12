@@ -390,16 +390,7 @@ class PhiMoeDecoderLayer(nn.Module):
             "mlp.experts.down_proj$": {"splits": down_splits},
         }
 
-        attn_block = PhiMoEAttention
-        mlp_block = PhiMoeSparseMoeBlock
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.self_attn = attn_block(
+        self.self_attn = PhiMoEAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -407,7 +398,7 @@ class PhiMoeDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.block_sparse_moe = mlp_block(
+        self.block_sparse_moe = PhiMoeSparseMoeBlock(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -557,9 +548,15 @@ class PhiMoeModel(EasyDeLBaseModule):
         )
 
         self.embed_dropout = nn.Dropout(config.embd_pdrop)
+        remat_layer_block = auto_remat(
+            PhiMoeDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                PhiMoeDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=idx,
                     dtype=dtype,

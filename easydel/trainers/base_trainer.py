@@ -1343,8 +1343,7 @@ class BaseTrainer(BaseTrainerProtocol):
         )
         unsupported_model_kwargs = tuple(
             sorted(
-                set(requested_model_kwargs.keys())
-                - set(compact_generation_model_kwargs(normalized_model_kwargs).keys())
+                set(requested_model_kwargs.keys()) - set(compact_generation_model_kwargs(normalized_model_kwargs).keys())
             )
         )
         return normalized_model_kwargs, unsupported_model_kwargs

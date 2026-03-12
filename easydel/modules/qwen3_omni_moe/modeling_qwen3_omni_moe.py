@@ -1574,20 +1574,7 @@ class Qwen3OmniMoeTextDecoderLayer(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
 
-        attn_block = Qwen3OmniMoeTextAttention
-        mlp_block = Qwen3OmniMoeTextMLP
-        moe_block = Qwen3OmniMoeTextSparseBlock
-
-        attn_block, mlp_block, moe_block = auto_remat(
-            attn_block,
-            mlp_block,
-            moe_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn = attn_block(
+        self.self_attn = Qwen3OmniMoeTextAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1601,7 +1588,7 @@ class Qwen3OmniMoeTextDecoderLayer(nn.Module):
         )
 
         if self.is_moe:
-            self.mlp = moe_block(
+            self.mlp = Qwen3OmniMoeTextSparseBlock(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1609,7 +1596,7 @@ class Qwen3OmniMoeTextDecoderLayer(nn.Module):
                 rngs=rngs,
             )
         else:
-            self.mlp = mlp_block(
+            self.mlp = Qwen3OmniMoeTextMLP(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -2129,20 +2116,7 @@ class Qwen3OmniMoeTalkerTextDecoderLayer(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
 
-        attn_block = Qwen3OmniMoeTalkerTextAttention
-        mlp_block = Qwen3OmniMoeTalkerTextMLP
-        moe_block = Qwen3OmniMoeTalkerTextSparseMoeBlock
-
-        attn_block, mlp_block, moe_block = auto_remat(
-            attn_block,
-            mlp_block,
-            moe_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn = attn_block(
+        self.self_attn = Qwen3OmniMoeTalkerTextAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -2156,7 +2130,7 @@ class Qwen3OmniMoeTalkerTextDecoderLayer(nn.Module):
         )
 
         if self.is_moe:
-            self.mlp = moe_block(
+            self.mlp = Qwen3OmniMoeTalkerTextSparseMoeBlock(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -2164,7 +2138,7 @@ class Qwen3OmniMoeTalkerTextDecoderLayer(nn.Module):
                 rngs=rngs,
             )
         else:
-            self.mlp = mlp_block(
+            self.mlp = Qwen3OmniMoeTalkerTextMLP(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -2384,18 +2358,7 @@ class Qwen3OmniMoeTalkerCodePredictorDecoderLayer(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
 
-        attn_block = Qwen3OmniMoeTalkerCodePredictorAttention
-        mlp_block = Qwen3OmniMoeTalkerCodePredictorMLP
-
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn = attn_block(
+        self.self_attn = Qwen3OmniMoeTalkerCodePredictorAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -2403,7 +2366,7 @@ class Qwen3OmniMoeTalkerCodePredictorDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.mlp = mlp_block(
+        self.mlp = Qwen3OmniMoeTalkerCodePredictorMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -2522,9 +2485,15 @@ class Qwen3OmniMoeTalkerCodePredictorModel(EasyDeLBaseModule):
             ]
         )
 
+        remat_layer_block = auto_remat(
+            Qwen3OmniMoeTalkerCodePredictorDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Qwen3OmniMoeTalkerCodePredictorDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=layer_idx,
                     dtype=dtype,
@@ -2802,9 +2771,15 @@ class Qwen3OmniMoeTalkerModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            Qwen3OmniMoeTalkerTextDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Qwen3OmniMoeTalkerTextDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=layer_idx,
                     dtype=dtype,
@@ -3701,9 +3676,15 @@ class Qwen3OmniMoeThinkerTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            Qwen3OmniMoeTextDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Qwen3OmniMoeTextDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=layer_idx,
                     dtype=dtype,
@@ -3893,9 +3874,15 @@ class Qwen3OmniMoeModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            Qwen3OmniMoeTextDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Qwen3OmniMoeTextDecoderLayer(
+                remat_layer_block(
                     config=text_config,
                     layer_idx=layer_idx,
                     dtype=dtype,

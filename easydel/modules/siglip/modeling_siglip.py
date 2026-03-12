@@ -36,7 +36,7 @@ from easydel.infra.modeling_outputs import (
     ImageClassifierOutput,
     ModelOutput,
 )
-from easydel.infra.utils import ACT2FN, ArrayParam
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import LayerNorm
@@ -204,7 +204,7 @@ class SiglipVisionEmbeddings(nn.Module):
             embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
         else:
             embeddings = embeddings + self.position_embedding(jnp.arange(self.num_positions, dtype="i4").reshape(1, -1))
-        return embeddings
+        return checkpoint_name(embeddings, "embeddings")
 
 
 class SiglipTextEmbeddings(nn.Module):
@@ -291,7 +291,7 @@ class SiglipTextEmbeddings(nn.Module):
         position_embeddings = self.position_embedding(position_ids)
         embeddings = inputs_embeds + position_embeddings
 
-        return embeddings
+        return checkpoint_name(embeddings, "embeddings")
 
 
 class SiglipAttention(AttentionModule):
@@ -483,13 +483,15 @@ class SiglipMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        hidden_states = checkpoint_name(self.fc2(self.activation_fn(self.fc1(hidden_states))), "mlp_output")
+        hidden_states = checkpoint_name(self.fc1(hidden_states), "mlp_up")
+        hidden_states = self.activation_fn(hidden_states)
+        hidden_states = checkpoint_name(self.fc2(hidden_states), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        return hidden_states
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 class SiglipEncoderLayer(nn.Module):
@@ -577,12 +579,13 @@ class SiglipEncoderLayer(nn.Module):
             output_attentions=output_attentions,
         )
         hidden_states = attn_outputs.attention_output
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
 
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, "residual")
+        hidden_states = checkpoint_name(hidden_states, "layer_output")
 
         return EncoderLayerOutput(
             hidden_states=hidden_states,
@@ -620,9 +623,15 @@ class SiglipEncoder(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
+        remat_layer_block = auto_remat(
+            SiglipEncoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                SiglipEncoderLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,
@@ -791,9 +800,9 @@ class SiglipTextTransformer(EasyDeLBaseModule):
         )
 
         last_hidden_state = encoder_outputs.last_hidden_state
-        last_hidden_state = self.final_layer_norm(last_hidden_state)
+        last_hidden_state = checkpoint_name(self.final_layer_norm(last_hidden_state), "model_output")
         pooled_output = last_hidden_state[:, -1, :]
-        pooled_output = self.head(pooled_output)
+        pooled_output = checkpoint_name(self.head(pooled_output), "text_projection_output")
 
         return BaseModelOutputWithPooling(
             last_hidden_state=last_hidden_state,
@@ -1052,7 +1061,7 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
         )
 
         last_hidden_state = encoder_outputs.last_hidden_state
-        last_hidden_state = self.post_layernorm(last_hidden_state)
+        last_hidden_state = checkpoint_name(self.post_layernorm(last_hidden_state), "model_output")
         pooler_output = self.head(last_hidden_state) if self.use_head else None
 
         return BaseModelOutputWithPooling(
@@ -1277,7 +1286,7 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
         hidden_state = self.attention(probe, hidden_state, hidden_state)
         residual = hidden_state
         hidden_state = self.layernorm(hidden_state)
-        hidden_state = residual + self.mlp(hidden_state)
+        hidden_state = checkpoint_name(residual + self.mlp(hidden_state), "residual")
         return hidden_state[:, 0]
 
 

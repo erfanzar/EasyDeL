@@ -498,17 +498,8 @@ class GptOssDecoderLayer(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.layer_idx = layer_idx
-        attn_block = GptOssAttention
-        mlp_block = GptOssMLP
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
 
-        self.self_attn = attn_block(
+        self.self_attn = GptOssAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -517,7 +508,7 @@ class GptOssDecoderLayer(nn.Module):
             layer_idx=layer_idx,
         )
 
-        self.mlp = mlp_block(
+        self.mlp = GptOssMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -664,9 +655,15 @@ class GptOssModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            GptOssDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                GptOssDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=layer_idx,
                     dtype=dtype,

@@ -191,6 +191,12 @@ class EasyDeLGradientCheckPointers(StrEnum):
             Similar to SAVE_ANYTHING_EXCEPT_THESE_NAMES.
         SAVE_ONLY_THESE_NAMES: Policy to save only specified names.
             Allows fine-grained control by inclusion list.
+        MLP_NOTSAVEABLE: Save everything except checkpoint names in the MLP family.
+            Implemented via SAVE_ONLY_THESE_NAMES over the known checkpoint targets.
+        ATTN_NOTSAVEABLE: Save everything except checkpoint names in the attention family.
+            Implemented via SAVE_ONLY_THESE_NAMES over the known checkpoint targets.
+        MLP_ATTN_NOTSAVEABLE: Save everything except MLP and attention checkpoint names.
+            Implemented via SAVE_ONLY_THESE_NAMES over the known checkpoint targets.
         SAVE_FROM_BOTH_POLICIES: Combines inclusion and exclusion policies.
             Uses both include and exclude lists for maximum flexibility.
 
@@ -212,6 +218,9 @@ class EasyDeLGradientCheckPointers(StrEnum):
     SAVE_ANYTHING_EXCEPT_THESE_NAMES = "save_anything_except_these_names"
     SAVE_ANY_NAMES_BUT_THESE = "save_any_names_but_these"
     SAVE_ONLY_THESE_NAMES = "save_only_these_names"
+    MLP_NOTSAVEABLE = "mlp_notsaveable"
+    ATTN_NOTSAVEABLE = "attn_notsaveable"
+    MLP_ATTN_NOTSAVEABLE = "mlp_attn_notsaveable"
     SAVE_FROM_BOTH_POLICIES = "save_from_both_policies"
 
 
@@ -295,6 +304,9 @@ AVAILABLE_GRADIENT_CHECKPOINTS = tp.Literal[
     "save_anything_except_these_names",
     "save_any_names_but_these",
     "save_only_these_names",
+    "mlp_notsaveable",
+    "attn_notsaveable",
+    "mlp_attn_notsaveable",
     "save_from_both_policies",
 ]
 
@@ -352,11 +364,13 @@ AVAILABLE_SPARSE_MODULE_TYPES = tp.Literal["bcoo", "bcsr", "coo", "csr"]
 # checkpointing can be applied. Used with name-based checkpoint policies.
 AVAILABLE_GRADIENT_CHECKPOINT_TARGETS = tp.Literal[
     "attn_dense",
+    "attn_gate",
     "attn_key",
     "attn_key_value",
     "attn_output",
     "attn_qkv",
     "attn_query",
+    "attn_query_a",
     "attn_receptance",
     "attn_value",
     "attn_weights",
@@ -365,16 +379,80 @@ AVAILABLE_GRADIENT_CHECKPOINT_TARGETS = tp.Literal[
     "lm_head_output",
     "mlp_down",
     "mlp_gate",
+    "mlp_gate_up",
     "mlp_output",
     "mlp_up",
     "model_output",
     "moe_expert_output",
+    "moe_expert_v1",
+    "moe_expert_w1",
+    "moe_expert_w2",
+    "moe_gate",
     "moe_gate_logits",
     "moe_output",
     "moe_router_logits",
+    "moe_up",
     "normed_input",
+    "projector_linear1",
+    "projector_linear2",
     "residual",
+    "residual_attn",
+    "residual_mlp",
+    "ssm_dt_proj",
+    "ssm_input_proj",
+    "ssm_output_proj",
+    "ssm_x_proj",
+    "text_projection_output",
+    "vision_attn_output",
+    "visual_projection_output",
 ]
+
+# Runtime registry for checkpoint target names.
+# Keep this list aligned with AVAILABLE_GRADIENT_CHECKPOINT_TARGETS.
+GRADIENT_CHECKPOINT_TARGETS: tuple[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS, ...] = (
+    "attn_dense",
+    "attn_gate",
+    "attn_key",
+    "attn_key_value",
+    "attn_output",
+    "attn_qkv",
+    "attn_query",
+    "attn_query_a",
+    "attn_receptance",
+    "attn_value",
+    "attn_weights",
+    "embeddings",
+    "layer_output",
+    "lm_head_output",
+    "mlp_down",
+    "mlp_gate",
+    "mlp_gate_up",
+    "mlp_output",
+    "mlp_up",
+    "model_output",
+    "moe_expert_output",
+    "moe_expert_v1",
+    "moe_expert_w1",
+    "moe_expert_w2",
+    "moe_gate",
+    "moe_gate_logits",
+    "moe_output",
+    "moe_router_logits",
+    "moe_up",
+    "normed_input",
+    "projector_linear1",
+    "projector_linear2",
+    "residual",
+    "residual_attn",
+    "residual_mlp",
+    "ssm_dt_proj",
+    "ssm_input_proj",
+    "ssm_output_proj",
+    "ssm_x_proj",
+    "text_projection_output",
+    "vision_attn_output",
+    "visual_projection_output",
+)
 
 
 def define_flags_with_default(

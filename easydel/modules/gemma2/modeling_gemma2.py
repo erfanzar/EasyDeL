@@ -355,18 +355,9 @@ class Gemma2DecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        mlp_block = Gemma2MLP
-        attn_block = Gemma2Attention
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
         self.is_sliding = bool(self.layer_idx % 2)
-        self.self_attn = attn_block(
+        self.self_attn = Gemma2Attention(
             self.config,
             layer_idx=self.layer_idx,
             dtype=dtype,
@@ -374,7 +365,7 @@ class Gemma2DecoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.mlp = mlp_block(
+        self.mlp = Gemma2MLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -514,9 +505,15 @@ class Gemma2Model(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            Gemma2DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Gemma2DecoderLayer(
+                remat_layer_block(
                     self.config,
                     layer_idx=i,
                     dtype=dtype,

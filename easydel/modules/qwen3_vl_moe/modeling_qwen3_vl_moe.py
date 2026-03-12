@@ -1480,19 +1480,7 @@ class Qwen3VLMoeTextDecoderLayer(nn.Module):
         self.precision = precision
         self.layer_idx = layer_idx
 
-        attn_block = Qwen3VLMoeTextAttention
-        mlp_block = Qwen3VLMoeTextMLP
-        moe_block = Qwen3VLMoeTextSparseBlock
-        attn_block, mlp_block, moe_block = auto_remat(
-            attn_block,
-            mlp_block,
-            moe_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn = attn_block(
+        self.self_attn = Qwen3VLMoeTextAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1506,7 +1494,7 @@ class Qwen3VLMoeTextDecoderLayer(nn.Module):
         )
 
         if self.is_moe:
-            self.mlp = moe_block(
+            self.mlp = Qwen3VLMoeTextSparseBlock(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1515,7 +1503,7 @@ class Qwen3VLMoeTextDecoderLayer(nn.Module):
             )
             self.mlp.layer_idx = layer_idx
         else:
-            self.mlp = mlp_block(
+            self.mlp = Qwen3VLMoeTextMLP(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1668,9 +1656,15 @@ class Qwen3VLMoeTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            Qwen3VLMoeTextDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Qwen3VLMoeTextDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=i,
                     dtype=dtype,

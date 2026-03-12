@@ -805,19 +805,9 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
-        attn_block = Glm4MoeLiteAttention
-        mlp_block = Glm4MoeLiteMLP
         mlp_moe_block = Glm4MoeLiteMoE
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn = attn_block(
+        self.self_attn = Glm4MoeLiteAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -840,7 +830,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
                 rngs=rngs,
             )
         else:
-            self.mlp = mlp_block(
+            self.mlp = Glm4MoeLiteMLP(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -955,9 +945,15 @@ class Glm4MoeLiteModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            Glm4MoeLiteDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Glm4MoeLiteDecoderLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,

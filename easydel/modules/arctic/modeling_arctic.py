@@ -572,17 +572,8 @@ class ArcticDecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.rngs = rngs
-        attn_block = ArcticAttention
-        mlp_block = ArcticMoeBlock
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.self_attn = attn_block(
+        self.self_attn = ArcticAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -590,7 +581,7 @@ class ArcticDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.block_sparse_moe = mlp_block(
+        self.block_sparse_moe = ArcticMoeBlock(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -768,9 +759,15 @@ class ArcticModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            ArcticDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                ArcticDecoderLayer(
+                remat_layer_block(
                     layer_idx=layer_idx,
                     config=config,
                     dtype=dtype,

@@ -227,17 +227,7 @@ class Qwen3DecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        attn_block = Qwen3Attention
-        mlp_block = Qwen3MLP
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn = attn_block(
+        self.self_attn = Qwen3Attention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -246,7 +236,7 @@ class Qwen3DecoderLayer(nn.Module):
             layer_idx=layer_idx,
         )
 
-        self.mlp = mlp_block(
+        self.mlp = Qwen3MLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -388,9 +378,15 @@ class Qwen3Model(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        layer_block = auto_remat(
+            Qwen3DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Qwen3DecoderLayer(
+                layer_block(
                     config=config,
                     layer_idx=layer_idx,
                     dtype=dtype,
