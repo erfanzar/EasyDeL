@@ -51,8 +51,8 @@ EasyDeL supports distributed execution with Ray, particularly for multi-host and
 
 EasyDeL pins Ray to a known-good version to avoid cluster/CLI mismatches:
 
-- Project dependency: `ray[default]==2.53.0` (see `pyproject.toml`).
-- Docker images also install `ray[default,gcp]==2.53.0` (see `Dockerfile`).
+- Project dependency: `ray[default]==2.54.0` (see `pyproject.toml`).
+- Docker images also install `ray[default,gcp]==2.54.0` (see `Dockerfile`).
 
 If you use Ray autoscaler (`ray up/attach/down`), run the CLI with the same pinned version:
 

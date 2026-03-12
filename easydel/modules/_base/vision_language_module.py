@@ -65,6 +65,7 @@ See Also:
     - MultiModalMergeFeature: Embedding merge utilities
 """
 
+import inspect
 from abc import abstractmethod
 from collections.abc import Callable
 
@@ -905,15 +906,60 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         Returns:
             dict: Prepared inputs including pixel_values for the model.
         """
+        try:
+            signature = inspect.signature(self.base_model.prepare_inputs_for_generation)
+            accepts_var_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+            forwarded_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if value is not None and (accepts_var_kwargs or key in signature.parameters)
+            }
+        except (TypeError, ValueError):
+            forwarded_kwargs = {}
         model_inputs = self.base_model.prepare_inputs_for_generation(
             input_ids=input_ids,
             max_length=max_length,
             pad_token_id=pad_token_id,
             starts=starts,
             attention_mask=attention_mask,
+            **forwarded_kwargs,
         )
         # Add vision inputs
         model_inputs["pixel_values"] = pixel_values
+        for key, value in kwargs.items():
+            if value is not None:
+                model_inputs[key] = value
+
+        if self._uses_mrope:
+            explicit_position_ids = kwargs["position_ids"] if "position_ids" in kwargs else None
+            position_ids = model_inputs["position_ids"] if "position_ids" in model_inputs else None
+            rope_deltas = model_inputs["rope_deltas"] if "rope_deltas" in model_inputs else None
+            image_grid_thw = model_inputs["image_grid_thw"] if "image_grid_thw" in model_inputs else None
+            video_grid_thw = model_inputs["video_grid_thw"] if "video_grid_thw" in model_inputs else None
+
+            if explicit_position_ids is None and (image_grid_thw is not None or video_grid_thw is not None):
+                position_ids, rope_deltas = self.base_model.get_rope_index(
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask,
+                )
+                model_inputs["position_ids"] = position_ids
+                model_inputs["rope_deltas"] = rope_deltas
+            elif position_ids is not None and hasattr(position_ids, "ndim") and position_ids.ndim == 2:
+                batch_size, sequence_length = position_ids.shape
+                position_ids = jnp.broadcast_to(position_ids[None, :, :], (3, batch_size, sequence_length))
+                model_inputs["position_ids"] = position_ids
+                if rope_deltas is None:
+                    max_pos = jnp.max(position_ids)
+                    model_inputs["rope_deltas"] = jnp.full(
+                        (batch_size, 1),
+                        max_pos + 1 - sequence_length,
+                        dtype=jnp.int32,
+                    )
         return model_inputs
 
     def update_inputs_for_generation(
@@ -944,4 +990,15 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
         model_kwargs.pop("pixel_values_videos", None)
         model_kwargs.pop("image_grid_thw", None)
         model_kwargs.pop("video_grid_thw", None)
+        model_kwargs.pop("image_grid_hws", None)
+        model_kwargs.pop("image_sizes", None)
+        model_kwargs.pop("image_max_grid_size", None)
+        model_kwargs.pop("video_max_grid_size", None)
+        model_kwargs.pop("image_embeds", None)
+        model_kwargs.pop("video_embeds", None)
+        model_kwargs.pop("visual_embeds", None)
+        model_kwargs.pop("image_hidden_states", None)
+        model_kwargs.pop("video_hidden_states", None)
+        model_kwargs.pop("image_features", None)
+        model_kwargs.pop("video_features", None)
         return model_kwargs

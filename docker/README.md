@@ -272,5 +272,5 @@ docker run -it --rm \
 - The CUDA image requires CUDA 12.8 compatible hardware
 - TPU support requires Google Cloud credentials and TPU access
 - Images default to Python 3.13 (override with `PYTHON_VERSION`, e.g. `PYTHON_VERSION=3.12 ./docker/build.sh cpu`)
-- Ray is pinned to 2.53.0 (`ray[default,gcp]` installed in Docker images)
+- Ray is pinned to 2.54.0 (`ray[default,gcp]` installed in Docker images)
 - Dependencies are installed with `uv` (`JAX_PLATFORMS=cpu` is set during CUDA/TPU builds to avoid backend detection at build time)

@@ -78,6 +78,7 @@ import contextlib
 import os
 import pickle
 import typing as tp
+import uuid
 from typing import Self
 
 import jax
@@ -202,6 +203,8 @@ class EasyDeLState(struct.PyTreeNode):
         apply_fn (tp.Callable | None): Optional model application function for custom
             forward pass implementations. Defaults to None, in which case the standard
             model call is used.
+        esurge_cache_scope_key (str): Unique key used to scope eSurge compiled caches
+            to this state instance. Auto-generated from a UUID on creation.
 
     Example:
         Creating state from a model and training::
@@ -262,6 +265,10 @@ class EasyDeLState(struct.PyTreeNode):
     tx: optax.GradientTransformation | None = struct.field(pytree_node=False)
     opt_state: optax.OptState | None = struct.field(pytree_node=True)
     apply_fn: tp.Callable | None = struct.field(pytree_node=False, default=None)
+    esurge_cache_scope_key: str = struct.field(
+        pytree_node=False,
+        default_factory=lambda: f"state-{uuid.uuid4().hex}",
+    )
 
     def apply_gradients(self: Self, *, grads) -> Self:
         """Apply gradients to update parameters and optimizer state.
@@ -801,7 +808,9 @@ class EasyDeLState(struct.PyTreeNode):
         See Also:
             - :meth:`merge`: Explicit merge with custom parameters.
         """
-        return nn.merge(self.graphdef, self.graphstate, self.graphother)
+        model = nn.merge(self.graphdef, self.graphstate, self.graphother)
+        model._esurge_cache_scope_key = self.esurge_cache_scope_key
+        return model
 
     @property
     def size(self) -> int:
