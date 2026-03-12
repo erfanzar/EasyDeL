@@ -66,7 +66,7 @@ RUN set -eux; \
     fi
 
 # Ray with GCP extras
-RUN uv pip install 'ray[default,gcp]==2.53.0'
+RUN uv pip install 'ray[default,gcp]==2.54.0'
 
 # TPU-only: install gcloud
 RUN set -eux; \

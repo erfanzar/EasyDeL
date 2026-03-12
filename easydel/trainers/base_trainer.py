@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import collections.abc
 import copy
+import gc
 import os
 import pprint
 import time
@@ -67,7 +68,13 @@ from .trainer_protocol import (
     TrainerOutput,
 )
 from .training_configurations import MetricsType, TrainingArguments
-from .training_utils import resolve_total_steps
+from .training_utils import (
+    GENERATION_MODEL_INPUT_KEYS,
+    compact_generation_model_kwargs,
+    normalize_generation_model_kwargs,
+    prepare_generation_model_kwargs_for_call,
+    resolve_total_steps,
+)
 from .utils import CollateMapTransform, HFDataSource, ToNumpy
 
 try:
@@ -707,7 +714,9 @@ class BaseTrainer(BaseTrainerProtocol):
             (),
         )
         self.generate_function = getattr(self, "generate_function", None)
+        self.generate_function_with_model_kwargs = getattr(self, "generate_function_with_model_kwargs", None)
         self.latest_generation_samples = getattr(self, "latest_generation_samples", [])
+        self.preview_log_table = getattr(self, "preview_log_table", None)
         rng = getattr(self, "_generation_rng", None)
         seed = self.arguments.generation_seed
         if rng is None:
@@ -1018,8 +1027,9 @@ class BaseTrainer(BaseTrainerProtocol):
         *,
         shard_inputs: bool = True,
         config_overrides: dict[str, tp.Any] | None = None,
+        accept_model_kwargs: bool = False,
         **generate_kwargs,
-    ) -> tp.Callable[[EasyDeLState, jax.Array, jax.Array], tuple[jax.Array, jax.Array, jax.Array]]:
+    ) -> tp.Callable[..., tuple[jax.Array, jax.Array, jax.Array]]:
         """
         Build and return a compiled generation function that mirrors the model's `generate`.
 
@@ -1031,6 +1041,9 @@ class BaseTrainer(BaseTrainerProtocol):
             Whether to shard the prompt tensors using the model's partition manager before generation.
         config_overrides:
             Optional attribute overrides applied to the copied generation configuration.
+        accept_model_kwargs:
+            Whether the compiled function should accept an additional ``model_kwargs``
+            dictionary (e.g. multimodal inputs) alongside ``input_ids`` and ``attention_mask``.
         generate_kwargs:
             Extra keyword arguments forwarded to `module.generate`.
         """
@@ -1052,6 +1065,67 @@ class BaseTrainer(BaseTrainerProtocol):
 
         mesh = self.model.mesh
         empty_sharding = jax.sharding.NamedSharding(spec=jax.sharding.PartitionSpec(), mesh=mesh)
+
+        if accept_model_kwargs:
+            model_kwargs_sharding = {key: None for key in GENERATION_MODEL_INPUT_KEYS}
+
+            @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
+                in_shardings=(self.state_shardings, empty_sharding, empty_sharding, model_kwargs_sharding),
+                out_shardings=(empty_sharding, empty_sharding, empty_sharding),
+            )
+            def generate(
+                state: EasyDeLState,
+                input_ids: jax.Array,
+                attention_mask: jax.Array,
+                model_kwargs: dict[str, tp.Any],
+            ):
+                module = state.model
+                with module.mesh:
+                    shard_input_ids = input_ids
+                    shard_attention_mask = attention_mask
+                    if shard_inputs:
+                        partition_manager = getattr(module.config, "partition_manager", None)
+                        if partition_manager is not None:
+                            axes = [common_types.BATCH, common_types.SEQUENCE_PARALLEL]
+                            shard_input_ids = partition_manager.shard(
+                                shard_input_ids,
+                                axes=axes,
+                                mode=common_types.MODE_PREFILL,
+                            )
+                            shard_attention_mask = partition_manager.shard(
+                                shard_attention_mask,
+                                axes=axes,
+                                mode=common_types.MODE_PREFILL,
+                            )
+                    call_model_kwargs = compact_generation_model_kwargs(model_kwargs)
+                    call_model_kwargs = prepare_generation_model_kwargs_for_call(
+                        call_model_kwargs,
+                        target_sequence_length=shard_attention_mask.shape[-1],
+                        flatten_grouped_multimodal=False,
+                    )
+                    generate_inputs = {
+                        "input_ids": shard_input_ids,
+                        "attention_mask": shard_attention_mask,
+                    }
+
+                    if config_copy is None:
+                        outputs = module.generate(
+                            **generate_inputs,
+                            **call_model_kwargs,
+                            **effective_generate_kwargs,
+                        )
+                    else:
+                        outputs = module.generate(
+                            **generate_inputs,
+                            generation_config=config_copy,
+                            **call_model_kwargs,
+                            **effective_generate_kwargs,
+                        )
+
+                    sequences: jax.Array = outputs.sequences if hasattr(outputs, "sequences") else outputs
+                    return sequences, shard_input_ids, shard_attention_mask
+
+            return generate
 
         @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
             in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
@@ -1101,6 +1175,7 @@ class BaseTrainer(BaseTrainerProtocol):
         input_ids: jax.Array | np.ndarray,
         attention_mask: jax.Array | np.ndarray | None = None,
         *,
+        model_kwargs: dict[str, tp.Any] | None = None,
         state: EasyDeLState | None = None,
         generation_config: GenerationConfig | None = None,
         shard_inputs: bool | None = None,
@@ -1117,6 +1192,9 @@ class BaseTrainer(BaseTrainerProtocol):
         Args:
             input_ids: Token IDs for the prompt.
             attention_mask: Optional attention mask. Defaults to all ones.
+            model_kwargs: Optional dictionary of extra model inputs (e.g. multimodal
+                tensors like ``pixel_values``). Keys must be supported by the model's
+                ``prepare_inputs_for_generation``.
             state: Model state to use. Defaults to self.model_state.
             generation_config: Optional generation configuration override.
             shard_inputs: Whether to shard inputs across devices.
@@ -1147,6 +1225,24 @@ class BaseTrainer(BaseTrainerProtocol):
             attention_mask = jnp.ones_like(input_ids, dtype=jnp.int32)
         else:
             attention_mask = jnp.asarray(attention_mask)
+        normalized_model_kwargs = None
+        has_model_kwargs = False
+        if model_kwargs:
+            normalized_model_kwargs, unsupported_model_kwargs = self._normalize_supported_generation_model_kwargs(
+                state,
+                model_kwargs,
+            )
+            if unsupported_model_kwargs:
+                unsupported = ", ".join(unsupported_model_kwargs)
+                raise ValueError(
+                    "Compiled generation received raw model kwargs that are not supported by "
+                    f"`prepare_inputs_for_generation`: {unsupported}."
+                )
+            normalized_model_kwargs = jax.tree_util.tree_map(
+                lambda x: jnp.asarray(x) if x is not None else None,
+                normalized_model_kwargs,
+            )
+            has_model_kwargs = bool(compact_generation_model_kwargs(normalized_model_kwargs))
 
         needs_custom_fn = bool(generation_config or config_overrides or generate_kwargs)
         if needs_custom_fn:
@@ -1159,20 +1255,39 @@ class BaseTrainer(BaseTrainerProtocol):
                 generation_config=generation_config,
                 shard_inputs=shard_inputs,
                 config_overrides=merged_overrides or None,
+                accept_model_kwargs=has_model_kwargs,
                 **merged_kwargs,
             )
         else:
-            if self.generate_function is None:
-                default_kwargs = self._default_generation_kwargs()
-                default_overrides = self._default_generation_config_overrides()
-                self.generate_function = self.create_generate_function(
-                    shard_inputs=shard_inputs,
-                    config_overrides=default_overrides,
-                    **default_kwargs,
-                )
-            generate_fn = self.generate_function
+            default_kwargs = self._default_generation_kwargs()
+            default_overrides = self._default_generation_config_overrides()
+            if has_model_kwargs:
+                if self.generate_function_with_model_kwargs is None:
+                    self.generate_function_with_model_kwargs = self.create_generate_function(
+                        shard_inputs=shard_inputs,
+                        config_overrides=default_overrides,
+                        accept_model_kwargs=True,
+                        **default_kwargs,
+                    )
+                generate_fn = self.generate_function_with_model_kwargs
+            else:
+                if self.generate_function is None:
+                    self.generate_function = self.create_generate_function(
+                        shard_inputs=shard_inputs,
+                        config_overrides=default_overrides,
+                        **default_kwargs,
+                    )
+                generate_fn = self.generate_function
 
-        sequences, prompt_ids, prompt_mask = generate_fn(state, input_ids, attention_mask)
+        if has_model_kwargs:
+            sequences, prompt_ids, prompt_mask = generate_fn(
+                state,
+                input_ids,
+                attention_mask,
+                normalized_model_kwargs,
+            )
+        else:
+            sequences, prompt_ids, prompt_mask = generate_fn(state, input_ids, attention_mask)
 
         if all_gather:
             sequences = self._all_gather(sequences)
@@ -1183,18 +1298,99 @@ class BaseTrainer(BaseTrainerProtocol):
             return sequences, prompt_ids, prompt_mask
         return sequences
 
+    def release_generation_runtime(
+        self,
+        *,
+        state: EasyDeLState | None = None,
+        clear_esurge_compiled_cache: bool = False,
+    ) -> None:
+        """Drop cached generation runtimes so rollout HBM is reclaimed before scoring."""
+
+        self.generate_function = None
+        self.generate_function_with_model_kwargs = None
+
+        state = state or self.model_state
+        if state is not None:
+            try:
+                state.model.pause_esurge(
+                    release_model_state=True,
+                    clear_compiled_cache=clear_esurge_compiled_cache,
+                )
+            except Exception as exc:  # pragma: no cover - best-effort cleanup
+                log_debug_maybe(f"Failed to release generation runtime: {exc}")
+
+        gc.collect()
+
+    def _normalize_supported_generation_model_kwargs(
+        self,
+        state: EasyDeLState,
+        model_kwargs: dict[str, tp.Any] | None,
+    ) -> tuple[dict[str, tp.Any] | None, tuple[str, ...]]:
+        """Normalize raw generation kwargs against the model's generation entrypoint."""
+
+        if not model_kwargs:
+            return None, ()
+
+        requested_model_kwargs = compact_generation_model_kwargs(
+            normalize_generation_model_kwargs(model_kwargs),
+        )
+        if not requested_model_kwargs:
+            return None, ()
+
+        normalized_model_kwargs = normalize_generation_model_kwargs(
+            model_kwargs,
+            model_callable=state.model.prepare_inputs_for_generation,
+        )
+        unsupported_model_kwargs = tuple(
+            sorted(
+                set(requested_model_kwargs.keys())
+                - set(compact_generation_model_kwargs(normalized_model_kwargs).keys())
+            )
+        )
+        return normalized_model_kwargs, unsupported_model_kwargs
+
+    def maybe_release_generation_runtime(
+        self,
+        results: GenerationResults,
+        *,
+        state: EasyDeLState | None = None,
+        release_runtime_after_generation: bool = True,
+        clear_esurge_compiled_cache_after_generation: bool = False,
+    ) -> GenerationResults:
+        """Optionally release generation runtime after materializing outputs.
+
+        This is intentionally opt-in per generation call. Some trainers perform
+        multiple back-to-back generations (for example policy then reference
+        rollouts), so unconditional teardown inside `generate_unified` would
+        introduce avoidable resume/rebuild churn.
+        """
+        if not release_runtime_after_generation:
+            return results
+
+        logger.info_once("Releasing generation runtime after generation step.")
+        jax.block_until_ready(results.sequences)
+        jax.block_until_ready(results.completion_ids)
+        self.release_generation_runtime(
+            state=state,
+            clear_esurge_compiled_cache=clear_esurge_compiled_cache_after_generation,
+        )
+        return results
+
     def generate_unified(
         self,
         input_ids: jax.Array | np.ndarray | None = None,
         attention_mask: jax.Array | np.ndarray | None = None,
         prompts: str | list[str] | None = None,
         *,
+        model_kwargs: dict[str, tp.Any] | None = None,
         state: EasyDeLState | None = None,
         use_esurge: bool | None = None,
         apply_chat_template: bool = False,
         generation_config: GenerationConfig | None = None,
         shard_inputs: bool | None = None,
         config_overrides: dict[str, tp.Any] | None = None,
+        release_runtime_after_generation: bool = True,
+        clear_esurge_compiled_cache_after_generation: bool = False,
         all_gather: bool = False,
         **generate_kwargs,
     ) -> GenerationResults:
@@ -1217,6 +1413,13 @@ class BaseTrainer(BaseTrainerProtocol):
             generation_config: Optional generation configuration.
             shard_inputs: Whether to shard inputs across devices.
             config_overrides: Optional overrides for generation config.
+            model_kwargs: Optional dictionary of extra model inputs (e.g. multimodal
+                tensors). Keys must be supported by the model's
+                ``prepare_inputs_for_generation``.
+            release_runtime_after_generation: Whether to release the eSurge runtime
+                after generation completes. Defaults to True.
+            clear_esurge_compiled_cache_after_generation: Whether to clear the eSurge
+                compiled function cache after generation. Defaults to False.
             all_gather: Whether to gather results from all devices.
             **generate_kwargs: Additional kwargs passed to generation.
 
@@ -1256,10 +1459,32 @@ class BaseTrainer(BaseTrainerProtocol):
         state = state or self.model_state
         args = self.arguments
         processor = self._get_processing_class()
+        normalized_model_kwargs, unsupported_model_kwargs = self._normalize_supported_generation_model_kwargs(
+            state,
+            model_kwargs,
+        )
+        if unsupported_model_kwargs:
+            unsupported = ", ".join(unsupported_model_kwargs)
+            raise ValueError(
+                "Raw generation model kwargs are not supported by this model's "
+                f"`prepare_inputs_for_generation`: {unsupported}."
+            )
+        has_model_kwargs = bool(compact_generation_model_kwargs(normalized_model_kwargs))
 
         # Determine whether to use eSurge
         if use_esurge is None:
             use_esurge = args.use_esurge_generation
+        if has_model_kwargs and prompts is not None and input_ids is None:
+            raise ValueError(
+                "Raw model kwargs require pretokenized `input_ids`/`attention_mask`. "
+                "Use eSurge with multimodal messages or pass tokenized prompts.",
+            )
+        if use_esurge and has_model_kwargs:
+            logger.warning_once(
+                "Disabling eSurge generation because raw model kwargs were provided; "
+                "falling back to compiled generation.",
+            )
+            use_esurge = False
 
         pad_token_id = self._pad_token_id
         max_tokens = args.generation_max_new_tokens
@@ -1541,15 +1766,20 @@ class BaseTrainer(BaseTrainerProtocol):
                 prompt_mask = self._all_gather(prompt_mask)
                 completion_ids = self._all_gather(completion_ids)
                 completion_mask = self._all_gather(completion_mask)
-            return GenerationResults(
-                generation_results=output_records,
-                prompt_ids=prompt_ids,
-                prompt_mask=prompt_mask,
-                sequences=sequences,
-                completion_ids=completion_ids,
-                completion_mask=completion_mask,
-                decoded_prompts=return_prompts,
-                completion_prompts=completion_prompts,
+            return self.maybe_release_generation_runtime(
+                GenerationResults(
+                    generation_results=output_records,
+                    prompt_ids=prompt_ids,
+                    prompt_mask=prompt_mask,
+                    sequences=sequences,
+                    completion_ids=completion_ids,
+                    completion_mask=completion_mask,
+                    decoded_prompts=return_prompts,
+                    completion_prompts=completion_prompts,
+                ),
+                state=state,
+                release_runtime_after_generation=release_runtime_after_generation,
+                clear_esurge_compiled_cache_after_generation=clear_esurge_compiled_cache_after_generation,
             )
 
         # Handle compiled generation path
@@ -1623,6 +1853,7 @@ class BaseTrainer(BaseTrainerProtocol):
             sequences, prompt_ids, prompt_mask = self.generate_aio(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                model_kwargs=normalized_model_kwargs if has_model_kwargs else None,
                 state=state,
                 generation_config=generation_config,
                 shard_inputs=shard_inputs,
@@ -1650,21 +1881,26 @@ class BaseTrainer(BaseTrainerProtocol):
                 )
             completion_prompts = completion_prompts[: completion_ids.shape[0]]
 
-            return GenerationResults(
-                generation_results=self._decode_prompt_batch(
-                    processor,
-                    sequences,
-                    skip_special_tokens=True,
-                    pad_token_id=pad_token_id,
-                    pop_pad_tokens=True,
+            return self.maybe_release_generation_runtime(
+                GenerationResults(
+                    generation_results=self._decode_prompt_batch(
+                        processor,
+                        sequences,
+                        skip_special_tokens=True,
+                        pad_token_id=pad_token_id,
+                        pop_pad_tokens=True,
+                    ),
+                    prompt_ids=prompt_ids,
+                    prompt_mask=prompt_mask,
+                    sequences=sequences,
+                    completion_ids=completion_ids,
+                    completion_mask=completion_mask,
+                    decoded_prompts=decoded_prompt_texts,
+                    completion_prompts=completion_prompts or None,
                 ),
-                prompt_ids=prompt_ids,
-                prompt_mask=prompt_mask,
-                sequences=sequences,
-                completion_ids=completion_ids,
-                completion_mask=completion_mask,
-                decoded_prompts=decoded_prompt_texts,
-                completion_prompts=completion_prompts or None,
+                state=state,
+                release_runtime_after_generation=release_runtime_after_generation,
+                clear_esurge_compiled_cache_after_generation=clear_esurge_compiled_cache_after_generation,
             )
 
     def _get_processing_class(self):
@@ -1846,12 +2082,16 @@ class BaseTrainer(BaseTrainerProtocol):
                 prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
 
             if wandb is not None and args.use_wandb and args.can_log_metrics and args.generation_log_to_wandb:
-                table = wandb.Table(columns=["step", "prompt", "completion_id", "completion"])
+                if self.preview_log_table is None:
+                    self.preview_log_table = wandb.Table(
+                        columns=["step", "prompt", "completion_id", "completion"],
+                        log_mode="INCREMENTAL",
+                    )
                 for record in records:
                     prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
                     for idx, completion in enumerate(record["completions"]):
-                        table.add_data(step, prompt_repr, idx, completion)
-                wandb.log({"preview_generations": table}, step=step)
+                        self.preview_log_table.add_data(step, prompt_repr, idx, completion)
+                wandb.log({"preview_generations": self.preview_log_table}, step=step)
             if args.generation_preview_print:
                 logger.info(f"[preview step {step}] prompt: {prompt_repr}")
                 for idx, completion in enumerate(record["completions"]):

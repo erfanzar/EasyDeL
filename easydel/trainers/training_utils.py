@@ -82,6 +82,455 @@ def sanitize_model_call_kwargs(kwargs: collections.abc.Mapping[str, tp.Any]) -> 
     return normalized_kwargs
 
 
+GENERATION_MODEL_INPUT_KEYS = (
+    "inputs_embeds",
+    "position_ids",
+    "token_type_ids",
+    "cache_position",
+    "decoder_position_ids",
+    "pixel_values",
+    "pixel_attention_mask",
+    "pixel_values_videos",
+    "image_grid_thw",
+    "video_grid_thw",
+    "image_grid_hws",
+    "image_sizes",
+    "image_max_grid_size",
+    "video_max_grid_size",
+    "visual_pos_masks",
+    "deepstack_visual_embeds",
+    "rope_deltas",
+    "mm_token_type_ids",
+    "image_embeds",
+    "video_embeds",
+    "visual_embeds",
+    "image_hidden_states",
+    "video_hidden_states",
+    "image_features",
+    "video_features",
+)
+
+SHARED_GENERATION_MODEL_INPUT_KEYS = frozenset(
+    {
+        "image_max_grid_size",
+        "video_max_grid_size",
+    }
+)
+
+GROUPED_MULTIMODAL_MODEL_INPUT_KEYS = frozenset(
+    {
+        "pixel_values",
+        "pixel_values_videos",
+        "image_grid_thw",
+        "video_grid_thw",
+        "image_grid_hws",
+        "image_sizes",
+    }
+)
+
+PROMPT_SCORING_EXTENSION_KEYS = frozenset(
+    {
+        "token_type_ids",
+        "mm_token_type_ids",
+        "pixel_attention_mask",
+        "visual_pos_masks",
+    }
+)
+
+PROMPT_ONLY_SCORING_MODEL_INPUT_KEYS = frozenset(
+    {
+        "position_ids",
+        "cache_position",
+        "decoder_position_ids",
+        "visual_pos_masks",
+        "rope_deltas",
+    }
+)
+
+
+def normalize_generation_model_kwargs(
+    kwargs: collections.abc.Mapping[str, tp.Any] | None,
+    *,
+    model_callable: tp.Callable[..., tp.Any] | None = None,
+) -> dict[str, tp.Any]:
+    """Normalize model-side generation kwargs to a stable key set.
+
+    Generation JITs work best when auxiliary model inputs use a fixed pytree
+    structure. This helper keeps only known model input keys, filters them
+    against the model forward signature when available, and fills missing keys
+    with ``None`` so callers can safely pass the result into cached compiled
+    functions.
+
+    Args:
+        kwargs: Raw mapping of model keyword arguments. May be ``None``.
+        model_callable: Optional model forward callable used to filter keys
+            against its signature.
+
+    Returns:
+        dict: Normalized dictionary with all ``GENERATION_MODEL_INPUT_KEYS``
+            present (missing ones set to ``None``).
+    """
+
+    normalized = {key: None for key in GENERATION_MODEL_INPUT_KEYS}
+    if not kwargs:
+        return normalized
+
+    extracted = {key: value for key, value in kwargs.items() if key in normalized and value is not None}
+    if model_callable is not None:
+        extracted = filter_kwargs_for_callable(model_callable, extracted)
+    normalized.update(extracted)
+    return normalized
+
+
+def compact_generation_model_kwargs(
+    kwargs: collections.abc.Mapping[str, tp.Any] | None,
+) -> dict[str, tp.Any]:
+    """Drop ``None`` leaves from normalized generation model kwargs.
+
+    Args:
+        kwargs: Normalized generation model kwargs mapping. May be ``None``.
+
+    Returns:
+        dict: Compact dictionary with only non-``None`` entries.
+    """
+
+    if not kwargs:
+        return {}
+    return {key: value for key, value in kwargs.items() if value is not None}
+
+
+def _flatten_grouped_multimodal_model_value(
+    key: str,
+    value: tp.Any,
+) -> tp.Any:
+    """Flatten grouped multimodal leaves before the actual model call."""
+
+    if key not in GROUPED_MULTIMODAL_MODEL_INPUT_KEYS or not hasattr(value, "shape"):
+        return value
+
+    if key == "pixel_values" and value.ndim >= 5:
+        return jnp.reshape(value, (-1, *value.shape[2:]))
+    if key == "pixel_values_videos" and value.ndim >= 6:
+        return jnp.reshape(value, (-1, *value.shape[2:]))
+    if key in {"image_grid_thw", "video_grid_thw"} and value.ndim >= 3 and value.shape[-1] == 3:
+        return jnp.reshape(value, (-1, 3))
+    if key in {"image_grid_hws", "image_sizes"} and value.ndim >= 3 and value.shape[-1] == 2:
+        return jnp.reshape(value, (-1, 2))
+    return value
+
+
+def _extend_prompt_scoring_value_to_sequence_length(
+    key: str,
+    value: tp.Any,
+    *,
+    prompt_length: int | None,
+    target_sequence_length: int | None,
+) -> tp.Any:
+    """Extend prompt-only token-type style tensors across generated text tokens."""
+
+    if key not in PROMPT_SCORING_EXTENSION_KEYS or not hasattr(value, "shape"):
+        return value
+    if prompt_length is None or target_sequence_length is None or value.ndim == 0:
+        return value
+    current_length = value.shape[-1]
+    if current_length != prompt_length or target_sequence_length <= current_length:
+        return value
+
+    pad_width = [(0, 0)] * value.ndim
+    pad_width[-1] = (0, target_sequence_length - current_length)
+    pad_value = 0.0 if jnp.issubdtype(jnp.asarray(value).dtype, jnp.floating) else 0
+    return jnp.pad(jnp.asarray(value), pad_width, mode="constant", constant_values=pad_value)
+
+
+def prepare_generation_model_kwargs_for_call(
+    kwargs: collections.abc.Mapping[str, tp.Any] | None,
+    *,
+    target_sequence_length: int | None = None,
+    prompt_length: int | None = None,
+    flatten_grouped_multimodal: bool = True,
+) -> dict[str, tp.Any]:
+    """Prepare generation kwargs for a model call without losing prompt grouping upstream.
+
+    Args:
+        kwargs: Compact generation model kwargs mapping. May be ``None``.
+        target_sequence_length: Target sequence length for extending prompt-only
+            tensors. Defaults to ``None``.
+        prompt_length: Length of the prompt portion. Defaults to ``None``.
+        flatten_grouped_multimodal: Whether grouped multimodal leaves should be
+            flattened to model-call layout immediately. Generation should keep
+            prompt grouping until after any batch expansion.
+
+    Returns:
+        dict: Prepared dictionary ready for a model forward call.
+    """
+
+    prepared: dict[str, tp.Any] = {}
+    for key, value in compact_generation_model_kwargs(kwargs).items():
+        if flatten_grouped_multimodal:
+            value = _flatten_grouped_multimodal_model_value(key, value)
+        value = _extend_prompt_scoring_value_to_sequence_length(
+            key,
+            value,
+            prompt_length=prompt_length,
+            target_sequence_length=target_sequence_length,
+        )
+        prepared[key] = value
+    return prepared
+
+
+def strip_prompt_only_scoring_model_kwargs(
+    kwargs: collections.abc.Mapping[str, tp.Any] | None,
+) -> dict[str, tp.Any]:
+    """Drop prompt-only sequence-control kwargs before full-sequence scoring.
+
+    Args:
+        kwargs: Generation model kwargs mapping. May be ``None``.
+
+    Returns:
+        dict: Kwargs with prompt-only scoring keys removed.
+    """
+
+    compact_kwargs = compact_generation_model_kwargs(kwargs)
+    if compact_kwargs.get("deepstack_visual_embeds", None) is not None and compact_kwargs.get("visual_pos_masks", None) is not None:
+        excluded_keys = PROMPT_ONLY_SCORING_MODEL_INPUT_KEYS - {"visual_pos_masks"}
+    else:
+        excluded_keys = PROMPT_ONLY_SCORING_MODEL_INPUT_KEYS
+    return {
+        key: value
+        for key, value in compact_kwargs.items()
+        if key not in excluded_keys
+    }
+
+
+def extract_generation_model_kwargs(
+    batch: collections.abc.Mapping[str, tp.Any] | None,
+    *,
+    model_callable: tp.Callable[..., tp.Any] | None = None,
+) -> dict[str, tp.Any]:
+    """Extract generation-related model inputs from a larger batch mapping.
+
+    Args:
+        batch: Batch mapping potentially containing generation model inputs.
+            May be ``None``.
+        model_callable: Optional model forward callable used to filter keys
+            against its signature.
+
+    Returns:
+        dict: Compact dictionary of generation-related model inputs.
+    """
+
+    return compact_generation_model_kwargs(
+        normalize_generation_model_kwargs(batch, model_callable=model_callable),
+    )
+
+
+def validate_prompt_aligned_generation_model_kwargs(
+    kwargs: collections.abc.Mapping[str, tp.Any] | None,
+    *,
+    prompt_batch_size: int | None,
+) -> None:
+    """Validate that generation kwargs preserve prompt boundaries for GRPO-style scoring.
+
+    Args:
+        kwargs: Generation model kwargs to validate. May be ``None``.
+        prompt_batch_size: Expected prompt batch size that kwargs should align with.
+
+    Raises:
+        ValueError: If any non-shared kwarg doesn't expose the prompt batch size
+            on any axis.
+    """
+
+    compact_kwargs = compact_generation_model_kwargs(kwargs)
+    if prompt_batch_size is None or prompt_batch_size <= 0:
+        return
+
+    for key, value in compact_kwargs.items():
+        if key in SHARED_GENERATION_MODEL_INPUT_KEYS:
+            continue
+        if infer_prompt_batch_axis(value, prompt_batch_size, key=key) is not None:
+            continue
+
+        shape = getattr(value, "shape", None)
+        raise ValueError(
+            "GRPO requires prompt-aligned generation kwargs for scoring. "
+            f"Got `{key}` with shape {shape!r}, which does not expose the prompt batch size "
+            f"{prompt_batch_size} on any axis. Raw ragged multimodal inputs are not supported "
+            "here; use prompt-batch-aligned embeddings/features or a single aligned item per prompt."
+        )
+
+
+def infer_prompt_batch_axis(
+    value: tp.Any,
+    prompt_batch_size: int | None,
+    *,
+    key: str | None = None,
+) -> int | None:
+    """Infer which axis of ``value`` is aligned with the prompt batch.
+
+    Args:
+        value: Array, list, or tuple whose batch axis is to be inferred.
+        prompt_batch_size: The expected prompt batch size.
+        key: Optional key name for special-case handling (e.g. ``"position_ids"``).
+
+    Returns:
+        int | None: The axis index aligned with the prompt batch, or ``None``
+            if no axis matches.
+    """
+
+    if prompt_batch_size is None or prompt_batch_size <= 0:
+        return None
+
+    if isinstance(value, (list, tuple)):
+        return 0 if len(value) == prompt_batch_size else None
+
+    shape = getattr(value, "shape", None)
+    if shape is None or len(shape) == 0:
+        return None
+
+    if key == "position_ids" and len(shape) >= 3 and shape[0] == 3 and shape[1] == prompt_batch_size:
+        return 1
+    if shape[0] == prompt_batch_size:
+        return 0
+    return None
+
+
+def repeat_prompt_aligned_model_value(
+    value: tp.Any,
+    repeat_factor: int,
+    *,
+    prompt_batch_size: int | None = None,
+    key: str | None = None,
+) -> tp.Any:
+    """Repeat a prompt-aligned model input along its actual batch axis.
+
+    Args:
+        value: Array, list, or tuple to repeat.
+        repeat_factor: Number of times to repeat each element.
+        prompt_batch_size: Expected prompt batch size for axis inference.
+        key: Optional key name for special-case axis inference.
+
+    Returns:
+        The repeated value along its batch axis, or the original value if
+        ``repeat_factor <= 1`` or no batch axis is found.
+    """
+
+    if repeat_factor <= 1:
+        return value
+
+    batch_axis = infer_prompt_batch_axis(value, prompt_batch_size, key=key)
+    if batch_axis is None:
+        return value
+
+    if isinstance(value, list):
+        return [item for item in value for _ in range(repeat_factor)]
+    if isinstance(value, tuple):
+        return tuple(item for item in value for _ in range(repeat_factor))
+
+    return jnp.repeat(jnp.asarray(value), repeat_factor, axis=batch_axis)
+
+
+def slice_prompt_aligned_model_value(
+    value: tp.Any,
+    start: int,
+    end: int,
+    *,
+    prompt_batch_size: int | None = None,
+    key: str | None = None,
+) -> tp.Any:
+    """Slice a prompt-aligned model input along its actual batch axis.
+
+    Args:
+        value: Array, list, or tuple to slice.
+        start: Start index of the slice.
+        end: End index of the slice.
+        prompt_batch_size: Expected prompt batch size for axis inference.
+        key: Optional key name for special-case axis inference.
+
+    Returns:
+        The sliced value along its batch axis, or the original value if
+        no batch axis is found.
+    """
+
+    batch_axis = infer_prompt_batch_axis(value, prompt_batch_size, key=key)
+    if batch_axis is None:
+        return value
+
+    if isinstance(value, list):
+        return value[start:end]
+    if isinstance(value, tuple):
+        return value[start:end]
+
+    index = [slice(None)] * value.ndim
+    index[batch_axis] = slice(start, end)
+    return value[tuple(index)]
+
+
+def slice_prompt_aligned_model_kwargs(
+    kwargs: collections.abc.Mapping[str, tp.Any],
+    start: int,
+    end: int,
+    *,
+    prompt_batch_size: int | None = None,
+) -> dict[str, tp.Any]:
+    """Slice prompt-aligned model kwargs while preserving shared leaves.
+
+    Args:
+        kwargs: Mapping of model kwargs to slice.
+        start: Start index of the slice.
+        end: End index of the slice.
+        prompt_batch_size: Expected prompt batch size for axis inference.
+
+    Returns:
+        dict: Sliced kwargs dictionary.
+    """
+
+    sliced: dict[str, tp.Any] = {}
+    for key, value in kwargs.items():
+        if value is None:
+            sliced[key] = None
+            continue
+        sliced[key] = slice_prompt_aligned_model_value(
+            value,
+            start,
+            end,
+            prompt_batch_size=prompt_batch_size,
+            key=key,
+        )
+    return sliced
+
+
+def repeat_prompt_aligned_model_kwargs(
+    kwargs: collections.abc.Mapping[str, tp.Any] | None,
+    repeat_factor: int,
+    *,
+    prompt_batch_size: int | None = None,
+) -> dict[str, tp.Any]:
+    """Repeat prompt-aligned model kwargs to match completion-aligned batches.
+
+    Args:
+        kwargs: Mapping of model kwargs to repeat. May be ``None``.
+        repeat_factor: Number of times to repeat each element along its batch axis.
+        prompt_batch_size: Expected prompt batch size for axis inference.
+
+    Returns:
+        dict: Repeated kwargs dictionary.
+    """
+
+    compact_kwargs = compact_generation_model_kwargs(kwargs)
+    if repeat_factor <= 1 or not compact_kwargs:
+        return dict(compact_kwargs)
+
+    repeated: dict[str, tp.Any] = {}
+    for key, value in compact_kwargs.items():
+        repeated[key] = repeat_prompt_aligned_model_value(
+            value,
+            repeat_factor,
+            prompt_batch_size=prompt_batch_size,
+            key=key,
+        )
+    return repeated
+
+
 def _ste(x: jax.Array, q: jax.Array) -> jax.Array:
     q = q.astype(x.dtype)
     return x + lax.stop_gradient(q - x)

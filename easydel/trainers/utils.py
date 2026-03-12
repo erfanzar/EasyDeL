@@ -46,8 +46,31 @@ from ml_collections import ConfigDict  # pyright: ignore[reportMissingTypeStubs]
 from ml_collections.config_dict import placeholder  # pyright: ignore[reportMissingTypeStubs]
 
 from easydel.infra.utils import ProcessingClassType
+from easydel.trainers.training_utils import GENERATION_MODEL_INPUT_KEYS, SHARED_GENERATION_MODEL_INPUT_KEYS
 
 logger = get_logger(__name__)
+
+PROMPT_ALIGNED_LEFT_PAD_KEYS = frozenset(
+    {
+        "inputs_embeds",
+        "position_ids",
+        "token_type_ids",
+        "cache_position",
+        "decoder_position_ids",
+        "mm_token_type_ids",
+        "pixel_attention_mask",
+    }
+)
+FLATTENABLE_MULTIMODAL_KEYS = frozenset(
+    {
+        "pixel_values",
+        "pixel_values_videos",
+        "image_grid_thw",
+        "video_grid_thw",
+        "image_grid_hws",
+        "image_sizes",
+    }
+).intersection(GENERATION_MODEL_INPUT_KEYS)
 
 
 class JaxDistributedConfig:
@@ -1175,10 +1198,188 @@ class GRPODataCollatorTFDS:
         input_ids = [np.asarray(f["input_ids"], dtype=np.int32) for f in features]
         attention_mask = [np.asarray(f["attention_mask"], dtype=np.int32) for f in features]
 
-        return {
+        batch = {
             "input_ids": pad(input_ids, self.max_prompt_length, self.pad_token_id, "left"),
             "attention_mask": pad(attention_mask, self.max_prompt_length, 0, "left"),
         }
+        for key in _collect_present_feature_keys(features):
+            if key in {"input_ids", "attention_mask"}:
+                continue
+            values = [feature.get(key) for feature in features]
+            if all(value is None for value in values):
+                continue
+            if any(value is None for value in values):
+                if key in GENERATION_MODEL_INPUT_KEYS:
+                    raise ValueError(
+                        "GRPO batches must not mix present and missing generation kwargs. "
+                        f"Found mixed presence for `{key}` across one batch."
+                    )
+                continue
+            try:
+                arrays = [np.asarray(value) for value in values]
+            except Exception:
+                continue
+            if key in FLATTENABLE_MULTIMODAL_KEYS:
+                normalized_arrays = [_normalize_flattenable_multimodal_array(key, array) for array in arrays]
+                if all(array.shape == normalized_arrays[0].shape for array in normalized_arrays):
+                    if normalized_arrays[0].ndim >= 1 and normalized_arrays[0].shape[0] == 1:
+                        batch[key] = jnp.asarray(np.concatenate(normalized_arrays, axis=0))
+                    else:
+                        batch[key] = jnp.asarray(np.stack(normalized_arrays, axis=0))
+                    continue
+                try:
+                    batch[key] = jnp.asarray(np.concatenate(normalized_arrays, axis=0))
+                    continue
+                except Exception:
+                    arrays = normalized_arrays
+            arrays = [
+                _maybe_left_pad_prompt_aligned_array(
+                    key,
+                    array,
+                    prompt.shape[-1],
+                    self.max_prompt_length,
+                    pad_token_id=self.pad_token_id,
+                )
+                for array, prompt in zip(arrays, input_ids, strict=False)
+            ]
+            batch[key] = _stack_prompt_aligned_arrays(key, arrays)
+        return batch
+
+
+def _collect_present_feature_keys(features: list[dict[str, tp.Any]]) -> list[str]:
+    """Collect the union of keys present across a GRPO batch while preserving order."""
+
+    ordered_keys: dict[str, None] = {}
+    for feature in features:
+        for key in feature.keys():
+            ordered_keys.setdefault(key, None)
+    return list(ordered_keys.keys())
+
+
+def _maybe_left_pad_prompt_aligned_array(
+    key: str,
+    array: np.ndarray,
+    prompt_length: int,
+    max_prompt_length: int,
+    *,
+    pad_token_id: int,
+) -> np.ndarray:
+    """Left-pad arrays whose last dimension is aligned with the prompt length."""
+
+    if key not in PROMPT_ALIGNED_LEFT_PAD_KEYS:
+        return array
+    pad_axis = _prompt_aligned_padding_axis(key, array, prompt_length)
+    if pad_axis is None:
+        return array
+
+    padding_value = _prompt_aligned_padding_value(key, array, pad_token_id)
+    return _pad_single_along_axis(array, max_prompt_length, padding_value, pad_axis, "left")
+
+
+def _prompt_aligned_padding_axis(
+    key: str,
+    array: np.ndarray,
+    prompt_length: int,
+) -> int | None:
+    """Return the sequence axis for prompt-aligned auxiliary tensors."""
+
+    if array.ndim == 0:
+        return None
+    if key == "inputs_embeds":
+        return 0 if array.ndim >= 2 and array.shape[0] == prompt_length else None
+    return -1 if array.shape[-1] == prompt_length else None
+
+
+def _pad_single_along_axis(
+    tensor: np.ndarray,
+    max_length: int,
+    padding_value: int | float,
+    axis: int,
+    padding_side: str,
+) -> np.ndarray:
+    """Pad a single array along the requested sequence axis."""
+
+    axis = axis if axis >= 0 else tensor.ndim + axis
+    current_length = tensor.shape[axis]
+    if current_length == max_length:
+        return tensor
+
+    pad_width = [(0, 0)] * tensor.ndim
+    pad_amount = max(max_length - current_length, 0)
+    if padding_side == "left":
+        pad_width[axis] = (pad_amount, 0)
+    elif padding_side == "right":
+        pad_width[axis] = (0, pad_amount)
+    else:
+        raise ValueError("padding_side must be 'left' or 'right'")
+
+    padded = np.pad(tensor, pad_width, mode="constant", constant_values=padding_value)
+    index = [slice(None)] * padded.ndim
+    if padding_side == "left":
+        index[axis] = slice(-max_length, None)
+    else:
+        index[axis] = slice(0, max_length)
+    return padded[tuple(index)]
+
+
+def _stack_prompt_aligned_arrays(
+    key: str,
+    arrays: list[np.ndarray],
+) -> jnp.ndarray:
+    """Stack per-example prompt-aligned arrays while preserving model-expected axes."""
+
+    if key in SHARED_GENERATION_MODEL_INPUT_KEYS:
+        first = np.asarray(arrays[0])
+        if not all(np.array_equal(np.asarray(array), first) for array in arrays[1:]):
+            raise ValueError(
+                f"GRPO batches require a single shared value for `{key}` across the batch."
+            )
+        return jnp.asarray(first)
+
+    jax_arrays = [jnp.asarray(array) for array in arrays]
+    first = jax_arrays[0]
+    if key == "position_ids" and first.ndim >= 2 and first.shape[0] == 3 and all(
+        array.shape == first.shape for array in jax_arrays
+    ):
+        return jnp.stack(jax_arrays, axis=1)
+    if (
+        first.ndim >= 1
+        and first.shape[0] == 1
+        and all(array.shape == first.shape for array in jax_arrays)
+    ):
+        return jnp.concatenate(jax_arrays, axis=0)
+    return jnp.stack(jax_arrays, axis=0)
+
+
+def _prompt_aligned_padding_value(
+    key: str,
+    array: np.ndarray,
+    pad_token_id: int,
+) -> int | float:
+    """Choose a model-consistent padding value for prompt-aligned auxiliary tensors."""
+
+    if key in {"position_ids", "cache_position", "decoder_position_ids", "token_type_ids", "mm_token_type_ids"}:
+        return np.array(0, dtype=array.dtype).item()
+    if np.issubdtype(array.dtype, np.floating):
+        return np.array(0.0, dtype=array.dtype).item()
+    return np.array(pad_token_id, dtype=array.dtype).item()
+
+
+def _normalize_flattenable_multimodal_array(
+    key: str,
+    array: np.ndarray,
+) -> np.ndarray:
+    """Normalize multimodal arrays so prompts with multiple items can concatenate cleanly."""
+
+    if key in {"image_grid_thw", "video_grid_thw"} and array.ndim == 1 and array.shape[0] == 3:
+        return array[None, :]
+    if key in {"image_grid_hws", "image_sizes"} and array.ndim == 1 and array.shape[0] == 2:
+        return array[None, :]
+    if key == "pixel_values" and array.ndim == 3:
+        return array[None, ...]
+    if key == "pixel_values_videos" and array.ndim == 4:
+        return array[None, ...]
+    return array
 
 
 @auto_pytree
@@ -1192,10 +1393,28 @@ class GRPODataCollatorGrain:
         input_ids = np.asarray(feature["input_ids"], dtype=np.int32)
         attention_mask = np.asarray(feature["attention_mask"], dtype=np.int32)
 
-        return {
+        batch = {
             "input_ids": pad_single(input_ids, self.max_prompt_length, self.pad_token_id, "left"),
             "attention_mask": pad_single(attention_mask, self.max_prompt_length, 0, "left"),
         }
+        for key, value in feature.items():
+            if key not in {"input_ids", "attention_mask"} and value is not None:
+                try:
+                    array = np.asarray(value)
+                except Exception:
+                    batch[key] = value
+                    continue
+                if key in FLATTENABLE_MULTIMODAL_KEYS:
+                    batch[key] = _normalize_flattenable_multimodal_array(key, array)
+                else:
+                    batch[key] = _maybe_left_pad_prompt_aligned_array(
+                        key,
+                        array,
+                        input_ids.shape[-1],
+                        self.max_prompt_length,
+                        pad_token_id=self.pad_token_id,
+                    )
+        return batch
 
 
 @auto_pytree

@@ -259,7 +259,10 @@ class PPOTrainer(Trainer):
         self.data_tokenize_fn = data_tokenize_fn
         log_table = None
         if self.arguments.use_wandb and self.arguments.can_log_metrics and wandb is not None:
-            log_table = wandb.Table(columns=["generated_result", "input_prompt", "took", "length", "step"])
+            log_table = wandb.Table(
+                columns=["generated_result", "input_prompt", "took", "length", "step"],
+                log_mode="INCREMENTAL",
+            )
         self.log_table = log_table
 
         super().__init__(

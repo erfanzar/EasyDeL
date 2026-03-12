@@ -670,6 +670,8 @@ class GRPOTrainerCfg(BaseTrainerCfg):
         tools: List of tool definitions for tool-use scenarios.
         skip_apply_chat_template: Whether to skip applying chat template to prompts.
         num_return_sequences: Number of completions to generate per prompt.
+        ref_logps_chunk_size: Chunk size for reference-model log-prob computation.
+            Set to 0 to disable chunking.
         top_p: Top-p (nucleus) sampling probability threshold.
         top_k: Top-k sampling parameter.
         temperature: Sampling temperature for generation diversity.
@@ -695,6 +697,7 @@ class GRPOTrainerCfg(BaseTrainerCfg):
     tools: NotRequired[list[dict | Any] | None]
     skip_apply_chat_template: NotRequired[bool]
     num_return_sequences: NotRequired[int]
+    ref_logps_chunk_size: NotRequired[int]
     top_p: NotRequired[float]
     top_k: NotRequired[int]
     temperature: NotRequired[float]

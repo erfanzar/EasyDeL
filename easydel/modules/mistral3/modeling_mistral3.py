@@ -549,6 +549,7 @@ class Mistral3Model(EasyDeLBaseModule):
         pad_token_id: int,
         starts: int | None = None,
         pixel_values: Array | None = None,
+        image_sizes: Array | None = None,
         attention_mask: Bool[Array, "batch seq_len"] | None = None,
     ):
         """Prepare model inputs for autoregressive generation.
@@ -563,6 +564,8 @@ class Mistral3Model(EasyDeLBaseModule):
             starts (int | None, optional): Starting positions. Defaults to None.
             pixel_values (Array | None, optional): Image pixel values for multimodal
                 generation. Defaults to None.
+            image_sizes (Array | None, optional): Image size information for each image
+                in the batch. Defaults to None.
             attention_mask (Array | None, optional): Attention mask for the inputs.
                 Defaults to None.
 
@@ -577,6 +580,7 @@ class Mistral3Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
         )
         model_inputs["pixel_values"] = pixel_values
+        model_inputs["image_sizes"] = image_sizes
         return model_inputs
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
@@ -595,6 +599,7 @@ class Mistral3Model(EasyDeLBaseModule):
         """
         model_kwargs = self.language_model.update_inputs_for_generation(model_outputs, model_kwargs)
         model_kwargs.pop("pixel_values", None)  # only effect first iter
+        model_kwargs.pop("image_sizes", None)  # only effect first iter
         return model_kwargs
 
     def get_encoder(self):

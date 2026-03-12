@@ -7,8 +7,8 @@ This repo pins Ray and Docker build versions to keep TPU/GCP workflows stable. I
 
 ## What EasyDeL Pins
 
-- **Ray**: `ray[default]==2.53.0` in `pyproject.toml`.
-- **Docker images**: install `ray[default,gcp]==2.53.0` in `Dockerfile` (adds GCP autoscaler extras).
+- **Ray**: `ray[default]==2.54.0` in `pyproject.toml`.
+- **Docker images**: install `ray[default,gcp]==2.54.0` in `Dockerfile` (adds GCP autoscaler extras).
 - **Docker Python**: defaults to `PYTHON_VERSION=3.13` (override via build arg).
 
 ## Recommended Workflow (Avoid CLI/Cluster Mismatches)

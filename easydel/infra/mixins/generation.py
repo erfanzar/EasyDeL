@@ -1913,7 +1913,17 @@ class EasyGenerationMixin:
         """
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
+        model_kwargs.pop("inputs_embeds", None)
+        model_kwargs.pop("deepstack_visual_embeds", None)
+        model_kwargs.pop("visual_pos_masks", None)
         return model_kwargs
+
+    def _call_generation_model_step(self, model, running_token, call_kwargs):
+        """Run one generation step without forwarding incompatible prompt embeddings."""
+
+        if call_kwargs.get("inputs_embeds", None) is not None:
+            return model(**call_kwargs)
+        return model(running_token, **call_kwargs)
 
     def _create_required_props_from_kwargs(
         self, model_kwargs: dict[str, Array]
@@ -1975,7 +1985,9 @@ class EasyGenerationMixin:
                 param = valid_params[name]
                 if param.annotation != inspect.Parameter.empty:
                     try:
-                        if getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None:  # pyright: ignore[reportDeprecated]
+                        if (
+                            getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None
+                        ):  # pyright: ignore[reportDeprecated]
                             expected_type = param.annotation.__args__[0]
                             if not isinstance(value, expected_type):
                                 print(
@@ -2213,20 +2225,34 @@ class EasyGenerationMixin:
         Raises:
             ValueError: If is_encoder_decoder=True but encoder_outputs is not in model_kwargs.
         """
-        if expand_size == 1:
-            return input_ids, model_kwargs
+
+        def _expand_generation_value(key: str, value: tp.Any) -> tp.Any:
+            if value is None or not isinstance(value, jax.Array):
+                return value
+
+            batch_axis = 0
+            if key == "position_ids" and value.ndim >= 3 and value.shape[0] == 3:
+                batch_axis = 1
+
+            if expand_size != 1:
+                value = jnp.repeat(value, axis=batch_axis, repeats=expand_size)
+
+            if key == "pixel_values" and value.ndim >= 5:
+                return jnp.reshape(value, (-1, *value.shape[2:]))
+            if key == "pixel_values_videos" and value.ndim >= 6:
+                return jnp.reshape(value, (-1, *value.shape[2:]))
+            if key in {"image_grid_thw", "video_grid_thw"} and value.ndim >= 3 and value.shape[-1] == 3:
+                return jnp.reshape(value, (-1, 3))
+            if key in {"image_grid_hws", "image_sizes"} and value.ndim >= 3 and value.shape[-1] == 2:
+                return jnp.reshape(value, (-1, 2))
+            return value
 
         def _expand_dict_for_generation(dict_to_expand):
             for key in dict_to_expand:
-                if dict_to_expand[key] is not None and isinstance(dict_to_expand[key], jax.Array):
-                    dict_to_expand[key] = jnp.repeat(
-                        dict_to_expand[key],
-                        axis=0,
-                        repeats=expand_size,
-                    )
+                dict_to_expand[key] = _expand_generation_value(key, dict_to_expand[key])
             return dict_to_expand
 
-        if input_ids is not None:
+        if input_ids is not None and expand_size != 1:
             input_ids = input_ids.repeat(repeats=expand_size, axis=0)
 
         model_kwargs = _expand_dict_for_generation(model_kwargs)
@@ -2710,7 +2736,7 @@ class EasyGenerationMixin:
                     continue
                 if hasattr(mask, "shape") and len(mask.shape) > 0 and mask.shape[-1] != running_len:
                     call_kwargs.pop(mask_key, None)
-            model_outputs = model(state.running_token, **call_kwargs)
+            model_outputs = self._call_generation_model_step(model, state.running_token, call_kwargs)
             logits = model_outputs.logits[:, -1]
 
             logits = logits_processor(state.sequences, logits, state.cur_len)
@@ -2858,7 +2884,7 @@ class EasyGenerationMixin:
                     continue
                 if hasattr(mask, "shape") and len(mask.shape) > 0 and mask.shape[-1] != running_len:
                     call_kwargs.pop(mask_key, None)
-            model_outputs = model(state.running_token, **call_kwargs)
+            model_outputs = self._call_generation_model_step(model, state.running_token, call_kwargs)
 
             logits = model_outputs.logits[:, -1]
             logits = logits_processor(state.sequences, logits, state.cur_len)
@@ -3421,21 +3447,44 @@ class EasyGenerationMixin:
     def _esurge_cache_scope(self) -> str:
         """Return a stable cache scope for this model instance.
 
-        eSurge cache entries should be scoped to a model object, not to the
-        current weight values. Some training loops mutate/replace graphstate at
-        each step, and using a value-dependent hash causes unnecessary engine
-        churn and repeated recompilation.
+        eSurge cache entries should remain stable across repeated
+        `EasyDeLState.model` reconstructions while still separating logically
+        distinct model lineages. Training loops often rebuild module objects
+        from the same graphdef/state, so using `id(self)` causes unnecessary
+        engine churn and repeated recompilation.
         """
-        scope = getattr(self, "_esurge_cache_scope_key", None)
-        if scope is not None:
-            return scope
+        try:
+            return self._esurge_cache_scope_key
+        except AttributeError:
+            pass
 
         try:
-            model_hash = self.static_hash(["attn_mechanism"])
+            config = self.config.to_dict()
+            model_type = self._model_type
+            backend = _resolve_backend_for_esurge(self.config)
+            text_config = self.config.get_text_config()
+            attn_mechanism = _normalize_attn_mechanism_value(self.config.attn_mechanism)
+            has_mla_attention, has_non_mla_attention = _detect_mla_attention_mix(self, text_config)
+            num_heads = text_config.num_attention_heads or 0
+            is_mla_model = has_mla_attention and int(num_heads) > 0
+            if is_mla_model:
+                esurge_attn = "multi_latent_ragged_page_attention_v1"
+            elif backend == "gpu":
+                esurge_attn = "unified_attention"
+            else:
+                esurge_attn = "ragged_page_attention_v3"
+            config["_esurge_backend"] = backend
+            config["_esurge_attn_mechanism"] = esurge_attn
+            config["_esurge_original_attn_mechanism"] = attn_mechanism
+            config["_esurge_has_mla_attention"] = has_mla_attention
+            config["_esurge_has_non_mla_attention"] = has_non_mla_attention
+
+            strgs = pprint.pformat((id(self), model_type, config), sort_dicts=True).encode("utf-8")
+            model_hash = int.from_bytes(hashlib.md5(strgs).digest(), byteorder="big", signed=True)
         except Exception:
             model_hash = "unknown"
 
-        scope = f"{id(self)}-{model_hash}"
+        scope = f"esurge-{model_hash}"
         try:
             self._esurge_cache_scope_key = scope
         except Exception:

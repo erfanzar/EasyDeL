@@ -174,6 +174,12 @@ class GRPOConfig(TrainingArguments):
         default=1.0,
         metadata={"help": "Keep only the top quantile of tokens by entropy in the loss (1.0 disables filtering)."},
     )
+    ref_logps_chunk_size: int = field(
+        default=0,
+        metadata={
+            "help": "Chunk size for reference-model log-prob computation. Set to 0 to disable chunking."
+        },
+    )
 
     def __post_init__(
         self,

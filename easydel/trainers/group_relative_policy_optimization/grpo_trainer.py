@@ -33,7 +33,10 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
-from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
+from easydel.utils.helpers import (  # pyright: ignore[reportPrivateLocalImportUsage]
+    capture_time,
+    get_logger,
+)
 from easydel.utils.traversals import deepcopy_model
 
 from ..prompt_transforms import GRPOPreprocessTransform
@@ -42,9 +45,15 @@ from ..trainer.trainer import Trainer
 from ..trainer_protocol import TrainerConfigureFunctionOutput
 from ..training_configurations import MetricsType
 from ..training_utils import (
+    extract_generation_model_kwargs,
     filter_kwargs_for_callable,
+    normalize_generation_model_kwargs,
+    repeat_prompt_aligned_model_kwargs,
     resolve_straight_through_emulator,
     sanitize_model_call_kwargs,
+    slice_prompt_aligned_model_kwargs,
+    strip_prompt_only_scoring_model_kwargs,
+    validate_prompt_aligned_generation_model_kwargs,
 )
 from ._fn import get_per_token_logps, grpo_step
 from .grpo_config import GRPOConfig
@@ -148,6 +157,7 @@ class GRPOTrainer(Trainer):
         if isinstance(self.scale_rewards, str):
             self.scale_rewards = self.scale_rewards.lower()
         self.top_entropy_quantile = arguments.top_entropy_quantile
+        self.ref_logps_chunk_size = max(int(arguments.ref_logps_chunk_size or 0), 0)
 
         if not isinstance(model, EasyDeLState):
             model = model.to_state()
@@ -241,7 +251,10 @@ class GRPOTrainer(Trainer):
         self.data_tokenize_fn = data_tokenize_fn
         log_table = None
         if self.arguments.use_wandb and self.arguments.can_log_metrics and wandb is not None:
-            log_table = wandb.Table(columns=["generated_result", "input_prompt", "took", "length", "step"])
+            log_table = wandb.Table(
+                columns=["generated_result", "input_prompt", "took", "length", "step"],
+                log_mode="INCREMENTAL",
+            )
         self.log_table = log_table
 
         super().__init__(
@@ -382,7 +395,7 @@ class GRPOTrainer(Trainer):
             static_argnums=static_argnames,
         )
 
-        def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef):
+        def _compute_refmodel_logps(graphtree, graphother, ids, mask, model_kwargs=None, graphdef=None):
             graphother = jax.tree_util.tree_map(
                 lambda x: jax.lax.stop_gradient(x) if hasattr(x, "shape") else x,
                 graphother,
@@ -391,7 +404,17 @@ class GRPOTrainer(Trainer):
             with apply.mesh:
                 ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
                 mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
-                return get_per_token_logps(apply, ids, mask, self.arguments.max_prompt_length)
+                model_kwargs = normalize_generation_model_kwargs(
+                    model_kwargs,
+                    model_callable=apply.__call__,
+                )
+                return get_per_token_logps(
+                    apply,
+                    ids,
+                    mask,
+                    self.arguments.max_prompt_length,
+                    model_kwargs=model_kwargs,
+                )
 
         self.compute_refmodel_logps = ejit(
             partial(_compute_refmodel_logps, graphdef=self.ref_state.graphdef),
@@ -401,6 +424,7 @@ class GRPOTrainer(Trainer):
                 self.ref_state.shardings.graphother,
                 empty_sharding,
                 empty_sharding,
+                {key: None for key in normalize_generation_model_kwargs(None).keys()},
             ),
             out_shardings=empty_sharding,
         )
@@ -428,11 +452,21 @@ class GRPOTrainer(Trainer):
         batch = self._purify_batch(batch)
         with capture_time() as preprocessing_time_fn:
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
+            prompt_model_kwargs = extract_generation_model_kwargs(
+                batch,
+                model_callable=state.model.__call__,
+            )
+            scoring_prompt_model_kwargs = strip_prompt_only_scoring_model_kwargs(prompt_model_kwargs)
+            validate_prompt_aligned_generation_model_kwargs(
+                scoring_prompt_model_kwargs,
+                prompt_batch_size=prompt_ids.shape[0],
+            )
 
             with capture_time() as generation_time_fn:
                 results = self.generate_unified(
                     input_ids=prompt_ids,
                     attention_mask=prompt_mask,
+                    model_kwargs=prompt_model_kwargs,
                     state=state,
                     apply_chat_template=False,  # GRPO doesn't apply chat template to prompts
                     shard_inputs=False,  # Already sharded
@@ -456,28 +490,77 @@ class GRPOTrainer(Trainer):
             generation_factor = completion_ids.shape[0] // max(prompt_mask.shape[0], 1)
             generation_factor = max(generation_factor, 1)
             ridmask = prompt_mask.repeat(generation_factor, 0)
+            repeated_prompt_model_kwargs = repeat_prompt_aligned_model_kwargs(
+                scoring_prompt_model_kwargs,
+                generation_factor,
+                prompt_batch_size=prompt_mask.shape[0],
+            )
+            normalized_repeated_model_kwargs = normalize_generation_model_kwargs(
+                repeated_prompt_model_kwargs,
+                model_callable=self.ref_state.model.__call__,
+            )
+            prompt_completion_mask = jnp.concatenate([ridmask, completion_mask], -1)
 
             with capture_time() as token_logps_time_fn:
-                ref_per_token_logps = self.compute_refmodel_logps(
-                    self.ref_state.graphstate,
-                    self.ref_state.graphother,
-                    prompt_completion_ids,
-                    jnp.concatenate([ridmask, completion_mask], -1),
-                )
+                if self.ref_logps_chunk_size > 0 and prompt_completion_ids.shape[0] > self.ref_logps_chunk_size:
+                    ref_chunks: list[jax.Array] = []
+                    full_batch_size = int(prompt_completion_ids.shape[0])
+                    for start in range(0, full_batch_size, self.ref_logps_chunk_size):
+                        end = min(start + self.ref_logps_chunk_size, full_batch_size)
+                        ref_chunks.append(
+                            self.compute_refmodel_logps(
+                                self.ref_state.graphstate,
+                                self.ref_state.graphother,
+                                prompt_completion_ids[start:end],
+                                prompt_completion_mask[start:end],
+                                slice_prompt_aligned_model_kwargs(
+                                    normalized_repeated_model_kwargs,
+                                    start,
+                                    end,
+                                    prompt_batch_size=full_batch_size,
+                                ),
+                            )
+                        )
+                    ref_per_token_logps = jnp.concatenate(ref_chunks, axis=0)
+                else:
+                    ref_per_token_logps = self.compute_refmodel_logps(
+                        self.ref_state.graphstate,
+                        self.ref_state.graphother,
+                        prompt_completion_ids,
+                        prompt_completion_mask,
+                        normalized_repeated_model_kwargs,
+                    )
             token_logps_time = token_logps_time_fn()
 
             host_completion_ids = np.asarray(jax.device_get(completion_ids), dtype=np.int64)
-            completions_text = self.processing_class.batch_decode(
-                host_completion_ids.tolist(),
+            host_completion_mask = np.asarray(jax.device_get(completion_mask), dtype=np.int32)
+            raw_completions_text = self._decode_prompt_batch(
+                self.processing_class,
+                host_completion_ids,
+                skip_special_tokens=False,
+                pad_token_id=self._pad_token_id,
+                pop_pad_tokens=True,
+                attention_mask=host_completion_mask,
+            )
+            clean_completions_text = self._decode_prompt_batch(
+                self.processing_class,
+                host_completion_ids,
                 skip_special_tokens=True,
+                pad_token_id=self._pad_token_id,
+                pop_pad_tokens=True,
+                attention_mask=host_completion_mask,
             )
 
             is_conversational = self.train_is_conversational if is_train else self.eval_is_conversational
 
             if is_conversational:
-                completions = [[{"role": "assistant", "content": completion}] for completion in completions_text]
+                raw_completions = [[{"role": "assistant", "content": completion}] for completion in raw_completions_text]
+                clean_completions = [
+                    [{"role": "assistant", "content": completion}] for completion in clean_completions_text
+                ]
             else:
-                completions = completions_text
+                raw_completions = raw_completions_text
+                clean_completions = clean_completions_text
 
             rewards_per_func = jnp.full(
                 (prompt_ids.shape[0] * generation_factor, len(self.reward_funcs)),
@@ -491,11 +574,11 @@ class GRPOTrainer(Trainer):
                     if isinstance(reward_func, EasyDeLState):
                         if is_conversational:
                             messages = [
-                                {"messages": p + c} for p, c in zip(completion_prompts, completions, strict=False)
+                                {"messages": p + c} for p, c in zip(completion_prompts, clean_completions, strict=False)
                             ]
                             texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                         else:
-                            texts = [p + c for p, c in zip(completion_prompts, completions, strict=False)]
+                            texts = [p + c for p, c in zip(completion_prompts, clean_completions, strict=False)]
 
                         rew = reward_func.apply_fn(
                             reward_func.graphdef,
@@ -516,12 +599,17 @@ class GRPOTrainer(Trainer):
                         ).logits[:, 0]
                     else:
                         in_prompts = completion_prompts
-                        output_reward_func = reward_func(
-                            prompts=in_prompts,
-                            completions=completions,
-                            max_length=self.arguments.max_length,
-                            batch=batch,
+                        reward_call_kwargs = filter_kwargs_for_callable(
+                            reward_func,
+                            {
+                                "prompts": in_prompts,
+                                "completions": clean_completions,
+                                "raw_completions": raw_completions,
+                                "max_length": self.arguments.max_length,
+                                "batch": batch,
+                            },
                         )
+                        output_reward_func = reward_func(**reward_call_kwargs)
                         rew = jnp.array(
                             [val if val is not None else jnp.nan for val in output_reward_func],
                             dtype="f4",
@@ -537,6 +625,10 @@ class GRPOTrainer(Trainer):
             completion_mask = self._all_gather(completion_mask)
             ref_per_token_logps = self._all_gather(ref_per_token_logps)
             rewards_per_func = self._all_gather(rewards_per_func)
+            scoring_prompt_model_kwargs = jax.tree_util.tree_map(
+                lambda x: self._all_gather(x) if isinstance(x, jax.Array) else x,
+                scoring_prompt_model_kwargs,
+            )
 
             with capture_time() as grouped_comp_time_fn:
                 generation_factor = completion_ids.shape[0] // max(prompt_mask.shape[0], 1)
@@ -601,6 +693,7 @@ class GRPOTrainer(Trainer):
                 "ref_per_token_logps": ref_per_token_logps,
                 "advantages": advantages,
                 "num_items_in_batch": jnp.sum(completion_mask),
+                **scoring_prompt_model_kwargs,
             },
             metrics_dict,
         )
