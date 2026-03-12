@@ -253,7 +253,7 @@ if _check_bool_flag("EASYDEL_AUTO", True):
     _os.environ["KMP_AFFINITY"] = "noverbose"
     _os.environ["GRPC_VERBOSITY"] = "ERROR"
     _os.environ["GLOG_minloglevel"] = "3"
-
+    _os.environ.setdefault("HF_ALLOW_CODE_EVAL", "1")
     _os.environ["CACHE_TRITON_KERNELS"] = "1"
     _os.environ["TPU_MIN_LOG_LEVEL"] = "4"
     _os.environ["TPU_STDERR_LOG_LEVEL"] = "4"
