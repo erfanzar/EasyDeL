@@ -180,6 +180,18 @@ class GRPOConfig(TrainingArguments):
             "help": "Chunk size for reference-model log-prob computation. Set to 0 to disable chunking."
         },
     )
+    completion_chunk_size: int = field(
+        default=0,
+        metadata={
+            "help": "Chunk size for completion-loss computation. Set to 0 to disable chunked completion loss."
+        },
+    )
+    max_loss_completion_tokens: int = field(
+        default=0,
+        metadata={
+            "help": "Optional cap on completion tokens used by the GRPO loss. Set to 0 to disable truncation."
+        },
+    )
 
     def __post_init__(
         self,
@@ -224,6 +236,10 @@ class GRPOConfig(TrainingArguments):
             self.scale_rewards = "group"
         elif self.scale_rewards is False:
             self.scale_rewards = "none"
+
+        self.ref_logps_chunk_size = max(int(self.ref_logps_chunk_size or 0), 0)
+        self.completion_chunk_size = max(int(self.completion_chunk_size or 0), 0)
+        self.max_loss_completion_tokens = max(int(self.max_loss_completion_tokens or 0), 0)
 
         if hasattr(super(), "__post_init__"):
             super().__post_init__(
