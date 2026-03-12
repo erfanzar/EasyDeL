@@ -533,13 +533,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             and (self.config.num_experts > 0 and (self.layer_idx + 1) % self.config.decoder_sparse_step == 0)
             else Qwen2MoeMLP
         )
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
         self.self_attn = attn_block(
             config=config,
             dtype=dtype,
@@ -693,9 +686,15 @@ class Qwen2MoeModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            Qwen2MoeDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Qwen2MoeDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=layer_idx,
                     dtype=dtype,

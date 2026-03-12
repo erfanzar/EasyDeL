@@ -519,6 +519,7 @@ class Trainer(BaseTrainer):
                     if self.scheduler is not None
                     else self.arguments.learning_rate,
                     epoch=epoch,
+                    epoch_progress=current_step / steps_per_epoch,
                     flops_per_token=self._backward_flops_per_token,
                     extra_flops_per_token=self._extra_backward_flops_per_token,
                     batch_size=self.training_batch_size,
@@ -634,6 +635,7 @@ class Trainer(BaseTrainer):
                     current_step=current_step,
                     learning_rate=0.000,
                     epoch=0,
+                    epoch_progress=None,
                     flops_per_token=self._forward_flops_per_token,
                     extra_flops_per_token=self._extra_forward_flops_per_token,
                     batch_size=self.evaluation_batch_size,

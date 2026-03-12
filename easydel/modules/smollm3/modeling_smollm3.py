@@ -45,7 +45,7 @@ from easydel.caching import (
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, DecoderLayerOutput
-from easydel.infra.utils import block_wise_ffn
+from easydel.infra.utils import auto_remat, block_wise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RMSNorm, RowParallelLinear
 from easydel.layers.attention import UnifiedAttention
 from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
@@ -308,7 +308,7 @@ class SmolLM3DecoderLayer(nn.Module):
             output_attentions,
             frequencies,
         )
-        hidden_states = residual + attention_output.attention_output
+        hidden_states = checkpoint_name(residual + attention_output.attention_output, "residual")
 
         # Pre-norm architecture: norm -> mlp -> residual
         residual = hidden_states
@@ -324,7 +324,7 @@ class SmolLM3DecoderLayer(nn.Module):
         else:
             mlp_output = self.mlp(hidden_states)
 
-        hidden_states = residual + mlp_output
+        hidden_states = checkpoint_name(residual + mlp_output, "residual")
 
         hidden_states = apply_logical_sharding(
             hidden_states,
@@ -439,16 +439,16 @@ class SmolLM3MLP(nn.Module):
             partition_manager=self.config.partition_manager,
         )
         # SwiGLU activation: silu(gate) * up
-        gate = self.gate_proj(hidden_states)
-        up = self.up_proj(hidden_states)
+        gate = checkpoint_name(self.gate_proj(hidden_states), "mlp_gate")
+        up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
         hidden_states = nn.silu(gate) * up
-        hidden_states = self.down_proj(hidden_states)
+        hidden_states = checkpoint_name(self.down_proj(hidden_states), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        return hidden_states
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 @register_module(
@@ -511,9 +511,15 @@ class SmolLM3Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            SmolLM3DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                SmolLM3DecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=i,
                     dtype=dtype,
@@ -651,7 +657,7 @@ class SmolLM3Model(EasyDeLBaseModule):
                 )
 
         # Final layer norm
-        hidden_states = self.norm(hidden_states)
+        hidden_states = checkpoint_name(self.norm(hidden_states), "model_output")
 
         if output_hidden_states:
             assert all_hidden_states is not None

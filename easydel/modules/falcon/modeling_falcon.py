@@ -377,15 +377,8 @@ class FalconBlock(nn.Module):
                     param_dtype=self.param_dtype,
                     rngs=rngs,
                 )
-        attn_block, mlp_block = auto_remat(
-            FalconAttention,
-            FalconMlp,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
 
-        self.mlp = mlp_block(
+        self.mlp = FalconMlp(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -393,7 +386,7 @@ class FalconBlock(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.self_attention = attn_block(
+        self.self_attention = FalconAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -542,9 +535,15 @@ class FalconModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            FalconBlock,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.h = nn.List(
             [
-                FalconBlock(
+                remat_layer_block(
                     config=config,
                     layer_idx=i,
                     dtype=dtype,

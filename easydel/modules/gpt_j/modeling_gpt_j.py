@@ -482,15 +482,6 @@ class GPTJBlock(nn.Module):
         hidden_size = self.config.hidden_size
         inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
-        attn_block = GPTJAttention
-        mlp_block = GPTJMLP
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
         self.ln_1 = LayerNorm(
             self.config.hidden_size,
             epsilon=config.layer_norm_epsilon,
@@ -499,7 +490,7 @@ class GPTJBlock(nn.Module):
             rngs=rngs,
         )
 
-        self.attn = attn_block(
+        self.attn = GPTJAttention(
             config,
             layer_idx=layer_idx,
             dtype=dtype,
@@ -508,7 +499,7 @@ class GPTJBlock(nn.Module):
             rngs=rngs,
         )
 
-        self.mlp = mlp_block(
+        self.mlp = GPTJMLP(
             config,
             inner_dim,
             dtype=dtype,
@@ -638,9 +629,15 @@ class GPTJModel(EasyDeLBaseModule):
             rate=self.config.embd_pdrop,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            GPTJBlock,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.h = nn.List(
             [
-                GPTJBlock(
+                remat_layer_block(
                     config,
                     layer_idx=i,
                     dtype=dtype,

@@ -1112,20 +1112,7 @@ class GlmMoeDsaDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
-        attn_block = GlmMoeDsaAttention
-        mlp_block = GlmMoeDsaMLP
-        mlp_moe_block = GlmMoeDsaMoE
-
-        attn_block, mlp_block, mlp_moe_block = auto_remat(
-            attn_block,
-            mlp_block,
-            mlp_moe_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn = attn_block(
+        self.self_attn = GlmMoeDsaAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1140,7 +1127,7 @@ class GlmMoeDsaDecoderLayer(nn.Module):
             and config.n_routed_experts is not None
             and config.num_experts_per_tok is not None
         ):
-            self.mlp = mlp_moe_block(
+            self.mlp = GlmMoeDsaMoE(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1148,7 +1135,7 @@ class GlmMoeDsaDecoderLayer(nn.Module):
                 rngs=rngs,
             )
         else:
-            self.mlp = mlp_block(
+            self.mlp = GlmMoeDsaMLP(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -1270,9 +1257,15 @@ class GlmMoeDsaModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            GlmMoeDsaDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                GlmMoeDsaDecoderLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,

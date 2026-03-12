@@ -923,13 +923,6 @@ class DbrxBlock(nn.Module):
         self.resid_pdrop = self.config.resid_pdrop
         attn_block = DbrxNormAttentionNorm
         ffn_block = DbrxFFN
-        attn_block, ffn_block = auto_remat(
-            attn_block,
-            ffn_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
         self.norm_attn_norm = attn_block(
             config=config,
             dtype=dtype,
@@ -1063,9 +1056,15 @@ class DbrxModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            DbrxBlock,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.blocks = nn.List(
             [
-                DbrxBlock(
+                remat_layer_block(
                     config=config,
                     layer_idx=i,
                     dtype=dtype,

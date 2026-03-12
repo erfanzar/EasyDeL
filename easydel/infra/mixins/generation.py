@@ -1912,7 +1912,11 @@ class EasyGenerationMixin:
             dict: The updated `model_kwargs` dictionary ready for the next generation step.
         """
         model_kwargs["past_key_values"] = model_outputs.past_key_values
-        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
+        position_ids = model_kwargs["position_ids"]
+        if getattr(position_ids, "ndim", 0) == 3:
+            model_kwargs["position_ids"] = position_ids[:, :, -1:] + 1
+        else:
+            model_kwargs["position_ids"] = position_ids[:, -1:] + 1
         model_kwargs.pop("inputs_embeds", None)
         model_kwargs.pop("deepstack_visual_embeds", None)
         model_kwargs.pop("visual_pos_masks", None)
@@ -1985,9 +1989,7 @@ class EasyGenerationMixin:
                 param = valid_params[name]
                 if param.annotation != inspect.Parameter.empty:
                     try:
-                        if (
-                            getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None
-                        ):  # pyright: ignore[reportDeprecated]
+                        if getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None:  # pyright: ignore[reportDeprecated]
                             expected_type = param.annotation.__args__[0]
                             if not isinstance(value, expected_type):
                                 print(

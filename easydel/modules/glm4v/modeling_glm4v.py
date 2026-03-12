@@ -1096,14 +1096,7 @@ class Glm4vTextDecoderLayer(nn.Module):
         self.precision = precision
         self.layer_idx = layer_idx
 
-        attn_block, mlp_block = auto_remat(
-            Glm4vTextAttention,
-            Glm4vTextMLP,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.self_attn = attn_block(
+        self.self_attn = Glm4vTextAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1111,7 +1104,7 @@ class Glm4vTextDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.mlp = mlp_block(
+        self.mlp = Glm4vTextMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1250,9 +1243,15 @@ class Glm4vTextModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            Glm4vTextDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Glm4vTextDecoderLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,

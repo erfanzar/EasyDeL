@@ -1255,17 +1255,7 @@ class Qwen3VLTextDecoderLayer(nn.Module):
         self.precision = precision
         self.layer_idx = layer_idx
 
-        attn_block = Qwen3VLTextAttention
-        mlp_block = Qwen3VLTextMLP
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn = attn_block(
+        self.self_attn = Qwen3VLTextAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1274,7 +1264,7 @@ class Qwen3VLTextDecoderLayer(nn.Module):
             layer_idx=layer_idx,
         )
 
-        self.mlp = mlp_block(
+        self.mlp = Qwen3VLTextMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1415,9 +1405,15 @@ class Qwen3VLTextModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            Qwen3VLTextDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Qwen3VLTextDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=i,
                     dtype=dtype,

@@ -328,21 +328,11 @@ class GemmaDecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        mlp_block = GemmaMLP
-        attn_block = GemmaAttention
-
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
 
         # Define layers
         self.input_layernorm = GemmaRMSNorm(self.config, dtype=self.dtype)
         self.post_attention_layernorm = GemmaRMSNorm(self.config, dtype=self.dtype)
-        self.self_attn = attn_block(
+        self.self_attn = GemmaAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -350,7 +340,7 @@ class GemmaDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.mlp = mlp_block(
+        self.mlp = GemmaMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -488,9 +478,15 @@ class GemmaModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            GemmaDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                GemmaDecoderLayer(
+                remat_layer_block(
                     self.config,
                     layer_idx=i,
                     dtype=dtype,

@@ -505,17 +505,8 @@ class OpenELMDecoderLayer(nn.Module):
         self.precision = precision
         self.rngs = rngs
         self.layer_idx = layer_idx
-        attn_block = OpenELMMultiHeadCausalAttention
-        mlp_block = OpenELMFeedForwardNetwork
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
 
-        self.attn = attn_block(
+        self.attn = OpenELMMultiHeadCausalAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -523,7 +514,7 @@ class OpenELMDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.ffn = mlp_block(
+        self.ffn = OpenELMFeedForwardNetwork(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -668,9 +659,15 @@ class OpenELMModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            OpenELMDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                OpenELMDecoderLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,

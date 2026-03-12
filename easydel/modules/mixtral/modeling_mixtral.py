@@ -366,17 +366,7 @@ class MixtralDecoderLayer(nn.Module):
         self.precision = precision
         self.rngs = rngs
 
-        attn_block = MixtralAttention
-        mlp_block = MixtralSparseMoeBlock
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn = attn_block(
+        self.self_attn = MixtralAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -385,7 +375,7 @@ class MixtralDecoderLayer(nn.Module):
             layer_idx=layer_idx,
         )
 
-        self.block_sparse_moe = mlp_block(
+        self.block_sparse_moe = MixtralSparseMoeBlock(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -530,9 +520,15 @@ class MixtralModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            MixtralDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                MixtralDecoderLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,

@@ -301,16 +301,6 @@ class GPTNeoXBlock(nn.Module):
         self.rngs = rngs
         self.use_parallel_residual = config.use_parallel_residual
 
-        attn_block = GPTNeoXAttention
-        mlp_block = GPTNeoXMlp
-
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
         self.input_layernorm = LayerNorm(
             config.hidden_size,
             epsilon=config.layer_norm_eps,
@@ -325,7 +315,7 @@ class GPTNeoXBlock(nn.Module):
             param_dtype=param_dtype,
             rngs=rngs,
         )
-        self.attention = attn_block(
+        self.attention = GPTNeoXAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -460,9 +450,15 @@ class GPTNeoXModel(EasyDeLBaseModule):
             rngs=rngs,
         )
         self.emb_dropout = nn.Dropout(config.hidden_dropout, rngs=rngs)
+        remat_layer_block = auto_remat(
+            GPTNeoXBlock,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                GPTNeoXBlock(
+                remat_layer_block(
                     config=config,
                     layer_idx=i,
                     dtype=dtype,

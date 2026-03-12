@@ -30,7 +30,7 @@ from jaxtyping import Array, Bool, Float, Int
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
-from easydel.infra.utils import ArrayParam
+from easydel.infra.utils import ArrayParam, auto_remat
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseCausalLMModule
@@ -750,9 +750,15 @@ class RwkvModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            RwkvBlock,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.blocks = nn.List(
             [
-                RwkvBlock(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,

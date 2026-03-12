@@ -94,6 +94,7 @@ class StepMetrics:
         metrics: LossMetrics,
         current_step: int,
         epoch: int,
+        epoch_progress: float | None,
         flops_per_token: float,
         extra_flops_per_token: float,
         batch_size: int,
@@ -111,6 +112,8 @@ class StepMetrics:
             metrics: Loss metrics from the training step.
             current_step: Current training/evaluation step number.
             epoch: Current epoch number.
+            epoch_progress: Fractional epoch progress to log. When provided,
+                this replaces the integer epoch in the emitted metrics.
             flops_per_token: FLOPs required per token for forward pass.
             extra_flops_per_token: Additional FLOPs for backward pass.
             batch_size: Number of samples in the batch.
@@ -163,9 +166,11 @@ class StepMetrics:
 
         loss = metrics.loss
         z_loss = metrics.z_loss
+        epoch_value = float(epoch) if epoch_progress is None else float(epoch_progress)
 
         basic_metrics = {
-            "epoch": int(epoch),
+            "epoch": epoch_value,
+            "epoch_index": int(epoch),
             "execution_time": float(execution_time),
             "learning_rate": float(np.array(learning_rate).item()),
             "loss": float(loss),

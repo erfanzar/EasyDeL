@@ -666,19 +666,8 @@ class Llama4TextDecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        attn_block = Llama4TextAttention
-        mlp_block = Llama4TextMLP
-        moe_block = Llama4TextMoe
-        attn_block, mlp_block, moe_block = auto_remat(
-            attn_block,
-            mlp_block,
-            moe_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
 
-        self.self_attn = attn_block(
+        self.self_attn = Llama4TextAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -689,7 +678,7 @@ class Llama4TextDecoderLayer(nn.Module):
         self.use_chunked_attention = int((layer_idx + 1) % 4 != 0)  # <=> use rope
         self.is_moe_layer = layer_idx in config.moe_layers
         if self.is_moe_layer:  # the 128E model interleaves dense / sparse
-            self.feed_forward = moe_block(
+            self.feed_forward = Llama4TextMoe(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -697,7 +686,7 @@ class Llama4TextDecoderLayer(nn.Module):
                 rngs=rngs,
             )
         else:
-            self.feed_forward = mlp_block(
+            self.feed_forward = Llama4TextMLP(
                 config=config,
                 intermediate_size=config.intermediate_size_mlp,
                 dtype=dtype,
@@ -832,9 +821,15 @@ class Llama4TextModel(EasyDeLBaseModule):
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            Llama4TextDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Llama4TextDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=layer_idx,
                     dtype=dtype,
@@ -1538,18 +1533,8 @@ class Llama4VisionEncoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        attn_block = Llama4VisionAttention
-        mlp_block = Llama4VisionMLP
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.self_attn = attn_block(
+        self.self_attn = Llama4VisionAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1557,7 +1542,7 @@ class Llama4VisionEncoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.mlp = mlp_block(
+        self.mlp = Llama4VisionMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -1660,9 +1645,15 @@ class Llama4VisionEncoder(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
 
+        remat_layer_block = auto_remat(
+            Llama4VisionEncoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Llama4VisionEncoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=layer_idx,
                     dtype=dtype,

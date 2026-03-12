@@ -330,7 +330,9 @@ class Qwen3_5Model(Qwen3VLModel):
         image_max_grid_size: int | None = None,
         video_max_grid_size: int | None = None,
         cache_position: jax.Array | None = None,  # compatibility no-op
+        rope_deltas: jax.Array | None = None,  # compatibility no-op
         mm_token_type_ids: jax.Array | None = None,
+        **kwargs,
     ) -> Qwen3VLModelOutputWithPast:
         """Forward pass through the Qwen3.5 multimodal model.
 
@@ -340,6 +342,7 @@ class Qwen3_5Model(Qwen3VLModel):
         Returns:
             Qwen3VLModelOutputWithPast: Model outputs including logits and hidden states.
         """
+        del rope_deltas, kwargs
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:

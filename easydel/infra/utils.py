@@ -76,13 +76,32 @@ from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 from .errors import EasyDeLBlockWiseFFNError
-from .etils import AVAILABLE_SPARSE_MODULE_TYPES, EasyDeLGradientCheckPointers
+from .etils import AVAILABLE_SPARSE_MODULE_TYPES, GRADIENT_CHECKPOINT_TARGETS, EasyDeLGradientCheckPointers
 
 warnings.filterwarnings(
     "ignore",
     message="Primitive dynamic_update_slice was not handled by class",
 )
 logger = get_logger(__name__)
+
+_ATTN_CHECKPOINT_NAME_PATTERN = re.compile(r"^attn_")
+_MLP_CHECKPOINT_NAME_PATTERN = re.compile(r"^mlp_")
+
+
+def _select_checkpoint_names_by_regex(
+    *,
+    include_patterns: Sequence[re.Pattern[str]] | None = None,
+    exclude_patterns: Sequence[re.Pattern[str]] | None = None,
+) -> list[str]:
+    """Resolve known checkpoint names using include/exclude regex filters."""
+    names = list(GRADIENT_CHECKPOINT_TARGETS)
+    if include_patterns:
+        names = [name for name in names if any(pattern.search(name) for pattern in include_patterns)]
+    if exclude_patterns:
+        names = [name for name in names if not any(pattern.search(name) for pattern in exclude_patterns)]
+    if not names:
+        raise ValueError("Regex-based checkpoint target selection resolved to an empty set.")
+    return names
 
 
 def quick_gelu(x):
@@ -181,6 +200,9 @@ def get_gradient_checkpoint_policy(
             - 'save_anything_except_these_names': Save all except specified names
             - 'save_any_names_but_these': Save any names except specified
             - 'save_only_these_names': Save only specified names
+            - 'mlp_notsaveable': Save all known checkpoint names except MLP-family names
+            - 'attn_notsaveable': Save all known checkpoint names except attention-family names
+            - 'mlp_attn_notsaveable': Save all known checkpoint names except MLP and attention names
             - 'save_from_both_policies': Combine two policies
         save_names: List of checkpoint names to save (used with 'save_only_these_names')
         exclude_names: List of checkpoint names to exclude (used with 'save_anything_except_these_names')
@@ -208,6 +230,20 @@ def get_gradient_checkpoint_policy(
     if name == "save_only_these_names":
         if save_names is None:
             raise ValueError("save_names must be provided when using 'save_only_these_names' policy")
+        return jax.checkpoint_policies.save_only_these_names(*save_names)
+
+    elif name == "mlp_notsaveable":
+        save_names = _select_checkpoint_names_by_regex(exclude_patterns=[_MLP_CHECKPOINT_NAME_PATTERN])
+        return jax.checkpoint_policies.save_only_these_names(*save_names)
+
+    elif name == "attn_notsaveable":
+        save_names = _select_checkpoint_names_by_regex(exclude_patterns=[_ATTN_CHECKPOINT_NAME_PATTERN])
+        return jax.checkpoint_policies.save_only_these_names(*save_names)
+
+    elif name == "mlp_attn_notsaveable":
+        save_names = _select_checkpoint_names_by_regex(
+            exclude_patterns=[_MLP_CHECKPOINT_NAME_PATTERN, _ATTN_CHECKPOINT_NAME_PATTERN]
+        )
         return jax.checkpoint_policies.save_only_these_names(*save_names)
 
     elif name in ["save_anything_except_these_names", "save_any_names_but_these"]:

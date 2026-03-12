@@ -450,24 +450,15 @@ class PixtralBlock(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        attn_block = PixtralAttention
-        mlp_block = PixtralMLP
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.attention = attn_block(
+        self.attention = PixtralAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
         )
-        self.feed_forward = mlp_block(
+        self.feed_forward = PixtralMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -565,9 +556,15 @@ class PixtralTransformer(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
+        remat_layer_block = auto_remat(
+            PixtralBlock,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                PixtralBlock(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,

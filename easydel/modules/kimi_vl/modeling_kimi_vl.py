@@ -46,10 +46,12 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.common_types import Replicated
 from flax import nnx as nn
+from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import VLMCausalLMOutput
+from easydel.infra.utils import auto_remat
 from easydel.layers.attention import FlexibleAttentionModule
 from easydel.layers.norms import LayerNorm
 from easydel.modules._base import BaseVisionLanguageModule
@@ -303,7 +305,7 @@ class MoonVisionPatchEmbed(nn.Module):
             pixel_values = jnp.transpose(pixel_values, (0, 2, 3, 1))
         x = self.proj(pixel_values.astype(self.dtype))
         x = x.reshape(x.shape[0], -1)
-        return self.pos_emb(x, grid_hws)
+        return checkpoint_name(self.pos_emb(x, grid_hws), "embeddings")
 
 
 class Rope2DPosEmb(nn.Module):
@@ -455,7 +457,10 @@ class MLP2(nn.Module):
         Returns:
             Array: Output tensor of shape (..., output_dim).
         """
-        return self.fc1(self.activation(self.fc0(x)))
+        hidden_states = checkpoint_name(self.fc0(x), "mlp_up")
+        hidden_states = self.activation(hidden_states)
+        hidden_states = checkpoint_name(self.fc1(hidden_states), "mlp_down")
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 class MoonVitEncoderLayer(nn.Module):
@@ -571,7 +576,7 @@ class MoonVitEncoderLayer(nn.Module):
             Array: Attention output of shape (seq_len, hidden_dim).
         """
         seq_length = x.shape[0]
-        qkv = self.wqkv(x)
+        qkv = checkpoint_name(self.wqkv(x), "attn_qkv")
         qkv = qkv.reshape(seq_length, 3, self.num_heads, self.head_dim)
         q = qkv[:, 0]
         k = qkv[:, 1]
@@ -596,7 +601,7 @@ class MoonVitEncoderLayer(nn.Module):
         ).attention_outputs
 
         attn_out = attn_out.squeeze(0).reshape(seq_length, -1)
-        return self.wo(attn_out)
+        return checkpoint_name(self.wo(attn_out), "attn_output")
 
     def __call__(self, hidden_states: Array, cu_seqlens: Array, rope_freqs_cis: Array) -> Array:
         """Forward pass through the encoder layer.
@@ -615,12 +620,15 @@ class MoonVitEncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
-        hidden_states = residual + self._attention(hidden_states, cu_seqlens, rope_freqs_cis)
+        hidden_states = checkpoint_name(
+            residual + self._attention(hidden_states, cu_seqlens, rope_freqs_cis),
+            "residual",
+        )
 
         residual = hidden_states
         hidden_states = self.norm1(hidden_states)
-        hidden_states = residual + self.mlp(hidden_states)
-        return hidden_states
+        hidden_states = checkpoint_name(residual + self.mlp(hidden_states), "residual")
+        return checkpoint_name(hidden_states, "layer_output")
 
 
 class MoonVitEncoder(nn.Module):
@@ -670,9 +678,15 @@ class MoonVitEncoder(nn.Module):
         def activation(x):
             return jax.nn.gelu(x, approximate=True)
 
+        remat_layer_block = auto_remat(
+            MoonVitEncoderLayer,
+            policy=base_config.gradient_checkpointing,
+            save_names=base_config.gradient_checkpointing_targets,
+            exclude_names=base_config.gradient_checkpointing_targets,
+        )
         self.blocks = nn.List(
             [
-                MoonVitEncoderLayer(
+                remat_layer_block(
                     base_config=base_config,
                     num_heads=num_heads,
                     hidden_dim=hidden_dim,
@@ -719,7 +733,7 @@ class MoonVitEncoder(nn.Module):
         for block in self.blocks:
             hidden_states = block(hidden_states, cu_seqlens, rope_freqs_cis)
 
-        return self.final_layernorm(hidden_states)
+        return checkpoint_name(self.final_layernorm(hidden_states), "model_output")
 
 
 def patch_merger(
@@ -933,10 +947,10 @@ class KimiVLMultiModalProjector(nn.Module):
         """
         image_features = jnp.concatenate(image_features, axis=0)
         hidden_states = self.pre_norm(image_features).reshape(-1, self.hidden_size)
-        hidden_states = self.linear_1(hidden_states)
+        hidden_states = checkpoint_name(self.linear_1(hidden_states), "mlp_up")
         hidden_states = jax.nn.gelu(hidden_states, approximate=False)
-        hidden_states = self.linear_2(hidden_states)
-        return hidden_states
+        hidden_states = checkpoint_name(self.linear_2(hidden_states), "mlp_down")
+        return checkpoint_name(hidden_states, "mlp_output")
 
 
 @register_module(TaskType.IMAGE_TEXT_TO_TEXT, config=KimiVLConfig, model_type="kimi_vl")
@@ -1049,11 +1063,14 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
         """
         placeholder = int(self.config.media_placeholder_token_id)
         multimodal_embeddings = image_features.reshape(-1, image_features.shape[-1])
-        return BaseVisionLanguageModule.merge_multimodal_embeddings(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            multimodal_embeddings=multimodal_embeddings,
-            placeholder_token_id=placeholder,
+        return checkpoint_name(
+            BaseVisionLanguageModule.merge_multimodal_embeddings(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=multimodal_embeddings,
+                placeholder_token_id=placeholder,
+            ),
+            "embeddings",
         )
 
     def _extract_image_features(self, pixel_values: Array, image_grid_hws: Array) -> Array:
@@ -1155,7 +1172,7 @@ class KimiVLForConditionalGeneration(BaseVisionLanguageModule[DeepseekV3ForCausa
                 image_features.astype(inputs_embeds.dtype),
             )
 
-        return inputs_embeds
+        return checkpoint_name(inputs_embeds, "embeddings")
 
     def __call__(
         self,

@@ -237,17 +237,8 @@ class OlmoDecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        attn_block = OlmoAttention
-        mlp_block = OlmoMLP
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.self_attn = attn_block(
+        self.self_attn = OlmoAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -255,7 +246,7 @@ class OlmoDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.mlp = mlp_block(
+        self.mlp = OlmoMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -384,9 +375,15 @@ class OlmoModel(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            OlmoDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                OlmoDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=i,
                     dtype=dtype,

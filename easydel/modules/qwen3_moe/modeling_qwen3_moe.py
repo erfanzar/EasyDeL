@@ -443,19 +443,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.precision = precision
-        attn_block = Qwen3MoeAttention
-        mlp_block = Qwen3MoeMLP
-        moe_block = Qwen3MoeSparseBlock
-        attn_block, mlp_block, moe_block = auto_remat(
-            attn_block,
-            mlp_block,
-            moe_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
 
-        self.self_attn = attn_block(
+        self.self_attn = Qwen3MoeAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -467,7 +456,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         )
         if self.is_moe:
-            self.mlp = moe_block(
+            self.mlp = Qwen3MoeSparseBlock(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -475,7 +464,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 rngs=rngs,
             )
         else:
-            self.mlp = mlp_block(
+            self.mlp = Qwen3MoeMLP(
                 config=config,
                 dtype=dtype,
                 param_dtype=param_dtype,
@@ -608,9 +597,15 @@ class Qwen3MoeModel(EasyDeLBaseModule):
             param_dtype=param_dtype,
             rngs=rngs,
         )
+        remat_layer_block = auto_remat(
+            Qwen3MoeDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Qwen3MoeDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=layer_idx,
                     dtype=dtype,

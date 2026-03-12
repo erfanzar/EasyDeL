@@ -478,17 +478,7 @@ class GPT2Block(nn.Module):
             rngs=rngs,
         )
 
-        attn_block = GPT2Attention
-        mlp_block = GPT2MLP
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-
-        self.attn = attn_block(
+        self.attn = GPT2Attention(
             config,
             layer_idx=layer_idx,
             dtype=dtype,
@@ -505,7 +495,7 @@ class GPT2Block(nn.Module):
         )
 
         if config.add_cross_attention:
-            self.crossattention = attn_block(
+            self.crossattention = GPT2Attention(
                 config=config,
                 layer_idx=layer_idx,
                 dtype=dtype,
@@ -521,7 +511,7 @@ class GPT2Block(nn.Module):
                 rngs=rngs,
             )
 
-        self.mlp = mlp_block(
+        self.mlp = GPT2MLP(
             config=config,
             intermediate_size=inner_dim,
             dtype=dtype,
@@ -669,14 +659,7 @@ class GPT2Model(EasyDeLBaseModule):
             rngs=rngs,
             param_dtype=param_dtype,
         )
-        pos_embed_block = Embed
-        pos_embed_block = auto_remat(
-            pos_embed_block,
-            policy=self.config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.wpe = pos_embed_block(
+        self.wpe = Embed(
             self.config.max_position_embeddings,
             self.embed_dim,
             embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
@@ -686,9 +669,15 @@ class GPT2Model(EasyDeLBaseModule):
         )
 
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop, rngs=rngs)
+        remat_layer_block = auto_remat(
+            GPT2Block,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.h = nn.List(
             [
-                GPT2Block(
+                remat_layer_block(
                     self.config,
                     layer_idx=i,
                     dtype=dtype,

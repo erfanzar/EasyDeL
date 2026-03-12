@@ -440,17 +440,19 @@ def grpo_step(
         completion_lengths = jnp.sum(completion_mask, axis=1)
 
         use_chunked_completion_loss = (
-            completion_chunk_size > 0
-            and completion_ids.shape[0] > completion_chunk_size
-            and top_entropy_quantile >= 1.0
+            completion_chunk_size > 0 and completion_ids.shape[0] > completion_chunk_size and top_entropy_quantile >= 1.0
         )
         if use_chunked_completion_loss:
             expanded_prompt_ids = prompt_ids.repeat(effective_num_generations, 0)
             expanded_prompt_mask = prompt_mask.repeat(effective_num_generations, 0)
             completion_batch_size = int(completion_ids.shape[0])
-            normalizer = completion_token_count if completion_was_truncated else minibatch.get(
-                "num_items_in_batch",
-                completion_token_count,
+            normalizer = (
+                completion_token_count
+                if completion_was_truncated
+                else minibatch.get(
+                    "num_items_in_batch",
+                    completion_token_count,
+                )
             )
 
             loss_numerator = jnp.array(0.0, dtype=jnp.float32)
@@ -551,7 +553,9 @@ def grpo_step(
                     loss_numerator = loss_numerator + jnp.sum(chunk_per_token_loss * chunk_completion_mask)
 
                 if beta != 0.0:
-                    chunk_mean_kl_num, chunk_mean_kl_den = _masked_sum_and_count(chunk_per_token_kl, chunk_completion_mask)
+                    chunk_mean_kl_num, chunk_mean_kl_den = _masked_sum_and_count(
+                        chunk_per_token_kl, chunk_completion_mask
+                    )
                     mean_kl_num = mean_kl_num + chunk_mean_kl_num
                     mean_kl_den = mean_kl_den + chunk_mean_kl_den
                     chunk_ref_num, chunk_ref_den = _masked_sum_and_count(
@@ -712,9 +716,13 @@ def grpo_step(
         elif loss_type == "dr_grpo":
             loss = jnp.sum(per_token_loss * completion_mask) / (per_token_loss.shape[0] * per_token_loss.shape[1])
         elif loss_type in ["cispo", "dapo"]:
-            normalizer = completion_token_count if completion_was_truncated else minibatch.get(
-                "num_items_in_batch",
-                completion_token_count,
+            normalizer = (
+                completion_token_count
+                if completion_was_truncated
+                else minibatch.get(
+                    "num_items_in_batch",
+                    completion_token_count,
+                )
             )
             loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(normalizer, 1.0)
         else:

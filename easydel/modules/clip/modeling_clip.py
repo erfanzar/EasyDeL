@@ -37,7 +37,7 @@ from easydel.infra.modeling_outputs import (
     EncoderLayerOutput,
     ImageClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, ArrayParam
+from easydel.infra.utils import ACT2FN, ArrayParam, auto_remat
 from easydel.layers import ColumnParallelLinear, Embed
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import LayerNorm
@@ -167,7 +167,7 @@ class CLIPVisionEmbeddings(nn.Module):
                 axis=0,
             )
         )
-        return embeddings
+        return checkpoint_name(embeddings, name="embeddings")
 
 
 class CLIPTextEmbeddings(nn.Module):
@@ -230,7 +230,7 @@ class CLIPTextEmbeddings(nn.Module):
         position_embeds = self.position_embedding(position_ids.astype("i4"))
 
         embeddings = input_embeds + position_embeds
-        return embeddings
+        return checkpoint_name(embeddings, name="embeddings")
 
 
 class CLIPAttention(AttentionModule):
@@ -431,7 +431,7 @@ class CLIPMLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        return hidden_states
+        return checkpoint_name(hidden_states, name="mlp_output")
 
 
 class CLIPEncoderLayer(nn.Module):
@@ -520,12 +520,13 @@ class CLIPEncoderLayer(nn.Module):
             output_attentions=output_attentions,
         )
         hidden_states = attn_outputs.attention_output
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, name="residual")
 
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = checkpoint_name(residual + hidden_states, name="residual")
+        hidden_states = checkpoint_name(hidden_states, name="layer_output")
 
         return EncoderLayerOutput(
             hidden_states=hidden_states,
@@ -563,9 +564,15 @@ class CLIPEncoder(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
+        remat_layer_block = auto_remat(
+            CLIPEncoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                CLIPEncoderLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,
@@ -732,7 +739,7 @@ class CLIPTextTransformer(EasyDeLBaseModule):
         )
 
         last_hidden_state = encoder_outputs.last_hidden_state
-        last_hidden_state = self.final_layer_norm(last_hidden_state)
+        last_hidden_state = checkpoint_name(self.final_layer_norm(last_hidden_state), name="model_output")
 
         if self.eos_token_id == 2:
             pooled_output = last_hidden_state[
@@ -879,7 +886,7 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
             output_hidden_states=output_hidden_states,
         )
 
-        last_hidden_state = encoder_outputs.last_hidden_state
+        last_hidden_state = checkpoint_name(encoder_outputs.last_hidden_state, name="model_output")
         pooled_output = last_hidden_state[:, 0, :]
         pooled_output = self.post_layernorm(pooled_output)
 

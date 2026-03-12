@@ -315,17 +315,8 @@ class ExaoneDecoderLayer(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        attn_block = ExaoneAttention
-        mlp_block = ExaoneGatedMLP
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.attn = attn_block(
+        self.attn = ExaoneAttention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -333,7 +324,7 @@ class ExaoneDecoderLayer(nn.Module):
             rngs=rngs,
             layer_idx=layer_idx,
         )
-        self.mlp = mlp_block(
+        self.mlp = ExaoneGatedMLP(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -474,9 +465,15 @@ class ExaoneModel(EasyDeLBaseModule):
 
         self.drop = nn.Dropout(self.config.embed_dropout, rngs=rngs)
 
+        remat_layer_block = auto_remat(
+            ExaoneDecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.h = nn.List(
             [
-                ExaoneDecoderLayer(
+                remat_layer_block(
                     config=config,
                     layer_idx=i,
                     dtype=dtype,

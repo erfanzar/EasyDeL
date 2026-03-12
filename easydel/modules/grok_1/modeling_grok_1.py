@@ -505,16 +505,7 @@ class Grok1DecoderLayer(nn.Module):
         self.param_dtype = param_dtype
         self.precision = precision
         self.rngs = rngs
-        attn_block = Grok1Attention
-        mlp_block = Grok1SparseMoeBlock
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.attn = attn_block(
+        self.attn = Grok1Attention(
             config=self.config,
             layer_index=layer_index,
             dtype=dtype,
@@ -522,7 +513,7 @@ class Grok1DecoderLayer(nn.Module):
             precision=precision,
             rngs=rngs,
         )
-        self.moe_block = mlp_block(
+        self.moe_block = Grok1SparseMoeBlock(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -673,9 +664,15 @@ class Grok1Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            Grok1DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                Grok1DecoderLayer(
+                remat_layer_block(
                     layer_index=layer_index,
                     config=config,
                     dtype=dtype,

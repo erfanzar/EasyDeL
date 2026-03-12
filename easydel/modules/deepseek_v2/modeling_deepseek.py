@@ -775,18 +775,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
 
-        attn_block = DeepseekV2Attention
         mlp_block = DeepseekV2MLP
         mlp_moe_block = DeepseekV2MoE
 
-        attn_block, mlp_block = auto_remat(
-            attn_block,
-            mlp_block,
-            policy=config.gradient_checkpointing,
-            save_names=config.gradient_checkpointing_targets,
-            exclude_names=config.gradient_checkpointing_targets,
-        )
-        self.self_attn = attn_block(
+        self.self_attn = DeepseekV2Attention(
             config=config,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -957,9 +949,15 @@ class DeepseekV2Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+        remat_layer_block = auto_remat(
+            DeepseekV2DecoderLayer,
+            policy=config.gradient_checkpointing,
+            save_names=config.gradient_checkpointing_targets,
+            exclude_names=config.gradient_checkpointing_targets,
+        )
         self.layers = nn.List(
             [
-                DeepseekV2DecoderLayer(
+                remat_layer_block(
                     config=config,
                     dtype=dtype,
                     param_dtype=param_dtype,
