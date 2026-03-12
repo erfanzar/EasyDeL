@@ -171,6 +171,47 @@ def test_normalize_prompts_list_of_strings():
     assert normalized == prompts
 
 
+def test_prepare_generation_input_accepts_chat_prompt_field():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(max_length=8, generation_dataset_prompt_field="generation_prompt")
+
+    class _Processor:
+        def __init__(self):
+            self.padding_side = "right"
+            self.calls: list[tuple[object, dict[str, object]]] = []
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.calls.append((messages, kwargs))
+            if kwargs.get("tokenize", False):
+                return {
+                    "input_ids": np.asarray([[101, 102, 103]], dtype=np.int32),
+                    "attention_mask": np.asarray([[1, 1, 1]], dtype=np.int32),
+                }
+            return "<chat prompt>"
+
+    processor = _Processor()
+    trainer.processing_class = processor
+    trainer._batch_decode_tokens = lambda token_ids: ["decoded"]
+
+    prompt = {
+        "generation_prompt": [
+            {"role": "system", "content": "be precise"},
+            {"role": "user", "content": "solve x"},
+        ]
+    }
+
+    prepared = BaseTrainer._prepare_generation_input(trainer, prompt)
+
+    assert prepared is not None
+    np.testing.assert_array_equal(np.asarray(prepared["input_ids"]), np.asarray([[101, 102, 103]], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(prepared["attention_mask"]), np.asarray([[1, 1, 1]], dtype=np.int32))
+    assert prepared["prompt_text"] == "<chat prompt>"
+    assert len(processor.calls) == 2
+    assert processor.calls[0][0] == prompt["generation_prompt"]
+    assert processor.calls[0][1]["tokenize"] is True
+    assert processor.calls[1][1]["tokenize"] is False
+
+
 def test_maybe_generate_batches_prompts_and_maps_multiple_return_sequences():
     trainer = object.__new__(_PreviewTrainer)
     trainer.arguments = SimpleNamespace(

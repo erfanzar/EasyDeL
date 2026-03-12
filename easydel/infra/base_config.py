@@ -54,6 +54,7 @@ from typing import Any, NotRequired
 
 import jax
 import jax.extend
+import numpy as np
 import transformers
 from eformer import common_types
 from eformer.common_types import DP, EP, FSDP, MODE_TRAIN, NOT_GIVEN, SP, TP
@@ -1846,6 +1847,38 @@ class EasyDeLBaseConfig(PretrainedConfig):
         self.dict_dtype_to_str(serializable_config_dict)
 
         return serializable_config_dict
+
+    @staticmethod
+    def _is_dtype_like(value: tp.Any) -> bool:
+        """Return True for JAX/NumPy dtype objects and scalar type classes."""
+        if isinstance(value, np.dtype):
+            return True
+        if isinstance(value, type):
+            module = getattr(value, "__module__", "")
+            return module.startswith("numpy") or module.startswith("ml_dtypes") or module.startswith("jax.")
+        return False
+
+    @classmethod
+    def _normalize_json_value(cls, value: tp.Any) -> tp.Any:
+        """Recursively normalize dtype-like values into JSON-safe primitives."""
+        if isinstance(value, dict):
+            return {k: cls._normalize_json_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [cls._normalize_json_value(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(cls._normalize_json_value(v) for v in value)
+        if isinstance(value, (set, frozenset)):
+            return [cls._normalize_json_value(v) for v in value]
+        if isinstance(value, np.generic):
+            return value.item()
+        if cls._is_dtype_like(value):
+            return jnp.dtype(value).name
+        return value
+
+    def dict_dtype_to_str(self, d: dict[str, Any]) -> None:
+        """Normalize dtype-like values anywhere in the config tree."""
+        for key, value in list(d.items()):
+            d[key] = self._normalize_json_value(value)
 
     def to_dict(self) -> dict[str, tp.Any]:
         """Serialize config to a dictionary while temporarily hiding forbidden types.

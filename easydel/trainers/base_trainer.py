@@ -1997,6 +1997,26 @@ class BaseTrainer(BaseTrainerProtocol):
                         return self._prepare_generation_input(prompt[key])
                 log_debug_maybe("Dataset sample missing `input_ids`/`prompt` keys for preview generation; skipping")
                 return None
+        elif isinstance(prompt, list):
+            if processor is None or not hasattr(processor, "apply_chat_template"):
+                logger.warning("No tokenizer/processor available; cannot tokenize chat prompt.")
+                return None
+            if prompt and not isinstance(prompt[0], dict):
+                log_debug_maybe(f"Unsupported prompt list format for preview generation: {type(prompt[0])}")
+                return None
+
+            try:
+                processor.padding_side = "left"
+                encoded = processor.apply_chat_template(prompt, **encode_kwargs)
+                try:
+                    prompt_text = processor.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+                except Exception:  # pragma: no cover - best effort prompt display
+                    prompt_text = str(prompt)
+            except Exception as exc:  # pragma: no cover - tokenizer issues
+                log_debug_maybe(f"Failed to tokenize generation chat prompt: {exc}")
+                return None
+            input_ids = encoded["input_ids"]
+            attention = encoded.get("attention_mask")
         elif isinstance(prompt, str):
             if processor is None:
                 logger.warning("No tokenizer/processor available; cannot tokenize prompt text.")
