@@ -905,6 +905,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "mla_attn_softmax_dtype",
             mla_attn_softmax_dtype if mla_attn_softmax_dtype is not None else self.attn_softmax_dtype,
         )
+        self._coerce_runtime_dtype_fields()
         self.fcm_max_ratio = getattr(self, "fcm_max_ratio", fcm_max_ratio)
         self.fcm_min_ratio = getattr(self, "fcm_min_ratio", fcm_min_ratio)
         self.hardware_abstraction = getattr(self, "hardware_abstraction", hardware_abstraction)
@@ -1454,6 +1455,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         for key in base_reads:
             if hasattr(config, key):
                 setattr(self, key, getattr(config, key))
+        self._coerce_runtime_dtype_fields()
 
     def add_basic_configurations(
         self,
@@ -1617,6 +1619,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         set_attrs_smartly(self, "attn_softmax_dtype", jnp.float32, attn_softmax_dtype)
         set_attrs_smartly(self, "mla_attn_dtype", self.attn_dtype, mla_attn_dtype)
         set_attrs_smartly(self, "mla_attn_softmax_dtype", self.attn_softmax_dtype, mla_attn_softmax_dtype)
+        self._coerce_runtime_dtype_fields()
         set_attrs_smartly(self, "hardware_abstraction", DEFAULT_HARDWARE_ABSTRACTION, hardware_abstraction)
         set_attrs_smartly(self, "pallas_m_block_size", DEFAULT_PALLAS_M_BLOCK_SIZE, pallas_m_block_size)
         set_attrs_smartly(self, "pallas_k_block_size", DEFAULT_PALLAS_K_BLOCK_SIZE, pallas_k_block_size)
@@ -1853,10 +1856,83 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """Return True for JAX/NumPy dtype objects and scalar type classes."""
         if isinstance(value, np.dtype):
             return True
+        value_module = getattr(value.__class__, "__module__", "")
+        if value_module.startswith("torch") and value.__class__.__name__ == "dtype":
+            return True
         if isinstance(value, type):
             module = getattr(value, "__module__", "")
-            return module.startswith("numpy") or module.startswith("ml_dtypes") or module.startswith("jax.")
+            return (
+                module.startswith("numpy")
+                or module.startswith("ml_dtypes")
+                or module.startswith("jax.")
+                or module.startswith("torch")
+            )
         return False
+
+    @staticmethod
+    def _dtype_name(value: tp.Any) -> str:
+        """Convert framework-specific dtype objects into a stable string name."""
+        try:
+            return np.dtype(value).name
+        except TypeError:
+            pass
+        text = str(value).strip()
+        if text.startswith("torch."):
+            text = text.removeprefix("torch.")
+        return text
+
+    @classmethod
+    def _coerce_dtype_spec(cls, value: tp.Any) -> tp.Any:
+        """Convert persisted dtype strings back into runtime dtype objects."""
+        if value is None:
+            return None
+        if cls._is_dtype_like(value):
+            return jnp.dtype(cls._dtype_name(value))
+        if isinstance(value, str):
+            aliases = {
+                "bf16": "bfloat16",
+                "fp16": "float16",
+                "f16": "float16",
+                "fp32": "float32",
+                "f32": "float32",
+                "fp64": "float64",
+                "f64": "float64",
+                "nvfp8": "float8_e4m3",
+                "mxfp8": "float8_e5m2",
+                "fp8": "float8_e5m2",
+                "float8": "float8_e5m2",
+                "fp8_e4m3": "float8_e4m3",
+                "fp8_e4m3fn": "float8_e4m3fn",
+                "fp8_e4m3fnuz": "float8_e4m3fnuz",
+                "fp8_e4m3b11fnuz": "float8_e4m3b11fnuz",
+                "fp8_e3m4": "float8_e3m4",
+                "fp8_e8m0fnu": "float8_e8m0fnu",
+                "mxfp4": "float4_e2m1fn",
+                "fp4": "float4_e2m1fn",
+                "float4": "float4_e2m1fn",
+            }
+            normalized = value.strip().lower()
+            if normalized.startswith("torch."):
+                normalized = normalized.removeprefix("torch.")
+            normalized = aliases.get(normalized, normalized)
+            try:
+                return jnp.dtype(normalized)
+            except TypeError:
+                return value
+        return value
+
+    def _coerce_runtime_dtype_fields(self) -> None:
+        """Rehydrate known dtype config fields after loading from serialized JSON."""
+        for field_name in (
+            "dtype",
+            "attn_dtype",
+            "kvdtype",
+            "attn_softmax_dtype",
+            "mla_attn_dtype",
+            "mla_attn_softmax_dtype",
+        ):
+            if hasattr(self, field_name):
+                setattr(self, field_name, self._coerce_dtype_spec(getattr(self, field_name)))
 
     @classmethod
     def _normalize_json_value(cls, value: tp.Any) -> tp.Any:
@@ -1869,10 +1945,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
             return tuple(cls._normalize_json_value(v) for v in value)
         if isinstance(value, (set, frozenset)):
             return [cls._normalize_json_value(v) for v in value]
+        if hasattr(value, "to_dict") and callable(value.to_dict):
+            return cls._normalize_json_value(value.to_dict())
         if isinstance(value, np.generic):
             return value.item()
         if cls._is_dtype_like(value):
-            return jnp.dtype(value).name
+            return cls._dtype_name(value)
         return value
 
     def dict_dtype_to_str(self, d: dict[str, Any]) -> None:
@@ -2178,6 +2256,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
                 is serialized to JSON file.
         """
         ePath(json_file_path).write_text(self.to_json_string(use_diff=use_diff))
+
+    def to_json_string(self, use_diff: bool = True) -> str:
+        """Serialize the config to JSON with a dtype-aware fallback."""
+        config_dict = self.to_diff_dict() if use_diff else self.to_dict()
+        config_dict = self._encode_special_floats(config_dict)
+        config_dict = self._normalize_json_value(config_dict)
+        return json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
 
     @classmethod
     def _dict_from_json_file(cls, json_file: str | os.PathLike | ePathLike):
