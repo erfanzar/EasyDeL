@@ -322,6 +322,8 @@ class RequestOutput:
         Returns:
             Generated text string, or empty string if no outputs.
         """
+        if self.accumulated_text:
+            return self.accumulated_text
         return self.outputs[0].text if self.outputs else ""
 
     def get_summary(self) -> dict[str, Any]:
@@ -390,6 +392,7 @@ class eSurge(
         min_token_pad: int | None = None,
         max_num_seqs: int = 256,
         max_num_seq_buckets: list[int] | None = None,
+        async_scheduling: bool = False,
         max_num_batched_tokens: int | None | _Empty = NOT_GIVEN,
         hbm_utilization: float = 0.85,
         page_size: int = 128,
@@ -421,6 +424,7 @@ class eSurge(
         sampling_params_callback: SamplingCallable = None,
         extra_eos_token_ids: list[int] | None = None,
         extra_stops: str | list[str] | None = None,
+        ignore_stop_strings_in_reasoning: bool = True,
         silent_mode: bool = False,
         processor: Any | None = None,
         resolution_buckets: list[tuple[int, int]] | None = None,
@@ -457,6 +461,8 @@ class eSurge(
                 compilation (e.g., [1, 2, 4, 8, 16, 32]). When provided, the runner
                 compiles these bucket sizes and selects the smallest that can fit
                 the current active batch.
+            async_scheduling: Enable async token sampling overlap in the scheduler
+                and let the runner compile the corresponding safe batch shapes.
             max_num_batched_tokens: Maximum tokens per batch (auto-computed if None).
             hbm_utilization: Target HBM memory utilization (0.0-1.0).
             page_size: Page size for paged attention KV cache. Recommended >=256 for GPUs.
@@ -518,6 +524,10 @@ class eSurge(
             extra_stops: Additional stop strings applied to every request. These are
                 merged into per-request ``SamplingParams.stop`` at runtime and
                 de-duplicated while preserving existing stop order.
+            ignore_stop_strings_in_reasoning: When True, stop-string matching is
+                applied only to parsed visible content for requests that use a
+                reasoning parser. Stop strings that appear inside the reasoning
+                section will not terminate generation.
             silent_mode: If True, suppress informational eSurge engine logs.
             processor: Unified text/multimodal processor. Can be a tokenizer or an
                 HF processor (with an embedded tokenizer). If None, falls back to
@@ -700,6 +710,7 @@ class eSurge(
         self._kv_cache_valid = True
         self._paused = False
         self._sampling_params_callback = sampling_params_callback
+        self.ignore_stop_strings_in_reasoning = bool(ignore_stop_strings_in_reasoning)
 
         # Detokenizer cleanup tracking
         self._failed_detokenizer_resets: set[str] = set()
@@ -902,6 +913,7 @@ class eSurge(
             min_input_pad=min_input_pad,
             max_num_seqs=max_num_seqs,
             max_num_seq_buckets=max_num_seq_buckets,
+            async_scheduling=async_scheduling,
             min_token_pad=min_token_pad,
             use_aot_forward=use_aot_forward,
             bind_graphstate_for_aot=bind_graphstate_for_aot,
@@ -937,6 +949,7 @@ class eSurge(
             self.runner,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_prefix_caching=enable_prefix_caching,
+            async_scheduling=async_scheduling,
         )
         self._scheduler_max_num_batched_tokens = max_num_batched_tokens
         self._scheduler_enable_prefix_caching = enable_prefix_caching

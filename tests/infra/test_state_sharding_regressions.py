@@ -97,9 +97,9 @@ def test_partition_rules_match_optimizer_value_paths(tiny_sharded_llama):
         spec for spec in jax.tree_util.tree_leaves(partition_specs) if isinstance(spec, jax.sharding.PartitionSpec)
     ]
     assert spec_leaves, "Expected optimizer partition-spec leaves."
-    assert any(
-        _has_sharded_axis(spec) for spec in spec_leaves
-    ), "Optimizer partition specs unexpectedly collapsed to replicated-only specs."
+    assert any(_has_sharded_axis(spec) for spec in spec_leaves), (
+        "Optimizer partition specs unexpectedly collapsed to replicated-only specs."
+    )
 
 
 def test_partition_rules_are_open_ended_for_state_suffixes(tiny_sharded_llama):

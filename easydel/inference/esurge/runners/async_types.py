@@ -68,11 +68,12 @@ class AsyncPreResults:
             Initially device-resident; async copy to host is initiated when
             this object is created. The actual host transfer completes when
             the array is accessed via device_get().
-        request_seq_lens (list[tuple[int, CachedRequestState, int]]): List of
-            tuples containing (req_idx, req_state, seq_len) for each request
-            that generated tokens. req_idx is the index in the batch,
-            req_state is the CachedRequestState object, and seq_len is the
-            sequence length after generation.
+        request_seq_lens (list[tuple[int, int, CachedRequestState, int]]): List
+            of tuples containing (out_idx, seq_row_idx, req_state, seq_len) for
+            each request that generated tokens. out_idx is the request's index
+            in the sampled batch outputs, seq_row_idx is its current
+            sequence-buffer row, req_state is the CachedRequestState object,
+            and seq_len is the sequence length after generation.
         discard_sampled_tokens_req_indices (list[int]): Indices of requests
             whose sampled tokens should be discarded. This includes requests
             that were in partial prefill (still processing prompt) and thus
@@ -88,9 +89,9 @@ class AsyncPreResults:
         ...     req_ids=["req1", "req2", "req3"],
         ...     next_tokens=jax_array_on_device,  # Shape [3]
         ...     request_seq_lens=[
-        ...         (0, req_state1, 10),  # req1 at length 10
-        ...         (1, req_state2, 15),  # req2 at length 15
-        ...         (2, req_state3, 8),   # req3 at length 8
+        ...         (0, 0, req_state1, 10),  # req1 at length 10
+        ...         (1, 4, req_state2, 15),  # req2 currently in row 4
+        ...         (2, 7, req_state3, 8),   # req3 currently in row 7
         ...     ],
         ...     discard_sampled_tokens_req_indices=[2],  # Discard req3's token
         ...     placeholder_req_id_to_index={"req1": 0, "req2": 1},
@@ -102,6 +103,6 @@ class AsyncPreResults:
 
     req_ids: list[str]
     next_tokens: Array
-    request_seq_lens: list[tuple[int, CachedRequestState, int]]
+    request_seq_lens: list[tuple[int, int, CachedRequestState, int]]
     discard_sampled_tokens_req_indices: list[int]
     placeholder_req_id_to_index: dict[str, int]

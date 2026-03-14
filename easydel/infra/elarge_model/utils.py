@@ -43,6 +43,8 @@ Typical usage example:
 
 from __future__ import annotations
 
+import contextlib
+import importlib
 import json
 import os
 import tempfile
@@ -61,11 +63,82 @@ from .types import DTypeLike, ELMConfig, PrecisionLike, TaskType  # pyright: ign
 logger = get_logger(__name__)
 
 
+class _CodeEvalMetricProxy:
+    """Proxy a Hugging Face `code_eval` metric with overridden execution kwargs."""
+
+    def __init__(self, metric: Any, *, num_workers: int | None = None, timeout: float | None = None):
+        self._metric = metric
+        self._num_workers = None if num_workers is None else int(num_workers)
+        self._timeout = None if timeout is None else float(timeout)
+
+    def compute(self, *args: Any, **kwargs: Any) -> Any:
+        """Forward metric execution while injecting worker/timeout overrides."""
+        if self._num_workers is not None:
+            kwargs["num_workers"] = self._num_workers
+        if self._timeout is not None:
+            kwargs["timeout"] = self._timeout
+        return self._metric.compute(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._metric, name)
+
+
+@contextlib.contextmanager
+def override_lm_eval_code_exec(
+    *,
+    num_workers: int | None = None,
+    timeout: float | None = None,
+):
+    """Temporarily override lm-eval code-task execution settings.
+
+    This patches the local `lm_eval` Humaneval/MBPP helpers to use custom
+    `code_eval.compute(num_workers=..., timeout=...)` values without editing
+    the installed package. The override is process-local and reverted when the
+    context exits.
+    """
+    if num_workers is None and timeout is None:
+        yield
+        return
+
+    patched: list[tuple[Any, str, Any]] = []
+    for module_name, attr_name in (
+        ("lm_eval.tasks.humaneval.utils", "compute_"),
+        ("lm_eval.tasks.mbpp.utils", "pass_at_k"),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        original = getattr(module, attr_name, None)
+        if original is None:
+            continue
+        setattr(module, attr_name, _CodeEvalMetricProxy(original, num_workers=num_workers, timeout=timeout))
+        patched.append((module, attr_name, original))
+
+    try:
+        yield
+    finally:
+        for module, attr_name, original in reversed(patched):
+            setattr(module, attr_name, original)
+
+
+def _stringify_callable(obj: Any) -> str:
+    """Return a stable, human-readable identifier for a callable-like object."""
+    module = getattr(obj, "__module__", None)
+    qualname = getattr(obj, "__qualname__", None) or getattr(obj, "__name__", None)
+    if module and qualname:
+        return f"{module}.{qualname}"
+    if qualname:
+        return qualname
+    return repr(obj)
+
+
 def make_serializable(obj: Any) -> Any:
     """Convert arbitrary config-like objects into JSON/YAML-safe primitives.
 
     This recursively normalizes common configuration value types used in ELM:
-    mappings, sequences, dataclasses, enums, PathLike objects, and objects with
+    mappings, sequences, dataclasses, enums, PathLike objects, callables,
+    array-like objects exposing ``tolist``, raw bytes, and objects with
     ``to_dict``/``model_dump`` methods.
     """
     if isinstance(obj, Enum):
@@ -84,6 +157,12 @@ def make_serializable(obj: Any) -> Any:
         return make_serializable(obj.to_dict())
     if isinstance(obj, os.PathLike) or hasattr(obj, "__fspath__"):
         return os.fspath(obj)
+    if callable(obj):
+        return _stringify_callable(obj)
+    if hasattr(obj, "tolist") and callable(obj.tolist):
+        return make_serializable(obj.tolist())
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
     raise TypeError(f"Object of type {type(obj).__name__} is not serializable")
 
 

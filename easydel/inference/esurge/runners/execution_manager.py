@@ -889,6 +889,26 @@ class ExecutionManager:
         # device enqueues sampling behind the forward pass.
         return sampler_fn(batch_metadata, req_num_tokens_full, active_mask_full, logits, rng_key)
 
+    @staticmethod
+    def _get_feasible_compile_pairs(
+        num_tokens_paddings: list[int],
+        reqs_padds: list[int],
+    ) -> list[tuple[int, int]]:
+        """Return only schedulable token/request bucket combinations.
+
+        Every scheduled request consumes at least one token in a runner step,
+        so a request bucket larger than the token bucket cannot be reached at
+        runtime. Pruning those pairs shortens startup and avoids compiling dead
+        executables such as `(32 tokens, 256 requests)`.
+        """
+        feasible_pairs: list[tuple[int, int]] = []
+        for num_tokens in num_tokens_paddings:
+            for reqs_padd in reqs_padds:
+                if int(reqs_padd) > int(num_tokens):
+                    continue
+                feasible_pairs.append((int(num_tokens), int(reqs_padd)))
+        return feasible_pairs
+
     def compile(
         self,
         num_tokens_paddings: list[int],
@@ -897,6 +917,7 @@ class ExecutionManager:
         max_num_reqs: int,
         metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig,
         num_reqs_paddings: list[int] | None = None,
+        prune_infeasible_pairs: bool = True,
     ) -> None:
         """Compile model execution functions for various input configurations.
 
@@ -910,6 +931,10 @@ class ExecutionManager:
             max_pages_per_req: Maximum number of KV cache pages per request.
             max_num_reqs: Maximum number of concurrent requests.
             metadata: Pages cache metadata containing configuration details.
+            prune_infeasible_pairs: Whether to skip compile pairs where the
+                padded request bucket exceeds the token bucket. This is only
+                safe when runtime compacts interior zero-token rows before
+                bucket selection.
 
         Note:
             Compilation progress is logged using a progress bar. The total number
@@ -935,26 +960,31 @@ class ExecutionManager:
             reqs_padds = sorted({ufn(n, max_num_reqs) for n in range(1, max_num_reqs + 1)})
         if not reqs_padds:
             reqs_padds = [max_num_reqs]
-        total_compilations = len(num_tokens_paddings) * len(reqs_padds)
+        if prune_infeasible_pairs:
+            compile_pairs = self._get_feasible_compile_pairs(num_tokens_paddings, reqs_padds)
+        else:
+            compile_pairs = [
+                (int(num_tokens), int(reqs_padd)) for num_tokens in num_tokens_paddings for reqs_padd in reqs_padds
+            ]
+        total_compilations = len(compile_pairs)
         compilation_count = 0
         progress = ProgressLogger("eSurge", logger)
-        for num_tokens in num_tokens_paddings:
-            for reqs_padd in reqs_padds:
-                progress.update(
-                    compilation_count,
-                    total_compilations,
-                    f"Compiling [{compilation_count + 1}/{total_compilations}]: {num_tokens:5d} tokens, "
-                    f"{reqs_padd:2d} padded requests",
-                )
-                self._step_compile(
-                    num_tokens=num_tokens,
-                    num_reqs_max_model_len=num_reqs_max_model_len,
-                    max_pages_per_req=max_pages_per_req,
-                    max_num_reqs=max_num_reqs,
-                    padded_num_reqs=reqs_padd,
-                    metadata=metadata,
-                )
-                compilation_count += 1
+        for num_tokens, reqs_padd in compile_pairs:
+            progress.update(
+                compilation_count,
+                total_compilations,
+                f"Compiling [{compilation_count + 1}/{total_compilations}]: {num_tokens:5d} tokens, "
+                f"{reqs_padd:2d} padded requests",
+            )
+            self._step_compile(
+                num_tokens=num_tokens,
+                num_reqs_max_model_len=num_reqs_max_model_len,
+                max_pages_per_req=max_pages_per_req,
+                max_num_reqs=max_num_reqs,
+                padded_num_reqs=reqs_padd,
+                metadata=metadata,
+            )
+            compilation_count += 1
         progress.complete(f"All {total_compilations} compilations completed")
 
     def _step_compile(

@@ -59,7 +59,13 @@ from .builders import (
 from .normalizer import materialize_base_config, normalize, resolve_task, validate
 from .trainer_types import get_trainer_class, get_training_arguments_class, normalize_trainer_config
 from .types import ELMConfig, EvalKwargs
-from .utils import load_elm_config, make_serializable, save_elm_config, write_text_atomic
+from .utils import (
+    load_elm_config,
+    make_serializable,
+    override_lm_eval_code_exec,
+    save_elm_config,
+    write_text_atomic,
+)
 
 if typing.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
@@ -74,6 +80,20 @@ if typing.TYPE_CHECKING:
 logger = get_logger("eLargeModel")
 _ESURGE_UNSET = object()
 _QUANT_UNSET = object()
+
+
+def _task_uses_code_eval(task: Any) -> bool:
+    """Return True when a task specification looks like Humaneval/MBPP style code eval."""
+    code_eval_hints = ("humaneval", "mbpp")
+
+    def _matches(value: Any) -> bool:
+        return isinstance(value, str) and any(hint in value.lower() for hint in code_eval_hints)
+
+    if _matches(task):
+        return True
+    if isinstance(task, Mapping):
+        return any(_matches(task.get(key)) for key in ("task", "alias", "group", "dataset_path", "dataset_name"))
+    return any(_matches(getattr(task, attr, None)) for attr in ("task", "alias", "name"))
 
 
 class BuildTrainerKws(typing.TypedDict, total=False):
@@ -816,7 +836,10 @@ class eLargeModel:
 
     def set_eval(
         self,
-        max_new_tokens: int = 2048,
+        max_new_tokens: int = 8192,
+        hard_max_new_tokens: bool = False,
+        enable_thinking: bool = False,
+        ignore_benchmark_eos_flags: bool = False,
         temperature: float = 0.0,
         top_p: float = 0.95,
         batch_size: int | str | None = None,
@@ -830,7 +853,15 @@ class eLargeModel:
 
         Args:
             max_new_tokens: Maximum tokens to generate per evaluation sample
-                (default: 2048). Lower values speed up evaluation.
+                (default: 8192). Lower values speed up evaluation.
+            hard_max_new_tokens: Force `max_new_tokens` for every generation
+                task and ignore task-level lm-eval `max_gen_toks` /
+                `max_tokens` overrides. Default: False.
+            enable_thinking: Whether eval chat templating should explicitly
+                enable tokenizer-side thinking when supported. Default: False.
+            ignore_benchmark_eos_flags: Ignore lm-eval task stop strings and
+                EOS-text stop injection, relying on the model/engine EOS path
+                only. Default: False.
             temperature: Sampling temperature (default: 0.0 for greedy decoding).
                 0.0 = deterministic/greedy, higher = more random.
             top_p: Top-p (nucleus) sampling parameter (default: 0.95).
@@ -852,7 +883,7 @@ class eLargeModel:
         Example:
             >>> # Configure for deterministic evaluation
             >>> elm.set_eval(
-            ...     max_new_tokens=512,
+            ...     max_new_tokens=8192,
             ...     temperature=0.0,
             ...     batch_size=64
             ... )
@@ -866,6 +897,9 @@ class eLargeModel:
         """
         eval_cfg = self._config.setdefault("eval", {})
         eval_cfg["max_new_tokens"] = max_new_tokens
+        eval_cfg["hard_max_new_tokens"] = hard_max_new_tokens
+        eval_cfg["enable_thinking"] = enable_thinking
+        eval_cfg["ignore_benchmark_eos_flags"] = ignore_benchmark_eos_flags
         eval_cfg["temperature"] = temperature
         eval_cfg["top_p"] = top_p
         if batch_size is not None:
@@ -1839,16 +1873,24 @@ class eLargeModel:
         eval_config = self._config.get("eval", {}).copy()
         if eval_overrides:
             eval_config.update(eval_overrides)
-        # Use chat templating by default for eval unless explicitly overridden.
-        eval_config.setdefault("apply_chat_template", True)
+        # Match upstream lm-eval semantics: raw task prompts stay raw unless the
+        # caller explicitly opts into chat templating.
+        eval_config.setdefault("apply_chat_template", False)
         batch_size = eval_config.pop("batch_size", None)
-        max_new_tokens = eval_config.pop("max_new_tokens", 2048)
+        max_new_tokens = eval_config.pop("max_new_tokens", 8192)
+        hard_max_new_tokens = bool(eval_config.pop("hard_max_new_tokens", False))
+        enable_thinking = bool(eval_config.pop("enable_thinking", False))
+        ignore_benchmark_eos_flags = bool(eval_config.pop("ignore_benchmark_eos_flags", False))
         temperature = eval_config.pop("temperature", 0.0)
         top_p = eval_config.pop("top_p", 0.95)
         device = eval_config.pop("device", "cpu")
         num_fewshot = eval_config.pop("num_fewshot", num_fewshot)
         normalize_math_answers = bool(eval_config.pop("normalize_math_answers", True))
         math_answer_task_hints = eval_config.pop("math_answer_task_hints", None)
+        code_eval_num_workers = eval_config.pop("code_eval_num_workers", None)
+        code_eval_timeout = eval_config.pop("code_eval_timeout", None)
+        if code_eval_num_workers is None and any(_task_uses_code_eval(task) for task in tasks):
+            code_eval_num_workers = max(1, int(os.cpu_count() or 1))
         include_path = eval_config.pop("include_path", None)
         include_defaults = bool(eval_config.pop("include_defaults", True))
         task_manager = eval_config.pop("task_manager", None)
@@ -1864,6 +1906,9 @@ class eLargeModel:
             processor=self._tokenizer,
             max_length=self._config.get("esurge", {}).get("max_model_len", 8192),
             max_new_tokens=max_new_tokens,
+            hard_max_new_tokens=hard_max_new_tokens,
+            enable_thinking=enable_thinking,
+            ignore_benchmark_eos_flags=ignore_benchmark_eos_flags,
             batch_size=batch_size,
             temperature=temperature,
             top_p=top_p,
@@ -1887,19 +1932,35 @@ class eLargeModel:
             logger.info(
                 f"Batch size: {batch_size}, Few-shot: {num_fewshot if num_fewshot is not None else 'task-default'}"
             )
+            if code_eval_num_workers is not None or code_eval_timeout is not None:
+                logger.info(
+                    "Code-eval scorer overrides: num_workers=%s timeout=%s",
+                    code_eval_num_workers if code_eval_num_workers is not None else "default",
+                    code_eval_timeout if code_eval_timeout is not None else "default",
+                )
+                code_eval_override_ctx = override_lm_eval_code_exec(
+                    num_workers=code_eval_num_workers,
+                    timeout=code_eval_timeout,
+                )
+            else:
+                from contextlib import nullcontext
 
-            results = evaluator.simple_evaluate(
-                model=eval_adapter,
-                tasks=tasks,
-                num_fewshot=num_fewshot,
-                batch_size=batch_size,
-                device=device,
-                task_manager=task_manager,
-                **eval_config,
-            )
+                code_eval_override_ctx = nullcontext()
+
+            with code_eval_override_ctx:
+                results = evaluator.simple_evaluate(
+                    model=eval_adapter,
+                    tasks=tasks,
+                    num_fewshot=num_fewshot,
+                    batch_size=batch_size,
+                    device=device,
+                    task_manager=task_manager,
+                    **eval_config,
+                )
 
             if output_path:
-                ePath(output_path).write_text(json.dumps(results, indent=2))
+                serialized_results = make_serializable(results)
+                write_text_atomic(output_path, json.dumps(serialized_results, indent=2, ensure_ascii=False))
                 logger.info(f"eval results saved to: {output_path}")
 
             logger.info("evaluation summary:")

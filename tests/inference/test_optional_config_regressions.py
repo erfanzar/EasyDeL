@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -20,26 +22,117 @@ from flax import nnx as nn
 import easydel as ed
 from easydel.inference.esurge.config import CacheConfig, Config, SchedulerConfig
 from easydel.inference.esurge.core.interface import CacheGroupsConfig, CacheGroupSpec, FullAttentionSpec
+from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
+from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
 from easydel.inference.esurge.request import EngineRequest, EngineRequestStatus
 from easydel.inference.esurge.scheduler.scheduler import Scheduler
 from easydel.inference.evaluations.esurge_eval import eSurgeLMEvalAdapter
+from easydel.inference.reasoning.parsers.qwen3_reasoning_parser import Qwen3ReasoningParser
 from easydel.inference.sampling_params import SamplingParams
 from easydel.infra.utils import AttnMaskType
 
 
 class _DummyProcessor:
+    """Minimal processor stub for lm-eval adapter tests."""
+
     pad_token_id = None
     eos_token_id = 1
     padding_side = "right"
 
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        tokenize: bool = False,
+        add_generation_prompt: bool = True,
+    ) -> str:
+        """Return a deterministic chat template rendering."""
+        return "dummy-template"
+
+
+class _ThinkingProcessor(_DummyProcessor):
+    """Processor stub that records `enable_thinking` overrides."""
+
+    def __init__(self) -> None:
+        self.last_enable_thinking: bool | None = None
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        tokenize: bool = False,
+        add_generation_prompt: bool = True,
+        enable_thinking: bool = True,
+    ) -> str:
+        """Capture the thinking flag while returning a stable template."""
+        self.last_enable_thinking = enable_thinking
+        return "thinking-template"
+
 
 class _DummySurge:
+    """Minimal eSurge stub that satisfies adapter initialization."""
+
     max_num_seqs = 2
 
     class _Runner:
         model = None
 
     runner = _Runner()
+    _scheduler_running = True
+
+
+class _DummyTokenizer:
+    """Minimal tokenizer stub for reasoning parser tests."""
+
+    def get_vocab(self) -> dict[str, int]:
+        return {}
+
+
+class _ParsingHarness(EngineParsingMixin, EngineUtilsMixin):
+    """Small helper exposing parser/stop-policy logic for unit tests."""
+
+    ignore_stop_strings_in_reasoning = False
+    extra_stops = None
+    _generation_config_dict = None
+    _primary_eos_token_id = None
+    _sampling_params_callback = None
+
+
+class _FakeGenerateOutput:
+    """Small response stub matching the `eSurge.generate` output API."""
+
+    def __init__(self, request_id: str, text: str, accumulated_text: str | None = None):
+        self.request_id = request_id
+        self._text = text
+        self.accumulated_text = text if accumulated_text is None else accumulated_text
+
+    def get_text(self) -> str:
+        """Return the generated text payload."""
+        return self._text
+
+
+class _RecordingSurge(_DummySurge):
+    """eSurge test double that records generate calls."""
+
+    def __init__(self, text: str = "pass") -> None:
+        self.calls: list[dict[str, object]] = []
+        self.text = text
+
+    def generate(
+        self,
+        prompts: list[str],
+        sampling_params: SamplingParams,
+        request_id: list[str],
+        use_tqdm: bool = False,
+    ) -> list[_FakeGenerateOutput]:
+        """Record generation inputs and return fixed-text outputs."""
+        self.calls.append(
+            {
+                "prompts": list(prompts),
+                "sampling_params": sampling_params,
+                "request_id": list(request_id),
+                "use_tqdm": use_tqdm,
+            }
+        )
+        return [_FakeGenerateOutput(rid, self.text) for rid in request_id]
 
 
 def test_esurge_eval_rejects_non_iterable_math_hint_input(monkeypatch):
@@ -63,6 +156,272 @@ def test_esurge_eval_accepts_single_string_math_hint(monkeypatch):
     )
 
     assert adapter.math_answer_task_hints == ("gsm8k",)
+
+
+def test_esurge_eval_honors_request_generation_kwargs():
+    """Project lm-eval request kwargs into the effective sampling parameters."""
+    surge = _RecordingSurge()
+    adapter = eSurgeLMEvalAdapter(_DummySurge(), _DummyProcessor())
+    adapter.surge = surge
+
+    instances = [
+        SimpleNamespace(
+            arguments=[
+                "def foo(x):\n",
+                {
+                    "until": ["\ndef"],
+                    "max_gen_toks": 17,
+                    "do_sample": False,
+                    "top_p": 0.91,
+                    "top_k": 7,
+                    "min_p": 0.2,
+                    "include_stop_str_in_output": True,
+                },
+            ],
+            task_name="humaneval",
+        )
+    ]
+
+    outputs = adapter.generate_until(instances)
+
+    assert outputs == ["pass"]
+    assert len(surge.calls) == 1
+    sampling_params = surge.calls[0]["sampling_params"]
+    assert sampling_params.max_tokens == 17
+    assert sampling_params.temperature == 0.0
+    assert sampling_params.top_k == 0
+    assert sampling_params.min_p == 0.0
+    assert sampling_params.include_stop_str_in_output is True
+    assert "\ndef" in sampling_params.stop
+
+
+def test_esurge_eval_can_force_global_max_new_tokens():
+    """When enabled, the adapter should ignore task-local max token overrides."""
+    surge = _RecordingSurge()
+    adapter = eSurgeLMEvalAdapter(
+        _DummySurge(),
+        _DummyProcessor(),
+        max_new_tokens=9,
+        hard_max_new_tokens=True,
+    )
+    adapter.surge = surge
+
+    instances = [
+        SimpleNamespace(
+            arguments=[
+                "def foo(x):\n",
+                {
+                    "until": ["\ndef"],
+                    "max_gen_toks": 17,
+                    "max_tokens": 21,
+                },
+            ],
+            task_name="humaneval",
+        )
+    ]
+
+    outputs = adapter.generate_until(instances)
+
+    assert outputs == ["pass"]
+    assert len(surge.calls) == 1
+    sampling_params = surge.calls[0]["sampling_params"]
+    assert sampling_params.max_tokens == 9
+
+
+def test_esurge_eval_can_ignore_benchmark_eos_flags():
+    """Eval can drop task-provided stop strings and trust engine EOS only."""
+    surge = _RecordingSurge()
+    adapter = eSurgeLMEvalAdapter(
+        _DummySurge(),
+        _DummyProcessor(),
+        ignore_benchmark_eos_flags=True,
+    )
+    adapter.surge = surge
+
+    instances = [
+        SimpleNamespace(
+            arguments=[
+                "def foo(x):\n",
+                {
+                    "until": ["\ndef", "\nif"],
+                    "max_gen_toks": 17,
+                },
+            ],
+            task_name="humaneval",
+        )
+    ]
+
+    outputs = adapter.generate_until(instances)
+
+    assert outputs == ["pass"]
+    assert len(surge.calls) == 1
+    sampling_params = surge.calls[0]["sampling_params"]
+    assert sampling_params.stop == []
+
+
+def test_esurge_eval_prefers_accumulated_text_when_completion_text_is_stale():
+    """Treat RequestOutput.accumulated_text as authoritative when available."""
+    surge = _RecordingSurge()
+    adapter = eSurgeLMEvalAdapter(_DummySurge(), _DummyProcessor())
+    adapter.surge = surge
+
+    def _generate_with_stale_completion(
+        prompts: list[str],
+        sampling_params: SamplingParams,
+        request_id: list[str],
+        use_tqdm: bool = False,
+    ) -> list[_FakeGenerateOutput]:
+        del prompts, sampling_params, use_tqdm
+        return [_FakeGenerateOutput(rid, text="", accumulated_text="def answer():\n    return 42") for rid in request_id]
+
+    surge.generate = _generate_with_stale_completion
+
+    outputs = adapter.generate_until(
+        [
+            SimpleNamespace(arguments=["prompt", {"until": []}], task_name="task"),
+        ]
+    )
+
+    assert outputs == ["def answer():\n    return 42"]
+
+
+def test_esurge_eval_splits_batches_when_request_sampling_kwargs_differ():
+    """Separate prompts whose normalized sampling parameters do not match."""
+    surge = _RecordingSurge()
+    adapter = eSurgeLMEvalAdapter(_DummySurge(), _DummyProcessor())
+    adapter.surge = surge
+
+    instances = [
+        SimpleNamespace(arguments=["prompt-a", {"until": [], "temperature": 0.7, "top_k": 4}], task_name="task-a"),
+        SimpleNamespace(arguments=["prompt-b", {"until": [], "temperature": 0.7, "top_k": 8}], task_name="task-b"),
+    ]
+
+    outputs = adapter.generate_until(instances)
+
+    assert outputs == ["pass", "pass"]
+    assert len(surge.calls) == 2
+    assert {call["sampling_params"].top_k for call in surge.calls} == {4, 8}
+
+
+def test_esurge_eval_keeps_greedy_until_deterministic_even_with_request_sampling_overrides():
+    """Ignore per-request sampling overrides for greedy decoding paths."""
+    surge = _RecordingSurge()
+    adapter = eSurgeLMEvalAdapter(_DummySurge(), _DummyProcessor())
+    adapter.surge = surge
+
+    instances = [
+        SimpleNamespace(
+            arguments=["prompt", {"until": [], "temperature": 0.7, "top_p": 0.4, "top_k": 11}],
+            task_name="task",
+        )
+    ]
+
+    outputs = adapter.greedy_until(instances)
+
+    assert outputs == ["pass"]
+    assert len(surge.calls) == 1
+    sampling_params = surge.calls[0]["sampling_params"]
+    assert sampling_params.temperature == 0.0
+    assert sampling_params.top_p == 1.0
+    assert sampling_params.top_k == 0
+
+
+def test_esurge_eval_chat_template_disables_tokenizer_thinking():
+    """Tokenizer chat rendering should suppress model-side thinking when supported."""
+    processor = _ThinkingProcessor()
+    adapter = eSurgeLMEvalAdapter(_DummySurge(), processor)
+
+    rendered = adapter.apply_chat_template(
+        [{"role": "user", "content": "hello"}],
+        add_generation_prompt=True,
+    )
+
+    assert rendered == "thinking-template"
+    assert processor.last_enable_thinking is False
+
+
+def test_esurge_eval_chat_template_can_enable_tokenizer_thinking():
+    """Eval chat rendering should allow explicit thinking enablement."""
+    processor = _ThinkingProcessor()
+    adapter = eSurgeLMEvalAdapter(
+        _DummySurge(),
+        processor,
+        enable_thinking=True,
+    )
+
+    rendered = adapter.apply_chat_template(
+        [{"role": "user", "content": "hello"}],
+        add_generation_prompt=True,
+    )
+
+    assert rendered == "thinking-template"
+    assert processor.last_enable_thinking is True
+
+
+def test_engine_default_can_enable_reasoning_aware_stop_matching():
+    """Engine defaults should propagate parser-aware stop matching to requests."""
+    harness = _ParsingHarness()
+
+    prepared = harness._prepare_sampling_params_for_request(
+        SamplingParams(stop=["\nif"]),
+        request_id="req-stop-aware",
+        prompt="prompt",
+    )
+
+    assert prepared.ignore_stop_strings_in_reasoning is True
+
+
+def test_stop_strings_can_ignore_matches_inside_reasoning():
+    """Parser-aware stop matching should only inspect visible content."""
+    harness = _ParsingHarness()
+    raw_output = "<think>plan\nif guard</think>def answer():\n    return 1\nif __name__ == '__main__':\n    pass"
+    request_data = {
+        "sampling_params": SamplingParams(
+            stop=["\nif"],
+            ignore_stop_strings_in_reasoning=True,
+        ),
+        "reasoning_parser_instance": Qwen3ReasoningParser(_DummyTokenizer()),
+        "tool_parser_instance": None,
+        "parser_previous_text": "",
+        "parser_previous_token_ids": [],
+        "accumulated_reasoning": "",
+        "accumulated_content": "",
+        "decoder_visible_text": "",
+    }
+
+    parsed, visible_text, visible_delta, stop_hit, stop_reason = harness._parse_with_stop_string_policy(
+        request_data,
+        accumulated_text=raw_output,
+        delta_text=raw_output,
+        token_ids=[],
+        finished=True,
+    )
+
+    assert stop_hit is True
+    assert stop_reason == "\nif"
+    assert parsed["accumulated_reasoning"] == "plan\nif guard"
+    assert parsed["accumulated_content"] == "def answer():\n    return 1"
+    assert visible_text == "def answer():\n    return 1"
+    assert visible_delta == "def answer():\n    return 1"
+
+
+@pytest.mark.parametrize("method_name", ["generate_until", "greedy_until"])
+def test_esurge_eval_preserves_math_normalization_for_generation_methods(method_name: str):
+    """Keep math answer post-processing active for both generation entry points."""
+    surge = _RecordingSurge("The answer is 42.")
+    adapter = eSurgeLMEvalAdapter(_DummySurge(), _DummyProcessor())
+    adapter.surge = surge
+
+    instances = [
+        SimpleNamespace(
+            arguments=["Solve 40+2", {"until": []}],
+            task_name="gsm8k",
+        )
+    ]
+
+    outputs = getattr(adapter, method_name)(instances)
+
+    assert outputs == ["The answer is 42.\n#### 42"]
 
 
 def test_scheduler_falls_back_to_model_len_when_batch_token_limit_is_none():
@@ -162,6 +521,7 @@ def test_create_mesh_normalizes_multi_device_axis_dims_on_single_device(monkeypa
 
 
 def _build_tiny_qwen35(attn_mechanism: str):
+    """Construct a minimal text-only Qwen 3.5 model for attention tests."""
     config = ed.Qwen3_5TextConfig(
         vocab_size=128,
         hidden_size=64,
@@ -184,6 +544,7 @@ def _build_tiny_qwen35(attn_mechanism: str):
 
 
 def _build_tiny_qwen35_vlm(attn_mechanism: str):
+    """Construct a minimal multimodal Qwen 3.5 model for attention tests."""
     text_config = ed.Qwen3_5TextConfig(
         vocab_size=128,
         hidden_size=64,
@@ -229,6 +590,7 @@ def _build_tiny_qwen35_vlm(attn_mechanism: str):
 
 
 def test_esurge_compatible_model_forces_ragged_on_tpu(monkeypatch):
+    """TPU compatibility should switch text attention to the ragged backend."""
     model = _build_tiny_qwen35("unified_attention")
     import jax
 
@@ -238,6 +600,7 @@ def test_esurge_compatible_model_forces_ragged_on_tpu(monkeypatch):
 
 
 def test_esurge_compatible_model_forces_unified_on_gpu(monkeypatch):
+    """GPU compatibility should switch text attention to unified attention."""
     model = _build_tiny_qwen35("sdpa")
     import jax
 
@@ -247,6 +610,7 @@ def test_esurge_compatible_model_forces_unified_on_gpu(monkeypatch):
 
 
 def test_esurge_compatible_model_updates_vlm_text_attn_recursively():
+    """Compatibility conversion should also rewrite nested VLM text configs."""
     import jax
 
     backend = jax.default_backend()

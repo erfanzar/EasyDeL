@@ -3,7 +3,6 @@ from pathlib import Path
 
 from easydel.infra.etils import GRADIENT_CHECKPOINT_TARGETS
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULES_ROOT = REPO_ROOT / "easydel" / "modules"
 WRAPPER_MODELS_WITHOUT_LOCAL_CHECKPOINTS = {

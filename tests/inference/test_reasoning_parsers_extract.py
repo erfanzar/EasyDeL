@@ -19,6 +19,7 @@ from easydel.inference.reasoning.parsers import (
     Step3p5ReasoningParser,
     Step3ReasoningParser,
 )
+from easydel.inference.tools.parsers import MinimaxM2ToolParser, Step3ToolParser
 
 
 class _ParsingHarness(EngineParsingMixin):
@@ -163,7 +164,7 @@ def test_deepseek_v3_without_thinking_template(plain_tokenizer):
     parser = DeepSeekV3ReasoningParser(plain_tokenizer)
     output = "<think>reasoning here</think>answer here"
     reasoning, content = parser.extract_reasoning(output)
-    # Identity parser: no reasoning extraction
+    # Plain templates stay in pass-through mode unless prompt context activates reasoning.
     assert reasoning is None
     assert content == output
 
@@ -194,12 +195,12 @@ def test_qwen3_strict_only_end_tag(dummy_tokenizer):
 
 
 def test_qwen3_strict_only_start_tag(dummy_tokenizer):
-    """Qwen3 strict mode: missing end tag means all is content."""
+    """Qwen3 keeps explicit unfinished thinking hidden as reasoning."""
     parser = Qwen3ReasoningParser(dummy_tokenizer)
     output = "<think>thinking but no end"
     reasoning, content = parser.extract_reasoning(output)
-    assert reasoning is None
-    assert content == output
+    assert reasoning == "thinking but no end"
+    assert content is None
 
 
 def test_mistral_extract_reasoning(dummy_tokenizer):
@@ -785,7 +786,7 @@ def test_deepseek_v3_prompt_context_is_forwarded_to_delegate_streaming(thinking_
 def test_deepseek_v3_prompt_context_can_enable_delegate_from_plain_template(plain_tokenizer):
     parser = DeepSeekV3ReasoningParser(plain_tokenizer)
 
-    # Initially uses identity behavior.
+    # Plain templates stay in pass-through mode until prompt context activates reasoning.
     reasoning, content = parser.extract_reasoning("<think>reason</think>answer")
     assert reasoning is None
     assert content == "<think>reason</think>answer"
@@ -1107,6 +1108,77 @@ def test_esurge_output_parsers_step3_reasoning_only_delta_is_not_text(dummy_toke
     assert result["delta_reasoning"] == "thinking"
     assert result["delta_content"] == ""
     assert result["accumulated_content"] == ""
+
+
+def test_esurge_output_parsers_minimax_tool_calls_survive_finished_parse_without_end_tag():
+    tokenizer = _DummyTokenizer(
+        {
+            "<think>": 1,
+            "</think>": 2,
+            "<minimax:tool_call>": 3,
+            "</minimax:tool_call>": 4,
+        }
+    )
+    engine = _ParsingHarness()
+    rd = {
+        "reasoning_parser_instance": MiniMaxM2ReasoningParser(tokenizer),
+        "tool_parser_instance": MinimaxM2ToolParser(tokenizer),
+        "parser_previous_text": "",
+        "parser_previous_token_ids": [],
+        "accumulated_reasoning": "",
+        "accumulated_content": "",
+    }
+
+    result = engine._run_output_parsers(
+        rd=rd,
+        accumulated_text='<minimax:tool_call><invoke name="lookup"></invoke></minimax:tool_call>',
+        delta_text="",
+        token_ids=[],
+        finished=True,
+    )
+
+    assert result["tool_calls"] is not None
+    assert len(result["tool_calls"]) == 1
+    assert result["tool_calls"][0].function.name == "lookup"
+
+
+def test_esurge_output_parsers_step3_tool_calls_survive_finished_parse_without_end_tag():
+    tokenizer = _DummyTokenizer(
+        {
+            "<think>": 1,
+            "</think>": 2,
+            "<｜tool_calls_begin｜>": 3,
+            "<｜tool_calls_end｜>": 4,
+            "<｜tool_call_begin｜>": 5,
+            "<｜tool_call_end｜>": 6,
+            "<｜tool_sep｜>": 7,
+        }
+    )
+    engine = _ParsingHarness()
+    rd = {
+        "reasoning_parser_instance": Step3ReasoningParser(tokenizer),
+        "tool_parser_instance": Step3ToolParser(tokenizer),
+        "parser_previous_text": "",
+        "parser_previous_token_ids": [],
+        "accumulated_reasoning": "",
+        "accumulated_content": "",
+    }
+
+    result = engine._run_output_parsers(
+        rd=rd,
+        accumulated_text=(
+            "<｜tool_calls_begin｜><｜tool_call_begin｜>function<｜tool_sep｜>"
+            '<steptml:invoke name="lookup"></steptml:invoke>'
+            "<｜tool_call_end｜><｜tool_calls_end｜>"
+        ),
+        delta_text="",
+        token_ids=[],
+        finished=True,
+    )
+
+    assert result["tool_calls"] is not None
+    assert len(result["tool_calls"]) == 1
+    assert result["tool_calls"][0].function.name == "lookup"
 
 
 def test_granite_streaming_thought_then_response(dummy_tokenizer):

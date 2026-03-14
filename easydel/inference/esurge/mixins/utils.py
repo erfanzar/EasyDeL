@@ -702,6 +702,10 @@ class EngineUtilsMixin:
         callback = self._sampling_params_callback
 
         def _finalize(prepared: SamplingParams) -> SamplingParams:
+            if getattr(prepared, "ignore_stop_strings_in_reasoning", None) is None:
+                prepared.ignore_stop_strings_in_reasoning = bool(
+                    getattr(self, "ignore_stop_strings_in_reasoning", False)
+                )
             prepared = self._apply_extra_stops_to_sampling_params(prepared)
             prepared = self._apply_generation_config_to_sampling_params(prepared)
             return prepared

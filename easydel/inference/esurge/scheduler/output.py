@@ -332,3 +332,18 @@ class SchedulerOutput:
 
     async_scheduling: bool = False
     """Enable async token sampling for overlapped execution."""
+
+    num_running_reqs: int = 0
+    """Snapshot of total running requests after scheduling."""
+
+    num_waiting_reqs: int = 0
+    """Snapshot of total waiting requests after scheduling."""
+
+    free_pages: int | None = None
+    """Number of free KV-cache pages after scheduling."""
+
+    token_budget_initial: int | None = None
+    """Token budget available at the start of scheduling."""
+
+    token_budget_remaining: int | None = None
+    """Token budget remaining after scheduling."""

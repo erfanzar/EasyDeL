@@ -708,15 +708,10 @@ class SequenceBuffer:
             self.req_output_token_ids.clear()
             return
 
-        last_req_index = num_reqs + len(empty_req_indices) - 1
+        if not empty_req_indices:
+            return
 
-        for empty_index in reversed(empty_req_indices):
-            while last_req_index in empty_req_indices and last_req_index > empty_index:
-                last_req_index -= 1
-            if empty_index >= last_req_index:
-                continue
-            self._move_request(last_req_index, empty_index)
-            last_req_index -= 1
+        self.compact_holes_in_range(0, len(self._req_ids))
 
         del self._req_ids[self.num_reqs :]
         del self.req_output_token_ids[self.num_reqs :]

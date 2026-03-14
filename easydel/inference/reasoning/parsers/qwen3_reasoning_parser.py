@@ -40,8 +40,12 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
 
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
         """Extract reasoning with strict tag requirements (both tags needed unless prompt-gated)."""
-        # Qwen3 strictness: missing end tag is always content.
         if self.end_token not in model_output:
+            # If an explicit reasoning start tag is present, keep the whole
+            # unfinished segment hidden as reasoning rather than surfacing it
+            # as visible content.
+            if self.start_token in model_output or self._is_prompt_reasoning_active():
+                return super().extract_reasoning(model_output, request)
             return None, model_output
 
         # Missing start tag is only allowed when prompt context indicates

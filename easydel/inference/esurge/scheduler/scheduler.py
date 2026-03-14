@@ -258,6 +258,7 @@ class Scheduler(SchedulerInterface):
         runner: eSurgeRunner,
         max_num_batched_tokens: int | None = None,
         enable_prefix_caching: bool = True,
+        async_scheduling: bool = False,
     ) -> Scheduler:
         """Create a Scheduler instance from an eSurgeRunner.
 
@@ -274,6 +275,7 @@ class Scheduler(SchedulerInterface):
                 defaults to runner.max_model_len.
             enable_prefix_caching: Whether to enable prefix caching for
                 faster inference on repeated prefixes. Defaults to True.
+            async_scheduling: Whether to enable async scheduler overlap.
 
         Returns:
             Scheduler: A configured Scheduler instance ready for use.
@@ -310,6 +312,7 @@ class Scheduler(SchedulerInterface):
                     max_num_batched_tokens=max_num_batched_tokens,
                     max_model_len=runner.max_model_len,
                     max_num_seq_buckets=tuple(runner.max_num_seq_buckets),
+                    async_scheduling=async_scheduling,
                 ),
                 cache_config=CacheConfig(
                     num_pages=metadata.num_pages,
@@ -400,6 +403,7 @@ class Scheduler(SchedulerInterface):
             if self.max_num_scheduled_tokens is None:
                 raise ValueError("max_num_scheduled_tokens must not be None when token budget manager is disabled")
             token_budget = self.max_num_scheduled_tokens
+        token_budget_initial = int(token_budget)
 
         dp_size = max(1, int(getattr(self, "data_parallel_size", 1) or 1))
         num_pages = int(getattr(self.cache_config, "num_pages", 0) or 0)
@@ -782,6 +786,11 @@ class Scheduler(SchedulerInterface):
             preempted_req_ids={r.request_id for r in preempted_reqs},
             suggested_bucket=self._current_seq_bucket,  # Hint for runner's buffer selection
             async_scheduling=self.scheduler_config.async_scheduling,  # Pass async config to runner
+            num_running_reqs=len(self.running),
+            num_waiting_reqs=len(self.waiting),
+            free_pages=self.kv_cache_manager.page_pool.get_num_free_pages(),
+            token_budget_initial=token_budget_initial,
+            token_budget_remaining=int(token_budget),
         )
         self._update_after_schedule(scheduler_output)
         # Log scheduler metrics
