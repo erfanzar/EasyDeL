@@ -93,6 +93,59 @@ class EngineParsingMixin:
         visible_delta = self._compute_snapshot_delta_text(visible_text, previous_visible_text, delta_fallback)
         return visible_text, visible_delta, stop_triggered, stop_reason
 
+    @staticmethod
+    def _stop_strings_ignore_reasoning(rd: dict) -> bool:
+        """Return whether stop strings should only match parsed visible content."""
+        sampling_params = rd.get("sampling_params")
+        if sampling_params is None:
+            return False
+        if not bool(getattr(sampling_params, "ignore_stop_strings_in_reasoning", False)):
+            return False
+        return rd.get("reasoning_parser_instance") is not None
+
+    def _parse_with_stop_string_policy(
+        self,
+        rd: dict,
+        *,
+        accumulated_text: str,
+        delta_text: str,
+        token_ids: list[int],
+        finished: bool,
+    ) -> tuple[dict, str, str, bool, str | None]:
+        """Parse decoded text and apply stop-string policy in the correct domain."""
+        if self._stop_strings_ignore_reasoning(rd):
+            parsed = self._run_output_parsers(
+                rd=rd,
+                accumulated_text=accumulated_text,
+                delta_text=delta_text,
+                token_ids=token_ids,
+                finished=finished,
+            )
+            visible_text, visible_delta, stop_hit, stop_reason = self._apply_stop_string_policy(
+                rd,
+                accumulated_text=parsed["accumulated_content"],
+                fallback_delta=parsed["delta_content"] or delta_text,
+            )
+            rd["decoder_visible_text"] = visible_text
+            parsed["accumulated_content"] = visible_text
+            parsed["delta_content"] = visible_delta
+            return parsed, visible_text, visible_delta, stop_hit, stop_reason
+
+        visible_text, visible_delta, stop_hit, stop_reason = self._apply_stop_string_policy(
+            rd,
+            accumulated_text=accumulated_text,
+            fallback_delta=delta_text,
+        )
+        rd["decoder_visible_text"] = visible_text
+        parsed = self._run_output_parsers(
+            rd=rd,
+            accumulated_text=visible_text,
+            delta_text=visible_delta,
+            token_ids=token_ids,
+            finished=finished or stop_hit,
+        )
+        return parsed, visible_text, visible_delta, stop_hit, stop_reason
+
     def _run_output_parsers(
         self,
         rd: dict,
@@ -357,25 +410,19 @@ class EngineParsingMixin:
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index
                             rd["last_decode_time"] = now
 
-                            visible_text, visible_delta, stop_hit, stop_reason = self._apply_stop_string_policy(
-                                rd,
-                                accumulated_text=pipeline_result.accumulated_text,
-                                fallback_delta=pipeline_result.delta_text,
+                            parsed, visible_text, visible_delta, stop_hit, stop_reason = (
+                                self._parse_with_stop_string_policy(
+                                    rd,
+                                    accumulated_text=pipeline_result.accumulated_text,
+                                    delta_text=pipeline_result.delta_text,
+                                    token_ids=decodable_tokens,
+                                    finished=False,
+                                )
                             )
-                            rd["decoder_visible_text"] = visible_text
                             if stop_hit:
                                 force_finished = True
                                 if stop_reason:
                                     stop_string_finishes[request_id] = stop_reason
-
-                            # Run reasoning and tool parsers on decoded text
-                            parsed = self._run_output_parsers(
-                                rd=rd,
-                                accumulated_text=visible_text,
-                                delta_text=visible_delta,
-                                token_ids=decodable_tokens,
-                                finished=force_finished,
-                            )
 
                             # Update the specific sample's completion output
                             comp = ro.outputs[sample_index]
@@ -453,23 +500,17 @@ class EngineParsingMixin:
                                 prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
                             )
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index
-                            visible_text, visible_delta, stop_hit, stop_reason = self._apply_stop_string_policy(
-                                rd,
-                                accumulated_text=pipeline_result.accumulated_text,
-                                fallback_delta=pipeline_result.delta_text,
+                            parsed, visible_text, visible_delta, stop_hit, stop_reason = (
+                                self._parse_with_stop_string_policy(
+                                    rd,
+                                    accumulated_text=pipeline_result.accumulated_text,
+                                    delta_text=pipeline_result.delta_text,
+                                    token_ids=decodable_tokens,
+                                    finished=True,
+                                )
                             )
-                            rd["decoder_visible_text"] = visible_text
                             if stop_hit and stop_reason:
                                 stop_string_finishes[request_id] = stop_reason
-
-                            # Run reasoning and tool parsers (final decode)
-                            parsed = self._run_output_parsers(
-                                rd=rd,
-                                accumulated_text=visible_text,
-                                delta_text=visible_delta,
-                                token_ids=decodable_tokens,
-                                finished=True,
-                            )
 
                             # Update the specific sample's completion output
                             comp.text = parsed["accumulated_content"]

@@ -34,16 +34,12 @@ def test_dtype_to_string_known():
 def test_select_compatible_returns_original_when_sharding_is_valid():
     # 8 kv heads, headdim != 64 -> combined = align(8*2, packing).
     # With bf16 packing=1, groups=16.  16 % 4 == 0 -> ok.
-    result = _select_compatible_v3_kv_cache_dtype(
-        jnp.bfloat16, num_kv_heads=8, k_headdim=128, kv_head_shards=4
-    )
+    result = _select_compatible_v3_kv_cache_dtype(jnp.bfloat16, num_kv_heads=8, k_headdim=128, kv_head_shards=4)
     assert result == _canonicalize_dtype(jnp.bfloat16)
 
 
 def test_select_compatible_returns_original_when_no_tp():
-    result = _select_compatible_v3_kv_cache_dtype(
-        jnp.float8_e4m3fn, num_kv_heads=3, k_headdim=128, kv_head_shards=1
-    )
+    result = _select_compatible_v3_kv_cache_dtype(jnp.float8_e4m3fn, num_kv_heads=3, k_headdim=128, kv_head_shards=1)
     assert result == _canonicalize_dtype(jnp.float8_e4m3fn)
 
 
@@ -53,9 +49,7 @@ def test_select_compatible_upcasts_when_groups_not_divisible():
     # fp8 packing ~ 4 -> combined = align(8,4)=8, groups=8/4=2.
     # 2 % 4 != 0, so should upcast.
     # bf16 packing=1 -> combined = align(8,1)=8, groups=8/1=8.  8%4==0.
-    result = _select_compatible_v3_kv_cache_dtype(
-        jnp.float8_e4m3fn, num_kv_heads=4, k_headdim=128, kv_head_shards=4
-    )
+    result = _select_compatible_v3_kv_cache_dtype(jnp.float8_e4m3fn, num_kv_heads=4, k_headdim=128, kv_head_shards=4)
     assert result != _canonicalize_dtype(jnp.float8_e4m3fn)
 
 
@@ -63,6 +57,4 @@ def test_select_compatible_raises_when_nothing_works():
     # 1 kv head, headdim=128 -> combined heads always small.
     # With kv_head_shards very large, nothing divides.
     with pytest.raises(ValueError, match="incompatible"):
-        _select_compatible_v3_kv_cache_dtype(
-            jnp.float8_e4m3fn, num_kv_heads=1, k_headdim=128, kv_head_shards=1024
-        )
+        _select_compatible_v3_kv_cache_dtype(jnp.float8_e4m3fn, num_kv_heads=1, k_headdim=128, kv_head_shards=1024)

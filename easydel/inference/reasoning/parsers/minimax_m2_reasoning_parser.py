@@ -39,6 +39,9 @@ class MiniMaxM2ReasoningParser(BaseThinkingReasoningParser):
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
         """Extract reasoning by splitting at </think> (no start token required)."""
         if self.end_token not in model_output:
+            if self.start_token in model_output:
+                cleaned = model_output.replace(self.start_token, "").strip()
+                return cleaned or None, None
             return None, model_output
         # Everything before end token is reasoning (even without start token)
         parts = model_output.split(self.end_token, 1)

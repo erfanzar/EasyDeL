@@ -185,6 +185,7 @@ class eSurgeRunner:
         min_token_pad: int | None = None,
         max_num_seqs: int = 16,
         max_num_seq_buckets: list[int] | None = None,
+        async_scheduling: bool = False,
         use_aot_forward: bool = True,
         bind_graphstate_for_aot: bool = False,
         verbose: bool = False,
@@ -202,6 +203,7 @@ class eSurgeRunner:
             min_token_pad: Optional minimum token bucket size.
             max_num_seqs: Maximum concurrent sequences.
             max_num_seq_buckets: Optional explicit request-count buckets.
+            async_scheduling: Whether scheduler async token sampling is enabled.
             use_aot_forward: Whether to use AOT compilation.
             bind_graphstate_for_aot: Whether model-step AOT executables
                 capture graphstate/graphother as compile-time constants.
@@ -255,6 +257,7 @@ class eSurgeRunner:
         self.max_num_seq_buckets = self._init_seq_buckets(max_num_seq_buckets, max_num_seqs, min_input_pad)
         self.max_num_seqs = max_num_seqs
         self.max_num_reqs = self.max_num_seq_buckets[-1]
+        self.async_scheduling = bool(async_scheduling)
 
         self.max_model_len = max_model_len
         self.min_input_pad = max(min_input_pad, self.max_num_seq_buckets[0])
@@ -368,6 +371,12 @@ class eSurgeRunner:
                 seq_cap = int((n_pages * p_size) / 1000)
                 cache_parts.append(f"pages={n_pages:,} ({p_size} tok/page)")
                 cache_parts.append(f"sequence_capacity={seq_cap:,}K")
+            if hasattr(self.metadata, "get_max_num_seqs"):
+                try:
+                    no_window_cap = min(int(self.metadata.get_max_num_seqs()), int(self.max_num_reqs))
+                    cache_parts.append(f"no_window_concurrency={no_window_cap:,} reqs")
+                except Exception:
+                    logger.debug("Could not compute no-window concurrency summary", exc_info=True)
 
             lines = [
                 f"Model : {model_type}",
@@ -484,21 +493,51 @@ class eSurgeRunner:
             num_reqs: Number of active requests
 
         Returns:
-            Smallest sufficient bucket size from self.max_num_seq_buckets
+            Smallest sufficient bucket size from the active runtime buckets.
         """
+        buckets = getattr(self, "active_num_seq_buckets", self.max_num_seq_buckets)
         if num_reqs <= 0:
-            return self.max_num_seq_buckets[0]
-        for bucket in self.max_num_seq_buckets:
+            return buckets[0]
+        for bucket in buckets:
             if num_reqs <= bucket:
                 return bucket
-        return self.max_num_seq_buckets[-1]
+        return buckets[-1]
+
+    @staticmethod
+    def _clamp_request_buckets_to_runtime_cap(buckets: list[int], runtime_cap: int) -> list[int]:
+        """Clamp request-count buckets to the runtime execution cap.
+
+        The runner may admit more requests globally than it can execute in a
+        single scheduler window. Compilation and bucket lookup should therefore
+        only consider request-count buckets that are reachable under the current
+        runtime window cap.
+        """
+        runtime_cap = max(1, int(runtime_cap))
+        clamped = sorted({int(bucket) for bucket in buckets if 0 < int(bucket) <= runtime_cap})
+        if not clamped or clamped[-1] != runtime_cap:
+            clamped.append(runtime_cap)
+        return clamped
 
     def _setup_variables(self):
         """Initialize internal variables and preallocate reusable buffers."""
         self.num_reqs_max_model_len = min(self.metadata.get_max_num_seqs(), self.max_num_reqs)
         self.num_reqs_most_model_len = self.num_reqs_max_model_len
+        self._allow_sparse_window_packing = (
+            int(getattr(self.metadata, "data_parallel_size", 1) or 1) <= 1 and not self.async_scheduling
+        )
+        self.active_num_seq_buckets = self._clamp_request_buckets_to_runtime_cap(
+            self.max_num_seq_buckets,
+            self.num_reqs_max_model_len,
+        )
         self.requests: dict[str, CachedRequestState] = {}
         logger.debug(f"Token padding sizes: {len(self.num_tokens_paddings)} levels, max={self.max_num_tokens}")
+        logger.debug(
+            "Active request buckets clamped to runtime cap: %s (configured=%s, runtime_cap=%s)",
+            self.active_num_seq_buckets,
+            self.max_num_seq_buckets,
+            self.num_reqs_max_model_len,
+        )
+        logger.debug("Sparse zero-token row packing enabled: %s", self._allow_sparse_window_packing)
 
         logger.debug(
             f"Creating sequence buffer for max_num_reqs={self.max_num_reqs}, max_model_len={self.max_model_len}"
@@ -526,6 +565,10 @@ class eSurgeRunner:
         self._scheduled_full_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
         self._active_mask_full_cpu = np.zeros((self.max_num_reqs,), dtype=bool)
         self._req_num_tokens_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
+        self._window_temperature_cpu = np.zeros_like(self.sequence_buffer.temperature)
+        self._window_top_p_cpu = np.zeros_like(self.sequence_buffer.top_p)
+        self._window_top_k_cpu = np.zeros_like(self.sequence_buffer.top_k)
+        self._window_min_p_cpu = np.zeros_like(self.sequence_buffer.min_p)
 
         # VLM host-side scratch buffers keyed by `num_tokens_static` (avoid repeated
         # large allocations while keeping the step-function input pytree stable).
@@ -617,6 +660,168 @@ class eSurgeRunner:
             visual_pos_masks_cpu.fill(False)
 
         return cached
+
+    def _get_window_state_views(
+        self,
+        *,
+        start_index: int,
+        row_count: int,
+        page_table_cpu: np.ndarray,
+        page_table_version: int | None,
+        row_indices: np.ndarray | None = None,
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        int | None,
+    ]:
+        """Return CPU-side state views aligned to the active scheduler window.
+
+        Slices row-backed request state for the current scheduling window and
+        copies per-request sampling scalars into fixed-size scratch buffers so
+        downstream batch-preparation code still receives arrays sized for
+        ``max_num_reqs``. For nonzero windows the page-table version is salted
+        with ``start_index`` to avoid cache collisions between different row
+        slices that share the same underlying page-table allocation. Packed
+        non-contiguous row selections disable page-table cache reuse to avoid
+        stale cache hits on mismatched row layouts.
+        """
+        row_count = max(0, int(row_count))
+        if row_indices is not None:
+            row_indices = np.asarray(row_indices, dtype=np.int32)
+            token_ids_window_cpu = self.sequence_buffer.token_ids[row_indices]
+            num_computed_tokens_window_cpu = self.sequence_buffer.num_computed_tokens[row_indices]
+            page_table_window_cpu = page_table_cpu[row_indices]
+            start_index = int(row_indices[0]) if row_indices.size else 0
+            packed_rows = True
+        else:
+            start_index = max(0, int(start_index))
+            end_index = start_index + row_count
+
+            token_ids_window_cpu = self.sequence_buffer.token_ids[start_index:end_index]
+            num_computed_tokens_window_cpu = self.sequence_buffer.num_computed_tokens[start_index:end_index]
+            page_table_window_cpu = page_table_cpu[start_index:end_index]
+            packed_rows = False
+
+        temperature_window_cpu = self._window_temperature_cpu
+        top_p_window_cpu = self._window_top_p_cpu
+        top_k_window_cpu = self._window_top_k_cpu
+        min_p_window_cpu = self._window_min_p_cpu
+
+        temperature_window_cpu.fill(0)
+        top_p_window_cpu.fill(1.0)
+        top_k_window_cpu.fill(0)
+        min_p_window_cpu.fill(0)
+
+        if row_count > 0:
+            if row_indices is not None:
+                temperature_window_cpu[:row_count] = self.sequence_buffer.temperature[row_indices]
+                top_p_window_cpu[:row_count] = self.sequence_buffer.top_p[row_indices]
+                top_k_window_cpu[:row_count] = self.sequence_buffer.top_k[row_indices]
+                min_p_window_cpu[:row_count] = self.sequence_buffer.min_p[row_indices]
+            else:
+                temperature_window_cpu[:row_count] = self.sequence_buffer.temperature[start_index:end_index]
+                top_p_window_cpu[:row_count] = self.sequence_buffer.top_p[start_index:end_index]
+                top_k_window_cpu[:row_count] = self.sequence_buffer.top_k[start_index:end_index]
+                min_p_window_cpu[:row_count] = self.sequence_buffer.min_p[start_index:end_index]
+
+        # The batch-preparer page-table cache key must distinguish different
+        # row windows that share the same underlying page-table version.
+        if page_table_version is None:
+            page_table_window_version = None
+        elif packed_rows:
+            page_table_window_version = None
+        elif start_index == 0:
+            page_table_window_version = int(page_table_version)
+        else:
+            page_table_window_version = int(page_table_version) * (int(self.max_num_reqs) + 1) + start_index
+
+        return (
+            token_ids_window_cpu,
+            num_computed_tokens_window_cpu,
+            temperature_window_cpu,
+            top_p_window_cpu,
+            top_k_window_cpu,
+            min_p_window_cpu,
+            page_table_window_cpu,
+            page_table_window_version,
+        )
+
+    def _collect_schedulable_window_rows(
+        self,
+        *,
+        start_index: int,
+        stop_index: int,
+        scheduled_tokens_by_req: dict[str, int],
+        allow_sparse_packing: bool,
+    ) -> tuple[np.ndarray, list[str | None], list[int], int, bool]:
+        """Collect runnable rows for a window, compacting interior zero-token gaps.
+
+        The scheduler keeps some RUNNING requests resident even when they
+        receive zero tokens in the current step. When such rows appear in the
+        middle of a window, the execution key can become `(few tokens, many
+        requests)`, which is not a real batch shape. This helper preserves the
+        common contiguous-prefix fast path and only packs rows when interior
+        zero-token gaps are present.
+        """
+        start_index = max(0, int(start_index))
+        stop_index = max(start_index, int(stop_index))
+
+        window_req_ids: list[str | None] = []
+        window_scheduled: list[int] = []
+        last_positive_offset = -1
+
+        for global_row_index in range(start_index, stop_index):
+            rid = self.sequence_buffer.req_ids[global_row_index]
+            scheduled = int(scheduled_tokens_by_req.get(rid, 0)) if rid is not None else 0
+            window_req_ids.append(rid)
+            window_scheduled.append(scheduled)
+            if rid is not None and scheduled > 0:
+                last_positive_offset = global_row_index - start_index
+
+        if last_positive_offset < 0:
+            return np.empty((0,), dtype=np.int32), [], [], stop_index, False
+
+        prefix_stop = last_positive_offset + 1
+        has_interior_zero_rows = any(
+            rid is None or scheduled <= 0
+            for rid, scheduled in zip(window_req_ids[:prefix_stop], window_scheduled[:prefix_stop], strict=False)
+        )
+
+        if not has_interior_zero_rows:
+            row_indices = np.arange(start_index, start_index + prefix_stop, dtype=np.int32)
+            req_ids_window = [typing.cast(str, rid) for rid in window_req_ids[:prefix_stop]]
+            scheduled_list = [int(scheduled) for scheduled in window_scheduled[:prefix_stop]]
+            return row_indices, req_ids_window, scheduled_list, start_index + prefix_stop, False
+
+        if not allow_sparse_packing:
+            row_indices = np.arange(start_index, start_index + prefix_stop, dtype=np.int32)
+            req_ids_window = [typing.cast(str | None, rid) for rid in window_req_ids[:prefix_stop]]
+            scheduled_list = [int(scheduled) for scheduled in window_scheduled[:prefix_stop]]
+            return row_indices, req_ids_window, scheduled_list, start_index + prefix_stop, False
+
+        row_indices_list: list[int] = []
+        req_ids_window: list[str] = []
+        scheduled_list: list[int] = []
+        for offset in range(prefix_stop):
+            rid = window_req_ids[offset]
+            scheduled = int(window_scheduled[offset])
+            if rid is None or scheduled <= 0:
+                continue
+            row_indices_list.append(start_index + offset)
+            req_ids_window.append(rid)
+            scheduled_list.append(scheduled)
+        return (
+            np.asarray(row_indices_list, dtype=np.int32),
+            req_ids_window,
+            scheduled_list,
+            start_index + prefix_stop,
+            True,
+        )
 
     def _precompile_jitted_helpers(
         self,
@@ -760,11 +965,12 @@ class eSurgeRunner:
             max_pages_per_req=self.max_pages_per_req,
             max_num_reqs=self.max_num_reqs,
             metadata=self.metadata,
-            num_reqs_paddings=self.max_num_seq_buckets,
+            num_reqs_paddings=self.active_num_seq_buckets,
+            prune_infeasible_pairs=self._allow_sparse_window_packing,
         )
 
         self._precompile_jitted_helpers(
-            reqs_padds=self.max_num_seq_buckets,
+            reqs_padds=self.active_num_seq_buckets,
             prompt_len_buckets=[min(n, self.max_model_len) for n in num_tokens_paddings],
             precompile_allowed_mask=False,
             allowed_max=4096,
@@ -1231,7 +1437,7 @@ class eSurgeRunner:
             valid_sampled_token_ids[i] = np.array([])
 
         # Apply tokens to sequence buffer
-        for pre_req_idx, req_state, _ in pre_request_seq_lens:
+        for pre_req_idx, _, req_state, _ in pre_request_seq_lens:
             sampled_ids = valid_sampled_token_ids[pre_req_idx]
             if len(sampled_ids) == 0:
                 continue
@@ -1258,7 +1464,7 @@ class eSurgeRunner:
     def _update_placeholder(
         self,
         discard_sampled_tokens_req_indices: list[int],
-        request_seq_lens: list[tuple[int, CachedRequestState, int]],
+        request_seq_lens: list[tuple[int, int, CachedRequestState, int]],
     ) -> dict[str, int]:
         """Set placeholders for tokens not yet generated.
 
@@ -1270,8 +1476,8 @@ class eSurgeRunner:
         Args:
             discard_sampled_tokens_req_indices: Indices of requests whose
                 tokens should be discarded (e.g., partial prefill).
-            request_seq_lens: List of (req_idx, req_state, seq_len) tuples
-                for requests that generated tokens.
+            request_seq_lens: List of (out_idx, seq_row_idx, req_state,
+                seq_len) tuples for requests that generated tokens.
 
         Returns:
             Mapping from request ID to index for placeholder replacement.
@@ -1283,11 +1489,11 @@ class eSurgeRunner:
         placeholder_req_id_to_index: dict[str, int] = {}
         discard_set = set(discard_sampled_tokens_req_indices)
 
-        for req_idx, req_state, _ in request_seq_lens:
-            if req_idx in discard_set:
+        for out_idx, seq_row_idx, req_state, _ in request_seq_lens:
+            if out_idx in discard_set:
                 continue
 
-            start_idx = self.sequence_buffer.num_tokens_no_spec[req_idx]
+            start_idx = self.sequence_buffer.num_tokens_no_spec[seq_row_idx]
             end_idx = start_idx + 1  # Assume 1 token (no spec decode yet)
 
             if end_idx > self.max_model_len:
@@ -1297,12 +1503,12 @@ class eSurgeRunner:
                 )
 
             # Update buffer state
-            self.sequence_buffer.num_tokens_no_spec[req_idx] = end_idx
-            self.sequence_buffer.num_tokens[req_idx] = end_idx
+            self.sequence_buffer.num_tokens_no_spec[seq_row_idx] = end_idx
+            self.sequence_buffer.num_tokens[seq_row_idx] = end_idx
 
             # Add placeholder (0) to output
             req_state.output_token_ids.extend([0])
-            placeholder_req_id_to_index[req_state.req_id] = req_idx
+            placeholder_req_id_to_index[req_state.req_id] = seq_row_idx
 
         return placeholder_req_id_to_index
 
@@ -1504,7 +1710,7 @@ class eSurgeRunner:
         token_buckets_used: set[int] = set()
         req_buckets_used: set[int] = set()
         tokens_np: np.ndarray = np.array([], dtype=np.int32)
-        request_seq_lens: list[tuple[int, CachedRequestState, int]] = []
+        request_seq_lens: list[tuple[int, int, CachedRequestState, int]] = []
         discard_sampled_tokens_req_indices: list[int] = []
 
         cfg = getattr(self.model, "config", None)
@@ -1519,21 +1725,23 @@ class eSurgeRunner:
         while start_index < self.sequence_buffer.num_slots:
             host_start = time.time()
             num_reqs_total = self.sequence_buffer.num_slots
-            scheduled_list: list[int] = []
-            req_ids_window = []
-            for i in range(start_index, min(num_reqs_total, start_index + self.num_reqs_max_model_len)):
-                rid = self.sequence_buffer.req_ids[i]
-                req_ids_window.append(rid)
-                scheduled_list.append(int(scheduler_output.num_scheduled_tokens.get(rid, 0)) if rid is not None else 0)
-            while scheduled_list and scheduled_list[-1] == 0:
-                scheduled_list.pop()
-                req_ids_window.pop()
-
+            window_stop_index = min(num_reqs_total, start_index + self.num_reqs_max_model_len)
+            (
+                window_row_indices,
+                req_ids_window,
+                scheduled_list,
+                next_start_index,
+                packed_window_rows,
+            ) = self._collect_schedulable_window_rows(
+                start_index=start_index,
+                stop_index=window_stop_index,
+                scheduled_tokens_by_req=scheduler_output.num_scheduled_tokens,
+                allow_sparse_packing=self._allow_sparse_window_packing and not scheduler_output.async_scheduling,
+            )
             num_reqs = len(scheduled_list)
             if num_reqs == 0:
-                start_index += self.num_reqs_max_model_len
+                start_index = next_start_index
                 continue
-            end_index = start_index + num_reqs
 
             total_scheduled = sum(scheduled_list)
             idx = bisect_left(self.num_tokens_paddings, total_scheduled)
@@ -1558,7 +1766,7 @@ class eSurgeRunner:
                 # Avoid per-step dict lookups; SequenceBuffer keeps this aligned with its ordering.
                 req_num_tokens_np = self._req_num_tokens_cpu
                 req_num_tokens_np.fill(0)
-                req_num_tokens_np[:num_reqs] = self.sequence_buffer.num_tokens[start_index:end_index]
+                req_num_tokens_np[:num_reqs] = self.sequence_buffer.num_tokens[window_row_indices]
 
                 active_mask_full_cpu = self._active_mask_full_cpu
                 active_mask_full_cpu.fill(False)
@@ -1600,14 +1808,13 @@ class eSurgeRunner:
 
                 off = 0
                 for req_idx, rid in enumerate(req_ids_window):
-                    if rid is None:
-                        continue
                     n = int(scheduled_list[req_idx])
                     if n <= 0:
                         continue
 
                     req_state = self.requests.get(rid)
-                    start_tok = int(self.sequence_buffer.num_computed_tokens[start_index + req_idx])
+                    global_row_index = int(window_row_indices[req_idx])
+                    start_tok = int(self.sequence_buffer.num_computed_tokens[global_row_index])
                     end_tok = start_tok + n
 
                     if uses_mrope_model and mrope_position_ids_cpu is not None:
@@ -1692,22 +1899,25 @@ class eSurgeRunner:
                     rows_per_shard = self.num_reqs_max_model_len // dp_size
                     pages_per_shard = int(pages_per_shard_opt)
                     for local_req_idx in range(num_reqs):
-                        seq_len = int(self.sequence_buffer.num_computed_tokens[start_index + local_req_idx]) + int(
+                        req_id_dbg = req_ids_window[local_req_idx]
+                        if req_id_dbg is None or int(scheduled_list[local_req_idx]) <= 0:
+                            continue
+                        global_row_index = int(window_row_indices[local_req_idx])
+                        seq_len = int(self.sequence_buffer.num_computed_tokens[global_row_index]) + int(
                             scheduled_list[local_req_idx]
                         )
                         if seq_len <= 0:
                             continue
                         page_cnt = min((seq_len + page_size - 1) // page_size, int(page_table_cpu.shape[1]))
-                        row = np.asarray(page_table_cpu[start_index + local_req_idx, :page_cnt], dtype=np.int32)
+                        row = np.asarray(page_table_cpu[global_row_index, :page_cnt], dtype=np.int32)
                         row = row[row != 0]
                         if row.size == 0:
                             continue
-                        global_req_idx = start_index + local_req_idx
+                        global_req_idx = global_row_index
                         req_shard = min(global_req_idx // rows_per_shard, dp_size - 1)
                         page_lo, page_hi = dp_shard_page_bounds(req_shard, pages_per_shard)
                         invalid = row[(row < page_lo) | (row >= page_hi)]
                         if invalid.size:
-                            req_id_dbg = req_ids_window[local_req_idx]
                             logger.error(
                                 "Pre-execute DP-local mismatch: row=%s req_id=%s req_shard=%s range=[%s, %s) "
                                 "sample_bad_page=%s pages_preview=%s scheduled=%s computed=%s",
@@ -1719,9 +1929,26 @@ class eSurgeRunner:
                                 int(invalid[0]),
                                 row[:8].tolist(),
                                 int(scheduled_list[local_req_idx]),
-                                int(self.sequence_buffer.num_computed_tokens[start_index + local_req_idx]),
+                                int(self.sequence_buffer.num_computed_tokens[global_row_index]),
                             )
                             break
+
+            (
+                token_ids_window_cpu,
+                num_computed_tokens_window_cpu,
+                temperature_window_cpu,
+                top_p_window_cpu,
+                top_k_window_cpu,
+                min_p_window_cpu,
+                page_table_window_cpu,
+                page_table_window_version,
+            ) = self._get_window_state_views(
+                start_index=start_index,
+                row_count=num_reqs,
+                page_table_cpu=page_table_cpu,
+                page_table_version=page_table_version,
+                row_indices=window_row_indices if packed_window_rows else None,
+            )
             total_runner_host_time += time.time() - host_start
             step_start = time.time()
             (
@@ -1740,14 +1967,14 @@ class eSurgeRunner:
                 input_ids_buf=self.input_ids_buf,
                 position_ids_buf=self.position_ids_buf,
                 padded_num_reqs=padded_num_reqs,
-                token_ids_cpu=self.sequence_buffer.token_ids,
-                num_computed_tokens_cpu=self.sequence_buffer.num_computed_tokens,
-                temperature_cpu=self.sequence_buffer.temperature,
-                top_p_cpu=self.sequence_buffer.top_p,
-                top_k_cpu=self.sequence_buffer.top_k,
-                min_p_cpu=self.sequence_buffer.min_p,
-                page_table_cpu=page_table_cpu,
-                page_table_version=page_table_version,
+                token_ids_cpu=token_ids_window_cpu,
+                num_computed_tokens_cpu=num_computed_tokens_window_cpu,
+                temperature_cpu=temperature_window_cpu,
+                top_p_cpu=top_p_window_cpu,
+                top_k_cpu=top_k_window_cpu,
+                min_p_cpu=min_p_window_cpu,
+                page_table_cpu=page_table_window_cpu,
+                page_table_version=page_table_window_version,
                 mrope_position_ids_cpu=mrope_position_ids_cpu,
                 prefill_embeds_cpu=prefill_embeds_cpu,
                 prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
@@ -1776,7 +2003,7 @@ class eSurgeRunner:
             total_d2h_time += time.time() - d2h_start
 
             # Track for async scheduling
-            request_seq_lens: list[tuple[int, CachedRequestState, int]] = []
+            request_seq_lens: list[tuple[int, int, CachedRequestState, int]] = []
             discard_sampled_tokens_req_indices: list[int] = []
 
             up_wtime = time.time()
@@ -1800,7 +2027,9 @@ class eSurgeRunner:
                         # Check if async scheduling is enabled
                         if scheduler_output.async_scheduling:
                             # Async mode: don't append yet, will be done in next iteration
-                            request_seq_lens.append((i, req_state, seq_len))
+                            if req_idx is None:
+                                raise RuntimeError(f"Missing sequence-buffer row for active request {rid!r}")
+                            request_seq_lens.append((i, req_idx, req_state, seq_len))
                         else:
                             # Sync mode: append immediately
                             sampled_token_ids_all.append([tid])
@@ -1821,7 +2050,7 @@ class eSurgeRunner:
             up_wtime_took = time.time() - up_wtime
             total_post_proc_time += up_wtime_took
 
-            start_index = end_index
+            start_index = next_start_index
 
         metrics_start = time.time()
         metrics_collector = get_metrics_collector()
@@ -1837,11 +2066,13 @@ class eSurgeRunner:
         self._perf_iteration += 1
 
         total_tokens = int(scheduler_output.total_num_scheduled_tokens)
-        wall_tps = total_tokens / total_time if total_time > 0 else 0.0
+        agg_tps = total_tokens / total_time if total_time > 0 else 0.0
+        num_scheduled_reqs = sum(1 for n in scheduler_output.num_scheduled_tokens.values() if int(n) > 0)
+        req_tps = agg_tps / num_scheduled_reqs if num_scheduled_reqs > 0 else 0.0
         if self._perf_tps_ema is None:
-            self._perf_tps_ema = wall_tps
+            self._perf_tps_ema = agg_tps
         else:
-            self._perf_tps_ema = self._perf_alpha * wall_tps + (1.0 - self._perf_alpha) * self._perf_tps_ema
+            self._perf_tps_ema = self._perf_alpha * agg_tps + (1.0 - self._perf_alpha) * self._perf_tps_ema
 
         def _fmt_bucket(values: set[int]) -> str:
             if not values:
@@ -1880,12 +2111,21 @@ class eSurgeRunner:
                 f"extra={total_prep_extra_put_time * 1e3:.2f}ms) "
             )
 
+        queue_detail = (
+            f"q(run={int(getattr(scheduler_output, 'num_running_reqs', 0))},"
+            f"wait={int(getattr(scheduler_output, 'num_waiting_reqs', 0))},"
+            f"freep={getattr(scheduler_output, 'free_pages', '?')},"
+            f"budget={getattr(scheduler_output, 'token_budget_remaining', '?')}/"
+            f"{getattr(scheduler_output, 'token_budget_initial', '?')}) "
+        )
+
         self.log_it(
             f"[perf] it={self._perf_iteration:06d} "
             f"win={num_windows} "
             f"reqs={len(req_ids_all)}(new={num_new},cached={num_cached},fin={num_finished},pad={_fmt_bucket(req_buckets_used)}) "
             f"tok={total_tokens}/b{_fmt_bucket(token_buckets_used)} "
-            f"tps={wall_tps:,.0f} ema={self._perf_tps_ema:,.0f} "
+            f"{queue_detail}"
+            f"agg_tps={agg_tps:,.0f} req_tps={req_tps:,.1f} ema={self._perf_tps_ema:,.0f} "
             f"runner={total_runner_host_time * 1e3:.2f}ms d2h={total_d2h_time * 1e3:.2f}ms "
             f"prep={total_prep_time * 1e3:.2f}ms {prep_detail}"
             f"fwd={total_exec_time * 1e3:.2f}ms samp={total_sample_time * 1e3:.2f}ms "

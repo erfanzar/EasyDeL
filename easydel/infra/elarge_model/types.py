@@ -809,6 +809,9 @@ class eSurgeCfg(TypedDict, total=False):
         reasoning_parser: Name of the reasoning parser for extracting
             chain-of-thought content (e.g., "deepseek_r1", "qwen3", "mistral").
             See ``ReasoningParserManager`` for available parsers.
+        ignore_stop_strings_in_reasoning: When True, stop strings are matched
+            only against parsed visible content for requests using a reasoning
+            parser, so stop markers inside thinking do not terminate generation.
 
     Example:
         >>> from easydel.infra.elarge_model.types import eSurgeCfg
@@ -879,6 +882,7 @@ class eSurgeCfg(TypedDict, total=False):
     silent_mode: NotRequired[bool]
     tool_parser: NotRequired[ToolParserName | None]
     reasoning_parser: NotRequired[ReasoningParserName | None]
+    ignore_stop_strings_in_reasoning: NotRequired[bool]
 
 
 class TextDatasetInformCfg(TypedDict, total=False):
@@ -1353,6 +1357,14 @@ class EvalKwargs(TypedDict, total=False):
             uses its explicit argument (or defaults to 0).
         max_new_tokens: Maximum number of tokens to generate for
             generation-based tasks. Default: 2048.
+        hard_max_new_tokens: When True, force `max_new_tokens` for every
+            generation request and ignore task-level lm-eval overrides such as
+            `max_gen_toks` / `max_tokens`. Default: False.
+        enable_thinking: Whether eval chat templating should explicitly enable
+            tokenizer-side thinking when supported. Default: False.
+        ignore_benchmark_eos_flags: Ignore lm-eval task-provided stop strings
+            and EOS-text stop injection so eval relies on the model/engine EOS
+            policy only. Default: False.
         temperature: Sampling temperature for text generation.
             0.0 for greedy decoding, higher values increase randomness.
             Default: 0.0.
@@ -1392,6 +1404,12 @@ class EvalKwargs(TypedDict, total=False):
         torch_random_seed: PyTorch random seed for reproducibility.
         fewshot_random_seed: Random seed for few-shot example sampling.
         bootstrap_iters: Number of bootstrap iterations for stderr estimation.
+        code_eval_num_workers: Override the Humaneval/MBPP code scorer worker
+            count. When omitted for code-eval tasks, EasyDeL defaults this to
+            `os.cpu_count()`. Useful when post-generation scoring is the
+            bottleneck.
+        code_eval_timeout: Override the Humaneval/MBPP per-sample execution
+            timeout in seconds.
         confirm_run_unsafe_code: Confirm execution of tasks marked unsafe.
         metadata: Optional metadata dictionary passed to lm-eval.
         samples: Explicit sample-index mapping per task.
@@ -1427,10 +1445,15 @@ class EvalKwargs(TypedDict, total=False):
 
     num_fewshot: NotRequired[int | None]
     max_new_tokens: NotRequired[int]
+    hard_max_new_tokens: NotRequired[bool]
+    enable_thinking: NotRequired[bool]
+    ignore_benchmark_eos_flags: NotRequired[bool]
     temperature: NotRequired[float]
     top_p: NotRequired[float]
     normalize_math_answers: NotRequired[bool]
     math_answer_task_hints: NotRequired[collections.abc.Sequence[str] | str | None]
+    code_eval_num_workers: NotRequired[int | None]
+    code_eval_timeout: NotRequired[float | int | None]
     batch_size: NotRequired[int | str | None]
     max_batch_size: NotRequired[int | None]
     device: NotRequired[str | None]

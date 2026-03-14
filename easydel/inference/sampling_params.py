@@ -499,6 +499,7 @@ class SamplingParams:
     spaces_between_special_tokens: bool = True
     include_stop_str_in_output: bool = False
     output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE
+    ignore_stop_strings_in_reasoning: bool | None = True
 
     # Advanced & Guided Decoding
     truncate_prompt_tokens: Annotated[int, "ge=1"] | None = None

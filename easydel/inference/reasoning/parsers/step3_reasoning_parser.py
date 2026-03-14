@@ -34,7 +34,9 @@ class Step3ReasoningParser(BaseThinkingReasoningParser):
     def extract_reasoning(self, model_output: str, request=None) -> tuple[str | None, str | None]:
         """Extract reasoning by splitting at </think> (everything before is reasoning)."""
         if self.end_token not in model_output:
-            # No end token: entire output could be reasoning-in-progress or just content
+            if self.start_token in model_output:
+                cleaned = model_output.replace(self.start_token, "").strip()
+                return cleaned or None, None
             return None, model_output
         # Split at end token; everything before is reasoning
         parts = model_output.split(self.end_token, 1)
