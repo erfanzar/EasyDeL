@@ -3,7 +3,9 @@ from __future__ import annotations
 import inspect
 from dataclasses import fields
 
-from easydel.infra.elarge_model.trainer_types import (
+import pytest
+
+from easydel.infra.elarge.types import (
     BASE_TRAINER_DEFAULTS,
     TRAINER_SPECIFIC_DEFAULTS,
     BaseTrainerCfg,
@@ -64,3 +66,26 @@ def test_base_defaults_do_not_include_unknown_training_arguments_keys():
     valid_parameters = set(args_signature.parameters) - {"self", "max_sequence_length", "quantization_block"}
     unknown_defaults = sorted(set(BASE_TRAINER_DEFAULTS) - valid_parameters)
     assert unknown_defaults == [], f"BASE_TRAINER_DEFAULTS includes unknown keys: {unknown_defaults}"
+
+
+def test_training_arguments_normalize_single_benchmark_config():
+    args = TrainingArguments(
+        model_name="dummy",
+        total_batch_size=1,
+        benchmarks={"name": "code", "tasks": "humaneval", "enable_thinking": True},
+        benchmark_interval=8,
+    )
+
+    assert args.benchmark_interval == 8
+    assert isinstance(args.benchmarks, list)
+    assert args.benchmarks == [{"name": "code", "tasks": "humaneval", "enable_thinking": True}]
+
+
+def test_training_arguments_reject_removed_benchmark_task_alias():
+    with pytest.raises(TypeError, match="must use `tasks`"):
+        TrainingArguments(
+            model_name="dummy",
+            total_batch_size=1,
+            benchmarks={"name": "code", "task": "humaneval", "enable_thinking": True},
+            benchmark_interval=8,
+        )

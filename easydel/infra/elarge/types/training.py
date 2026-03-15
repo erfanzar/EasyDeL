@@ -40,7 +40,7 @@ hierarchy where specialized trainers extend base configurations.
 Example:
     Basic usage with trainer configuration:
 
-    >>> from easydel.infra.elarge_model.trainer_types import (
+    >>> from easydel.infra.elarge.types import (
     ...     normalize_trainer_config,
     ...     get_trainer_class,
     ... )
@@ -61,6 +61,8 @@ from __future__ import annotations
 
 import warnings
 from typing import Any, Literal, NotRequired, TypedDict, cast
+
+from .eval import BenchmarkConfig
 
 _TRAINER_TYPE_ALIASES: dict[str, str] = {
     "nash_md": "nash-md",
@@ -320,6 +322,8 @@ class BaseTrainerCfg(TypedDict, total=False):
         generation_seed: Random seed for generation preview.
         generation_preview_print: Whether to print generation preview to console.
         generation_log_to_wandb: Whether to log generation preview to WandB.
+        benchmark_interval: Run benchmark suites every N training steps.
+        benchmarks: List of named benchmark configs to execute during training.
         use_esurge_generation: Whether to use eSurge for optimized generation.
         esurge_use_tqdm: Whether to show tqdm progress for eSurge generation.
         esurge_hbm_utilization: HBM utilization target for eSurge.
@@ -484,6 +488,8 @@ class BaseTrainerCfg(TypedDict, total=False):
     generation_seed: NotRequired[int | None]
     generation_preview_print: NotRequired[bool]
     generation_log_to_wandb: NotRequired[bool]
+    benchmark_interval: NotRequired[int | None]
+    benchmarks: NotRequired[list[BenchmarkConfig] | BenchmarkConfig | None]
 
     # eSurge integration for generation
     use_esurge_generation: NotRequired[bool]
@@ -1359,6 +1365,8 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "generation_dataset_prompt_field": "prompt",
     "generation_preview_print": False,
     "generation_log_to_wandb": True,
+    "benchmark_interval": None,
+    "benchmarks": [],
     # eSurge integration defaults
     "use_esurge_generation": True,
     "esurge_hbm_utilization": 0.45,

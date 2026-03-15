@@ -410,7 +410,7 @@ class EngineParsingMixin:
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index
                             rd["last_decode_time"] = now
 
-                            parsed, visible_text, visible_delta, stop_hit, stop_reason = (
+                            parsed, _visible_text, visible_delta, stop_hit, stop_reason = (
                                 self._parse_with_stop_string_policy(
                                     rd,
                                     accumulated_text=pipeline_result.accumulated_text,
@@ -500,7 +500,7 @@ class EngineParsingMixin:
                                 prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
                             )
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index
-                            parsed, visible_text, visible_delta, stop_hit, stop_reason = (
+                            parsed, _visible_text, visible_delta, stop_hit, stop_reason = (
                                 self._parse_with_stop_string_policy(
                                     rd,
                                     accumulated_text=pipeline_result.accumulated_text,

@@ -83,7 +83,7 @@ if tp.TYPE_CHECKING:  # pragma: no cover
     from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
     from .base_module import EasyDeLBaseModule
     from .base_state import EasyDeLState
-    from .elarge_model import eLargeModel
+    from .elarge import BenchmarkConfig, eLargeModel
     from .loss_utils import LossConfig
 
 
@@ -117,6 +117,7 @@ def init_cluster():
 
 
 __all__ = (
+    "BenchmarkConfig",
     "EasyDeLBaseConfig",
     "EasyDeLBaseConfigDict",
     "EasyDeLBaseModule",
@@ -151,9 +152,13 @@ def __getattr__(name: str):  # pragma: no cover
 
         return LossConfig
     if name == "eLargeModel":
-        from .elarge_model import eLargeModel
+        from .elarge import eLargeModel
 
         return eLargeModel
+    if name == "BenchmarkConfig":
+        from .elarge import BenchmarkConfig
+
+        return BenchmarkConfig
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

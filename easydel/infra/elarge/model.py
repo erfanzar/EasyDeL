@@ -47,6 +47,11 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.factory import TaskType
 from easydel.trainers.training_configurations import TrainingArguments
 
+from .benchmarking import (
+    is_benchmark_config_like,
+    normalize_benchmark_configs,
+    run_lm_eval_with_esurge,
+)
 from .builders import (
     build_dataset,
     build_esurge,
@@ -56,15 +61,23 @@ from .builders import (
     to_esurge_kwargs,
     to_from_pretrained_kwargs,
 )
-from .normalizer import materialize_base_config, normalize, resolve_task, validate
-from .trainer_types import get_trainer_class, get_training_arguments_class, normalize_trainer_config
-from .types import ELMConfig, EvalKwargs
-from .utils import (
+from .processing import (
     load_elm_config,
     make_serializable,
-    override_lm_eval_code_exec,
+    materialize_base_config,
+    normalize,
+    resolve_task,
     save_elm_config,
+    validate,
     write_text_atomic,
+)
+from .types import (
+    BenchmarkConfig,
+    ELMConfig,
+    EvalKwargs,
+    get_trainer_class,
+    get_training_arguments_class,
+    normalize_trainer_config,
 )
 
 if typing.TYPE_CHECKING:
@@ -80,20 +93,6 @@ if typing.TYPE_CHECKING:
 logger = get_logger("eLargeModel")
 _ESURGE_UNSET = object()
 _QUANT_UNSET = object()
-
-
-def _task_uses_code_eval(task: Any) -> bool:
-    """Return True when a task specification looks like Humaneval/MBPP style code eval."""
-    code_eval_hints = ("humaneval", "mbpp")
-
-    def _matches(value: Any) -> bool:
-        return isinstance(value, str) and any(hint in value.lower() for hint in code_eval_hints)
-
-    if _matches(task):
-        return True
-    if isinstance(task, Mapping):
-        return any(_matches(task.get(key)) for key in ("task", "alias", "group", "dataset_path", "dataset_name"))
-    return any(_matches(getattr(task, attr, None)) for attr in ("task", "alias", "name"))
 
 
 class BuildTrainerKws(typing.TypedDict, total=False):
@@ -303,7 +302,7 @@ class eLargeModel:
         """
         from easydel.modules.auto.auto_configuration import infer_task_from_hf_config
 
-        from .utils import normalize_task
+        from .processing import normalize_task
 
         # Auto-detect task if None or AUTO_BIND
         if task is None or task == TaskType.AUTO_BIND or task == "auto-bind":
@@ -392,7 +391,7 @@ class eLargeModel:
             ...     "esurge": {"max_model_len": 4096}
             ... })
         """
-        from .utils import deep_merge
+        from .processing import deep_merge
 
         self._config = normalize(deep_merge(self._config, updates))
         return self
@@ -1778,7 +1777,7 @@ class eLargeModel:
 
     def eval(
         self,
-        tasks: str | list[str | dict[str, Any] | Any],
+        tasks: str | list[str | dict[str, Any] | Any] | BenchmarkConfig | list[BenchmarkConfig],
         num_fewshot: int | None = None,
         output_path: str | None = None,
         **eval_overrides: Unpack[EvalKwargs],
@@ -1857,15 +1856,37 @@ class eLargeModel:
             The evaluation uses settings from set_eval() for generation parameters.
             Default settings are optimized for deterministic evaluation (temperature=0).
         """
-        try:
-            from lm_eval import evaluator  # type:ignore
-        except ImportError as e:
-            raise ImportError(
-                "lm-eval is required for evaluation. Install with: pip install easydel[torch,lm-eval]"
-            ) from e
+
+        def _uses_removed_benchmark_task_alias(task: Any) -> bool:
+            if not isinstance(task, Mapping):
+                return False
+            if "tasks" in task or "task" not in task:
+                return False
+            task_spec_keys = {"task", "alias", "group", "dataset_path", "dataset_name"}
+            return any(key not in task_spec_keys for key in task)
+
+        if _uses_removed_benchmark_task_alias(tasks) or (
+            isinstance(tasks, list) and any(_uses_removed_benchmark_task_alias(task) for task in tasks)
+        ):
+            raise TypeError("benchmark configs must use `tasks`; the `task` alias is no longer supported.")
+
+        should_run_benchmarks = is_benchmark_config_like(tasks) or (
+            isinstance(tasks, list) and tasks and all(isinstance(task, Mapping) and "tasks" in task for task in tasks)
+        )
+        if should_run_benchmarks:
+            benchmark_overrides = dict(eval_overrides)
+            if num_fewshot is not None:
+                benchmark_overrides["num_fewshot"] = num_fewshot
+            return self.run_benchmarks(
+                benchmarks=tasks,
+                output_path=output_path,
+                **benchmark_overrides,
+            )
 
         if isinstance(tasks, str):
-            tasks = [tasks]
+            task_list = [tasks]
+        else:
+            task_list = list(tasks)
 
         if self._tokenizer is None:
             self.build_tokenizer()
@@ -1873,109 +1894,95 @@ class eLargeModel:
         eval_config = self._config.get("eval", {}).copy()
         if eval_overrides:
             eval_config.update(eval_overrides)
-        # Match upstream lm-eval semantics: raw task prompts stay raw unless the
-        # caller explicitly opts into chat templating.
-        eval_config.setdefault("apply_chat_template", False)
-        batch_size = eval_config.pop("batch_size", None)
-        max_new_tokens = eval_config.pop("max_new_tokens", 8192)
-        hard_max_new_tokens = bool(eval_config.pop("hard_max_new_tokens", False))
-        enable_thinking = bool(eval_config.pop("enable_thinking", False))
-        ignore_benchmark_eos_flags = bool(eval_config.pop("ignore_benchmark_eos_flags", False))
-        temperature = eval_config.pop("temperature", 0.0)
-        top_p = eval_config.pop("top_p", 0.95)
-        device = eval_config.pop("device", "cpu")
-        num_fewshot = eval_config.pop("num_fewshot", num_fewshot)
-        normalize_math_answers = bool(eval_config.pop("normalize_math_answers", True))
-        math_answer_task_hints = eval_config.pop("math_answer_task_hints", None)
-        code_eval_num_workers = eval_config.pop("code_eval_num_workers", None)
-        code_eval_timeout = eval_config.pop("code_eval_timeout", None)
-        if code_eval_num_workers is None and any(_task_uses_code_eval(task) for task in tasks):
-            code_eval_num_workers = max(1, int(os.cpu_count() or 1))
-        include_path = eval_config.pop("include_path", None)
-        include_defaults = bool(eval_config.pop("include_defaults", True))
-        task_manager = eval_config.pop("task_manager", None)
-
-        from easydel.inference.evaluations import eSurgeLMEvalAdapter
-
-        engine_instance = self.build_esurge()
-        if batch_size is None:
-            batch_size = self._config.get("esurge", {}).get("max_num_seqs", 32)
-
-        eval_adapter = eSurgeLMEvalAdapter(
-            surge=engine_instance,
+        results = run_lm_eval_with_esurge(
+            surge=self.build_esurge(),
             processor=self._tokenizer,
+            tasks=task_list,
             max_length=self._config.get("esurge", {}).get("max_model_len", 8192),
-            max_new_tokens=max_new_tokens,
-            hard_max_new_tokens=hard_max_new_tokens,
-            enable_thinking=enable_thinking,
-            ignore_benchmark_eos_flags=ignore_benchmark_eos_flags,
-            batch_size=batch_size,
-            temperature=temperature,
-            top_p=top_p,
-            normalize_math_answers=normalize_math_answers,
-            math_answer_task_hints=math_answer_task_hints,
+            fallback_batch_size=self._config.get("esurge", {}).get("max_num_seqs", 32),
+            num_fewshot=num_fewshot,
+            eval_config=eval_config,
+            stop_engine=True,
+            summary_logger=logger,
         )
 
-        if task_manager is None and (include_path is not None or not include_defaults):
-            from lm_eval.tasks import TaskManager  # type:ignore
+        if output_path:
+            serialized_results = make_serializable(results)
+            write_text_atomic(output_path, json.dumps(serialized_results, indent=2, ensure_ascii=False))
+            logger.info(f"eval results saved to: {output_path}")
 
-            task_manager = TaskManager(
-                verbosity=eval_config.get("verbosity"),
-                include_path=include_path,
-                include_defaults=include_defaults,
-                metadata=eval_config.get("metadata"),
-            )
+        return results
 
+    def run_benchmarks(
+        self,
+        benchmarks: BenchmarkConfig | list[BenchmarkConfig],
+        output_path: str | None = None,
+        **default_eval_overrides: Unpack[EvalKwargs],
+    ) -> dict[str, Any]:
+        """Run one or more named benchmark suites sequentially, sharing a single eSurge engine.
+
+        Unlike :meth:`eval`, which accepts a flat task list, this method accepts
+        :class:`~easydel.infra.elarge.benchmarking.BenchmarkConfig` mappings
+        that can each carry their own ``num_fewshot``, ``temperature``, and other
+        lm-eval settings.  A single eSurge engine is started before the loop and
+        terminated in the ``finally`` block, so GPU/TPU memory is only allocated
+        once for the whole suite.
+
+        Args:
+            benchmarks: A single :class:`BenchmarkConfig` or a list of them.
+                Each must contain a ``"tasks"`` key.
+            output_path: Optional file path.  When provided the combined results
+                dict is serialized to JSON and written atomically.
+            **default_eval_overrides: Additional :class:`EvalKwargs` that serve as
+                defaults for every benchmark (individual benchmark entries can
+                still override them).
+
+        Returns:
+            A dict of the form ``{"benchmarks": {<name>: <lm-eval result dict>, ...}}``.
+            Each value is the raw dict produced by ``lm_eval.evaluator.simple_evaluate``.
+        """
+
+        if self._tokenizer is None:
+            self.build_tokenizer()
+
+        default_eval_config = self._config.get("eval", {}).copy()
+        if default_eval_overrides:
+            default_eval_config.update(default_eval_overrides)
+
+        resolved_benchmarks = normalize_benchmark_configs(
+            benchmarks,
+            default_eval_config=default_eval_config,
+        )
+        if not resolved_benchmarks:
+            return {"benchmarks": {}}
+
+        engine_instance = self.build_esurge()
+        benchmark_results: dict[str, dict[str, Any]] = {}
         try:
-            logger.info(f"Starting evaluation on tasks: {tasks}")
-            logger.info("Using eSurge engine")
-            logger.info(
-                f"Batch size: {batch_size}, Few-shot: {num_fewshot if num_fewshot is not None else 'task-default'}"
-            )
-            if code_eval_num_workers is not None or code_eval_timeout is not None:
-                logger.info(
-                    "Code-eval scorer overrides: num_workers=%s timeout=%s",
-                    code_eval_num_workers if code_eval_num_workers is not None else "default",
-                    code_eval_timeout if code_eval_timeout is not None else "default",
+            for benchmark in resolved_benchmarks:
+                logger.info(f"Running benchmark {benchmark.name}: {benchmark.tasks}")
+                benchmark_results[benchmark.name] = run_lm_eval_with_esurge(
+                    surge=engine_instance,
+                    processor=self._tokenizer,
+                    tasks=benchmark.tasks,
+                    max_length=self._config.get("esurge", {}).get("max_model_len", 8192),
+                    fallback_batch_size=self._config.get("esurge", {}).get("max_num_seqs", 32),
+                    eval_config=benchmark.eval_kwargs,
+                    stop_engine=False,
+                    summary_logger=logger,
                 )
-                code_eval_override_ctx = override_lm_eval_code_exec(
-                    num_workers=code_eval_num_workers,
-                    timeout=code_eval_timeout,
-                )
-            else:
-                from contextlib import nullcontext
-
-                code_eval_override_ctx = nullcontext()
-
-            with code_eval_override_ctx:
-                results = evaluator.simple_evaluate(
-                    model=eval_adapter,
-                    tasks=tasks,
-                    num_fewshot=num_fewshot,
-                    batch_size=batch_size,
-                    device=device,
-                    task_manager=task_manager,
-                    **eval_config,
-                )
-
-            if output_path:
-                serialized_results = make_serializable(results)
-                write_text_atomic(output_path, json.dumps(serialized_results, indent=2, ensure_ascii=False))
-                logger.info(f"eval results saved to: {output_path}")
-
-            logger.info("evaluation summary:")
-
-            for task, metrics in results.get("results", {}).items():
-                logger.info(f"{task}:")
-                for metric, value in metrics.items():
-                    if isinstance(value, (int, float)):
-                        logger.info(f"  {metric}: {value:.4f}" if isinstance(value, float) else f"  {metric}: {value}")
-
-            return results
-
         finally:
-            if hasattr(eval_adapter, "stop"):
-                eval_adapter.stop()
+            try:
+                engine_instance.terminate()
+            except Exception:
+                ...
+
+        results: dict[str, Any] = {"benchmarks": benchmark_results}
+        if output_path:
+            serialized_results = make_serializable(results)
+            write_text_atomic(output_path, json.dumps(serialized_results, indent=2, ensure_ascii=False))
+            logger.info(f"eval results saved to: {output_path}")
+        return results
 
     def __repr__(self) -> str:
         """Developer-friendly string representation of eLargeModel.

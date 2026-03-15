@@ -591,3 +591,96 @@ def test_value_head_wrapper_delegates_call_esurge_engine():
     assert result == ["ok"]
     assert calls["args"] == ("engine",)
     assert calls["kwargs"] == {"prompts": ["hello"]}
+
+
+def test_maybe_benchmark_runs_named_benchmark_suite_and_logs_metrics(monkeypatch):
+    trainer = object.__new__(_PreviewTrainer)
+    logged_metrics: list[tuple[dict[str, float], int]] = []
+    wandb_calls: dict[str, object] = {}
+    trainer.arguments = SimpleNamespace(
+        benchmark_interval=2,
+        benchmarks=[
+            {
+                "name": "code_suite",
+                "tasks": ["humaneval"],
+                "enable_thinking": True,
+                "max_new_tokens": 256,
+            }
+        ],
+        esurge_hbm_utilization=None,
+        esurge_max_num_seqs=8,
+        esurge_min_input_pad=None,
+        esurge_page_size=None,
+        esurge_silent_mode=True,
+        esurge_runner_verbose=False,
+        esurge_max_num_batched_tokens=None,
+        esurge_enable_prefix_caching=None,
+        esurge_data_parallelism_axis=None,
+        esurge_max_num_seq_buckets=None,
+        eval_batch_size=4,
+        total_batch_size=4,
+        max_length=1024,
+        use_wandb=True,
+        can_log_metrics=True,
+        log_metrics=lambda metrics, step: logged_metrics.append((metrics, step)),
+    )
+    trainer.processing_class = object()
+    trainer.latest_benchmark_results = {}
+    trainer.benchmark_log_table = None
+
+    run_calls: list[dict[str, object]] = []
+
+    def _fake_run_lm_eval_with_esurge(**kwargs):
+        run_calls.append(kwargs)
+        return {"results": {"humaneval": {"pass@1,create_test": 0.5}}}
+
+    monkeypatch.setattr("easydel.trainers.base_trainer.run_lm_eval_with_esurge", _fake_run_lm_eval_with_esurge)
+
+    class _DummyTable:
+        def __init__(self, *, columns, log_mode):
+            wandb_calls["columns"] = columns
+            wandb_calls["log_mode"] = log_mode
+            self.rows: list[tuple[object, ...]] = []
+
+        def add_data(self, *row):
+            self.rows.append(row)
+
+    class _DummyWandb:
+        Table = _DummyTable
+
+        @staticmethod
+        def log(payload, step):
+            wandb_calls["payload"] = payload
+            wandb_calls["step"] = step
+
+    monkeypatch.setattr("easydel.trainers.base_trainer.wandb", _DummyWandb)
+
+    class _Model:
+        def __init__(self):
+            self.config = SimpleNamespace(granted_freq_max_position_embedding=4096)
+            self.pause_calls: list[dict[str, object]] = []
+
+        def get_esurge(self, **kwargs):
+            self.last_esurge_kwargs = kwargs
+            return "engine"
+
+        def pause_esurge(self, **kwargs):
+            self.pause_calls.append(kwargs)
+
+    state = SimpleNamespace(model=_Model())
+
+    trainer.maybe_benchmark(state=state, step=2)
+
+    assert len(run_calls) == 1
+    assert run_calls[0]["tasks"] == ["humaneval"]
+    assert run_calls[0]["eval_config"]["enable_thinking"] is True
+    assert run_calls[0]["eval_config"]["max_new_tokens"] == 256
+    assert run_calls[0]["stop_engine"] is False
+    assert trainer.latest_benchmark_results["code_suite"]["results"]["humaneval"]["pass@1,create_test"] == 0.5
+    assert logged_metrics == [({"benchmark/code_suite/humaneval/pass@1,create_test": 0.5}, 2)]
+    assert state.model.pause_calls == [{"release_model_state": True, "clear_compiled_cache": False}]
+    assert wandb_calls["columns"] == ["step", "benchmark", "task", "metric", "value"]
+    assert wandb_calls["log_mode"] == "INCREMENTAL"
+    assert trainer.benchmark_log_table.rows == [(2, "code_suite", "humaneval", "pass@1,create_test", 0.5)]
+    assert wandb_calls["payload"] == {"benchmark_results": trainer.benchmark_log_table}
+    assert wandb_calls["step"] == 2

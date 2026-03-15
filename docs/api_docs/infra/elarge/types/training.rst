@@ -1,7 +1,7 @@
-easydel.infra.elarge_model.defaults
+easydel.infra.elarge.types.training
 ===================================
 
-.. automodule:: easydel.infra.elarge_model.defaults
+.. automodule:: easydel.infra.elarge.types.training
    :members:
    :undoc-members:
    :show-inheritance:

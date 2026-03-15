@@ -18,7 +18,7 @@ from collections.abc import Iterator, Sequence
 
 from easydel.data.core.protocols import ShardedDataSource
 from easydel.data.transforms import LimitedShardedSource
-from easydel.infra.elarge_model.builders import _create_source_from_inform
+from easydel.infra.elarge.builders import _create_source_from_inform
 
 
 class UnknownSizeSource(ShardedDataSource[dict]):

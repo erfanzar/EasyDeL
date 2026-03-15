@@ -37,6 +37,8 @@ from eformer.serialization import Checkpointer
 from jax.sharding import PartitionSpec
 from optax import GradientTransformation  # pyright: ignore[reportMissingTypeStubs]
 
+from easydel.infra.elarge.benchmarking import normalize_benchmark_configs
+from easydel.infra.elarge.types import BenchmarkConfig
 from easydel.infra.errors import EasyDeLTimerError
 from easydel.infra.etils import (
     AVAILABLE_OPTIMIZERS,
@@ -451,6 +453,14 @@ class TrainingArguments:
     generation_log_to_wandb: bool = field(
         default=True,
         metadata={"help": "Whether to log preview generations to WandB when available."},
+    )
+    benchmark_interval: int | None = field(
+        default=None,
+        metadata={"help": "Run configured lm-eval benchmark suites every X training steps (disabled when None)."},
+    )
+    benchmarks: list[BenchmarkConfig] | BenchmarkConfig | None = field(
+        default_factory=list,
+        metadata={"help": "Benchmark suite definitions executed during training when benchmark_interval is set."},
     )
     use_esurge_generation: bool = field(
         default=True,
@@ -1009,8 +1019,20 @@ class TrainingArguments:
         if self.generation_interval is not None and self.generation_interval <= 0:
             logger.warning("`generation_interval` must be positive; disabling preview generation.")
             self.generation_interval = None
+        if self.benchmark_interval is not None and self.benchmark_interval <= 0:
+            logger.warning("`benchmark_interval` must be positive; disabling benchmark hooks.")
+            self.benchmark_interval = None
         if self.generation_num_prompts is not None:
             self.generation_num_prompts = max(1, int(self.generation_num_prompts))
+        if self.benchmarks is None:
+            self.benchmarks = []
+        elif isinstance(self.benchmarks, collections.abc.Mapping):
+            self.benchmarks = [dict(self.benchmarks)]
+        elif isinstance(self.benchmarks, collections.abc.Sequence) and not isinstance(self.benchmarks, (str, bytes)):
+            self.benchmarks = [dict(benchmark) for benchmark in self.benchmarks]
+        else:
+            raise TypeError("`benchmarks` must be a BenchmarkConfig or a sequence of BenchmarkConfig values.")
+        normalize_benchmark_configs(self.benchmarks)  # early validation; resolved again at runtime
         if self.esurge_max_num_seq_buckets is not None:
             self.esurge_max_num_seq_buckets = [int(v) for v in self.esurge_max_num_seq_buckets]
         if self.esurge_data_parallelism_axis is not None:
