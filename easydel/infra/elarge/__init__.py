@@ -21,12 +21,11 @@ optimization strategies for efficient training and inference.
 Key Components:
     - eLargeModel: Main class for managing large language model configurations
     - builders: Utility functions for constructing model architectures
-    - normalizer: Input/output normalization utilities
-    - trainer_types: Training-specific type definitions and utilities
-    - types: Core type definitions for the module
-    - utils: Helper functions and utilities
+    - processing: Configuration normalization and utility functions
+    - types: Core type definitions organised by domain
 """
 
-from .elarge_model import eLargeModel
+from .model import eLargeModel
+from .types import BenchmarkConfig
 
-__all__ = ("eLargeModel",)
+__all__ = ("BenchmarkConfig", "eLargeModel")

@@ -1169,6 +1169,71 @@ class eSurge(
         with self._scheduler_lock:
             return self.runner.execute_model(scheduler_output)
 
+    def _instantiate_reasoning_parser_for_metadata(self):
+        """Build a short-lived reasoning parser instance for token metadata lookups."""
+        if self._reasoning_parser_class is None or self.tokenizer is None:
+            return None
+        try:
+            return self._reasoning_parser_class(self.tokenizer)
+        except Exception:
+            return None
+
+    def _resolve_reasoning_boundary_token(self, attr_name: str) -> str | None:
+        """Resolve a reasoning boundary token from parser metadata when available."""
+        parser = self._instantiate_reasoning_parser_for_metadata()
+        return self._find_str_attr(parser, attr_name)
+
+    def _find_str_attr(self, parser, attr_name: str) -> str | None:
+        """Search parser, its delegate, and the parser class for a non-empty string attribute."""
+        candidates = (parser, getattr(parser, "_delegate", None), self._reasoning_parser_class)
+        for candidate in candidates:
+            token = getattr(candidate, attr_name, None)
+            if isinstance(token, str) and token:
+                return token
+        return None
+
+    def _resolve_reasoning_boundary_token_id(self, attr_name: str, token_attr_name: str) -> int | None:
+        """Resolve a reasoning boundary token ID from parser metadata or tokenizer vocab."""
+        parser = self._instantiate_reasoning_parser_for_metadata()
+        candidates = (parser, getattr(parser, "_delegate", None))
+        for candidate in candidates:
+            token_id = getattr(candidate, attr_name, None)
+            if isinstance(token_id, int):
+                return token_id
+        # Reuse the already-instantiated parser instead of creating a second one.
+        token = self._find_str_attr(parser, token_attr_name)
+        if token is None or self.tokenizer is None:
+            return None
+        try:
+            vocab = self.tokenizer.get_vocab()
+        except Exception:
+            vocab = None
+        if isinstance(vocab, dict):
+            token_id = vocab.get(token)
+            if isinstance(token_id, int):
+                return token_id
+        return None
+
+    @property
+    def think_start_token(self) -> str | None:
+        """Reasoning-start token for the active reasoning parser, if any."""
+        return self._resolve_reasoning_boundary_token("start_token")
+
+    @property
+    def think_end_token(self) -> str | None:
+        """Reasoning-end token for the active reasoning parser, if any."""
+        return self._resolve_reasoning_boundary_token("end_token")
+
+    @property
+    def think_start_token_id(self) -> int | None:
+        """Tokenizer ID for :attr:`think_start_token`, if resolvable."""
+        return self._resolve_reasoning_boundary_token_id("_start_token_id", "start_token")
+
+    @property
+    def think_end_token_id(self) -> int | None:
+        """Tokenizer ID for :attr:`think_end_token`, if resolvable."""
+        return self._resolve_reasoning_boundary_token_id("_end_token_id", "end_token")
+
     def __del__(self):
         """Destructor that cleans up resources.
 

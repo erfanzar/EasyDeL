@@ -142,6 +142,56 @@ def _trim_stop_sequences(text: str, stop: list[str]) -> str:
     return text if earliest is None else text[:earliest]
 
 
+def _postprocess_generation_text(
+    generation: str,
+    stop: list[str] | str | None,
+    think_end_token: str | None,
+) -> str:
+    """Strip optional reasoning prefix and trim any trailing stop text.
+
+    eSurge already supports parser-aware stop matching during generation. This
+    post-process step is only a final cleanup for eval outputs, so it first
+    discards any text before ``think_end_token`` while preserving the visible
+    text verbatim, then trims residual stop strings from that visible content.
+    """
+    if think_end_token:
+        _, separator, visible_text = generation.partition(think_end_token)
+        if separator:
+            generation = visible_text
+    stop_list = _normalize_stop_list(stop)
+    return _trim_stop_sequences(generation, stop_list)
+
+
+def _strip_empty_reasoning_scaffold(
+    rendered_prompt: str,
+    think_start_token: str | None,
+    think_end_token: str | None,
+) -> str:
+    """Remove tokenizer-injected empty reasoning blocks from rendered prompts.
+
+    Some chat templates emit an empty ``<think>...</think>`` scaffold even when
+    reasoning is disabled and the assistant message already contains a concrete
+    generation prefix. For code-completion style eval tasks this pollutes the
+    prompt without carrying information, so we strip only the empty scaffold and
+    leave any non-empty reasoning content untouched.
+    """
+    if not rendered_prompt:
+        return rendered_prompt
+
+    scaffold_patterns: list[str] = []
+    if think_start_token and think_end_token:
+        scaffold_patterns.append(rf"{re.escape(think_start_token)}\s*{re.escape(think_end_token)}(?:\s*\n)?")
+    else:
+        # Fallback for tokenizer templates that emit the common literal scaffold
+        # even when reasoning metadata is not surfaced through the engine.
+        scaffold_patterns.append(r"<think>\s*</think>(?:\s*\n)?")
+
+    stripped_prompt = rendered_prompt
+    for pattern in scaffold_patterns:
+        stripped_prompt = re.sub(pattern, "", stripped_prompt, count=1)
+    return stripped_prompt
+
+
 def _freeze_generation_value(value: Any) -> Any:
     """Convert nested generation kwargs into a hashable grouping key."""
     if isinstance(value, dict):
@@ -353,6 +403,9 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         max_new_tokens: int = 2048,
         hard_max_new_tokens: bool = False,
         enable_thinking: bool = False,
+        chat_template_args: dict[str, Any] | None = None,
+        think_start_token: str | None = None,
+        think_end_token: str | None = None,
         ignore_benchmark_eos_flags: bool = False,
         top_p: float = 0.95,
         temperature: float = 0.0,
@@ -376,6 +429,14 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
                 as `max_gen_toks` / `max_tokens`.
             enable_thinking: Whether eval chat templating should explicitly
                 enable tokenizer-side thinking when supported. Default: False.
+            chat_template_args: Optional tokenizer chat-template kwargs. These
+                are merged into ``tokenizer.apply_chat_template(...)`` and can
+                override ``enable_thinking`` when they include that key.
+            think_start_token: Optional explicit reasoning-start marker used by
+                downstream consumers. Defaults to ``surge.think_start_token``.
+            think_end_token: Optional explicit reasoning-end marker used for
+                post-processing generated text. Defaults to
+                ``surge.think_end_token``.
             ignore_benchmark_eos_flags: If True, ignore lm-eval task-provided
                 stop strings (such as `until` / `stop`) and skip the extra EOS
                 text stop added by lm-eval. Generation then relies on the
@@ -405,9 +466,17 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
         self.hard_max_new_tokens = bool(hard_max_new_tokens)
-        self.enable_thinking = bool(enable_thinking)
+        self.chat_template_args = dict(chat_template_args or {})
+        self.enable_thinking = bool(self.chat_template_args.pop("enable_thinking", enable_thinking))
+        self.think_start_token = (
+            think_start_token if think_start_token is not None else getattr(surge, "think_start_token", None)
+        )
+        self.think_end_token = (
+            think_end_token if think_end_token is not None else getattr(surge, "think_end_token", None)
+        )
         self.ignore_benchmark_eos_flags = bool(ignore_benchmark_eos_flags)
         self.top_p = top_p
+        self.truncation_side = str(getattr(surge, "truncate_mode", "left") or "left")
         self.normalize_math_answers = normalize_math_answers
         if math_answer_task_hints is None:
             raw_task_hints: Iterable[str] = _DEFAULT_MATH_ANSWER_TASK_HINTS
@@ -426,6 +495,10 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         self.model = getattr(getattr(surge, "runner", None), "model", None)
         self._scoring_model = None
         self._scoring_logits_fn = None
+        self._decode_supports_skip_special = None
+        self._decode_supports_spaces_between = None
+        self._chat_template_signature = None
+        self._chat_template_sig_resolved = False
         self.setup_complete = False
         self._setup()
 
@@ -561,21 +634,23 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
             return []
 
         try:
-            from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs  # type: ignore
+            from lm_eval.models.utils import handle_stop_sequences, maybe_truncate, normalize_gen_kwargs  # type: ignore
         except Exception:
             handle_stop_sequences = None
+            maybe_truncate = None
             normalize_gen_kwargs = None
 
         eos_text: str | None = None
         eot_token_id = self.eot_token_id
         if eot_token_id is not None:
             try:
-                eos_text = self.tok_decode([int(eot_token_id)])
+                eos_text = self.tok_decode([int(eot_token_id)], skip_special_tokens=False)
             except Exception:
                 eos_text = None
 
         sampling_param_fields = tuple(field.name for field in dataclass_fields(SamplingParams) if field.init)
         normalized_requests: list[SamplingParams] = []
+        prepared_prompts = list(prompts)
         for i in range(len(prompts)):
             raw_kwargs = (
                 dict(generation_kwargs[i]) if generation_kwargs is not None and i < len(generation_kwargs) else {}
@@ -626,11 +701,34 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
             if handle_stop_sequences is not None and not self.ignore_benchmark_eos_flags:
                 request_stops = handle_stop_sequences(request_stops, eos=eos_text)
 
+            prompt_text = prompts[i]
+            if maybe_truncate is not None:
+                try:
+                    prompt_token_ids = [int(tok) for tok in self.tok_encode(prompt_text)]
+                    prompt_token_ids, request_max_tokens = maybe_truncate(
+                        prompt_token_ids,
+                        max_gen_toks=int(request_max_tokens),
+                        max_model_len=self.max_length,
+                        side=self.truncation_side,
+                        verbose=False,
+                    )
+                    prompt_text = self.tok_decode(
+                        prompt_token_ids,
+                        skip_special_tokens=False,
+                        spaces_between_special_tokens=False,
+                    )
+                except Exception as trunc_exc:
+                    logger.debug("Prompt truncation failed, using original: %s", trunc_exc)
+                    prompt_text = prompts[i]
+            prepared_prompts[i] = prompt_text
+
             sampling_kwargs: dict[str, Any] = {
                 "max_tokens": int(request_max_tokens),
                 "temperature": float(self.temperature if request_temperature is None else request_temperature),
                 "top_p": float(self.top_p if request_top_p is None else request_top_p),
                 "stop": _normalize_stop_list(request_stops),
+                "skip_special_tokens": False,
+                "spaces_between_special_tokens": False,
                 "n": 1,
             }
 
@@ -669,7 +767,7 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         for group in groups.values():
             sampling_params = group["sampling_params"]
             indices = group["indices"]
-            group_prompts = [prompts[i] for i in indices]
+            group_prompts = [prepared_prompts[i] for i in indices]
             request_ids = [f"{_DEFAULT_REQUEST_ID_PREFIX}-{uuid.uuid4().hex}" for _ in group_prompts]
 
             # eSurge.generate may return outputs in completion order; re-map via request_id.
@@ -687,10 +785,12 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
                     )
                 output = by_id[request_id]
                 text = getattr(output, "accumulated_text", "") or output.get_text()
-                if sampling_params.include_stop_str_in_output:
-                    outputs[prompt_index] = text
-                else:
-                    outputs[prompt_index] = _trim_stop_sequences(text, list(sampling_params.stop))
+                effective_stops = [] if sampling_params.include_stop_str_in_output else list(sampling_params.stop)
+                outputs[prompt_index] = _postprocess_generation_text(
+                    text,
+                    effective_stops,
+                    self.think_end_token,
+                )
 
         return outputs
 
@@ -896,42 +996,68 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
                 "tokenize": False,
                 "add_generation_prompt": add_generation_prompt,
             }
-            try:
-                signature = inspect.signature(template_fn)
-            except (TypeError, ValueError):
-                signature = None
+            if not self._chat_template_sig_resolved:
+                try:
+                    self._chat_template_signature = inspect.signature(template_fn)
+                except (TypeError, ValueError):
+                    self._chat_template_signature = None
+                self._chat_template_sig_resolved = True
+            signature = self._chat_template_signature
 
             if signature is not None:
                 if "continue_final_message" in signature.parameters:
                     template_kwargs["continue_final_message"] = not add_generation_prompt
                 if "enable_thinking" in signature.parameters:
                     template_kwargs["enable_thinking"] = self.enable_thinking
-
-            return template_fn(
-                messages,
-                **template_kwargs,
-            )
+            template_kwargs.update(self.chat_template_args)
+            try:
+                rendered = template_fn(messages, **template_kwargs)
+            except Exception as template_exc:
+                if any(message.get("role") == "system" for message in (messages or [])):
+                    logger.debug("Chat template failed with system message, retrying without: %s", template_exc)
+                    filtered_messages = [message for message in (messages or []) if message.get("role") != "system"]
+                    rendered = template_fn(filtered_messages, **template_kwargs)
+                else:
+                    raise
+            if not self.enable_thinking:
+                rendered = _strip_empty_reasoning_scaffold(
+                    rendered,
+                    self.think_start_token,
+                    self.think_end_token,
+                )
+            return rendered
 
         lines = [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in (messages or [])]
         if add_generation_prompt:
             lines.append("assistant:")
         return "\n".join(lines)
 
-    def tok_encode(self, string: str):
+    def tok_encode(self, string: str, add_special_tokens: bool | None = None, **kwargs):
         """Encode a string into token IDs.
 
         Args:
             string: The input string to tokenize.
+            add_special_tokens: Optional override for tokenizer special-token
+                insertion. Defaults to ``False`` to match lm-eval causal
+                model behavior.
 
         Returns:
             list[int]: List of token IDs.
         """
+        if add_special_tokens is None:
+            add_special_tokens = False
         try:
-            return self.tokenizer.encode(string, add_special_tokens=False)
+            return self.tokenizer.encode(string, add_special_tokens=add_special_tokens, **kwargs)
         except TypeError:
             return self.tokenizer.encode(string)
 
-    def tok_decode(self, tokens):
+    def tok_decode(
+        self,
+        tokens,
+        *,
+        skip_special_tokens: bool = False,
+        spaces_between_special_tokens: bool | None = None,
+    ):
         """Decode token IDs into a string.
 
         Args:
@@ -940,7 +1066,23 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         Returns:
             str: The decoded text string.
         """
-        return self.tokenizer.decode(tokens)
+        if self._decode_supports_skip_special is None:
+            try:
+                sig = inspect.signature(self.tokenizer.decode)
+            except (TypeError, ValueError):
+                sig = None
+            self._decode_supports_skip_special = sig is not None and "skip_special_tokens" in sig.parameters
+            self._decode_supports_spaces_between = sig is not None and "spaces_between_special_tokens" in sig.parameters
+
+        decode_kwargs: dict[str, Any] = {}
+        if self._decode_supports_skip_special:
+            decode_kwargs["skip_special_tokens"] = skip_special_tokens
+        if spaces_between_special_tokens is not None and self._decode_supports_spaces_between:
+            decode_kwargs["spaces_between_special_tokens"] = spaces_between_special_tokens
+        try:
+            return self.tokenizer.decode(tokens, **decode_kwargs)
+        except TypeError:
+            return self.tokenizer.decode(tokens)
 
     def _encode_text(self, text: str) -> list[int]:
         """Encode text to token IDs using the tokenizer.
@@ -965,6 +1107,45 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
             return [int(t) for t in ids]
         except Exception:
             return [int(t) for t in self.tok_encode(text)]
+
+    @property
+    def prefix_token_id(self) -> int:
+        """Return the prefix token used for empty-context scoring.
+
+        This mirrors ``TemplateLM`` / ``vLLM`` behavior: prefer BOS when
+        available, otherwise fall back to EOS.
+        """
+        bos_id = getattr(self.tokenizer, "bos_token_id", None)
+        if isinstance(bos_id, list):
+            bos_id = bos_id[0] if bos_id else None
+        if bos_id is not None:
+            return int(bos_id)
+        eos_id = self.eot_token_id
+        if isinstance(eos_id, list):
+            eos_id = eos_id[0] if eos_id else None
+        if eos_id is not None:
+            return int(eos_id)
+        return 0
+
+    def _encode_pair(self, context: str, continuation: str) -> tuple[list[int], list[int]]:
+        """Encode a context/continuation pair with TemplateLM causal semantics.
+
+        Trailing whitespace on the context is moved to the front of the
+        continuation before tokenization so boundary-sensitive tokenizers score
+        the same continuation tokens as upstream ``TemplateLM``/``vLLM``.
+        """
+        if not context:
+            raise ValueError("Context cannot be empty for _encode_pair; use prefix_token_id path instead.")
+
+        n_spaces = len(context) - len(context.rstrip())
+        if n_spaces > 0:
+            continuation = context[-n_spaces:] + continuation
+            context = context[:-n_spaces]
+
+        whole_enc = [int(t) for t in self.tok_encode(context + continuation)]
+        context_enc = [int(t) for t in self.tok_encode(context)]
+        continuation_enc = whole_enc[len(context_enc) :]
+        return context_enc, continuation_enc
 
     def _loglikelihood_token_ids(
         self,
@@ -1160,7 +1341,7 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         """
         raise NotImplementedError("eSurgeLMEvalAdapter doesn't use _model_generate directly")
 
-    def loglikelihood(self, instances):
+    def loglikelihood(self, instances, disable_tqdm: bool = False):
         """Compute log-likelihood of completions given contexts.
 
         This method is part of the lm-evaluation-harness LM interface.
@@ -1175,24 +1356,38 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         Returns:
             List of (log_likelihood, is_greedy) tuples.
         """
-        requests: list[tuple[str, str]] = []
+        del disable_tqdm
+        encoded_requests: list[tuple[list[int], list[int]]] = []
 
         for instance in instances:
-            if hasattr(instance, "arguments"):
+            if hasattr(instance, "args"):
+                arguments = instance.args
+            elif hasattr(instance, "arguments"):
                 arguments = instance.arguments
             else:
                 arguments = instance
 
-            if len(arguments) >= 2:
-                requests.append((str(arguments[0]), str(arguments[1])))
-            else:
+            if len(arguments) < 2:
                 logger.warning("Invalid loglikelihood instance format: %s", instance)
-                requests.append(("", ""))
+                encoded_requests.append(([self.prefix_token_id], []))
+                continue
+
+            context = str(arguments[0])
+            continuation = str(arguments[1])
+            if context == "":
+                continuation_enc = [int(t) for t in self.tok_encode(continuation, add_special_tokens=False)]
+                if continuation_enc and self.prefix_token_id == continuation_enc[0]:
+                    context_enc, continuation_enc = continuation_enc[:1], continuation_enc[1:]
+                else:
+                    context_enc = [self.prefix_token_id]
+                encoded_requests.append((context_enc, continuation_enc))
+            else:
+                encoded_requests.append(self._encode_pair(context, continuation))
 
         results: list[tuple[float, bool]] = []
-        for chunk in _chunked(requests, self._batch_size):
-            ctx_ids = [self._encode_text(ctx) for ctx, _ in chunk]
-            cont_ids = [self._encode_text(cont) for _, cont in chunk]
+        for chunk in _chunked(encoded_requests, self._batch_size):
+            ctx_ids = [ctx for ctx, _ in chunk]
+            cont_ids = [cont for _, cont in chunk]
             results.extend(self._loglikelihood_token_ids(ctx_ids, cont_ids))
 
         return results

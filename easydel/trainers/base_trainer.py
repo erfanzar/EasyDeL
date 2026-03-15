@@ -50,6 +50,11 @@ from easydel.data.sources.hf_wrapper import wrap_hf_dataset
 from easydel.inference import SamplingParams
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.elarge.benchmarking import (
+    flatten_benchmark_metrics,
+    normalize_benchmark_configs,
+    run_lm_eval_with_esurge,
+)
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.factory import TaskType
 from easydel.infra.loss_utils import LossMetrics
@@ -716,7 +721,9 @@ class BaseTrainer(BaseTrainerProtocol):
         self.generate_function = getattr(self, "generate_function", None)
         self.generate_function_with_model_kwargs = getattr(self, "generate_function_with_model_kwargs", None)
         self.latest_generation_samples = getattr(self, "latest_generation_samples", [])
+        self.latest_benchmark_results = getattr(self, "latest_benchmark_results", {})
         self.preview_log_table = getattr(self, "preview_log_table", None)
+        self.benchmark_log_table = getattr(self, "benchmark_log_table", None)
         rng = getattr(self, "_generation_rng", None)
         seed = self.arguments.generation_seed
         if rng is None:
@@ -1548,32 +1555,7 @@ class BaseTrainer(BaseTrainerProtocol):
             if not prompts:
                 raise ValueError("No prompts available for eSurge generation")
 
-            # Build sampling params
-
-            # Build eSurge engine kwargs
-            esurge_kwargs = {}
-            if args.esurge_hbm_utilization is not None:
-                esurge_kwargs["hbm_utilization"] = args.esurge_hbm_utilization
-            if args.esurge_max_num_seqs is not None:
-                esurge_kwargs["max_num_seqs"] = args.esurge_max_num_seqs
-            else:
-                esurge_kwargs["max_num_seqs"] = (args.generation_num_return_sequences or 1) * args.total_batch_size
-            if args.esurge_min_input_pad is not None:
-                esurge_kwargs["min_input_pad"] = args.esurge_min_input_pad
-            if args.esurge_page_size is not None:
-                esurge_kwargs["page_size"] = args.esurge_page_size
-            if hasattr(args, "esurge_silent_mode"):
-                esurge_kwargs["silent_mode"] = args.esurge_silent_mode
-            if hasattr(args, "esurge_runner_verbose"):
-                esurge_kwargs["runner_verbose"] = args.esurge_runner_verbose
-            if args.esurge_max_num_batched_tokens is not None:
-                esurge_kwargs["max_num_batched_tokens"] = args.esurge_max_num_batched_tokens
-            if args.esurge_enable_prefix_caching is not None:
-                esurge_kwargs["enable_prefix_caching"] = args.esurge_enable_prefix_caching
-            if args.esurge_data_parallelism_axis is not None:
-                esurge_kwargs["data_parallelism_axis"] = args.esurge_data_parallelism_axis
-            if args.esurge_max_num_seq_buckets is not None:
-                esurge_kwargs["max_num_seq_buckets"] = [int(v) for v in args.esurge_max_num_seq_buckets]
+            esurge_kwargs = self._esurge_init_kwargs()
             effective_prompt_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
             # eSurge reserves a few tokens from the context budget (defaults to
             # `reserve_tokens = max_num_seqs`). When we tightly pack
@@ -1595,7 +1577,6 @@ class BaseTrainer(BaseTrainerProtocol):
                 f" top_k={sampling_params.top_k},"
                 f" n={sampling_params.n})"
             )
-            esurge_kwargs["tokenizer"] = processor
             esurge_engine = None
             try:
                 esurge_engine = state.model.get_esurge(**esurge_kwargs)
@@ -2270,6 +2251,153 @@ class BaseTrainer(BaseTrainerProtocol):
             results.append({"prompt": prompt_text, "completions": completions, "step": step})
 
         _finalize_preview_results(results)
+
+    def _esurge_init_kwargs(
+        self,
+        *,
+        max_num_seqs: int | None = None,
+    ) -> dict[str, tp.Any]:
+        args = self.arguments
+        esurge_kwargs: dict[str, tp.Any] = {}
+        if args.esurge_hbm_utilization is not None:
+            esurge_kwargs["hbm_utilization"] = args.esurge_hbm_utilization
+        if args.esurge_max_num_seqs is not None:
+            esurge_kwargs["max_num_seqs"] = args.esurge_max_num_seqs
+        elif max_num_seqs is not None:
+            esurge_kwargs["max_num_seqs"] = int(max_num_seqs)
+        else:
+            max_num_seqs = (args.generation_num_return_sequences or 1) * args.total_batch_size
+            esurge_kwargs["max_num_seqs"] = max_num_seqs
+        if args.esurge_min_input_pad is not None:
+            esurge_kwargs["min_input_pad"] = args.esurge_min_input_pad
+        if args.esurge_page_size is not None:
+            esurge_kwargs["page_size"] = args.esurge_page_size
+        if hasattr(args, "esurge_silent_mode"):
+            esurge_kwargs["silent_mode"] = args.esurge_silent_mode
+        if hasattr(args, "esurge_runner_verbose"):
+            esurge_kwargs["runner_verbose"] = args.esurge_runner_verbose
+        if args.esurge_max_num_batched_tokens is not None:
+            esurge_kwargs["max_num_batched_tokens"] = args.esurge_max_num_batched_tokens
+        if args.esurge_enable_prefix_caching is not None:
+            esurge_kwargs["enable_prefix_caching"] = args.esurge_enable_prefix_caching
+        if args.esurge_data_parallelism_axis is not None:
+            esurge_kwargs["data_parallelism_axis"] = args.esurge_data_parallelism_axis
+        if args.esurge_max_num_seq_buckets is not None:
+            esurge_kwargs["max_num_seq_buckets"] = [int(v) for v in args.esurge_max_num_seq_buckets]
+        processor = self._get_processing_class()
+        if processor is not None:
+            esurge_kwargs["tokenizer"] = processor
+        return esurge_kwargs
+
+    def maybe_benchmark(
+        self,
+        state: EasyDeLState,
+        step: int,
+    ) -> None:
+        """Optionally run configured lm-eval benchmark suites during training."""
+
+        args = self.arguments
+        if args is None:
+            return
+
+        interval = args.benchmark_interval
+        if interval is None:
+            return
+        if interval <= 0 or step % interval != 0:
+            return
+
+        benchmark_cfgs = normalize_benchmark_configs(args.benchmarks)
+        if not benchmark_cfgs:
+            return
+
+        processor = self._get_processing_class()
+        if processor is None:
+            logger.warning("Skipping benchmark hook: no tokenizer/processing_class is attached to the trainer.")
+            return
+
+        model_config = getattr(state.model, "config", None)
+        max_length = getattr(model_config, "granted_freq_max_position_embedding", None)
+        if max_length is None:
+            max_length = getattr(model_config, "max_position_embeddings", None)
+        if max_length is None:
+            max_length = args.max_length or 8192
+
+        esurge_engine = None
+        benchmark_results: dict[str, dict[str, tp.Any]] = {}
+        flat_metrics: dict[str, float] = {}
+
+        try:
+            esurge_engine = state.model.get_esurge(**self._esurge_init_kwargs())
+            fallback_batch_size = args.esurge_max_num_seqs or args.eval_batch_size or args.total_batch_size
+            for benchmark in benchmark_cfgs:
+                logger.info(f"[benchmark step {step}] running {benchmark.name}: {benchmark.tasks}")
+                result = run_lm_eval_with_esurge(
+                    surge=esurge_engine,
+                    processor=processor,
+                    tasks=benchmark.tasks,
+                    max_length=int(max_length),
+                    fallback_batch_size=fallback_batch_size,
+                    eval_config=benchmark.eval_kwargs,
+                    stop_engine=False,
+                    summary_logger=logger,
+                )
+                benchmark_results[benchmark.name] = result
+                flat_metrics.update(flatten_benchmark_metrics(benchmark.name, result))
+        finally:
+            try:
+                state.model.pause_esurge(release_model_state=True, clear_compiled_cache=False)
+            except Exception as exc:  # pragma: no cover - best-effort cleanup
+                log_debug_maybe(f"Failed to release benchmark runtime: {exc}")
+
+        if not benchmark_results:
+            return
+
+        self.latest_benchmark_results = benchmark_results
+        self._log_benchmark_results_to_wandb(step=step, benchmark_results=benchmark_results)
+        if flat_metrics:
+            self.arguments.log_metrics(metrics=flat_metrics, step=step)
+
+    def _log_benchmark_results_to_wandb(
+        self,
+        *,
+        step: int,
+        benchmark_results: dict[str, dict[str, tp.Any]],
+    ) -> None:
+        """Log benchmark summaries to W&B as an incremental table."""
+
+        args = self.arguments
+        if args is None or wandb is None or not args.use_wandb or not args.can_log_metrics:
+            return
+
+        if self.benchmark_log_table is None:
+            self.benchmark_log_table = wandb.Table(
+                columns=["step", "benchmark", "task", "metric", "value"],
+                log_mode="INCREMENTAL",
+            )
+
+        rows_added = False
+        for benchmark_name, result in benchmark_results.items():
+            result_metrics = result.get("results", {})
+            if not isinstance(result_metrics, collections.abc.Mapping):
+                continue
+            for task_name, metrics in result_metrics.items():
+                if not isinstance(metrics, collections.abc.Mapping):
+                    continue
+                for metric_name, value in metrics.items():
+                    numeric_value: float | None = None
+                    if isinstance(value, bool):
+                        numeric_value = float(value)
+                    elif isinstance(value, int | float):
+                        numeric_value = float(value)
+                    if numeric_value is None:
+                        continue
+                    self.benchmark_log_table.add_data(
+                        step, benchmark_name, str(task_name), str(metric_name), numeric_value
+                    )
+                    rows_added = True
+
+        if rows_added:
+            wandb.log({"benchmark_results": self.benchmark_log_table}, step=step)
 
     def _one_to_all(self, arr: jax.Array) -> jax.Array:
         """Distribute array from one device to all devices.

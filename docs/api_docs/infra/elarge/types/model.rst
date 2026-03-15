@@ -1,7 +1,7 @@
-easydel.infra.elarge_model.types
+easydel.infra.elarge.types.model
 ================================
 
-.. automodule:: easydel.infra.elarge_model.types
+.. automodule:: easydel.infra.elarge.types.model
    :members:
    :undoc-members:
    :show-inheritance:

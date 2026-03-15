@@ -33,7 +33,7 @@ Key Functions:
     - build_sharded_source: Creates efficient ShardedDataSource for streaming
 
 Example:
-    >>> from easydel.infra.elarge_model import builders
+    >>> from easydel.infra.elarge import builders
     >>> cfg = {
     ...     "model": {"name_or_path": "meta-llama/Llama-2-7b", "task": "causal_lm"},
     ...     "loader": {"dtype": "bf16"},
@@ -74,9 +74,8 @@ from easydel.modules.auto import (
     AutoEasyDeLModelForZeroShotImageClassification,
 )
 
-from .normalizer import materialize_base_config, normalize, resolve_task
+from .processing import coerce_dtype, coerce_precision, materialize_base_config, normalize, resolve_task
 from .types import ELMConfig
-from .utils import coerce_dtype, coerce_precision
 
 
 def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:

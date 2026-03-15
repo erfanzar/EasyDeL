@@ -39,14 +39,58 @@ class _DummyProcessor:
     eos_token_id = 1
     padding_side = "right"
 
+    def __init__(self) -> None:
+        self.last_chat_template_kwargs: dict[str, object] = {}
+
     def apply_chat_template(
         self,
         messages: list[dict[str, str]],
         tokenize: bool = False,
         add_generation_prompt: bool = True,
+        **kwargs,
     ) -> str:
         """Return a deterministic chat template rendering."""
+        self.last_chat_template_kwargs = {
+            "messages": list(messages),
+            "tokenize": tokenize,
+            "add_generation_prompt": add_generation_prompt,
+            **kwargs,
+        }
         return "dummy-template"
+
+    def encode(self, string: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return [ord(ch) for ch in string]
+
+    def decode(
+        self,
+        tokens,
+        skip_special_tokens: bool = False,
+        spaces_between_special_tokens: bool = False,
+    ) -> str:
+        del skip_special_tokens, spaces_between_special_tokens
+        return "".join(chr(int(token)) for token in tokens)
+
+
+class _BoundaryAwareProcessor(_DummyProcessor):
+    """Processor stub with boundary-sensitive tokenization for scoring tests."""
+
+    bos_token_id = 11
+    eos_token_id = 12
+
+    def encode(self, string: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        table = {
+            "hello": [1],
+            "world": [2],
+            " world": [3],
+            "hello world": [1, 3],
+            "<bos>answer": [11, 21],
+            "answer": [21],
+        }
+        if string in table:
+            return list(table[string])
+        return super().encode(string, add_special_tokens=False)
 
 
 class _ThinkingProcessor(_DummyProcessor):
@@ -61,10 +105,41 @@ class _ThinkingProcessor(_DummyProcessor):
         tokenize: bool = False,
         add_generation_prompt: bool = True,
         enable_thinking: bool = True,
+        **kwargs,
     ) -> str:
         """Capture the thinking flag while returning a stable template."""
         self.last_enable_thinking = enable_thinking
+        self.last_chat_template_kwargs = {
+            "messages": list(messages),
+            "tokenize": tokenize,
+            "add_generation_prompt": add_generation_prompt,
+            "enable_thinking": enable_thinking,
+            **kwargs,
+        }
         return "thinking-template"
+
+
+class _EmptyReasoningScaffoldProcessor(_DummyProcessor):
+    """Processor stub that injects an empty reasoning scaffold when continuing."""
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        tokenize: bool = False,
+        add_generation_prompt: bool = True,
+        continue_final_message: bool = False,
+        enable_thinking: bool = True,
+        **kwargs,
+    ) -> str:
+        self.last_chat_template_kwargs = {
+            "messages": list(messages),
+            "tokenize": tokenize,
+            "add_generation_prompt": add_generation_prompt,
+            "continue_final_message": continue_final_message,
+            "enable_thinking": enable_thinking,
+            **kwargs,
+        }
+        return "<|im_start|>assistant\n<think>\n\n</think>\n\nprefix"
 
 
 class _DummySurge:
@@ -77,6 +152,26 @@ class _DummySurge:
 
     runner = _Runner()
     _scheduler_running = True
+
+    @property
+    def think_start_token(self) -> str | None:
+        return "<think>"
+
+    @property
+    def think_end_token(self) -> str | None:
+        return "</think>"
+
+
+class _NoReasoningMetadataSurge(_DummySurge):
+    """Minimal surge stub without exposed reasoning boundary metadata."""
+
+    @property
+    def think_start_token(self) -> str | None:
+        return None
+
+    @property
+    def think_end_token(self) -> str | None:
+        return None
 
 
 class _DummyTokenizer:
@@ -144,6 +239,50 @@ def test_esurge_eval_rejects_non_iterable_math_hint_input(monkeypatch):
             _DummyProcessor(),
             math_answer_task_hints=False,
         )
+
+
+def test_esurge_eval_prefix_token_id_prefers_bos(monkeypatch):
+    monkeypatch.setattr(eSurgeLMEvalAdapter, "_setup", lambda self: None)
+
+    adapter = eSurgeLMEvalAdapter(
+        _DummySurge(),
+        _BoundaryAwareProcessor(),
+    )
+
+    assert adapter.prefix_token_id == 11
+
+
+def test_esurge_eval_loglikelihood_matches_template_lm_pair_encoding(monkeypatch):
+    monkeypatch.setattr(eSurgeLMEvalAdapter, "_setup", lambda self: None)
+
+    adapter = eSurgeLMEvalAdapter(
+        _DummySurge(),
+        _BoundaryAwareProcessor(),
+        batch_size=8,
+    )
+
+    captured: list[tuple[list[list[int]], list[list[int]]]] = []
+
+    def _capture(ctx_ids, cont_ids):
+        captured.append((ctx_ids, cont_ids))
+        return [(0.0, True)] * len(ctx_ids)
+
+    monkeypatch.setattr(adapter, "_loglikelihood_token_ids", _capture)
+
+    instances = [
+        SimpleNamespace(args=("hello ", "world")),
+        SimpleNamespace(args=("", "<bos>answer")),
+    ]
+
+    result = adapter.loglikelihood(instances)
+
+    assert result == [(0.0, True), (0.0, True)]
+    assert captured == [
+        (
+            [[1], [11]],
+            [[3], [21]],
+        )
+    ]
 
 
 def test_esurge_eval_accepts_single_string_math_hint(monkeypatch):
@@ -358,6 +497,149 @@ def test_esurge_eval_chat_template_can_enable_tokenizer_thinking():
     assert processor.last_enable_thinking is True
 
 
+def test_esurge_eval_chat_template_forwards_chat_template_args():
+    """Additional chat-template kwargs should be forwarded to the tokenizer."""
+    processor = _ThinkingProcessor()
+    adapter = eSurgeLMEvalAdapter(
+        _DummySurge(),
+        processor,
+        chat_template_args={"foo": "bar"},
+    )
+
+    rendered = adapter.apply_chat_template(
+        [{"role": "user", "content": "hello"}],
+        add_generation_prompt=True,
+    )
+
+    assert rendered == "thinking-template"
+    assert processor.last_chat_template_kwargs["foo"] == "bar"
+
+
+def test_esurge_eval_chat_template_strips_empty_reasoning_scaffold_when_thinking_disabled():
+    """Rendered prompts should drop inert empty reasoning blocks for non-thinking evals."""
+    processor = _EmptyReasoningScaffoldProcessor()
+    adapter = eSurgeLMEvalAdapter(_DummySurge(), processor, enable_thinking=False)
+
+    rendered = adapter.apply_chat_template(
+        [{"role": "assistant", "content": "prefix"}],
+        add_generation_prompt=False,
+    )
+
+    assert rendered == "<|im_start|>assistant\nprefix"
+
+
+def test_esurge_eval_chat_template_strips_literal_empty_reasoning_scaffold_without_metadata():
+    """Prompt cleanup should still remove the common literal scaffold without parser metadata."""
+    processor = _EmptyReasoningScaffoldProcessor()
+    adapter = eSurgeLMEvalAdapter(_NoReasoningMetadataSurge(), processor, enable_thinking=False)
+
+    rendered = adapter.apply_chat_template(
+        [{"role": "assistant", "content": "prefix"}],
+        add_generation_prompt=False,
+    )
+
+    assert rendered == "<|im_start|>assistant\nprefix"
+
+
+def test_esurge_eval_uses_vllm_style_detokenization_defaults_for_generation():
+    """Eval generations should disable spaces_between_special_tokens by default."""
+    surge = _RecordingSurge()
+    adapter = eSurgeLMEvalAdapter(_DummySurge(), _DummyProcessor())
+    adapter.surge = surge
+
+    outputs = adapter.generate_until(
+        [
+            SimpleNamespace(arguments=["prompt", {"until": []}], task_name="task"),
+        ]
+    )
+
+    assert outputs == ["pass"]
+    sampling_params = surge.calls[0]["sampling_params"]
+    assert sampling_params.skip_special_tokens is False
+    assert sampling_params.spaces_between_special_tokens is False
+
+
+def test_esurge_eval_can_strip_reasoning_prefix_with_think_end_token():
+    """Visible eval text should be recoverable from raw outputs containing thinking blocks."""
+    surge = _RecordingSurge()
+    adapter = eSurgeLMEvalAdapter(
+        _DummySurge(),
+        _DummyProcessor(),
+        think_end_token="</think>",
+    )
+    adapter.surge = surge
+
+    def _generate_reasoning_prefixed(
+        prompts: list[str],
+        sampling_params: SamplingParams,
+        request_id: list[str],
+        use_tqdm: bool = False,
+    ) -> list[_FakeGenerateOutput]:
+        del prompts, sampling_params, use_tqdm
+        return [_FakeGenerateOutput(rid, text="<think>plan</think>def answer():\n    return 42") for rid in request_id]
+
+    surge.generate = _generate_reasoning_prefixed
+
+    outputs = adapter.generate_until(
+        [
+            SimpleNamespace(arguments=["prompt", {"until": []}], task_name="task"),
+        ]
+    )
+
+    assert outputs == ["def answer():\n    return 42"]
+
+
+def test_esurge_eval_preserves_indentation_after_think_end_token():
+    """Reasoning cleanup should not strip visible indentation from code completions."""
+    surge = _RecordingSurge()
+    adapter = eSurgeLMEvalAdapter(
+        _DummySurge(),
+        _DummyProcessor(),
+        think_end_token="</think>",
+    )
+    adapter.surge = surge
+
+    def _generate_indented_completion(
+        prompts: list[str],
+        sampling_params: SamplingParams,
+        request_id: list[str],
+        use_tqdm: bool = False,
+    ) -> list[_FakeGenerateOutput]:
+        del prompts, sampling_params, use_tqdm
+        return [_FakeGenerateOutput(rid, text="<think>plan</think>\n    return 42") for rid in request_id]
+
+    surge.generate = _generate_indented_completion
+
+    outputs = adapter.generate_until(
+        [
+            SimpleNamespace(arguments=["prompt", {"until": []}], task_name="task"),
+        ]
+    )
+
+    assert outputs == ["\n    return 42"]
+
+
+def test_esurge_eval_pretruncates_generation_prompts_like_vllm():
+    """Prompt text should be truncated before dispatch so eval matches lm-eval backends more closely."""
+    surge = _RecordingSurge()
+    adapter = eSurgeLMEvalAdapter(
+        _DummySurge(),
+        _DummyProcessor(),
+        max_length=6,
+        max_new_tokens=2,
+    )
+    adapter.surge = surge
+
+    outputs = adapter.generate_until(
+        [
+            SimpleNamespace(arguments=["abcdef", {"until": [], "max_gen_toks": 2}], task_name="task"),
+        ]
+    )
+
+    assert outputs == ["pass"]
+    assert surge.calls[0]["prompts"] == ["cdef"]
+
+
 def test_engine_default_can_enable_reasoning_aware_stop_matching():
     """Engine defaults should propagate parser-aware stop matching to requests."""
     harness = _ParsingHarness()
@@ -369,6 +651,20 @@ def test_engine_default_can_enable_reasoning_aware_stop_matching():
     )
 
     assert prepared.ignore_stop_strings_in_reasoning is True
+
+
+def test_esurge_exposes_reasoning_boundary_token_properties():
+    """Engine metadata should expose the active parser's think delimiters."""
+    engine = object.__new__(ed.eSurge)
+    engine._reasoning_parser_class = Qwen3ReasoningParser
+    engine.tokenizer = _DummyTokenizer()
+    engine._scheduler_running = False
+    engine._monitoring_initialized = False
+    engine._profiling_active = False
+    engine.runner = SimpleNamespace(shutdown=lambda: None)
+
+    assert engine.think_start_token == "<think>"
+    assert engine.think_end_token == "</think>"
 
 
 def test_stop_strings_can_ignore_matches_inside_reasoning():

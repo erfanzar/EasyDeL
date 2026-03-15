@@ -31,7 +31,7 @@ The configuration is organized into several sections:
 Example:
     Access default configuration values::
 
-        from easydel.infra.elarge_model.defaults import DEFAULTS
+        from easydel.infra.elarge.defaults import DEFAULTS
 
         # Get default dtype for model loading
         default_dtype = DEFAULTS["loader"]["dtype"]  # Returns "bf16"
@@ -48,11 +48,11 @@ Attributes:
     DEFAULTS (ELMConfig): A dictionary containing all default configuration
         values for the ELM system. This includes settings for model loading,
         sharding strategies, quantization, base configuration, inference
-        engine (ESurge), and data mixture handling.
+        engine (eSurge), and data mixture handling.
 
 See Also:
-    - :mod:`easydel.infra.elarge_model.types`: Type definitions for ELMConfig.
-    - :mod:`easydel.infra.elarge_model`: Main ELM module documentation.
+    - :mod:`easydel.infra.elarge.types`: Type definitions for ELMConfig.
+    - :mod:`easydel.infra.elarge`: Main ELM module documentation.
 """
 
 from __future__ import annotations

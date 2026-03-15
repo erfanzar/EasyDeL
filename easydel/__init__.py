@@ -349,6 +349,7 @@ _import_structure = {
         "Rngs",
         "auto_pytree",
         "eLargeModel",
+        "BenchmarkConfig",
         "escale",
         "init_cluster",
     ],
@@ -942,6 +943,7 @@ if _tp.TYPE_CHECKING:
     )
     from .inference.evaluations import eSurgeLMEvalAdapter
     from .infra import (
+        BenchmarkConfig,
         EasyDeLBaseConfig,
         EasyDeLBaseConfigDict,
         EasyDeLBaseModule,

@@ -4,7 +4,7 @@ easydel.infra package
 .. toctree::
    :maxdepth: 2
 
-   elarge_model/index
+   elarge/index
    mixins/index
    base_config
    base_module

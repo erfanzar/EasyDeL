@@ -1,5 +1,5 @@
-from easydel.infra.elarge_model.builders import to_esurge_kwargs
-from easydel.infra.elarge_model.elarge_model import eLargeModel
+from easydel.infra.elarge.builders import to_esurge_kwargs
+from easydel.infra.elarge.model import eLargeModel
 
 
 def test_to_esurge_kwargs_forwards_string_extra_stops():

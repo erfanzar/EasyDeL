@@ -1,5 +1,5 @@
-from easydel.infra.elarge_model.builders import to_from_pretrained_kwargs
-from easydel.infra.elarge_model.elarge_model import eLargeModel
+from easydel.infra.elarge.builders import to_from_pretrained_kwargs
+from easydel.infra.elarge.model import eLargeModel
 
 
 def test_to_from_pretrained_kwargs_materializes_qmm_quantization_overrides():
