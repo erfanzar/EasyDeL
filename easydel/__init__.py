@@ -418,8 +418,10 @@ _import_structure = {
         "AutoEasyDeLModel",
         "AutoEasyDeLModelForCausalLM",
         "AutoEasyDeLModelForDiffusionLM",
+        "AutoEasyDeLModelForEmbedding",
         "AutoEasyDeLModelForImageTextToText",
         "AutoEasyDeLModelForSeq2SeqLM",
+        "AutoEasyDeLModelForEmbedding",
         "AutoEasyDeLModelForSequenceClassification",
         "AutoEasyDeLModelForSpeechSeq2Seq",
         "AutoEasyDeLModelForZeroShotImageClassification",
@@ -429,6 +431,7 @@ _import_structure = {
         "AutoStateAnyToAnyModel",
         "AutoStateForCausalLM",
         "AutoStateForDiffusionLM",
+        "AutoStateForEmbedding",
         "AutoStateForImageSequenceClassification",
         "AutoStateForImageTextToText",
         "AutoStateForSeq2SeqLM",
@@ -737,6 +740,7 @@ _import_structure = {
     "modules.qwen2": [
         "Qwen2Config",
         "Qwen2ForCausalLM",
+        "Qwen2ForEmbedding",
         "Qwen2ForSequenceClassification",
         "Qwen2Model",
     ],
@@ -772,6 +776,7 @@ _import_structure = {
     "modules.qwen3": [
         "Qwen3Config",
         "Qwen3ForCausalLM",
+        "Qwen3ForEmbedding",
         "Qwen3ForSequenceClassification",
         "Qwen3Model",
     ],
@@ -885,8 +890,12 @@ _import_structure = {
         "CPOTrainer",
         "DistillationConfig",
         "DistillationTrainer",
+        "EmbeddingConfig",
+        "EmbeddingTrainer",
         "DPOConfig",
         "DPOTrainer",
+        "AgenticMoshPitConfig",
+        "AgenticMoshPitTrainer",
         "GFPOConfig",
         "GFPOTrainer",
         "GKDConfig",
@@ -901,6 +910,8 @@ _import_structure = {
         "NashMDTrainer",
         "PPOConfig",
         "PPOTrainer",
+        "RLVRConfig",
+        "RLVRTrainer",
         "XPOConfig",
         "XPOTrainer",
         "OnPolicyDistillationConfig",
@@ -976,6 +987,7 @@ if _tp.TYPE_CHECKING:
         AutoEasyDeLModel,
         AutoEasyDeLModelForCausalLM,
         AutoEasyDeLModelForDiffusionLM,
+        AutoEasyDeLModelForEmbedding,
         AutoEasyDeLModelForImageTextToText,
         AutoEasyDeLModelForSeq2SeqLM,
         AutoEasyDeLModelForSequenceClassification,
@@ -987,6 +999,7 @@ if _tp.TYPE_CHECKING:
         AutoStateAnyToAnyModel,
         AutoStateForCausalLM,
         AutoStateForDiffusionLM,
+        AutoStateForEmbedding,
         AutoStateForImageSequenceClassification,
         AutoStateForImageTextToText,
         AutoStateForSeq2SeqLM,
@@ -1100,10 +1113,22 @@ if _tp.TYPE_CHECKING:
     from .modules.phi3 import Phi3Config, Phi3ForCausalLM, Phi3Model
     from .modules.phimoe import PhiMoeConfig, PhiMoeForCausalLM, PhiMoeModel
     from .modules.pixtral import PixtralVisionConfig, PixtralVisionModel
-    from .modules.qwen2 import Qwen2Config, Qwen2ForCausalLM, Qwen2ForSequenceClassification, Qwen2Model
+    from .modules.qwen2 import (
+        Qwen2Config,
+        Qwen2ForCausalLM,
+        Qwen2ForEmbedding,
+        Qwen2ForSequenceClassification,
+        Qwen2Model,
+    )
     from .modules.qwen2_moe import Qwen2MoeConfig, Qwen2MoeForCausalLM, Qwen2MoeForSequenceClassification, Qwen2MoeModel
     from .modules.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration, Qwen2VLModel
-    from .modules.qwen3 import Qwen3Config, Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
+    from .modules.qwen3 import (
+        Qwen3Config,
+        Qwen3ForCausalLM,
+        Qwen3ForEmbedding,
+        Qwen3ForSequenceClassification,
+        Qwen3Model,
+    )
     from .modules.qwen3_5 import (
         Qwen3_5Config,
         Qwen3_5ForCausalLM,
@@ -1221,6 +1246,8 @@ if _tp.TYPE_CHECKING:
         VanillaAttn,
     )
     from .trainers import (
+        AgenticMoshPitConfig,
+        AgenticMoshPitTrainer,
         BaseTrainer,
         BCOConfig,
         BCOTrainer,
@@ -1230,6 +1257,8 @@ if _tp.TYPE_CHECKING:
         DistillationTrainer,
         DPOConfig,
         DPOTrainer,
+        EmbeddingConfig,
+        EmbeddingTrainer,
         GFPOConfig,
         GFPOTrainer,
         GKDConfig,
@@ -1249,6 +1278,8 @@ if _tp.TYPE_CHECKING:
         RayDistributedTrainer,
         RewardConfig,
         RewardTrainer,
+        RLVRConfig,
+        RLVRTrainer,
         SDPOConfig,
         SDPOTrainer,
         SeqKDConfig,

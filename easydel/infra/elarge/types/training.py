@@ -66,6 +66,8 @@ from .eval import BenchmarkConfig
 
 _TRAINER_TYPE_ALIASES: dict[str, str] = {
     "nash_md": "nash-md",
+    "agentic_moshpit": "agentic-moshpit",
+    "rlvr_trainer": "rlvr",
 }
 """Mapping of trainer type aliases to their canonical forms.
 
@@ -370,6 +372,10 @@ class BaseTrainerCfg(TypedDict, total=False):
             "on_policy_distillation",
             "seq_kd",
             "sparse_distillation",
+            "agentic-moshpit",
+            "agentic_moshpit",
+            "rlvr",
+            "embedding",
         ]
     ]
     learning_rate: NotRequired[float]
@@ -713,6 +719,93 @@ class GRPOTrainerCfg(BaseTrainerCfg):
     top_p: NotRequired[float]
     top_k: NotRequired[int]
     temperature: NotRequired[float]
+
+
+class AgenticMoshPitTrainerCfg(GRPOTrainerCfg):
+    """Configuration for Agentic MoshPit trainer (AgenticMoshPitConfig).
+
+    Agentic MoshPit extends GRPO with multi-turn environment interaction,
+    where the model acts as an agent that interacts with environments
+    over multiple turns with optional tool-calling support.
+
+    Attributes:
+        max_steps: Maximum number of environment steps per episode.
+        group_size: Number of rollouts per environment seed for grouping.
+        num_env_groups: Number of distinct environment seeds per batch.
+        reward_mode: How rewards are computed: "episode", "step", or "gigpo".
+        advantage_estimator: Advantage method: "grpo", "reinforce", "gigpo",
+            "step_reinforce", or "agentic_reinforce".
+        step_reward_gamma: Discount factor for step-level rewards.
+        episode_reward_weight: Weight for episode rewards in GiGPO mode.
+        step_reward_weight: Weight for step rewards in GiGPO mode.
+        system_prompt: System prompt prepended to agent conversations.
+        tool_names: List of registered tool names to make available.
+        tool_call_parser: Tool call parser variant.
+        max_tool_calls_per_step: Maximum tool calls per agent turn.
+
+    Example:
+        >>> config: AgenticMoshPitTrainerCfg = {
+        ...     "trainer_type": "agentic-moshpit",
+        ...     "max_steps": 10,
+        ...     "group_size": 4,
+        ...     "num_env_groups": 8,
+        ...     "reward_mode": "episode",
+        ...     "advantage_estimator": "grpo",
+        ... }
+    """
+
+    max_steps: NotRequired[int]
+    group_size: NotRequired[int]
+    num_env_groups: NotRequired[int]
+    reward_mode: NotRequired[Literal["episode", "step", "gigpo"]]
+    advantage_estimator: NotRequired[Literal["grpo", "reinforce", "gigpo", "step_reinforce", "agentic_reinforce"]]
+    step_reward_gamma: NotRequired[float]
+    episode_reward_weight: NotRequired[float]
+    step_reward_weight: NotRequired[float]
+    system_prompt: NotRequired[str | None]
+    tool_names: NotRequired[list[str] | None]
+    tool_caller: NotRequired[str | None]
+    max_tool_calls_per_step: NotRequired[int]
+    reasoning_parser: NotRequired[str | None]
+
+
+class RLVRTrainerCfg(GRPOTrainerCfg):
+    """Configuration for Reinforcement Learning with Verifiable Rewards (RLVRConfig).
+
+    RLVR uses rule-based verifiable reward functions (math answer checking,
+    code test execution, format compliance) instead of learned reward models.
+
+    Attributes:
+        answer_key: Dataset column containing gold answers.
+        test_key: Dataset column containing code test cases.
+        format_pattern: Regex pattern for format compliance checking.
+        format_reward_weight: Weight for format reward component.
+        length_penalty_target: Target length for length penalty. 0 disables.
+        length_penalty_weight: Weight for length penalty component.
+        max_len_mask: Mask completions without EOS from loss.
+        reward_clip_range: Clip rewards to [-range, range]. 0 disables.
+        difficulty_key: Dataset column for difficulty scores.
+        difficulty_loss_weight: Weight loss by difficulty.
+
+    Example:
+        >>> config: RLVRTrainerCfg = {
+        ...     "trainer_type": "rlvr",
+        ...     "answer_key": "answer",
+        ...     "num_return_sequences": 8,
+        ...     "max_completion_length": 2048,
+        ... }
+    """
+
+    answer_key: NotRequired[str]
+    test_key: NotRequired[str]
+    format_pattern: NotRequired[str | None]
+    format_reward_weight: NotRequired[float]
+    length_penalty_target: NotRequired[int]
+    length_penalty_weight: NotRequired[float]
+    max_len_mask: NotRequired[bool]
+    reward_clip_range: NotRequired[float]
+    difficulty_key: NotRequired[str | None]
+    difficulty_loss_weight: NotRequired[bool]
 
 
 class SDPOTrainerCfg(GRPOTrainerCfg):
@@ -1262,9 +1355,51 @@ class XPOTrainerCfg(GRPOTrainerCfg):
     missing_eos_penalty: NotRequired[float | None]
 
 
+class EmbeddingTrainerCfg(BaseTrainerCfg):
+    """Configuration for contrastive Embedding trainer (EmbeddingConfig).
+
+    Trains dense text embedding models using contrastive objectives such
+    as InfoNCE, MNRL, or triplet loss. Supports Matryoshka multi-dim
+    training for variable-size embeddings.
+
+    Attributes:
+        loss_type: Contrastive loss: "infonce", "triplet", or "mnrl".
+        temperature: Temperature for InfoNCE/MNRL similarity scaling.
+        margin: Margin for triplet loss.
+        query_field: Dataset column for query/anchor texts.
+        positive_field: Dataset column for positive texts.
+        negative_field: Dataset column for hard negative texts.
+        matryoshka_dims: Embedding dims for Matryoshka training.
+        normalize_embeddings: L2-normalize embeddings before loss.
+        pooling_strategy: Override pooling ("last", "mean", etc.).
+
+    Example:
+        >>> config: EmbeddingTrainerCfg = {
+        ...     "trainer_type": "embedding",
+        ...     "loss_type": "infonce",
+        ...     "temperature": 0.05,
+        ...     "learning_rate": 2e-5,
+        ...     "total_batch_size": 128,
+        ... }
+    """
+
+    loss_type: NotRequired[Literal["infonce", "triplet", "mnrl"]]
+    temperature: NotRequired[float]
+    margin: NotRequired[float]
+    query_field: NotRequired[str]
+    positive_field: NotRequired[str]
+    negative_field: NotRequired[str | None]
+    matryoshka_dims: NotRequired[list[int] | None]
+    normalize_embeddings: NotRequired[bool]
+    pooling_strategy: NotRequired[str | None]
+    dataset_num_proc: NotRequired[int | None]
+
+
 class TrainerConfig(
     ORPOTrainerCfg,
     GRPOTrainerCfg,
+    AgenticMoshPitTrainerCfg,
+    RLVRTrainerCfg,
     SDPOTrainerCfg,
     PPOTrainerCfg,
     SFTTrainerCfg,
@@ -1279,6 +1414,7 @@ class TrainerConfig(
     GKDTrainerCfg,
     NashMDTrainerCfg,
     XPOTrainerCfg,
+    EmbeddingTrainerCfg,
     BaseTrainerCfg,
     DPOTrainerCfg,
 ):
@@ -1431,6 +1567,79 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "ref_model_sync_steps": 64,
         "skip_apply_chat_template": False,
         "num_return_sequences": 1,
+        "top_p": 0.95,
+        "top_k": 50,
+        "temperature": 0.7,
+    },
+    "gfpo": {
+        "trainer_prefix": "GFPO",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "beta": 0.04,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 4,
+        "top_p": 0.95,
+        "top_k": 50,
+        "temperature": 0.7,
+    },
+    "gspo": {
+        "trainer_prefix": "GSPO",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 256,
+        "beta": 0.04,
+        "sync_ref_model": False,
+        "ref_model_mixup_alpha": 0.9,
+        "ref_model_sync_steps": 64,
+        "skip_apply_chat_template": False,
+        "num_return_sequences": 4,
+        "top_p": 0.95,
+        "top_k": 50,
+        "temperature": 0.7,
+    },
+    "agentic-moshpit": {
+        "trainer_prefix": "AgenticMoshPit",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 512,
+        "max_completion_length": 1024,
+        "beta": 0.04,
+        "max_steps": 10,
+        "group_size": 4,
+        "num_env_groups": 4,
+        "reward_mode": "episode",
+        "advantage_estimator": "grpo",
+        "step_reward_gamma": 0.95,
+        "episode_reward_weight": 1.0,
+        "step_reward_weight": 1.0,
+        "tool_caller": None,
+        "max_tool_calls_per_step": 5,
+        "top_p": 0.95,
+        "top_k": 50,
+        "temperature": 0.7,
+    },
+    "rlvr": {
+        "trainer_prefix": "RLVR",
+        "learning_rate": 1e-6,
+        "remove_unused_columns": False,
+        "max_prompt_length": 1024,
+        "max_completion_length": 2048,
+        "beta": 0.04,
+        "num_return_sequences": 8,
+        "answer_key": "answer",
+        "test_key": "tests",
+        "format_reward_weight": 0.0,
+        "length_penalty_target": 0,
+        "length_penalty_weight": 0.0,
+        "max_len_mask": True,
+        "reward_clip_range": 0.0,
+        "difficulty_loss_weight": False,
         "top_p": 0.95,
         "top_k": 50,
         "temperature": 0.7,
@@ -1624,6 +1833,18 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "top_k": 50,
         "temperature": 0.7,
     },
+    "embedding": {
+        "trainer_prefix": "Embedding",
+        "learning_rate": 2e-5,
+        "loss_type": "infonce",
+        "temperature": 0.05,
+        "margin": 0.2,
+        "query_field": "query",
+        "positive_field": "positive",
+        "normalize_embeddings": True,
+        "max_length": 512,
+        "remove_unused_columns": False,
+    },
 }
 """Trainer-specific default configuration overrides.
 
@@ -1810,7 +2031,8 @@ def get_trainer_class(trainer_type: str):
     Args:
         trainer_type: Type of trainer to retrieve. Supported values include:
             "sft", "dpo", "orpo", "grpo", "sdpo", "ppo", "reward", "distillation",
-            "kto", "bco", "cpo", "gkd", "nash-md", "xpo", "base".
+            "kto", "bco", "cpo", "gkd", "nash-md", "xpo", "base",
+            "agentic-moshpit", "rlvr".
             Case-insensitive with alias support.
 
     Returns:
@@ -1845,7 +2067,8 @@ def get_training_arguments_class(trainer_type: str):
     Args:
         trainer_type: Type of trainer configuration to retrieve. Supported values
             include: "sft", "dpo", "orpo", "grpo", "sdpo", "ppo", "reward", "distillation",
-            "kto", "bco", "cpo", "gkd", "nash-md", "xpo", "base".
+            "kto", "bco", "cpo", "gkd", "nash-md", "xpo", "base",
+            "agentic-moshpit", "rlvr".
             Case-insensitive with alias support.
 
     Returns:

@@ -149,7 +149,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
             kv_head_dim_size: Legacy alias for ``kv_lora_rank``.
             k_headdim: Legacy alias for ``kv_lora_rank``.
             v_headdim: Legacy alias for ``qk_rope_head_dim``.
-            hbm_utilization: Fraction of free HBM to allocate (0.0–1.0).
+            hbm_utilization: Fraction of free HBM to allocate (0.0-1.0).
             page_size: Number of tokens per page.
             version: Cache layout version (only ``"v1"`` is supported).
 
@@ -229,7 +229,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
                 packed_page_tokens * kv_dim_padded * bytes_av
             ),
             version="v1",
-            _kvdtype_str=DTYPE_TO_STRING_MAP[kvdtype],
+            _kvdtype_str=DTYPE_TO_STRING_MAP[kvdtype.type if hasattr(kvdtype, "type") else kvdtype],
         )
 
     @property

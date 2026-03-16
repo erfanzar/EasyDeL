@@ -724,7 +724,25 @@ class eSurge(
         self._idle_monitor_event = threading.Event()
         self._idle_monitor_thread: threading.Thread | None = None
 
-        # Tool calling and reasoning parser initialization
+        # Tool calling and reasoning parser initialization with auto-detection
+        _model_type: str | None = None
+        if not isinstance(model, str) and hasattr(model, "config"):
+            _model_type = getattr(model.config, "model_type", None)
+
+        if tool_parser is None and _model_type is not None:
+            from easydel.inference.tools.auto_detect import detect_tool_parser
+
+            _detected = detect_tool_parser(model_type=_model_type, tokenizer=self.tokenizer)
+            if _detected:
+                tool_parser = _detected
+
+        if reasoning_parser is None and _model_type is not None:
+            from easydel.inference.reasoning.auto_detect import detect_reasoning_parser
+
+            _detected = detect_reasoning_parser(model_type=_model_type, tokenizer=self.tokenizer)
+            if _detected:
+                reasoning_parser = _detected
+
         self.tool_parser_name = tool_parser
         self.reasoning_parser_name = reasoning_parser
         self._tool_parser_class = None

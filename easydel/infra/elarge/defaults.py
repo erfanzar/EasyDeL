@@ -45,13 +45,13 @@ Note:
     use cases on TPU/GPU hardware with tensor parallelism.
 
 Attributes:
-    DEFAULTS (ELMConfig): A dictionary containing all default configuration
+    DEFAULTS (eLMConfig): A dictionary containing all default configuration
         values for the ELM system. This includes settings for model loading,
         sharding strategies, quantization, base configuration, inference
         engine (eSurge), and data mixture handling.
 
 See Also:
-    - :mod:`easydel.infra.elarge.types`: Type definitions for ELMConfig.
+    - :mod:`easydel.infra.elarge.types`: Type definitions for eLMConfig.
     - :mod:`easydel.infra.elarge`: Main ELM module documentation.
 """
 
@@ -59,9 +59,9 @@ from __future__ import annotations
 
 import pathlib
 
-from .types import ELMConfig
+from .types import eLMConfig
 
-DEFAULTS: ELMConfig = {
+DEFAULTS: eLMConfig = {
     # Loader configuration: Controls how models are loaded into memory.
     # - dtype: The computation dtype for model forward passes (bf16 = bfloat16).
     # - param_dtype: The dtype used to store model parameters (bf16 = bfloat16).

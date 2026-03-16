@@ -750,6 +750,23 @@ class AutoStateForImageSequenceClassification(BaseAutoEasyState):
     _base = AutoEasyDeLModelForSequenceClassification
 
 
+class AutoEasyDeLModelForEmbedding(BaseAutoEasyModel):
+    """Auto loader for embedding models that produce dense vector representations.
+
+    Loads models registered under ``TaskType.EMBEDDING`` and wraps them with
+    pooling and optional L2 normalization for similarity-ready embeddings.
+    Compatible with models like GTE-Qwen2, E5-Mistral, BGE, and others.
+    """
+
+    model_task: TaskType = TaskType.EMBEDDING  # Static
+
+
+class AutoStateForEmbedding(BaseAutoEasyState):
+    """Loads saved states for embedding models."""
+
+    _base = AutoEasyDeLModelForEmbedding
+
+
 class AutoEasyDeLModel(BaseAutoEasyModel):
     """
     This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub

@@ -57,12 +57,13 @@ Example:
     ... )
 """
 
-from .modeling_qwen import Qwen2ForCausalLM, Qwen2ForSequenceClassification, Qwen2Model
+from .modeling_qwen import Qwen2ForCausalLM, Qwen2ForEmbedding, Qwen2ForSequenceClassification, Qwen2Model
 from .qwen_configuration import Qwen2Config
 
 __all__ = (
     "Qwen2Config",
     "Qwen2ForCausalLM",
+    "Qwen2ForEmbedding",
     "Qwen2ForSequenceClassification",
     "Qwen2Model",
 )

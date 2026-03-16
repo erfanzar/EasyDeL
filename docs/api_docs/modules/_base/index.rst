@@ -11,6 +11,7 @@ easydel.modules._base package
    _vlm_features
    causal_lm_module
    conditional_generation_module
+   embedding_module
    image_classification_module
    question_answering_module
    sequence_classification_module

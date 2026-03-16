@@ -27,7 +27,7 @@ Sub-modules:
     data: Dataset and mixture configs (DataMixtureCfg, TokenizationCfg).
     eval: Evaluation and benchmark configs (BenchmarkConfig, EvalKwargs).
     training: Trainer configs and defaults (TrainerConfig, LossConfig).
-    root: Top-level ELMConfig combining all sections.
+    root: Top-level eLMConfig combining all sections.
 """
 
 # Re-export TaskType for backward compatibility (originally imported via types.py)
@@ -59,10 +59,11 @@ from .eval import (
 from .infra import PlatformCfg, ShardingCfg
 from .model import LoaderCfg, ModelCfg, OperationConfigsDict
 from .quantization import EasyDeLQuantizationCfg, QuantizationCfg
-from .root import ELMConfig
+from .root import eLMConfig
 from .training import (
     BASE_TRAINER_DEFAULTS,
     TRAINER_SPECIFIC_DEFAULTS,
+    AgenticMoshPitTrainerCfg,
     BaseTrainerCfg,
     BCOTrainerCfg,
     CPOTrainerCfg,
@@ -77,6 +78,7 @@ from .training import (
     ORPOTrainerCfg,
     PPOTrainerCfg,
     RewardTrainerCfg,
+    RLVRTrainerCfg,
     SDPOTrainerCfg,
     SeqKDTrainerCfg,
     SFTTrainerCfg,
@@ -93,6 +95,7 @@ from .training import (
 __all__ = (
     "BASE_TRAINER_DEFAULTS",
     "TRAINER_SPECIFIC_DEFAULTS",
+    "AgenticMoshPitTrainerCfg",
     "BCOTrainerCfg",
     "BaseCfg",
     "BaseTrainerCfg",
@@ -107,7 +110,6 @@ __all__ = (
     "DatasetSaveCfg",
     "DatasetTypeLike",
     "DistillationTrainerCfg",
-    "ELMConfig",
     "EasyDeLQuantizationCfg",
     "EvalKwargs",
     "GKDTrainerCfg",
@@ -126,6 +128,7 @@ __all__ = (
     "PlatformCfg",
     "PrecisionLike",
     "QuantizationCfg",
+    "RLVRTrainerCfg",
     "ResolvedBenchmarkConfig",
     "RewardTrainerCfg",
     "SDPOTrainerCfg",
@@ -139,6 +142,7 @@ __all__ = (
     "TrainerConfig",
     "VisualDatasetInformCfg",
     "XPOTrainerCfg",
+    "eLMConfig",
     "eSurgeCfg",
     "get_trainer_class",
     "get_trainer_defaults",

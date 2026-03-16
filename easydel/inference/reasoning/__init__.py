@@ -22,6 +22,11 @@ Note:
 """
 
 from .abstract_reasoning import ReasoningParser, ReasoningParserManager
+from .auto_detect import (
+    detect_reasoning_parser,
+    get_reasoning_tags,
+    make_reasoning_stripper,
+)
 from .basic_parsers import BaseThinkingReasoningParser
 from .parsers import (
     DeepSeekR1ReasoningParser,
@@ -62,4 +67,7 @@ __all__ = (
     "SeedOSSReasoningParser",
     "Step3ReasoningParser",
     "Step3p5ReasoningParser",
+    "detect_reasoning_parser",
+    "get_reasoning_tags",
+    "make_reasoning_stripper",
 )

@@ -67,6 +67,7 @@ from easydel.modules.auto import (
     AutoEasyDeLModel,
     AutoEasyDeLModelForCausalLM,
     AutoEasyDeLModelForDiffusionLM,
+    AutoEasyDeLModelForEmbedding,
     AutoEasyDeLModelForImageTextToText,
     AutoEasyDeLModelForSeq2SeqLM,
     AutoEasyDeLModelForSequenceClassification,
@@ -75,10 +76,10 @@ from easydel.modules.auto import (
 )
 
 from .processing import coerce_dtype, coerce_precision, materialize_base_config, normalize, resolve_task
-from .types import ELMConfig
+from .types import eLMConfig
 
 
-def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
+def to_from_pretrained_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
     """Convert ELM configuration to kwargs for model.from_pretrained() calls.
 
     Extracts and transforms configuration values from various sections of an ELM
@@ -162,7 +163,7 @@ def to_from_pretrained_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[s
     )
 
 
-def build_model(cfg_like: ELMConfig | Mapping[str, Any]) -> EasyDeLBaseModule:
+def build_model(cfg_like: eLMConfig | Mapping[str, Any]) -> EasyDeLBaseModule:
     """Build an EasyDeL model from ELM configuration.
 
     Automatically selects the appropriate model class based on the task type
@@ -222,12 +223,14 @@ def build_model(cfg_like: ELMConfig | Mapping[str, Any]) -> EasyDeLBaseModule:
         return AutoEasyDeLModelForDiffusionLM.from_pretrained(**kw)
     if task == TaskType.SEQUENCE_CLASSIFICATION:
         return AutoEasyDeLModelForSequenceClassification.from_pretrained(**kw)
+    if task == TaskType.EMBEDDING:
+        return AutoEasyDeLModelForEmbedding.from_pretrained(**kw)
     if task == TaskType.ANY_TO_ANY:
         return AutoEasyDeLAnyToAnyModel.from_pretrained(**kw)
     return AutoEasyDeLModel.from_pretrained(**kw)
 
 
-def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
+def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
     """Convert ELM configuration to kwargs for eSurge initialization.
 
     Extracts eSurge-specific configuration values from the 'esurge' section
@@ -423,7 +426,7 @@ def to_esurge_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
     )
 
 
-def build_esurge(cfg_like: ELMConfig | Mapping[str, Any], model: EasyDeLBaseModule | None = None):
+def build_esurge(cfg_like: eLMConfig | Mapping[str, Any], model: EasyDeLBaseModule | None = None):
     """Build an eSurge inference engine from ELM configuration.
 
     Creates an eSurge instance with the model, tokenizer/processor, and inference
@@ -518,7 +521,7 @@ def build_esurge(cfg_like: ELMConfig | Mapping[str, Any], model: EasyDeLBaseModu
     )
 
 
-def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str, Any]:
+def to_data_mixture_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
     """Convert ELM configuration to kwargs for DatasetMixture creation.
 
     Transforms the 'mixture' configuration section into the format expected
@@ -687,7 +690,7 @@ def to_data_mixture_kwargs(cfg_like: ELMConfig | Mapping[str, Any]) -> dict[str,
     return kwargs
 
 
-def build_dataset(cfg_like: ELMConfig | Mapping[str, Any]) -> Dataset | IterableDataset | None:
+def build_dataset(cfg_like: eLMConfig | Mapping[str, Any]) -> Dataset | IterableDataset | None:
     """Build a dataset from ELM configuration with data mixture.
 
     Creates a unified dataset from the mixture configuration using the
@@ -985,7 +988,7 @@ def save_dataset(
 
 
 def build_tokenized_dataset(
-    cfg_like: ELMConfig | Mapping[str, Any],
+    cfg_like: eLMConfig | Mapping[str, Any],
     save: bool = True,
 ) -> Dataset | IterableDataset | tuple[Dataset | IterableDataset, str]:
     """Build, tokenize, and optionally save a dataset from ELM configuration.
@@ -1416,7 +1419,7 @@ def _create_source_from_inform(
     return LimitedShardedSource(source, num_rows) if num_rows is not None else source
 
 
-def build_sharded_source(cfg_like: ELMConfig | Mapping[str, Any]) -> "ShardedDataSource | None":
+def build_sharded_source(cfg_like: eLMConfig | Mapping[str, Any]) -> "ShardedDataSource | None":
     """Build a ShardedDataSource from ELM configuration.
 
     Creates a unified ShardedDataSource using the new streaming-first architecture

@@ -107,6 +107,15 @@ def test_coerce_runtime_dtype_fields_accepts_torch_dtype_strings():
     assert config.attn_dtype == jnp.dtype(jnp.float16)
 
 
+def test_coerce_runtime_dtype_fields_preserves_torch_dtype_objects():
+    torch = pytest.importorskip("torch")
+    config = EasyDeLBaseConfig()
+    config.dtype = torch.bfloat16
+    config._coerce_runtime_dtype_fields()
+    assert config.dtype is torch.bfloat16
+    assert config.torch_dtype is torch.bfloat16
+
+
 def test_coerce_runtime_dtype_fields_accepts_fp8_fp4_aliases():
     config = EasyDeLBaseConfig()
     config.dtype = "fp8"

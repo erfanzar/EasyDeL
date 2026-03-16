@@ -6,5 +6,6 @@ easydel.inference.reasoning package
 
    parsers/index
    abstract_reasoning
+   auto_detect
    basic_parsers
    reasoning_mixin

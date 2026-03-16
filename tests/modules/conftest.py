@@ -85,11 +85,12 @@ def small_model_config():
 
 
 @pytest.fixture(scope="session")
-def jax_mesh():
+def jax_mesh(small_model_config):
     """Create a JAX mesh for distributed computation tests."""
+    dims = small_model_config["sharding_axis_dims"]
     mesh = jax.sharding.Mesh(
-        np.array(jax.devices()).reshape((1, 1, -1, 1, 1)),
-        ("dp", "fsdp", "tp", "sp", "pp"),
+        np.array(jax.devices()).reshape(dims),
+        ("dp", "fsdp", "ep", "tp", "sp"),
     )
     return mesh
 

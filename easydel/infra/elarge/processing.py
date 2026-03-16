@@ -73,7 +73,7 @@ from easydel.infra.factory import TaskType
 from easydel.layers.quantization._quants import QuantizationConfig  # pyright: ignore[reportPrivateLocalImportUsage]
 
 from .defaults import DEFAULTS
-from .types import DTypeLike, ELMConfig, PrecisionLike  # pyright: ignore[reportPrivateLocalImportUsage]
+from .types import DTypeLike, PrecisionLike, eLMConfig  # pyright: ignore[reportPrivateLocalImportUsage]
 
 logger = get_logger(__name__)
 
@@ -693,7 +693,7 @@ def write_text_atomic(path: str | os.PathLike | ePathLike, data: str, *, encodin
 # ---------------------------------------------------------------------------
 
 
-def resolve_task(cfg: ELMConfig) -> TaskType:
+def resolve_task(cfg: eLMConfig) -> TaskType:
     """Resolve the task type from an ELM configuration.
 
     Determines the appropriate TaskType for model loading based on the configuration.
@@ -733,7 +733,7 @@ def resolve_task(cfg: ELMConfig) -> TaskType:
     return task
 
 
-def normalize(cfg: ELMConfig | Mapping[str, Any]) -> ELMConfig:
+def normalize(cfg: eLMConfig | Mapping[str, Any]) -> eLMConfig:
     """Normalize an ELM configuration by merging with defaults and processing values.
 
     This function takes a raw configuration and performs the following operations:
@@ -750,7 +750,7 @@ def normalize(cfg: ELMConfig | Mapping[str, Any]) -> ELMConfig:
             Must contain at minimum {"model": {"name_or_path": "..."}}
 
     Returns:
-        ELMConfig: Normalized configuration with all defaults applied. The returned
+        eLMConfig: Normalized configuration with all defaults applied. The returned
             dictionary will contain all standard ELM configuration sections
             (model, loader, sharding, platform, quantization, esurge, base_config).
 
@@ -786,10 +786,10 @@ def normalize(cfg: ELMConfig | Mapping[str, Any]) -> ELMConfig:
         if mlen is not None:
             merged.setdefault("esurge", {})["max_model_len"] = int(mlen)
 
-    return cast(ELMConfig, cast(object, merged))
+    return cast(eLMConfig, cast(object, merged))
 
 
-def materialize_base_config(cfg: ELMConfig, prefer: tp.Literal["base", "sections"] = "base") -> EasyDeLBaseConfigDict:
+def materialize_base_config(cfg: eLMConfig, prefer: tp.Literal["base", "sections"] = "base") -> EasyDeLBaseConfigDict:
     """Materialize a complete base configuration from ELM config sections.
 
     This function consolidates configuration values from various ELM sections
@@ -911,7 +911,7 @@ def materialize_base_config(cfg: ELMConfig, prefer: tp.Literal["base", "sections
     return cast(EasyDeLBaseConfigDict, cast(object, base))
 
 
-def validate(cfg_like: ELMConfig | Mapping[str, Any]) -> None:
+def validate(cfg_like: eLMConfig | Mapping[str, Any]) -> None:
     """Validate an ELM configuration for correctness and consistency.
 
     Performs comprehensive validation checks on the configuration including:
@@ -924,7 +924,7 @@ def validate(cfg_like: ELMConfig | Mapping[str, Any]) -> None:
 
     Args:
         cfg_like: ELM configuration to validate. Can be a raw configuration
-            or an already-normalized ELMConfig dictionary.
+            or an already-normalized eLMConfig dictionary.
 
     Raises:
         ValueError: If configuration contains invalid values or inconsistencies:
@@ -988,10 +988,10 @@ def validate(cfg_like: ELMConfig | Mapping[str, Any]) -> None:
 
 
 def save_elm_config(
-    config: ELMConfig | Mapping[str, Any],
+    config: eLMConfig | Mapping[str, Any],
     json_file_path: str | os.PathLike | ePathLike,
 ) -> None:
-    """Save an ELMConfig to a JSON file.
+    """Save an eLMConfig to a JSON file.
 
     This function serializes an ELM configuration to a JSON file,
     automatically creating parent directories if they do not exist.
@@ -999,7 +999,7 @@ def save_elm_config(
 
     Args:
         config: The configuration to save. Can be either:
-            - An ELMConfig dataclass instance.
+            - An eLMConfig dataclass instance.
             - A Mapping (dict) with configuration values.
             The configuration will be normalized before serialization.
         json_file_path: The path where the JSON file will be saved.
@@ -1007,12 +1007,12 @@ def save_elm_config(
             Parent directories are created automatically if needed.
 
     Example:
-        >>> from easydel.infra.elarge.types import ELMConfig
+        >>> from easydel.infra.elarge.types import eLMConfig
         >>> config = {"model": {"name_or_path": "meta-llama/Llama-2-7b"}}
         >>> save_elm_config(config, "configs/my_config.json")
 
-        >>> # Using ELMConfig dataclass
-        >>> elm_config = ELMConfig(model=ModelConfig(...))
+        >>> # Using eLMConfig dataclass
+        >>> elm_config = eLMConfig(model=ModelConfig(...))
         >>> save_elm_config(elm_config, "/path/to/config.json")
 
     Note:
@@ -1030,11 +1030,11 @@ def save_elm_config(
     write_text_atomic(json_file_path, payload, encoding="utf-8")
 
 
-def load_elm_config(json_file_path: str | os.PathLike | ePathLike) -> ELMConfig:
-    """Load an ELMConfig from a JSON file.
+def load_elm_config(json_file_path: str | os.PathLike | ePathLike) -> eLMConfig:
+    """Load an eLMConfig from a JSON file.
 
     This function reads a JSON configuration file and returns a
-    normalized ELMConfig object. The loaded configuration is validated
+    normalized eLMConfig object. The loaded configuration is validated
     and normalized to ensure all required fields are present and
     properly typed.
 
@@ -1044,7 +1044,7 @@ def load_elm_config(json_file_path: str | os.PathLike | ePathLike) -> ELMConfig:
             The file must exist and contain valid JSON.
 
     Returns:
-        An ELMConfig dataclass instance populated with the loaded
+        An eLMConfig dataclass instance populated with the loaded
         and normalized configuration values.
 
     Raises:

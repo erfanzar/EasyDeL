@@ -94,12 +94,13 @@ For more information on Qwen3, see:
     - Qwen2 Technical Report: https://arxiv.org/abs/2407.10671
 """
 
-from .modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3Model
+from .modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForEmbedding, Qwen3ForSequenceClassification, Qwen3Model
 from .qwen3_configuration import Qwen3Config
 
 __all__ = (
     "Qwen3Config",
     "Qwen3ForCausalLM",
+    "Qwen3ForEmbedding",
     "Qwen3ForSequenceClassification",
     "Qwen3Model",
 )

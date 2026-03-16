@@ -1569,7 +1569,8 @@ class BaseTrainer(BaseTrainerProtocol):
                 reserve_tokens = esurge_kwargs.get("max_num_seqs", 0)
             esurge_kwargs["max_model_len"] = sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)  # pyright: ignore[reportOptionalOperand]
 
-            logger.info_once(f"Creating eSurge {pprint.pformat(esurge_kwargs)}")
+            _log_kwargs = {k: v for k, v in esurge_kwargs.items() if k != "tokenizer"}
+            logger.info_once(f"Creating eSurge {pprint.pformat(_log_kwargs)}")
             logger.info_once(
                 f"SamplingParams(max_tokens={sampling_params.max_tokens},"
                 f" temperature={sampling_params.temperature},"
@@ -2252,11 +2253,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
         _finalize_preview_results(results)
 
-    def _esurge_init_kwargs(
-        self,
-        *,
-        max_num_seqs: int | None = None,
-    ) -> dict[str, tp.Any]:
+    def _esurge_init_kwargs(self, *, max_num_seqs: int | None = None) -> dict[str, tp.Any]:
         args = self.arguments
         esurge_kwargs: dict[str, tp.Any] = {}
         if args.esurge_hbm_utilization is not None:
@@ -2278,6 +2275,8 @@ class BaseTrainer(BaseTrainerProtocol):
             esurge_kwargs["runner_verbose"] = args.esurge_runner_verbose
         if args.esurge_max_num_batched_tokens is not None:
             esurge_kwargs["max_num_batched_tokens"] = args.esurge_max_num_batched_tokens
+        else:
+            esurge_kwargs["max_num_batched_tokens"] = min(args.max_length, 4096)
         if args.esurge_enable_prefix_caching is not None:
             esurge_kwargs["enable_prefix_caching"] = args.esurge_enable_prefix_caching
         if args.esurge_data_parallelism_axis is not None:

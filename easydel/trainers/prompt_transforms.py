@@ -1317,3 +1317,82 @@ class SFTPreprocessTransform(Transform):
 
     def __repr__(self) -> str:
         return f"SFTPreprocessTransform(max_length={self._max_length}, mask_prompt={self._mask_prompt})"
+
+
+class EmbeddingPreprocessTransform(Transform):
+    """Transform that tokenizes query/positive/negative text columns for contrastive embedding training.
+
+    Converts raw text strings from dataset columns into tokenized ``input_ids``
+    and ``attention_mask`` arrays with ``query_``/``positive_``/``negative_``
+    prefixes expected by the ``EmbeddingTrainer``.
+
+    Args:
+        tokenizer: Tokenizer instance for text encoding.
+        max_length: Maximum sequence length for tokenization.
+        query_field: Dataset column name containing query/anchor texts.
+        positive_field: Dataset column name containing positive texts.
+        negative_field: Optional column name for hard negative texts.
+
+    Example:
+        >>> transform = EmbeddingPreprocessTransform(
+        ...     tokenizer=tokenizer,
+        ...     max_length=512,
+        ...     query_field="query",
+        ...     positive_field="positive",
+        ... )
+        >>> result = transform({"query": "What is JAX?", "positive": "JAX is a NumPy library."})
+        >>> list(result.keys())
+        ['query_input_ids', 'query_attention_mask', 'positive_input_ids', 'positive_attention_mask']
+    """
+
+    def __init__(
+        self,
+        tokenizer: tp.Any,
+        max_length: int = 512,
+        query_field: str = "query",
+        positive_field: str = "positive",
+        negative_field: str | None = None,
+    ):
+        self._tokenizer = tokenizer
+        self._max_length = max_length
+        self._query_field = query_field
+        self._positive_field = positive_field
+        self._negative_field = negative_field
+
+    def __call__(self, example: Example) -> Example:
+        result: dict[str, tp.Any] = {}
+
+        for prefix, field_name in [
+            ("query", self._query_field),
+            ("positive", self._positive_field),
+        ]:
+            text = example[field_name]
+            encoded = self._tokenizer(
+                text,
+                truncation=True,
+                max_length=self._max_length,
+                padding="max_length",
+                return_attention_mask=True,
+            )
+            result[f"{prefix}_input_ids"] = encoded["input_ids"]
+            result[f"{prefix}_attention_mask"] = encoded["attention_mask"]
+
+        if self._negative_field and self._negative_field in example:
+            encoded = self._tokenizer(
+                example[self._negative_field],
+                truncation=True,
+                max_length=self._max_length,
+                padding="max_length",
+                return_attention_mask=True,
+            )
+            result["negative_input_ids"] = encoded["input_ids"]
+            result["negative_attention_mask"] = encoded["attention_mask"]
+
+        return result
+
+    def __repr__(self) -> str:
+        return (
+            f"EmbeddingPreprocessTransform(max_length={self._max_length}, "
+            f"query={self._query_field}, positive={self._positive_field}, "
+            f"negative={self._negative_field})"
+        )

@@ -1870,6 +1870,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
         return False
 
     @staticmethod
+    def _is_torch_dtype_instance(value: tp.Any) -> bool:
+        """Return True for concrete ``torch.dtype`` objects without importing torch eagerly."""
+        value_module = getattr(value.__class__, "__module__", "")
+        return value_module.startswith("torch") and value.__class__.__name__ == "dtype"
+
+    @staticmethod
     def _dtype_name(value: tp.Any) -> str:
         """Convert framework-specific dtype objects into a stable string name."""
         try:
@@ -1886,6 +1892,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """Convert persisted dtype strings back into runtime dtype objects."""
         if value is None:
             return None
+        if cls._is_torch_dtype_instance(value):
+            # HF configs expose `torch_dtype` through the `dtype` property. Preserve
+            # concrete torch dtypes so downstream HF model init keeps working.
+            return value
         if cls._is_dtype_like(value):
             return jnp.dtype(cls._dtype_name(value))
         if isinstance(value, str):

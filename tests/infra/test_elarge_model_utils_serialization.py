@@ -3,8 +3,7 @@ from __future__ import annotations
 import base64
 import pickle
 import sys
-from types import ModuleType
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 
@@ -50,7 +49,7 @@ def test_override_lm_eval_code_exec_runs_code_eval_in_subprocess(monkeypatch) ->
 
     captured_payload = {}
 
-    def _fake_run(cmd, *, input, capture_output, timeout, env, check):
+    def _fake_run(cmd, *, input, capture_output, timeout, env, check):  # noqa
         del cmd, capture_output, timeout, env, check
         payload = pickle.loads(base64.b64decode(input))
         captured_payload.update(payload)

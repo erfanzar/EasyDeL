@@ -45,7 +45,6 @@ from transformers import AutoTokenizer
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.factory import TaskType
-from easydel.trainers.training_configurations import TrainingArguments
 
 from .benchmarking import (
     is_benchmark_config_like,
@@ -73,8 +72,8 @@ from .processing import (
 )
 from .types import (
     BenchmarkConfig,
-    ELMConfig,
     EvalKwargs,
+    eLMConfig,
     get_trainer_class,
     get_training_arguments_class,
     normalize_trainer_config,
@@ -88,8 +87,10 @@ if typing.TYPE_CHECKING:
     from easydel.inference.reasoning.abstract_reasoning import ReasoningParserName
     from easydel.inference.tools.abstract_tool import ToolParserName
     from easydel.trainers import Trainer
+    from easydel.trainers.training_configurations import TrainingArguments
 
     from .types import TextDatasetInformCfg, VisualDatasetInformCfg
+
 logger = get_logger("eLargeModel")
 _ESURGE_UNSET = object()
 _QUANT_UNSET = object()
@@ -108,6 +109,8 @@ class BuildTrainerKws(typing.TypedDict, total=False):
         teacher_model: Teacher model for distillation training
         reward_funcs: Custom reward functions for GRPO/SDPO/PPO-style trainers
         feedback_func: Optional textual feedback callback for SDPO
+        env_factory: Environment factory for AgenticMoshPit trainer
+        tools: Tool instances for AgenticMoshPit trainer
     """
 
     data_collator: NotRequired[typing.Callable]
@@ -119,6 +122,8 @@ class BuildTrainerKws(typing.TypedDict, total=False):
     teacher_model: NotRequired[EasyDeLBaseModule | None]
     reward_funcs: NotRequired[Any | None]
     feedback_func: NotRequired[typing.Callable | None]
+    env_factory: NotRequired[typing.Callable | None]
+    tools: NotRequired[list | None]
 
 
 class eLargeModel:
@@ -166,12 +171,12 @@ class eLargeModel:
         >>> results = elm.eval(["hellaswag", "mmlu"])
     """
 
-    def __init__(self, config: ELMConfig | Mapping[str, Any] | str | os.PathLike | ePathLike | None = None):
+    def __init__(self, config: eLMConfig | Mapping[str, Any] | str | os.PathLike | ePathLike | None = None):
         """Initialize eLargeModel with configuration.
 
         Args:
             config: Can be:
-                - ELMConfig or dict with configuration
+                - eLMConfig or dict with configuration
                 - Path to JSON or YAML configuration file
                 - None to create empty configuration
         """
@@ -325,7 +330,7 @@ class eLargeModel:
         return cls(config)
 
     @property
-    def config(self) -> ELMConfig:
+    def config(self) -> eLMConfig:
         """Get the normalized configuration dictionary.
 
         Returns:
@@ -1561,6 +1566,21 @@ class eLargeModel:
             trainer_kwargs["eval_dataset"] = eval_dataset
             trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
 
+        elif trainer_type == "cpo":
+            if reference_model is None:
+                reference_model = self.build_reference_model()
+
+            if reference_model is not None and base_state_class is not None:
+                reference_model = reference_model.to_state(base_state_class)
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reference_model"] = reference_model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
         elif trainer_type in {"bco", "kto"}:
             if reference_model is None:
                 reference_model = self.build_reference_model()
@@ -1753,6 +1773,43 @@ class eLargeModel:
             trainer_kwargs["train_dataset"] = train_dataset
             trainer_kwargs["eval_dataset"] = eval_dataset
 
+        elif trainer_type in {"agentic-moshpit", "agentic_moshpit"}:
+            env_factory = kwargs.get("env_factory")
+            if env_factory is None:
+                raise ValueError(
+                    "agentic-moshpit training requires `env_factory` kwarg — "
+                    "a callable that returns an AgenticEnvironment instance."
+                )
+
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["env_factory"] = env_factory
+            trainer_kwargs["reward_funcs"] = reward_funcs
+            trainer_kwargs["tools"] = kwargs.get("tools")
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes")
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn")
+
+        elif trainer_type == "rlvr":
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["reward_funcs"] = reward_funcs
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes")
+            trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn")
+
+        elif trainer_type == "embedding":
+            trainer_kwargs["arguments"] = training_args
+            trainer_kwargs["model"] = model
+            trainer_kwargs["processing_class"] = self._tokenizer
+            trainer_kwargs["train_dataset"] = train_dataset
+            trainer_kwargs["eval_dataset"] = eval_dataset
+            trainer_kwargs["data_collator"] = kwargs.get("data_collator", None)
+
         else:
             trainer_kwargs["arguments"] = training_args
             trainer_kwargs["model"] = model
@@ -1770,6 +1827,8 @@ class eLargeModel:
                     "reward_processing_classes",
                     "data_tokenize_fn",
                     "feedback_func",
+                    "env_factory",
+                    "tools",
                 ]:
                     trainer_kwargs[key] = value
 

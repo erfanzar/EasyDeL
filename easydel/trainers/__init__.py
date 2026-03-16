@@ -13,11 +13,13 @@
 # limitations under the License.
 
 from . import prompt_transforms
+from .agentic_moshpit import AgenticMoshPitConfig, AgenticMoshPitTrainer
 from .base_trainer import BaseTrainer
 from .binary_classifier_optimization_trainer import BCOConfig, BCOTrainer
 from .contrastive_preference_optimization_trainer import CPOConfig, CPOTrainer
 from .direct_preference_optimization_trainer import DPOConfig, DPOTrainer
 from .distillation_trainer import DistillationConfig, DistillationTrainer
+from .embedding_trainer import EmbeddingConfig, EmbeddingTrainer
 from .generalized_knowledge_distillation_trainer import GKDConfig, GKDTrainer
 from .group_filtered_policy_optimization import GFPOConfig, GFPOTrainer
 from .group_relative_policy_optimization import GRPOConfig, GRPOTrainer
@@ -41,6 +43,7 @@ from .prompt_transforms import (
 from .proximal_policy_optimization_trainer import PPOConfig, PPOTrainer
 from .ray_scaler import RayDistributedTrainer
 from .reward_trainer import RewardConfig, RewardTrainer
+from .rlvr_trainer import RLVRConfig, RLVRTrainer
 from .self_distillation_policy_optimization import SDPOConfig, SDPOTrainer
 from .seq_kd_trainer import SeqKDConfig, SeqKDTrainer
 from .sparse_distillation_trainer import SparseDistillationConfig, SparseDistillationTrainer
@@ -50,6 +53,8 @@ from .training_configurations import TrainingArguments
 from .xpo_trainer import XPOConfig, XPOTrainer
 
 __all__ = (
+    "AgenticMoshPitConfig",
+    "AgenticMoshPitTrainer",
     "BCOConfig",
     "BCOPreprocessTransform",
     "BCOTrainer",
@@ -62,6 +67,8 @@ __all__ = (
     "DPOTrainer",
     "DistillationConfig",
     "DistillationTrainer",
+    "EmbeddingConfig",
+    "EmbeddingTrainer",
     "GFPOConfig",
     "GFPOTrainer",
     "GKDConfig",
@@ -84,6 +91,8 @@ __all__ = (
     "PPOConfig",
     "PPOPreprocessTransform",
     "PPOTrainer",
+    "RLVRConfig",
+    "RLVRTrainer",
     "RayDistributedTrainer",
     "RewardConfig",
     "RewardPreprocessTransform",
