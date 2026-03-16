@@ -192,6 +192,7 @@ class TaskType(StrEnum):
     SEQUENCE_CLASSIFICATION = "sequence-classification"
     AUDIO_CLASSIFICATION = "audio-classification"
     IMAGE_CLASSIFICATION = "image-classification"
+    EMBEDDING = "embedding"
     ANY_TO_ANY = "any-to-any"
     AUTO_BIND = "auto-bind"
 

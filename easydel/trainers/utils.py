@@ -2372,3 +2372,74 @@ def truncate_right(input_ids, stop_token_id, pad_token_id):
     output_ids = jnp.where(idxs > trunc_idxs, pad_token_id, input_ids)
     mask = jnp.where(idxs > trunc_idxs, 0, 1)
     return output_ids, mask
+
+
+@auto_pytree
+class EmbeddingDataCollatorTFDS:
+    """Data collator for contrastive embedding training with TFDS backends.
+
+    Stacks tokenized query/positive/negative tensors from individual
+    examples into batched JAX arrays. Expects examples to already be
+    tokenized with ``query_input_ids``, ``query_attention_mask``,
+    ``positive_input_ids``, ``positive_attention_mask``, and optionally
+    ``negative_input_ids``, ``negative_attention_mask`` keys.
+
+    Args:
+        pad_token_id: Token ID used for padding. Defaults to 0.
+        max_length: Maximum sequence length. Defaults to 512.
+        has_negatives: Whether the dataset includes hard negative columns.
+
+    Example:
+        >>> collator = EmbeddingDataCollatorTFDS(pad_token_id=0, max_length=512)
+        >>> batch = collator([example1, example2, example3])
+        >>> batch["query_input_ids"].shape
+        (3, 512)
+    """
+
+    pad_token_id: int = 0
+    max_length: int = 512
+    has_negatives: bool = False
+
+    def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, jnp.ndarray]:
+        keys = [
+            "query_input_ids",
+            "query_attention_mask",
+            "positive_input_ids",
+            "positive_attention_mask",
+        ]
+        if self.has_negatives:
+            keys.extend(["negative_input_ids", "negative_attention_mask"])
+
+        batch: dict[str, jnp.ndarray] = {}
+        for key in keys:
+            if key in features[0]:
+                batch[key] = jnp.array([f[key] for f in features])
+        return batch
+
+
+@auto_pytree
+class EmbeddingDataCollatorGrain:
+    """Data collator for contrastive embedding training with Grain backends.
+
+    Same as ``EmbeddingDataCollatorTFDS`` but for the Grain data pipeline.
+    """
+
+    pad_token_id: int = 0
+    max_length: int = 512
+    has_negatives: bool = False
+
+    def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, jnp.ndarray]:
+        keys = [
+            "query_input_ids",
+            "query_attention_mask",
+            "positive_input_ids",
+            "positive_attention_mask",
+        ]
+        if self.has_negatives:
+            keys.extend(["negative_input_ids", "negative_attention_mask"])
+
+        batch: dict[str, jnp.ndarray] = {}
+        for key in keys:
+            if key in features[0]:
+                batch[key] = jnp.array([f[key] for f in features])
+        return batch

@@ -561,7 +561,7 @@ class SequenceLengthPoolingFeature:
             pool = SequenceLengthPoolingFeature(strategy="mean")
             ```
         """
-        valid_strategies = {"last", "first", "mean", "max"}
+        valid_strategies = {"last", "first", "mean", "max", "weighted_mean"}
         if strategy not in valid_strategies:
             raise ValueError(f"strategy must be one of {valid_strategies}, got {strategy}")
 
@@ -639,11 +639,21 @@ class SequenceLengthPoolingFeature:
             return hidden_states[jnp.arange(batch_size), sequence_lengths]
 
         elif self.strategy == "mean":
-            # Mean pooling over sequence
+            if attention_mask is not None:
+                weights = attention_mask[:, :, None].astype(hidden_states.dtype)
+                return jnp.sum(hidden_states * weights, axis=1) / jnp.clip(jnp.sum(weights, axis=1), a_min=1e-9)
+            return jnp.mean(hidden_states, axis=1)
+
+        elif self.strategy == "weighted_mean":
+            if attention_mask is not None:
+                seq_len = hidden_states.shape[1]
+                pos_weights = jnp.arange(1, seq_len + 1, dtype=hidden_states.dtype)[None, :, None]
+                mask = attention_mask[:, :, None].astype(hidden_states.dtype)
+                weights = pos_weights * mask
+                return jnp.sum(hidden_states * weights, axis=1) / jnp.clip(jnp.sum(weights, axis=1), a_min=1e-9)
             return jnp.mean(hidden_states, axis=1)
 
         elif self.strategy == "max":
-            # Max pooling over sequence
             return jnp.max(hidden_states, axis=1)
 
         else:

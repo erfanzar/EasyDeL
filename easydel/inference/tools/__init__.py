@@ -92,6 +92,7 @@ See Also:
 # ideas are coming from vLLM.
 
 from .abstract_tool import ToolParser, ToolParserManager
+from .auto_detect import detect_tool_parser
 from .parsers import (
     DeepSeekV3ToolParser,
     DeepSeekV31ToolParser,
@@ -160,5 +161,6 @@ __all__ = (
     "ToolCallingMixin",
     "ToolParser",
     "ToolParserManager",
+    "detect_tool_parser",
     "xLAMToolParser",
 )

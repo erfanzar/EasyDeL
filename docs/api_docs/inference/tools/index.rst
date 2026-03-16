@@ -6,5 +6,6 @@ easydel.inference.tools package
 
    parsers/index
    abstract_tool
+   auto_detect
    tool_calling_mixin
    utils

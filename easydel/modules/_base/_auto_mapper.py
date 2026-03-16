@@ -642,6 +642,69 @@ def create_image_classification_class(
     return cls
 
 
+def create_embedding_class(
+    model_name: str,
+    base_model_class: type[ModelT],
+    config_class: type[ConfigT],
+    model_type: str,
+    base_model_name: str = "model",
+    **default_feature_kwargs: Any,
+) -> type:
+    """Create a ForEmbedding class dynamically.
+
+    Generates a new embedding model class that pools hidden states and
+    optionally L2-normalizes them. No learned task head is created.
+
+    Args:
+        model_name: Name prefix (e.g. ``"Llama"`` → ``"LlamaForEmbedding"``).
+        base_model_class: The base model class to wrap.
+        config_class: The configuration class for this model.
+        model_type: Model type string for registration.
+        base_model_name: Attribute name for the base model.
+        **default_feature_kwargs: Defaults such as ``pooling_strategy``,
+            ``normalize_embeddings``, ``embedding_dim``.
+
+    Returns:
+        A new class inheriting from ``BaseEmbeddingModule``.
+    """
+    from .embedding_module import BaseEmbeddingModule
+
+    class_name = f"{model_name}ForEmbedding"
+
+    def __init__(self, config, dtype=None, param_dtype=None, precision=None, *, rngs, **kwargs):
+        merged_kwargs = {**default_feature_kwargs, **kwargs}
+        import jax.numpy as _jnp
+
+        dtype = dtype or _jnp.bfloat16
+        param_dtype = param_dtype or _jnp.bfloat16
+
+        super(type(self), self).__init__(
+            config=config,
+            base_model_class=base_model_class,
+            base_model_name=base_model_name,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            **merged_kwargs,
+        )
+
+    cls = type(
+        class_name,
+        (BaseEmbeddingModule,),
+        {
+            "__init__": __init__,
+            "__module__": base_model_class.__module__,
+            "__qualname__": class_name,
+            "_task_type": TaskType.EMBEDDING,
+            "_model_type": model_type,
+            "_config_class": config_class,
+        },
+    )
+
+    return cls
+
+
 # Registry mapping task types to factory functions
 AUTO_MODEL_FACTORY_REGISTRY: dict[TaskType, callable] = {
     TaskType.CAUSAL_LM: create_causal_lm_class,
@@ -650,6 +713,7 @@ AUTO_MODEL_FACTORY_REGISTRY: dict[TaskType, callable] = {
     # TaskType.QUESTION_ANSWERING: create_question_answering_class,  # Not yet in TaskType enum
     TaskType.SEQUENCE_TO_SEQUENCE: create_conditional_generation_class,
     TaskType.IMAGE_CLASSIFICATION: create_image_classification_class,
+    TaskType.EMBEDDING: create_embedding_class,
 }
 """Registry mapping TaskType enum values to their corresponding factory functions.
 

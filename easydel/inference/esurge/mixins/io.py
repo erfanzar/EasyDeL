@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from easydel.inference.sampling_params import SamplingParams
 
@@ -398,6 +398,32 @@ class EngineIOMixin:
             else:
                 self.abort_request(request_id)
 
+    @overload
+    def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        *,
+        stream: Literal[False] = ...,
+        chat_template: str | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> RequestOutput: ...
+
+    @overload
+    def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        *,
+        stream: Literal[True],
+        chat_template: str | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> Iterator[RequestOutput]: ...
+
     def chat(
         self,
         messages: list[dict],
@@ -407,7 +433,7 @@ class EngineIOMixin:
         stream: bool = False,
         chat_template: str | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
-    ):
+    ) -> RequestOutput | Iterator[RequestOutput]:
         """High-level chat interface compatible with vLLM and OpenAI APIs.
 
         Provides a convenient chat-based interface for conversational AI applications.
@@ -544,7 +570,7 @@ class EngineIOMixin:
         stream: bool = False,
         chat_template: str | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
-    ):
+    ) -> RequestOutput | Iterator[RequestOutput]:
         """Handle multimodal chat with images/videos.
 
         Internal method that processes vision-language model requests.

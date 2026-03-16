@@ -45,7 +45,7 @@ from easydel.infra.utils import ACT2FN, auto_remat, block_wise_ffn
 from easydel.layers import ColumnParallelLinear, Embed, RowParallelLinear
 from easydel.layers import RMSNorm as RMSNorm
 from easydel.layers.attention import FlexibleAttentionModule, UnifiedAttention
-from easydel.modules._base import BaseCausalLMModule, BaseSequenceClassificationModule
+from easydel.modules._base import BaseCausalLMModule, BaseEmbeddingModule, BaseSequenceClassificationModule
 
 from .qwen_configuration import Qwen2Config
 
@@ -851,3 +851,55 @@ class Qwen2ForSequenceClassification(BaseSequenceClassificationModule[Qwen2Model
         Returns the embedding layer of the module.
         """
         return self.model.get_embedding()
+
+
+@register_module(TaskType.EMBEDDING, config=Qwen2Config, model_type="qwen2")
+class Qwen2ForEmbedding(BaseEmbeddingModule[Qwen2Model, Qwen2Config]):
+    """Qwen2 model for text embedding and similarity tasks.
+
+    Produces dense vector representations by pooling the last hidden state
+    of the Qwen2 transformer and optionally L2-normalizing. Compatible with
+    GTE-Qwen2 and other Qwen2-based embedding checkpoints.
+
+    Uses ``last`` token pooling by default (matching the GTE-Qwen2 convention
+    where the EOS/last token aggregates sequence information).
+
+    Example:
+        >>> model = Qwen2ForEmbedding(config, rngs=rngs)
+        >>> outputs = model(input_ids=input_ids, attention_mask=mask)
+        >>> embeddings = outputs.embeddings  # (batch, hidden_size)
+    """
+
+    _task_type = TaskType.EMBEDDING
+    _model_type = "qwen2"
+    _config_class = Qwen2Config
+
+    def __init__(
+        self,
+        config: Qwen2Config,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        *,
+        rngs: nn.Rngs,
+    ):
+        """Initialize Qwen2 embedding model.
+
+        Args:
+            config: Qwen2 model configuration.
+            dtype: Computation data type. Defaults to bfloat16.
+            param_dtype: Parameter data type. Defaults to bfloat16.
+            precision: JAX precision setting.
+            rngs: Flax random number generators.
+        """
+        super().__init__(
+            config=config,
+            base_model_class=Qwen2Model,
+            base_model_name="model",
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+            pooling_strategy="last",
+            normalize_embeddings=True,
+        )

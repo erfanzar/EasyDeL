@@ -1117,6 +1117,40 @@ class SequenceClassifierOutput(ModelOutput):
 
 
 @auto_pytree
+class EmbeddingOutput(ModelOutput):
+    """Output class for embedding models.
+
+    Used for models that produce dense vector representations of input
+    sequences for tasks like semantic search, retrieval, clustering, and
+    similarity computation.
+
+    Attributes:
+        embeddings: Pooled and optionally L2-normalized embedding vectors.
+            Shape: ``(batch_size, embedding_dim)``.
+        hidden_states: Tuple of Arrays (one for the output of the embeddings +
+            one for the output of each layer). Shape of each:
+            ``(batch_size, sequence_length, hidden_size)``.
+        attentions: Tuple of Arrays (one for each layer). Shape of each:
+            ``(batch_size, num_heads, sequence_length, sequence_length)``.
+        past_key_values: Cached key-values for efficient generation.
+        loss: Optional contrastive loss when training with paired examples.
+
+    Example:
+        >>> output = EmbeddingOutput(
+        ...     embeddings=jnp.ones((2, 768)),  # 2 sequences, 768-dim embeddings
+        ... )
+        >>> output.embeddings.shape
+        (2, 768)
+    """
+
+    embeddings: Array = None
+    hidden_states: tuple[Array] | None = None
+    attentions: tuple[Array] | None = None
+    past_key_values: TransformerCache | None = None
+    loss: Array | None = None
+
+
+@auto_pytree
 class Seq2SeqSequenceClassifierOutput(ModelOutput):
     """Output class for sequence-to-sequence sequence classification models.
 

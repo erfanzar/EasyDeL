@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Top-level ELMConfig TypedDict.
+"""Top-level eLMConfig TypedDict.
 
 Defines the root configuration structure that combines all ELM subsystem
 configurations into a single declarative specification.
@@ -31,7 +31,7 @@ from .quantization import QuantizationCfg
 from .training import TrainerConfig
 
 
-class ELMConfig(TypedDict, total=False):
+class eLMConfig(TypedDict, total=False):
     """Complete ELM (EasyDeL Large Model) configuration structure.
 
     This is the top-level configuration type that combines all configuration

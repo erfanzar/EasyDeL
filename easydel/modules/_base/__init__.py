@@ -95,6 +95,7 @@ from ._auto_mapper import (
     AUTO_MODEL_FACTORY_REGISTRY,
     create_causal_lm_class,
     create_conditional_generation_class,
+    create_embedding_class,
     create_image_classification_class,
     create_question_answering_class,
     create_sequence_classification_class,
@@ -131,6 +132,7 @@ from ._vlm_features import (
 # Task-specific base modules
 from .causal_lm_module import BaseCausalLMModule
 from .conditional_generation_module import BaseConditionalGenerationModule
+from .embedding_module import BaseEmbeddingModule
 from .image_classification_module import BaseImageClassificationModule
 from .question_answering_module import BaseQuestionAnsweringModule
 from .sequence_classification_module import BaseSequenceClassificationModule
@@ -141,6 +143,7 @@ __all__ = [
     "AUTO_MODEL_FACTORY_REGISTRY",
     "BaseCausalLMModule",
     "BaseConditionalGenerationModule",
+    "BaseEmbeddingModule",
     "BaseImageClassificationModule",
     "BaseModelProtocol",
     "BaseQuestionAnsweringModule",
@@ -162,6 +165,7 @@ __all__ = [
     "VisionModelProtocol",
     "create_causal_lm_class",
     "create_conditional_generation_class",
+    "create_embedding_class",
     "create_image_classification_class",
     "create_question_answering_class",
     "create_sequence_classification_class",

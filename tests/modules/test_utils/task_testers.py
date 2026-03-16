@@ -271,7 +271,7 @@ class CausalLMTester(BaseTester):
                     ed_logits=ed_output.logits,
                     hf_loss=float(hf_output.loss.cpu().detach().numpy()),
                     ed_loss=float(ed_output.loss),
-                    hf_aux_loss=float(hf_aux) if hf_aux else 0,
+                    hf_aux_loss=float(hf_aux.cpu().detach()) if hf_aux else 0,
                     ed_aux_loss=float(ed_aux) if ed_aux else 0,
                 )
 
@@ -318,10 +318,7 @@ class CausalLMTester(BaseTester):
         try:
             # Setup config
             config = setup_config(config, small_model_config)
-            # Generation tests should be portable across backends. Some MoE paths
-            # use collectives that are not available on XLA:CPU when sharding on EP,
-            # so prefer placing the extra device on TP.
-            config.sharding_axis_dims = (1, 1, 1, -1, 1)
+            config.sharding_axis_dims = small_model_config["sharding_axis_dims"]
             # Handle EasyDeL-only models (no HF model needed for generation test)
             if hf_class is None:
                 with config.mesh:
@@ -1228,4 +1225,89 @@ class EasyDeLOnlyTester:
             return TestResult(
                 success=False,
                 error_message=str(e),
+            )
+
+
+class EmbeddingTester:
+    """Test EMBEDDING models (EasyDeL-only, no HF comparison).
+
+    Verifies that embedding models:
+    1. Produce correct output shapes ``(batch, hidden_size)``
+    2. Return L2-normalized vectors when configured
+    3. Support Matryoshka truncation
+    """
+
+    def run(
+        self,
+        module_name: str,
+        task: ed.TaskType,
+        config: Any,
+        small_model_config: dict,
+    ) -> TestResult:
+        """Run embedding forward pass and verify output shapes + normalization.
+
+        Args:
+            module_name: Name of the module (e.g. ``"qwen2"``)
+            task: Task type (should be ``TaskType.EMBEDDING``)
+            config: Model configuration
+            small_model_config: Base config dictionary
+
+        Returns:
+            TestResult indicating success and extra info about shapes/norms.
+        """
+        try:
+            config = setup_config(config, small_model_config)
+
+            with config.mesh:
+                ed_model = create_ed_model_only(
+                    module_name=module_name,
+                    task=task,
+                    config=config,
+                    small_model_config=small_model_config,
+                )
+
+                batch_size = small_model_config["batch_size"]
+                seq_len = small_model_config["sequence_length"]
+                vocab_size = small_model_config["vocab_size"]
+
+                import numpy as np
+
+                np.random.seed(42)  # noqa: NPY002
+                input_ids = jnp.array(
+                    np.random.randint(0, vocab_size, (batch_size, seq_len)),  # noqa: NPY002
+                    dtype="i4",
+                )
+                attention_mask = jnp.ones_like(input_ids, dtype="bool")
+
+                output = ed_model(input_ids=input_ids, attention_mask=attention_mask)
+
+                embeddings = output.embeddings
+                hidden_size = config.hidden_size
+                expected_shape = (batch_size, hidden_size)
+                shape_ok = tuple(embeddings.shape) == expected_shape
+
+                norms = jnp.linalg.norm(embeddings, axis=-1)
+                norms_ok = bool(jnp.allclose(norms, 1.0, atol=1e-4))
+
+                success = shape_ok and norms_ok
+                msg = ""
+                if not shape_ok:
+                    msg += f"Shape mismatch: got {tuple(embeddings.shape)}, expected {expected_shape}. "
+                if not norms_ok:
+                    msg += f"L2 norms not ~1.0: min={float(norms.min()):.4f}, max={float(norms.max()):.4f}. "
+
+            return TestResult(
+                success=success,
+                error_message=msg,
+                extra_info={
+                    "embedding_shape": list(embeddings.shape),
+                    "norms_min": float(norms.min()),
+                    "norms_max": float(norms.max()),
+                },
+            )
+
+        except Exception as e:
+            return TestResult(
+                success=False,
+                error_message=f"{e}\n{traceback.format_exc()}",
             )

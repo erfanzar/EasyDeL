@@ -69,6 +69,7 @@ TASK_ALIASES: dict[str, TaskType] = {
     "image_text_to_text": TaskType.IMAGE_TEXT_TO_TEXT,
     "zero_shot_image_classification": TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION,
     "diffusion_lm": TaskType.DIFFUSION_LM,
+    "embedding": TaskType.EMBEDDING,
     "base": TaskType.BASE_MODULE,
 }
 
@@ -205,6 +206,9 @@ def infer_task_from_hf_config(model_name_or_path: str) -> TaskType | None:
 
         elif "ForZeroShotImageClassification" in arch:
             return TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION
+
+        elif "ForEmbedding" in arch or "ForSentenceEmbedding" in arch:
+            return TaskType.EMBEDDING
 
         if "vision" in model_type or "clip" in model_type:
             return TaskType.BASE_VISION

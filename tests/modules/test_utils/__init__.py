@@ -39,6 +39,7 @@ from .task_testers import (
     BaseTester,
     CausalLMTester,
     EasyDeLOnlyTester,
+    EmbeddingTester,
     Seq2SeqTester,
     SequenceClassificationTester,
     TestResult,
@@ -53,6 +54,7 @@ __all__ = [
     # Comparators
     "ComparisonResult",
     "EasyDeLOnlyTester",
+    "EmbeddingTester",
     "Seq2SeqTester",
     "SequenceClassificationTester",
     "TestResult",

@@ -4,10 +4,12 @@ easydel.trainers package
 .. toctree::
    :maxdepth: 2
 
+   agentic_moshpit/index
    binary_classifier_optimization_trainer/index
    contrastive_preference_optimization_trainer/index
    direct_preference_optimization_trainer/index
    distillation_trainer/index
+   embedding_trainer/index
    generalized_knowledge_distillation_trainer/index
    group_filtered_policy_optimization/index
    group_relative_policy_optimization/index
@@ -19,6 +21,7 @@ easydel.trainers package
    proximal_policy_optimization_trainer/index
    ray_scaler/index
    reward_trainer/index
+   rlvr_trainer/index
    self_distillation_policy_optimization/index
    seq_kd_trainer/index
    sparse_distillation_trainer/index

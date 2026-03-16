@@ -1519,14 +1519,14 @@ print(transcription)
 
 ## Documentation
 
-For comprehensive documentation, tutorials, and API reference:
+For comprehensive documentation, examples, and API reference:
 
 ### 📚 [EasyDeL Documentation](https://easydel.readthedocs.io/en/latest/)
 
 #### Key Resources
 
 - Installation Guide
-- Training Tutorials (SFT, DPO, GRPO, etc.)
+- Training Examples (SFT, DPO, GRPO, etc.)
 - eSurge Deployment Guide
 - Environment Flags: [`docs/environment_variables.md`](docs/environment_variables.md)
 - Model Architecture Details

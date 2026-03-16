@@ -2749,6 +2749,8 @@ class EasyBridgeMixin(PushToHubMixin):
             from transformers import AutoModelForImageTextToText as module
         elif cls._model_task == TaskType.SEQUENCE_CLASSIFICATION:
             from transformers import AutoModelForSequenceClassification as module
+        elif cls._model_task == TaskType.EMBEDDING:
+            from transformers import AutoModelForCausalLM as module
         elif cls._model_task == TaskType.BASE_MODULE:
             from transformers import AutoModel as module
         elif cls._model_task == TaskType.BASE_VISION:

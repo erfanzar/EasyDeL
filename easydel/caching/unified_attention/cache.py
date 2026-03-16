@@ -374,7 +374,7 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
             num_pages=num_pages,
             max_num_pages_per_req=cdiv(max_model_length, page_size),
             num_slices_per_kv_cache_update_page=int(num_slices_per_page),
-            _kvdtype_str=DTYPE_TO_STRING_MAP[kvdtype],
+            _kvdtype_str=DTYPE_TO_STRING_MAP[kvdtype.type if hasattr(kvdtype, "type") else kvdtype],
         )
 
     @property
