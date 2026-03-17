@@ -14,6 +14,9 @@
 
 from pathlib import Path
 
+import jax
+import numpy as np
+
 from easydel.infra.mixins.bridge import EasyBridgeMixin
 
 
@@ -65,3 +68,33 @@ def test_save_model_files_uses_default_gather_fns_when_not_provided(tmp_path, mo
     )
 
     assert saved_trees == [{"weight": "gathered:raw"}]
+
+
+def test_save_model_files_normalizes_numpy_arrays_before_checkpoint_write(tmp_path, monkeypatch):
+    saved_trees: list[dict[str, object]] = []
+
+    class _NumpyStateStub:
+        def to_pure_dict(self):
+            return {"weight": np.ones((2, 2), dtype=np.float32)}
+
+    class _CheckpointerStub:
+        def __init__(self, **kwargs):
+            pass
+
+        def save_pytree(self, *, tree, prefix, mesh, dtype):
+            saved_trees.append(tree)
+            return str(tmp_path / f"{prefix}.ckpt")
+
+    monkeypatch.setattr("easydel.infra.mixins.bridge.nn.split", lambda *args, **kwargs: (None, _NumpyStateStub()))
+    monkeypatch.setattr("easydel.infra.mixins.bridge.Checkpointer", _CheckpointerStub)
+
+    EasyBridgeMixin._save_model_files(
+        _BridgeModelStub(),
+        save_directory=tmp_path,
+        gather_fns={},
+        float_dtype=None,
+        step=None,
+    )
+
+    assert len(saved_trees) == 1
+    assert isinstance(saved_trees[0]["weight"], jax.Array)
