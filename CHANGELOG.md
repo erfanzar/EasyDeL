@@ -2,7 +2,7 @@
 
 ---
 
-## 2026-03-17 — (unreleased)
+## 2026-03-17
 
 ### feat: Add loss strategy abstraction, TPU preemption checkpointing, training resume improvements, and license headers
 
@@ -41,7 +41,7 @@
 
 ---
 
-## 2026-03-16 — `8aceedf7`
+## 2026-03-16
 
 ### feat: Add AgenticMoshPit, RLVR, and Embedding trainers with full eLarge support
 
@@ -65,7 +65,7 @@ Also:
 
 ---
 
-## 2026-03-15 — `f5c5f652`
+## 2026-03-15
 
 ### refactor: Rename `elarge_model` to `elarge`, add trainer benchmarking and eSurge eval improvements
 
@@ -83,7 +83,7 @@ Also:
 
 ---
 
-## 2026-03-14 — `da8dab1e`
+## 2026-03-14
 
 ### fix: Harden eSurge eval/runtime alignment and serialization
 
@@ -102,7 +102,7 @@ Also:
 
 ---
 
-## 2026-03-13 — `b0aea938`
+## 2026-03-13
 
 ### fix: Ensure dtype fields survive config serialization round-trips
 
@@ -114,7 +114,7 @@ Also:
 
 ---
 
-## 2026-03-12 — `9b45aebe`
+## 2026-03-12
 
 ### fix: Handle dtype serialization in config and chat-template prompts in generation preview
 
@@ -125,7 +125,7 @@ Also:
 
 ---
 
-## 2026-03-12 — `c56ec546`
+## 2026-03-12
 
 ### refactor: Move `auto_remat` from per-sublayer to whole decoder layer and expand gradient checkpoint infrastructure
 
@@ -141,7 +141,7 @@ Also:
 
 ---
 
-## 2026-03-12 — `bcbd9a94`
+## 2026-03-12
 
 ### refactor: Move GRPO completion chunk size and max loss tokens from env vars to config fields
 
@@ -152,7 +152,7 @@ Also:
 
 ---
 
-## 2026-03-12 — `06dc531c`
+## 2026-03-12
 
 ### feat: Add multimodal generation support to GRPO/GFPO trainers and upgrade dependencies
 
@@ -173,7 +173,7 @@ Also:
 
 ---
 
-## 2026-03-10 — `81fb1b64`
+## 2026-03-10
 
 ### fix: Fix XLA trigger for gated delta rule
 
@@ -183,7 +183,7 @@ Also:
 
 ---
 
-## 2026-03-09 — `c14e60a8`
+## 2026-03-09
 
 ### feat: Add linear attention conv-state helpers, TP-safe ragged cache dtype, num_rows limiting, and quantization group-size fallback
 
@@ -200,7 +200,7 @@ Also:
 
 ---
 
-## 2026-03-08 — `40330cba`
+## 2026-03-08
 
 ### docs: Add comprehensive docstrings across the codebase and bump eformer/ejkernel
 
@@ -212,7 +212,7 @@ Also:
 
 ---
 
-## 2026-03-06 — `94a1a5e4`
+## 2026-03-06
 
 ### refactor: Replace assert statements with proper exceptions, fix typos, and centralize generation config
 
@@ -232,7 +232,7 @@ Also:
 
 ---
 
-## 2026-03-05 — `ddef8f84`
+## 2026-03-05
 
 ### fix: Reduce HBM spikes in distillation trainer and fix sharding step type
 
@@ -246,7 +246,7 @@ Also:
 
 ---
 
-## 2026-03-05 — `b2b5ab4f`
+## 2026-03-05
 
 ### feat: Add MLA ragged paged attention support and auto-detection for MLA architectures
 
@@ -263,7 +263,7 @@ Also:
 
 ---
 
-## 2026-03-04 — `754c44d6`
+## 2026-03-04
 
 ### fix: Fix distillation trainer and bump eformer to 0.0.98
 
@@ -274,7 +274,7 @@ Also:
 
 ---
 
-## 2026-03-04 — `2b1f3cf8`
+## 2026-03-04
 
 ### refactor: Delegate GDR kernel to ejkernel module API and improve W&B naming
 
@@ -291,7 +291,7 @@ Also:
 
 ---
 
-## 2026-03-03 — `fdd0fc1f`
+## 2026-03-03
 
 ### fix: Fix backward pass for gated delta rule
 
