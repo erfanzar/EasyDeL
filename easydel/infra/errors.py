@@ -96,6 +96,15 @@ class EasyDeLBreakRequest(Exception):
     """
 
 
+class EasyDeLPreemptionSignal(Exception):
+    """Signal that training stopped early after saving a TPU preemption checkpoint.
+
+    This is a control-flow exception used to distinguish a coordinated
+    preemption save from unrelated iterator exhaustion or generator
+    ``StopIteration`` errors.
+    """
+
+
 class EasyDeLBlockWiseFFNError(Exception):
     """Error in block-wise feed-forward network operations.
 

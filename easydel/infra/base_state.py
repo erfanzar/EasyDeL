@@ -75,6 +75,8 @@ from __future__ import annotations
 
 import collections.abc
 import contextlib
+import datetime as dt
+import json
 import os
 import pickle
 import typing as tp
@@ -1093,6 +1095,7 @@ class EasyDeLState(struct.PyTreeNode):
         float_dtype: jnp.dtype | None = None,
         save_optimizer: bool = True,
         step: int | None = None,
+        gather_fns: dict[str, tp.Callable] | None = None,
     ) -> None:
         """Save the complete EasyDeLState to a directory.
 
@@ -1112,6 +1115,9 @@ class EasyDeLState(struct.PyTreeNode):
                 Defaults to True.
             step (int | None): Training step to record in checkpoint metadata.
                 If None, uses the current `self.step` value. Defaults to None.
+            gather_fns (dict[str, Callable] | None): Optional parameter gather
+                functions forwarded to ``model.save_pretrained`` for callers
+                that need explicit sharded-weight gathering behavior.
 
         Returns:
             None
@@ -1155,10 +1161,20 @@ class EasyDeLState(struct.PyTreeNode):
 
         self.model.save_pretrained(
             save_directory=save_directory,
-            gather_fns=self.model._gather_fns,
+            gather_fns=gather_fns,
             float_dtype=float_dtype,
             step=step,
         )
+        try:
+            if jax.process_index() == 0:
+                metadata = {
+                    "step": int(step),
+                    "timestamp": dt.datetime.now(dt.UTC).isoformat(),
+                    "is_temporary": False,
+                }
+                (save_directory / "metadata.json").write_text(json.dumps(metadata))
+        except Exception as exc:
+            logger.warning(f"Failed to write checkpoint discovery metadata for {save_directory}: {exc}")
 
     @classmethod
     def load_state(

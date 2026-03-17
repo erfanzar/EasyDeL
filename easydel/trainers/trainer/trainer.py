@@ -38,7 +38,7 @@ import jax
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
-from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
+from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLPreemptionSignal, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import ejit
@@ -262,6 +262,29 @@ class Trainer(BaseTrainer):
             checkpoint_manager=checkpoint_manager,
         )
 
+    def _get_epoch_step_bounds(self, epoch: int) -> tuple[int, int]:
+        """Return the global step range assigned to an epoch."""
+        if self.max_training_steps is None:
+            raise RuntimeError("max_training_steps must be set before training")
+        total_epochs = max(int(self.arguments.num_train_epochs), 1)
+        return (
+            (epoch * self.max_training_steps) // total_epochs,
+            ((epoch + 1) * self.max_training_steps) // total_epochs,
+        )
+
+    def _get_resume_epoch(self, step: int) -> int:
+        """Map a global training step back to its epoch index."""
+        if self.max_training_steps is None:
+            raise RuntimeError("max_training_steps must be set before training")
+        total_epochs = max(int(self.arguments.num_train_epochs), 1)
+        if step >= self.max_training_steps:
+            return total_epochs
+        for epoch in range(total_epochs):
+            _, epoch_end_step = self._get_epoch_step_bounds(epoch)
+            if step < epoch_end_step:
+                return epoch
+        return total_epochs
+
     def _run_training_loop(
         self,
         state: EasyDeLState,
@@ -291,10 +314,9 @@ class Trainer(BaseTrainer):
         - Checkpoint saving at specified intervals
         - Early stopping on interruption or time limits
 
-        The method handles resumption differently for Grain (seekable) and
-        TensorFlow (non-seekable) datasets. For Grain, it can resume from
-        the exact position, while for TF datasets it starts fresh but
-        continues from the saved model state.
+        Resume is keyed off the saved global training step. The trainer
+        fast-forwards the training iterator by the already-consumed batch
+        count and continues from the correct point inside the current epoch.
 
         Args:
             state: Initial model state with parameters and optimizer state
@@ -320,29 +342,32 @@ class Trainer(BaseTrainer):
             desc="training process",
         )
 
-        # Handle resumption based on dataset type
         initial_step = int(jax.device_get(state.step))
         start_epoch = 0
+        train_iter = iter(self.dataloader_train)
 
         if initial_step > 0:
-            pbar.update(initial_step)
             if self.max_training_steps is None:
                 raise RuntimeError("max_training_steps must be set before training")
-            steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
-
-            if self.arguments.use_grain:
-                logger.info(f"Resuming Grain dataset from step {initial_step}")
-                start_epoch = initial_step // steps_per_epoch
+            pbar.update(min(initial_step, self.max_training_steps))
+            start_epoch = self._get_resume_epoch(initial_step)
+            if initial_step < self.max_training_steps:
+                logger.info(
+                    f"Resuming training from step {initial_step}; fast-forwarding dataloader by {initial_step} batches."
+                )
+                train_iter = self._fast_forward_batches(train_iter, self.dataloader_train, initial_step)
             else:
                 logger.info(
-                    f"Resuming training from step {initial_step} (non-seekable dataset, starting fresh data iteration)"
+                    f"Resumed state is already at step {initial_step}, which is at or beyond "
+                    f"max_training_steps={self.max_training_steps}."
                 )
-
-        train_iter = iter(self.dataloader_train)
         try:
             run_exception = None
             with self.mesh:
                 for epoch in range(start_epoch, self.arguments.num_train_epochs):
+                    epoch_start_step, epoch_end_step = self._get_epoch_step_bounds(epoch)
+                    if epoch_start_step >= epoch_end_step:
+                        continue
                     state, run_exception, train_iter = self._train_epoch(
                         state=state,
                         train_dataset=self.dataloader_train,
@@ -351,6 +376,8 @@ class Trainer(BaseTrainer):
                         step_metrics=step_metrics,
                         pbar=pbar,
                         epoch=epoch,
+                        epoch_start_step=epoch_start_step,
+                        epoch_end_step=epoch_end_step,
                     )
 
                     current_step = int(jax.device_get(state.step))
@@ -423,6 +450,8 @@ class Trainer(BaseTrainer):
         step_metrics: StepMetrics,
         pbar: BaseProgressBar,
         epoch: int,
+        epoch_start_step: int | None = None,
+        epoch_end_step: int | None = None,
     ):
         """Execute a single training epoch.
 
@@ -485,18 +514,20 @@ class Trainer(BaseTrainer):
 
         if self.max_training_steps is None:
             raise RuntimeError("max_training_steps must be set before training")
-        steps_per_epoch = self.max_training_steps // self.arguments.num_train_epochs
+        if epoch_start_step is None or epoch_end_step is None:
+            epoch_start_step, epoch_end_step = self._get_epoch_step_bounds(epoch)
+        epoch_total_steps = max(epoch_end_step - epoch_start_step, 1)
         run_exception: Exception | None = None
 
-        for _ in range(steps_per_epoch):
+        while True:
             current_step = int(jax.device_get(state.step))
-            if current_step >= self.max_training_steps:
+            if current_step >= self.max_training_steps or current_step >= epoch_end_step:
                 break
             try:
                 batch, train_iter = self._get_next_batch(train_iter, train_dataset)
                 step_metrics.start_step()
                 state = self.on_step_start(state=state, step=current_step)
-            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, StopIteration) as exc:
+            except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, EasyDeLPreemptionSignal) as exc:
                 return state, exc, train_iter
 
             # Execute training step
@@ -519,7 +550,7 @@ class Trainer(BaseTrainer):
                     if self.scheduler is not None
                     else self.arguments.learning_rate,
                     epoch=epoch,
-                    epoch_progress=current_step / steps_per_epoch,
+                    epoch_progress=min(max((current_step - epoch_start_step) / epoch_total_steps, 0.0), 1.0),
                     flops_per_token=self._backward_flops_per_token,
                     extra_flops_per_token=self._extra_backward_flops_per_token,
                     batch_size=self.training_batch_size,
@@ -539,7 +570,15 @@ class Trainer(BaseTrainer):
                     step=current_step,
                     mode="train",
                 )
+                if self._should_save_tpu_preemption_checkpoint(current_step):
+                    if jax.process_index() == 0 or self.arguments.log_all_workers:
+                        logger.warning(
+                            f"TPU preemption sync point reached at step {current_step}. Saving coordinated checkpoint."
+                        )
+                    self._save_tpu_preemption_checkpoint(state=state, step=current_step)
+                    return state, EasyDeLPreemptionSignal("TPU preemption checkpoint saved"), train_iter
                 self.log_weight_distribution(state=state, step=current_step)
+                self.log_watchers(state=state, step=current_step)
                 try:
                     self.maybe_generate(state=state, step=current_step, metrics=metrics)
                 except Exception as exc:  # pragma: no cover - preview must not interrupt training
@@ -549,20 +588,7 @@ class Trainer(BaseTrainer):
                 except Exception as exc:  # pragma: no cover - benchmarks must not interrupt training
                     logger.warning(f"Benchmark hook failed: {exc}")
 
-                def checkpoint_callback(dest, mesh, meta, s=state):
-                    self._save_state(
-                        state=s,
-                        save_directory=str(self.arguments._get_save_directory() / dest),
-                    )
-                    # Clean up old permanent checkpoints if save_total_limit is set
-                    self._cleanup_old_checkpoints()
-
-                self.checkpointer.on_step(
-                    mesh=self.mesh,
-                    pytree=None,  # State saving handled via callback
-                    step=current_step,
-                    true_callbacks=[checkpoint_callback],
-                )
+                self._save_checkpoint_for_step(state=state, step=current_step)
                 if self._should_run_evaluation(current_step):
                     for _ in self.eval(model_state=state):
                         ...

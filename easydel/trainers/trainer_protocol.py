@@ -831,6 +831,15 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         """
 
     @abstractmethod
+    def log_watchers(self, state: EasyDeLState, step: int):
+        """Run registered LogWatcher instances and log their metrics.
+
+        Args:
+            state: Model state containing parameters.
+            step: Current training step.
+        """
+
+    @abstractmethod
     def log_metrics(
         self,
         metrics: dict[str, float],

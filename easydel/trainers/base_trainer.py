@@ -16,6 +16,8 @@ from __future__ import annotations
 import collections.abc
 import copy
 import gc
+import itertools
+import operator
 import os
 import pprint
 import time
@@ -55,7 +57,7 @@ from easydel.infra.elarge.benchmarking import (
     normalize_benchmark_configs,
     run_lm_eval_with_esurge,
 )
-from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
+from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLPreemptionSignal, EasyDeLTimerError
 from easydel.infra.factory import TaskType
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
@@ -198,6 +200,8 @@ class BaseTrainer(BaseTrainerProtocol):
         if arguments.model_name is None:
             arguments.model_name = getattr(model_state.model, "_model_type", "module")
         self.arguments = arguments
+        self._preemption_checkpoint_path = None
+        self._tpu_preemption_sync_available = None
 
         self._resumed_from_checkpoint = False
         if self.arguments.resume_if_possible:
@@ -231,6 +235,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
                     model_state = resumed_state
                     self._resumed_from_checkpoint = True
+                    self._maybe_remove_loaded_checkpoint(checkpoint_path)
                 else:
                     logger.info("No checkpoints found. Starting fresh training.")
             except Exception as e:
@@ -673,6 +678,8 @@ class BaseTrainer(BaseTrainerProtocol):
         self.checkpoint_manager = getattr(self, "checkpoint_manager", None)
         self.pruning_module = self.arguments.pruning_module
         self.memory_monitor = getattr(self.arguments, "memory_monitor", None)
+        self._preemption_checkpoint_path = getattr(self, "_preemption_checkpoint_path", None)
+        self._tpu_preemption_sync_available = getattr(self, "_tpu_preemption_sync_available", None)
 
         self._model = getattr(self, "_model", None)
         self.config = getattr(self, "config", None)
@@ -3104,11 +3111,82 @@ class BaseTrainer(BaseTrainerProtocol):
         self._save_readme(directory_name)
         state.save_state(
             save_directory=directory_name,
+            gather_fns=kwargs.get("gather_fns"),
             float_dtype=self.model.param_dtype,
             save_optimizer=self.arguments.save_optimizer_state,
         )
 
         return str(directory_name)
+
+    def _sync_checkpointer_after_callback_save(self, step: int) -> None:
+        """Mirror checkpointer bookkeeping for callback-driven saves.
+
+        EasyDeL uses ``Checkpointer.on_step(..., pytree=None, true_callbacks=[...])``
+        so the external checkpointer decides *when* to save while the trainer callback
+        performs the actual state serialization. In the pinned eformer implementation,
+        the internal ``_last_save_step`` / ``_last_save_time`` fields are only updated
+        when ``save_checkpoint`` is invoked with a real pytree. Keep those fields in
+        sync here so step/time policies continue to behave correctly.
+        """
+        checkpointer = getattr(self, "checkpointer", None)
+        if checkpointer is None:
+            return
+        try:
+            if hasattr(checkpointer, "_last_save_step"):
+                checkpointer._last_save_step = int(step)
+            now_factory = getattr(checkpointer, "_dt_now_injection", None)
+            if callable(now_factory) and hasattr(checkpointer, "_last_save_time"):
+                checkpointer._last_save_time = now_factory()
+        except Exception as exc:
+            logger.warning(f"Failed to synchronize checkpointer bookkeeping after save: {exc}")
+
+    def _save_checkpoint_for_step(
+        self,
+        state: EasyDeLState,
+        *,
+        step: int,
+        force: bool = False,
+    ) -> str | None:
+        """Run checkpointer policy evaluation and serialize the current trainer state."""
+        saved_directory = [None]
+
+        def save_callback(dest, mesh, meta, s=state):
+            full_path = str(self.arguments._get_save_directory() / dest)
+            saved_directory[0] = self._save_state(state=s, save_directory=full_path)
+            self._cleanup_old_checkpoints()
+
+        self.checkpointer.on_step(
+            mesh=self.mesh,
+            pytree=None,
+            step=step,
+            force=force,
+            true_callbacks=[save_callback],
+        )
+        if saved_directory[0] is not None:
+            self._sync_checkpointer_after_callback_save(step=step)
+        return saved_directory[0]
+
+    def _maybe_remove_loaded_checkpoint(self, checkpoint_path: str) -> None:
+        """Delete a checkpoint after load when explicitly requested."""
+        if not getattr(self.arguments, "remove_ckpt_after_load", False):
+            return
+        try:
+            if jax.process_count() > 1:
+                from jax.experimental import multihost_utils as mh
+
+                mh.sync_global_devices("easydel.remove_ckpt_after_load.before")
+            if jax.process_index() == 0:
+                import fsspec
+
+                fs, plain_path = fsspec.core.url_to_fs(str(checkpoint_path))
+                logger.info(f"Removing checkpoint after load: {checkpoint_path}")
+                fs.rm(plain_path, recursive=True)
+            if jax.process_count() > 1:
+                from jax.experimental import multihost_utils as mh
+
+                mh.sync_global_devices("easydel.remove_ckpt_after_load.after")
+        except Exception as exc:
+            logger.warning(f"Failed to remove checkpoint after load {checkpoint_path}: {exc}")
 
     def _create_checkpointer(self):
         """Create and configure the Checkpointer instance.
@@ -3583,37 +3661,25 @@ class BaseTrainer(BaseTrainerProtocol):
                 logger.warning("KeyboardInterrupt: Training interrupted. Saving current state...")
             elif isinstance(run_exception, EasyDeLTimerError):
                 logger.warning("Training reached maximum time limit. Saving current state...")
-            elif isinstance(run_exception, StopIteration):
+            elif isinstance(run_exception, EasyDeLPreemptionSignal):
                 ...  # simply just pass
             else:
                 raise RuntimeError(f"EasyDeL Runtime dumped due to {run_exception!s}") from run_exception
         checkpoint_path = "SAVING_SKIPPED"
         filename = None
 
-        dire = ePath(self.arguments.save_directory)
-        if self.arguments.do_last_save:
-            # Use checkpointer.on_step with force=True for final save
+        if self._preemption_checkpoint_path is not None:
+            checkpoint_path = str(self._preemption_checkpoint_path)
+            filename = str(self._preemption_checkpoint_path)
+        elif self.arguments.do_last_save:
+            dire = ePath(self.arguments.save_directory)
             current_step = int(jax.device_get(state.step))
-
-            # Track the saved directory in the callback
-            saved_directory = [None]  # Use list for mutability in closure
-
-            def save_callback(dest, mesh, meta, s=state):
-                full_path = str(self.arguments._get_save_directory() / dest)
-                saved_directory[0] = self._save_state(state=s, save_directory=full_path)
-                # Clean up old permanent checkpoints if save_total_limit is set
-                self._cleanup_old_checkpoints()
-
-            self.checkpointer.on_step(
-                mesh=self.mesh,
-                pytree=None,
+            filename = self._save_checkpoint_for_step(
+                state=state,
                 step=current_step,
-                force=True,  # Force final checkpoint save
-                true_callbacks=[save_callback],
+                force=True,
             )
-
-            if saved_directory[0] is not None:
-                filename = saved_directory[0]
+            if filename is not None:
                 if self.arguments.save_directory is not None:
                     checkpoint_path = dire / filename
 
@@ -3683,19 +3749,103 @@ class BaseTrainer(BaseTrainerProtocol):
                   and updated_data_iter is the potentially reinitialized iterator.
 
         Raises:
-            StopIteration: If dataloader is exhausted and cannot be reinitialized.
+            RuntimeError: If the dataloader is empty and cannot provide batches.
         """
         try:
             batch = next(data_iter)
         except (StopIteration, IndexError):
             data_iter = iter(dataloader)
-            batch = next(data_iter)
+            try:
+                batch = next(data_iter)
+            except StopIteration as exc:
+                raise RuntimeError("Dataloader is empty and cannot provide batches.") from exc
 
         # Remove specified ids from batch if needed
         for id_to_pop in self.arguments.ids_to_pop_from_dataset or []:
             _ = batch.pop(id_to_pop, None)
 
         return batch, data_iter
+
+    def _fast_forward_batches(self, data_iter, dataloader, num_batches: int):
+        """Advance an iterator by discarding a fixed number of batches.
+
+        This mirrors the normal training-time iterator semantics, including
+        automatic reinitialization when a finite dataloader is exhausted.
+        """
+        num_batches = max(int(num_batches), 0)
+        if num_batches > 10_000:
+            logger.warning(
+                f"Fast-forwarding dataloader by {num_batches} batches. This may take a while for large step counts."
+            )
+        if num_batches == 0:
+            return data_iter
+        builtin_sequence_iterators = (type(iter([])), type(iter(())), type(iter(range(0))))
+        if isinstance(dataloader, collections.abc.Sequence) and isinstance(data_iter, builtin_sequence_iterators):
+            total_batches = len(dataloader)
+            if total_batches == 0:
+                raise RuntimeError("Dataloader is empty and cannot be fast-forwarded.")
+            consumed_batches = total_batches - max(operator.length_hint(data_iter), 0)
+            target_index = (consumed_batches + num_batches) % total_batches
+            return itertools.islice(iter(dataloader), target_index, None)
+        remaining = num_batches
+        while remaining > 0:
+            skipped = sum(1 for _ in itertools.islice(data_iter, remaining))
+            remaining -= skipped
+            if remaining <= 0:
+                break
+            data_iter = iter(dataloader)
+            try:
+                next(data_iter)
+            except StopIteration as exc:
+                raise RuntimeError("Dataloader is empty and cannot be fast-forwarded.") from exc
+            remaining -= 1
+        return data_iter
+
+    def _should_enable_tpu_preemption_checkpointing(self) -> bool:
+        """Return whether TPU preemption-triggered checkpointing is enabled."""
+        if not self.arguments.save_tpu_preemption_checkpoints:
+            return False
+        try:
+            return jax.default_backend() == "tpu"
+        except Exception:
+            return False
+
+    def _should_save_tpu_preemption_checkpoint(self, step: int) -> bool:
+        """Return True when JAX's preemption sync service reaches a safe save step."""
+        if not self._should_enable_tpu_preemption_checkpointing():
+            return False
+        if self._tpu_preemption_sync_available is False:
+            return False
+        try:
+            from jax.experimental import multihost_utils
+
+            should_save = bool(multihost_utils.reached_preemption_sync_point(int(step)))
+            self._tpu_preemption_sync_available = True
+            return should_save
+        except RuntimeError as exc:
+            self._tpu_preemption_sync_available = False
+            logger.warning_once(
+                "TPU preemption checkpointing requested but JAX preemption sync is unavailable. "
+                "Ensure `jax_enable_preemption_service` is enabled before distributed initialization. "
+                f"Disabling feature for this run. Original error: {exc}"
+            )
+            return False
+
+    def _save_tpu_preemption_checkpoint(self, state: EasyDeLState, step: int) -> str | None:
+        """Save a coordinated TPU preemption checkpoint using standard trainer naming."""
+        from jax.experimental import multihost_utils
+
+        sync_prefix = f"tpu-preemption-save-{int(step)}"
+        multihost_utils.sync_global_devices(sync_prefix + "-start")
+        saved_path = self._save_checkpoint_for_step(
+            state=state,
+            step=step,
+            force=True,
+        )
+        multihost_utils.sync_global_devices(sync_prefix + "-done")
+        if saved_path is not None:
+            self._preemption_checkpoint_path = saved_path
+        return saved_path
 
     def create_progress_bar(
         self,
@@ -3758,6 +3908,18 @@ class BaseTrainer(BaseTrainerProtocol):
             Delegates to arguments.log_weight_distribution method.
         """
         return self.arguments.log_weight_distribution(state=state, step=step)
+
+    def log_watchers(self, state: EasyDeLState, step: int):
+        """Run registered LogWatcher instances and log their metrics.
+
+        Args:
+            state: Model state containing parameters.
+            step: Current training step.
+
+        Notes:
+            Delegates to arguments.log_watchers method.
+        """
+        return self.arguments.log_watchers(state=state, step=step)
 
     def log_metrics(
         self,

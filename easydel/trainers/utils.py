@@ -73,6 +73,12 @@ FLATTENABLE_MULTIMODAL_KEYS = frozenset(
 ).intersection(GENERATION_MODEL_INPUT_KEYS)
 
 
+def _enable_jax_preemption_service() -> None:
+    """Enable JAX TPU preemption sync before distributed initialization."""
+    os.environ.setdefault("JAX_ENABLE_PREEMPTION_SERVICE", "true")
+    jax.config.update("jax_enable_preemption_service", True)
+
+
 class JaxDistributedConfig:
     """Configuration manager for JAX distributed training.
 
@@ -138,17 +144,27 @@ class JaxDistributedConfig:
         """
         config = cls.get_default_config(config)
         if config.initialize_jax_distributed:
+            _enable_jax_preemption_service()
+            if jax.distributed.is_initialized():
+                logger.debug("JAX distributed already initialized; using existing setup.")
+                return
             if config.local_device_ids is not None:
                 local_device_ids = [int(x) for x in config.local_device_ids.split(",")]
             else:
                 local_device_ids = None
 
-            jax.distributed.initialize(
-                coordinator_address=config.coordinator_address,
-                num_processes=config.num_processes,
-                process_id=config.process_id,
-                local_device_ids=local_device_ids,
-            )
+            try:
+                jax.distributed.initialize(
+                    coordinator_address=config.coordinator_address,
+                    num_processes=config.num_processes,
+                    process_id=config.process_id,
+                    local_device_ids=local_device_ids,
+                )
+            except RuntimeError:
+                if jax.distributed.is_initialized():
+                    logger.debug("JAX distributed already initialized; using existing setup.")
+                    return
+                raise
 
 
 def create_prompt_creator(processing_class):

@@ -74,7 +74,6 @@ import typing as tp
 
 from eformer import escale
 from eformer.escale import PartitionAxis
-from eformer.executor import DistributedConfig
 from eformer.loggings import get_logger
 from eformer.pytree import PyTree, auto_pytree
 from flax.nnx import Rngs
@@ -95,25 +94,31 @@ def init_cluster():
     computing. It attempts to initialize the JAX distributed runtime using the
     DistributedConfig from eformer.
 
-    The function handles two types of failures gracefully:
-    - RuntimeError: Occurs when JAX distributed is already initialized manually
-    - General Exception: Occurs when running in single-process mode
-
-    Both failures are logged as warnings and do not raise exceptions, allowing
-    the code to continue execution in both distributed and single-process scenarios.
-
     Note:
         This function should be called once at the beginning of your program
         before any distributed operations.
     """
+    import os as _os
+
+    import jax as _jax
+
     _logger = get_logger("EasyDeL-Distributed")
+    _os.environ.setdefault("JAX_ENABLE_PREEMPTION_SERVICE", "true")
+    _jax.config.update("jax_enable_preemption_service", True)
+
+    if _jax.distributed.is_initialized():
+        _logger.info("JAX distributed already initialized; using existing setup.")
+        return
+
+    from eformer.executor import DistributedConfig as _DistributedConfig
 
     try:
-        DistributedConfig().initialize()
+        _DistributedConfig().initialize()
     except RuntimeError:
-        _logger.warn("Failed to initialize jax-dist if you have initialized that manually you can ignore this warning")
-    except Exception:  # maybe it's a single process
-        _logger.warn("Failed to initialize jax-dist")
+        if _jax.distributed.is_initialized():
+            _logger.info("JAX distributed already initialized; using existing setup.")
+            return
+        raise
 
 
 __all__ = (

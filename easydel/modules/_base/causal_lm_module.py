@@ -384,20 +384,9 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
 
         outputs = self.base_model(**base_model_kwargs)
 
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
         lm_logits = None
         if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
-
-            # Apply logit capping if configured
-            lm_logits = self.apply_logit_cap(lm_logits)
+            lm_logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
 
         # Compute router auxiliary loss if configured
         aux_loss = self.compute_router_aux_loss(outputs)
@@ -522,8 +511,7 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
 
         logits = None
         if apply_lm_head:
-            logits = checkpoint_name(self.apply_lm_head(outputs.last_hidden_state), "lm_head_output")
-            logits = self.apply_logit_cap(logits)
+            logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
 
         aux_loss = None
         if aux_loss_fn is not None and mode not in [
@@ -583,6 +571,20 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         w = self.get_embedding().embedding.value.T if tie_embeddings else None
         lm_head = getattr(self, self._lm_head_name)
         return lm_head(hidden_states, w=w)
+
+    def prepare_lm_head_inputs(self, hidden_states: Array) -> Array:
+        """Apply the shared pre-LM-head hidden-state transform."""
+        return apply_logical_sharding(
+            hidden_states,
+            dynamic_axes=common_types.HiddenStateSharding,
+            partition_manager=self.config.partition_manager,
+        )
+
+    def compute_lm_logits(self, hidden_states: Array) -> Array:
+        """Project hidden states to final logits using the module's full LM-head path."""
+
+        logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
+        return self.apply_logit_cap(logits)
 
     def get_task_head(self):
         """Returns the language modeling head module.

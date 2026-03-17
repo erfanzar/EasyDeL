@@ -94,17 +94,17 @@ from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 
 from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
 from .etils import EasyDeLGradientCheckPointers
-from .utils import sanitize_partition_spec_for_shape, sanitize_partition_specs_for_shape_tree
-
-__all__ = (
-    "EasyDeLBaseConfig",
-    "EasyDeLBaseConfigDict",
-    "EasyDeLBaseModule",
-    "ParameterTransformRule",
+from .loss_utils import (
+    LOSS_MAPPING,
+    ForCausalLMLoss,
+    ForSequenceClassificationLoss,
+    LossConfig,
+    LossMetrics,
+    resolve_loss_strategy,
 )
-from .loss_utils import LOSS_MAPPING, ForCausalLMLoss, ForSequenceClassificationLoss, LossConfig, LossMetrics
 from .mixins import BaseModuleProtocol, EasyBridgeMixin, EasyGenerationMixin, OperationCacheMixin
 from .modeling_outputs import EmbeddingInfo
+from .utils import sanitize_partition_spec_for_shape, sanitize_partition_specs_for_shape_tree
 
 if tp.TYPE_CHECKING:
     from easydel.infra.base_state import EasyDeLState
@@ -781,6 +781,12 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         """
 
         return LOSS_MAPPING[self.lossfn_type]
+
+    @cached_property
+    def loss_strategy(self: Self):
+        """Get the planning-aware loss strategy for the resolved loss function."""
+
+        return resolve_loss_strategy(self.loss_function)
 
     @property
     def module_dtype(self: Self) -> jnp.dtype:
@@ -2772,15 +2778,28 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             forward_batch = dict(forward_batch)
             forward_batch.pop("inputs_embeds", None)
 
+        forward_plan = self.loss_strategy.plan_forward(
+            module=self,
+            labels=labels,
+            loss_config=loss_config,
+            batch=batch,
+            loss_kwargs=loss_kwargs,
+        )
+        if forward_plan.forward_kwargs:
+            forward_batch = dict(forward_batch)
+            forward_batch.update(forward_plan.forward_kwargs)
+
         outputs = self(**forward_batch)
 
-        loss_output: LossMetrics = self.loss_function(
+        loss_output: LossMetrics = self.loss_strategy.compute(
+            module=self,
+            outputs=outputs,
             labels=labels,
-            config=loss_config,
+            loss_config=loss_config,
+            batch=batch,
+            loss_kwargs=loss_kwargs,
             paxis=self.config.partition_axis,
-            **loss_kwargs,
-            **outputs,
-            **batch,
+            forward_plan=forward_plan,
         )
         if hasattr(outputs, "aux_loss"):
             if outputs.aux_loss is not None:
@@ -3026,3 +3045,11 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         tree_hash = _get_args_signature((self.graphstate, self.graphother), dict_config)
         bytes_in = hashlib.md5((tree_hash).encode("utf-8")).digest()
         return int.from_bytes(bytes_in, byteorder="big", signed=True)
+
+
+__all__ = (
+    "EasyDeLBaseConfig",
+    "EasyDeLBaseConfigDict",
+    "EasyDeLBaseModule",
+    "ParameterTransformRule",
+)
