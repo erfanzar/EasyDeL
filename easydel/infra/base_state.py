@@ -128,6 +128,14 @@ TX_STRUCT_JSON = "tx_structure.json"
 logger = get_logger(__name__)
 
 
+def _is_optimizer_template_incompatibility(exc: Exception) -> bool:
+    """Return whether an optimizer restore error signals a template mismatch."""
+    message = str(exc)
+    return (isinstance(exc, KeyError) and "Missing array for key" in message) or (
+        isinstance(exc, ValueError) and "Array shape mismatch for key" in message
+    )
+
+
 def _sanitize_partition_specs_for_shape_tree(
     partition_specs: tp.Any,
     shape_tree: tp.Any,
@@ -941,19 +949,39 @@ class EasyDeLState(struct.PyTreeNode):
             """Load using modern TensorStore format."""
             path = str(AsyncCheckpointManager.safe_loadpath(org_path))
             tx_template = tx_template if tx_template is not None else self.tx
+
+            def _load_tensorstore(template):
+                return checkpointer.load_pytree(
+                    mesh=self.model.mesh,
+                    path=path,
+                    partition_rules=partition_rules,
+                    prefix="tx",
+                    load_treedef=True,
+                    discover_latest=True,
+                    discover_raise=False,
+                    template=template,
+                )
+
             template = None
             if tx_template is not None:
-                template = jax.eval_shape(tx_template.init, self.graphstate)
-            opt_state, metadata = checkpointer.load_pytree(
-                mesh=self.model.mesh,
-                path=path,
-                partition_rules=partition_rules,
-                prefix="tx",
-                load_treedef=True,
-                discover_latest=True,
-                discover_raise=False,
-                template=template,
-            )
+                try:
+                    template = jax.eval_shape(tx_template.init, self.graphstate)
+                except Exception:
+                    logger.warning(
+                        "Failed to build an optimizer template for TensorStore restore; "
+                        "retrying using the saved optimizer structure.",
+                        exc_info=True,
+                    )
+
+            try:
+                opt_state, metadata = _load_tensorstore(template)
+            except KeyError as exc:
+                if template is not None and "Missing array for key" in str(exc):
+                    logger.error(
+                        "Optimizer checkpoint is incompatible with the current optimizer template.",
+                        exc_info=True,
+                    )
+                raise
             step = metadata.get("step", 0)
             return opt_state, step
 
@@ -962,7 +990,9 @@ class EasyDeLState(struct.PyTreeNode):
                 opt_state, step = new_method(tx_template)
                 logger.info(f"Optimizer state loaded from {load_directory} (step {step}).")
                 return self.replace(opt_state=opt_state, step=jnp.asarray(step))
-            except Exception:
+            except Exception as exc:
+                if _is_optimizer_template_incompatibility(exc):
+                    raise
                 logger.exception("Failed to load optimizer state via TensorStore format.")
 
         try:
