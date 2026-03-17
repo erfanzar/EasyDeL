@@ -1194,7 +1194,10 @@ class TrainingArguments:
         """
         if possible_max is None:
             possible_max = 2**63 - 1
-        return self.get_optimizer_and_scheduler(possible_max)[0]
+        optimizer = self.get_optimizer_and_scheduler(possible_max)[0]
+        if self.pruning_module is not None:
+            optimizer = self.pruning_module.wrap_optax(optimizer)
+        return optimizer
 
     def get_optimizer_and_scheduler(self, steps: int | None = None):
         """
