@@ -1476,6 +1476,7 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "init_tx": True,
     "train_on_inputs": True,
     "aux_loss_enabled": False,
+    "step_start_point": None,
     "resume_if_possible": True,
     "truncation_mode": "keep_end",
     "max_length": 4096,

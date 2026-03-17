@@ -229,10 +229,6 @@ class BaseTrainer(BaseTrainerProtocol):
                     actual_step = int(jax.device_get(resumed_state.step))
                     logger.info(f"Successfully resumed from checkpoint at step {actual_step}")
 
-                    if self.arguments.step_start_point is None:
-                        self.arguments.step_start_point = actual_step
-                        logger.info(f"Set step_start_point to {actual_step}")
-
                     model_state = resumed_state
                     self._resumed_from_checkpoint = True
                     self._maybe_remove_loaded_checkpoint(checkpoint_path)
@@ -242,6 +238,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 logger.warning(f"Resuming from checkpoint failed: {e}. Starting fresh training.")
 
         self.model_state = model_state
+        self._apply_step_start_point()
         self._model = flax.nnx.eval_shape(lambda: self.model_state.model)
         self.dataset_train = dataset_train
         self.dataset_eval = dataset_eval
@@ -303,6 +300,69 @@ class BaseTrainer(BaseTrainerProtocol):
 
         self._initialize_attributes()
         self.initialize_trainer_utils()
+
+    def _apply_step_start_point(self) -> None:
+        """Initialize a fresh training state from ``step_start_point`` when requested."""
+        requested_step_value = self.arguments.step_start_point
+        if self.model_state is None or requested_step_value is None:
+            return
+
+        requested_step = int(requested_step_value)
+        current_step = int(jax.device_get(self.model_state.step))
+        step_dtype = getattr(self.model_state.step, "dtype", jnp.int32)
+        normalized_step = jnp.asarray(requested_step, dtype=step_dtype)
+        if current_step == requested_step:
+            if not isinstance(self.model_state.step, jax.Array):
+                self.model_state = self.model_state.replace(step=normalized_step)
+            return
+        if current_step != 0 and not self._resumed_from_checkpoint:
+            logger.warning(
+                f"Ignoring step_start_point={requested_step} because model_state.step is already "
+                f"{current_step}. Use a fresh state or checkpoint resume instead."
+            )
+            return
+
+        self.model_state = self.model_state.replace(step=normalized_step)
+        if self._resumed_from_checkpoint:
+            logger.info(
+                "Overrode resumed checkpoint step from "
+                f"{current_step} to {requested_step} via step_start_point."
+            )
+        else:
+            logger.info(f"Initialized model_state.step to {requested_step} from step_start_point.")
+
+    def _apply_step_start_point_to_optimizer_state(self) -> None:
+        """Align optimizer and scheduler counters with ``step_start_point``."""
+        requested_step_value = getattr(self.arguments, "step_start_point", None)
+        if (
+            self.model_state is None
+            or requested_step_value is None
+            or getattr(self.model_state, "opt_state", None) is None
+        ):
+            return
+
+        requested_step = int(requested_step_value)
+        if int(jax.device_get(self.model_state.step)) != requested_step:
+            return
+
+        updated = {"changed": False}
+
+        def _seed_count(path, leaf):
+            if not path:
+                return leaf
+            key = path[-1]
+            key_name = getattr(key, "name", None)
+            key_name = key_name if key_name is not None else getattr(key, "key", None)
+            if key_name != "count":
+                return leaf
+            updated["changed"] = True
+            leaf_dtype = getattr(leaf, "dtype", getattr(self.model_state.step, "dtype", jnp.int32))
+            return jnp.asarray(requested_step, dtype=leaf_dtype)
+
+        opt_state = jax.tree_util.tree_map_with_path(_seed_count, self.model_state.opt_state)
+        if updated["changed"]:
+            self.model_state = self.model_state.replace(opt_state=opt_state)
+            logger.info(f"Aligned optimizer/scheduler counters to step_start_point={requested_step}.")
 
     @staticmethod
     def _normalize_esurge_prompts(
@@ -1574,7 +1634,9 @@ class BaseTrainer(BaseTrainerProtocol):
             reserve_tokens = esurge_kwargs.get("reserve_tokens")
             if reserve_tokens is None:
                 reserve_tokens = esurge_kwargs.get("max_num_seqs", 0)
-            esurge_kwargs["max_model_len"] = sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)  # pyright: ignore[reportOptionalOperand]
+            esurge_kwargs["max_model_len"] = (
+                sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)
+            )  # pyright: ignore[reportOptionalOperand]
 
             _log_kwargs = {k: v for k, v in esurge_kwargs.items() if k != "tokenizer"}
             logger.info_once(f"Creating eSurge {pprint.pformat(_log_kwargs)}")
@@ -2568,6 +2630,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 elif self.model_state.opt_state is not None and self.model_state.tx is None:
                     self.model_state = self.model_state.replace(tx=self.tx)
 
+                self._apply_step_start_point_to_optimizer_state()
                 rules = self.model._get_partition_rules(None)
                 self.model_state = self.model_state.shard_state(partition_rules=rules, mesh=self.model.mesh)
                 self.state_shardings = self.model_state.shardings
@@ -3261,12 +3324,9 @@ class BaseTrainer(BaseTrainerProtocol):
             state: The model state containing the step counter.
 
         Returns:
-            int: Current step number, adjusted by step_start_point if set.
+            int: Current step number from the training state.
         """
-        step = int(jax.device_get(state.step))
-        if self.arguments.step_start_point is not None:
-            step += self.arguments.step_start_point
-        return step
+        return int(jax.device_get(state.step))
 
     def _save_readme(self, save_directory):
         """Save training information as README.md in checkpoint directory.

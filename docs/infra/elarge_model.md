@@ -483,6 +483,10 @@ trainer:
   learning_rate: 2.0e-4  # Higher LR for quantized
   num_train_epochs: 1
   total_batch_size: 64
+  # Optional: start this run at an explicit global step.
+  # Useful when continuing schedules/logging from an external run.
+  step_start_point: 5000
+  resume_if_possible: false
   save_directory: ./llama-qlora-output
 
 actions:
@@ -548,11 +552,25 @@ elm = (
         learning_rate=2e-5,
         num_train_epochs=3,
         total_batch_size=32,
+        step_start_point=5000,
+        resume_if_possible=False,
     )
 )
 
 # Start training
 trainer_output = elm.train()
+```
+
+If you want eLarge to begin from an explicit global step without loading a checkpoint,
+set `step_start_point` and disable automatic checkpoint resume:
+
+```python
+elm.set_trainer(
+    trainer_type="sft",
+    total_batch_size=32,
+    step_start_point=5000,
+    resume_if_possible=False,
+)
 ```
 
 ### Creating an eLargeModel

@@ -19,6 +19,7 @@ from dataclasses import fields
 
 import pytest
 
+from easydel.infra.elarge.model import eLargeModel
 from easydel.infra.elarge.types import (
     BASE_TRAINER_DEFAULTS,
     TRAINER_SPECIFIC_DEFAULTS,
@@ -112,6 +113,33 @@ def test_training_arguments_preserve_none_step_start_point_for_auto_resume():
     )
 
     assert args.step_start_point is None
+
+
+def test_elarge_build_training_arguments_preserves_step_start_point():
+    elm = eLargeModel({"model": {"name_or_path": "dummy-model"}})
+    elm.set_trainer(
+        "sft",
+        total_batch_size=1,
+        step_start_point=123,
+        resume_if_possible=False,
+    )
+
+    args = elm.build_training_arguments()
+
+    assert args.step_start_point == 123
+    assert args.resume_if_possible is False
+
+
+def test_normalize_trainer_config_defaults_step_start_point_to_none():
+    config = normalize_trainer_config(
+        {
+            "trainer_type": "sft",
+            "total_batch_size": 1,
+        }
+    )
+
+    assert "step_start_point" in config
+    assert config["step_start_point"] is None
 
 
 def test_training_arguments_default_tpu_preemption_checkpoint_settings():
