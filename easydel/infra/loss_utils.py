@@ -67,9 +67,12 @@ Example:
     >>> print(f"Loss: {metrics.loss}, Accuracy: {metrics.accuracy}")
 """
 
+from __future__ import annotations
+
 import collections.abc
 import dataclasses
 import enum
+import inspect
 import typing as tp
 from dataclasses import fields
 from functools import reduce
@@ -87,6 +90,162 @@ from jax.sharding import PartitionSpec
 from jaxtyping import Array
 
 from easydel.utils.compiling_utils import hash_fn
+
+
+@dataclasses.dataclass(frozen=True)
+class LossForwardPlan:
+    """Forward-pass requirements declared by a loss strategy.
+
+    A frozen dataclass that communicates how the forward pass should be
+    configured before the loss is computed. Strategies inspect the model,
+    labels, and config in ``plan_forward`` and return a plan whose
+    ``forward_kwargs`` are merged into the model's ``__call__`` invocation.
+
+    For example, ``CausalLMLossStrategy`` returns
+    ``LossForwardPlan(forward_kwargs={"apply_lm_head": False})`` so that
+    the model skips the dense LM-head projection when the strategy will
+    handle it in memory-efficient token chunks instead.
+
+    Attributes:
+        forward_kwargs: Extra keyword arguments injected into the model
+            forward call. An empty dict (the default) means "run the
+            model normally with no overrides".
+    """
+
+    forward_kwargs: dict[str, tp.Any] = dataclasses.field(default_factory=dict)
+
+
+class BaseLossStrategy:
+    """Two-stage loss interface: plan the forward pass, then consume outputs.
+
+    Subclasses implement a two-phase protocol used by the training loop:
+
+    1. **plan_forward** — inspect the model, labels, and loss config *before*
+       the forward pass and return a ``LossForwardPlan`` whose
+       ``forward_kwargs`` are merged into the model call. This lets the
+       strategy disable expensive operations (e.g. the LM-head projection)
+       when it will handle them more efficiently during loss computation.
+    2. **compute** — receive the model outputs (possibly modified by the plan)
+       and produce a ``LossMetrics`` scalar.
+
+    The base class returns a no-op plan and raises ``NotImplementedError``
+    from ``compute`` so that every concrete strategy is forced to provide
+    its own loss logic.
+    """
+
+    __name__ = "BaseLossStrategy"
+
+    def plan_forward(
+        self,
+        *,
+        module: tp.Any,
+        labels: jax.Array | None,
+        loss_config: LossConfig | None,
+        batch: collections.abc.Mapping[str, Array],
+        loss_kwargs: dict[str, tp.Any],
+    ) -> LossForwardPlan:
+        """Return forward-pass overrides for the upcoming model call.
+
+        Args:
+            module: The EasyDeL model instance.
+            labels: Target token IDs (may be ``None`` at inference time).
+            loss_config: Loss configuration, or ``None`` for defaults.
+            batch: Full training batch mapping.
+            loss_kwargs: Extra keyword arguments destined for the loss.
+
+        Returns:
+            A ``LossForwardPlan``. The default implementation returns an
+            empty plan (no overrides).
+        """
+        del module, labels, loss_config, batch, loss_kwargs
+        return LossForwardPlan()
+
+    def compute(
+        self,
+        *,
+        module: tp.Any,
+        outputs: tp.Any,
+        labels: jax.Array | None,
+        loss_config: LossConfig | None,
+        batch: collections.abc.Mapping[str, Array],
+        loss_kwargs: dict[str, tp.Any],
+        paxis: PartitionAxis | None,
+        forward_plan: LossForwardPlan,
+    ) -> LossMetrics:
+        """Compute the loss from model outputs.
+
+        Args:
+            module: The EasyDeL model instance.
+            outputs: Model forward-pass outputs (a namespace with ``logits``,
+                ``last_hidden_state``, etc.).
+            labels: Target token IDs.
+            loss_config: Loss configuration.
+            batch: Full training batch mapping.
+            loss_kwargs: Extra keyword arguments for loss computation.
+            paxis: Partition axis spec for distributed sharding, or ``None``.
+            forward_plan: The plan returned by ``plan_forward`` for this step.
+
+        Returns:
+            A ``LossMetrics`` dataclass with ``loss``, ``z_loss``,
+            ``weight_sum``, and ``accuracy``.
+
+        Raises:
+            NotImplementedError: Always, in the base class.
+        """
+        del module, outputs, labels, loss_config, batch, loss_kwargs, paxis, forward_plan
+        raise NotImplementedError
+
+
+class FunctionalLossStrategy(BaseLossStrategy):
+    """Compatibility adapter that wraps a plain loss callable as a strategy.
+
+    Many existing loss functions (e.g. ``ForCausalLMLoss``,
+    ``ForSequenceClassificationLoss``) follow a simple post-forward
+    signature::
+
+        loss_fn(labels=..., config=..., paxis=..., **outputs, **batch)
+
+    This adapter makes any such callable usable through the two-stage
+    ``BaseLossStrategy`` protocol by delegating ``compute`` directly to
+    the wrapped function. ``plan_forward`` is inherited unchanged (no-op),
+    so the model runs its full default forward pass.
+
+    Args:
+        loss_fn: A callable that accepts keyword arguments and returns
+            ``LossMetrics``.
+    """
+
+    def __init__(self, loss_fn: tp.Callable[..., LossMetrics]):
+        self.loss_fn = loss_fn
+        self.__name__ = getattr(loss_fn, "__name__", type(loss_fn).__name__)
+
+    def compute(
+        self,
+        *,
+        module: tp.Any,
+        outputs: tp.Any,
+        labels: jax.Array | None,
+        loss_config: LossConfig | None,
+        batch: collections.abc.Mapping[str, Array],
+        loss_kwargs: dict[str, tp.Any],
+        paxis: PartitionAxis | None,
+        forward_plan: LossForwardPlan,
+    ) -> LossMetrics:
+        """Delegate to the wrapped loss callable, ignoring the forward plan.
+
+        The wrapped function receives ``labels``, ``config``, ``paxis``,
+        plus all entries from ``loss_kwargs``, ``outputs``, and ``batch``
+        unpacked as keyword arguments.
+        """
+        del module, forward_plan
+        return self.loss_fn(
+            labels=labels,
+            config=loss_config,
+            paxis=paxis,
+            **loss_kwargs,
+            **outputs,
+            **batch,
+        )
 
 
 @enum.unique
@@ -174,7 +333,7 @@ class LossConfig:
         chunk_token_size: If set, enables token-dimension chunking with this
             chunk size. Reduces memory for long sequences.
         chunk_block_size: If set, enables blockwise processing with this block
-            size. Alternative memory optimization strategy.
+            size. Alternative memory optimization strategy (default=4096).
         compute_dtype: Data type for computation. One of "fp32" or "bf16".
             If None, uses the input dtype.
 
@@ -209,7 +368,7 @@ class LossConfig:
     ) = None
     chunk_vocab_size: int | None = None
     chunk_token_size: int | None = None
-    chunk_block_size: int | None = None
+    chunk_block_size: int | None = 4096
     compute_dtype: tp.Literal["fp32", "bf16"] | None = None
 
     def __repr__(self):
@@ -348,6 +507,92 @@ def _logsumexp_chunked(x: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
     return jnp.log(s) + m
 
 
+def _label_smoothing_params(
+    vocab_size: int,
+    label_smoothing: float,
+    dtype: jnp.dtype,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Compute label-smoothing coefficients equivalent to the dense one-hot formulation.
+
+    Given a smoothing factor ``eps``, the smoothed target distribution is::
+
+        q(k) = (1 - eps) * delta(k, y) + eps / V
+
+    This function returns the three scalars needed to evaluate the
+    cross-entropy against that distribution *without* materializing the
+    full ``[..., V]`` one-hot tensor:
+
+    * ``confidence`` = 1 - eps   (mass on the true class)
+    * ``low_confidence`` = eps / (V - 1)   (mass on each non-true class)
+    * ``normalizing_constant`` = H(q)   (entropy of the smoothed target,
+      subtracted so that a perfect model achieves zero loss)
+
+    Args:
+        vocab_size: Number of classes (V).
+        label_smoothing: Smoothing factor in (0, 1).
+        dtype: Computation dtype for the returned arrays.
+
+    Returns:
+        Tuple of ``(confidence, low_confidence, normalizing_constant)``,
+        each a scalar ``jax.Array`` of the requested dtype.
+    """
+    confidence = jnp.asarray(1.0 - label_smoothing, dtype=dtype)
+    low_confidence = (jnp.asarray(1.0, dtype=dtype) - confidence) / jnp.asarray(vocab_size - 1, dtype=dtype)
+    normalizing_constant = -(
+        confidence * jnp.log(confidence)
+        + jnp.asarray(vocab_size - 1, dtype=dtype) * low_confidence * jnp.log(low_confidence + 1e-20)
+    )
+    return confidence, low_confidence, normalizing_constant
+
+
+def _apply_sparse_label_smoothing(
+    log_z: jax.Array,
+    target_logit: jax.Array,
+    sum_logits: jax.Array,
+    *,
+    vocab_size: int,
+    label_smoothing: float,
+    dtype: jnp.dtype,
+) -> jax.Array:
+    """Compute label-smoothed cross-entropy in the sparse (index-based) setting.
+
+    This is mathematically equivalent to::
+
+        (1 - eps) * NLL  +  eps * (log_z - mean_logits)
+
+    but uses the dense-parity decomposition from ``_label_smoothing_params``
+    to avoid the ``eps * mean`` approximation and to match the dense
+    one-hot loss path exactly. The result is::
+
+        log_z - [(confidence - low_confidence) * target_logit
+                 + low_confidence * sum_logits]
+        - normalizing_constant
+
+    where ``confidence``, ``low_confidence``, and ``normalizing_constant``
+    come from ``_label_smoothing_params``.
+
+    Args:
+        log_z: Log-partition function ``logsumexp(logits, axis=-1)``,
+            shape ``[...]``.
+        target_logit: Logit at the true-class index for each token,
+            shape ``[...]``.
+        sum_logits: Sum of all logits along the vocab axis, shape ``[...]``.
+        vocab_size: Number of classes (V).
+        label_smoothing: Smoothing factor in (0, 1).
+        dtype: Computation dtype.
+
+    Returns:
+        Smoothed per-token cross-entropy, same shape as ``log_z``.
+    """
+    confidence, low_confidence, normalizing_constant = _label_smoothing_params(
+        vocab_size=vocab_size,
+        label_smoothing=label_smoothing,
+        dtype=dtype,
+    )
+    target_mass_logits = (confidence - low_confidence) * target_logit + low_confidence * sum_logits
+    return log_z - target_mass_logits - normalizing_constant
+
+
 def cross_entropy_blockwise_logits(
     logits: jax.Array,  # [B, T, V] or [N, V]
     targets: jax.Array,  # [B, T] or [N]
@@ -408,18 +653,20 @@ def cross_entropy_blockwise_logits(
         ... )
         >>> normalized_loss = loss / w_sum
     """
+    compute_dtype = jnp.dtype(dtype or logits.dtype)
+
     # Flatten tokens
     if logits.ndim == 3:
         B, T, V = logits.shape
         L = B * T
         logits2d = logits.reshape(L, V)
         y = targets.reshape(L)
-        w = None if weights is None else weights.reshape(L).astype(jnp.float32)
+        w = None if weights is None else weights.reshape(L).astype(compute_dtype)
     elif logits.ndim == 2:
         L, V = logits.shape  # pyright: ignore[reportConstantRedefinition]
         logits2d = logits
         y = targets
-        w = None if weights is None else weights.astype(jnp.float32)
+        w = None if weights is None else weights.astype(compute_dtype)
     else:
         raise ValueError(f"logits must be [B, T, V] or [N, V], got {logits.shape}")
 
@@ -427,19 +674,19 @@ def cross_entropy_blockwise_logits(
         raise ValueError(f"block_size must be > 0, got {block_size}")
 
     # Upcast for numerical stability
-    logits2d = logits2d.astype(dtype or logits2d.dtype)
+    logits2d = logits2d.astype(compute_dtype)
 
     # Valid/weights
     valid = y != ignore_index
     y_safe = jnp.where(valid, y, 0)
-    w = valid.astype(jnp.float32) if w is None else valid.astype(jnp.float32) * w
+    w = valid.astype(compute_dtype) if w is None else valid.astype(compute_dtype) * w
 
     # Accumulators
-    neg_inf = jnp.array(-jnp.inf, dtype=jnp.float32)
+    neg_inf = jnp.array(-jnp.inf, dtype=compute_dtype)
     m = jnp.full((L,), neg_inf)
     log_z = jnp.full((L,), neg_inf)
-    o = jnp.zeros((L,), dtype=jnp.float32)  # sum of target logits
-    sum_logits = jnp.zeros((L,), dtype=jnp.float32)  # for smoothing
+    o = jnp.zeros((L,), dtype=compute_dtype)  # sum of target logits
+    sum_logits = jnp.zeros((L,), dtype=compute_dtype)  # for smoothing
     best_logit = jnp.full((L,), neg_inf)
     best_id = jnp.zeros((L,), dtype=jnp.int32)
 
@@ -475,6 +722,10 @@ def cross_entropy_blockwise_logits(
 
         return m, log_z, o, sum_logits, best_logit, best_id
 
+    # The blockwise CE loop can otherwise save every [tokens, block_size] chunk
+    # for backward, which explodes memory at long sequence lengths.
+    process_block = jax.checkpoint(process_block, prevent_cse=False, static_argnums=(1,))
+
     def full_body(i, carry):
         """Process a full block in the fori_loop."""
         start = i * block_size
@@ -492,11 +743,15 @@ def cross_entropy_blockwise_logits(
     # Base CE
     nll = log_z - o  # [L]
 
-    # Label smoothing: (1-eps)*NLL + eps*(log_z - mean(logits))
     if label_smoothing and label_smoothing != 0.0:
-        eps = jnp.asarray(label_smoothing, dtype=jnp.float32)
-        mean_logits = sum_logits / float(V)
-        nll = (1.0 - eps) * nll + eps * (log_z - mean_logits)
+        nll = _apply_sparse_label_smoothing(
+            log_z,
+            o,
+            sum_logits,
+            vocab_size=V,
+            label_smoothing=label_smoothing,
+            dtype=compute_dtype,
+        )
 
     # z-loss term
     zterm = (z_loss * (log_z**2)) if (z_loss and z_loss != 0.0) else 0.0
@@ -507,7 +762,10 @@ def cross_entropy_blockwise_logits(
     weight_sum = jnp.sum(w)
 
     # Weighted accuracy
-    acc = jnp.sum((best_id == y_safe).astype(jnp.float32) * w) / jnp.maximum(weight_sum, 1e-8)
+    acc = jnp.sum((best_id == y_safe).astype(compute_dtype) * w) / jnp.maximum(
+        weight_sum,
+        jnp.asarray(1e-8, dtype=compute_dtype),
+    )
 
     return total_loss, total_z_loss, weight_sum, acc
 
@@ -572,8 +830,14 @@ def sparse_cross_entropy_chunked_vocab(
     nll = lse - logit_y
 
     if label_smoothing > 0.0:
-        eps = label_smoothing
-        nll = (1.0 - eps) * nll + eps * (lse - jnp.mean(logits, axis=-1))
+        nll = _apply_sparse_label_smoothing(
+            lse,
+            logit_y,
+            jnp.sum(logits, axis=-1),
+            vocab_size=logits.shape[-1],
+            label_smoothing=label_smoothing,
+            dtype=compute_dtype,
+        )
 
     z_term = (z_loss * jnp.square(lse)) if z_loss > 0.0 else 0.0
     nll = nll + (z_term if z_loss > 0.0 else 0.0)
@@ -663,13 +927,20 @@ def sparse_cross_entropy_chunked_tokens(
         )
 
         lse = jax.scipy.special.logsumexp(chunk_logits, axis=-1)
-        logit_y = jnp.take_along_axis(chunk_logits, chunk_targets[:, None], axis=-1)[:, 0]
         valid = chunk_targets != ignore_index
+        safe_chunk_targets = jnp.where(valid, chunk_targets, 0)
+        logit_y = jnp.take_along_axis(chunk_logits, safe_chunk_targets[:, None], axis=-1)[:, 0]
         nll = lse - logit_y
 
         if label_smoothing > 0.0:
-            eps = label_smoothing
-            nll = (1.0 - eps) * nll + eps * (lse - jnp.mean(chunk_logits, axis=-1))
+            nll = _apply_sparse_label_smoothing(
+                lse,
+                logit_y,
+                jnp.sum(chunk_logits, axis=-1),
+                vocab_size=V,
+                label_smoothing=label_smoothing,
+                dtype=compute_dtype,
+            )
 
         zterm = (z_loss * jnp.square(lse)) if z_loss > 0.0 else 0.0
         nll = nll + (zterm if z_loss > 0.0 else 0.0)
@@ -700,13 +971,20 @@ def sparse_cross_entropy_chunked_tokens(
         chunk_weights = None if weights1d is None else lax.dynamic_slice_in_dim(weights1d, start, tail, axis=0)
 
         lse = jax.scipy.special.logsumexp(chunk_logits, axis=-1)
-        logit_y = jnp.take_along_axis(chunk_logits, chunk_targets[:, None], axis=-1)[:, 0]
         valid = chunk_targets != ignore_index
+        safe_chunk_targets = jnp.where(valid, chunk_targets, 0)
+        logit_y = jnp.take_along_axis(chunk_logits, safe_chunk_targets[:, None], axis=-1)[:, 0]
         nll = lse - logit_y
 
         if label_smoothing > 0.0:
-            eps = label_smoothing
-            nll = (1.0 - eps) * nll + eps * (lse - jnp.mean(chunk_logits, axis=-1))
+            nll = _apply_sparse_label_smoothing(
+                lse,
+                logit_y,
+                jnp.sum(chunk_logits, axis=-1),
+                vocab_size=V,
+                label_smoothing=label_smoothing,
+                dtype=compute_dtype,
+            )
 
         zterm = (z_loss * jnp.square(lse)) if z_loss > 0.0 else 0.0
         nll = nll + (zterm if z_loss > 0.0 else 0.0)
@@ -784,8 +1062,14 @@ def dynamic_cross_entropy_loss(
     logit_y = jnp.take_along_axis(logits, safe_targets[..., None], axis=-1)[..., 0]
     nll = lse - logit_y
     if label_smoothing > 0.0:
-        eps = label_smoothing
-        nll = (1.0 - eps) * nll + eps * (lse - jnp.mean(logits, axis=-1))
+        nll = _apply_sparse_label_smoothing(
+            lse,
+            logit_y,
+            jnp.sum(logits, axis=-1),
+            vocab_size=logits.shape[-1],
+            label_smoothing=label_smoothing,
+            dtype=compute_dtype,
+        )
     w = valid.astype(compute_dtype) if weight is None else valid.astype(compute_dtype) * weight.astype(compute_dtype)
     loss = nll * w
     norm = jnp.maximum(jnp.sum(w), 1e-8)
@@ -1719,6 +2003,498 @@ def fixed_cross_entropy(
             loss = total_loss
 
     return LossMetrics(loss=loss, z_loss=total_z_loss, weight_sum=weight_sum, accuracy=accuracy)
+
+
+def resolve_causal_lm_chunk_token_size(
+    hidden_states: jax.Array,
+    vocab_size: int,
+    config: LossConfig | None = None,
+) -> int:
+    """Choose an optimal token-dimension chunk size for chunked LM-head loss.
+
+    When computing causal-LM loss without materializing the full
+    ``[B, T, V]`` logits tensor, the token dimension is split into chunks
+    of this size. Each chunk independently projects hidden states through
+    the LM head and computes cross-entropy, keeping peak memory bounded
+    to roughly ``B * chunk * V * dtype_bytes``.
+
+    The heuristic targets a ~16 GiB temporary logits buffer, rounds down
+    to a power of two, and clamps to ``[1, 4096]`` without exceeding
+    the computed budget. If
+    ``config.chunk_token_size`` is already set, that value is used
+    directly (clamped to the actual sequence length).
+
+    Args:
+        hidden_states: Model hidden states with shape ``[B, T, H]``.
+        vocab_size: Vocabulary size (V).
+        config: Optional ``LossConfig``. If its ``chunk_token_size`` field
+            is set, that value takes priority.
+
+    Returns:
+        Token chunk size as a positive integer, never exceeding ``T``.
+    """
+    if config is not None and config.chunk_token_size is not None:
+        return max(1, min(int(config.chunk_token_size), int(hidden_states.shape[1])))
+
+    batch_size = max(1, int(hidden_states.shape[0]))
+    seq_len = max(1, int(hidden_states.shape[1]))
+    vocab_size = max(1, int(vocab_size))
+
+    # The outer chunked LM-head path materializes [B, chunk, V] logits before
+    # fixed_cross_entropy consumes them, so the chunk must not exceed the target
+    # memory budget. Use the widest dtype implied by the hidden states and the
+    # requested loss compute dtype to avoid underestimating mixed-precision runs.
+    projection_dtype = (
+        jnp.float32
+        if config is not None and config.compute_dtype == "fp32"
+        else (jnp.bfloat16 if config is not None and config.compute_dtype == "bf16" else hidden_states.dtype)
+    )
+    dtype_bytes = max(1, hidden_states.dtype.itemsize, jnp.dtype(projection_dtype).itemsize)
+    target_bytes = 16 * 1024 * 1024 * 1024
+    raw_chunk = max(1, target_bytes // max(1, batch_size * vocab_size * dtype_bytes))
+    chunk = 1 << max(0, raw_chunk.bit_length() - 1)
+    chunk = min(4096, chunk)
+    return min(chunk, seq_len)
+
+
+def causal_lm_loss_chunked_lm_head(
+    hidden_states: jax.Array | None,
+    labels: jax.Array | None,
+    lm_head_fn: tp.Callable[[jax.Array], jax.Array],
+    *,
+    vocab_size: int,
+    attention_mask: jax.Array | None = None,
+    config: LossConfig | None = None,
+    num_items_in_batch: int | None = None,
+    batch: collections.abc.Mapping[str, Array] | None = None,
+    logit_cap_fn: tp.Callable[[jax.Array], jax.Array] | None = None,
+    token_chunk_size: int | None = None,
+    **kwargs: tp.Any,
+) -> LossMetrics:
+    """Compute causal-LM cross-entropy by projecting hidden states through the
+    LM head in token-dimension chunks, avoiding the full ``[B, T, V]`` logit
+    materialization.
+
+    The token sequence is split into equal-sized chunks (padded with
+    ``ignore_index`` labels if necessary). For each chunk a ``jax.lax.scan``
+    iteration:
+
+    1. Projects the chunk's hidden states to logits via ``lm_head_fn``.
+    2. Optionally caps logits with ``logit_cap_fn``.
+    3. Computes ``fixed_cross_entropy`` on the chunk.
+    4. Accumulates loss, z-loss, weight sum, and correct-token counts.
+
+    Each chunk body is wrapped with ``jax.checkpoint`` so that backward
+    recomputes logits per chunk instead of storing all of them.
+
+    Args:
+        hidden_states: Model hidden states, shape ``[B, T, H]``.
+        labels: Target token IDs, shape ``[B, T]``.
+        lm_head_fn: Callable that maps ``[B, chunk, H] -> [B, chunk, V]``
+            (the model's LM-head projection).
+        vocab_size: Vocabulary size, used for automatic chunk sizing.
+        attention_mask: Optional ``[B, T]`` mask (1 = valid, 0 = padding).
+        config: ``LossConfig`` controlling shifting, smoothing, z-loss,
+            normalizing factor, etc. Defaults to ``LossConfig()``.
+        num_items_in_batch: If set, the total loss is divided by this value
+            after the global normalizing factor is applied.
+        batch: Full training batch mapping. ``decoder_loss_weights`` and
+            ``decoder_target_tokens`` are extracted if present.
+        logit_cap_fn: Optional callable applied to logits before loss
+            (e.g. ``tanh`` capping for Gemma-2 style models).
+        token_chunk_size: Explicit chunk size. If ``None``, chosen
+            automatically via ``resolve_causal_lm_chunk_token_size``.
+        **kwargs: Forwarded to ``fixed_cross_entropy`` for each chunk.
+
+    Returns:
+        ``LossMetrics`` with aggregated ``loss``, ``z_loss``,
+        ``weight_sum``, and ``accuracy`` across all chunks.
+
+    Raises:
+        ValueError: If ``hidden_states`` or ``labels`` is ``None``, or if
+            their shapes are not ``[B, T, H]`` and ``[B, T]`` respectively.
+    """
+    if hidden_states is None or labels is None:
+        raise ValueError("hidden_states and labels cannot be None")
+    if hidden_states.ndim != 3 or labels.ndim != 2:
+        raise ValueError(
+            "causal_lm_loss_chunked_lm_head expects hidden_states [B, T, H] and labels [B, T], "
+            f"got {hidden_states.shape} and {labels.shape}."
+        )
+
+    if config is None:
+        config = LossConfig()
+
+    shift_attn_m = attention_mask
+    if config.shift_tokens:
+        shift_hidden_states = hidden_states[:, :-1, :]
+        shift_labels = labels[:, 1:]
+        if attention_mask is not None:
+            shift_attn_m = attention_mask[:, 1:]
+    else:
+        shift_hidden_states = hidden_states
+        shift_labels = labels
+
+    if shift_hidden_states.shape[1] == 0:
+        zero = jnp.array(0.0, dtype=shift_hidden_states.dtype)
+        return LossMetrics(loss=zero, z_loss=zero, weight_sum=zero, accuracy=zero)
+
+    compute_dtype = (
+        jnp.float32
+        if config.compute_dtype == "fp32"
+        else (jnp.bfloat16 if config.compute_dtype == "bf16" else shift_hidden_states.dtype)
+    )
+    global_loss_batch = dict(batch or {})
+    if "decoder_target_tokens" not in global_loss_batch:
+        global_loss_batch["decoder_target_tokens"] = shift_labels
+    else:
+        global_loss_batch["decoder_target_tokens"] = jnp.asarray(global_loss_batch["decoder_target_tokens"])
+    if "decoder_loss_weights" in global_loss_batch:
+        shift_loss_weights = jnp.asarray(global_loss_batch["decoder_loss_weights"], compute_dtype)
+        if config.shift_tokens and shift_loss_weights.shape == labels.shape:
+            shift_loss_weights = shift_loss_weights[:, 1:]
+        elif shift_loss_weights.shape != shift_labels.shape:
+            raise ValueError(
+                "decoder_loss_weights must match labels or shifted labels, "
+                f"got {shift_loss_weights.shape}, labels {labels.shape}, shifted {shift_labels.shape}."
+            )
+        global_loss_batch["decoder_loss_weights"] = shift_loss_weights
+    else:
+        if shift_attn_m is not None:
+            global_loss_batch["decoder_loss_weights"] = shift_attn_m.astype(compute_dtype)
+        else:
+            global_loss_batch["decoder_loss_weights"] = (shift_labels != config.ignore_index).astype(compute_dtype)
+
+    global_loss_factor, _ = get_factor_and_weight(
+        config.loss_normalizing_factor,
+        global_loss_batch,
+        compute_dtype=compute_dtype,
+    )
+    # The outer LM-head chunking path already materializes [B, chunk, V] logits
+    # per scan step. Inner vocab/block CE chunking cannot reduce that dominant
+    # allocation, but it does add a second chunking loop and can significantly
+    # slow training. Keep token chunking at the outer projection boundary and
+    # run the per-chunk CE densely.
+    chunk_loss_config = dataclasses.replace(
+        config,
+        loss_normalizing_factor=None,
+        chunk_vocab_size=None,
+        chunk_token_size=None,
+        chunk_block_size=None,
+    )
+
+    chunk_size = token_chunk_size or resolve_causal_lm_chunk_token_size(
+        hidden_states=shift_hidden_states,
+        vocab_size=vocab_size,
+        config=config,
+    )
+
+    batch_size, seq_len, hidden_dim = shift_hidden_states.shape
+    pad_len = (-seq_len) % chunk_size
+
+    if pad_len:
+        shift_hidden_states = jnp.pad(shift_hidden_states, ((0, 0), (0, pad_len), (0, 0)))
+        shift_labels = jnp.pad(shift_labels, ((0, 0), (0, pad_len)), constant_values=config.ignore_index)
+        if shift_attn_m is not None:
+            shift_attn_m = jnp.pad(shift_attn_m, ((0, 0), (0, pad_len)))
+
+    padded_seq_len = shift_hidden_states.shape[1]
+    num_chunks = padded_seq_len // chunk_size
+
+    hidden_chunks = shift_hidden_states.reshape(batch_size, num_chunks, chunk_size, hidden_dim).transpose(1, 0, 2, 3)
+    label_chunks = shift_labels.reshape(batch_size, num_chunks, chunk_size).transpose(1, 0, 2)
+    mask_chunks = None
+    if shift_attn_m is not None:
+        mask_chunks = shift_attn_m.reshape(batch_size, num_chunks, chunk_size).transpose(1, 0, 2)
+    loss_weight_chunks = global_loss_batch["decoder_loss_weights"]
+    if pad_len:
+        loss_weight_chunks = jnp.pad(loss_weight_chunks, ((0, 0), (0, pad_len)))
+    loss_weight_chunks = loss_weight_chunks.reshape(batch_size, num_chunks, chunk_size).transpose(1, 0, 2)
+
+    def _chunk_loss(chunk_hidden_states, chunk_labels, chunk_attention_mask, chunk_loss_weights):
+        logits = lm_head_fn(chunk_hidden_states)
+        if logit_cap_fn is not None:
+            logits = logit_cap_fn(logits)
+        chunk_loss_batch = {
+            "decoder_target_tokens": chunk_labels,
+            "decoder_loss_weights": chunk_loss_weights.astype(compute_dtype),
+        }
+        chunk_metrics = fixed_cross_entropy(
+            source=logits,
+            target=chunk_labels,
+            attention_mask=chunk_attention_mask,
+            config=chunk_loss_config,
+            num_items_in_batch=None,
+            batch=chunk_loss_batch,
+            **kwargs,
+        )
+        correct = chunk_metrics.accuracy.astype(chunk_metrics.weight_sum.dtype) * chunk_metrics.weight_sum
+        return chunk_metrics.loss, chunk_metrics.z_loss, chunk_metrics.weight_sum, correct
+
+    _chunk_loss = jax.checkpoint(_chunk_loss, prevent_cse=False)
+
+    def _scan_body(carry, xs):
+        chunk_hidden_states, chunk_labels, chunk_attention_mask, chunk_loss_weights = xs
+        chunk_loss, chunk_z_loss, chunk_weight_sum, chunk_correct = _chunk_loss(
+            chunk_hidden_states,
+            chunk_labels,
+            chunk_attention_mask,
+            chunk_loss_weights,
+        )
+        return (
+            carry[0] + chunk_loss,
+            carry[1] + chunk_z_loss,
+            carry[2] + chunk_weight_sum,
+            carry[3] + chunk_correct,
+        ), None
+
+    zero = jnp.array(0.0, dtype=compute_dtype)
+    scan_inputs = (
+        hidden_chunks,
+        label_chunks,
+        mask_chunks if mask_chunks is not None else jnp.full(label_chunks.shape, True, dtype=jnp.bool_),
+        loss_weight_chunks,
+    )
+    (total_loss, total_z_loss, weight_sum, correct_sum), _ = jax.lax.scan(
+        _scan_body,
+        (zero, zero, zero, zero),
+        scan_inputs,
+    )
+
+    if global_loss_factor is not None:
+        total_loss = total_loss / global_loss_factor
+        total_z_loss = total_z_loss / global_loss_factor
+
+    if num_items_in_batch is not None:
+        total_loss = total_loss / num_items_in_batch
+
+    accuracy = correct_sum / jnp.maximum(weight_sum, jnp.asarray(1e-8, dtype=weight_sum.dtype))
+    return LossMetrics(loss=total_loss, z_loss=total_z_loss, weight_sum=weight_sum, accuracy=accuracy)
+
+
+def _should_chunk_causal_lm_loss(
+    *,
+    module: tp.Any,
+    labels: jax.Array | None,
+    loss_config: LossConfig | None,
+    token_chunk_size: int | None = None,
+) -> bool:
+    """Decide whether the chunked LM-head loss path should be activated.
+
+    Returns ``True`` when all of the following hold:
+
+    * ``labels`` is not ``None`` and has at least 2 dimensions.
+    * The module supports the chunked protocol (has ``compute_lm_logits``
+      and an ``apply_lm_head`` parameter in ``__call__``).
+    * The loss config does not use features incompatible with the chunked
+      path (custom ``reduction``, ``divide_weight_sum``, or per-sequence
+      normalizing factors).
+    * Either an explicit ``token_chunk_size`` / ``config.chunk_token_size``
+      is set, *or* the projected logit tensor would exceed 2^28 elements
+      (~1 GiB in fp32), making the unchunked path memory-prohibitive.
+
+    Args:
+        module: The EasyDeL model instance.
+        labels: Target token IDs, or ``None``.
+        loss_config: Loss configuration, or ``None`` for defaults.
+        token_chunk_size: Explicit chunk size override, if any.
+
+    Returns:
+        ``True`` if the chunked path should be used.
+    """
+    if labels is None:
+        return False
+    if not _supports_chunked_causal_lm_forward(module):
+        return False
+
+    config = loss_config or LossConfig()
+    if config.reduction is not None or config.divide_weight_sum:
+        return False
+
+    loss_factor = config.loss_normalizing_factor
+    if hasattr(loss_factor, "name"):
+        loss_factor = loss_factor.name
+    if isinstance(loss_factor, str):
+        loss_factor = loss_factor.upper()
+    if loss_factor in {"NO_WEIGHT_NUM_REAL_TARGET_TOKENS", "AVERAGE_PER_SEQUENCE"}:
+        return False
+
+    explicit_chunk = token_chunk_size is not None or config.chunk_token_size is not None
+    memory_tuned = explicit_chunk or config.chunk_block_size is not None or config.chunk_vocab_size is not None
+    if not memory_tuned or labels.ndim < 2:
+        return False
+
+    effective_seq_len = max(1, int(labels.shape[1]) - (1 if config.shift_tokens else 0))
+    projected_logit_elements = int(labels.shape[0]) * effective_seq_len * int(module.config.vocab_size)
+    return explicit_chunk or projected_logit_elements >= (1 << 28)
+
+
+def _supports_chunked_causal_lm_forward(module: tp.Any) -> bool:
+    """Check whether *module* exposes the API needed for chunked LM-head loss.
+
+    The chunked path requires two things from the model:
+
+    1. A ``compute_lm_logits`` method that projects hidden states to vocab
+       logits (used as the per-chunk LM-head callable).
+    2. An ``apply_lm_head`` parameter in ``__call__`` so the forward pass
+       can be told to skip the built-in LM-head projection.
+
+    Args:
+        module: The model instance to inspect.
+
+    Returns:
+        ``True`` if both requirements are satisfied.
+    """
+    if not hasattr(module, "compute_lm_logits"):
+        return False
+
+    try:
+        call_signature = inspect.signature(module.__call__)
+    except (TypeError, ValueError):
+        return False
+    return "apply_lm_head" in call_signature.parameters
+
+
+class CausalLMLossStrategy(BaseLossStrategy):
+    """Planning-aware loss strategy for causal language modelling.
+
+    This strategy has two operating modes chosen automatically in
+    ``plan_forward``:
+
+    **Dense mode** (default fallback) — the model runs its full forward
+    pass including the LM-head projection. Loss is computed by the
+    existing ``ForCausalLMLoss`` function on the materialised logits.
+
+    **Chunked mode** — when the projected logit tensor would be very
+    large (or the user explicitly sets ``chunk_token_size``), the plan
+    tells the model to skip the LM-head (``apply_lm_head=False``).
+    ``compute`` then calls ``causal_lm_loss_chunked_lm_head`` which
+    projects hidden states through the LM head in small token-dimension
+    chunks, keeping peak memory bounded.
+
+    The strategy name is set to ``"ForCausalLMLoss"`` so that
+    ``resolve_loss_strategy`` can match it by name.
+    """
+
+    __name__ = "ForCausalLMLoss"
+
+    def plan_forward(
+        self,
+        *,
+        module: tp.Any,
+        labels: jax.Array | None,
+        loss_config: LossConfig | None,
+        batch: collections.abc.Mapping[str, Array],
+        loss_kwargs: dict[str, tp.Any],
+    ) -> LossForwardPlan:
+        """Decide whether to request the chunked (headless) forward path.
+
+        If ``_should_chunk_causal_lm_loss`` returns ``True``, the plan
+        sets ``apply_lm_head=False`` so that the model returns raw hidden
+        states instead of logits. Otherwise an empty plan is returned and
+        the model runs normally.
+        """
+        del batch
+        if _should_chunk_causal_lm_loss(
+            module=module,
+            labels=labels,
+            loss_config=loss_config,
+            token_chunk_size=loss_kwargs.get("token_chunk_size"),
+        ):
+            return LossForwardPlan(forward_kwargs={"apply_lm_head": False})
+        return LossForwardPlan()
+
+    def compute(
+        self,
+        *,
+        module: tp.Any,
+        outputs: tp.Any,
+        labels: jax.Array | None,
+        loss_config: LossConfig | None,
+        batch: collections.abc.Mapping[str, Array],
+        loss_kwargs: dict[str, tp.Any],
+        paxis: PartitionAxis | None,
+        forward_plan: LossForwardPlan,
+    ) -> LossMetrics:
+        """Compute causal-LM loss, dispatching to dense or chunked path.
+
+        If the forward plan left ``apply_lm_head`` as ``True`` (or
+        absent), this delegates to the existing ``ForCausalLMLoss``
+        function which expects pre-computed logits in *outputs*.
+
+        Otherwise it extracts ``last_hidden_state`` from *outputs*,
+        optionally runs ``module.prepare_lm_head_inputs``, and calls
+        ``causal_lm_loss_chunked_lm_head`` to project + compute loss in
+        token chunks.
+
+        Raises:
+            TypeError: If the chunked path was selected but the model did
+                not return ``last_hidden_state``.
+        """
+        del paxis
+        last_hidden_state = getattr(outputs, "last_hidden_state", None)
+        if forward_plan.forward_kwargs.get("apply_lm_head", True):
+            return ForCausalLMLoss(
+                labels=labels,
+                config=loss_config,
+                paxis=module.config.partition_axis,
+                **loss_kwargs,
+                **outputs,
+                **batch,
+            )
+        if last_hidden_state is None:
+            raise TypeError(
+                f"{type(module).__name__} opted into chunked causal-LM loss but did not return "
+                "`last_hidden_state` when `apply_lm_head=False`."
+            )
+
+        chunked_loss_kwargs = dict(loss_kwargs)
+        if "num_items_in_batch" not in chunked_loss_kwargs and "num_items_in_batch" in batch:
+            chunked_loss_kwargs["num_items_in_batch"] = batch["num_items_in_batch"]
+
+        lm_head_inputs = (
+            module.prepare_lm_head_inputs(last_hidden_state)
+            if hasattr(module, "prepare_lm_head_inputs")
+            else last_hidden_state
+        )
+
+        return causal_lm_loss_chunked_lm_head(
+            hidden_states=lm_head_inputs,
+            labels=labels,
+            lm_head_fn=module.compute_lm_logits,
+            vocab_size=int(module.config.vocab_size),
+            attention_mask=batch.get("attention_mask"),
+            config=loss_config,
+            batch=batch,
+            **chunked_loss_kwargs,
+        )
+
+
+def resolve_loss_strategy(loss_fn: tp.Callable[..., LossMetrics]) -> BaseLossStrategy:
+    """Wrap a loss callable in the appropriate ``BaseLossStrategy``.
+
+    If *loss_fn* is the standard ``ForCausalLMLoss`` (including common
+    ``functools.wraps`` wrappers), returns a ``CausalLMLossStrategy``
+    that can optionally skip the dense LM-head projection for memory
+    savings. For all other callables, returns a
+    ``FunctionalLossStrategy`` that simply delegates ``compute`` to the
+    original function.
+
+    Args:
+        loss_fn: Any callable that produces ``LossMetrics``.
+
+    Returns:
+        A ``BaseLossStrategy`` instance wrapping *loss_fn*.
+    """
+    if isinstance(loss_fn, BaseLossStrategy):
+        return loss_fn
+    try:
+        unwrapped_loss_fn = inspect.unwrap(loss_fn)
+    except (AttributeError, TypeError, ValueError):
+        unwrapped_loss_fn = loss_fn
+    if unwrapped_loss_fn is ForCausalLMLoss:
+        return CausalLMLossStrategy()
+    return FunctionalLossStrategy(loss_fn)
 
 
 def ForCausalLMLoss(

@@ -25,6 +25,7 @@ visualization tools for training large language models. It includes:
 from __future__ import annotations
 
 import abc
+import dataclasses
 import re
 import time
 import typing as tp
@@ -666,3 +667,90 @@ def compute_weight_stats(params: dict[str, tp.Any], repattern: str) -> dict[str,
             stats[f"{output_path}/histogram"] = MetricsHistogram.from_array(weight)
 
     return stats
+
+
+@dataclasses.dataclass
+class LogWatcher:
+    """A user-defined per-parameter metric that is evaluated at a fixed interval.
+
+    Watchers generalise the built-in weight-distribution logging by letting
+    users register arbitrary functions that receive a single parameter array
+    and return a dictionary of named scalar (or histogram) metrics.
+
+    Attributes:
+        name: Logging group name. Results are logged under
+            ``"{name}/{param_path}/{metric_key}"``.
+        fn: Callable that takes a single ``jax.Array`` (one model parameter,
+            already flattened from the param tree) and returns a dict mapping
+            metric names to scalar floats, ``jax.Array`` scalars, or
+            ``(bin_counts, bin_edges)`` tuples for histogram logging.
+        interval: Evaluate this watcher every *interval* training steps.
+        pattern: Regex matched against the dot-joined parameter path
+            (e.g. ``"layers\\.0\\.attention\\..*"``). Only parameters whose
+            path matches are passed to *fn*. Defaults to ``".*"`` (all
+            parameters).
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>> watcher = LogWatcher(
+        ...     name="norm",
+        ...     fn=lambda arr: {"l2": float(jnp.linalg.norm(arr))},
+        ...     interval=100,
+        ... )
+    """
+
+    name: str
+    fn: tp.Callable[[jax.Array], dict[str, tp.Any]]
+    interval: int = 500
+    pattern: str = ".*"
+
+
+def run_watchers(
+    watchers: list[LogWatcher],
+    params: dict[str, tp.Any],
+    step: int,
+) -> dict[str, tp.Any]:
+    """Execute all active watchers against model parameters and collect metrics.
+
+    For each watcher whose *interval* divides *step*, the function iterates
+    over the flattened parameter tree, matches paths against the watcher's
+    *pattern*, calls ``watcher.fn(param_array)`` on each match, and merges
+    the returned dicts into a single output keyed as
+    ``"{watcher.name}/{param_path}/{metric_key}"``.
+
+    Args:
+        watchers: List of ``LogWatcher`` instances to evaluate.
+        params: Model parameters (e.g. ``state.graphstate``), a nested dict
+            or PyTree that will be flattened via ``traversals.flatten_dict``.
+        step: Current training step. A watcher is skipped when
+            ``step % watcher.interval != 0``.
+
+    Returns:
+        Merged metrics dict ready for ``TrainingArguments.log_metrics``.
+        Values are whatever the watcher *fn* returns — typically floats,
+        ``jax.Array`` scalars, or ``(bin_counts, bin_edges)`` tuples.
+    """
+    if not watchers:
+        return {}
+
+    active = [w for w in watchers if w.interval > 0 and step % w.interval == 0]
+    if not active:
+        return {}
+
+    flat_params = traversals.flatten_dict(params)
+    metrics: dict[str, tp.Any] = {}
+
+    for watcher in active:
+        compiled_pattern = re.compile(watcher.pattern)
+        for path, param in flat_params.items():
+            weight = param.value if hasattr(param, "value") else param
+            pattern_search = ".".join(str(p) for p in path)
+            if not compiled_pattern.match(pattern_search):
+                continue
+            output_path = "/".join(str(p) for p in path)
+            result = watcher.fn(weight)
+            if isinstance(result, dict):
+                for key, value in result.items():
+                    metrics[f"{watcher.name}/{output_path}/{key}"] = value
+
+    return metrics

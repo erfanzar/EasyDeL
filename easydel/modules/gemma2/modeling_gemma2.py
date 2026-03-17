@@ -816,22 +816,9 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
             inputs_embeds=inputs_embeds,
         )
 
-        hidden_states = outputs.last_hidden_state
-
-        hidden_states = apply_logical_sharding(
-            hidden_states,
-            dynamic_axes=common_types.HiddenStateSharding,
-            partition_manager=self.config.partition_manager,
-        )
-
         lm_logits = None
         if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
-
-        if self.config.final_logit_softcapping is not None:
-            assert lm_logits is not None
-            cap = jnp.array(self.config.final_logit_softcapping, dtype=lm_logits.dtype)
-            lm_logits = cap * jax.nn.tanh(lm_logits / cap)
+            lm_logits = self.compute_lm_logits(self.prepare_lm_head_inputs(outputs.last_hidden_state))
 
         return CausalLMOutput(
             logits=lm_logits,
@@ -847,6 +834,26 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
         Decoder-Only models don't have an encoder.
         """
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
+
+    def compute_lm_logits(self, hidden_states: Array) -> Array:
+        """Project hidden states to vocabulary logits with optional soft-capping.
+
+        Calls the base LM-head projection, then applies Gemma-2's logit
+        soft-capping when ``config.final_logit_softcapping`` is set:
+        ``cap * tanh(logits / cap)``, which smoothly bounds logit
+        magnitudes to ``[-cap, cap]``.
+
+        Args:
+            hidden_states: Hidden representations, shape ``[B, T, H]``.
+
+        Returns:
+            Logits with shape ``[B, T, V]``, optionally soft-capped.
+        """
+        lm_logits = super().compute_lm_logits(hidden_states)
+        if self.config.final_logit_softcapping is not None:
+            cap = jnp.array(self.config.final_logit_softcapping, dtype=lm_logits.dtype)
+            lm_logits = cap * jax.nn.tanh(lm_logits / cap)
+        return lm_logits
 
     def get_decoder(self):
         """

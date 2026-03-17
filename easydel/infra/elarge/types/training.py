@@ -267,6 +267,8 @@ class BaseTrainerCfg(TypedDict, total=False):
         save_total_limit: Maximum number of checkpoints to keep.
         save_directory: Directory path for saving checkpoints.
         save_optimizer_state: Whether to include optimizer state in checkpoints.
+        save_tpu_preemption_checkpoints: Whether JAX TPU preemption sync should
+            force-save a standard EasyDeL checkpoint for auto-resume.
         remove_ckpt_after_load: Whether to remove checkpoint after loading.
         evaluation_steps: Run evaluation every N steps.
         max_evaluation_steps: Maximum number of evaluation steps per evaluation run.
@@ -277,6 +279,7 @@ class BaseTrainerCfg(TypedDict, total=False):
         report_metrics: Whether to report metrics to external trackers (e.g., WandB).
         metrics_to_show_in_rich_pbar: List of metric names to display in Rich progress bar.
         progress_bar_type: Type of progress bar ("tqdm", "rich", or "json").
+        watchers: List of LogWatcher instances for custom per-parameter metric logging.
         weight_distribution_pattern: Regex pattern for selecting weights to log distributions.
         weight_distribution_log_steps: Log weight distributions every N steps.
         verbose: Whether to enable verbose logging output.
@@ -429,6 +432,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     save_total_limit: NotRequired[int | None]
     save_directory: NotRequired[str]
     save_optimizer_state: NotRequired[bool]
+    save_tpu_preemption_checkpoints: NotRequired[bool]
     remove_ckpt_after_load: NotRequired[bool]
 
     evaluation_steps: NotRequired[int | None]
@@ -441,6 +445,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     report_metrics: NotRequired[bool]
     metrics_to_show_in_rich_pbar: NotRequired[list[str] | None]
     progress_bar_type: NotRequired[Literal["tqdm", "rich", "json"]]
+    watchers: NotRequired[list[Any]]
     weight_distribution_pattern: NotRequired[str]
     weight_distribution_log_steps: NotRequired[int]
     verbose: NotRequired[bool]
@@ -1476,6 +1481,7 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "max_length": 4096,
     "save_directory": "EasyDeL-Checkpoints",
     "save_optimizer_state": True,
+    "save_tpu_preemption_checkpoints": True,
     "remove_ckpt_after_load": False,
     "log_steps": 10,
     "report_steps": 5,

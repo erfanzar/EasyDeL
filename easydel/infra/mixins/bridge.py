@@ -492,15 +492,34 @@ class EasyBridgeMixin(PushToHubMixin):
             if self.generation_config is not None:
                 _save_generation_config(self.generation_config, save_directory)
 
-        state = nn.split(self, nn.Param, ...)[1]  # NOTE: This one here ignores LoRA Params...
+        state = nn.split(self, nn.Param, ...)[1]
+        state_dict = state.to_pure_dict()
         if gather_fns is None:
-            gather_fns = self._gather_fns
+            try:
+                gather_fns = self._gather_fns
+            except (AttributeError, NotImplementedError):
+                gather_fns = None
+        if gather_fns is not None:
+            flat_state = flatten_dict(state_dict)
+            flat_gather_fns = gather_fns if is_flatten(gather_fns) else flatten_dict(gather_fns)
+            normalized_gather_fns: dict[tuple, tp.Callable] = {}
+            for key, gather_fn in flat_gather_fns.items():
+                if isinstance(key, str):
+                    normalized_gather_fns[tuple(key.split("."))] = gather_fn
+                else:
+                    normalized_gather_fns[key] = gather_fn
+            for key, gather_fn in normalized_gather_fns.items():
+                value = flat_state.get(key)
+                if value is None or not callable(gather_fn):
+                    continue
+                flat_state[key] = gather_fn(value)
+            state_dict = unflatten_dict(flat_state)
         output_model_file = Checkpointer(
             base_path=str(save_directory),
             save_interval=None,
             step_policies=[],
         ).save_pytree(
-            tree=state.to_pure_dict(),
+            tree=state_dict,
             prefix="model",
             mesh=self.mesh,
             dtype=float_dtype,
@@ -557,7 +576,8 @@ class EasyBridgeMixin(PushToHubMixin):
             step=step,
         )
         readme_path = easy_directory / "README.md"
-        readme_path.write_text(self._model_card(repo_id, repo_id))
+        if not readme_path.exists():
+            readme_path.write_text(self._model_card(repo_id, repo_id))
 
         if push_to_hub and jax.process_index() == 0:
             self._upload_modified_files(

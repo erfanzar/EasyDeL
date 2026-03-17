@@ -86,7 +86,7 @@ if typing.TYPE_CHECKING:
     from easydel.inference import eSurge
     from easydel.inference.reasoning.abstract_reasoning import ReasoningParserName
     from easydel.inference.tools.abstract_tool import ToolParserName
-    from easydel.trainers import Trainer
+    from easydel.trainers import LogWatcher, Trainer
     from easydel.trainers.training_configurations import TrainingArguments
 
     from .types import TextDatasetInformCfg, VisualDatasetInformCfg
@@ -1330,6 +1330,41 @@ class eLargeModel:
         trainer_cfg = self._config.setdefault("trainer", {})
         trainer_cfg["trainer_type"] = trainer_type
         trainer_cfg.update(kwargs)
+        return self
+
+    def set_watchers(self, *watchers: LogWatcher) -> eLargeModel:
+        """Register LogWatcher instances for per-parameter metric logging.
+
+        Watchers are evaluated during training at their individual intervals
+        and results are logged through the standard metrics pipeline
+        (wandb / TensorBoard).
+
+        Args:
+            *watchers: One or more ``LogWatcher`` instances to attach.
+
+        Returns:
+            Self for method chaining.
+
+        Example:
+            >>> import jax.numpy as jnp
+            >>> from easydel.trainers import LogWatcher
+            >>> elm.set_watchers(
+            ...     LogWatcher(
+            ...         name="norm",
+            ...         fn=lambda arr: {"l2": float(jnp.linalg.norm(arr))},
+            ...         interval=100,
+            ...     ),
+            ...     LogWatcher(
+            ...         name="sparsity",
+            ...         fn=lambda arr: {"pct_zero": float((arr == 0).mean())},
+            ...         interval=200,
+            ...         pattern=r".*attention.*",
+            ...     ),
+            ... )
+        """
+        trainer_cfg = self._config.setdefault("trainer", {})
+        existing = trainer_cfg.get("watchers", [])
+        trainer_cfg["watchers"] = existing + list(watchers)
         return self
 
     def get_trainer_config(self) -> Mapping[str, Any]:

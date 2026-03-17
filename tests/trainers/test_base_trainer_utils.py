@@ -1,8 +1,26 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
+from easydel.infra.errors import EasyDeLPreemptionSignal
 from easydel.trainers.base_trainer import BaseTrainer, GenerationResults
 from easydel.trainers.proximal_policy_optimization_trainer.modeling_value_head import CausalLMWithValueHead
 
@@ -110,6 +128,29 @@ class _ModelStub:
         return self._rules
 
 
+class _CheckpointerStub:
+    def __init__(self, *, should_save: bool = True):
+        self.should_save = should_save
+        self._last_save_step = 0
+        self._last_save_time = None
+        self._dt_now_injection = lambda: "synced-now"
+        self.calls: list[dict[str, object]] = []
+
+    def on_step(self, *, mesh, pytree, step, force=False, true_callbacks):
+        self.calls.append(
+            {
+                "mesh": mesh,
+                "pytree": pytree,
+                "step": step,
+                "force": force,
+            }
+        )
+        if not self.should_save:
+            return
+        for callback in true_callbacks:
+            callback(f"run-{step}", mesh, {"step": step, "is_temporary": False})
+
+
 def test_configure_state_initializes_tx_then_shards_via_state_api():
     trainer = object.__new__(_PreviewTrainer)
     trainer.timer = _NoopTimer()
@@ -143,6 +184,189 @@ def test_configure_state_resume_keeps_step_and_sets_runtime_tx_before_sharding()
     assert {"step": 17} in trainer.model_state.replace_calls
     assert trainer.model_state.shard_state_calls == [{"partition_rules": ((".*", "pspec"),), "mesh": trainer.model.mesh}]
     assert trainer.state_shardings == "state-shardings"
+
+
+def test_save_checkpoint_for_step_updates_checkpointer_bookkeeping_for_callback_saves():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer._model = SimpleNamespace(mesh="mesh")
+    trainer.arguments = SimpleNamespace(_get_save_directory=lambda: Path("/tmp/easydel-checkpoints"))
+    trainer.checkpointer = _CheckpointerStub()
+
+    saved_paths: list[str] = []
+    cleanup_calls: list[str] = []
+
+    def _save_state(*, state, save_directory):
+        saved_paths.append(save_directory)
+        return save_directory
+
+    trainer._save_state = _save_state
+    trainer._cleanup_old_checkpoints = lambda: cleanup_calls.append("called")
+
+    saved = BaseTrainer._save_checkpoint_for_step(trainer, state="state", step=7)
+
+    assert saved == "/tmp/easydel-checkpoints/run-7"
+    assert saved_paths == ["/tmp/easydel-checkpoints/run-7"]
+    assert cleanup_calls == ["called"]
+    assert trainer.checkpointer._last_save_step == 7
+    assert trainer.checkpointer._last_save_time == "synced-now"
+    assert trainer.checkpointer.calls == [
+        {
+            "mesh": "mesh",
+            "pytree": None,
+            "step": 7,
+            "force": False,
+        }
+    ]
+
+
+def test_fast_forward_batches_replays_iterator_with_wraparound_semantics():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(ids_to_pop_from_dataset=None)
+    dataloader = [{"value": 0}, {"value": 1}, {"value": 2}]
+
+    data_iter = BaseTrainer._fast_forward_batches(trainer, iter(dataloader), dataloader, 4)
+    batch, _ = BaseTrainer._get_next_batch(trainer, data_iter, dataloader)
+
+    assert batch == {"value": 1}
+
+
+def test_fast_forward_batches_raises_on_empty_dataloader():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(ids_to_pop_from_dataset=None)
+
+    with pytest.raises(RuntimeError, match="empty"):
+        BaseTrainer._fast_forward_batches(trainer, iter(()), (), 1)
+
+
+def test_get_next_batch_raises_runtime_error_for_empty_dataloader():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(ids_to_pop_from_dataset=None)
+
+    with pytest.raises(RuntimeError, match="empty"):
+        BaseTrainer._get_next_batch(trainer, iter(()), ())
+
+
+def test_trainer_save_state_forwards_gather_fns(tmp_path):
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        save_arguments=lambda path: None,
+        save_optimizer_state=False,
+        _get_save_directory_milestone=lambda step, create=True: tmp_path / f"run-{step}",
+    )
+    trainer._model = SimpleNamespace(param_dtype=jnp.bfloat16)
+    trainer._save_readme = lambda directory: None
+    save_calls: list[dict[str, object]] = []
+    gather_fns = {"params": object()}
+
+    class _State:
+        def save_state(self, **kwargs):
+            save_calls.append(dict(kwargs))
+
+    saved = BaseTrainer._save_state(
+        trainer,
+        state=_State(),
+        save_directory=tmp_path / "explicit",
+        gather_fns=gather_fns,
+    )
+
+    assert saved == str(tmp_path / "explicit")
+    assert len(save_calls) == 1
+    assert str(save_calls[0]["save_directory"]) == str(tmp_path / "explicit")
+    assert save_calls[0]["gather_fns"] is gather_fns
+    assert save_calls[0]["float_dtype"] is jnp.bfloat16
+    assert save_calls[0]["save_optimizer"] is False
+
+
+def test_save_tpu_preemption_checkpoint_uses_standard_checkpoint_naming():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer._preemption_checkpoint_path = None
+    save_calls: list[dict[str, object]] = []
+
+    def _save_checkpoint_for_step(*, state, step, force=False):
+        save_calls.append({"state": state, "step": step, "force": force})
+        return f"/tmp/easydel-checkpoints/run-{step}"
+
+    trainer._save_checkpoint_for_step = _save_checkpoint_for_step
+
+    with patch("jax.experimental.multihost_utils.sync_global_devices") as sync_global_devices:
+        saved = BaseTrainer._save_tpu_preemption_checkpoint(trainer, state="state", step=9)
+
+    assert saved == "/tmp/easydel-checkpoints/run-9"
+    assert trainer._preemption_checkpoint_path == "/tmp/easydel-checkpoints/run-9"
+    assert save_calls == [{"state": "state", "step": 9, "force": True}]
+    assert [call.args[0] for call in sync_global_devices.call_args_list] == [
+        "tpu-preemption-save-9-start",
+        "tpu-preemption-save-9-done",
+    ]
+
+
+def test_should_save_tpu_preemption_checkpoint_uses_jax_sync_point():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(save_tpu_preemption_checkpoints=True)
+    trainer._tpu_preemption_sync_available = None
+
+    with (
+        patch("jax.default_backend", return_value="tpu"),
+        patch("jax.experimental.multihost_utils.reached_preemption_sync_point", return_value=True) as sync_point,
+    ):
+        assert BaseTrainer._should_save_tpu_preemption_checkpoint(trainer, step=11) is True
+
+    sync_point.assert_called_once_with(11)
+    assert trainer._tpu_preemption_sync_available is True
+
+
+def test_should_save_tpu_preemption_checkpoint_disables_on_missing_jax_service():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(save_tpu_preemption_checkpoints=True)
+    trainer._tpu_preemption_sync_available = None
+
+    with (
+        patch("jax.default_backend", return_value="tpu"),
+        patch(
+            "jax.experimental.multihost_utils.reached_preemption_sync_point",
+            side_effect=RuntimeError("preemption sync manager missing"),
+        ),
+        patch("easydel.trainers.base_trainer.logger.warning_once") as warning_once,
+    ):
+        assert BaseTrainer._should_save_tpu_preemption_checkpoint(trainer, step=11) is False
+
+    warning_once.assert_called_once()
+    assert trainer._tpu_preemption_sync_available is False
+
+
+def test_prepare_training_output_prefers_preemption_checkpoint_without_extra_last_save():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(do_last_save=True, save_directory="/tmp/easydel-checkpoints")
+    trainer._model = SimpleNamespace(mesh="mesh")
+    trainer._preemption_checkpoint_path = "/tmp/easydel-checkpoints/run-9"
+
+    def _unexpected_save(*args, **kwargs):
+        raise AssertionError("unexpected final save")
+
+    trainer._save_checkpoint_for_step = _unexpected_save
+
+    output = BaseTrainer._prepare_training_output(
+        trainer,
+        state=SimpleNamespace(step=9),
+        run_exception=EasyDeLPreemptionSignal("TPU preemption checkpoint saved"),
+    )
+
+    assert output.checkpoint_path == "/tmp/easydel-checkpoints/run-9"
+    assert output.last_save_file_name == "/tmp/easydel-checkpoints/run-9"
+
+
+def test_prepare_training_output_treats_plain_stop_iteration_as_runtime_error():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(do_last_save=False, save_directory="/tmp/easydel-checkpoints")
+    trainer._model = SimpleNamespace(mesh="mesh")
+    trainer._preemption_checkpoint_path = None
+
+    with pytest.raises(RuntimeError, match="unexpected iterator exhaustion"):
+        BaseTrainer._prepare_training_output(
+            trainer,
+            state=SimpleNamespace(step=0),
+            run_exception=StopIteration("unexpected iterator exhaustion"),
+        )
 
 
 def test_normalize_prompts_plain_string():

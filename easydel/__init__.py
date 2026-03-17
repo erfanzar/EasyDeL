@@ -883,47 +883,55 @@ _import_structure = {
         "Xerxes2Model",
     ],
     "trainers": [
-        "BaseTrainer",
+        "AgenticMoshPitConfig",
+        "AgenticMoshPitTrainer",
         "BCOConfig",
+        "BCOPreprocessTransform",
         "BCOTrainer",
+        "BaseTrainer",
         "CPOConfig",
+        "CPOPreprocessTransform",
         "CPOTrainer",
+        "DPOConfig",
+        "DPOPreprocessTransform",
+        "DPOTrainer",
         "DistillationConfig",
         "DistillationTrainer",
         "EmbeddingConfig",
         "EmbeddingTrainer",
-        "DPOConfig",
-        "DPOTrainer",
-        "AgenticMoshPitConfig",
-        "AgenticMoshPitTrainer",
         "GFPOConfig",
         "GFPOTrainer",
         "GKDConfig",
         "GKDTrainer",
         "GRPOConfig",
+        "GRPOPreprocessTransform",
         "GRPOTrainer",
         "GSPOConfig",
         "GSPOTrainer",
         "KTOConfig",
+        "KTOPreprocessTransform",
         "KTOTrainer",
+        "LogWatcher",
         "NashMDConfig",
         "NashMDTrainer",
+        "ORPOConfig",
+        "ORPOPreprocessTransform",
+        "ORPOTrainer",
+        "OnPolicyDistillationConfig",
+        "OnPolicyDistillationTrainer",
         "PPOConfig",
+        "PPOPreprocessTransform",
         "PPOTrainer",
         "RLVRConfig",
         "RLVRTrainer",
-        "XPOConfig",
-        "XPOTrainer",
-        "OnPolicyDistillationConfig",
-        "OnPolicyDistillationTrainer",
-        "ORPOConfig",
-        "ORPOTrainer",
         "RayDistributedTrainer",
         "RewardConfig",
+        "RewardPreprocessTransform",
         "RewardTrainer",
         "SDPOConfig",
         "SDPOTrainer",
         "SFTConfig",
+        "SFTPreprocessTransform",
         "SFTTrainer",
         "SeqKDConfig",
         "SeqKDTrainer",
@@ -931,7 +939,10 @@ _import_structure = {
         "SparseDistillationTrainer",
         "Trainer",
         "TrainingArguments",
+        "XPOConfig",
+        "XPOTrainer",
         "pack_sequences",
+        "prompt_transforms",
     ],
 }
 
@@ -1250,12 +1261,15 @@ if _tp.TYPE_CHECKING:
         AgenticMoshPitTrainer,
         BaseTrainer,
         BCOConfig,
+        BCOPreprocessTransform,
         BCOTrainer,
         CPOConfig,
+        CPOPreprocessTransform,
         CPOTrainer,
         DistillationConfig,
         DistillationTrainer,
         DPOConfig,
+        DPOPreprocessTransform,
         DPOTrainer,
         EmbeddingConfig,
         EmbeddingTrainer,
@@ -1264,19 +1278,27 @@ if _tp.TYPE_CHECKING:
         GKDConfig,
         GKDTrainer,
         GRPOConfig,
+        GRPOPreprocessTransform,
         GRPOTrainer,
         GSPOConfig,
         GSPOTrainer,
         KTOConfig,
+        KTOPreprocessTransform,
         KTOTrainer,
+        LogWatcher,
         NashMDConfig,
         NashMDTrainer,
         OnPolicyDistillationConfig,
         OnPolicyDistillationTrainer,
         ORPOConfig,
+        ORPOPreprocessTransform,
         ORPOTrainer,
+        PPOConfig,
+        PPOPreprocessTransform,
+        PPOTrainer,
         RayDistributedTrainer,
         RewardConfig,
+        RewardPreprocessTransform,
         RewardTrainer,
         RLVRConfig,
         RLVRTrainer,
@@ -1285,6 +1307,7 @@ if _tp.TYPE_CHECKING:
         SeqKDConfig,
         SeqKDTrainer,
         SFTConfig,
+        SFTPreprocessTransform,
         SFTTrainer,
         SparseDistillationConfig,
         SparseDistillationTrainer,
@@ -1293,6 +1316,7 @@ if _tp.TYPE_CHECKING:
         XPOConfig,
         XPOTrainer,
         pack_sequences,
+        prompt_transforms,
     )
     from .utils import (
         ModelConverter,
@@ -1340,19 +1364,24 @@ else:
 
 
 # Keep import side effects minimal: distributed/JAX backend initialization is opt-in.
-_distributed_init_enabled = _check_bool_flag("ENABLE_DISTRIBUTED_INIT", False)
+_os.environ.setdefault("JAX_ENABLE_PREEMPTION_SERVICE", "true")
+_distributed_init_enabled = _check_bool_flag("ENABLE_DISTRIBUTED_INIT", True)
 if _distributed_init_enabled:
-    from eformer.executor import DistributedConfig as _DistributedConfig
+    import jax as _jax
 
-    try:
-        _DistributedConfig().initialize()
-    except RuntimeError as e:
-        _logger.warning(
-            f"Failed to initialize jax-dist if you have initialized that manually you can ignore this warning {e}"
-        )
-    except Exception:  # maybe it's a single process
-        _logger.warning("Failed to initialize jax-dist")
-    del _DistributedConfig
+    _jax.config.update("jax_enable_preemption_service", True)
+    if _jax.distributed.is_initialized():
+        _logger.debug("JAX distributed already initialized; using existing setup.")
+    else:
+        from eformer.executor import DistributedConfig as _DistributedConfig
+
+        try:
+            _DistributedConfig().initialize()
+        except RuntimeError:
+            if _jax.distributed.is_initialized():
+                _logger.debug("JAX distributed already initialized; using existing setup.")
+            else:
+                raise
 else:
     _distributed_msg = (
         "Skipping initialization of `DistributedConfig` (ENABLE_DISTRIBUTED_INIT=0), "

@@ -1,3 +1,17 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import inspect
@@ -89,3 +103,21 @@ def test_training_arguments_reject_removed_benchmark_task_alias():
             benchmarks={"name": "code", "task": "humaneval", "enable_thinking": True},
             benchmark_interval=8,
         )
+
+
+def test_training_arguments_preserve_none_step_start_point_for_auto_resume():
+    args = TrainingArguments(
+        model_name="dummy",
+        total_batch_size=1,
+    )
+
+    assert args.step_start_point is None
+
+
+def test_training_arguments_default_tpu_preemption_checkpoint_settings():
+    args = TrainingArguments(
+        model_name="dummy",
+        total_batch_size=1,
+    )
+
+    assert args.save_tpu_preemption_checkpoints is True

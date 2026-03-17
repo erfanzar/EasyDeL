@@ -1,7 +1,23 @@
+# Copyright 2026 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Tests for Cohere model."""
 
 import pytest
 import transformers
+from flax import nnx as nn
+from jax import numpy as jnp
 
 import easydel as ed
 
@@ -50,6 +66,20 @@ class TestCohere:
             max_new_tokens=16,
         )
         assert result.success, f"Cohere generation failed: {result.error_message}"
+
+    def test_compute_lm_logits_applies_logit_scale(self, cohere_config):
+        """Chunked loss should use Cohere's scaled logits path."""
+        cohere_config.logit_scale = 0.5
+        model = ed.CohereForCausalLM(
+            config=cohere_config,
+            rngs=nn.Rngs(0),
+        )
+        hidden_states = jnp.ones((1, 2, cohere_config.hidden_size), dtype=jnp.float32)
+
+        actual = model.compute_lm_logits(hidden_states)
+        expected = model.apply_lm_head(hidden_states) * cohere_config.logit_scale
+
+        assert jnp.allclose(actual, expected, atol=1e-5)
 
 
 if __name__ == "__main__":

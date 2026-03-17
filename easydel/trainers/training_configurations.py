@@ -51,7 +51,7 @@ from easydel.infra.loss_utils import LossConfig
 from easydel.utils import Registry
 from easydel.utils.compiling_utils import hash_fn
 
-from .metrics import MetricsHistogram, compute_weight_stats
+from .metrics import LogWatcher, MetricsHistogram, compute_weight_stats, run_watchers
 from .utils import JaxDistributedConfig
 
 try:
@@ -585,6 +585,15 @@ class TrainingArguments:
             )
         },
     )
+    save_tpu_preemption_checkpoints: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Whether to force-save a standard EasyDeL checkpoint when JAX's TPU preemption "
+                "sync service reaches a safe save step."
+            )
+        },
+    )
     scheduler: AVAILABLE_SCHEDULERS = field(
         default=EasyDeLSchedulers.NONE,
         metadata={"help": "The scheduler to use."},
@@ -680,6 +689,15 @@ class TrainingArguments:
     weight_decay: float = field(
         default=0.01,
         metadata={"help": "The weight decay value."},
+    )
+    watchers: list[LogWatcher] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "List of LogWatcher instances that define custom per-parameter "
+                "metrics to log at independent intervals during training."
+            ),
+        },
     )
     weight_distribution_pattern: str = field(
         default=r".*",
@@ -1010,7 +1028,6 @@ class TrainingArguments:
 
         self.step_partition_spec = _parse_partition_spec(self.step_partition_spec)
 
-        self.step_start_point = self.step_start_point or 0
         self.eval_batch_size = self.eval_batch_size if self.eval_batch_size is not None else self.total_batch_size
         if self.loss_config is None:
             self.loss_config = LossConfig()
@@ -1528,6 +1545,27 @@ class TrainingArguments:
 
         except Exception as e:
             logger.warning(f"Failed to log weight distribution {e}...")
+
+    def log_watchers(self, state, step: int):
+        """Run all registered ``LogWatcher`` instances and log their metrics.
+
+        Each watcher is only evaluated when ``step`` is a multiple of its
+        ``interval``. Results are sent through the standard
+        ``log_metrics`` pipeline (wandb / TensorBoard).
+
+        Args:
+            state: Model state whose ``graphstate`` contains the parameters.
+            step: Current training step.
+        """
+        if not self.watchers:
+            return
+        try:
+            metrics = run_watchers(self.watchers, state.graphstate, step)
+            if metrics:
+                metrics = jax.device_get(metrics)
+                self.log_metrics(metrics, step)
+        except Exception as e:
+            logger.warning(f"Failed to log watchers: {e}...")
 
     def _log_to_wandb(
         self,

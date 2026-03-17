@@ -25,6 +25,7 @@ from .group_filtered_policy_optimization import GFPOConfig, GFPOTrainer
 from .group_relative_policy_optimization import GRPOConfig, GRPOTrainer
 from .group_sequence_policy_optimization import GSPOConfig, GSPOTrainer
 from .kto_trainer import KTOConfig, KTOTrainer
+from .metrics import LogWatcher
 from .nash_md_trainer import NashMDConfig, NashMDTrainer
 from .odds_ratio_preference_optimization_trainer import ORPOConfig, ORPOTrainer
 from .on_policy_distillation_trainer import OnPolicyDistillationConfig, OnPolicyDistillationTrainer
@@ -81,6 +82,7 @@ __all__ = (
     "KTOConfig",
     "KTOPreprocessTransform",
     "KTOTrainer",
+    "LogWatcher",
     "NashMDConfig",
     "NashMDTrainer",
     "ORPOConfig",
