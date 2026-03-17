@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import namedtuple
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -92,6 +94,9 @@ class _MeshCtx:
         return False
 
 
+_CountState = namedtuple("_CountState", ["count", "payload"])
+
+
 class _StateStub:
     def __init__(self, *, opt_state, tx, step=0):
         self.opt_state = opt_state
@@ -105,7 +110,10 @@ class _StateStub:
     def init_tx(self, tx):
         self.init_tx_calls.append(tx)
         self.tx = tx
-        self.opt_state = {"initialized": True}
+        self.opt_state = (
+            _CountState(count=jnp.asarray(0, dtype=jnp.int32), payload={"initialized": True}),
+            {"count": jnp.asarray(0, dtype=jnp.int32)},
+        )
         return self
 
     def replace(self, **kwargs):
@@ -184,6 +192,98 @@ def test_configure_state_resume_keeps_step_and_sets_runtime_tx_before_sharding()
     assert {"step": 17} in trainer.model_state.replace_calls
     assert trainer.model_state.shard_state_calls == [{"partition_rules": ((".*", "pspec"),), "mesh": trainer.model.mesh}]
     assert trainer.state_shardings == "state-shardings"
+
+
+def test_apply_step_start_point_initializes_fresh_state_step():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(step_start_point=13)
+    trainer._resumed_from_checkpoint = False
+    trainer.model_state = _StateStub(opt_state=None, tx=None, step=0)
+
+    BaseTrainer._apply_step_start_point(trainer)
+
+    assert int(trainer.model_state.step) == 13
+    assert any("step" in call and int(call["step"]) == 13 for call in trainer.model_state.replace_calls)
+
+
+def test_apply_step_start_point_normalizes_matching_step_to_jax_array():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(step_start_point=13)
+    trainer._resumed_from_checkpoint = False
+    trainer.model_state = _StateStub(opt_state=None, tx=None, step=13)
+
+    BaseTrainer._apply_step_start_point(trainer)
+
+    assert isinstance(trainer.model_state.step, jax.Array)
+    assert int(trainer.model_state.step) == 13
+    assert any("step" in call and int(call["step"]) == 13 for call in trainer.model_state.replace_calls)
+
+
+def test_apply_step_start_point_ignores_nonzero_state_step():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(step_start_point=13)
+    trainer._resumed_from_checkpoint = False
+    trainer.model_state = _StateStub(opt_state=None, tx=None, step=4)
+
+    with patch("easydel.trainers.base_trainer.logger.warning") as warning:
+        BaseTrainer._apply_step_start_point(trainer)
+
+    assert int(trainer.model_state.step) == 4
+    assert not any("step" in call for call in trainer.model_state.replace_calls)
+    warning.assert_called_once()
+
+
+def test_apply_step_start_point_overrides_resumed_checkpoint_step():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(step_start_point=13)
+    trainer._resumed_from_checkpoint = True
+    trainer.model_state = _StateStub(opt_state={"loaded": True}, tx="old-tx", step=4)
+
+    BaseTrainer._apply_step_start_point(trainer)
+
+    assert isinstance(trainer.model_state.step, jax.Array)
+    assert int(trainer.model_state.step) == 13
+    assert any("step" in call and int(call["step"]) == 13 for call in trainer.model_state.replace_calls)
+
+
+def test_configure_state_seeds_opt_state_counts_from_step_start_point():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.timer = _NoopTimer()
+    trainer.arguments = SimpleNamespace(init_tx=True, step_start_point=13)
+    trainer._resumed_from_checkpoint = False
+    trainer.tx = "tx-object"
+    trainer.model_state = _StateStub(opt_state=None, tx=None, step=jnp.asarray(13, dtype=jnp.int32))
+    trainer._model = _ModelStub(rules=((".*", "pspec"),))
+
+    BaseTrainer._configure_state(trainer)
+
+    assert trainer.model_state.init_tx_calls == ["tx-object"]
+    assert int(trainer.model_state.opt_state[0].count) == 13
+    assert int(trainer.model_state.opt_state[1]["count"]) == 13
+
+
+def test_configure_state_resume_seeds_opt_state_counts_from_step_start_point():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.timer = _NoopTimer()
+    trainer.arguments = SimpleNamespace(init_tx=True, step_start_point=13)
+    trainer._resumed_from_checkpoint = True
+    trainer.tx = "new-tx"
+    trainer.model_state = _StateStub(
+        opt_state=(
+            _CountState(count=jnp.asarray(4, dtype=jnp.int32), payload={"loaded": True}),
+            {"count": jnp.asarray(4, dtype=jnp.int32)},
+        ),
+        tx="old-tx",
+        step=jnp.asarray(13, dtype=jnp.int32),
+    )
+    trainer._model = _ModelStub(rules=((".*", "pspec"),))
+
+    BaseTrainer._configure_state(trainer)
+
+    assert trainer.model_state.init_tx_calls == []
+    assert {"tx": "new-tx"} in trainer.model_state.replace_calls
+    assert int(trainer.model_state.opt_state[0].count) == 13
+    assert int(trainer.model_state.opt_state[1]["count"]) == 13
 
 
 def test_save_checkpoint_for_step_updates_checkpointer_bookkeeping_for_callback_saves():
@@ -275,6 +375,13 @@ def test_trainer_save_state_forwards_gather_fns(tmp_path):
     assert save_calls[0]["gather_fns"] is gather_fns
     assert save_calls[0]["float_dtype"] is jnp.bfloat16
     assert save_calls[0]["save_optimizer"] is False
+
+
+def test_get_current_step_uses_state_step_without_step_start_point_offset():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(step_start_point=9)
+
+    assert BaseTrainer._get_current_step(trainer, SimpleNamespace(step=7)) == 7
 
 
 def test_save_tpu_preemption_checkpoint_uses_standard_checkpoint_naming():

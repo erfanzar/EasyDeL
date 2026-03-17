@@ -171,6 +171,23 @@ actions:
       port: 8000
 ```
 
+### Start From a Specific Training Step
+
+```yaml
+model:
+  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+
+trainer:
+  trainer_type: sft
+  total_batch_size: 4
+  step_start_point: 5000
+  resume_if_possible: false
+
+actions:
+  - validate
+  - train
+```
+
 ## Key Flags
 
 | Flag              | Description                              |

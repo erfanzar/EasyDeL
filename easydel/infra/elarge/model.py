@@ -1301,6 +1301,8 @@ class eLargeModel:
                 - gradient_accumulation_steps: Gradient accumulation steps
                 - warmup_steps: Number of warmup steps
                 - output_dir: Directory to save checkpoints
+                - step_start_point: Initialize training from an explicit global step
+                - resume_if_possible: Auto-resume from the latest checkpoint if one exists
                 DPO-specific:
                 - beta: KL regularization coefficient
                 - loss_type: "sigmoid", "ipo", "hinge"
