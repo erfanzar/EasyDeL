@@ -56,3 +56,41 @@ def test_save_state_forwards_gather_fns_and_writes_metadata(tmp_path):
     metadata = json.loads((tmp_path / "metadata.json").read_text())
     assert metadata["step"] == 7
     assert metadata["is_temporary"] is False
+
+
+def test_save_optimizer_uses_compatibility_helper_in_multiprocess_mode(tmp_path, monkeypatch):
+    saved_trees: list[dict[str, object]] = []
+
+    class _MeshCtx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _CheckpointerStub:
+        def save_pytree(self, **kwargs):
+            saved_trees.append(kwargs["tree"])
+
+    state = type(
+        "_OptimizerStateStub",
+        (),
+        {
+            "opt_state": {"momentum": jnp.ones((2,), dtype=jnp.float32)},
+            "model": type("_Model", (), {"mesh": _MeshCtx()})(),
+        },
+    )()
+
+    monkeypatch.setattr("easydel.infra.base_state.jax.process_count", lambda: 2)
+    monkeypatch.setattr(
+        "easydel.infra.base_state.ensure_multiprocess_checkpoint_compatible",
+        lambda tree, *, mesh, context: {"momentum": "compat"},
+    )
+
+    EasyDeLState.save_optimizer(
+        state,
+        save_directory=tmp_path,
+        checkpointer=_CheckpointerStub(),
+    )
+
+    assert saved_trees == [{"momentum": "compat"}]
