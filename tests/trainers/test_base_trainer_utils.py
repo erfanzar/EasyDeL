@@ -357,17 +357,17 @@ def test_trainer_save_state_forwards_gather_fns(tmp_path):
     trainer._save_readme = lambda directory: None
     save_calls: list[dict[str, object]] = []
     gather_fns = {"params": object()}
+    with patch("easydel.trainers.base_trainer.jax.process_count", return_value=1):
+        class _State:
+            def save_state(self, **kwargs):
+                save_calls.append(dict(kwargs))
 
-    class _State:
-        def save_state(self, **kwargs):
-            save_calls.append(dict(kwargs))
-
-    saved = BaseTrainer._save_state(
-        trainer,
-        state=_State(),
-        save_directory=tmp_path / "explicit",
-        gather_fns=gather_fns,
-    )
+        saved = BaseTrainer._save_state(
+            trainer,
+            state=_State(),
+            save_directory=tmp_path / "explicit",
+            gather_fns=gather_fns,
+        )
 
     assert saved == str(tmp_path / "explicit")
     assert len(save_calls) == 1
@@ -375,6 +375,35 @@ def test_trainer_save_state_forwards_gather_fns(tmp_path):
     assert save_calls[0]["gather_fns"] is gather_fns
     assert save_calls[0]["float_dtype"] is jnp.bfloat16
     assert save_calls[0]["save_optimizer"] is False
+
+
+def test_trainer_save_state_ignores_gather_fns_in_multiprocess_mode(tmp_path):
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        save_arguments=lambda path: None,
+        save_optimizer_state=False,
+        _get_save_directory_milestone=lambda step, create=True: tmp_path / f"run-{step}",
+    )
+    trainer._model = SimpleNamespace(param_dtype=jnp.bfloat16)
+    trainer._save_readme = lambda directory: None
+    save_calls: list[dict[str, object]] = []
+    gather_fns = {"params": object()}
+
+    class _State:
+        def save_state(self, **kwargs):
+            save_calls.append(dict(kwargs))
+
+    with patch("easydel.trainers.base_trainer.jax.process_count", return_value=2):
+        saved = BaseTrainer._save_state(
+            trainer,
+            state=_State(),
+            save_directory=tmp_path / "explicit",
+            gather_fns=gather_fns,
+        )
+
+    assert saved == str(tmp_path / "explicit")
+    assert len(save_calls) == 1
+    assert save_calls[0]["gather_fns"] is None
 
 
 def test_get_current_step_uses_state_step_without_step_start_point_offset():

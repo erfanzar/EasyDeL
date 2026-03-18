@@ -20,12 +20,11 @@ import jax.numpy as jnp
 import pytest
 
 import easydel.infra.loss_utils as loss_utils_module
-
 from easydel.infra.loss_utils import (
     ForCausalLMLoss,
     ForSequenceClassificationLoss,
-    LossForwardPlan,
     LossConfig,
+    LossForwardPlan,
     LossMetrics,
     causal_lm_loss_chunked_lm_head,
     cross_entropy_blockwise_logits,

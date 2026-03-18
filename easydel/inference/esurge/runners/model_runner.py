@@ -61,7 +61,9 @@ from __future__ import annotations
 import time
 import typing
 from bisect import bisect_left
+from collections import deque
 from concurrent.futures import Future
+from dataclasses import dataclass
 
 import flax
 import jax
@@ -93,6 +95,20 @@ if typing.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
 
 logger = get_logger("eSurge")
+
+
+@dataclass(frozen=True)
+class RunnerPerfSample:
+    iteration: int
+    total_tokens: int
+    num_scheduled_reqs: int
+    num_new: int
+    num_cached: int
+    num_finished: int
+    total_time: float
+    agg_tps: float
+    req_tps: float
+    ema_tps: float
 
 
 def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:  # pyright: ignore[reportUnusedFunction]
@@ -294,6 +310,11 @@ class eSurgeRunner:
         self._perf_iteration = 0
         self._perf_tps_ema: float | None = None
         self._perf_alpha = 0.2
+        self._perf_last_agg_tps: float | None = None
+        self._perf_last_req_tps: float | None = None
+        self._perf_last_total_time: float | None = None
+        self._perf_last_total_tokens: int | None = None
+        self._perf_history: deque[RunnerPerfSample] = deque(maxlen=max(32768, int(max_model_len) * 4))
 
         # Async scheduling state
         self._pre_async_results: AsyncPreResults | None = None
@@ -2069,6 +2090,10 @@ class eSurgeRunner:
         agg_tps = total_tokens / total_time if total_time > 0 else 0.0
         num_scheduled_reqs = sum(1 for n in scheduler_output.num_scheduled_tokens.values() if int(n) > 0)
         req_tps = agg_tps / num_scheduled_reqs if num_scheduled_reqs > 0 else 0.0
+        self._perf_last_agg_tps = agg_tps
+        self._perf_last_req_tps = req_tps
+        self._perf_last_total_time = total_time
+        self._perf_last_total_tokens = total_tokens
         if self._perf_tps_ema is None:
             self._perf_tps_ema = agg_tps
         else:
@@ -2085,6 +2110,20 @@ class eSurgeRunner:
         num_new = len(scheduler_output.scheduled_new_reqs)
         num_cached = scheduler_output.scheduled_cached_reqs.num_reqs
         num_finished = len(scheduler_output.finished_req_ids)
+        self._perf_history.append(
+            RunnerPerfSample(
+                iteration=self._perf_iteration,
+                total_tokens=total_tokens,
+                num_scheduled_reqs=num_scheduled_reqs,
+                num_new=num_new,
+                num_cached=num_cached,
+                num_finished=num_finished,
+                total_time=total_time,
+                agg_tps=agg_tps,
+                req_tps=req_tps,
+                ema_tps=float(self._perf_tps_ema),
+            )
+        )
 
         step_gap_time = total_step_time - (total_prep_time + total_exec_time + total_sample_time)
         step_gap_time = max(0.0, step_gap_time)

@@ -16,6 +16,7 @@ from pathlib import Path
 
 import jax
 import numpy as np
+from jax import numpy as jnp
 
 from easydel.infra.mixins.bridge import EasyBridgeMixin
 
@@ -32,6 +33,11 @@ class _ConfigStub:
 class _StateStub:
     def to_pure_dict(self):
         return {"weight": "raw"}
+
+
+class _ArrayStateStub:
+    def to_pure_dict(self):
+        return {"weight": jnp.ones((2, 2), dtype=jnp.float32)}
 
 
 class _BridgeModelStub:
@@ -58,6 +64,7 @@ def test_save_model_files_uses_default_gather_fns_when_not_provided(tmp_path, mo
 
     monkeypatch.setattr("easydel.infra.mixins.bridge.nn.split", lambda *args, **kwargs: (None, _StateStub()))
     monkeypatch.setattr("easydel.infra.mixins.bridge.Checkpointer", _CheckpointerStub)
+    monkeypatch.setattr("easydel.infra.mixins.bridge.jax.process_count", lambda: 1)
 
     EasyBridgeMixin._save_model_files(
         _BridgeModelStub(),
@@ -68,6 +75,62 @@ def test_save_model_files_uses_default_gather_fns_when_not_provided(tmp_path, mo
     )
 
     assert saved_trees == [{"weight": "gathered:raw"}]
+
+
+def test_save_model_files_skips_default_gather_fns_in_multiprocess_mode(tmp_path, monkeypatch):
+    saved_trees: list[dict[str, object]] = []
+
+    class _CheckpointerStub:
+        def __init__(self, **kwargs):
+            pass
+
+        def save_pytree(self, *, tree, prefix, mesh, dtype):
+            saved_trees.append(tree)
+            return str(tmp_path / f"{prefix}.ckpt")
+
+    monkeypatch.setattr("easydel.infra.mixins.bridge.nn.split", lambda *args, **kwargs: (None, _StateStub()))
+    monkeypatch.setattr("easydel.infra.mixins.bridge.Checkpointer", _CheckpointerStub)
+    monkeypatch.setattr("easydel.infra.mixins.bridge.jax.process_count", lambda: 2)
+
+    EasyBridgeMixin._save_model_files(
+        _BridgeModelStub(),
+        save_directory=tmp_path,
+        gather_fns=None,
+        float_dtype=None,
+        step=None,
+    )
+
+    assert saved_trees == [{"weight": "raw"}]
+
+
+def test_save_model_files_uses_compatibility_helper_in_multiprocess_mode(tmp_path, monkeypatch):
+    saved_trees: list[dict[str, object]] = []
+
+    class _CheckpointerStub:
+        def __init__(self, **kwargs):
+            pass
+
+        def save_pytree(self, *, tree, prefix, mesh, dtype):
+            saved_trees.append(tree)
+            return str(tmp_path / f"{prefix}.ckpt")
+
+    monkeypatch.setattr("easydel.infra.mixins.bridge.nn.split", lambda *args, **kwargs: (None, _ArrayStateStub()))
+    monkeypatch.setattr("easydel.infra.mixins.bridge.Checkpointer", _CheckpointerStub)
+    monkeypatch.setattr("easydel.infra.mixins.bridge.jax.process_count", lambda: 2)
+    monkeypatch.setattr(
+        "easydel.infra.mixins.bridge.ensure_multiprocess_checkpoint_compatible",
+        lambda tree, *, mesh, context: {"weight": "compat"},
+    )
+
+    EasyBridgeMixin._save_model_files(
+        _BridgeModelStub(),
+        save_directory=tmp_path,
+        gather_fns=None,
+        float_dtype=None,
+        step=None,
+    )
+
+    assert saved_trees == [{"weight": "compat"}]
 
 
 def test_save_model_files_normalizes_numpy_arrays_before_checkpoint_write(tmp_path, monkeypatch):

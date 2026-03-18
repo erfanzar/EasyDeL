@@ -3172,9 +3172,12 @@ class BaseTrainer(BaseTrainerProtocol):
         directory_name.mkdir(exist_ok=True)
         self.arguments.save_arguments(directory_name / DEFAULT_ARGS_JSON_NAME)
         self._save_readme(directory_name)
+        gather_fns = kwargs.get("gather_fns")
+        if jax.process_count() > 1 and gather_fns is not None:
+            gather_fns = None
         state.save_state(
             save_directory=directory_name,
-            gather_fns=kwargs.get("gather_fns"),
+            gather_fns=gather_fns,
             float_dtype=self.model.param_dtype,
             save_optimizer=self.arguments.save_optimizer_state,
         )

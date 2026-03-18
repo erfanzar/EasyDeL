@@ -496,10 +496,16 @@ class EasyBridgeMixin(PushToHubMixin):
         state = nn.split(self, nn.Param, ...)[1]
         state_dict = state.to_pure_dict()
         if gather_fns is None:
-            try:
-                gather_fns = self._gather_fns
-            except (AttributeError, NotImplementedError):
-                gather_fns = None
+            if jax.process_count() == 1:
+                try:
+                    gather_fns = self._gather_fns
+                except (AttributeError, NotImplementedError):
+                    gather_fns = None
+            else:
+                logger.info(
+                    "Skipping default gather_fns during multiprocess save to preserve sharded arrays "
+                    "for TensorStore checkpointing."
+                )
         if gather_fns is not None:
             flat_state = flatten_dict(state_dict)
             flat_gather_fns = gather_fns if is_flatten(gather_fns) else flatten_dict(gather_fns)
