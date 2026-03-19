@@ -2890,6 +2890,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
         """
         if self.partition_axis is None:
             self.partition_axis = PartitionAxis()
+        elif isinstance(self.partition_axis, dict):
+            self.partition_axis = PartitionAxis(**self.partition_axis)
         return PartitionManager(self.partition_axis)
 
     __hash__ = hash_fn

@@ -1625,6 +1625,14 @@ class eSurgeRunner:
                 i_req_id = self.sequence_buffer.req_ids[i]
                 j_req_id = self.sequence_buffer.req_ids[j]
 
+                # Guard against empty slots that survived compaction
+                # (e.g. when prompt count < max_num_seqs).
+                if i_req_id is None:
+                    break  # no more populated slots from the left
+                if j_req_id is None:
+                    j -= 1
+                    continue
+
                 i_is_decode = (
                     scheduler_output.num_scheduled_tokens.get(i_req_id, 0) == 1
                     and self.sequence_buffer.num_computed_tokens[i] > 0

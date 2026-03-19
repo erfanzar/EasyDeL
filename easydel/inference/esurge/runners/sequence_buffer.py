@@ -524,7 +524,7 @@ class SequenceBuffer:
         self.num_tokens_no_spec[req_index] = 0
         self.num_prompt_tokens[req_index] = 0
         self.num_computed_tokens[req_index] = 0
-        self.page_table.add_row([[] for _ in self.page_table.page_tables], req_index)
+        self.page_table.clear_row(req_index)
 
         for req_set in [
             self.greedy_reqs,
@@ -578,55 +578,9 @@ class SequenceBuffer:
         """
         write = lo
         for read in range(lo, hi):
-            req_id = self._req_ids[read]
-            if req_id is not None:
+            if self._req_ids[read] is not None:
                 if read != write:
-                    # Move request from 'read' to 'write' (write is a hole)
-                    self._req_ids[write] = req_id
-                    self._req_ids[read] = None
-                    self.req_id_to_index[req_id] = write
-                    self.req_output_token_ids[write] = self.req_output_token_ids[read]
-                    self.req_output_token_ids[read] = None
-                    # NumPy array rows: copy then clear source
-                    self.token_ids[write] = self.token_ids[read]
-                    self.token_ids[read] = 0
-                    self.num_tokens[write] = self.num_tokens[read]
-                    self.num_tokens[read] = 0
-                    self.num_tokens_no_spec[write] = self.num_tokens_no_spec[read]
-                    self.num_tokens_no_spec[read] = 0
-                    self.num_prompt_tokens[write] = self.num_prompt_tokens[read]
-                    self.num_prompt_tokens[read] = 0
-                    self.num_computed_tokens[write] = self.num_computed_tokens[read]
-                    self.num_computed_tokens[read] = 0
-                    self.temperature[write] = self.temperature[read]
-                    self.temperature[read] = -1.0
-                    self.top_p[write] = self.top_p[read]
-                    self.top_p[read] = 1.0
-                    self.top_k[write] = self.top_k[read]
-                    self.top_k[read] = 0
-                    self.min_p[write] = self.min_p[read]
-                    self.min_p[read] = 0.0
-                    self.frequency_penalties[write] = self.frequency_penalties[read]
-                    self.frequency_penalties[read] = 0.0
-                    self.presence_penalties[write] = self.presence_penalties[read]
-                    self.presence_penalties[read] = 0.0
-                    self.repetition_penalties[write] = self.repetition_penalties[read]
-                    self.repetition_penalties[read] = 1.0
-                    # Page table
-                    self.page_table.swap_row(write, read)
-                    # Dict-based fields
-                    for d in (self.generator_seeds, self.min_tokens, self.bad_words_token_ids):
-                        if read in d:
-                            d[write] = d.pop(read)
-                        else:
-                            d.pop(write, None)
-                    self.logit_bias[write] = self.logit_bias[read]
-                    self.logit_bias[read] = None
-                    if self.allowed_token_ids_mask is not None:
-                        self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[write].set(
-                            self.allowed_token_ids_mask[read]
-                        )
-                        self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[read].set(False)
+                    self._move_request(read, write)
                 write += 1
         if write < hi:
             self._update_request_distribution()
@@ -721,21 +675,23 @@ class SequenceBuffer:
         """Move a request from one index to another.
 
         Internal method for relocating a request within the buffer.
+        Gracefully skips empty slots (None req_id) to avoid crashes
+        during dynamic batching when prompt count < max_num_seqs.
 
         Args:
             from_idx: Source index of the request.
             to_idx: Destination index for the request.
 
-        Raises:
-            RuntimeError: If from_idx doesn't contain a valid request.
-
         Note:
             This is an internal method used by condense() and other
             buffer reorganization operations. Modifies the buffer in-place.
+            If from_idx contains an empty slot (None req_id), the call
+            is a no-op to prevent desync between bookkeeping and arrays.
         """
         req_id = self._req_ids[from_idx]
         if req_id is None:
-            raise RuntimeError(f"from_idx {from_idx} does not contain a valid request")
+            logger.debug("_move_request called on empty slot from_idx=%s", from_idx)
+            return
 
         # Static bookkeeping
         self._req_ids[to_idx] = req_id
@@ -744,22 +700,36 @@ class SequenceBuffer:
         self.req_output_token_ids[from_idx] = None
         self.req_id_to_index[req_id] = to_idx
 
-        # Arrays - update in-place
+        # Arrays - copy to destination then zero source to keep
+        # JAX array pointers and internal bookkeeping in sync.
         self.token_ids = move_row(self.token_ids, from_idx, to_idx)
+        self.token_ids[from_idx] = 0
         self.num_tokens = move_row(self.num_tokens, from_idx, to_idx)
+        self.num_tokens[from_idx] = 0
         self.num_tokens_no_spec = move_row(self.num_tokens_no_spec, from_idx, to_idx)
+        self.num_tokens_no_spec[from_idx] = 0
         self.num_prompt_tokens = move_row(self.num_prompt_tokens, from_idx, to_idx)
+        self.num_prompt_tokens[from_idx] = 0
         self.num_computed_tokens = move_row(self.num_computed_tokens, from_idx, to_idx)
+        self.num_computed_tokens[from_idx] = 0
         self.temperature = move_row(self.temperature, from_idx, to_idx)
+        self.temperature[from_idx] = -1.0
         self.top_p = move_row(self.top_p, from_idx, to_idx)
+        self.top_p[from_idx] = 1.0
         self.top_k = move_row(self.top_k, from_idx, to_idx)
+        self.top_k[from_idx] = 0
         self.frequency_penalties = move_row(self.frequency_penalties, from_idx, to_idx)
+        self.frequency_penalties[from_idx] = 0.0
         self.presence_penalties = move_row(self.presence_penalties, from_idx, to_idx)
+        self.presence_penalties[from_idx] = 0.0
         self.repetition_penalties = move_row(self.repetition_penalties, from_idx, to_idx)
+        self.repetition_penalties[from_idx] = 1.0
         self.min_p = move_row(self.min_p, from_idx, to_idx)
+        self.min_p[from_idx] = 0.0
 
-        # Page table - mutate in-place
+        # Page table - copy then clear source to prevent stale pointers.
         self.page_table.move_row(from_idx, to_idx)
+        self.page_table.clear_row(from_idx)
 
         # Sparse/optional data
         self._move_sparse_data(from_idx, to_idx)
