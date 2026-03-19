@@ -155,6 +155,8 @@ class OperationMetadata:
         self.set_attrs_carefully("runtime_dtype",  jnp.float32, "attn_dtype")
         self.set_attrs_carefully("runtime_softmax_dtype", jnp.float32, "attn_softmax_dtype")
         self.set_attrs_carefully("partition_axis", PartitionAxis())
+        if isinstance(self.partition_axis, dict):
+            self.partition_axis = PartitionAxis(**self.partition_axis)
         self.set_attrs_carefully("partition_manager", PartitionManager(self.partition_axis))
         # DON'T READ FROM CONFIG
         self.set_attrs_carefully("sequence_axis_name", "sp", "sequence_axis_name", use_base_config=False)

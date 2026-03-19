@@ -132,31 +132,42 @@ class PageTable:
         self.page_table_cpu[row_idx, start : start + num_pages] = page_ids
         self.cpu_version += 1
 
+    def clear_row(self, row_idx: int) -> None:
+        """Zero out a row, resetting page IDs and count.
+
+        Args:
+            row_idx: Index of the row to clear.
+
+        Note:
+            Call commit() to sync changes to GPU.
+        """
+        self.page_table_cpu[row_idx].fill(PAGE_TABLE_PADDING_VAL)
+        self.num_pages_per_row[row_idx] = 0
+        self.cpu_version += 1
+
     def add_row(self, page_ids: list[int], row_idx: int) -> None:
         """Replace a row with new page IDs.
 
-        Resets the row to empty, then adds the provided page IDs to the
-        CPU array. Changes are not visible on GPU until commit() is called.
+        Clears the row, then appends the provided page IDs. Changes are
+        not visible on GPU until commit() is called.
 
         Args:
             page_ids: New page IDs for the row.
             row_idx: Index of the row to replace.
 
         Note:
-            This is equivalent to clearing the row and then appending.
             Call commit() to sync changes to GPU.
         """
-        self.num_pages_per_row[row_idx] = 0
+        self.clear_row(row_idx)
         self.append_row(page_ids, row_idx)
-        # `append_row` already bumps `cpu_version` when non-empty.
-        if not page_ids:
-            self.cpu_version += 1
 
     def move_row(self, src: int, tgt: int) -> None:
         """Move row content from source to target.
 
         Copies the page IDs and count from source row to target row in the
-        CPU array. Only copies the valid pages (up to source length).
+        CPU array. The full target row is reset before copying so that no
+        stale page IDs from a previous occupant survive beyond the valid
+        range.
 
         Args:
             src: Source row index.
@@ -168,6 +179,7 @@ class PageTable:
         """
         num_pages = self.num_pages_per_row[src]
         self.page_table_cpu[tgt, :num_pages] = self.page_table_cpu[src, :num_pages]
+        self.page_table_cpu[tgt, num_pages:].fill(PAGE_TABLE_PADDING_VAL)
         self.num_pages_per_row[tgt] = num_pages
         self.cpu_version += 1
 
@@ -312,6 +324,18 @@ class MultiGroupPageTable:
         """
         for i, page_table in enumerate(self.page_tables):
             page_table.add_row(page_ids[i], row_idx)
+
+    def clear_row(self, row_idx: int) -> None:
+        """Clear a row across all groups, zeroing page IDs and counts.
+
+        Args:
+            row_idx: Row index to clear.
+
+        Note:
+            Call commit() to sync changes to GPU.
+        """
+        for page_table in self.page_tables:
+            page_table.clear_row(row_idx)
 
     def move_row(self, src: int, tgt: int) -> None:
         """Move a row across all groups.
