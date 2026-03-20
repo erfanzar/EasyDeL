@@ -60,7 +60,6 @@ class EvalKwargs(TypedDict, total=False):
         max_batch_size: Upper bound on auto batch size. None for no limit.
         device: Device string for lm-eval (e.g., ``"cpu"``). None for default.
         use_cache: Path to cache evaluation requests. None to disable caching.
-        use_tqdm: Whether to show progress bars during evaluation.
         limit: Limit the number of evaluation examples. Float for fraction, int
             for count. None for all.
         cache_requests: Whether to cache individual evaluation requests.
@@ -117,7 +116,6 @@ class EvalKwargs(TypedDict, total=False):
     max_batch_size: NotRequired[int | None]
     device: NotRequired[str | None]
     use_cache: NotRequired[str | None]
-    use_tqdm: NotRequired[bool]
     limit: NotRequired[int | float | None]
     cache_requests: NotRequired[bool]
     rewrite_requests_cache: NotRequired[bool]

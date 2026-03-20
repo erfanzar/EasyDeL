@@ -59,6 +59,19 @@ from ..utils import pad_to_length
 from .dpo_config import LOSS_FN_VARIANTS
 
 
+def _get_reference_logps_from_batch(batch: dict[str, tp.Any]) -> tuple[tp.Any | None, tp.Any | None]:
+    """Read reference log-prob columns from either the canonical or legacy keys."""
+    ref_chosen_logps = batch.get("ref_chosen_logps")
+    if ref_chosen_logps is None:
+        ref_chosen_logps = batch.get("reference_chosen_log_probs")
+
+    ref_rejected_logps = batch.get("ref_rejected_logps")
+    if ref_rejected_logps is None:
+        ref_rejected_logps = batch.get("reference_rejected_log_probs")
+
+    return ref_chosen_logps, ref_rejected_logps
+
+
 def concatenated_inputs(
     batch: dict[str, list | Array],
     padding_value: int,
@@ -821,14 +834,24 @@ def training_step(
         label_smoothing=label_smoothing,
     )
 
-    # Pre-compute reference logps outside jax.value_and_grad to avoid
-    # nn.remat trace-level conflicts when the reference model uses
-    # gradient checkpointing inside the grad trace.
-    if "ref_chosen_logps" not in batch or "ref_rejected_logps" not in batch:
-        rfm = reference_state.model
-        rfm.eval()
-        ref_out = jax.lax.stop_gradient(concatenated_forward(rfm, batch))
-        batch = {**batch, "ref_chosen_logps": ref_out["chosen_logps"], "ref_rejected_logps": ref_out["rejected_logps"]}
+    if not reference_free:
+        # Pre-compute reference logps outside jax.value_and_grad to avoid
+        # nn.remat trace-level conflicts when the reference model uses
+        # gradient checkpointing inside the grad trace.
+        ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
+        if ref_chosen_logps is None or ref_rejected_logps is None:
+            rfm = reference_state.model
+            rfm.eval()
+            ref_out = jax.lax.stop_gradient(concatenated_forward(rfm, batch))
+            ref_chosen_logps = ref_out["chosen_logps"]
+            ref_rejected_logps = ref_out["rejected_logps"]
+
+        if "ref_chosen_logps" not in batch or "ref_rejected_logps" not in batch:
+            batch = {
+                **batch,
+                "ref_chosen_logps": ref_chosen_logps,
+                "ref_rejected_logps": ref_rejected_logps,
+            }
 
     def calculate_loss(tree: flax.nnx.GraphState, call_batch):
         """
@@ -847,11 +870,14 @@ def training_step(
 
         model_output = concatenated_forward(module, call_batch)
 
-        ref_chosen_logps = jax.lax.stop_gradient(call_batch["ref_chosen_logps"])
-        ref_rejected_logps = jax.lax.stop_gradient(call_batch["ref_rejected_logps"])
-
         chosen_logps = model_output["chosen_logps"]
         rejected_logps = model_output["rejected_logps"]
+        if reference_free:
+            ref_chosen_logps = jnp.zeros_like(chosen_logps)
+            ref_rejected_logps = jnp.zeros_like(rejected_logps)
+        else:
+            ref_chosen_logps = jax.lax.stop_gradient(call_batch["ref_chosen_logps"])
+            ref_rejected_logps = jax.lax.stop_gradient(call_batch["ref_rejected_logps"])
         losses = _loss_func(
             chosen_logps,
             rejected_logps,
@@ -863,7 +889,7 @@ def training_step(
 
         chosen_rewards = beta * jax.lax.stop_gradient(chosen_logps - ref_chosen_logps)
         rejected_rewards = beta * jax.lax.stop_gradient(rejected_logps - ref_rejected_logps)
-        if hasattr(model_output, "aux_loss"):
+        if "aux_loss" in model_output:
             losses += model_output["aux_loss"]
 
         metrics = LossMetrics(
@@ -950,49 +976,36 @@ def evaluation_step(
         Returns:
             LossMetrics: The computed loss metrics.
         """
-        (
-            mean_chosen_logits,
-            mean_rejected_logits,
-            _,
-            _,
-        ) = concatenated_forward(state.merge(tree), batch)
+        model_output = concatenated_forward(state.merge(tree), batch)
+        chosen_logps = model_output["chosen_logps"]
+        rejected_logps = model_output["rejected_logps"]
 
-        if "ref_chosen_logps" in batch and "ref_rejected_logps" in batch:
-            ref_chosen_logps = batch["ref_chosen_logps"]
-            ref_rejected_logps = batch["ref_rejected_logps"]
-        else:
-            if reference_state is None:
-                (
-                    ref_chosen_logps,
-                    ref_rejected_logps,
-                    _,
-                    _,
-                ) = concatenated_forward(state.model, batch)
-            else:
-                (
-                    ref_chosen_logps,
-                    ref_rejected_logps,
-                    _,
-                    _,
-                ) = concatenated_forward(reference_state.model, batch)
-
-        pi_log_ratios = mean_chosen_logits - mean_rejected_logits
+        ref_chosen_logps, ref_rejected_logps = _get_reference_logps_from_batch(batch)
+        if ref_chosen_logps is None or ref_rejected_logps is None:
+            ref_model = state.model if reference_state is None else reference_state.model
+            ref_output = concatenated_forward(ref_model, batch)
+            ref_chosen_logps = ref_output["chosen_logps"]
+            ref_rejected_logps = ref_output["rejected_logps"]
 
         if reference_free:
-            ref_log_ratios = 0
+            ref_chosen_for_loss = jnp.zeros_like(chosen_logps)
+            ref_rejected_for_loss = jnp.zeros_like(rejected_logps)
         else:
-            ref_log_ratios = ref_chosen_logps - ref_rejected_logps
+            ref_chosen_for_loss = ref_chosen_logps
+            ref_rejected_for_loss = ref_rejected_logps
 
-        logits = pi_log_ratios - ref_log_ratios
         losses = _loss_func(
-            logits,
-            mean_chosen_logits,
-            ref_chosen_logps,
-            mean_rejected_logits,
-            ref_rejected_logps,
+            chosen_logps,
+            rejected_logps,
+            ref_chosen_for_loss,
+            ref_rejected_for_loss,
+            beta,
+            label_smoothing,
         )
-        chosen_rewards = beta * (mean_chosen_logits - ref_chosen_logps)
-        rejected_rewards = beta * (mean_rejected_logits - ref_rejected_logps)
+
+        chosen_rewards = beta * (chosen_logps - ref_chosen_for_loss)
+        rejected_rewards = beta * (rejected_logps - ref_rejected_for_loss)
+
         metrics = LossMetrics(
             loss=losses.mean(),
             rejected_rewards=rejected_rewards,

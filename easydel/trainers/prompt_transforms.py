@@ -58,6 +58,10 @@ _TOKENIZED_FIELDS = {
     "label",
     "embedding_input_ids",
     "embedding_attention_mask",
+    "ref_chosen_logps",
+    "ref_rejected_logps",
+    "reference_chosen_log_probs",
+    "reference_rejected_log_probs",
 }
 
 

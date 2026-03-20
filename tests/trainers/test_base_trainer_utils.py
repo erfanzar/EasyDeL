@@ -358,6 +358,7 @@ def test_trainer_save_state_forwards_gather_fns(tmp_path):
     save_calls: list[dict[str, object]] = []
     gather_fns = {"params": object()}
     with patch("easydel.trainers.base_trainer.jax.process_count", return_value=1):
+
         class _State:
             def save_state(self, **kwargs):
                 save_calls.append(dict(kwargs))

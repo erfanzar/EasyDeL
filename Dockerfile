@@ -34,10 +34,26 @@ RUN set -eux; \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential git curl wget \
-        libgomp1 rsync openssh-client sudo tmux screen netbase gnupg && \
+        libgomp1 rsync openssh-client sudo tmux screen netbase gnupg \
+        apt-transport-https && \
     if [[ "$HARDWARE_TYPE" == "tpu" ]]; then \
         apt-get install -y --no-install-recommends docker.io; \
     fi; \
+    mkdir -p /etc/apt/keyrings && \
+    wget -q -O - https://apt.grafana.com/gpg.key \
+        | gpg --dearmor > /etc/apt/keyrings/grafana.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" \
+        > /etc/apt/sources.list.d/grafana.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends grafana && \
+    PROM_ARCH=$(case "$(uname -m)" in x86_64) echo amd64;; aarch64) echo arm64;; armv7l) echo armv7;; *) echo "unsupported arch: $(uname -m)" >&2 && exit 1;; esac) && \
+    PROM_VER="3.3.0" && \
+    wget -q -O /tmp/prometheus.tar.gz \
+        "https://github.com/prometheus/prometheus/releases/download/v${PROM_VER}/prometheus-${PROM_VER}.linux-${PROM_ARCH}.tar.gz" && \
+    tar -xzf /tmp/prometheus.tar.gz -C /tmp && \
+    install -m 0755 /tmp/prometheus-${PROM_VER}.linux-${PROM_ARCH}/prometheus /usr/local/bin/prometheus && \
+    install -m 0755 /tmp/prometheus-${PROM_VER}.linux-${PROM_ARCH}/promtool /usr/local/bin/promtool && \
+    rm -rf /tmp/prometheus* && \
     rm -rf /var/lib/apt/lists/*
 
 # uv binary
@@ -68,6 +84,9 @@ RUN set -eux; \
 # Ray with GCP extras
 RUN uv pip install 'ray[default,gcp]==2.54.0'
 
+# eSurge monitoring dependencies (Prometheus metrics + Rich console dashboard)
+RUN uv pip install prometheus-client rich
+
 # TPU-only: install gcloud
 RUN set -eux; \
     if [[ "$HARDWARE_TYPE" == "tpu" ]]; then \
@@ -82,6 +101,7 @@ RUN set -eux; \
 RUN useradd -m -s /bin/bash easydel && \
     echo "easydel ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers && \
     chown -R easydel:easydel /app && \
+    chown -R easydel:easydel /var/lib/grafana /var/log/grafana /etc/grafana && \
     if [[ "$HARDWARE_TYPE" == "tpu" ]]; then usermod -aG docker easydel; fi
 
 # Shell quieting for rsync/ssh

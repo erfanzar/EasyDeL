@@ -472,6 +472,8 @@ class ExecutionManager:
             use_aot_forward=self.use_aot_forward,
             cache_capacity=self._cache_capacity,
         )
+        self._sampler_token_history_cpu = numpy.zeros((self.max_num_reqs, self.max_model_len), dtype=numpy.int32)
+        self._sampler_zero_token_history = jax.device_put(self._sampler_token_history_cpu, self._empty_sharding)
 
     def clear_cache(self) -> None:
         """Clear all cached compiled functions.
@@ -566,6 +568,9 @@ class ExecutionManager:
         top_p_cpu: numpy.ndarray,
         top_k_cpu: numpy.ndarray,
         min_p_cpu: numpy.ndarray,
+        frequency_penalties_cpu: numpy.ndarray,
+        presence_penalties_cpu: numpy.ndarray,
+        repetition_penalties_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,
         page_table_version: int | None = None,
         # VLM prefill helpers (optional)
@@ -660,6 +665,9 @@ class ExecutionManager:
             top_p_cpu=top_p_cpu,
             top_k_cpu=top_k_cpu,
             min_p_cpu=min_p_cpu,
+            frequency_penalties_cpu=frequency_penalties_cpu,
+            presence_penalties_cpu=presence_penalties_cpu,
+            repetition_penalties_cpu=repetition_penalties_cpu,
             page_table_cpu=page_table_cpu,
             page_table_version=page_table_version,
             padded_num_reqs_in=padded_num_reqs,
@@ -720,6 +728,12 @@ class ExecutionManager:
             active_mask_full=active_mask_full,
             logits=model_outputs.logits,
             rng_key=self.rng_key,
+            token_ids_cpu=token_ids_cpu,
+            need_penalties=bool(
+                numpy.any(frequency_penalties_cpu != 0.0)
+                or numpy.any(presence_penalties_cpu != 0.0)
+                or numpy.any(repetition_penalties_cpu != 1.0)
+            ),
         )
         jax.block_until_ready(model_outputs.logits)
         exec_took = time.time() - start_exec
@@ -857,6 +871,8 @@ class ExecutionManager:
         active_mask_full: jax.Array,
         logits: jax.Array,
         rng_key: jax.Array,
+        token_ids_cpu: numpy.ndarray,
+        need_penalties: bool,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Run the compiled sampler step (no KV-cache mutation).
 
@@ -872,6 +888,8 @@ class ExecutionManager:
             active_mask_full: Boolean mask for active requests [max_num_reqs].
             logits: Model output logits [padded_num_reqs, vocab_size].
             rng_key: JAX random key for stochastic sampling.
+            token_ids_cpu: CPU token history aligned to the active request window.
+            need_penalties: Whether any request in the window uses penalties.
 
         Returns:
             Tuple of (updated_rng_key, sampled_tokens, valid_mask) where:
@@ -885,9 +903,23 @@ class ExecutionManager:
             synchronize on the returned arrays when ready to use them.
         """
         sampler_fn = self._sampler_executor.get_compiled(num_tokens=num_tokens, padded_num_reqs=padded_num_reqs)
+        if need_penalties:
+            self._sampler_token_history_cpu.fill(0)
+            if token_ids_cpu.size:
+                self._sampler_token_history_cpu[: token_ids_cpu.shape[0], : token_ids_cpu.shape[1]] = token_ids_cpu
+            token_history = jax.device_put(self._sampler_token_history_cpu, self._empty_sharding)
+        else:
+            token_history = self._sampler_zero_token_history
         # Keep this non-blocking so the caller can overlap host work while the
         # device enqueues sampling behind the forward pass.
-        return sampler_fn(batch_metadata, req_num_tokens_full, active_mask_full, logits, rng_key)
+        return sampler_fn(
+            batch_metadata,
+            req_num_tokens_full,
+            active_mask_full,
+            logits,
+            rng_key,
+            token_history,
+        )
 
     @staticmethod
     def _get_feasible_compile_pairs(
@@ -1060,6 +1092,7 @@ class ExecutionManager:
                     inputs.active_mask_full,
                     dummy_logits,
                     inputs.rng_key,
+                    self._sampler_zero_token_history,
                 )
                 self._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_sampler"] = _tree_hash(sampler_args)
 
@@ -1110,6 +1143,9 @@ class ExecutionManager:
         top_p_cpu: numpy.ndarray,
         top_k_cpu: numpy.ndarray,
         min_p_cpu: numpy.ndarray,
+        frequency_penalties_cpu: numpy.ndarray,
+        presence_penalties_cpu: numpy.ndarray,
+        repetition_penalties_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,  # Pass page table as CPU array
         padded_num_reqs_in: int,
         page_table_version: int | None = None,
@@ -1143,6 +1179,9 @@ class ExecutionManager:
             top_p_cpu: Top-p per request (CPU array).
             top_k_cpu: Top-k per request (CPU array).
             min_p_cpu: Min-p per request (CPU array).
+            frequency_penalties_cpu: Frequency penalty per request (CPU array).
+            presence_penalties_cpu: Presence penalty per request (CPU array).
+            repetition_penalties_cpu: Repetition penalty per request (CPU array).
             page_table_cpu: Page table (CPU array).
             padded_num_reqs_in: Requested padding for request count.
             page_table_version: Optional version for page table caching.
@@ -1172,6 +1211,9 @@ class ExecutionManager:
             top_p_cpu=top_p_cpu,
             top_k_cpu=top_k_cpu,
             min_p_cpu=min_p_cpu,
+            frequency_penalties_cpu=frequency_penalties_cpu,
+            presence_penalties_cpu=presence_penalties_cpu,
+            repetition_penalties_cpu=repetition_penalties_cpu,
             page_table_cpu=page_table_cpu,
             page_table_version=page_table_version,
             padded_num_reqs_in=padded_num_reqs_in,
@@ -1199,6 +1241,9 @@ class ExecutionManager:
         top_p_cpu: numpy.ndarray,
         top_k_cpu: numpy.ndarray,
         min_p_cpu: numpy.ndarray,
+        frequency_penalties_cpu: numpy.ndarray,
+        presence_penalties_cpu: numpy.ndarray,
+        repetition_penalties_cpu: numpy.ndarray,
         page_table_cpu: numpy.ndarray,
         padded_num_reqs_in: int,
         page_table_version: int | None = None,
@@ -1220,6 +1265,9 @@ class ExecutionManager:
             top_p_cpu: Top-p per request.
             top_k_cpu: Top-k per request.
             min_p_cpu: Min-p per request.
+            frequency_penalties_cpu: Frequency penalty per request.
+            presence_penalties_cpu: Presence penalty per request.
+            repetition_penalties_cpu: Repetition penalty per request.
             page_table_cpu: Page table for all requests.
             padded_num_reqs_in: Requested padding for request count.
             page_table_version: Optional version for page table caching.
@@ -1239,6 +1287,9 @@ class ExecutionManager:
             top_p_cpu=top_p_cpu,
             top_k_cpu=top_k_cpu,
             min_p_cpu=min_p_cpu,
+            frequency_penalties_cpu=frequency_penalties_cpu,
+            presence_penalties_cpu=presence_penalties_cpu,
+            repetition_penalties_cpu=repetition_penalties_cpu,
             page_table_cpu=page_table_cpu,
             page_table_version=page_table_version,
             padded_num_reqs_in=padded_num_reqs_in,
@@ -1404,6 +1455,9 @@ class ExecutionManager:
             top_p_cpu=temp_buffer.top_p,
             top_k_cpu=temp_buffer.top_k,
             min_p_cpu=temp_buffer.min_p,
+            frequency_penalties_cpu=temp_buffer.frequency_penalties,
+            presence_penalties_cpu=temp_buffer.presence_penalties,
+            repetition_penalties_cpu=temp_buffer.repetition_penalties,
             page_table_cpu=page_table_cpu_dummy,
             padded_num_reqs_in=padded_num_reqs,
             mrope_position_ids_cpu=mrope_position_ids_cpu,

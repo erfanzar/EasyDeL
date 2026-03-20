@@ -39,7 +39,8 @@ Architecture Notes:
 
     - packed_qsl_seqlens: [2, max_num_reqs+1] for query_start_loc and seq_lens
     - packed_i32_padded: [3, padded_num_reqs] for scheduled, logits_indices, top_k
-    - packed_f32_padded: [3, padded_num_reqs] for temperature, top_p, min_p
+    - packed_f32_padded: [6, padded_num_reqs] for temperature, top_p, min_p,
+      frequency_penalty, presence_penalty, repetition_penalty
     - packed_misc_i32: [5] for num_requests, padded_num_reqs, request_distribution
 
     Properties provide unpacking for convenient access while maintaining
@@ -138,7 +139,10 @@ class BatchMetadata:
 
     # Packed per-request parameters (padded to batch bucket):
     # - int32: [3, padded_num_reqs] => (scheduled, logits_indices, top_k)
-    # - float32: [3, padded_num_reqs] => (temperature, top_p, min_p)
+    # - float32: [6, padded_num_reqs] => (
+    #       temperature, top_p, min_p,
+    #       frequency_penalty, presence_penalty, repetition_penalty
+    #   )
     packed_i32_padded: jax.Array
     packed_f32_padded: jax.Array
 
@@ -264,6 +268,21 @@ class BatchMetadata:
                 the maximum token probability.
         """
         return self.packed_f32_padded[2]
+
+    @property
+    def frequency_penalties(self) -> jax.Array:
+        """Get frequency penalties for each request."""
+        return self.packed_f32_padded[3]
+
+    @property
+    def presence_penalties(self) -> jax.Array:
+        """Get presence penalties for each request."""
+        return self.packed_f32_padded[4]
+
+    @property
+    def repetition_penalties(self) -> jax.Array:
+        """Get repetition penalties for each request."""
+        return self.packed_f32_padded[5]
 
     @property
     def num_requests(self) -> jax.Array:

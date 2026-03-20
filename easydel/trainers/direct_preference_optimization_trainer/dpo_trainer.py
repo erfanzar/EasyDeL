@@ -18,8 +18,8 @@ from collections import defaultdict
 from functools import partial
 
 import jax
+import numpy as np
 from eformer.loggings import get_logger
-from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
 
@@ -185,10 +185,12 @@ class DPOTrainer(Trainer):
         Returns:
             DPOPreprocessTransform or None if data is already tokenized.
         """
-
         if self._is_pretokenized():
             return None
 
+        return self._build_preprocess_transform()
+
+    def _build_preprocess_transform(self) -> DPOPreprocessTransform:
         return DPOPreprocessTransform(
             tokenizer=self.processing_class,
             max_prompt_length=self.arguments.max_prompt_length,
@@ -197,15 +199,40 @@ class DPOTrainer(Trainer):
             label_pad_token_id=self.arguments.label_pad_token_id,
         )
 
-    def _is_pretokenized(self) -> bool:
-        """Check if dataset already has DPO tokenized fields."""
-        if self._train_source is None:
+    @staticmethod
+    def _source_is_pretokenized(source: "ShardedDataSource | None") -> bool:
+        if source is None:
             return False
         try:
-            sample = next(iter(self._train_source.open_shard(self._train_source.shard_names[0])))
+            sample = next(iter(source.open_shard(source.shard_names[0])))
             return "prompt_input_ids" in sample
         except (StopIteration, IndexError):
             return False
+
+    @staticmethod
+    def _source_has_reference_logps(source: "ShardedDataSource | None") -> bool:
+        if source is None:
+            return False
+        try:
+            sample = next(iter(source.open_shard(source.shard_names[0])))
+        except (StopIteration, IndexError):
+            return False
+        return ("ref_chosen_logps" in sample and "ref_rejected_logps" in sample) or (
+            "reference_chosen_log_probs" in sample and "reference_rejected_log_probs" in sample
+        )
+
+    def _build_source_from_dataset(
+        self,
+        dataset: "Dataset | IterableDataset | ShardedDataSource | None",
+    ) -> "ShardedDataSource | None":
+        source = self._to_sharded_source(dataset)
+        if source is None or self._source_is_pretokenized(source):
+            return source
+        return source.transform(self._build_preprocess_transform())
+
+    def _is_pretokenized(self) -> bool:
+        """Check if dataset already has DPO tokenized fields."""
+        return self._source_is_pretokenized(self._train_source)
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """Configure and JIT-compile training and evaluation step functions."""
@@ -328,67 +355,107 @@ class DPOTrainer(Trainer):
     def configure_dataloaders(self):
         """Configure dataloaders with optional precomputed reference log probs."""
         if self.dataset_train is not None:
-            if self.arguments.precompute_ref_log_probs and not self._precomputed_train_ref_log_probs:
-                reference_chosen_log_probs = []
-                ref_rejected_logps = []
-
-                for padded_batch in tqdm(iterable=self.dataset_train, desc="Train dataset reference log probs"):
-                    reference_chosen_logp, reference_rejected_logp = self.compute_reference_log_probs(
-                        self.model_state,
-                        padded_batch,
-                    )
-                    reference_chosen_log_probs.append(reference_chosen_logp)
-                    ref_rejected_logps.append(reference_rejected_logp)
-
-                all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
-                all_ref_rejected_logps = jnp.concatenate(ref_rejected_logps)
-
-                self.dataset_train = self.dataset_train.add_column(
-                    name="reference_chosen_log_probs",
-                    column=all_reference_chosen_log_probs,
-                )
-                self.dataset_train = self.dataset_train.add_column(
-                    name="ref_rejected_logps",
-                    column=all_ref_rejected_logps,
-                )
+            if self._source_has_reference_logps(self._train_source):
                 self._precomputed_train_ref_log_probs = True
+            if self.arguments.precompute_ref_log_probs and not self._precomputed_train_ref_log_probs:
+                self._precomputed_train_ref_log_probs = self._precompute_reference_log_probs_for_split(
+                    dataset_attr="dataset_train",
+                    source_attr="_train_source",
+                    batch_size=self.training_batch_size,
+                    is_train=True,
+                    desc="Train dataset reference log probs",
+                )
 
         if self.dataset_eval is not None:
-            if self.arguments.precompute_ref_log_probs and not self._precomputed_eval_ref_log_probs:
-                reference_chosen_log_probs = []
-                ref_rejected_logps = []
-
-                for padded_batch in tqdm(iterable=self.dataset_eval, desc="Eval dataset reference log probs"):
-                    reference_chosen_logp, reference_rejected_logp = self.compute_reference_log_probs(
-                        self.model_state,
-                        padded_batch,
-                    )
-                    reference_chosen_log_probs.append(reference_chosen_logp)
-                    ref_rejected_logps.append(reference_rejected_logp)
-
-                all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
-                all_ref_rejected_logps = jnp.concatenate(ref_rejected_logps)
-
-                self.dataset_eval = self.dataset_eval.add_column(
-                    name="reference_chosen_log_probs", column=all_reference_chosen_log_probs
-                )
-                self.dataset_eval = self.dataset_eval.add_column(
-                    name="ref_rejected_logps", column=all_ref_rejected_logps
-                )
+            if self._source_has_reference_logps(self._eval_source):
                 self._precomputed_eval_ref_log_probs = True
+            if self.arguments.precompute_ref_log_probs and not self._precomputed_eval_ref_log_probs:
+                self._precomputed_eval_ref_log_probs = self._precompute_reference_log_probs_for_split(
+                    dataset_attr="dataset_eval",
+                    source_attr="_eval_source",
+                    batch_size=self.evaluation_batch_size,
+                    is_train=False,
+                    desc="Eval dataset reference log probs",
+                )
 
         return super().configure_dataloaders()
 
+    def _precompute_reference_log_probs_for_split(
+        self,
+        *,
+        dataset_attr: str,
+        source_attr: str,
+        batch_size: int,
+        is_train: bool,
+        desc: str,
+    ) -> bool:
+        dataset = getattr(self, dataset_attr)
+        source = getattr(self, source_attr)
+
+        if dataset is None or source is None:
+            return False
+        if not hasattr(dataset, "add_column"):
+            logger.warning(
+                "`precompute_ref_log_probs=True` requires a dataset that supports `add_column`; "
+                f"falling back to on-the-fly reference scoring for `{dataset_attr}`."
+            )
+            return False
+
+        ref_chosen_logps: list[np.ndarray] = []
+        ref_rejected_logps: list[np.ndarray] = []
+        data_collator = self.data_collator or (lambda batch: batch)
+        batch_iterator = self._create_dataloader_from_source(
+            source=source,
+            batch_size=batch_size,
+            is_train=is_train,
+            shuffle=False,
+            num_epochs=1,
+            drop_remainder=False,
+        )
+
+        for raw_batch in tqdm(iterable=batch_iterator, desc=desc):
+            padded_batch = self._purify_batch(data_collator(raw_batch))
+            ref_chosen_logp, ref_rejected_logp = self.compute_reference_log_probs(padded_batch)
+            ref_chosen_logps.append(np.asarray(ref_chosen_logp))
+            ref_rejected_logps.append(np.asarray(ref_rejected_logp))
+
+        if not ref_chosen_logps:
+            return False
+
+        updated_dataset = dataset.add_column(
+            name="ref_chosen_logps",
+            column=np.concatenate(ref_chosen_logps, axis=0),
+        )
+        updated_dataset = updated_dataset.add_column(
+            name="ref_rejected_logps",
+            column=np.concatenate(ref_rejected_logps, axis=0),
+        )
+        setattr(self, dataset_attr, updated_dataset)
+        setattr(self, source_attr, self._build_source_from_dataset(updated_dataset))
+        return True
+
     def compute_reference_log_probs(
         self,
-        state: EasyDeLState,
         padded_batch: dict,
     ) -> tuple[tp.Any, tp.Any]:
         """Compute log probabilities of the reference model for a batch."""
-        if self.reference_state is None:
-            outs = self.concatenated_forward(state.model, batch=padded_batch)
+        reference_model = self.model_state.model if self.reference_state is None else self.reference_state.model
+        reference_model.eval()
+        forward_fn = getattr(self, "concatenated_forward", None)
+        if forward_fn is None:
+            outs = concatenated_forward(
+                reference_model,
+                batch=padded_batch,
+                is_encoder_decoder=self.arguments.is_encoder_decoder,
+                label_pad_token_id=self.arguments.label_pad_token_id,
+                padding_value=self.padding_value,
+                max_length=self.arguments.max_length,
+                truncation_mode=self.arguments.truncation_mode,
+                aux_loss_enabled=self.arguments.aux_loss_enabled,
+                loss_type=self.arguments.loss_type,
+            )
         else:
-            outs = self.concatenated_forward(self.reference_state.model, batch=padded_batch)
+            outs = forward_fn(reference_model, batch=padded_batch)
         return outs["chosen_logps"], outs["rejected_logps"]
 
     @property

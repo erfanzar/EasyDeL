@@ -576,6 +576,8 @@ class SamplingParams:
             raise ValueError(f"n must be at least 1, got {self.n}.")
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise ValueError(f"presence_penalty must be in [-2, 2], got {self.presence_penalty}.")
+        if self.repetition_penalty <= 0.0:
+            raise ValueError(f"repetition_penalty must be > 0, got {self.repetition_penalty}.")
         if self.temperature is None:
             raise ValueError("temperature must be set before validation")
         if self.temperature < 0.0:
