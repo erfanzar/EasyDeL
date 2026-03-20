@@ -43,11 +43,7 @@ def _run_preemption_env_probe(env_overrides: dict[str, str] | None = None) -> tu
     env = os.environ.copy()
     if env_overrides:
         env.update(env_overrides)
-    code = (
-        "import os\n"
-        "import easydel\n"
-        "print(os.environ.get('JAX_ENABLE_PREEMPTION_SERVICE'))\n"
-    )
+    code = "import os\nimport easydel\nprint(os.environ.get('JAX_ENABLE_PREEMPTION_SERVICE'))\n"
     proc = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,

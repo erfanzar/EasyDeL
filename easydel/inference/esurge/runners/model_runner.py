@@ -590,6 +590,9 @@ class eSurgeRunner:
         self._window_top_p_cpu = np.zeros_like(self.sequence_buffer.top_p)
         self._window_top_k_cpu = np.zeros_like(self.sequence_buffer.top_k)
         self._window_min_p_cpu = np.zeros_like(self.sequence_buffer.min_p)
+        self._window_frequency_penalties_cpu = np.zeros_like(self.sequence_buffer.frequency_penalties)
+        self._window_presence_penalties_cpu = np.zeros_like(self.sequence_buffer.presence_penalties)
+        self._window_repetition_penalties_cpu = np.ones_like(self.sequence_buffer.repetition_penalties)
 
         # VLM host-side scratch buffers keyed by `num_tokens_static` (avoid repeated
         # large allocations while keeping the step-function input pytree stable).
@@ -698,6 +701,9 @@ class eSurgeRunner:
         np.ndarray,
         np.ndarray,
         np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
         int | None,
     ]:
         """Return CPU-side state views aligned to the active scheduler window.
@@ -732,11 +738,17 @@ class eSurgeRunner:
         top_p_window_cpu = self._window_top_p_cpu
         top_k_window_cpu = self._window_top_k_cpu
         min_p_window_cpu = self._window_min_p_cpu
+        frequency_penalties_window_cpu = self._window_frequency_penalties_cpu
+        presence_penalties_window_cpu = self._window_presence_penalties_cpu
+        repetition_penalties_window_cpu = self._window_repetition_penalties_cpu
 
         temperature_window_cpu.fill(0)
         top_p_window_cpu.fill(1.0)
         top_k_window_cpu.fill(0)
         min_p_window_cpu.fill(0)
+        frequency_penalties_window_cpu.fill(0.0)
+        presence_penalties_window_cpu.fill(0.0)
+        repetition_penalties_window_cpu.fill(1.0)
 
         if row_count > 0:
             if row_indices is not None:
@@ -744,11 +756,23 @@ class eSurgeRunner:
                 top_p_window_cpu[:row_count] = self.sequence_buffer.top_p[row_indices]
                 top_k_window_cpu[:row_count] = self.sequence_buffer.top_k[row_indices]
                 min_p_window_cpu[:row_count] = self.sequence_buffer.min_p[row_indices]
+                frequency_penalties_window_cpu[:row_count] = self.sequence_buffer.frequency_penalties[row_indices]
+                presence_penalties_window_cpu[:row_count] = self.sequence_buffer.presence_penalties[row_indices]
+                repetition_penalties_window_cpu[:row_count] = self.sequence_buffer.repetition_penalties[row_indices]
             else:
                 temperature_window_cpu[:row_count] = self.sequence_buffer.temperature[start_index:end_index]
                 top_p_window_cpu[:row_count] = self.sequence_buffer.top_p[start_index:end_index]
                 top_k_window_cpu[:row_count] = self.sequence_buffer.top_k[start_index:end_index]
                 min_p_window_cpu[:row_count] = self.sequence_buffer.min_p[start_index:end_index]
+                frequency_penalties_window_cpu[:row_count] = self.sequence_buffer.frequency_penalties[
+                    start_index:end_index
+                ]
+                presence_penalties_window_cpu[:row_count] = self.sequence_buffer.presence_penalties[
+                    start_index:end_index
+                ]
+                repetition_penalties_window_cpu[:row_count] = self.sequence_buffer.repetition_penalties[
+                    start_index:end_index
+                ]
 
         # The batch-preparer page-table cache key must distinguish different
         # row windows that share the same underlying page-table version.
@@ -769,6 +793,9 @@ class eSurgeRunner:
             top_k_window_cpu,
             min_p_window_cpu,
             page_table_window_cpu,
+            frequency_penalties_window_cpu,
+            presence_penalties_window_cpu,
+            repetition_penalties_window_cpu,
             page_table_window_version,
         )
 
@@ -1970,6 +1997,9 @@ class eSurgeRunner:
                 top_k_window_cpu,
                 min_p_window_cpu,
                 page_table_window_cpu,
+                frequency_penalties_window_cpu,
+                presence_penalties_window_cpu,
+                repetition_penalties_window_cpu,
                 page_table_window_version,
             ) = self._get_window_state_views(
                 start_index=start_index,
@@ -2002,6 +2032,9 @@ class eSurgeRunner:
                 top_p_cpu=top_p_window_cpu,
                 top_k_cpu=top_k_window_cpu,
                 min_p_cpu=min_p_window_cpu,
+                frequency_penalties_cpu=frequency_penalties_window_cpu,
+                presence_penalties_cpu=presence_penalties_window_cpu,
+                repetition_penalties_cpu=repetition_penalties_window_cpu,
                 page_table_cpu=page_table_window_cpu,
                 page_table_version=page_table_window_version,
                 mrope_position_ids_cpu=mrope_position_ids_cpu,

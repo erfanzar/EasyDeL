@@ -214,11 +214,54 @@ class PrometheusMetrics:
         # System info
         self.system_info = Info(f"{prefix}system_info", "System information")
 
+        # Monotonic cursor: total requests seen so far (completed + failed).
+        # Used to process only new completions from the deque without
+        # double-counting, even after the deque wraps around.
+        self._completions_cursor: int = 0
+        # Track the id() of the last deque entry we observed for
+        # scheduler and runner metrics to avoid re-observing the same
+        # object.  Using object identity is safe because the deque holds
+        # dataclass instances that are never replaced in-place.
+        self._last_scheduler_id: int = 0
+        self._last_runner_id: int = 0
+
+    @staticmethod
+    def _observe_new_entries(deque, cursor_id: int, observe_fn) -> int:
+        """Observe deque entries added after the cursor, return new cursor id.
+
+        Uses a single pass: if the cursor is found, only entries after it are
+        observed.  If the cursor was evicted (not found), all entries collected
+        during the scan are observed.
+        """
+        if not deque:
+            return 0
+        if cursor_id == 0:
+            for item in deque:
+                observe_fn(item)
+            return id(deque[-1])
+        pending = []
+        found = False
+        for item in deque:
+            if found:
+                observe_fn(item)
+            elif id(item) == cursor_id:
+                found = True  # skip this one, observe the rest
+            else:
+                pending.append(item)
+        if not found:
+            # Cursor was evicted — observe everything we skipped
+            for item in pending:
+                observe_fn(item)
+        return id(deque[-1])
+
     def update_from_metrics_collector(self, collector: MetricsCollector) -> None:
         """Update Prometheus metrics from the metrics collector.
 
         Fetches the latest metrics from the MetricsCollector and updates
         all Prometheus gauges, counters, and histograms accordingly.
+
+        Only newly-completed requests (since the last call) are processed
+        so that counters and histograms are not double-counted.
 
         Args:
             collector: MetricsCollector instance to read metrics from.
@@ -228,15 +271,37 @@ class PrometheusMetrics:
         """
         system_metrics = collector.get_system_metrics()
 
-        # Update system-level metrics
-        self.tokens_per_second.set(system_metrics.average_throughput)
-
-        # Update from recent completed requests
         with collector._lock:
-            # Update request metrics from recent completions
-            recent_requests = list(collector.completed_requests)[-10:]  # Last 10 requests
+            # ── Tokens-per-second: prefer live runner TPS, fall back to
+            #    completed-request average so the gauge is non-zero during
+            #    active generation.
+            live_tps = 0.0
+            scheduler_reports_running = (
+                bool(collector.scheduler_metrics) and collector.scheduler_metrics[-1].num_running_requests > 0
+            )
+            if collector.runner_metrics and (scheduler_reports_running or not collector.scheduler_metrics):
+                live_tps = collector.runner_metrics[-1].tokens_per_second
+            if live_tps > 0:
+                self.tokens_per_second.set(live_tps)
+            elif system_metrics.average_throughput > 0:
+                self.tokens_per_second.set(float(system_metrics.average_throughput))
+            else:
+                self.tokens_per_second.set(0.0)
 
-            for req_metrics in recent_requests:
+            # ── Process only NEW completed requests since last update ──
+            # collector.counters tracks the monotonic total; the deque may
+            # have wrapped so we cannot index into it.  Instead, compute
+            # how many new completions occurred since our last cursor and
+            # read that many items from the *tail* of the deque.
+            total_now = collector.counters["total_completed"] + collector.counters["total_failed"]
+            num_new = total_now - self._completions_cursor
+            if num_new > len(collector.completed_requests):
+                # More completed than the deque holds — we lost some, take all
+                num_new = len(collector.completed_requests)
+            new_requests = list(collector.completed_requests)[-num_new:] if num_new > 0 else []
+            self._completions_cursor = total_now
+
+            for req_metrics in new_requests:
                 if req_metrics.error:
                     self.requests_total.labels(status="failed").inc()
                 else:
@@ -250,21 +315,31 @@ class PrometheusMetrics:
 
                 self.tokens_generated_total.inc(req_metrics.generated_tokens)
 
-            # Update scheduler metrics
+            # ── Scheduler metrics ──
             if collector.scheduler_metrics:
                 latest_scheduler = collector.scheduler_metrics[-1]
+                # Gauges: always set to latest value
                 self.waiting_requests.set(latest_scheduler.num_waiting_requests)
                 self.running_requests.set(latest_scheduler.num_running_requests)
                 self.scheduled_tokens.set(latest_scheduler.num_scheduled_tokens)
-                self.schedule_duration.observe(latest_scheduler.schedule_time)
+                self._last_scheduler_id = self._observe_new_entries(
+                    collector.scheduler_metrics,
+                    self._last_scheduler_id,
+                    lambda sm: self.schedule_duration.observe(sm.schedule_time),
+                )
 
-            # Update runner metrics
+            # ── Runner metrics ──
             if collector.runner_metrics:
                 latest_runner = collector.runner_metrics[-1]
-                self.model_execution_duration.observe(latest_runner.execution_time)
+                # Gauge: always set to latest
                 self.batch_size.set(latest_runner.batch_size)
+                self._last_runner_id = self._observe_new_entries(
+                    collector.runner_metrics,
+                    self._last_runner_id,
+                    lambda rm: self.model_execution_duration.observe(rm.execution_time),
+                )
 
-            # Update cache metrics
+            # ── Cache metrics ──
             if collector.cache_metrics:
                 latest_cache = collector.cache_metrics[-1]
                 self.cache_pages_total.set(latest_cache.total_pages)
@@ -492,11 +567,16 @@ class RichConsoleMonitor:
         # Footer
         self.layout["footer"].update(Panel("Press Ctrl+C to stop monitoring", style="dim"))
 
-    def start(self) -> None:
+    def start(self, blocking: bool = False) -> None:
         """Start the live console monitor.
 
-        Starts a background thread that continuously updates the display.
-        Blocks the main thread until Ctrl+C is pressed.
+        Starts a background daemon thread that continuously updates the
+        display.  By default the call returns immediately so the engine
+        can continue processing requests.  Pass ``blocking=True`` to
+        block until Ctrl+C (useful when running the monitor standalone).
+
+        Args:
+            blocking: If True, block the calling thread until interrupted.
         """
         if self.running:
             return
@@ -515,10 +595,11 @@ class RichConsoleMonitor:
         self._thread = threading.Thread(target=_monitor_loop, daemon=True)
         self._thread.start()
 
-        try:
-            self._thread.join()
-        except KeyboardInterrupt:
-            self.stop()
+        if blocking:
+            try:
+                self._thread.join()
+            except KeyboardInterrupt:
+                self.stop()
 
     def stop(self) -> None:
         """Stop the console monitor.

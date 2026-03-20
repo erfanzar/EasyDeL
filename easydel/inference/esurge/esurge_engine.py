@@ -704,6 +704,8 @@ class eSurge(
         self._grafana_process: subprocess.Popen | None = None
         self._grafana_temp_dir: str | None = None
         self._grafana_url: str | None = None
+        self._prometheus_process: subprocess.Popen | None = None
+        self._prometheus_temp_dir: str | None = None
         self._esurge_name = esurge_name
         self._scheduler_running = False
         self.destroy_pages_on_pause = destroy_pages_on_pause

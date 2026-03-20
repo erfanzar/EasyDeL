@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -22,6 +23,134 @@ import uuid
 from typing import Any
 
 from ..metrics import get_metrics_collector, initialize_metrics
+
+
+def _panel(
+    title: str,
+    expr: str,
+    ds_uid: str,
+    grid_x: int,
+    grid_y: int,
+    grid_w: int = 12,
+    grid_h: int = 8,
+    panel_id: int = 1,
+    panel_type: str = "timeseries",
+    unit: str = "",
+    legend_mode: str = "list",
+) -> dict:
+    """Build a single Grafana dashboard panel dict."""
+    target = {
+        "datasource": {"type": "prometheus", "uid": ds_uid},
+        "expr": expr,
+        "legendFormat": "{{__name__}}",
+        "refId": "A",
+    }
+    field_config: dict[str, Any] = {"defaults": {"unit": unit}, "overrides": []}
+    panel: dict[str, Any] = {
+        "id": panel_id,
+        "title": title,
+        "type": panel_type,
+        "datasource": {"type": "prometheus", "uid": ds_uid},
+        "targets": [target],
+        "fieldConfig": field_config,
+        "gridPos": {"h": grid_h, "w": grid_w, "x": grid_x, "y": grid_y},
+        "options": {"legend": {"displayMode": legend_mode}, "tooltip": {"mode": "multi"}},
+    }
+    if panel_type == "stat":
+        panel["options"] = {
+            "reduceOptions": {"calcs": ["lastNotNull"]},
+            "colorMode": "value",
+            "graphMode": "area",
+        }
+    return panel
+
+
+def _build_esurge_dashboard_model(datasource_uid: str) -> dict:
+    """Return a complete Grafana dashboard dict for eSurge metrics."""
+    panels = [
+        # ── Row 0: key stat panels ──
+        _panel("Tokens / sec", "esurge_tokens_per_second", datasource_uid, 0, 0, 6, 4, 1, "stat", "ops"),
+        _panel("Running Requests", "esurge_running_requests", datasource_uid, 6, 0, 6, 4, 2, "stat", "short"),
+        _panel("Waiting Requests", "esurge_waiting_requests", datasource_uid, 12, 0, 6, 4, 3, "stat", "short"),
+        _panel("Batch Size", "esurge_batch_size", datasource_uid, 18, 0, 6, 4, 4, "stat", "short"),
+        # ── Row 1: throughput & latency ──
+        _panel("Throughput (tok/s)", "esurge_tokens_per_second", datasource_uid, 0, 4, 12, 8, 5, unit="ops"),
+        _panel(
+            "Request Latency (p50 / p99)",
+            "histogram_quantile(0.5, rate(esurge_request_duration_seconds_bucket[1m]))",
+            datasource_uid,
+            12,
+            4,
+            12,
+            8,
+            6,
+            unit="s",
+        ),
+        # ── Row 2: TTFT & schedule time ──
+        _panel(
+            "Time to First Token (p50 / p99)",
+            "histogram_quantile(0.5, rate(esurge_time_to_first_token_seconds_bucket[1m]))",
+            datasource_uid,
+            0,
+            12,
+            12,
+            8,
+            7,
+            unit="s",
+        ),
+        _panel(
+            "Schedule Duration (p50)",
+            "histogram_quantile(0.5, rate(esurge_schedule_duration_seconds_bucket[1m]))",
+            datasource_uid,
+            12,
+            12,
+            12,
+            8,
+            8,
+            unit="s",
+        ),
+        # ── Row 3: cache ──
+        _panel("Cache Pages (total vs used)", "esurge_cache_pages_total", datasource_uid, 0, 20, 8, 8, 9),
+        _panel("Cache Pages Used", "esurge_cache_pages_used", datasource_uid, 8, 20, 8, 8, 10),
+        _panel("Cache Hit Rate", "esurge_cache_hit_rate", datasource_uid, 16, 20, 8, 8, 11, unit="percentunit"),
+        # ── Row 4: model execution ──
+        _panel(
+            "Model Execution Time (p50)",
+            "histogram_quantile(0.5, rate(esurge_model_execution_duration_seconds_bucket[1m]))",
+            datasource_uid,
+            0,
+            28,
+            12,
+            8,
+            12,
+            unit="s",
+        ),
+        _panel(
+            "Tokens Generated (rate)",
+            "rate(esurge_tokens_generated_total[1m])",
+            datasource_uid,
+            12,
+            28,
+            12,
+            8,
+            13,
+            unit="ops",
+        ),
+    ]
+
+    dashboard = {
+        "id": None,
+        "uid": "esurge-overview",
+        "title": "eSurge Engine Overview",
+        "tags": ["esurge", "inference"],
+        "timezone": "browser",
+        "schemaVersion": 39,
+        "version": 1,
+        "refresh": "5s",
+        "time": {"from": "now-15m", "to": "now"},
+        "panels": panels,
+    }
+    return dashboard
 
 
 class EngineMonitoringMixin:
@@ -45,6 +174,7 @@ class EngineMonitoringMixin:
         datasource_name: str,
         datasource_uid: str,
         datasource_url: str,
+        for_docker: bool = False,
     ) -> str:
         """Create temporary provisioning config for Grafana.
 
@@ -55,6 +185,9 @@ class EngineMonitoringMixin:
             datasource_name: Display name for the data source.
             datasource_uid: Unique identifier for the data source.
             datasource_url: URL of the Prometheus metrics endpoint.
+            for_docker: If True, use container-relative paths in provider
+                config (the provisioning root is mounted at
+                ``/etc/grafana/provisioning`` inside the container).
 
         Returns:
             Path to the provisioning root directory.
@@ -62,8 +195,10 @@ class EngineMonitoringMixin:
         provisioning_root = tempfile.mkdtemp(prefix="esurge_grafana_")
         datasources_dir = os.path.join(provisioning_root, "datasources")
         dashboards_dir = os.path.join(provisioning_root, "dashboards")
+        dashboard_json_dir = os.path.join(provisioning_root, "dashboard_json")
         os.makedirs(datasources_dir, exist_ok=True)
         os.makedirs(dashboards_dir, exist_ok=True)
+        os.makedirs(dashboard_json_dir, exist_ok=True)
 
         datasource_config = f"""apiVersion: 1
 datasources:
@@ -80,17 +215,30 @@ datasources:
         with open(os.path.join(datasources_dir, "esurge-prometheus.yaml"), "w", encoding="utf-8") as f:
             f.write(datasource_config)
 
-        provider_config = """apiVersion: 1
+        # Docker mounts provisioning_root at /etc/grafana/provisioning,
+        # so the dashboard JSON dir is at a fixed container path.
+        # Local Grafana uses the real host path.
+        if for_docker:
+            json_path_in_config = "/etc/grafana/provisioning/dashboard_json"
+        else:
+            json_path_in_config = dashboard_json_dir
+
+        provider_config = f"""apiVersion: 1
 providers:
   - name: "esurge-autoprovisioned"
     type: file
     disableDeletion: false
-    updateIntervalSeconds: 30
+    updateIntervalSeconds: 10
     options:
-      path: /etc/grafana/provisioning/dashboards
+      path: {json_path_in_config}
+      foldersFromFilesStructure: false
 """
         with open(os.path.join(dashboards_dir, "provider.yaml"), "w", encoding="utf-8") as f:
             f.write(provider_config)
+
+        dashboard_model = _build_esurge_dashboard_model(datasource_uid)
+        with open(os.path.join(dashboard_json_dir, "esurge-overview.json"), "w", encoding="utf-8") as f:
+            json.dump(dashboard_model, f, indent=2)
 
         return provisioning_root
 
@@ -239,6 +387,194 @@ providers:
         self._info(" Grafana started (Docker) at %s (datasource -> %s)", self._grafana_url, datasource_url)
         return self._grafana_url
 
+    def _start_prometheus_server(
+        self,
+        scrape_target: str,
+        prometheus_server_port: int = 9090,
+    ) -> str | None:
+        """Start a Prometheus server that scrapes the prometheus_client endpoint.
+
+        Args:
+            scrape_target: The host:port of the prometheus_client exporter
+                           (e.g. ``"localhost:11184"``).
+            prometheus_server_port: Port for the Prometheus server itself.
+
+        Returns:
+            Prometheus server URL if started, None otherwise.
+        """
+        if self._prometheus_process:
+            return f"http://localhost:{prometheus_server_port}"
+
+        prometheus_exe = shutil.which("prometheus")
+        if not prometheus_exe:
+            return None
+
+        prom_dir = tempfile.mkdtemp(prefix="esurge_prometheus_")
+        data_dir = os.path.join(prom_dir, "data")
+        os.makedirs(data_dir, exist_ok=True)
+
+        config = (
+            "global:\n"
+            "  scrape_interval: 2s\n"
+            "  evaluation_interval: 2s\n"
+            "scrape_configs:\n"
+            "  - job_name: esurge\n"
+            "    metrics_path: /metrics\n"
+            f"    static_configs:\n"
+            f"      - targets: ['{scrape_target}']\n"
+        )
+        config_path = os.path.join(prom_dir, "prometheus.yml")
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(config)
+
+        cmd = [
+            prometheus_exe,
+            f"--config.file={config_path}",
+            f"--storage.tsdb.path={data_dir}",
+            f"--web.listen-address=0.0.0.0:{prometheus_server_port}",
+            "--storage.tsdb.retention.time=1h",
+            "--web.enable-lifecycle",
+        ]
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            self._info(" Failed to start Prometheus server: %s", exc)
+            shutil.rmtree(prom_dir, ignore_errors=True)
+            return None
+
+        self._prometheus_process = proc
+        self._prometheus_temp_dir = prom_dir
+        url = f"http://localhost:{prometheus_server_port}"
+        self._info(" Prometheus server started at %s (scraping %s)", url, scrape_target)
+        return url
+
+    def _stop_prometheus_server(self) -> None:
+        """Stop the Prometheus server if it was started by the engine."""
+        if self._prometheus_process:
+            try:
+                self._prometheus_process.terminate()
+                self._prometheus_process.wait(timeout=5)
+                self._info(" Prometheus server stopped")
+            except Exception:
+                try:
+                    self._prometheus_process.kill()
+                except Exception:
+                    pass
+            self._prometheus_process = None
+        if self._prometheus_temp_dir:
+            shutil.rmtree(self._prometheus_temp_dir, ignore_errors=True)
+            self._prometheus_temp_dir = None
+
+    def _provision_running_grafana(
+        self,
+        grafana_host: str | None,
+        grafana_port: int,
+        grafana_admin_user: str,
+        grafana_admin_password: str,
+        datasource_name: str,
+        datasource_uid: str,
+        datasource_url: str,
+    ) -> str | None:
+        """Provision datasource and dashboard on an already-running Grafana via HTTP API.
+
+        Returns:
+            Grafana URL if provisioning succeeded, None otherwise.
+        """
+        import base64
+        import urllib.error
+        import urllib.request
+
+        grafana_base = f"http://{grafana_host or 'localhost'}:{grafana_port}"
+        auth = base64.b64encode(f"{grafana_admin_user}:{grafana_admin_password}".encode()).decode()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Basic {auth}",
+        }
+
+        # Check if Grafana is reachable
+        try:
+            req = urllib.request.Request(f"{grafana_base}/api/health", headers=headers)
+            urllib.request.urlopen(req, timeout=3)
+        except Exception:
+            return None
+
+        self._info(" Detected running Grafana at %s, provisioning via API...", grafana_base)
+
+        # Upsert datasource
+        datasource_provisioned = False
+        ds_payload = json.dumps(
+            {
+                "name": datasource_name,
+                "uid": datasource_uid,
+                "type": "prometheus",
+                "access": "proxy",
+                "url": datasource_url,
+                "isDefault": True,
+                "jsonData": {"timeInterval": "1s"},
+            }
+        ).encode()
+        try:
+            req = urllib.request.Request(
+                f"{grafana_base}/api/datasources",
+                data=ds_payload,
+                headers=headers,
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5)
+            self._info("  Datasource '%s' created", datasource_name)
+            datasource_provisioned = True
+        except urllib.error.HTTPError as e:
+            if e.code == 409:
+                # Already exists — update it
+                try:
+                    req = urllib.request.Request(
+                        f"{grafana_base}/api/datasources/uid/{datasource_uid}",
+                        data=ds_payload,
+                        headers=headers,
+                        method="PUT",
+                    )
+                    urllib.request.urlopen(req, timeout=5)
+                    self._info("  Datasource '%s' updated", datasource_name)
+                    datasource_provisioned = True
+                except Exception as update_exc:
+                    self._info("  Failed to update datasource '%s': %s", datasource_name, update_exc)
+            else:
+                self._info("  Failed to create datasource: %s", e)
+        if not datasource_provisioned:
+            return None
+
+        # Upsert dashboard
+        dashboard_model = _build_esurge_dashboard_model(datasource_uid)
+        dashboard_payload = json.dumps(
+            {
+                "dashboard": dashboard_model,
+                "overwrite": True,
+                "message": "Auto-provisioned by eSurge",
+            }
+        ).encode()
+        try:
+            req = urllib.request.Request(
+                f"{grafana_base}/api/dashboards/db",
+                data=dashboard_payload,
+                headers=headers,
+                method="POST",
+            )
+            resp = urllib.request.urlopen(req, timeout=5)
+            resp_data = json.loads(resp.read().decode())
+            dashboard_url = f"{grafana_base}{resp_data.get('url', '/d/esurge-overview')}"
+            self._info("  Dashboard provisioned: %s", dashboard_url)
+        except Exception as e:
+            self._info("  Failed to provision dashboard: %s", e)
+            return None
+
+        self._grafana_url = grafana_base
+        return grafana_base
+
     def _start_grafana_service(
         self,
         prometheus_url: str | None,
@@ -255,7 +591,9 @@ providers:
     ) -> str | None:
         """Attempt to launch Grafana wired to the Prometheus endpoint.
 
-        Tries local grafana-server first, falls back to Docker if enabled.
+        First checks if Grafana is already running and provisions via the
+        HTTP API.  Otherwise tries a local grafana-server binary, then
+        optionally falls back to Docker.
 
         Args:
             prometheus_url: URL of the Prometheus metrics endpoint.
@@ -273,7 +611,7 @@ providers:
         Returns:
             Grafana URL if started successfully, None otherwise.
         """
-        if self._grafana_container_name or self._grafana_process:
+        if self._grafana_container_name or self._grafana_process or self._grafana_url:
             return self._grafana_url
 
         if not prometheus_url:
@@ -281,22 +619,62 @@ providers:
             return None
 
         datasource_uid = datasource_uid or "esurge-prometheus"
-        datasource_url = datasource_url or prometheus_url
-        docker_datasource_url = (
-            datasource_url.replace("0.0.0.0", "host.docker.internal")
+
+        # prometheus_url is the raw exporter endpoint (e.g. http://0.0.0.0:11184/metrics).
+        # Grafana needs a real Prometheus *server* with query APIs, not the
+        # raw /metrics endpoint.  Start one if possible.
+        from urllib.parse import urlparse
+
+        parsed = urlparse(prometheus_url)
+        exporter_host = parsed.hostname or "localhost"
+        exporter_port = parsed.port or 11184
+        scrape_target = f"{exporter_host}:{exporter_port}"
+        # Normalise 0.0.0.0 → localhost for Prometheus scraping
+        if exporter_host == "0.0.0.0":
+            scrape_target = f"localhost:{exporter_port}"
+
+        prom_server_url = datasource_url  # user override
+        if not prom_server_url:
+            prom_server_url = self._start_prometheus_server(
+                scrape_target=scrape_target,
+                prometheus_server_port=9090,
+            )
+        if not prom_server_url:
+            self._info(
+                " Grafana autostart skipped: could not start Prometheus server "
+                "(install prometheus: https://prometheus.io/download/)"
+            )
+            return None
+
+        # For Docker-based Grafana, rewrite localhost → host.docker.internal
+        docker_prom_url = (
+            prom_server_url.replace("0.0.0.0", "host.docker.internal")
             .replace("localhost", "host.docker.internal")
             .replace("127.0.0.1", "host.docker.internal")
         )
 
-        provisioning_root = self._prepare_grafana_provisioning(
+        # If Grafana is already running, provision via HTTP API
+        api_url = self._provision_running_grafana(
+            grafana_host=grafana_host,
+            grafana_port=grafana_port,
+            grafana_admin_user=grafana_admin_user,
+            grafana_admin_password=grafana_admin_password,
             datasource_name=datasource_name,
             datasource_uid=datasource_uid,
-            datasource_url=docker_datasource_url if use_docker else datasource_url,
+            datasource_url=prom_server_url,
         )
+        if api_url:
+            return api_url
 
-        # Try local grafana-server first
+        # Try local grafana-server first — always use host-local URL
+        local_provisioning = self._prepare_grafana_provisioning(
+            datasource_name=datasource_name,
+            datasource_uid=datasource_uid,
+            datasource_url=prom_server_url,
+            for_docker=False,
+        )
         local_url = self._start_local_grafana_service(
-            provisioning_root=provisioning_root,
+            provisioning_root=local_provisioning,
             grafana_host=grafana_host,
             grafana_port=grafana_port,
             grafana_admin_user=grafana_admin_user,
@@ -305,26 +683,33 @@ providers:
         )
         if local_url:
             return local_url
+        shutil.rmtree(local_provisioning, ignore_errors=True)
 
         if not use_docker:
-            shutil.rmtree(provisioning_root, ignore_errors=True)
             self._info(" Grafana autostart skipped: local server unavailable and Docker disabled")
             return None
 
+        # Docker fallback — use container-relative paths and Docker URLs
+        docker_provisioning = self._prepare_grafana_provisioning(
+            datasource_name=datasource_name,
+            datasource_uid=datasource_uid,
+            datasource_url=docker_prom_url,
+            for_docker=True,
+        )
         docker_url = self._start_docker_grafana_service(
-            provisioning_root=provisioning_root,
+            provisioning_root=docker_provisioning,
             grafana_host=grafana_host,
             grafana_port=grafana_port,
             grafana_image=grafana_image,
             grafana_admin_user=grafana_admin_user,
             grafana_admin_password=grafana_admin_password,
             allow_anonymous=allow_anonymous,
-            datasource_url=docker_datasource_url,
+            datasource_url=docker_prom_url,
         )
         if docker_url:
             return docker_url
 
-        shutil.rmtree(provisioning_root, ignore_errors=True)
+        shutil.rmtree(docker_provisioning, ignore_errors=True)
         return None
 
     def _stop_grafana_service(self) -> None:
@@ -333,6 +718,7 @@ providers:
         Cleans up Docker containers, local processes, and temporary provisioning
         directories. Safe to call even if Grafana was not started.
         """
+        # Stop processes/containers BEFORE removing their temp dirs
         container = self._grafana_container_id or self._grafana_container_name
         docker_exe = shutil.which("docker") if container else None
         if container and docker_exe:
@@ -347,11 +733,6 @@ providers:
             except Exception:
                 self._info(" Failed to stop Grafana container %s", container)
 
-        if self._grafana_temp_dir:
-            shutil.rmtree(self._grafana_temp_dir, ignore_errors=True)
-
-        self._grafana_container_name = None
-        self._grafana_container_id = None
         if self._grafana_process:
             try:
                 self._grafana_process.terminate()
@@ -360,6 +741,15 @@ providers:
             except Exception:
                 self._info(" Failed to stop Grafana process gracefully")
             self._grafana_process = None
+
+        self._stop_prometheus_server()
+
+        # Now safe to remove temp dirs
+        if self._grafana_temp_dir:
+            shutil.rmtree(self._grafana_temp_dir, ignore_errors=True)
+
+        self._grafana_container_name = None
+        self._grafana_container_id = None
         self._grafana_temp_dir = None
         self._grafana_url = None
 
@@ -423,7 +813,7 @@ providers:
             - 'grafana': Grafana UI (when auto-start succeeds)
         """
         if self._monitoring_initialized:
-            if start_grafana and not self._grafana_container_name:
+            if start_grafana and not self._grafana_container_name and not self._grafana_url:
                 existing_urls = self._monitoring_urls or {}
                 prometheus_url = existing_urls.get("prometheus")
                 grafana_url = self._start_grafana_service(
@@ -460,7 +850,7 @@ providers:
 
         if enable_prometheus:
             try:
-                from .monitoring import start_monitoring_server
+                from ..monitoring import start_monitoring_server
 
                 self._monitoring_server = start_monitoring_server(prometheus_port=prometheus_port, update_interval=1.0)
                 host_for_logs = dashboard_host or "0.0.0.0"
@@ -500,7 +890,7 @@ providers:
 
         if enable_console:
             try:
-                from .monitoring import start_console_monitor
+                from ..monitoring import start_console_monitor
 
                 self._info(" Starting console monitor...")
                 start_console_monitor(refresh_rate=1.0)
@@ -536,6 +926,16 @@ providers:
             except Exception as e:
                 self._info(f" Error stopping Prometheus server: {e}")
             self._monitoring_server = None
+
+        # Stop the console monitor if it was started
+        try:
+            from .. import monitoring as _mon_module
+
+            if _mon_module._console_monitor is not None:
+                _mon_module._console_monitor.stop()
+                _mon_module._console_monitor = None
+        except Exception:
+            pass
 
         self._stop_grafana_service()
 

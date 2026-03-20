@@ -2013,6 +2013,7 @@ class eLargeModel:
         self,
         benchmarks: BenchmarkConfig | list[BenchmarkConfig],
         output_path: str | None = None,
+        engine_instance: eSurge | None = None,
         **default_eval_overrides: Unpack[EvalKwargs],
     ) -> dict[str, Any]:
         """Run one or more named benchmark suites sequentially, sharing a single eSurge engine.
@@ -2029,6 +2030,9 @@ class eLargeModel:
                 Each must contain a ``"tasks"`` key.
             output_path: Optional file path.  When provided the combined results
                 dict is serialized to JSON and written atomically.
+            engine_instance: Provided eSurge engine and if it's None eLargeModel will build a new one.
+                This is useful if the caller wants to manage the engine lifecycle themselves
+                (e.g., for running multiple benchmark suites sequentially without restarting the engine each time).
             **default_eval_overrides: Additional :class:`EvalKwargs` that serve as
                 defaults for every benchmark (individual benchmark entries can
                 still override them).
@@ -2051,8 +2055,9 @@ class eLargeModel:
         )
         if not resolved_benchmarks:
             return {"benchmarks": {}}
-
-        engine_instance = self.build_esurge()
+        owns_engine = engine_instance is None
+        if owns_engine:
+            engine_instance = self.build_esurge()
         benchmark_results: dict[str, dict[str, Any]] = {}
         try:
             for benchmark in resolved_benchmarks:
@@ -2068,10 +2073,11 @@ class eLargeModel:
                     summary_logger=logger,
                 )
         finally:
-            try:
-                engine_instance.terminate()
-            except Exception:
-                ...
+            if owns_engine:
+                try:
+                    engine_instance.terminate()
+                except Exception:
+                    ...
 
         results: dict[str, Any] = {"benchmarks": benchmark_results}
         if output_path:

@@ -325,8 +325,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self.model_state = self.model_state.replace(step=normalized_step)
         if self._resumed_from_checkpoint:
             logger.info(
-                "Overrode resumed checkpoint step from "
-                f"{current_step} to {requested_step} via step_start_point."
+                f"Overrode resumed checkpoint step from {current_step} to {requested_step} via step_start_point."
             )
         else:
             logger.info(f"Initialized model_state.step to {requested_step} from step_start_point.")
@@ -1634,9 +1633,7 @@ class BaseTrainer(BaseTrainerProtocol):
             reserve_tokens = esurge_kwargs.get("reserve_tokens")
             if reserve_tokens is None:
                 reserve_tokens = esurge_kwargs.get("max_num_seqs", 0)
-            esurge_kwargs["max_model_len"] = (
-                sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)
-            )  # pyright: ignore[reportOptionalOperand]
+            esurge_kwargs["max_model_len"] = sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)  # pyright: ignore[reportOptionalOperand]
 
             _log_kwargs = {k: v for k, v in esurge_kwargs.items() if k != "tokenizer"}
             logger.info_once(f"Creating eSurge {pprint.pformat(_log_kwargs)}")

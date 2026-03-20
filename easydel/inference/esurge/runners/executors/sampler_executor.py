@@ -55,7 +55,12 @@ Example:
     >>> # Execute sampling
     >>> sampler_fn = executor.get_compiled(num_tokens=256, padded_num_reqs=16)
     >>> rng_key, tokens, valid_mask = sampler_fn(
-    ...     metadata, req_num_tokens, active_mask, logits, rng_key
+    ...     metadata,
+    ...     req_num_tokens,
+    ...     active_mask,
+    ...     logits,
+    ...     rng_key,
+    ...     token_history,
     ... )
 """
 
@@ -69,6 +74,7 @@ from jax import numpy as jnp
 
 from easydel.utils import ejit
 
+from ...core.sampler import apply_history_penalties
 from ...core.sampler import sample_tokens as sample_tokens_fn
 from ...core.sampling_metadata import SamplingMetadata
 from ..execution_types import BatchMetadata, StepFunctionInputs
@@ -106,7 +112,12 @@ class SamplerExecutor:
         ... )
         >>> sampler_fn = executor.get_compiled(num_tokens=256, padded_num_reqs=16)
         >>> rng_key, tokens, valid = sampler_fn(
-        ...     batch_metadata, req_num_tokens, active_mask, logits, rng_key
+        ...     batch_metadata,
+        ...     req_num_tokens,
+        ...     active_mask,
+        ...     logits,
+        ...     rng_key,
+        ...     token_history,
         ... )
     """
 
@@ -268,6 +279,11 @@ class SamplerExecutor:
             inputs.active_mask_full,
             dummy_logits,
             inputs.rng_key,
+            jnp.zeros(
+                (int(inputs.req_num_tokens_full.shape[0]), int(self.max_model_len)),
+                dtype=jnp.int32,
+                out_sharding=self._empty_sharding,
+            ),
         )
 
         if self.use_aot_forward:
@@ -290,8 +306,14 @@ class SamplerExecutor:
 
         Note:
             The returned function signature is:
-            (metadata, req_num_tokens_full, active_mask_full, logits, rng_key)
-            -> (updated_rng_key, sampled_tokens, valid_mask)
+            (
+                metadata,
+                req_num_tokens_full,
+                active_mask_full,
+                logits,
+                rng_key,
+                token_history,
+            ) -> (updated_rng_key, sampled_tokens, valid_mask)
         """
 
         @ejit
@@ -301,6 +323,7 @@ class SamplerExecutor:
             active_mask_full: jax.Array,
             logits: jax.Array,
             rng_key: jax.Array,
+            token_history: jax.Array,
         ):
             batch_size = logits.shape[0]
             i_reqs = jnp.arange(batch_size, dtype=jnp.int32)
@@ -315,6 +338,16 @@ class SamplerExecutor:
 
             is_all_greedy = jnp.all(jnp.where(active_mask[:, None], temp <= 0.0, True))
             need_min_p_sampling = jnp.any((minp > 0.0) & active_mask)
+
+            logits = apply_history_penalties(
+                logits,
+                token_history=token_history,
+                seq_lens=metadata.seq_lens,
+                active_mask=active_mask,
+                presence_penalties=metadata.presence_penalties,
+                frequency_penalties=metadata.frequency_penalties,
+                repetition_penalties=metadata.repetition_penalties,
+            )
 
             sampling_metadata = SamplingMetadata(
                 temperatures=temp,

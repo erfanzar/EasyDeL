@@ -913,6 +913,43 @@ class DataCollatorForPreferenceTFDS:
     label_pad_token_id: int = -100
     is_encoder_decoder: bool | None = False
 
+    def _get_prompt_arrays(self, feature: dict[str, tp.Any]) -> tuple[jnp.ndarray, jnp.ndarray]:
+        prompt_input_ids = jnp.asarray(feature["prompt_input_ids"])
+        prompt_attention_mask = feature.get("prompt_attention_mask")
+        if prompt_attention_mask is None:
+            prompt_attention_mask = jnp.ones_like(prompt_input_ids)
+        else:
+            prompt_attention_mask = jnp.asarray(prompt_attention_mask)
+        return prompt_input_ids, prompt_attention_mask
+
+    def _extract_completion_arrays(
+        self,
+        feature: dict[str, tp.Any],
+        prefix: str,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        input_ids = jnp.asarray(feature[f"{prefix}_input_ids"])
+        attention_mask = feature.get(f"{prefix}_attention_mask")
+        if attention_mask is None:
+            attention_mask = jnp.ones_like(input_ids)
+        else:
+            attention_mask = jnp.asarray(attention_mask)
+
+        labels = feature.get(f"{prefix}_labels")
+        if labels is not None:
+            labels = jnp.asarray(labels)
+            completion_tokens = labels != self.label_pad_token_id
+            input_ids = input_ids[completion_tokens]
+            attention_mask = attention_mask[completion_tokens]
+        elif input_ids.shape[-1] > self.max_completion_length and "prompt_attention_mask" in feature:
+            prompt_length = int(np.asarray(feature["prompt_attention_mask"]).sum())
+            input_ids = input_ids[prompt_length:]
+            attention_mask = attention_mask[prompt_length:]
+
+        valid_tokens = attention_mask.astype(bool)
+        input_ids = input_ids[valid_tokens]
+        attention_mask = attention_mask[valid_tokens]
+        return input_ids, jnp.ones_like(input_ids, dtype=attention_mask.dtype)
+
     def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, tp.Any]:
         """Collate a batch of preference examples for DPO training.
 
@@ -934,12 +971,17 @@ class DataCollatorForPreferenceTFDS:
             Prompts are left-padded, completions are right-padded.
             Attention masks are automatically generated from input IDs.
         """
-        prompt_input_ids = [jnp.array(feature["prompt_input_ids"]) for feature in features]
-        prompt_attention_mask = [jnp.ones_like(input_ids) for input_ids in prompt_input_ids]
-        chosen_input_ids = [jnp.array(feature["chosen_input_ids"]) for feature in features]
-        chosen_attention_mask = [jnp.ones_like(input_ids) for input_ids in chosen_input_ids]
-        rejected_input_ids = [jnp.array(feature["rejected_input_ids"]) for feature in features]
-        rejected_attention_mask = [jnp.ones_like(input_ids) for input_ids in rejected_input_ids]
+        prompt_arrays = [self._get_prompt_arrays(feature) for feature in features]
+        prompt_input_ids = [input_ids for input_ids, _ in prompt_arrays]
+        prompt_attention_mask = [attention_mask for _, attention_mask in prompt_arrays]
+
+        chosen_arrays = [self._extract_completion_arrays(feature, "chosen") for feature in features]
+        chosen_input_ids = [input_ids for input_ids, _ in chosen_arrays]
+        chosen_attention_mask = [attention_mask for _, attention_mask in chosen_arrays]
+
+        rejected_arrays = [self._extract_completion_arrays(feature, "rejected") for feature in features]
+        rejected_input_ids = [input_ids for input_ids, _ in rejected_arrays]
+        rejected_attention_mask = [attention_mask for _, attention_mask in rejected_arrays]
 
         pixel_values = None
         pixel_attention_mask = None
@@ -948,11 +990,19 @@ class DataCollatorForPreferenceTFDS:
         if "pixel_attention_mask" in features[0]:
             pixel_attention_mask = [jnp.array(feature["pixel_attention_mask"]) for feature in features]
 
+        ref_chosen_key = "ref_chosen_logps" if "ref_chosen_logps" in features[0] else None
+        if ref_chosen_key is None and "reference_chosen_log_probs" in features[0]:
+            ref_chosen_key = "reference_chosen_log_probs"
+
+        ref_rejected_key = "ref_rejected_logps" if "ref_rejected_logps" in features[0] else None
+        if ref_rejected_key is None and "reference_rejected_log_probs" in features[0]:
+            ref_rejected_key = "reference_rejected_log_probs"
+
         ref_chosen_logps = None
         ref_rejected_logps = None
-        if "ref_chosen_logps" in features[0] and "ref_rejected_logps" in features[0]:
-            ref_chosen_logps = jnp.array([feature["ref_chosen_logps"] for feature in features])
-            ref_rejected_logps = jnp.array([feature["ref_rejected_logps"] for feature in features])
+        if ref_chosen_key is not None and ref_rejected_key is not None:
+            ref_chosen_logps = jnp.array([feature[ref_chosen_key] for feature in features])
+            ref_rejected_logps = jnp.array([feature[ref_rejected_key] for feature in features])
 
         # Pad sequences
         output = {
@@ -1010,6 +1060,43 @@ class DataCollatorForPreferenceGrain:
     label_pad_token_id: int = -100
     is_encoder_decoder: bool | None = False
 
+    def _get_prompt_arrays(self, features: dict[str, tp.Any]) -> tuple[np.ndarray, np.ndarray]:
+        prompt_input_ids = np.asarray(features["prompt_input_ids"])
+        prompt_attention_mask = features.get("prompt_attention_mask")
+        if prompt_attention_mask is None:
+            prompt_attention_mask = np.ones_like(prompt_input_ids)
+        else:
+            prompt_attention_mask = np.asarray(prompt_attention_mask)
+        return prompt_input_ids, prompt_attention_mask
+
+    def _extract_completion_arrays(
+        self,
+        features: dict[str, tp.Any],
+        prefix: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        input_ids = np.asarray(features[f"{prefix}_input_ids"])
+        attention_mask = features.get(f"{prefix}_attention_mask")
+        if attention_mask is None:
+            attention_mask = np.ones_like(input_ids)
+        else:
+            attention_mask = np.asarray(attention_mask)
+
+        labels = features.get(f"{prefix}_labels")
+        if labels is not None:
+            labels = np.asarray(labels)
+            completion_tokens = labels != self.label_pad_token_id
+            input_ids = input_ids[completion_tokens]
+            attention_mask = attention_mask[completion_tokens]
+        elif input_ids.shape[-1] > self.max_completion_length and "prompt_attention_mask" in features:
+            prompt_length = int(np.asarray(features["prompt_attention_mask"]).sum())
+            input_ids = input_ids[prompt_length:]
+            attention_mask = attention_mask[prompt_length:]
+
+        valid_tokens = attention_mask.astype(bool)
+        input_ids = input_ids[valid_tokens]
+        attention_mask = attention_mask[valid_tokens]
+        return input_ids, np.ones_like(input_ids, dtype=attention_mask.dtype)
+
     def __call__(self, features: dict[str, tp.Any]) -> dict[str, tp.Any]:
         """Collate preference data for Grain-based DPO training.
 
@@ -1022,12 +1109,9 @@ class DataCollatorForPreferenceGrain:
         Note:
             Similar to TFDS version but processes single dictionary input.
         """
-        prompt_input_ids = np.array(features["prompt_input_ids"])
-        prompt_attention_mask = np.ones_like(prompt_input_ids)
-        chosen_input_ids = np.array(features["chosen_input_ids"])
-        chosen_attention_mask = np.ones_like(chosen_input_ids)
-        rejected_input_ids = np.array(features["rejected_input_ids"])
-        rejected_attention_mask = np.ones_like(rejected_input_ids)
+        prompt_input_ids, prompt_attention_mask = self._get_prompt_arrays(features)
+        chosen_input_ids, chosen_attention_mask = self._extract_completion_arrays(features, "chosen")
+        rejected_input_ids, rejected_attention_mask = self._extract_completion_arrays(features, "rejected")
         pixel_values = None
         pixel_attention_mask = None
         if "pixel_values" in features.keys():
@@ -1035,11 +1119,19 @@ class DataCollatorForPreferenceGrain:
         if "pixel_attention_mask" in features.keys():
             pixel_attention_mask = np.array(features["pixel_attention_mask"])
 
+        ref_chosen_key = "ref_chosen_logps" if "ref_chosen_logps" in features.keys() else None
+        if ref_chosen_key is None and "reference_chosen_log_probs" in features.keys():
+            ref_chosen_key = "reference_chosen_log_probs"
+
+        ref_rejected_key = "ref_rejected_logps" if "ref_rejected_logps" in features.keys() else None
+        if ref_rejected_key is None and "reference_rejected_log_probs" in features.keys():
+            ref_rejected_key = "reference_rejected_log_probs"
+
         ref_chosen_logps = None
         ref_rejected_logps = None
-        if "ref_chosen_logps" in features.keys() and "ref_rejected_logps" in features.keys():
-            ref_chosen_logps = np.array(features["ref_chosen_logps"])
-            ref_rejected_logps = np.array(features["ref_rejected_logps"])
+        if ref_chosen_key is not None and ref_rejected_key is not None:
+            ref_chosen_logps = np.array(features[ref_chosen_key])
+            ref_rejected_logps = np.array(features[ref_rejected_key])
 
         # Pad sequences
         output = {

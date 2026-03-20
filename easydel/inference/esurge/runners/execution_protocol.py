@@ -181,6 +181,9 @@ class ExecutionManagerProtocol(Protocol):
         top_p_cpu: np.ndarray,
         top_k_cpu: np.ndarray,
         min_p_cpu: np.ndarray,
+        frequency_penalties_cpu: np.ndarray,
+        presence_penalties_cpu: np.ndarray,
+        repetition_penalties_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
         page_table_version: int | None = None,
@@ -213,6 +216,9 @@ class ExecutionManagerProtocol(Protocol):
             top_p_cpu: Top-p sampling parameters (CPU array).
             top_k_cpu: Top-k sampling parameters (CPU array).
             min_p_cpu: Min-p sampling parameters (CPU array).
+            frequency_penalties_cpu: Frequency penalties (CPU array).
+            presence_penalties_cpu: Presence penalties (CPU array).
+            repetition_penalties_cpu: Repetition penalties (CPU array).
             page_table_cpu: KV cache page table (CPU array).
             padded_num_reqs_in: Padded request count for bucketing.
             page_table_version: Optional version for cache invalidation.
@@ -264,6 +270,8 @@ class ExecutionManagerProtocol(Protocol):
         active_mask_full: jax.Array,
         logits: jax.Array,
         rng_key: jax.Array,
+        token_ids_cpu: np.ndarray,
+        need_penalties: bool,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Sample tokens from logits.
 
@@ -278,6 +286,8 @@ class ExecutionManagerProtocol(Protocol):
             active_mask_full: Boolean mask for active requests.
             logits: Model output logits [padded_num_reqs, vocab_size].
             rng_key: JAX random key for stochastic sampling.
+            token_ids_cpu: CPU token history aligned to the current request window.
+            need_penalties: Whether any request in the batch needs penalties.
 
         Returns:
             Tuple of (updated_rng_key, sampled_tokens, valid_mask) where:

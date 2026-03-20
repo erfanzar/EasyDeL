@@ -179,7 +179,7 @@ class BatchMetadataPreparer:
         self._scheduled_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
         self._packed_qsl_seqlens_cpu = np.zeros((2, self.max_num_reqs + 1), dtype=np.int32)
         self._packed_i32_padded_cpu = np.zeros((3, self.max_num_reqs), dtype=np.int32)
-        self._packed_f32_padded_cpu = np.zeros((3, self.max_num_reqs), dtype=np.float32)
+        self._packed_f32_padded_cpu = np.zeros((6, self.max_num_reqs), dtype=np.float32)
         self._packed_misc_i32_cpu = np.zeros((5,), dtype=np.int32)
         self._arange_cpu = np.arange(self.max_num_tokens, dtype=np.int32)
         self._pages_tables_cpu = np.full(
@@ -201,7 +201,7 @@ class BatchMetadataPreparer:
         self._async_scheduled_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
         self._async_packed_qsl_seqlens_cpu = np.zeros((2, self.max_num_reqs + 1), dtype=np.int32)
         self._async_packed_i32_padded_cpu = np.zeros((3, self.max_num_reqs), dtype=np.int32)
-        self._async_packed_f32_padded_cpu = np.zeros((3, self.max_num_reqs), dtype=np.float32)
+        self._async_packed_f32_padded_cpu = np.zeros((6, self.max_num_reqs), dtype=np.float32)
         self._async_packed_misc_i32_cpu = np.zeros((5,), dtype=np.int32)
         self._async_pages_tables_cpu = np.full(
             (self._num_reqs_max_model_len, self._max_pages_per_req),
@@ -218,6 +218,9 @@ class BatchMetadataPreparer:
         self._async_top_p_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
         self._async_top_k_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
         self._async_min_p_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
+        self._async_frequency_penalties_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
+        self._async_presence_penalties_cpu = np.zeros((self.max_num_reqs,), dtype=np.float32)
+        self._async_repetition_penalties_cpu = np.ones((self.max_num_reqs,), dtype=np.float32)
         self._async_page_table_cpu = np.zeros((self.max_num_reqs, self._max_pages_per_req), dtype=np.int32)
 
         # Device cache for `pages_tables`. This table is derived from the CPU page
@@ -512,6 +515,9 @@ class BatchMetadataPreparer:
         top_p_cpu: np.ndarray,
         top_k_cpu: np.ndarray,
         min_p_cpu: np.ndarray,
+        frequency_penalties_cpu: np.ndarray,
+        presence_penalties_cpu: np.ndarray,
+        repetition_penalties_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         page_table_version: int | None,
         padded_num_reqs_in: int,
@@ -534,6 +540,9 @@ class BatchMetadataPreparer:
             top_p_cpu: Top-p sampling parameters per request.
             top_k_cpu: Top-k sampling parameters per request.
             min_p_cpu: Min-p sampling parameters per request.
+            frequency_penalties_cpu: Frequency penalties per request.
+            presence_penalties_cpu: Presence penalties per request.
+            repetition_penalties_cpu: Repetition penalties per request.
             page_table_cpu: Page table [max_reqs, max_pages_per_req].
             page_table_version: Optional version for cache invalidation.
             padded_num_reqs_in: Requested padding for request count.
@@ -725,6 +734,9 @@ class BatchMetadataPreparer:
         packed_f32_padded[0, :padded_num_reqs] = temperature_cpu[:padded_num_reqs]
         packed_f32_padded[1, :padded_num_reqs] = top_p_cpu[:padded_num_reqs]
         packed_f32_padded[2, :padded_num_reqs] = min_p_cpu[:padded_num_reqs]
+        packed_f32_padded[3, :padded_num_reqs] = frequency_penalties_cpu[:padded_num_reqs]
+        packed_f32_padded[4, :padded_num_reqs] = presence_penalties_cpu[:padded_num_reqs]
+        packed_f32_padded[5, :padded_num_reqs] = repetition_penalties_cpu[:padded_num_reqs]
 
         packed_misc_i32.fill(0)
         packed_misc_i32[0] = np.int32(num_requests)
@@ -774,6 +786,9 @@ class BatchMetadataPreparer:
         top_p_cpu: np.ndarray,
         top_k_cpu: np.ndarray,
         min_p_cpu: np.ndarray,
+        frequency_penalties_cpu: np.ndarray,
+        presence_penalties_cpu: np.ndarray,
+        repetition_penalties_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
         page_table_version: int | None = None,
@@ -808,6 +823,9 @@ class BatchMetadataPreparer:
             top_p_cpu: Top-p per request [max_num_reqs].
             top_k_cpu: Top-k per request [max_num_reqs].
             min_p_cpu: Min-p per request [max_num_reqs].
+            frequency_penalties_cpu: Frequency penalty per request [max_num_reqs].
+            presence_penalties_cpu: Presence penalty per request [max_num_reqs].
+            repetition_penalties_cpu: Repetition penalty per request [max_num_reqs].
             page_table_cpu: Page table [max_num_reqs, max_pages_per_req].
             padded_num_reqs_in: Requested padding for request count bucketing.
             page_table_version: Optional version for page table caching.
@@ -843,6 +861,9 @@ class BatchMetadataPreparer:
             top_p_cpu=top_p_cpu,
             top_k_cpu=top_k_cpu,
             min_p_cpu=min_p_cpu,
+            frequency_penalties_cpu=frequency_penalties_cpu,
+            presence_penalties_cpu=presence_penalties_cpu,
+            repetition_penalties_cpu=repetition_penalties_cpu,
             page_table_cpu=page_table_cpu,
             page_table_version=page_table_version,
             padded_num_reqs_in=int(padded_num_reqs_in),
@@ -994,6 +1015,9 @@ class BatchMetadataPreparer:
         top_p_cpu: np.ndarray,
         top_k_cpu: np.ndarray,
         min_p_cpu: np.ndarray,
+        frequency_penalties_cpu: np.ndarray,
+        presence_penalties_cpu: np.ndarray,
+        repetition_penalties_cpu: np.ndarray,
         page_table_cpu: np.ndarray,
         padded_num_reqs_in: int,
         page_table_version: int | None = None,
@@ -1021,6 +1045,9 @@ class BatchMetadataPreparer:
             top_p_cpu: Top-p per request.
             top_k_cpu: Top-k per request.
             min_p_cpu: Min-p per request.
+            frequency_penalties_cpu: Frequency penalty per request.
+            presence_penalties_cpu: Presence penalty per request.
+            repetition_penalties_cpu: Repetition penalty per request.
             page_table_cpu: Page table for all requests.
             padded_num_reqs_in: Requested padding for request count.
             page_table_version: Optional version for page table caching.
@@ -1044,6 +1071,9 @@ class BatchMetadataPreparer:
         np.copyto(self._async_top_p_cpu, top_p_cpu)
         np.copyto(self._async_top_k_cpu, top_k_cpu)
         np.copyto(self._async_min_p_cpu, min_p_cpu)
+        np.copyto(self._async_frequency_penalties_cpu, frequency_penalties_cpu)
+        np.copyto(self._async_presence_penalties_cpu, presence_penalties_cpu)
+        np.copyto(self._async_repetition_penalties_cpu, repetition_penalties_cpu)
         np.copyto(self._async_page_table_cpu, page_table_cpu)
 
         host_build_start = time.time()
@@ -1057,6 +1087,9 @@ class BatchMetadataPreparer:
             top_p_cpu=self._async_top_p_cpu,
             top_k_cpu=self._async_top_k_cpu,
             min_p_cpu=self._async_min_p_cpu,
+            frequency_penalties_cpu=self._async_frequency_penalties_cpu,
+            presence_penalties_cpu=self._async_presence_penalties_cpu,
+            repetition_penalties_cpu=self._async_repetition_penalties_cpu,
             page_table_cpu=self._async_page_table_cpu,
             page_table_version=page_table_version,
             padded_num_reqs_in=int(padded_num_reqs_in),
