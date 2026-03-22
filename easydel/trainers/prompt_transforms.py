@@ -320,11 +320,12 @@ class GRPOPreprocessTransform(Transform):
 
         # Apply chat template if conversational format
         if isinstance(prompt, list) and not self._skip_apply_chat_template:
+            example_tools = result.get("tools")
             prompt = self._tokenizer.apply_chat_template(
                 prompt,
                 tokenize=False,
                 add_generation_prompt=True,
-                tools=self._tools,
+                tools=example_tools if example_tools is not None else self._tools,
             )
 
         # Tokenize with left padding for generation
