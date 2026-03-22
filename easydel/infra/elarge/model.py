@@ -1954,6 +1954,21 @@ class eLargeModel:
         """
 
         def _uses_removed_benchmark_task_alias(task: Any) -> bool:
+            """Check whether a task dict uses the removed ``task`` alias with extra keys.
+
+            The old benchmark config format allowed a ``task`` key alongside
+            arbitrary override keys.  This was replaced by a ``tasks`` key.
+            This helper detects configs that still use the legacy format so
+            callers can raise a clear error.
+
+            Args:
+                task: A candidate task specification to inspect.
+
+            Returns:
+                True if *task* is a mapping that uses the removed ``task``
+                alias with keys beyond the known task-spec fields, False
+                otherwise.
+            """
             if not isinstance(task, Mapping):
                 return False
             if "tasks" in task or "task" not in task:

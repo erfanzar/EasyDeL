@@ -64,19 +64,33 @@ class FastIncrementalDecoder:
         self.tokenizer = tokenizer
         self.context_window = max(0, int(context_window))
 
-    def _decode(self, token_ids: Iterable[int], *, skip_special_tokens: bool) -> str:
+    def _decode(
+        self,
+        token_ids: Iterable[int],
+        *,
+        skip_special_tokens: bool,
+        spaces_between_special_tokens: bool,
+    ) -> str:
         """Wrapper around `tokenizer.decode` that works with all HF versions."""
         try:
             return self.tokenizer.decode(
                 list(token_ids),
                 skip_special_tokens=skip_special_tokens,
+                spaces_between_special_tokens=spaces_between_special_tokens,
                 clean_up_tokenization_spaces=False,
             )
         except TypeError:
-            return self.tokenizer.decode(
-                list(token_ids),
-                skip_special_tokens=skip_special_tokens,
-            )
+            try:
+                return self.tokenizer.decode(
+                    list(token_ids),
+                    skip_special_tokens=skip_special_tokens,
+                    clean_up_tokenization_spaces=False,
+                )
+            except TypeError:
+                return self.tokenizer.decode(
+                    list(token_ids),
+                    skip_special_tokens=skip_special_tokens,
+                )
 
     def decode(
         self,
@@ -85,6 +99,7 @@ class FastIncrementalDecoder:
         buffered_tokens: list,
         *,
         skip_special_tokens: bool,
+        spaces_between_special_tokens: bool = True,
         context_tokens: Iterable[int] | None = None,
     ) -> tuple[str, list[int], bool]:
         """
@@ -108,13 +123,29 @@ class FastIncrementalDecoder:
         if not candidate:
             return "", buffered, bool(buffered)
 
-        decoded_candidate = self._decode(candidate, skip_special_tokens=skip_special_tokens)
-        decoded_context = self._decode(context, skip_special_tokens=skip_special_tokens) if context else ""
+        decoded_candidate = self._decode(
+            candidate,
+            skip_special_tokens=skip_special_tokens,
+            spaces_between_special_tokens=spaces_between_special_tokens,
+        )
+        decoded_context = (
+            self._decode(
+                context,
+                skip_special_tokens=skip_special_tokens,
+                spaces_between_special_tokens=spaces_between_special_tokens,
+            )
+            if context
+            else ""
+        )
 
         if decoded_context and not decoded_candidate.startswith(decoded_context):
             # Fall back to no-context decode if prefix alignment fails.
             decoded_context = ""
-            decoded_candidate = self._decode(buffered + fresh, skip_special_tokens=skip_special_tokens)
+            decoded_candidate = self._decode(
+                buffered + fresh,
+                skip_special_tokens=skip_special_tokens,
+                spaces_between_special_tokens=spaces_between_special_tokens,
+            )
 
         delta = decoded_candidate[len(decoded_context) :]
         if "�" in delta:
@@ -227,6 +258,7 @@ def _detokenizer_worker(
                 generated_tokens = message["tokens"]
                 finished = message["finished"]
                 skip_special = message["skip_special_tokens"]
+                spaces_between_special = message.get("spaces_between_special_tokens", True)
 
                 state = states.setdefault(
                     rid, {"last_index": 0, "previous_text": "", "buffered": [], "prompt_context": None}
@@ -258,6 +290,7 @@ def _detokenizer_worker(
                         state["previous_text"],
                         buffered,
                         skip_special_tokens=skip_special,
+                        spaces_between_special_tokens=spaces_between_special,
                         context_tokens=context_tokens,
                     )
                     state["buffered"] = new_buffered
@@ -270,6 +303,7 @@ def _detokenizer_worker(
                             full_decoded = tokenizer.decode(
                                 generated_tokens,
                                 skip_special_tokens=skip_special,
+                                spaces_between_special_tokens=spaces_between_special,
                                 clean_up_tokenization_spaces=False,
                             )
                         except TypeError:

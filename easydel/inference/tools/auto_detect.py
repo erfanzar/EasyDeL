@@ -48,8 +48,10 @@ import typing as tp
 from .abstract_tool import ToolParserManager, ToolParserName
 
 MODEL_TYPE_TO_TOOL_PARSER: dict[str, ToolParserName] = {
-    "qwen3_5_moe": "hermes",
-    "qwen3_5": "hermes",
+    "qwen3_5_moe": "qwen3_coder",
+    "qwen3_5": "qwen3_coder",
+    "qwen3_5_moe_text": "qwen3_coder",
+    "qwen3_5_text": "qwen3_coder",
     "qwen3_moe": "hermes",
     "qwen3_next": "hermes",
     "qwen3": "hermes",

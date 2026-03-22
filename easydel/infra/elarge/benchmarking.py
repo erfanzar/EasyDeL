@@ -209,6 +209,16 @@ def task_uses_code_eval(task: Any) -> bool:
     code_eval_hints = ("humaneval", "mbpp")
 
     def _matches(value: Any) -> bool:
+        """Check if a value contains a code-eval task hint.
+
+        Args:
+            value: An arbitrary value to test. Only strings are matched.
+
+        Returns:
+            True if *value* is a string whose lowercase form contains
+            any of the ``code_eval_hints`` (e.g. ``"humaneval"``,
+            ``"mbpp"``), False otherwise.
+        """
         return isinstance(value, str) and any(hint in value.lower() for hint in code_eval_hints)
 
     if _matches(task):

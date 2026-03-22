@@ -97,7 +97,77 @@ class EngineUtilsMixin:
 
             normalized_messages.append(msg)
 
-        return normalized_messages
+        return EngineUtilsMixin._collapse_system_messages(normalized_messages)
+
+    @staticmethod
+    def _content_to_text_parts(content: Any) -> list[dict[str, Any]]:
+        """Convert arbitrary message content into text-part arrays."""
+
+        if content is None:
+            return []
+        if isinstance(content, list):
+            parts: list[dict[str, Any]] = []
+            for item in content:
+                if isinstance(item, dict):
+                    parts.append(copy.deepcopy(item))
+                elif item is not None:
+                    parts.append({"type": "text", "text": str(item)})
+            return parts
+        return [{"type": "text", "text": str(content)}]
+
+    @staticmethod
+    def _merge_system_content(existing: Any, new_content: Any) -> Any:
+        """Merge multiple system-message contents into a single leading turn."""
+
+        if isinstance(existing, list) or isinstance(new_content, list):
+            return EngineUtilsMixin._content_to_text_parts(existing) + EngineUtilsMixin._content_to_text_parts(
+                new_content
+            )
+
+        existing_text = "" if existing is None else str(existing)
+        new_text = "" if new_content is None else str(new_content)
+        if existing_text and new_text:
+            return f"{existing_text}\n\n{new_text}"
+        return existing_text or new_text
+
+    @staticmethod
+    def _collapse_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Fold all system turns into one leading system message for strict templates."""
+
+        if not messages:
+            return messages
+
+        system_indices = [idx for idx, msg in enumerate(messages) if msg.get("role") == "system"]
+        if len(system_indices) <= 1 and (not system_indices or system_indices[0] == 0):
+            return messages
+
+        merged_system: dict[str, Any] | None = None
+        ordered_messages: list[dict[str, Any]] = []
+        for message in messages:
+            if message.get("role") != "system":
+                ordered_messages.append(message)
+                continue
+
+            msg_copy = dict(message)
+            msg_copy.pop("tool_calls", None)
+            msg_copy.pop("function_call", None)
+            if merged_system is None:
+                merged_system = msg_copy
+                continue
+            merged_system["content"] = EngineUtilsMixin._merge_system_content(
+                merged_system.get("content"),
+                msg_copy.get("content"),
+            )
+
+        if merged_system is None:
+            return ordered_messages
+
+        if system_indices != [0]:
+            logger.warning(
+                "Collapsing %d system messages into the first position for chat-template compatibility.",
+                len(system_indices),
+            )
+        return [merged_system, *ordered_messages]
 
     @staticmethod
     def _normalize_chat_template_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
@@ -426,6 +496,7 @@ class EngineUtilsMixin:
         *,
         finished: bool,
         skip_special_tokens: bool = False,
+        spaces_between_special_tokens: bool = True,
         prompt_context: list[int] | None = None,
     ) -> DetokenizerResult:
         """Decode tokens using the detokenizer worker pipeline.
@@ -437,6 +508,8 @@ class EngineUtilsMixin:
             generated_tokens: Full list of generated tokens so far.
             finished: Whether generation is complete (triggers final flush).
             skip_special_tokens: Whether to skip special tokens in output.
+            spaces_between_special_tokens: Whether to preserve tokenizer-inserted
+                spacing between adjacent special tokens.
             prompt_context: Last N prompt token IDs for first-token context.
 
         Returns:
@@ -448,6 +521,7 @@ class EngineUtilsMixin:
             tokens_for_decode,
             finished=finished,
             skip_special_tokens=skip_special_tokens,
+            spaces_between_special_tokens=spaces_between_special_tokens,
             prompt_context=prompt_context,
         )
 

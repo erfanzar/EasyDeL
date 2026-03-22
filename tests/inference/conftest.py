@@ -19,5 +19,9 @@ import os
 
 def pytest_configure() -> None:
     """Keep inference unit tests hermetic on hosts with occupied TPU runtimes."""
+    if "ENABLE_DISTRIBUTED_INIT" not in os.environ:
+        os.environ["ENABLE_DISTRIBUTED_INIT"] = "0"
     if "JAX_PLATFORMS" not in os.environ and "JAX_PLATFORM_NAME" not in os.environ:
         os.environ["JAX_PLATFORMS"] = "cpu"
+    if "JAX_PLATFORM_NAME" not in os.environ:
+        os.environ["JAX_PLATFORM_NAME"] = "cpu"

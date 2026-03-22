@@ -216,6 +216,13 @@ class FunctionalLossStrategy(BaseLossStrategy):
     """
 
     def __init__(self, loss_fn: tp.Callable[..., LossMetrics]):
+        """Wrap a plain loss callable as a ``BaseLossStrategy``.
+
+        Args:
+            loss_fn: A callable that accepts keyword arguments (``labels``,
+                ``config``, ``paxis``, plus model outputs and batch entries)
+                and returns a ``LossMetrics`` instance.
+        """
         self.loss_fn = loss_fn
         self.__name__ = getattr(loss_fn, "__name__", type(loss_fn).__name__)
 
@@ -1607,6 +1614,16 @@ def _sum_weights_per_segment(
         """
 
         def fn(prev, x):
+            """Scan step that propagates the previous non-zero value forward.
+
+            Args:
+                prev: Carry value from the previous scan step.
+                x: Current element of the scanned array.
+
+            Returns:
+                Tuple of (new_carry, output) where zeros in ``x`` are
+                replaced by ``prev``.
+            """
             y = jnp.where(x == 0, prev, x)
             return y, y
 
@@ -2205,6 +2222,23 @@ def causal_lm_loss_chunked_lm_head(
         loss_weights = jnp.pad(loss_weights, ((0, 0), (0, pad_len)))
 
     def _chunk_loss(chunk_hidden_states, chunk_labels, chunk_attention_mask, chunk_loss_weights):
+        """Compute cross-entropy loss for a single chunk of the sequence.
+
+        Projects hidden states through the LM head, optionally caps logits,
+        and computes the fixed cross-entropy loss with accuracy tracking.
+
+        Args:
+            chunk_hidden_states: Hidden states for this chunk, shape
+                ``(batch, chunk_size, hidden_dim)``.
+            chunk_labels: Target token IDs, shape ``(batch, chunk_size)``.
+            chunk_attention_mask: Attention mask or None, shape
+                ``(batch, chunk_size)``.
+            chunk_loss_weights: Per-token loss weights, shape
+                ``(batch, chunk_size)``.
+
+        Returns:
+            Tuple of (loss, z_loss, weight_sum, correct_count).
+        """
         logits = lm_head_fn(chunk_hidden_states)
         if logit_cap_fn is not None:
             logits = logit_cap_fn(logits)
@@ -2227,6 +2261,18 @@ def causal_lm_loss_chunked_lm_head(
     _chunk_loss = jax.checkpoint(_chunk_loss, prevent_cse=False)
 
     def _accumulate_chunk(i: int, carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array]):
+        """Accumulate loss metrics from the i-th chunk into running totals.
+
+        Slices the i-th chunk from the padded sequence, computes its loss
+        via ``_chunk_loss``, and adds the results to the carry accumulators.
+
+        Args:
+            i: Zero-based chunk index.
+            carry: Running totals of (loss, z_loss, weight_sum, correct_count).
+
+        Returns:
+            Updated carry tuple with this chunk's contributions added.
+        """
         start = i * chunk_size
         chunk_hidden_states = lax.dynamic_slice_in_dim(shift_hidden_states, start, chunk_size, axis=1)
         chunk_labels = lax.dynamic_slice_in_dim(shift_labels, start, chunk_size, axis=1)

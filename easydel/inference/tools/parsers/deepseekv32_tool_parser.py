@@ -169,6 +169,24 @@ class DeepSeekV32ToolParser(ToolParser):
         if not self.model_tokenizer:
             raise ValueError("The model tokenizer must be passed to the ToolParser constructor during construction.")
 
+    def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
+        """Adjust the chat completion request for DSML tool call parsing.
+
+        Disables special token skipping when tools are enabled so that DSML
+        sentinel tokens are preserved in the model output for parsing.
+
+        Args:
+            request: The incoming chat completion request to adjust.
+
+        Returns:
+            The modified request with ``skip_special_tokens`` set to False
+            when tools are active.
+        """
+        request = super().adjust_request(request)
+        if request.tools and request.tool_choice != "none":
+            request.skip_special_tokens = False
+        return request
+
     def _generate_tool_call_id(self) -> str:
         """Generate a unique tool call ID.
 
@@ -181,28 +199,16 @@ class DeepSeekV32ToolParser(ToolParser):
         return f"call_{uuid.uuid4().hex[:24]}"
 
     def _reset_streaming_state(self) -> None:
-        """Reset all streaming state variables.
+        """Reset all streaming state for a new message.
 
-        Clears all internal state used for tracking streaming tool call
-        parsing progress. Should be called at the start of each new
-        streaming session.
+        Clears the tool index counter, tool-call-started flag, previously
+        accumulated tool call records, and per-tool streamed argument buffers.
+        Called automatically at the start of each new streaming response.
         """
         self.current_tool_index = 0
-        self.invoke_index = 0
         self.is_tool_call_started = False
-        self.header_sent = False
-        self.current_tool_id = None
-        self.current_function_name = None
-        self.current_param_name = None
-        self.current_param_value = ""
-        self.param_count = 0
-        self.in_param = False
-        self.in_function = False
-        self.json_started = False
-        self.json_closed = False
-        self.accumulated_params = {}
-        self.streaming_request = None
         self.prev_tool_call_arr.clear()
+        self.streamed_args_for_tool.clear()
 
     def _parse_invoke_params(self, invoke_str: str) -> dict | None:
         """Parse parameters from an invoke block string.
@@ -361,6 +367,92 @@ class DeepSeekV32ToolParser(ToolParser):
         except json.JSONDecodeError:
             return value
 
+    def _convert_params_with_schema(
+        self,
+        function_name: str,
+        param_dict: dict[str, str],
+        request: ChatCompletionRequest | None,
+    ) -> dict[str, Any]:
+        """Convert raw string parameter values using the tool schema types.
+
+        Looks up each parameter's expected type from the tool definition in
+        the request, then delegates to ``_convert_param_value`` for type
+        coercion. Parameters without a matching schema entry default to string.
+
+        Args:
+            function_name: Name of the function whose schema to look up.
+            param_dict: Raw parameter name-to-value mapping (all strings).
+            request: The chat completion request containing tool definitions,
+                or None if unavailable.
+
+        Returns:
+            Dictionary mapping parameter names to their type-converted values.
+        """
+        param_config: dict[str, Any] = {}
+        if request and request.tools:
+            for tool in request.tools:
+                if (
+                    hasattr(tool, "function")
+                    and tool.function.name == function_name
+                    and hasattr(tool.function, "parameters")
+                ):
+                    schema = tool.function.parameters
+                    if isinstance(schema, dict) and "properties" in schema:
+                        param_config = schema["properties"]
+                    break
+
+        converted: dict[str, Any] = {}
+        for name, value in param_dict.items():
+            param_type = "string"
+            if name in param_config and isinstance(param_config[name], dict):
+                param_type = param_config[name].get("type", "string")
+            converted[name] = self._convert_param_value(value, param_type)
+        return converted
+
+    def _extract_delta_tool_calls(
+        self,
+        current_text: str,
+        request: ChatCompletionRequest | None,
+    ) -> list[DeltaToolCall]:
+        """Extract DeltaToolCalls from newly completed invoke blocks.
+
+        Scans ``current_text`` for complete ``<invoke>...</invoke>`` blocks
+        that have not yet been emitted, parses their parameters, converts
+        values using the tool schema, and returns one ``DeltaToolCall`` per
+        newly completed invoke.
+
+        Args:
+            current_text: The full accumulated model output so far.
+            request: The chat completion request with tool definitions for
+                schema-based type conversion, or None.
+
+        Returns:
+            List of ``DeltaToolCall`` objects for each newly completed invoke
+            block. Empty if no new blocks were found.
+        """
+        complete_invokes = self.invoke_complete_regex.findall(current_text)
+        delta_tool_calls: list[DeltaToolCall] = []
+
+        while len(complete_invokes) > self.current_tool_index:
+            invoke_name, invoke_body = complete_invokes[self.current_tool_index]
+            param_dict = self._parse_invoke_params(invoke_body) or {}
+            converted = self._convert_params_with_schema(invoke_name, param_dict, request)
+            args_json = json.dumps(converted, ensure_ascii=False)
+            idx = self.current_tool_index
+            self.current_tool_index += 1
+            self.prev_tool_call_arr.append({"name": invoke_name, "arguments": converted})
+            self.streamed_args_for_tool.append(args_json)
+            delta_tool_calls.append(
+                DeltaToolCall(
+                    index=idx,
+                    id=self._generate_tool_call_id(),
+                    function=DeltaFunctionCall(name=invoke_name, arguments=args_json),
+                    type="function",
+                )
+            )
+
+        return delta_tool_calls
+
     def extract_tool_calls_streaming(
         self,
         previous_text: str,
@@ -373,260 +465,41 @@ class DeepSeekV32ToolParser(ToolParser):
     ) -> DeltaMessage | None:
         """Extract tool calls from streaming model output.
 
-        Handles incremental parsing of DSML format during streaming
-        generation. Maintains extensive state to track position within
-        the structured DSML format and emit incremental updates.
-
-        The method processes:
-        - Detection of DSML block start
-        - Function invoke header parsing
-        - Parameter extraction and type conversion
-        - JSON fragment streaming
-        - Tool call completion
+        Uses a buffer-until-complete-invoke strategy: tokens are accumulated
+        until a complete ``<invoke>...</invoke>`` block is available, then
+        the block is parsed and emitted in one shot as a ``DeltaToolCall``.
+        Content tokens that appear before the first DSML block are forwarded
+        as regular content deltas.
 
         Args:
-            previous_text: Text generated up to the previous chunk.
-            current_text: All text generated so far including current chunk.
-            delta_text: New text added in this chunk only.
-            previous_token_ids: Token IDs up to previous chunk (unused).
-            current_token_ids: All token IDs so far (unused).
-            delta_token_ids: New token IDs in this chunk.
-            request: Original chat completion request with tool definitions.
-                Used for parameter type lookups.
+            previous_text: All text generated before this step.
+            current_text: All text generated up to and including this step.
+            delta_text: The new text added in this step.
+            previous_token_ids: Token IDs for ``previous_text``.
+            current_token_ids: Token IDs for ``current_text``.
+            delta_token_ids: Token IDs for ``delta_text``.
+            request: The chat completion request with tool definitions.
 
         Returns:
-            DeltaMessage | None: A delta message containing:
-                - Tool call with function name on first detection
-                - JSON argument fragments as parameters are parsed
-                - Content text if outside tool call region
-                - None if more data is needed
-
-        Note:
-            This method maintains extensive internal state and should
-            only be called sequentially with proper text accumulation.
+            A ``DeltaMessage`` containing either content text, tool call
+            deltas, or both. Returns None when there is nothing new to emit.
         """
-
         if not previous_text:
             self._reset_streaming_state()
-            self.streaming_request = request
-
-        if not delta_text:
-            if delta_token_ids:
-                complete_calls = len(self.tool_call_complete_regex.findall(current_text))
-                if complete_calls > 0 and len(self.prev_tool_call_arr) > 0:
-                    open_calls = current_text.count(self.tool_call_start_token) - current_text.count(
-                        self.tool_call_end_token
-                    )
-                    if open_calls == 0:
-                        return DeltaMessage(content="")
-                elif not self.is_tool_call_started and current_text:
-                    return DeltaMessage(content="")
-            return None
-
-        if self.json_closed and not self.in_function:
-            invoke_ends = current_text.count(self.invoke_end_token)
-            if invoke_ends > self.current_tool_index:
-                self.current_tool_index += 1
-                self.header_sent = False
-                self.param_count = 0
-                self.json_started = False
-                self.json_closed = False
-                self.in_function = False
-                self.accumulated_params = {}
-                return None
-
-        if not self.is_tool_call_started:
-            if self.dsml_token in current_text:
-                self.is_tool_call_started = True
-                if self.dsml_start_check in delta_text:
-                    content_before = delta_text[: delta_text.index(self.dsml_start_check)]
-                    if content_before:
-                        return DeltaMessage(content=content_before)
-                return None
-
-            if current_text.rstrip().endswith(self.tool_call_end_token) and delta_text.strip() == "":
-                return None
-
-            if delta_text.endswith("<"):
-                return DeltaMessage(content=delta_text[:-1])
-            if previous_text and previous_text.endswith("<"):
-                return DeltaMessage(content="<" + delta_text)
-            return DeltaMessage(content=delta_text)
-
-        invoke_starts_count = current_text.count(self.invoke_start_prefix)
-        if self.current_tool_index >= invoke_starts_count:
-            return None
-
-        invoke_start_positions: list[int] = []
-        idx = 0
-        while True:
-            idx = current_text.find(self.invoke_start_prefix, idx)
-            if idx == -1:
-                break
-            invoke_start_positions.append(idx)
-            idx += len(self.invoke_start_prefix)
-
-        if self.current_tool_index >= len(invoke_start_positions):
-            return None
-
-        invoke_start_idx = invoke_start_positions[self.current_tool_index]
-        invoke_end_idx = current_text.find(self.invoke_end_token, invoke_start_idx)
-        if invoke_end_idx == -1:
-            tool_text = current_text[invoke_start_idx:]
+        content_before = None
+        if self.is_tool_call_started:
+            pass
+        elif self.tool_call_start_token in current_text:
+            self.is_tool_call_started = True
+            start_idx = current_text.index(self.tool_call_start_token)
+            content_before = current_text[len(previous_text) : start_idx] or None
         else:
-            tool_text = current_text[invoke_start_idx : invoke_end_idx + len(self.invoke_end_token)]
+            return DeltaMessage(content=delta_text) if delta_text else None
 
-        if not self.header_sent:
-            if self.invoke_start_prefix in tool_text:
-                func_start = tool_text.find(self.invoke_start_prefix) + len(self.invoke_start_prefix)
-                func_end = tool_text.find(">", func_start)
-                if func_end != -1:
-                    function_name_raw = tool_text[func_start:func_end]
-                    self.current_function_name = self._extract_name(function_name_raw)
-                    self.current_tool_id = self._generate_tool_call_id()
-                    self.header_sent = True
-                    self.in_function = True
+        delta_tool_calls = self._extract_delta_tool_calls(current_text, request)
 
-                    if len(self.prev_tool_call_arr) <= self.current_tool_index:
-                        self.prev_tool_call_arr.append({"name": self.current_function_name, "arguments": "{}"})
-
-                    return DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_index,
-                                id=self.current_tool_id,
-                                function=DeltaFunctionCall(name=self.current_function_name, arguments=""),
-                                type="function",
-                            )
-                        ]
-                    )
-            return None
-
-        if self.in_function:
-            if self.in_function and not self.json_started:
-                self.json_started = True
-                return DeltaMessage(
-                    tool_calls=[DeltaToolCall(index=self.current_tool_index, function=DeltaFunctionCall(arguments="{"))]
-                )
-
-            if not self.json_started:
-                self.json_started = True
-
-            if not self.json_closed and self.invoke_end_token in tool_text:
-                total_param_count = tool_text.count(self.parameter_prefix)
-                if self.param_count >= total_param_count:
-                    self.json_closed = True
-
-                    invoke_start = tool_text.find(self.invoke_start_prefix) + len(self.invoke_start_prefix)
-                    invoke_content_end = tool_text.find(self.invoke_end_token, invoke_start)
-                    if invoke_content_end != -1:
-                        invoke_content = tool_text[invoke_start:invoke_content_end]
-                        try:
-                            invoke_params = self._parse_invoke_params(invoke_content)
-                            if invoke_params and self.current_tool_index < len(self.prev_tool_call_arr):
-                                self.prev_tool_call_arr[self.current_tool_index]["arguments"] = json.dumps(
-                                    invoke_params, ensure_ascii=False
-                                )
-                        except Exception:
-                            pass
-
-                    result = DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(index=self.current_tool_index, function=DeltaFunctionCall(arguments="}"))
-                        ]
-                    )
-
-                    self.json_closed = True
-                    self.in_function = False
-                    self.accumulated_params = {}
-                    return result
-
-                return None
-
-            param_starts: list[int] = []
-            idx = 0
-            while True:
-                idx = tool_text.find(self.parameter_prefix, idx)
-                if idx == -1:
-                    break
-                param_starts.append(idx)
-                idx += len(self.parameter_prefix)
-
-            if not self.in_param and self.param_count < len(param_starts) and len(param_starts) > self.param_count:
-                param_idx = param_starts[self.param_count]
-                param_start = param_idx + len(self.parameter_prefix)
-                remaining = tool_text[param_start:]
-
-                if ">" in remaining:
-                    name_end = remaining.find(">")
-                    param_name_raw = remaining[:name_end]
-                    self.current_param_name = self._extract_param_name(param_name_raw)
-
-                    value_start = param_start + name_end + 1
-                    value_text = tool_text[value_start:]
-                    if value_text.startswith("\n"):
-                        value_text = value_text[1:]
-
-                    param_end_idx = value_text.find(self.parameter_end_token)
-                    if param_end_idx == -1:
-                        next_param_idx = value_text.find(self.parameter_prefix)
-                        func_end_idx = value_text.find(self.invoke_end_token)
-
-                        if next_param_idx != -1 and (func_end_idx == -1 or next_param_idx < func_end_idx):
-                            param_end_idx = next_param_idx
-                        elif func_end_idx != -1:
-                            param_end_idx = func_end_idx
-                        else:
-                            if self.invoke_end_token in tool_text:
-                                param_end_idx = len(value_text)
-                            else:
-                                return None
-
-                    if param_end_idx != -1:
-                        param_value = value_text[:param_end_idx]
-                        if param_value.endswith("\n"):
-                            param_value = param_value[:-1]
-
-                        self.accumulated_params[self.current_param_name] = param_value
-
-                        param_config: dict[str, Any] = {}
-                        if self.streaming_request and self.streaming_request.tools:
-                            for tool in self.streaming_request.tools:
-                                if (
-                                    hasattr(tool, "function")
-                                    and tool.function.name == self.current_function_name
-                                    and hasattr(tool.function, "parameters")
-                                ):
-                                    params = tool.function.parameters
-                                    if isinstance(params, dict) and "properties" in params:
-                                        param_config = params["properties"]
-                                    break
-
-                        param_type = "string"
-                        if (
-                            self.current_param_name in param_config
-                            and isinstance(param_config[self.current_param_name], dict)
-                            and "type" in param_config[self.current_param_name]
-                        ):
-                            param_type = param_config[self.current_param_name]["type"]
-
-                        converted_value = self._convert_param_value(param_value, param_type)
-                        serialized_value = json.dumps(converted_value, ensure_ascii=False)
-
-                        if self.param_count == 0:
-                            json_fragment = f'"{self.current_param_name}": {serialized_value}'
-                        else:
-                            json_fragment = f', "{self.current_param_name}": {serialized_value}'
-
-                        self.param_count += 1
-
-                        return DeltaMessage(
-                            tool_calls=[
-                                DeltaToolCall(
-                                    index=self.current_tool_index,
-                                    function=DeltaFunctionCall(arguments=json_fragment),
-                                )
-                            ]
-                        )
-
+        if delta_tool_calls or content_before:
+            return DeltaMessage(content=content_before, tool_calls=delta_tool_calls)
+        if not delta_text and delta_token_ids and self.prev_tool_call_arr:
+            return DeltaMessage(content="")
         return None

@@ -253,14 +253,16 @@ class EngineParsingMixin:
         # Step 2: Tool call extraction on content portion
         if tool_parser is not None and content_for_tools:
             try:
+                tool_request = rd.get("tool_parser_request")
                 if finished:
-                    from easydel.inference.openai_api_modules import ChatCompletionRequest, ChatMessage
+                    if tool_request is None:
+                        from easydel.inference.openai_api_modules import ChatCompletionRequest, ChatMessage
 
-                    dummy_request = ChatCompletionRequest(
-                        model="dummy",
-                        messages=[ChatMessage(role="user", content="")],
-                    )
-                    extracted = tool_parser.extract_tool_calls(content_for_tools, dummy_request)
+                        tool_request = ChatCompletionRequest(
+                            model="dummy",
+                            messages=[ChatMessage(role="user", content="")],
+                        )
+                    extracted = tool_parser.extract_tool_calls(content_for_tools, tool_request)
                     if extracted.tools_called and extracted.tool_calls:
                         result["tool_calls"] = extracted.tool_calls
                         # Update delta_content to exclude tool call markup
@@ -280,12 +282,13 @@ class EngineParsingMixin:
                     if content_delta is None:
                         content_delta = delta_text
 
-                    from easydel.inference.openai_api_modules import ChatCompletionRequest, ChatMessage
+                    if tool_request is None:
+                        from easydel.inference.openai_api_modules import ChatCompletionRequest, ChatMessage
 
-                    dummy_request = ChatCompletionRequest(
-                        model="dummy",
-                        messages=[ChatMessage(role="user", content="")],
-                    )
+                        tool_request = ChatCompletionRequest(
+                            model="dummy",
+                            messages=[ChatMessage(role="user", content="")],
+                        )
                     delta_ids = token_ids[len(prev_token_ids) :] if prev_token_ids else token_ids
                     delta_msg = tool_parser.extract_tool_calls_streaming(
                         previous_text=prev_content,
@@ -294,7 +297,7 @@ class EngineParsingMixin:
                         previous_token_ids=prev_token_ids,
                         current_token_ids=token_ids,
                         delta_token_ids=delta_ids,
-                        request=dummy_request,
+                        request=tool_request,
                     )
                     if delta_msg is not None:
                         if hasattr(delta_msg, "tool_calls") and delta_msg.tool_calls:
@@ -386,6 +389,10 @@ class EngineParsingMixin:
 
                         last_idx = rd["last_decoded_index"]
                         sampling_params = rd.get("sampling_params")
+                        skip_special_tokens = bool(getattr(sampling_params, "skip_special_tokens", False))
+                        spaces_between_special_tokens = bool(
+                            getattr(sampling_params, "spaces_between_special_tokens", True)
+                        )
                         has_stop_strings = bool(getattr(sampling_params, "stop", None))
                         if has_stop_strings:
                             stop_decode_interval_tokens = min(self.decode_interval_tokens, 4)
@@ -405,6 +412,8 @@ class EngineParsingMixin:
                                 request_id,
                                 decodable_tokens,
                                 finished=False,
+                                skip_special_tokens=skip_special_tokens,
+                                spaces_between_special_tokens=spaces_between_special_tokens,
                                 prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
                             )
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index
@@ -491,12 +500,19 @@ class EngineParsingMixin:
                         decodable_tokens = self._filter_eos_tokens(rd["generated_tokens"])
                         num_decodable = len(decodable_tokens)
                         last_idx = rd["last_decoded_index"]
+                        sampling_params = rd.get("sampling_params")
+                        skip_special_tokens = bool(getattr(sampling_params, "skip_special_tokens", False))
+                        spaces_between_special_tokens = bool(
+                            getattr(sampling_params, "spaces_between_special_tokens", True)
+                        )
                         if num_decodable > last_idx:
                             prompt_ctx = rd.get("prompt_token_ids") if last_idx == 0 else None
                             pipeline_result = self._decode_with_pipeline(
                                 request_id,
                                 decodable_tokens,
                                 finished=True,
+                                skip_special_tokens=skip_special_tokens,
+                                spaces_between_special_tokens=spaces_between_special_tokens,
                                 prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
                             )
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index

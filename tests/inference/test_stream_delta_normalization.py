@@ -14,7 +14,14 @@
 
 from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
 from easydel.inference.inference_engine_interface import BaseInferenceApiServer
-from easydel.inference.openai_api_modules import DeltaMessage
+from easydel.inference.openai_api_modules import (
+    ChatCompletionRequest,
+    ChatMessage,
+    DeltaMessage,
+    ExtractedToolCallInformation,
+    FunctionCall,
+    ToolCall,
+)
 from easydel.inference.tools.tool_calling_mixin import ToolCallingMixin
 
 
@@ -55,6 +62,20 @@ class _StringStreamingParser:
         return "delta-from-parser"
 
 
+class _BatchToolParser:
+    def extract_tool_calls(self, _response_text, _request):
+        return ExtractedToolCallInformation(
+            tools_called=True,
+            tool_calls=[
+                ToolCall(
+                    type="function",
+                    function=FunctionCall(name="lookup", arguments="{}"),
+                )
+            ],
+            content=None,
+        )
+
+
 class _Server(ToolCallingMixin):
     pass
 
@@ -87,6 +108,22 @@ def test_tool_calling_mixin_streaming_coerces_string_delta():
     )
     assert isinstance(delta, DeltaMessage)
     assert delta.content == "delta-from-parser"
+
+
+def test_tool_calling_mixin_batch_uses_tool_calls_finish_reason():
+    server = _Server()
+    server.tool_parsers = {"test-model": _BatchToolParser()}
+    request = ChatCompletionRequest(model="test-model", messages=[ChatMessage(role="user", content="hi")])
+
+    message, finish_reason = server.extract_tool_calls_batch(
+        response_text="<tool_call>ignored</tool_call>",
+        request=request,
+        model_name="test-model",
+    )
+
+    assert finish_reason == "tool_calls"
+    assert message.tool_calls is not None
+    assert message.tool_calls[0].function.name == "lookup"
 
 
 def test_compute_delta_text_handles_overlap_and_shrink_without_warnings():

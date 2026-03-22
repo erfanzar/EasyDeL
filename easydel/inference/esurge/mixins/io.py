@@ -104,12 +104,64 @@ class EngineIOMixin:
         self.abort_request(request_id)
         return True
 
+    @staticmethod
+    def _build_tool_parser_request(
+        *,
+        prompt: str,
+        tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ):
+        """Build a minimal chat request for parser-side schema access."""
+        if tools is None and tool_choice is None:
+            return None
+
+        from easydel.inference.openai_api_modules import ChatCompletionRequest
+
+        normalized_tools: list[dict[str, Any]] | None = None
+        if tools is not None:
+            normalized_tools = []
+            for tool in tools:
+                if hasattr(tool, "model_dump"):
+                    raw_tool = tool.model_dump(exclude_none=True)
+                elif isinstance(tool, dict):
+                    raw_tool = dict(tool)
+                else:
+                    continue
+
+                function_payload = raw_tool.get("function")
+                if isinstance(function_payload, dict):
+                    normalized_tools.append(
+                        {
+                            "type": str(raw_tool.get("type") or "function"),
+                            "function": function_payload,
+                        }
+                    )
+                    continue
+
+                if isinstance(raw_tool.get("name"), str):
+                    normalized_tools.append(
+                        {
+                            "type": "function",
+                            "function": raw_tool,
+                        }
+                    )
+
+        return ChatCompletionRequest.model_validate(
+            {
+                "model": "dummy",
+                "messages": [{"role": "user", "content": prompt}],
+                "tools": normalized_tools,
+                "tool_choice": tool_choice,
+            }
+        )
+
     def generate(
         self,
         prompts: str | list[str],
         sampling_params: SamplingParams | None = None,
         request_id: str | list[str] | None = None,
         use_tqdm: bool = True,
+        tool_parser_request: Any | None = None,
     ) -> list[RequestOutput]:
         """Generate completions for one or more prompts (blocking).
 
@@ -176,7 +228,13 @@ class EngineIOMixin:
                 request_id=req_id,
                 prompt=prompt,
             )
-            self._add_request(req_id, prompt, effective_params, prompt_token_ids=prompt_tokens)
+            self._add_request(
+                req_id,
+                prompt,
+                effective_params,
+                prompt_token_ids=prompt_tokens,
+                tool_parser_request=tool_parser_request,
+            )
 
         outputs = []
         pbar = None
@@ -234,6 +292,7 @@ class EngineIOMixin:
         prompts: str | list[str],
         sampling_params: SamplingParams | None = None,
         request_id: str | None = None,
+        tool_parser_request: Any | None = None,
     ) -> Iterator[RequestOutput]:
         """Stream generation output as tokens are produced.
 
@@ -293,7 +352,13 @@ class EngineIOMixin:
             request_id=request_id,
             prompt=prompt,
         )
-        self._add_request(request_id, prompt, effective_params, prompt_token_ids=prompt_tokens)
+        self._add_request(
+            request_id,
+            prompt,
+            effective_params,
+            prompt_token_ids=prompt_tokens,
+            tool_parser_request=tool_parser_request,
+        )
 
         self._ensure_scheduler_running(context="stream-start")
 
@@ -403,6 +468,7 @@ class EngineIOMixin:
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
         sampling_params: SamplingParams | None = None,
         request_id: str | None = None,
         *,
@@ -416,6 +482,7 @@ class EngineIOMixin:
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
         sampling_params: SamplingParams | None = None,
         request_id: str | None = None,
         *,
@@ -428,13 +495,14 @@ class EngineIOMixin:
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
         sampling_params: SamplingParams | None = None,
         request_id: str | None = None,
         stream: bool = False,
         chat_template: str | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
     ) -> RequestOutput | Iterator[RequestOutput]:
-        """High-level chat interface compatible with vLLM and OpenAI APIs.
+        """High-level chat interface compatible with OpenAI APIs.
 
         Provides a convenient chat-based interface for conversational AI applications.
         Automatically formats messages using the model's chat template and handles
@@ -514,6 +582,7 @@ class EngineIOMixin:
             return self._chat_multimodal(
                 messages=messages,
                 tools=tools,
+                tool_choice=tool_choice,
                 sampling_params=sampling_params,
                 request_id=request_id,
                 stream=stream,
@@ -528,15 +597,26 @@ class EngineIOMixin:
                 chat_template=chat_template,
                 chat_template_kwargs=chat_template_kwargs,
             )
+            tool_parser_request = self._build_tool_parser_request(
+                prompt=prompt,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
 
             if stream:
-                return self.stream(prompt, sampling_params=sampling_params, request_id=request_id)
+                return self.stream(
+                    prompt,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                    tool_parser_request=tool_parser_request,
+                )
             else:
                 outs = self.generate(
                     prompt,
                     sampling_params=sampling_params,
                     request_id=request_id,
                     use_tqdm=False,
+                    tool_parser_request=tool_parser_request,
                 )
                 return outs[0]
 
@@ -565,6 +645,7 @@ class EngineIOMixin:
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
         sampling_params: SamplingParams | None = None,
         request_id: str | None = None,
         stream: bool = False,
@@ -633,6 +714,11 @@ class EngineIOMixin:
             request_id=request_id,
             prompt=prompt,
         )
+        tool_parser_request = self._build_tool_parser_request(
+            prompt=prompt,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
 
         # Add request with vision data
         self._add_request(
@@ -640,6 +726,7 @@ class EngineIOMixin:
             prompt=prompt,
             sampling_params=effective_params,
             prompt_token_ids=prompt_token_ids,
+            tool_parser_request=tool_parser_request,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             pixel_values_videos=pixel_values_videos,

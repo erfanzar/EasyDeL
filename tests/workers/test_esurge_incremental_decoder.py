@@ -56,6 +56,29 @@ class DummyWordPieceTokenizer:
         return " ".join(tokens).replace(" ##", "")
 
 
+class RecordingSpecialTokenTokenizer:
+    def __init__(self):
+        self.calls = []
+
+    def decode(
+        self,
+        token_ids,
+        *,
+        skip_special_tokens=False,
+        spaces_between_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    ):
+        self.calls.append(
+            {
+                "token_ids": list(token_ids),
+                "skip_special_tokens": skip_special_tokens,
+                "spaces_between_special_tokens": spaces_between_special_tokens,
+                "clean_up_tokenization_spaces": clean_up_tokenization_spaces,
+            }
+        )
+        return "".join(f"<{token}>" for token in token_ids)
+
+
 def test_incremental_decoder_buffers_until_utf8_valid():
     tokenizer = DummyByteTokenizer()
     decoder = FastIncrementalDecoder(tokenizer, context_window=0)
@@ -84,6 +107,28 @@ def test_incremental_decoder_buffers_until_utf8_valid():
     assert has_buffer is False
 
 
+def test_incremental_decoder_forwards_spaces_between_special_tokens_flag():
+    tokenizer = RecordingSpecialTokenTokenizer()
+    decoder = FastIncrementalDecoder(tokenizer, context_window=0)
+    buffered: list[int] = []
+
+    delta, buffered, has_buffer = decoder.decode(
+        [42],
+        "",
+        buffered,
+        skip_special_tokens=False,
+        spaces_between_special_tokens=False,
+        context_tokens=[],
+    )
+
+    assert delta == "<42>"
+    assert buffered == []
+    assert has_buffer is False
+    assert tokenizer.calls
+    assert tokenizer.calls[0]["spaces_between_special_tokens"] is False
+    assert tokenizer.calls[0]["skip_special_tokens"] is False
+
+
 def test_incremental_decoder_uses_context_for_wordpiece():
     tokenizer = DummyWordPieceTokenizer()
     decoder = FastIncrementalDecoder(tokenizer, context_window=1)
@@ -94,6 +139,7 @@ def test_incremental_decoder_uses_context_for_wordpiece():
         "Hello",
         buffered,
         skip_special_tokens=True,
+        spaces_between_special_tokens=True,
         context_tokens=[1],
     )
     assert delta == "world"

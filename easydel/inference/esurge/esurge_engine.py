@@ -115,11 +115,16 @@ MLA_RAGGED_ATTN_MECHANISM = "multi_latent_ragged_page_attention_v1"
 
 
 def _set_requested_new(sp, n: int):  # pyright: ignore[reportUnusedFunction]
-    """Set the max_tokens or max_new_tokens attribute on a SamplingParams object.
+    """Set the generation length on a SamplingParams object.
+
+    Attempts to set both ``max_tokens`` and ``max_new_tokens`` attributes
+    when they exist, ensuring compatibility across different SamplingParams
+    variants.
 
     Args:
-        sp: SamplingParams instance to modify.
-        n: Number of tokens to set.
+        sp: A SamplingParams-like object whose token-limit fields will be
+            mutated in place.
+        n: The desired number of new tokens to generate.
     """
     if hasattr(sp, "max_tokens"):
         sp.max_tokens = int(n)
@@ -128,7 +133,19 @@ def _set_requested_new(sp, n: int):  # pyright: ignore[reportUnusedFunction]
 
 
 def _normalize_data_parallelism_axis(axis: str) -> str:
-    """Normalize and validate the requested data-parallel axis name."""
+    """Normalize and validate a data-parallel axis name.
+
+    Strips whitespace and ensures the result is non-empty.
+
+    Args:
+        axis: Raw axis name string to normalize.
+
+    Returns:
+        The stripped, validated axis name.
+
+    Raises:
+        ValueError: If the axis name is empty after stripping.
+    """
     axis_name = str(axis).strip()
     if not axis_name:
         raise ValueError("`data_parallelism_axis` must be a non-empty string.")
@@ -136,7 +153,19 @@ def _normalize_data_parallelism_axis(axis: str) -> str:
 
 
 def _normalize_attn_mechanism_value(attn_mechanism: Any) -> str | None:
-    """Normalize attention mechanism enum/string to plain string."""
+    """Normalize an attention mechanism identifier to a plain string.
+
+    Handles enum-like objects (with a ``.value`` attribute) as well as
+    raw strings.
+
+    Args:
+        attn_mechanism: An attention mechanism identifier. May be ``None``,
+            a string, or an enum with a ``value`` attribute.
+
+    Returns:
+        The string representation of the mechanism, or ``None`` if the
+        input is ``None``.
+    """
     if attn_mechanism is None:
         return None
     if hasattr(attn_mechanism, "value"):
@@ -145,7 +174,23 @@ def _normalize_attn_mechanism_value(attn_mechanism: Any) -> str | None:
 
 
 def _text_config_uses_mla(text_config: Any) -> bool:
-    """Best-effort detection for MLA architectures from text config."""
+    """Detect whether a text config indicates Multi-Latent Attention (MLA).
+
+    Uses several heuristics in order of priority:
+    1. Explicit ``attn_mechanism`` or ``mla_attn_mechanism`` matching the
+       MLA ragged attention constant.
+    2. An ``attention_type`` attribute equal to ``"mla"``.
+    3. A callable or boolean ``is_mla`` attribute.
+    4. Presence of ``kv_lora_rank`` (or ``kv_lora_dim``) together with
+       ``qk_rope_head_dim`` or ``qk_nope_head_dim``.
+
+    Args:
+        text_config: A model text configuration object (e.g.,
+            ``PretrainedConfig``). May be ``None``.
+
+    Returns:
+        ``True`` if the config signals MLA usage, ``False`` otherwise.
+    """
     if text_config is None:
         return False
 
@@ -187,7 +232,21 @@ def _text_config_uses_mla(text_config: Any) -> bool:
 
 
 def _detect_mla_attention_mix(model: Any, text_config: Any = None) -> tuple[bool, bool]:
-    """Detect whether a model has MLA and/or non-MLA UnifiedAttention blocks."""
+    """Detect whether a model contains MLA and/or non-MLA attention blocks.
+
+    Traverses all ``UnifiedAttention`` sub-modules in *model* and inspects
+    each one's ``attention_type``. Falls back to config-level heuristics
+    via ``_text_config_uses_mla`` when no attention modules are found.
+
+    Args:
+        model: An EasyDeL model instance to inspect.
+        text_config: Optional text configuration used as a fallback when
+            module traversal yields no results.
+
+    Returns:
+        A ``(has_mla, has_non_mla)`` tuple of booleans indicating
+        whether MLA and/or standard attention blocks were detected.
+    """
     has_mla_attention = False
     has_non_mla_attention = False
 
@@ -213,7 +272,22 @@ def _detect_mla_attention_mix(model: Any, text_config: Any = None) -> tuple[bool
 
 
 def _with_data_parallel_axis(partition_axis: Any, data_parallelism_axis: str) -> Any:
-    """Return partition-axis metadata with an updated data-parallel axis."""
+    """Return partition-axis metadata with the data-parallel axis set.
+
+    Handles multiple input shapes: ``None``, plain ``dict``, objects with a
+    mutable ``data_parallel_axis`` attribute, and generic objects whose
+    ``__dict__`` can be merged into a new instance. Falls back to returning
+    a minimal dict when other strategies fail.
+
+    Args:
+        partition_axis: Existing partition-axis metadata. May be ``None``,
+            a ``dict``, or an object with ``data_parallel_axis``.
+        data_parallelism_axis: The axis name to assign for data parallelism.
+
+    Returns:
+        Updated partition-axis metadata (same type as input when possible,
+        otherwise a ``dict``).
+    """
     if partition_axis is None:
         return {"data_parallel_axis": data_parallelism_axis}
 

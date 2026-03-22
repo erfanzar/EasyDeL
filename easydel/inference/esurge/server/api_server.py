@@ -1090,6 +1090,19 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         if top_k < 0:
             top_k = 0
 
+        def _coerce_optional_bool(value: tp.Any, default: bool) -> bool:
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"1", "true", "yes", "y", "on"}:
+                    return True
+                if lowered in {"0", "false", "no", "n", "off"}:
+                    return False
+            return bool(value)
+
         return SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1101,6 +1114,10 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             min_p=float(getattr(request, "min_p", 0.0)),
             n=int(request.n or 1),
             stop=request.stop,
+            skip_special_tokens=_coerce_optional_bool(getattr(request, "skip_special_tokens", None), False),
+            spaces_between_special_tokens=_coerce_optional_bool(
+                getattr(request, "spaces_between_special_tokens", None), True
+            ),
         )
 
     def _prepare_chat_input(self, request: ChatCompletionRequest, esurge: eSurge) -> str:
@@ -1479,23 +1496,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                 engine_messages.insert(0, {"role": "system", "content": instructions})
 
             raw_tools, tools_for_template = self._extract_responses_tools(payload)
-            tool_request: ChatCompletionRequest | None = None
-            if raw_tools:
-                try:
-                    tool_request = ChatCompletionRequest.model_validate(
-                        {
-                            "model": model,
-                            "messages": self._flatten_messages_to_text(engine_messages),
-                            "tools": raw_tools,
-                            "tool_choice": payload.get("tool_choice"),
-                            "temperature": payload.get("temperature", 1.0),
-                            "top_p": payload.get("top_p", 1.0),
-                            "max_tokens": max_tokens,
-                            "stream": bool(payload.get("stream", False)),
-                        }
-                    )
-                except Exception:
-                    tool_request = None
 
             sampling_params = self._create_sampling_params_from_responses(payload, max_tokens)
             sampling_params = self._apply_extra_stops_to_sampling_params(sampling_params)
@@ -1535,17 +1535,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                     output.tool_calls or (primary_output.tool_calls if primary_output is not None else None)
                 )
 
-                if tool_calls_payload is None and tool_request is not None:
-                    message, _finish_reason = self.extract_tool_calls_batch(
-                        response_text=response_text,
-                        request=tool_request,
-                        model_name=model,
-                    )
-                    tool_calls_payload = self._jsonify_tool_calls(message.model_extra.get("tool_calls"))
-                    if tool_calls_payload is not None:
-                        response_text = tp.cast(str, message.content) if message.content is not None else ""
-                    elif message.content is not None:
-                        response_text = tp.cast(str, message.content)
                 if tool_calls_payload:
                     # Prefer canonical function_call items over raw protocol text.
                     response_text = ""
@@ -1713,36 +1702,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                             if engine_has_parsers:
                                 previous_text = current_text
                                 previous_token_ids = current_token_ids
-                            elif tool_request is not None:
-                                delta_token_ids = (
-                                    current_token_ids[len(previous_token_ids) :]
-                                    if previous_token_ids
-                                    else current_token_ids
-                                )
-                                raw_delta_message = self.extract_tool_calls_streaming(
-                                    model_name=model,
-                                    previous_text=previous_text,
-                                    current_text=current_text,
-                                    delta_text=delta_text,
-                                    previous_token_ids=previous_token_ids,
-                                    current_token_ids=current_token_ids,
-                                    delta_token_ids=delta_token_ids,
-                                    request=tool_request,
-                                )
-                                delta_message = self._coerce_stream_delta_message(
-                                    raw_delta_message,
-                                    fallback_text=delta_text,
-                                    default_role="assistant",
-                                )
-                                previous_text = current_text
-                                previous_token_ids = current_token_ids
-
-                                if delta_message is not None:
-                                    if isinstance(delta_message.content, str):
-                                        delta_text = delta_message.content
-                                    elif delta_message.tool_calls:
-                                        delta_text = ""
-                                    delta_tool_calls_raw = delta_message.tool_calls
                             else:
                                 previous_text = current_text
                                 previous_token_ids = current_token_ids
@@ -1867,8 +1826,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                                     },
                                 )
 
-                            if raw_tools and self._looks_like_tool_protocol_text(delta_text):
-                                delta_text = ""
                             if saw_function_call_delta:
                                 delta_text = ""
 
@@ -1937,17 +1894,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                             or (primary_output.tool_calls if primary_output is not None else None)
                         )
 
-                        if tool_calls_payload is None and tool_request is not None and full_text:
-                            message, _finish_reason = self.extract_tool_calls_batch(
-                                response_text=full_text,
-                                request=tool_request,
-                                model_name=model,
-                            )
-                            tool_calls_payload = self._jsonify_tool_calls(message.model_extra.get("tool_calls"))
-                            if tool_calls_payload is not None:
-                                full_text = tp.cast(str, message.content) if message.content is not None else ""
-                            elif message.content is not None:
-                                full_text = tp.cast(str, message.content)
                         if tool_calls_payload or saw_function_call_delta:
                             full_text = ""
 
@@ -2277,11 +2223,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                 self.metrics.average_tokens_per_second * 0.9 + tokens_per_second * 0.1
             )
 
-        response_text = output.accumulated_text or output.get_text()
-        engine_has_parsers = (hasattr(esurge, "_tool_parser_class") and esurge._tool_parser_class is not None) or (
-            hasattr(esurge, "_reasoning_parser_class") and esurge._reasoning_parser_class is not None
-        )
-
         choices: list[ChatCompletionResponseChoice] = []
         for idx, completion in enumerate(output.outputs):
             if completion.tool_calls:
@@ -2292,23 +2233,13 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                     reasoning_content=completion.reasoning_content,
                 )
                 finish_reason = "tool_calls"
-            elif completion.reasoning_content is not None or engine_has_parsers:
+            else:
                 message = ChatMessage(
                     role="assistant",
                     content=completion.text,
                     reasoning_content=completion.reasoning_content,
                 )
                 finish_reason = completion.finish_reason or "stop"
-            else:
-                message, finish_reason_extracted = self.extract_tool_calls_batch(
-                    response_text=response_text,
-                    request=request,
-                    model_name=request.model,
-                )
-                if finish_reason_extracted != "function_call" and completion.finish_reason:
-                    finish_reason = completion.finish_reason
-                else:
-                    finish_reason = finish_reason_extracted
             if finish_reason == "finished":
                 finish_reason = "stop"
             choices.append(ChatCompletionResponseChoice(index=idx, message=message, finish_reason=finish_reason))
@@ -2350,6 +2281,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                     esurge.chat(
                         messages=messages,
                         tools=self.extract_tools(request=request),
+                        tool_choice=request.tool_choice,
                         sampling_params=sampling_params,
                         request_id=request_id,
                         stream=False,
@@ -2385,7 +2317,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             """
             async with self._acquire_generation_slot():
                 prompt_tokens = 0
-                tool_parser = self.get_tool_parser_for_model(request.model)
                 previous_text = ""
                 previous_token_ids: list[int] = []
                 queue = self._start_stream_task(
@@ -2394,6 +2325,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                         esurge.chat(
                             messages=messages,
                             tools=tools,
+                            tool_choice=request.tool_choice,
                             sampling_params=sampling_params,
                             request_id=request_id,
                             stream=True,
@@ -2458,34 +2390,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                                 tool_calls=output.delta_tool_calls,
                                 reasoning_content=output.delta_reasoning_content,
                             )
-                        elif tool_parser:
-                            current_token_ids = output.outputs[0].token_ids if output.outputs else []
-                            delta_token_ids = (
-                                current_token_ids[len(previous_token_ids) :] if previous_token_ids else current_token_ids
-                            )
-
-                            raw_delta_message = self.extract_tool_calls_streaming(
-                                model_name=request.model,
-                                previous_text=previous_text,
-                                current_text=current_text,
-                                delta_text=delta_text,
-                                previous_token_ids=previous_token_ids,
-                                current_token_ids=current_token_ids,
-                                delta_token_ids=delta_token_ids,
-                                request=request,
-                            )
-                            delta_message = self._coerce_stream_delta_message(
-                                raw_delta_message,
-                                fallback_text=delta_text,
-                                default_role="assistant",
-                            )
-                            previous_text = current_text
-                            previous_token_ids = current_token_ids
-
-                            if delta_message is None and request.tools:
-                                continue
-                            if delta_message is None:
-                                delta_message = DeltaMessage(content=delta_text, role="assistant")
                         else:
                             previous_text = current_text
                             current_token_ids = output.outputs[0].token_ids if output.outputs else []
@@ -2502,12 +2406,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
                         if delta_message and delta_message.tool_calls:
                             saw_tool_call_delta = True
-                        if delta_message and request.tools:
-                            content_text = delta_message.content if isinstance(delta_message.content, str) else None
-                            if self._looks_like_tool_protocol_text(content_text):
-                                delta_message.content = None
-                        if saw_tool_call_delta and delta_message:
-                            delta_message.content = None
 
                         chunk = ChatCompletionStreamResponse(
                             model=request.model,

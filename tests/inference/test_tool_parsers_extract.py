@@ -29,6 +29,7 @@ from easydel.inference.tools.parsers import (
     MinimaxM2ToolParser,
     Olmo3PythonicToolParser,
     OpenAIToolParser,
+    Qwen3CoderToolParser,
     Qwen3XMLToolParser,
     xLAMToolParser,
 )
@@ -56,6 +57,16 @@ class _DummyTokenizer:
 
 def _make_request() -> ChatCompletionRequest:
     return ChatCompletionRequest(model="dummy", messages=[ChatMessage(role="user", content="hi")])
+
+
+def _make_request_with_tools(tools: list[dict]) -> ChatCompletionRequest:
+    return ChatCompletionRequest.model_validate(
+        {
+            "model": "dummy",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+        }
+    )
 
 
 @pytest.fixture()
@@ -250,6 +261,211 @@ def test_qwen3xml_extract_tool_calls(dummy_tokenizer):
     assert extracted.tool_calls[0].function.name == "foo"
     assert json.loads(extracted.tool_calls[0].function.arguments) == {"a": "1"}
     assert extracted.tool_calls[0].id
+
+
+def test_qwen3xml_extract_tool_calls_without_wrapper_and_with_named_attrs(dummy_tokenizer):
+    parser = Qwen3XMLToolParser(dummy_tokenizer)
+    request = _make_request_with_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {"type": "integer"},
+                            "enabled": {"type": "boolean"},
+                        },
+                    },
+                },
+            }
+        ]
+    )
+    output = (
+        '<function name="lookup"><parameter=limit>5</parameter><parameter name="enabled">true</parameter></function>'
+    )
+
+    extracted = parser.extract_tool_calls(output, request)
+
+    assert extracted.tools_called is True
+    assert len(extracted.tool_calls) == 1
+    assert extracted.tool_calls[0].function.name == "lookup"
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {"limit": 5, "enabled": True}
+
+
+def test_qwen3xml_streaming_emits_completed_bare_function(dummy_tokenizer):
+    parser = Qwen3XMLToolParser(dummy_tokenizer)
+    request = _make_request()
+
+    first = parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text="preface <function=lookup>",
+        delta_text="preface <function=lookup>",
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=request,
+    )
+    second = parser.extract_tool_calls_streaming(
+        previous_text="preface <function=lookup>",
+        current_text="preface <function=lookup><parameter=query>AI</parameter></function>",
+        delta_text="<parameter=query>AI</parameter></function>",
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=request,
+    )
+
+    assert first is not None
+    assert first.content == "preface "
+    assert second is not None
+    assert second.tool_calls is not None
+    assert second.tool_calls[0].function.name == "lookup"
+    assert json.loads(second.tool_calls[0].function.arguments) == {"query": "AI"}
+
+
+def test_qwen3coder_extract_tool_calls_converts_types_like_vllm(dummy_tokenizer):
+    parser = Qwen3CoderToolParser(dummy_tokenizer)
+    request = _make_request_with_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "limit": {"type": "integer"},
+                            "return_metadata": {"type": "boolean"},
+                            "filters": {"anyOf": [{"type": "object"}, {"type": "null"}]},
+                            "tags": {"type": "array"},
+                        },
+                    },
+                },
+            }
+        ]
+    )
+    output = (
+        "<tool_call><function=lookup>"
+        "<parameter=query>\nAI\n</parameter>"
+        "<parameter=limit>\n5\n</parameter>"
+        "<parameter=return_metadata>\ntrue\n</parameter>"
+        '<parameter=filters>\n{"region":"us-en"}\n</parameter>'
+        '<parameter=tags>\n["news","ml"]\n</parameter>'
+        "</function></tool_call>"
+    )
+
+    extracted = parser.extract_tool_calls(output, request)
+
+    assert extracted.tools_called is True
+    assert len(extracted.tool_calls) == 1
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {
+        "query": "AI",
+        "limit": 5,
+        "return_metadata": True,
+        "filters": {"region": "us-en"},
+        "tags": ["news", "ml"],
+    }
+
+
+def test_qwen3coder_extract_tool_calls_filters_invalid_partial_functions(dummy_tokenizer):
+    parser = Qwen3CoderToolParser(dummy_tokenizer)
+    request = _make_request()
+    output = "<tool_call><function=lookup</function></tool_call>"
+
+    extracted = parser.extract_tool_calls(output, request)
+
+    assert extracted.tools_called is False
+    assert extracted.tool_calls == []
+    assert extracted.content is None
+
+
+def test_qwen3coder_streaming_initializes_stream_buffers(dummy_tokenizer):
+    parser = Qwen3CoderToolParser(dummy_tokenizer)
+    request = _make_request()
+    first_delta = parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text="<tool_call>",
+        delta_text="<tool_call>",
+        previous_token_ids=[],
+        current_token_ids=[1],
+        delta_token_ids=[1],
+        request=request,
+    )
+    delta = parser.extract_tool_calls_streaming(
+        previous_text="<tool_call>",
+        current_text="<tool_call><function=lookup>",
+        delta_text="<function=lookup>",
+        previous_token_ids=[1],
+        current_token_ids=[1],
+        delta_token_ids=[],
+        request=request,
+    )
+
+    assert first_delta is None
+    assert delta is not None
+    assert delta.tool_calls is not None
+    assert delta.tool_calls[0].function.name == "lookup"
+    assert parser.prev_tool_call_arr == [{"name": "lookup", "arguments": "{}"}]
+    assert parser.streamed_args_for_tool == [""]
+
+
+def test_deepseek_v32_streaming_buffers_until_complete_invoke(dummy_tokenizer):
+    parser = DeepSeekV32ToolParser(dummy_tokenizer)
+    request = _make_request_with_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "limit": {"type": "integer"},
+                        },
+                    },
+                },
+            }
+        ]
+    )
+
+    first = parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text="hi <｜DSML｜function_calls>",
+        delta_text="hi <｜DSML｜function_calls>",
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=request,
+    )
+    second = parser.extract_tool_calls_streaming(
+        previous_text="hi <｜DSML｜function_calls>",
+        current_text=(
+            "hi <｜DSML｜function_calls>"
+            '<｜DSML｜invoke name="lookup">'
+            '<｜DSML｜parameter name="limit" string="true">5</｜DSML｜parameter>'
+            "</｜DSML｜invoke>"
+        ),
+        delta_text=(
+            '<｜DSML｜invoke name="lookup">'
+            '<｜DSML｜parameter name="limit" string="true">5</｜DSML｜parameter>'
+            "</｜DSML｜invoke>"
+        ),
+        previous_token_ids=[],
+        current_token_ids=[],
+        delta_token_ids=[],
+        request=request,
+    )
+
+    assert first is not None
+    assert first.content == "hi "
+    assert first.tool_calls in (None, [])
+    assert second is not None
+    assert second.tool_calls is not None
+    assert second.tool_calls[0].function.name == "lookup"
+    assert json.loads(second.tool_calls[0].function.arguments) == {"limit": 5}
 
 
 def test_xlam_extract_tool_calls(dummy_tokenizer):

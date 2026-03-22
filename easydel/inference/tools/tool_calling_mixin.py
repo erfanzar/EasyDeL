@@ -174,7 +174,7 @@ class ToolCallingMixin:
             tuple[ChatMessage, str]: A tuple containing:
                 - ChatMessage: The assistant message with role, content, and
                   optional tool_calls field populated if tools were detected.
-                - str: The finish_reason - "function_call" if tools were called,
+                - str: The finish_reason - "tool_calls" if tools were called,
                   or "stop" for regular text completion.
 
         Example:
@@ -183,7 +183,7 @@ class ToolCallingMixin:
             ...     response, request, "my_model"
             ... )
             >>> print(reason)
-            'function_call'
+            'tool_calls'
             >>> print(message.tool_calls[0].function.name)
             'get_weather'
 
@@ -204,7 +204,7 @@ class ToolCallingMixin:
                 content=extracted.content,
                 tool_calls=extracted.tool_calls,
             )
-            finish_reason = "function_call"
+            finish_reason = "tool_calls"
         else:
             message = ChatMessage(
                 role="assistant",

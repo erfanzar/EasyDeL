@@ -282,6 +282,16 @@ def create_constant_length_dataset(
         raise ValueError("Either `dataset_text_field` or `formatting_func` should be provided.")
 
     def constant_length_generator() -> collections.abc.Iterator[dict[str, jnp.ndarray]]:
+        """Generate fixed-length tokenized examples from a text dataset.
+
+        Buffers raw text from the dataset, tokenizes in bulk, concatenates
+        all tokens, and slices into equal-length sequences of ``seq_length``.
+        When ``infinite`` is True the dataset iterator resets upon exhaustion.
+
+        Yields:
+            dict with ``input_ids`` and ``attention_mask`` as jnp arrays
+            of shape ``(seq_length,)``.
+        """
         iterator = iter(dataset)
         more_examples = True
 
@@ -465,6 +475,19 @@ class DataCollatorForCompletionOnlyLM:
         ignore_index: int = -100,
         **kwargs,
     ):
+        """Initialize the completion-only language modeling data collator.
+
+        Args:
+            processing_class: Tokenizer instance or a HuggingFace model name
+                to load a tokenizer from.
+            response_template: String or token ID list that marks the start
+                of the response/completion portion in each example.
+            instruction_template: Optional string or token ID list marking
+                the start of instruction turns (for multi-turn training).
+            mlm: Whether to use masked language modeling. Defaults to False.
+            ignore_index: Label ID used to mask non-completion tokens in loss
+                computation. Defaults to -100.
+        """
         from transformers import AutoTokenizer
 
         if isinstance(processing_class, str):
@@ -500,6 +523,19 @@ class DataCollatorForCompletionOnlyLM:
         self.ignore_index = ignore_index
 
     def _whole_word_mask(self, input_tokens: list[str], max_predictions=512):
+        """Create a whole-word mask for masked language modeling.
+
+        Groups sub-word tokens (identified by ``##`` prefixes) into whole
+        words, then randomly selects ~15% of tokens to mask while respecting
+        word boundaries.
+
+        Args:
+            input_tokens: List of string tokens from the tokenizer.
+            max_predictions: Maximum number of tokens to mask per sequence.
+
+        Returns:
+            list[int]: Binary mask where 1 indicates a token selected for masking.
+        """
         from transformers import BertTokenizer, BertTokenizerFast
 
         if not isinstance(self.processing_class, BertTokenizer | BertTokenizerFast):
@@ -575,6 +611,18 @@ class DataCollatorForCompletionOnlyLM:
         return inputs, labels
 
     def jax_call(self, examples: list[list[int] | tp.Any | dict[str, tp.Any]]) -> dict[str, tp.Any]:
+        """Collate and apply whole-word masking to a batch using JAX arrays.
+
+        Pads the batch, generates whole-word masks, and applies random token
+        masking for MLM pre-training.
+
+        Args:
+            examples: List of examples, each either a list of token IDs or
+                a dict containing ``input_ids`` (and optionally ``chinese_ref``).
+
+        Returns:
+            dict with ``input_ids`` and ``labels`` as JAX arrays.
+        """
         if isinstance(examples[0], collections.abc.Mapping):
             input_ids = [e["input_ids"] for e in examples]
         else:
@@ -609,6 +657,19 @@ class DataCollatorForCompletionOnlyLM:
         return {"input_ids": inputs, "labels": labels}
 
     def __call__(self, examples: list[list[int] | tp.Any | dict[str, tp.Any]]) -> dict[str, tp.Any]:
+        """Collate examples and mask labels so loss is only on completions.
+
+        Applies whole-word MLM masking via ``jax_call``, then sets labels to
+        ``ignore_index`` for all non-completion tokens based on the response
+        (and optionally instruction) template boundaries.
+
+        Args:
+            examples: List of examples, each either a list of token IDs or
+                a dict containing ``input_ids``.
+
+        Returns:
+            dict with ``input_ids`` and ``labels`` as JAX arrays.
+        """
         batch = self.jax_call(examples)
 
         if self.instruction_template is None:
@@ -763,6 +824,16 @@ class RewardDataCollatorWithPaddingTFDS:
             target_len = None
 
         def _pad_right(arr: jnp.ndarray, pad_value: int) -> jnp.ndarray:
+            """Pad or truncate an array to ``target_len`` on the right side.
+
+            Args:
+                arr: Input JAX array to pad or truncate.
+                pad_value: Value used for padding.
+
+            Returns:
+                Array with its last dimension matching ``target_len``, or
+                unchanged if ``target_len`` is None.
+            """
             if target_len is None:
                 return arr
             if arr.shape[-1] > target_len:
@@ -859,6 +930,16 @@ class RewardDataCollatorWithPaddingGrain:
             pad_token_id = 0
 
         def _pad_right(arr: np.ndarray, pad_value: int) -> np.ndarray:
+            """Pad or truncate a NumPy array to ``max_length`` on the right side.
+
+            Args:
+                arr: Input NumPy array to pad or truncate.
+                pad_value: Value used for padding.
+
+            Returns:
+                Array with its last dimension matching ``max_length``, or
+                unchanged if padding is disabled.
+            """
             if self.max_length is None or not self.padding:
                 return arr
             if arr.shape[-1] > self.max_length:
@@ -914,6 +995,15 @@ class DataCollatorForPreferenceTFDS:
     is_encoder_decoder: bool | None = False
 
     def _get_prompt_arrays(self, feature: dict[str, tp.Any]) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Extract prompt input IDs and attention mask as JAX arrays.
+
+        Args:
+            feature: Single example dict containing ``prompt_input_ids``
+                and optionally ``prompt_attention_mask``.
+
+        Returns:
+            Tuple of (prompt_input_ids, prompt_attention_mask) as jnp arrays.
+        """
         prompt_input_ids = jnp.asarray(feature["prompt_input_ids"])
         prompt_attention_mask = feature.get("prompt_attention_mask")
         if prompt_attention_mask is None:
@@ -927,6 +1017,19 @@ class DataCollatorForPreferenceTFDS:
         feature: dict[str, tp.Any],
         prefix: str,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Extract completion token IDs and attention mask as JAX arrays.
+
+        Strips prompt tokens and padding from the prefixed fields (e.g.
+        ``chosen_input_ids`` or ``rejected_input_ids``) using labels or
+        prompt length, returning only valid completion tokens.
+
+        Args:
+            feature: Single example dict with prefixed input/mask/label keys.
+            prefix: Key prefix, typically ``"chosen"`` or ``"rejected"``.
+
+        Returns:
+            Tuple of (completion_input_ids, completion_attention_mask).
+        """
         input_ids = jnp.asarray(feature[f"{prefix}_input_ids"])
         attention_mask = feature.get(f"{prefix}_attention_mask")
         if attention_mask is None:
@@ -1061,6 +1164,15 @@ class DataCollatorForPreferenceGrain:
     is_encoder_decoder: bool | None = False
 
     def _get_prompt_arrays(self, features: dict[str, tp.Any]) -> tuple[np.ndarray, np.ndarray]:
+        """Extract prompt input IDs and attention mask as NumPy arrays.
+
+        Args:
+            features: Single example dict containing ``prompt_input_ids``
+                and optionally ``prompt_attention_mask``.
+
+        Returns:
+            Tuple of (prompt_input_ids, prompt_attention_mask) as np arrays.
+        """
         prompt_input_ids = np.asarray(features["prompt_input_ids"])
         prompt_attention_mask = features.get("prompt_attention_mask")
         if prompt_attention_mask is None:
@@ -1074,6 +1186,19 @@ class DataCollatorForPreferenceGrain:
         features: dict[str, tp.Any],
         prefix: str,
     ) -> tuple[np.ndarray, np.ndarray]:
+        """Extract completion token IDs and attention mask as NumPy arrays.
+
+        Strips prompt tokens and padding from the prefixed fields (e.g.
+        ``chosen_input_ids`` or ``rejected_input_ids``) using labels or
+        prompt length, returning only valid completion tokens.
+
+        Args:
+            features: Single example dict with prefixed input/mask/label keys.
+            prefix: Key prefix, typically ``"chosen"`` or ``"rejected"``.
+
+        Returns:
+            Tuple of (completion_input_ids, completion_attention_mask).
+        """
         input_ids = np.asarray(features[f"{prefix}_input_ids"])
         attention_mask = features.get(f"{prefix}_attention_mask")
         if attention_mask is None:
@@ -1184,6 +1309,20 @@ class DataCollatorForPreferenceGrain:
 
 @dataclass
 class _BCODataCollatorMixin:
+    """Shared padding utilities for BCO (Binary Classifier Optimization) data collators.
+
+    Provides helper methods to pad prompt, completion, and full-sequence
+    arrays to their respective maximum lengths. Subclassed by both the
+    TFDS and Grain BCO collators.
+
+    Attributes:
+        max_prompt_length: Maximum number of tokens for the prompt portion.
+        max_completion_length: Maximum number of tokens for the completion portion.
+        pad_token_id: Token ID used for input padding.
+        label_pad_token_id: Token ID used for label padding (ignored in loss).
+        is_encoder_decoder: Whether the model uses an encoder-decoder architecture.
+    """
+
     max_prompt_length: int
     max_completion_length: int
     pad_token_id: int
@@ -1196,9 +1335,28 @@ class _BCODataCollatorMixin:
         return self.max_prompt_length + self.max_completion_length
 
     def _pad_prompt(self, arrays: list[np.ndarray], padding_value: int, side: str = "left") -> jnp.ndarray:
+        """Pad a list of prompt arrays to ``max_prompt_length``.
+
+        Args:
+            arrays: List of 1-D arrays to pad and stack.
+            padding_value: Value used for padding.
+            side: Padding side, ``"left"`` (default) or ``"right"``.
+
+        Returns:
+            Batched JAX array of shape ``(len(arrays), max_prompt_length)``.
+        """
         return pad(arrays, self.max_prompt_length, padding_value=padding_value, padding_side=side)
 
     def _pad_completion(self, arrays: list[np.ndarray], padding_value: int) -> jnp.ndarray:
+        """Pad a list of completion arrays to ``max_completion_length`` (right-padded).
+
+        Args:
+            arrays: List of 1-D arrays to pad and stack.
+            padding_value: Value used for padding.
+
+        Returns:
+            Batched JAX array of shape ``(len(arrays), max_completion_length)``.
+        """
         return pad(arrays, self.max_completion_length, padding_value=padding_value, padding_side="right")
 
     def _pad_full_sequence(self, arrays: list[np.ndarray], padding_value: int, side: str = "right") -> jnp.ndarray:
@@ -1206,6 +1364,17 @@ class _BCODataCollatorMixin:
         return pad(arrays, self.max_length, padding_value=padding_value, padding_side=side)
 
     def _pad_optional(self, arrays: list[np.ndarray], max_length: int, padding_value: int, side: str) -> jnp.ndarray:
+        """Pad a list of arrays to an arbitrary ``max_length``.
+
+        Args:
+            arrays: List of 1-D arrays to pad and stack.
+            max_length: Target sequence length.
+            padding_value: Value used for padding.
+            side: Padding side, ``"left"`` or ``"right"``.
+
+        Returns:
+            Batched JAX array of shape ``(len(arrays), max_length)``.
+        """
         return pad(arrays, max_length, padding_value=padding_value, padding_side=side)
 
 
@@ -1213,6 +1382,19 @@ class BCODataCollatorTFDS(_BCODataCollatorMixin):
     """Data collator for BCO training with TFDS backends."""
 
     def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, jnp.ndarray]:
+        """Collate a batch of BCO examples for TFDS-based training.
+
+        Pads prompt, completion, and label arrays and assembles them into
+        a single batch dict. Optionally includes embedding and reference
+        log-probability fields when present.
+
+        Args:
+            features: List of example dicts, each containing prompt/completion
+                token IDs, attention masks, labels, and a binary ``label`` flag.
+
+        Returns:
+            Batched dict of JAX arrays ready for the BCO trainer.
+        """
         prompt_input_ids = [np.asarray(f["prompt_input_ids"], dtype=np.int32) for f in features]
         prompt_attention_mask = [np.asarray(f["prompt_attention_mask"], dtype=np.int32) for f in features]
         completion_input_ids = [np.asarray(f["completion_input_ids"], dtype=np.int32) for f in features]
@@ -1246,6 +1428,19 @@ class BCODataCollatorGrain(_BCODataCollatorMixin):
     """Grain-compatible BCO data collator."""
 
     def __call__(self, feature: dict[str, tp.Any]) -> dict[str, np.ndarray]:
+        """Collate a single BCO example for Grain-based training.
+
+        Pads prompt, completion, and label arrays to their respective
+        maximum lengths. Optionally includes embedding and reference
+        log-probability fields when present.
+
+        Args:
+            feature: Single example dict containing prompt/completion
+                token IDs, attention masks, labels, and a binary ``label`` flag.
+
+        Returns:
+            Dict of NumPy arrays ready for the BCO trainer.
+        """
         prompt_input_ids = np.asarray(feature["prompt_input_ids"], dtype=np.int32)
         prompt_attention_mask = np.asarray(feature["prompt_attention_mask"], dtype=np.int32)
         completion_input_ids = np.asarray(feature["completion_input_ids"], dtype=np.int32)
@@ -1303,6 +1498,19 @@ class GRPODataCollatorTFDS:
     pad_token_id: int = 0
 
     def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, jnp.ndarray]:
+        """Collate a batch of GRPO prompt examples for TFDS-based training.
+
+        Left-pads input IDs and attention masks to ``max_prompt_length``,
+        and stacks any additional feature keys (e.g. multimodal inputs or
+        generation kwargs) present across the batch.
+
+        Args:
+            features: List of example dicts, each containing at minimum
+                ``input_ids`` and ``attention_mask``.
+
+        Returns:
+            Batched dict of JAX arrays ready for the GRPO trainer.
+        """
         input_ids = [np.asarray(f["input_ids"], dtype=np.int32) for f in features]
         attention_mask = [np.asarray(f["attention_mask"], dtype=np.int32) for f in features]
 
@@ -1495,6 +1703,19 @@ class GRPODataCollatorGrain:
     pad_token_id: int = 0
 
     def __call__(self, feature: dict[str, tp.Any]) -> dict[str, np.ndarray]:
+        """Collate a single GRPO prompt example for Grain-based training.
+
+        Left-pads input IDs and attention masks to ``max_prompt_length``,
+        and includes any additional feature keys (e.g. multimodal inputs or
+        generation kwargs) present in the example.
+
+        Args:
+            feature: Single example dict containing at minimum
+                ``input_ids`` and ``attention_mask``.
+
+        Returns:
+            Dict of NumPy arrays ready for the GRPO trainer.
+        """
         input_ids = np.asarray(feature["input_ids"], dtype=np.int32)
         attention_mask = np.asarray(feature["attention_mask"], dtype=np.int32)
 
