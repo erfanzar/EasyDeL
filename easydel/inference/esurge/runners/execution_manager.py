@@ -491,7 +491,12 @@ class ExecutionManager:
         self._debug_baselines.clear()
 
     def has_compiled_variants(self) -> bool:
-        """Return whether model and sampler executors have compiled variants."""
+        """Check whether both model and sampler executors have compiled variants.
+
+        Returns:
+            True if both the model executor and the sampler executor have at
+            least one cached compiled function, False otherwise.
+        """
         return bool(self._model_executor.cache_keys()) and bool(self._sampler_executor.cache_keys())
 
     def update_graphs(

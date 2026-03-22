@@ -71,6 +71,7 @@ class EngineRequestsMixin:
         prompt: str,
         sampling_params: SamplingParams,
         prompt_token_ids: list[int] | None = None,
+        tool_parser_request: Any | None = None,
         # Vision-language model data (optional)
         pixel_values: Any | None = None,
         image_grid_thw: Any | None = None,
@@ -265,6 +266,7 @@ class EngineRequestsMixin:
                 "max_model_len": max_model_len,
                 # Per-request parser instances (fresh per request for streaming state isolation)
                 "tool_parser_instance": self._tool_parser_class(self.tokenizer) if self._tool_parser_class else None,
+                "tool_parser_request": tool_parser_request,
                 "reasoning_parser_instance": (
                     self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
                 ),
@@ -389,6 +391,7 @@ class EngineRequestsMixin:
                         "tool_parser_instance": (
                             self._tool_parser_class(self.tokenizer) if self._tool_parser_class else None
                         ),
+                        "tool_parser_request": tool_parser_request,
                         "reasoning_parser_instance": (
                             self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
                         ),

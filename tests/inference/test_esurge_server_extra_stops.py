@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from easydel.inference.esurge.server.api_server import eSurgeApiServer
+from easydel.inference.openai_api_modules import ChatCompletionRequest
 from easydel.inference.sampling_params import SamplingParams
 
 
@@ -44,3 +45,20 @@ def test_apply_extra_stops_populates_empty_stop_list():
     updated = server._apply_extra_stops_to_sampling_params(sampling_params)
 
     assert updated.stop == ["<user>"]
+
+
+def test_create_sampling_params_honors_special_token_flags():
+    server = _make_server(None)
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "dummy-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "skip_special_tokens": "true",
+            "spaces_between_special_tokens": "off",
+        }
+    )
+
+    sampling_params = server._create_sampling_params(request)
+
+    assert sampling_params.skip_special_tokens is True
+    assert sampling_params.spaces_between_special_tokens is False

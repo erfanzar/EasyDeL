@@ -262,6 +262,17 @@ def _coerce_sampling_params_template(
 
 
 def _is_math_answer_task(task_name: str | None, task_hints: tuple[str, ...]) -> bool:
+    """Determine whether a task name indicates a math-answer evaluation task.
+
+    Args:
+        task_name: The name of the evaluation task, or None.
+        task_hints: Lowercase substrings that identify math-answer tasks
+            (e.g. ``("gsm8k", "math")``).
+
+    Returns:
+        True if *task_name* contains any of the *task_hints*
+        (case-insensitive), False otherwise or if *task_name* is falsy.
+    """
     if not task_name:
         return False
     normalized = task_name.lower()
@@ -269,6 +280,18 @@ def _is_math_answer_task(task_name: str | None, task_hints: tuple[str, ...]) -> 
 
 
 def _normalize_number_candidate(candidate: str) -> str | None:
+    """Normalize a raw string into a clean numeric representation.
+
+    Strips whitespace, resolves trailing ``=`` expressions, removes
+    currency symbols (``$``) and thousands separators (``,``), and
+    extracts the first number matching ``_NUMBER_RE``.
+
+    Args:
+        candidate: The raw string that may contain a number.
+
+    Returns:
+        The extracted numeric string, or None if no valid number is found.
+    """
     candidate = candidate.strip()
     if not candidate:
         return None
@@ -282,6 +305,19 @@ def _normalize_number_candidate(candidate: str) -> str | None:
 
 
 def _extract_math_answer(generation: str) -> str | None:
+    """Extract a numeric answer from a model generation string.
+
+    Tries the following strategies in order:
+        1. A strict ``#### <number>`` pattern (GSM8K style).
+        2. The last ``\\boxed{...}`` match (LaTeX style).
+        3. The last standalone number in the text.
+
+    Args:
+        generation: The full model-generated text.
+
+    Returns:
+        A normalized numeric string if an answer is found, or None.
+    """
     strict_match = _STRICT_MATH_ANSWER_RE.search(generation)
     if strict_match is not None:
         return _normalize_number_candidate(strict_match.group(1))
@@ -299,6 +335,21 @@ def _extract_math_answer(generation: str) -> str | None:
 
 
 def _normalize_math_generation(generation: str) -> str:
+    """Ensure a model generation ends with a ``#### <answer>`` marker.
+
+    If the generation already contains a strict ``#### <number>`` answer
+    marker it is returned unchanged.  Otherwise the numeric answer is
+    extracted via ``_extract_math_answer`` and appended as a new
+    ``#### <answer>`` line so that downstream exact-match scoring works
+    correctly.
+
+    Args:
+        generation: The raw model-generated text.
+
+    Returns:
+        The generation text, potentially with an appended ``#### <answer>``
+        suffix.
+    """
     if _STRICT_MATH_ANSWER_RE.search(generation) is not None:
         return generation
 
@@ -605,6 +656,15 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         return self.model
 
     def _get_scoring_model(self):
+        """Return the cached scoring model, building it on first access.
+
+        Lazily initializes ``self._scoring_model`` by calling
+        ``_build_scoring_model`` on the first invocation, then returns
+        the cached instance on subsequent calls.
+
+        Returns:
+            The scoring model instance used for log-likelihood evaluation.
+        """
         if self._scoring_model is None:
             self._scoring_model = self._build_scoring_model()
         return self._scoring_model
@@ -615,6 +675,15 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
             scoring_model = self._get_scoring_model()
 
             def _forward(input_ids, attention_mask):
+                """Compute logits from the scoring model for the given inputs.
+
+                Args:
+                    input_ids: Token ID array of shape ``[batch, seq_len]``.
+                    attention_mask: Boolean or integer mask of the same shape.
+
+                Returns:
+                    Logits tensor of shape ``[batch, seq_len, vocab_size]``.
+                """
                 return scoring_model(input_ids=input_ids, attention_mask=attention_mask).logits
 
             self._scoring_logits_fn = jax.jit(_forward)

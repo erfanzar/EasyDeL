@@ -191,3 +191,59 @@ def test_format_chat_prompt_normalizes_tool_call_arguments_in_messages():
     arguments = used_messages[0]["tool_calls"][0]["function"]["arguments"]
     assert isinstance(arguments, dict)
     assert arguments["path"] == "/tmp/a.txt"
+
+
+class _StrictSystemPositionTokenizer:
+    def __init__(self):
+        self.calls = []
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=False,
+        tools=None,
+        add_generation_prompt=True,
+        chat_template=None,
+        **_kwargs,
+    ):
+        self.calls.append((messages, tools))
+        seen_non_system = False
+        for msg in messages:
+            if msg.get("role") == "system" and seen_non_system:
+                raise RuntimeError("System message must be at the beginning.")
+            if msg.get("role") != "system":
+                seen_non_system = True
+        return "PROMPT"
+
+
+def test_format_chat_prompt_collapses_late_system_messages_to_front():
+    engine = _DummyEngine()
+    engine.tokenizer = _StrictSystemPositionTokenizer()
+
+    prompt = engine._format_chat_prompt(
+        messages=[
+            {"role": "system", "content": "base instructions"},
+            {"role": "user", "content": "first turn"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"q":"abc"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "system", "content": "follow the schema strictly"},
+        ],
+        tools=None,
+    )
+
+    assert prompt == "PROMPT"
+    assert len(engine.tokenizer.calls) == 1
+    used_messages, _ = engine.tokenizer.calls[0]
+    assert used_messages[0]["role"] == "system"
+    assert used_messages[0]["content"] == "base instructions\n\nfollow the schema strictly"
+    assert [msg["role"] for msg in used_messages[1:]] == ["user", "assistant", "tool"]

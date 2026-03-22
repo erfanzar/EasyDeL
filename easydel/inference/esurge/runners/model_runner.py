@@ -114,21 +114,23 @@ class RunnerPerfSample:
 def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:  # pyright: ignore[reportUnusedFunction]
     """Calculate padded request count for compilation efficiency.
 
-    Pads the number of requests to powers of 2 (up to 8) or the nearest
-    power of 2 above 8. This reduces the number of unique compilations
+    Pads the number of requests to the nearest power of 2 that is at least
+    ``min_input_pad``.  This reduces the number of unique compilations
     needed while maintaining good utilization.
 
     Args:
-        x: Actual number of requests
-        upper_limit: Maximum allowed requests
+        x: Actual number of requests.
+        upper_limit: Maximum allowed requests.
+        min_input_pad: Minimum padding floor; values of ``x`` at or below
+            this threshold are padded up to ``min_input_pad``.
 
     Returns:
-        int: Padded request count, capped at upper_limit
+        Padded request count, capped at ``upper_limit``.
 
     Example:
-        >>> _get_padded_num_reqs_with_upper_limit(3, 32)   # Returns 8
-        >>> _get_padded_num_reqs_with_upper_limit(10, 32)  # Returns 16
-        >>> _get_padded_num_reqs_with_upper_limit(20, 16)  # Returns 16
+        >>> _get_padded_num_reqs_with_upper_limit(3, 32, 8)   # Returns 8
+        >>> _get_padded_num_reqs_with_upper_limit(10, 32, 8)  # Returns 16
+        >>> _get_padded_num_reqs_with_upper_limit(20, 16, 8)  # Returns 16
     """
     res = min_input_pad if x <= min_input_pad else 1 << (x - 1).bit_length()
     return min(res, upper_limit)
@@ -323,7 +325,13 @@ class eSurgeRunner:
         self._log_startup_summary()
 
     def _log_startup_summary(self) -> None:
-        """Log a consolidated startup summary showing model architecture, algorithms, cache config, and runtime info."""
+        """Log a consolidated startup summary to the logger.
+
+        Inspects the model configuration to gather architecture details
+        (layer types, attention mechanism), cache configuration (page count,
+        sequence capacity), and recurrent operation names, then emits a
+        single multi-line INFO log with all key runtime parameters.
+        """
         try:
             text_config = self.model.config.get_text_config()
             model_type = getattr(text_config, "model_type", "unknown")
@@ -529,9 +537,19 @@ class eSurgeRunner:
         """Clamp request-count buckets to the runtime execution cap.
 
         The runner may admit more requests globally than it can execute in a
-        single scheduler window. Compilation and bucket lookup should therefore
-        only consider request-count buckets that are reachable under the current
-        runtime window cap.
+        single scheduler window.  Compilation and bucket lookup should
+        therefore only consider request-count buckets that are reachable
+        under the current runtime window cap.
+
+        Args:
+            buckets: Original list of request-count bucket sizes.
+            runtime_cap: Maximum number of requests executable in one
+                scheduler window.
+
+        Returns:
+            Sorted list of bucket sizes where every entry is at most
+            ``runtime_cap``, with ``runtime_cap`` itself always included
+            as the final element.
         """
         runtime_cap = max(1, int(runtime_cap))
         clamped = sorted({int(bucket) for bucket in buckets if 0 < int(bucket) <= runtime_cap})
@@ -540,7 +558,14 @@ class eSurgeRunner:
         return clamped
 
     def _setup_variables(self):
-        """Initialize internal variables and preallocate reusable buffers."""
+        """Initialize internal variables and preallocate reusable buffers.
+
+        Computes the runtime request cap from paged-attention metadata,
+        clamps sequence buckets accordingly, creates the ``SequenceBuffer``
+        for tracking active sequences, and allocates fixed JAX arrays
+        (``input_ids_buf``, ``position_ids_buf``, ``arange``, etc.) that
+        are reused across iterations to avoid repeated allocation.
+        """
         self.num_reqs_max_model_len = min(self.metadata.get_max_num_seqs(), self.max_num_reqs)
         self.num_reqs_most_model_len = self.num_reqs_max_model_len
         self._allow_sparse_window_packing = (

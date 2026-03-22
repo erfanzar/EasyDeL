@@ -107,6 +107,14 @@ def get_safe_arr(xs):
 
 
 def _normalize_partition_spec_entry(value: tp.Any) -> tp.Any:
+    """Recursively convert lists to tuples within a partition spec entry.
+
+    Args:
+        value: A partition spec entry that may contain nested lists or tuples.
+
+    Returns:
+        The entry with all lists converted to tuples, preserving other types as-is.
+    """
     if isinstance(value, list):
         return tuple(_normalize_partition_spec_entry(item) for item in value)
     if isinstance(value, tuple):
@@ -115,6 +123,21 @@ def _normalize_partition_spec_entry(value: tp.Any) -> tp.Any:
 
 
 def _parse_partition_spec(value: tp.Any) -> PartitionSpec:
+    """Parse a value into a JAX PartitionSpec.
+
+    Handles PartitionSpec instances, None, string representations (including
+    ``"PartitionSpec(...)"`` format), and list/tuple inputs.
+
+    Args:
+        value: The value to parse. Can be a PartitionSpec, None, a string
+            representation, or a list/tuple of axis names.
+
+    Returns:
+        A PartitionSpec constructed from the parsed value.
+
+    Raises:
+        ValueError: If a string value cannot be parsed into a valid spec.
+    """
     if isinstance(value, PartitionSpec):
         return value
     if value is None:
@@ -142,6 +165,17 @@ def _parse_partition_spec(value: tp.Any) -> PartitionSpec:
 
 
 def _apply_training_args_legacy_aliases(data: dict[str, tp.Any]) -> dict[str, tp.Any]:
+    """Rewrite deprecated field names in a config dict to their current equivalents.
+
+    Translates ``quantization_block`` to ``quantization_group_size`` when the
+    new name is not already present, then removes the deprecated key.
+
+    Args:
+        data: A configuration dictionary, typically from deserialized JSON.
+
+    Returns:
+        A new dictionary with deprecated aliases replaced by current field names.
+    """
     data = dict(data)
     if "quantization_block" in data:
         if "quantization_group_size" not in data:
@@ -729,6 +763,14 @@ class TrainingArguments:
 
     @property
     def can_log_metrics(self):
+        """Whether this process should log metrics.
+
+        Returns ``False`` when the process is not rank-zero and
+        ``log_all_workers`` is disabled. Can be overridden via the setter.
+
+        Returns:
+            bool: True if metrics logging is enabled for this process.
+        """
         if self._can_log_metrics is None:
             if not self.is_process_zero and not self.log_all_workers:
                 return False
@@ -737,23 +779,57 @@ class TrainingArguments:
 
     @can_log_metrics.setter
     def can_log_metrics(self, val):
+        """Override the automatic metrics-logging decision.
+
+        Args:
+            val: Explicit boolean to force metrics logging on or off,
+                or None to revert to the default behavior.
+        """
         self._can_log_metrics = val
 
     @property
     def offload_device(self):
+        """Return the JAX device used for parameter offloading.
+
+        Resolves the device from ``offload_device_type`` and
+        ``offload_device_index``.
+
+        Returns:
+            jax.Device: The target offload device.
+        """
         return jax.devices(self.offload_device_type)[self.offload_device_index]
 
     @property
     def training_time_seconds(self) -> int | None:
+        """Convert ``training_time_limit`` to total seconds.
+
+        Returns:
+            The training time limit in seconds, or None if no limit is set.
+        """
         if self.training_time_limit is None:
             return None
         return self._time_to_seconds(self.training_time_limit)
 
     @functools.cached_property
     def is_process_zero(self):
+        """Whether the current process is the rank-zero (main) process.
+
+        Returns:
+            bool: True if ``jax.process_index()`` is 0.
+        """
         return jax.process_index() == 0
 
     def _handle_deprecated_max_sequence_length(self, max_sequence_length: int | None) -> None:
+        """Migrate the deprecated ``max_sequence_length`` value to ``max_length``.
+
+        Emits a FutureWarning and sets ``max_length`` when it has not been
+        explicitly provided. If both are set to conflicting values,
+        ``max_length`` takes precedence and a warning is emitted.
+
+        Args:
+            max_sequence_length: The deprecated sequence-length value, or None
+                if it was not supplied.
+        """
         if max_sequence_length is None:
             return
         warnings.warn(
@@ -786,6 +862,16 @@ class TrainingArguments:
         )
 
     def _handle_deprecated_quantization_block(self, quantization_block: int | None) -> None:
+        """Migrate the deprecated ``quantization_block`` value to ``quantization_group_size``.
+
+        Emits a FutureWarning and sets ``quantization_group_size`` when it has
+        not been explicitly provided. If both are set to conflicting values,
+        ``quantization_group_size`` takes precedence and a warning is emitted.
+
+        Args:
+            quantization_block: The deprecated quantization block size, or None
+                if it was not supplied.
+        """
         if quantization_block is None:
             return
         warnings.warn(
@@ -949,6 +1035,19 @@ class TrainingArguments:
         """
 
         def _coerce_float(value: tp.Any) -> tp.Any:
+            """Best-effort coercion of a value to a Python float.
+
+            Handles numeric types, NumPy scalars, and whitespace-stripped
+            strings. Returns the original value unchanged if conversion is
+            not possible (e.g., non-numeric strings, booleans, None).
+
+            Args:
+                value: The value to coerce.
+
+            Returns:
+                A Python float if conversion succeeds, otherwise the
+                original value.
+            """
             if value is None:
                 return None
             if isinstance(value, bool):
@@ -966,6 +1065,20 @@ class TrainingArguments:
             return value
 
         def _coerce_int(value: tp.Any) -> tp.Any:
+            """Best-effort coercion of a value to a Python int.
+
+            Handles int/float types, NumPy scalars, and whitespace-stripped
+            strings. Floats are converted only when they represent whole
+            numbers. Returns the original value unchanged if conversion is
+            not possible.
+
+            Args:
+                value: The value to coerce.
+
+            Returns:
+                A Python int if conversion succeeds, otherwise the original
+                value.
+            """
             if value is None:
                 return None
             if isinstance(value, bool):
@@ -1082,6 +1195,17 @@ class TrainingArguments:
                 raise ValueError("`esurge_data_parallelism_axis` must be a non-empty string when provided.")
 
         def _inherit_generation_attr(attr, fallback_name):
+            """Copy a fallback attribute into a generation attribute if unset.
+
+            Sets ``self.<attr>`` to ``self.<fallback_name>`` when the
+            generation attribute is None and the fallback holds a
+            non-None, non-False value.
+
+            Args:
+                attr: Name of the generation attribute to populate.
+                fallback_name: Name of the legacy/alternative attribute to
+                    read from.
+            """
             current = getattr(self, attr, None)
             if current is None and hasattr(self, fallback_name):
                 fallback_value = getattr(self, fallback_name)
@@ -1443,6 +1567,16 @@ class TrainingArguments:
 
     @staticmethod
     def _wandb_float_token(value: float | int | None, fallback: str = "none") -> str:
+        """Format a numeric value as a compact string token for W&B run names.
+
+        Args:
+            value: The numeric value to format, or None.
+            fallback: String to return when ``value`` is None.
+
+        Returns:
+            A compact string representation (e.g., ``"5e-05"``) or the
+            fallback string.
+        """
         if value is None:
             return fallback
         number = float(value)
@@ -1729,6 +1863,14 @@ class TrainingArguments:
 
     @classmethod
     def _dict_from_json_file(cls, json_file: str | os.PathLike):
+        """Load a JSON file and return its contents as a dictionary.
+
+        Args:
+            json_file: Path to the JSON configuration file.
+
+        Returns:
+            dict: The parsed JSON contents.
+        """
         return json.loads(ePath(json_file).read_text())
 
     def to_dict(self) -> dict[str, tp.Any]:
@@ -1870,11 +2012,32 @@ class TrainingArguments:
         ePath(json_file_path).write_text(self.to_json_string())
 
     def _get_save_directory(self, create: bool = True) -> ePathLike | None:
+        """Return the base checkpoint save directory.
+
+        Args:
+            create: If True, ensure the directory exists before returning.
+
+        Returns:
+            The checkpoint directory path, or None if no path is configured.
+        """
         if create:
             self.ensure_checkpoint_path()
         return self.get_path()
 
     def _get_save_directory_milestone(self, step, create: bool = True) -> ePathLike:
+        """Return the checkpoint directory for a specific training step.
+
+        Creates a subdirectory named ``run-{step}`` under the base save
+        directory.
+
+        Args:
+            step: The training step number used to name the subdirectory.
+            create: If True, create the directory (and parents) if it does
+                not exist.
+
+        Returns:
+            The milestone checkpoint directory path.
+        """
         directory_name = f"run-{step}"
         savedir = self._get_save_directory(create=create)
         if savedir is None:
@@ -1888,10 +2051,23 @@ class TrainingArguments:
 
 
 def _get_max_sequence_length(self: TrainingArguments) -> int | None:
+    """Getter for the deprecated ``max_sequence_length`` property.
+
+    Returns:
+        The current ``max_length`` value.
+    """
     return self.max_length
 
 
 def _set_max_sequence_length(self: TrainingArguments, value: int | None) -> None:
+    """Setter for the deprecated ``max_sequence_length`` property.
+
+    Emits a FutureWarning directing users to ``max_length``, then
+    forwards the value.
+
+    Args:
+        value: The sequence length to set.
+    """
     warnings.warn(
         "`max_sequence_length` is deprecated; use `max_length` instead.",
         FutureWarning,
@@ -1908,10 +2084,23 @@ TrainingArguments.max_sequence_length = property(
 
 
 def _get_quantization_block(self: TrainingArguments) -> int | None:
+    """Getter for the deprecated ``quantization_block`` property.
+
+    Returns:
+        The current ``quantization_group_size`` value.
+    """
     return self.quantization_group_size
 
 
 def _set_quantization_block(self: TrainingArguments, value: int | None) -> None:
+    """Setter for the deprecated ``quantization_block`` property.
+
+    Emits a FutureWarning directing users to ``quantization_group_size``,
+    then forwards the value.
+
+    Args:
+        value: The quantization block size to set.
+    """
     warnings.warn(
         "`quantization_block` is deprecated; use `quantization_group_size` instead.",
         FutureWarning,

@@ -163,6 +163,16 @@ class BaseTrainer(BaseTrainerProtocol):
     )
 
     def __setattr__(self, name: str, value: tp.Any) -> None:
+        """Set an attribute, applying runtime model config overrides for state attributes.
+
+        Intercepts assignments to model/reference/teacher state attributes and
+        automatically applies any runtime configuration overrides from the
+        training arguments.
+
+        Args:
+            name: The attribute name being set.
+            value: The value to assign.
+        """
         object.__setattr__(self, name, value)
         if name not in self._RUNTIME_MODEL_OVERRIDE_STATE_ATTRS or value is None:
             return
@@ -268,6 +278,18 @@ class BaseTrainer(BaseTrainerProtocol):
             )
 
             def _stack_per_example_outputs(per_example: list[dict[str, tp.Any]]) -> dict[str, tp.Any]:
+                """Stack per-example collator outputs into batched arrays.
+
+                Concatenates or stacks JAX arrays from individually collated
+                examples into a single batched dictionary. Arrays with a leading
+                dimension of 1 are concatenated; others are stacked.
+
+                Args:
+                    per_example: List of dicts, each from collating one example.
+
+                Returns:
+                    A dict mapping keys to batched JAX arrays, or empty dict on failure.
+                """
                 if not per_example or not isinstance(per_example[0], dict):
                     return {}
                 stacked: dict[str, tp.Any] = {}
@@ -291,6 +313,19 @@ class BaseTrainer(BaseTrainerProtocol):
                 return stacked
 
             def _auto_data_collator(batch):
+                """Automatically collate a batch using the base collator.
+
+                Tries the base collator on the full batch first. If that fails
+                (e.g. for datasets that yield non-standard formats), falls back
+                to collating each example individually and stacking results.
+
+                Args:
+                    batch: A list/tuple of examples or an already-collated batch.
+
+                Returns:
+                    The collated batch as a dict of arrays, or the original input
+                    if collation is not applicable.
+                """
                 if not isinstance(batch, (list, tuple)):
                     return batch
                 batch_list = list(batch)
@@ -412,6 +447,20 @@ class BaseTrainer(BaseTrainerProtocol):
         updated = {"changed": False}
 
         def _seed_count(path, leaf):
+            """Replace optimizer 'count' leaves with the requested step value.
+
+            Used as a ``tree_map_with_path`` function to walk the optimizer
+            state tree and set any leaf named ``count`` to the target step,
+            aligning scheduler/optimizer counters with ``step_start_point``.
+
+            Args:
+                path: The pytree path to the current leaf.
+                leaf: The current leaf value in the optimizer state tree.
+
+            Returns:
+                The leaf replaced with ``requested_step`` if it is a count
+                leaf, otherwise the original leaf unchanged.
+            """
             if not path:
                 return leaf
             key = path[-1]
@@ -502,10 +551,19 @@ class BaseTrainer(BaseTrainerProtocol):
         hints: list[str] = []
 
         def _add(text: str) -> None:
+            """Append a hint string if it is not already present in the list."""
             if text not in hints:
                 hints.append(text)
 
         def _int_attr(name: str) -> int | None:
+            """Get an integer attribute from the training arguments by name.
+
+            Args:
+                name: The attribute name to look up on ``args``.
+
+            Returns:
+                The attribute value cast to int, or None if not set.
+            """
             value = getattr(args, name, None)
             if value is None:
                 return None
@@ -718,6 +776,18 @@ class BaseTrainer(BaseTrainerProtocol):
         """Normalize user-provided prompts into strings or chat conversations."""
 
         def _normalize_single(item: tp.Any) -> str | list[dict[str, str]]:
+            """Normalize a single prompt item into a string or chat message list.
+
+            Handles dicts (with ``role``/``content`` or ``prompt``/``text`` keys),
+            lists of messages, and plain strings. When ``apply_chat_template`` is
+            True, bare strings are wrapped as a user chat message.
+
+            Args:
+                item: A prompt in any supported format (str, dict, or list).
+
+            Returns:
+                A plain string or a list of chat-message dicts.
+            """
             if isinstance(item, list):
                 if not item:
                     return ""
@@ -756,6 +826,23 @@ class BaseTrainer(BaseTrainerProtocol):
         pop_pad_tokens: bool = False,
         attention_mask: jax.Array | np.ndarray | None = None,
     ) -> list[str]:
+        """Decode a batch of token IDs into prompt strings.
+
+        Args:
+            processor: Tokenizer or processor with a ``decode`` method.
+            input_ids: Token ID array of shape ``(batch, seq_len)`` or ``(seq_len,)``.
+            skip_special_tokens: Whether to strip special tokens during decoding.
+            pad_token_id: Explicit pad token ID for stripping; inferred from
+                ``processor`` if not provided and ``pop_pad_tokens`` is True.
+            pop_pad_tokens: If True, remove padding tokens before decoding.
+            attention_mask: Optional mask used to identify real (non-pad) tokens.
+
+        Returns:
+            A list of decoded prompt strings, one per sequence in the batch.
+
+        Raises:
+            ValueError: If ``processor`` is None or lacks a ``decode`` method.
+        """
         if processor is None or not hasattr(processor, "decode"):
             raise ValueError("Cannot decode input_ids to prompts without a valid processor")
         array = np.asarray(input_ids)
@@ -788,6 +875,15 @@ class BaseTrainer(BaseTrainerProtocol):
 
     @staticmethod
     def _sanitize_text_prompt(prompt: str, processor: PreTrainedTokenizerBase | None) -> str:
+        """Remove pad token occurrences from a decoded text prompt.
+
+        Args:
+            prompt: The decoded text string to sanitize.
+            processor: Tokenizer or processor to look up the pad token from.
+
+        Returns:
+            The prompt string with all pad token substrings removed.
+        """
         pad_token = None
         if processor is not None:
             pad_token = getattr(processor, "pad_token", None) or getattr(
@@ -799,6 +895,18 @@ class BaseTrainer(BaseTrainerProtocol):
 
     @staticmethod
     def _peek_first_example(dataset: tp.Any) -> tp.Any | None:
+        """Retrieve the first example from a dataset without consuming it.
+
+        Supports HF Datasets (indexing), iterables, dicts of datasets, and
+        ``ShardedDataSource`` objects. Returns None if the dataset is empty
+        or the first example cannot be retrieved.
+
+        Args:
+            dataset: Any dataset-like object to peek into.
+
+        Returns:
+            The first example, or None if unavailable.
+        """
         if dataset is None:
             return None
         if isinstance(dataset, dict):
@@ -823,6 +931,16 @@ class BaseTrainer(BaseTrainerProtocol):
         return None
 
     def _initialize_conversational_flags(self, train_dataset: tp.Any, eval_dataset: tp.Any) -> None:
+        """Detect whether train and eval datasets use conversational format.
+
+        Peeks at the first example of each dataset and sets
+        ``self.train_is_conversational`` and ``self.eval_is_conversational``
+        accordingly.
+
+        Args:
+            train_dataset: The training dataset to inspect.
+            eval_dataset: The evaluation dataset to inspect.
+        """
         from .prompt_transforms import is_conversational
 
         self.train_is_conversational = False
@@ -856,6 +974,14 @@ class BaseTrainer(BaseTrainerProtocol):
 
     @mesh.setter
     def mesh(self, val):
+        """No-op setter for the mesh property.
+
+        The mesh is derived from the model and cannot be set directly.
+        Assignments are silently ignored.
+
+        Args:
+            val: The value to set (ignored).
+        """
         return val
 
     @property
@@ -909,38 +1035,53 @@ class BaseTrainer(BaseTrainerProtocol):
 
     @property
     def _train_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
+        """Extra arguments passed to the shared training function at each step."""
         return self._train_shared_fn_extra_args_
 
     @property
     def _eval_shared_fn_extra_args(self) -> tuple[tp.Any, ...]:
+        """Extra arguments passed to the shared evaluation function at each step."""
         return self._eval_shared_fn_extra_args_
 
     @property
     def _train_shared_fn_static_args(self) -> tuple[tp.Any, ...]:
+        """Static (compile-time constant) arguments for the shared training function."""
         return self._train_shared_fn_static_args_  # pyright: ignore[reportReturnType]
 
     @property
     def _eval_shared_fn_static_args(self) -> tuple[tp.Any, ...]:
+        """Static (compile-time constant) arguments for the shared evaluation function."""
         return self._eval_shared_fn_static_args_  # pyright: ignore[reportReturnType]
 
     @_train_shared_fn_static_args.setter
     def _train_shared_fn_static_args(self, val):
+        """Set static arguments for the shared training function."""
         self._train_shared_fn_static_args_ = val
 
     @_eval_shared_fn_static_args.setter
     def _eval_shared_fn_static_args(self, val):
+        """Set static arguments for the shared evaluation function."""
         self._eval_shared_fn_static_args_ = val
 
     @_train_shared_fn_extra_args.setter
     def _train_shared_fn_extra_args(self, val):
+        """Set extra arguments for the shared training function."""
         self._train_shared_fn_extra_args_ = val
 
     @_eval_shared_fn_extra_args.setter
     def _eval_shared_fn_extra_args(self, val):
+        """Set extra arguments for the shared evaluation function."""
         self._eval_shared_fn_extra_args_ = val
 
     @cached_property
     def _pad_token_id(self):
+        """Resolve the pad token ID from the processing class.
+
+        Falls back to the first EOS token ID if no pad token is defined.
+
+        Returns:
+            The integer pad token ID.
+        """
         if isinstance(self.processing_class, ProcessorMixin):
             pad_token_id = self.processing_class.tokenizer.pad_token_id
         else:
@@ -952,6 +1093,14 @@ class BaseTrainer(BaseTrainerProtocol):
 
     @cached_property
     def _eos_token_id(self) -> list[int]:
+        """Collect all unique EOS token IDs from the processor and model config.
+
+        Merges EOS IDs from the processing class and the model's generation
+        config (if available), returning a deduplicated list.
+
+        Returns:
+            A list of unique EOS token IDs.
+        """
         eos_ids = []
         if isinstance(self.processing_class, ProcessorMixin):
             proc_eos_token_id = self.processing_class.tokenizer.eos_token_id
@@ -968,6 +1117,18 @@ class BaseTrainer(BaseTrainerProtocol):
         return list(set(eos_ids))
 
     def _make_attn_mask(self, arr):
+        """Build a causal attention mask that masks positions after the first EOS token.
+
+        For each sequence in the batch, all positions up to and including the
+        first EOS token are marked as 1 (attended); positions after are 0.
+        If no EOS token is found in a sequence, all positions are attended.
+
+        Args:
+            arr: Token ID array of shape ``(batch_size, seq_len)``.
+
+        Returns:
+            An int32 attention mask of shape ``(batch_size, seq_len)``.
+        """
         is_eos = jnp.isin(arr, jnp.asarray(self._eos_token_id).reshape(-1))
         return (
             (jnp.arange(is_eos.shape[1])[None, :].repeat(is_eos.shape[0], axis=0))
@@ -1398,6 +1559,13 @@ class BaseTrainer(BaseTrainerProtocol):
             return {}
 
         def _maybe_insert(target: dict[str, tp.Any], key: str, value: tp.Any) -> None:
+            """Insert a key-value pair into target dict only if value is not None.
+
+            Args:
+                target: Dictionary to conditionally insert into.
+                key: Key to set in the dictionary.
+                value: Value to set; insertion is skipped when None.
+            """
             if value is not None:
                 target[key] = value
 
@@ -1439,6 +1607,12 @@ class BaseTrainer(BaseTrainerProtocol):
         return kwargs
 
     def _default_generation_config_overrides(self) -> dict[str, tp.Any] | None:
+        """Return a copy of user-specified generation config overrides, or None if empty.
+
+        Returns:
+            A dict of generation config attribute overrides, or None if no
+            overrides are configured.
+        """
         overrides = self.arguments.generation_config_overrides
         if not overrides:
             return None
@@ -1502,6 +1676,19 @@ class BaseTrainer(BaseTrainerProtocol):
                 attention_mask: jax.Array,
                 model_kwargs: dict[str, tp.Any],
             ):
+                """Run model generation with additional model kwargs (e.g., multimodal inputs).
+
+                Args:
+                    state: Current model state containing parameters and model.
+                    input_ids: Tokenized input prompt IDs.
+                    attention_mask: Attention mask for the input sequence.
+                    model_kwargs: Extra model inputs such as pixel values for
+                        multimodal models.
+
+                Returns:
+                    Tuple of (generated sequences, sharded input_ids,
+                    sharded attention_mask).
+                """
                 module = state.model
                 with module.mesh:
                     shard_input_ids = input_ids
@@ -1555,6 +1742,17 @@ class BaseTrainer(BaseTrainerProtocol):
             out_shardings=(empty_sharding, empty_sharding, empty_sharding),
         )
         def generate(state: EasyDeLState, input_ids: jax.Array, attention_mask: jax.Array):
+            """Run model generation from input_ids and attention_mask only.
+
+            Args:
+                state: Current model state containing parameters and model.
+                input_ids: Tokenized input prompt IDs.
+                attention_mask: Attention mask for the input sequence.
+
+            Returns:
+                Tuple of (generated sequences, sharded input_ids,
+                sharded attention_mask).
+            """
             module = state.model
             with module.mesh:
                 shard_input_ids = input_ids
@@ -2313,6 +2511,14 @@ class BaseTrainer(BaseTrainerProtocol):
             )
 
     def _get_processing_class(self):
+        """Resolve the tokenizer or processor associated with the trainer.
+
+        Checks ``self.processing_class``, ``self.tokenizer``, and the model
+        state in order, returning the first non-None result.
+
+        Returns:
+            The tokenizer/processor instance, or None if none is available.
+        """
         proc = getattr(self, "processing_class", None)
         if proc is not None:
             return proc
@@ -2331,6 +2537,16 @@ class BaseTrainer(BaseTrainerProtocol):
         return None
 
     def _batch_decode_tokens(self, token_ids: tp.Any) -> list[str] | None:
+        """Decode a batch of token ID arrays into human-readable strings.
+
+        Args:
+            token_ids: Array-like of token IDs with shape ``(batch, seq)`` or
+                ``(seq,)``.
+
+        Returns:
+            List of decoded strings, or None if no processor is available or
+            decoding fails.
+        """
         processor = self._get_processing_class()
         if processor is None or not hasattr(processor, "batch_decode"):
             return None
@@ -2344,6 +2560,15 @@ class BaseTrainer(BaseTrainerProtocol):
             return None
 
     def _collect_generation_prompts(self) -> list[tp.Any]:
+        """Collect prompts for preview generation during training.
+
+        Gathers prompts from ``arguments.generation_prompts`` first, then
+        supplements with randomly sampled training dataset entries if more
+        prompts are needed.
+
+        Returns:
+            List of prompt objects (strings, dicts, or chat message lists).
+        """
         args = self.arguments
         if args is None:
             return []
@@ -2356,6 +2581,15 @@ class BaseTrainer(BaseTrainerProtocol):
         return prompts
 
     def _sample_prompts_from_dataset(self, expected: int) -> list[tp.Any]:
+        """Randomly sample prompt entries from the training dataset.
+
+        Args:
+            expected: Maximum number of samples to draw.
+
+        Returns:
+            List of raw dataset samples (up to ``expected`` items). Returns
+            an empty list if the dataset is unavailable or empty.
+        """
         dataset = getattr(self, "dataset_train", None)
         if dataset is None or expected <= 0:
             return []
@@ -2379,6 +2613,21 @@ class BaseTrainer(BaseTrainerProtocol):
         return prompts
 
     def _prepare_generation_input(self, prompt: tp.Any) -> dict[str, tp.Any] | None:
+        """Tokenize and pad a single prompt into model-ready input arrays.
+
+        Handles raw strings, chat-format message lists, and dict samples that
+        may already contain ``input_ids``. Uses left-padding and left-truncation
+        so the generation continuation is always at the right edge.
+
+        Args:
+            prompt: A string, list of chat messages, or dict with ``input_ids``
+                or a text field.
+
+        Returns:
+            Dict with ``input_ids``, ``attention_mask`` (numpy arrays), and an
+            optional ``prompt_text`` string, or None if the prompt could not be
+            processed.
+        """
         processor = self._get_processing_class()
         prompt_text: str | None = None
         encode_kwargs = dict(
@@ -2501,6 +2750,16 @@ class BaseTrainer(BaseTrainerProtocol):
         results: list[dict[str, tp.Any]] = []
 
         def _finalize_preview_results(records: list[dict[str, tp.Any]]) -> None:
+            """Log and store completed preview generation results.
+
+            Saves records to ``self.latest_generation_samples``, optionally
+            logs them to Weights & Biases, and prints completions when
+            ``generation_preview_print`` is enabled.
+
+            Args:
+                records: List of dicts, each containing ``prompt``,
+                    ``completions``, and ``step`` keys.
+            """
             if not records:
                 return
             self.latest_generation_samples = records
@@ -2682,6 +2941,19 @@ class BaseTrainer(BaseTrainerProtocol):
         _finalize_preview_results(results)
 
     def _esurge_init_kwargs(self, *, max_num_seqs: int | None = None) -> dict[str, tp.Any]:
+        """Build keyword arguments for initializing an eSurge inference runtime.
+
+        Reads eSurge-related settings from ``self.arguments`` and assembles
+        them into a kwargs dict suitable for constructing an eSurge engine.
+
+        Args:
+            max_num_seqs: Optional override for the maximum number of
+                concurrent sequences. Falls back to trainer arguments or a
+                computed default.
+
+        Returns:
+            Dict of eSurge initialization keyword arguments.
+        """
         args = self.arguments
         esurge_kwargs: dict[str, tp.Any] = {}
         if args.esurge_hbm_utilization is not None:
@@ -3186,6 +3458,22 @@ class BaseTrainer(BaseTrainerProtocol):
             )
 
         def calculate_steps(dataset, is_train: bool) -> int:
+            """Compute the total number of training or evaluation steps.
+
+            Uses forced step counts from arguments when available, otherwise
+            derives the count from dataset length, batch size, and epoch count.
+
+            Args:
+                dataset: The training or evaluation dataset.
+                is_train: Whether the calculation is for training steps.
+
+            Returns:
+                Total number of optimizer steps for the run.
+
+            Raises:
+                ValueError: If dataset length cannot be determined and no
+                    per-epoch step count is configured.
+            """
             forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
             total_data_len: int | None = None
             if forced_steps is None:
@@ -3576,6 +3864,14 @@ class BaseTrainer(BaseTrainerProtocol):
         saved_directory = [None]
 
         def save_callback(dest, mesh, meta, s=state):
+            """Checkpointer callback that serializes trainer state to disk.
+
+            Args:
+                dest: Relative checkpoint destination path.
+                mesh: Device mesh (unused, required by checkpointer API).
+                meta: Checkpoint metadata dict (unused, required by API).
+                s: Model state to save (defaults to outer ``state``).
+            """
             full_path = str(self.arguments._get_save_directory() / dest)
             saved_directory[0] = self._save_state(state=s, save_directory=full_path)
             self._cleanup_old_checkpoints()
@@ -3666,6 +3962,14 @@ class BaseTrainer(BaseTrainerProtocol):
 
         # Sort by modification time (oldest first)
         def get_mtime(path):
+            """Return the modification time of a checkpoint directory.
+
+            Args:
+                path: Path-like object pointing to a checkpoint directory.
+
+            Returns:
+                Modification timestamp as a float, or 0 on failure.
+            """
             try:
                 return path.stat().get("mtime", 0)
             except Exception:
@@ -3896,6 +4200,19 @@ class BaseTrainer(BaseTrainerProtocol):
         easystate_to_huggingface_model_kwargs: dict | None = None,
         torch_save_pretrained_kwargs: dict | None = None,
     ):
+        """Convert the JAX model to a PyTorch HuggingFace model and save it.
+
+        Args:
+            state: Current EasyDeL model state.
+            save_directory: Filesystem path where the model will be saved.
+            easystate_to_huggingface_model_kwargs: Extra kwargs passed to
+                ``model.to_torch()``.
+            torch_save_pretrained_kwargs: Extra kwargs passed to the HF
+                model's ``save_pretrained``.
+
+        Returns:
+            The converted HuggingFace PyTorch model.
+        """
         easystate_to_huggingface_model_kwargs = easystate_to_huggingface_model_kwargs or {}
         torch_save_pretrained_kwargs = torch_save_pretrained_kwargs or {}
         hf_model = state.model.to_torch(**easystate_to_huggingface_model_kwargs)
@@ -3909,6 +4226,19 @@ class BaseTrainer(BaseTrainerProtocol):
         model_config,
         model_type,
     ):
+        """Create a HuggingFace ``AutoConfig`` populated from the EasyDeL model config.
+
+        Copies compatible attributes from the EasyDeL config onto a fresh HF
+        config instance, converting numeric strings to numbers.
+
+        Args:
+            state: Current EasyDeL model state.
+            model_config: The EasyDeL model configuration object.
+            model_type: HuggingFace model type identifier string.
+
+        Returns:
+            A HuggingFace ``PretrainedConfig`` instance.
+        """
         from transformers import AutoConfig
 
         hf_model_config = AutoConfig.for_model(model_type=model_type)
@@ -4008,7 +4338,13 @@ class BaseTrainer(BaseTrainerProtocol):
         self._setup_static_metrics()
         self._evaluation_time_start = time.time()
 
-    def _setup_static_metrics(self): ...
+    def _setup_static_metrics(self):
+        """Initialize static training/evaluation metrics.
+
+        Subclasses should override this to set up metric accumulators
+        before training or evaluation begins.
+        """
+        ...
 
     def compile_aot(self) -> bool:
         """
@@ -4029,6 +4365,17 @@ class BaseTrainer(BaseTrainerProtocol):
         compiled = False
 
         def compile_function(function, dataloader, state, tag):
+            """Lower and AOT-compile a step function if not already compiled.
+
+            Args:
+                function: The JIT-wrapped step function to compile.
+                dataloader: Dataloader providing a sample batch for shape inference.
+                state: Current model state passed as the first compilation arg.
+                tag: Human-readable label used in log messages.
+
+            Returns:
+                The compiled function, or the original if already compiled.
+            """
             if not isinstance(function, Compiled):
                 logger.info("Compiling function: %s", tag)
                 return function.lower(state, next(iter(dataloader))).compile()
@@ -4078,6 +4425,24 @@ class BaseTrainer(BaseTrainerProtocol):
         state: EasyDeLState,
         run_exception: Exception | None = None,
     ):
+        """Finalize training by handling exceptions and saving the last checkpoint.
+
+        Processes any exception that terminated the training loop (e.g.,
+        ``KeyboardInterrupt``, timer limit), performs a final checkpoint save
+        if configured, and assembles the ``TrainerOutput``.
+
+        Args:
+            state: The model state at the end of training.
+            run_exception: Exception that stopped training, or None for a
+                clean finish.
+
+        Returns:
+            A ``TrainerOutput`` containing the final state and checkpoint path.
+
+        Raises:
+            RuntimeError: If the exception is not a recognized graceful
+                interruption.
+        """
         if run_exception is not None:
             if isinstance(run_exception, KeyboardInterrupt):
                 logger.warning("KeyboardInterrupt: Training interrupted. Saving current state...")

@@ -152,6 +152,7 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
         *,
         finished: bool,
         skip_special_tokens: bool,
+        spaces_between_special_tokens: bool = True,
         prompt_context: list[int] | None = None,
     ) -> DetokenizerResult:
         """Decode tokens incrementally.
@@ -161,6 +162,8 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
             generated_tokens: The list of tokens generated so far.
             finished: Whether generation is complete for this request.
             skip_special_tokens: Whether to skip special tokens in the final decode.
+            spaces_between_special_tokens: Whether adjacent special tokens should
+                be separated by spaces during decode.
             prompt_context: Last N prompt token IDs for first-token context.
                 SentencePiece tokenizers need preceding context to avoid
                 spurious leading spaces on the first generated token.
@@ -177,6 +180,7 @@ class DetokenizerWorkerClient(_BaseWorkerClient):
             "tokens": generated_tokens,
             "finished": finished,
             "skip_special_tokens": skip_special_tokens,
+            "spaces_between_special_tokens": spaces_between_special_tokens,
         }
         if prompt_context:
             msg["prompt_context"] = prompt_context

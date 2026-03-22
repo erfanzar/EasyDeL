@@ -392,6 +392,24 @@ class GatedDeltaRuleOp(OperationImpl):
 
         @jax.named_scope("grouped_gdr_decode_pallas")
         def _run(q, k, v, b, d, s):
+            """Execute the Pallas-backed grouped GDR decode on a single shard.
+
+            This thin wrapper is used as the per-shard function for
+            ``jax.shard_map``, delegating to the static Pallas kernel
+            while keeping the named scope for profiling.
+
+            Args:
+                q: Query tensor shard.
+                k: Key tensor shard.
+                v: Value tensor shard.
+                b: Beta tensor shard.
+                d: Decay tensor shard.
+                s: Recurrent state tensor shard.
+
+            Returns:
+                A tuple of (output, new_state) produced by the Pallas
+                grouped GDR decode kernel.
+            """
             return GatedDeltaRuleOp.grouped_gdr_decode_pallas(q, k, v, b, d, s)
 
         output, new_state = jax.shard_map(
