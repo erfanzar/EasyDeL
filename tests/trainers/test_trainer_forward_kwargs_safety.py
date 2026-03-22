@@ -37,6 +37,7 @@ from easydel.trainers.odds_ratio_preference_optimization_trainer._fn import (
     concatenated_forward as orpo_concatenated_forward,
 )
 from easydel.trainers.proximal_policy_optimization_trainer._fn import get_per_token_logps_values_entropies
+from easydel.trainers.seq_kd_trainer.seq_kd_trainer import SeqKDTrainer
 from easydel.trainers.supervised_fine_tuning_trainer.sft_config import SFTConfig
 from easydel.trainers.supervised_fine_tuning_trainer.sft_trainer import SFTTrainer
 from easydel.trainers.trainer import Trainer
@@ -630,3 +631,117 @@ def test_sft_transform_uses_assistant_only_loss():
 
     assert transform is not None
     assert transform._mask_prompt is True
+
+
+def test_seq_kd_transform_passes_tools_to_chat_template():
+    class _ToolAwareTokenizer:
+        def __init__(self):
+            self.chat_template = "tool-chat-template"
+            self.calls = []
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, tools=None, **kwargs):
+            del kwargs
+            self.calls.append(
+                {
+                    "messages": messages,
+                    "tokenize": tokenize,
+                    "add_generation_prompt": add_generation_prompt,
+                    "tools": tools,
+                }
+            )
+            return "rendered prompt"
+
+        def __call__(
+            self,
+            text,
+            padding=False,
+            max_length=None,
+            truncation=False,
+            add_special_tokens=False,
+            return_attention_mask=True,
+            **kwargs,
+        ):
+            del text, padding, max_length, truncation, add_special_tokens, kwargs
+            result = {"input_ids": [1, 2, 3]}
+            if return_attention_mask:
+                result["attention_mask"] = [1, 1, 1]
+            return result
+
+    tokenizer = _ToolAwareTokenizer()
+    trainer = SeqKDTrainer.__new__(SeqKDTrainer)
+    trainer.processing_class = tokenizer
+    trainer.arguments = SimpleNamespace(
+        max_prompt_length=32,
+        skip_apply_chat_template=False,
+        tools=[{"type": "function", "function": {"name": "lookup"}}],
+    )
+    trainer._is_pretokenized = lambda: False
+
+    transform = SeqKDTrainer._get_preprocess_transform(trainer)
+
+    assert transform is not None
+    transformed = transform({"prompt": [{"role": "user", "content": "search"}]})
+
+    assert transformed["input_ids"][-3:] == [1, 2, 3]
+    assert transformed["attention_mask"][-3:] == [1, 1, 1]
+    assert tokenizer.calls
+    assert tokenizer.calls[-1]["tools"] == trainer.arguments.tools
+
+
+def test_seq_kd_transform_uses_example_tools_when_present():
+    class _ToolAwareTokenizer:
+        def __init__(self):
+            self.chat_template = "tool-chat-template"
+            self.calls = []
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, tools=None, **kwargs):
+            del kwargs
+            self.calls.append(
+                {
+                    "messages": messages,
+                    "tokenize": tokenize,
+                    "add_generation_prompt": add_generation_prompt,
+                    "tools": tools,
+                }
+            )
+            return "rendered prompt"
+
+        def __call__(
+            self,
+            text,
+            padding=False,
+            max_length=None,
+            truncation=False,
+            add_special_tokens=False,
+            return_attention_mask=True,
+            **kwargs,
+        ):
+            del text, padding, max_length, truncation, add_special_tokens, kwargs
+            result = {"input_ids": [4, 5]}
+            if return_attention_mask:
+                result["attention_mask"] = [1, 1]
+            return result
+
+    tokenizer = _ToolAwareTokenizer()
+    trainer = SeqKDTrainer.__new__(SeqKDTrainer)
+    trainer.processing_class = tokenizer
+    trainer.arguments = SimpleNamespace(
+        max_prompt_length=16,
+        skip_apply_chat_template=False,
+        tools=None,
+    )
+    trainer._is_pretokenized = lambda: False
+
+    transform = SeqKDTrainer._get_preprocess_transform(trainer)
+    example_tools = [{"type": "function", "function": {"name": "search"}}]
+    transformed = transform(
+        {
+            "prompt": [{"role": "user", "content": "search"}],
+            "tools": example_tools,
+        }
+    )
+
+    assert transformed["input_ids"][-2:] == [4, 5]
+    assert transformed["attention_mask"][-2:] == [1, 1]
+    assert tokenizer.calls
+    assert tokenizer.calls[-1]["tools"] == example_tools

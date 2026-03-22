@@ -141,6 +141,7 @@ class SeqKDTrainer(Trainer):
             tokenizer=self.processing_class,
             max_prompt_length=self.arguments.max_prompt_length,
             skip_apply_chat_template=self.arguments.skip_apply_chat_template,
+            tools=getattr(self.arguments, "tools", None),
         )
 
     def _is_pretokenized(self) -> bool:
