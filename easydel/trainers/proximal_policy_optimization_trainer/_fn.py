@@ -33,6 +33,11 @@ from jax.sharding import PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
+from easydel.trainers._logprob_utils import (
+    compute_per_token_logps_and_entropies_from_hidden_states,
+    compute_token_logps_and_entropies_chunked,
+    resolve_lmhead_chunksize,
+)
 
 from ..training_utils import (
     make_assertions_and_get_sizes,
@@ -81,39 +86,62 @@ def compute_per_token_logps(logits: jax.Array, input_ids: jax.Array, prompt_leng
     return jnp.squeeze(token_log_probs, axis=-1)
 
 
-def get_per_token_logps_values_entropies(model, input_ids: jax.Array, attention_mask: jax.Array, prompt_length: int):
+def get_per_token_logps_values_entropies(
+    model,
+    input_ids: jax.Array,
+    attention_mask: jax.Array,
+    prompt_length: int,
+    logprob_vocab_chunk_size: int | None = None,
+):
     """Compute per-token log probabilities, values, and entropies for PPO.
 
-    Performs a forward pass through the model with value head to obtain
-    all quantities needed for PPO loss computation.
+    Performs a forward pass through the model (with value head) to obtain
+    all quantities needed for PPO loss computation. When the model's
+    ``lmhead_chunksize`` is configured, the forward pass is run in
+    *headless* mode (``apply_lm_head=False``) and log probabilities and
+    entropies are derived directly from the hidden states using chunked
+    projection through the LM head, avoiding materialization of the full
+    ``[batch, seq, vocab]`` logit tensor.
 
     Args:
-        model: CausalLMWithValueHead model instance.
-        input_ids: Full input sequence (prompt + completion).
-        attention_mask: Attention mask for the sequence.
-        prompt_length: Length of the prompt prefix.
+        model: CausalLMWithValueHead model instance. Must expose a
+            ``value_head`` module and, when headless chunking is active,
+            must return ``last_hidden_state`` in its outputs.
+        input_ids: Full input sequence (prompt + completion) of shape
+            ``(batch_size, seq_len)``.
+        attention_mask: Attention mask of shape ``(batch_size, seq_len)``.
+        prompt_length: Length of the prompt prefix. Log probabilities,
+            entropies, and values are extracted only for the completion
+            portion (tokens after the prompt).
+        logprob_vocab_chunk_size: When set to a positive value, the log-softmax
+            and entropy computations over the vocabulary dimension are
+            performed in chunks of this size to reduce peak memory.
+            ``None`` disables vocabulary chunking.
 
     Returns:
-        Tuple of (token_log_probs, values, entropies):
-            - token_log_probs: Log probabilities for completion tokens.
-            - values: Value head predictions for completion positions.
-            - entropies: Per-token entropy of the output distribution.
+        Tuple of ``(token_log_probs, values, entropies)``:
+            - ``token_log_probs``: Per-token log probabilities for the
+              completion tokens, shape ``(batch, completion_len)``.
+            - ``values``: Value head predictions for completion positions,
+              shape ``(batch, completion_len)``.
+            - ``entropies``: Per-token entropy of the output distribution,
+              shape ``(batch, completion_len)``.
 
     Raises:
-        ValueError: If model outputs don't provide hidden states.
+        ValueError: If the model outputs do not provide hidden states
+            (required for the value head and, when headless mode is
+            active, for chunked log-probability computation).
     """
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        output_hidden_states=True,
-    )
-    logits = outputs.logits[:, prompt_length - 1 :]
-    logits = logits[:, :-1, :]
-
-    token_log_probs = compute_per_token_logps(logits, input_ids, prompt_length)
-
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
-    entropies = -jnp.sum(jnp.exp(log_probs) * log_probs, axis=-1)
+    call_kwargs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "output_hidden_states": True,
+    }
+    lmhead_chunksize = resolve_lmhead_chunksize(model)
+    if lmhead_chunksize is not None:
+        call_kwargs["apply_lm_head"] = False
+    outputs = model(**call_kwargs)
+    targets = input_ids[:, prompt_length:]
 
     hidden_states = getattr(outputs, "last_hidden_state", None)
     if hidden_states is None:
@@ -121,6 +149,26 @@ def get_per_token_logps_values_entropies(model, input_ids: jax.Array, attention_
         if hidden_states is None:
             raise ValueError("Model outputs do not provide hidden states; cannot compute value head outputs.")
         hidden_states = hidden_states[-1]
+
+    if outputs.logits is None and lmhead_chunksize is not None:
+        score_hidden_states = hidden_states[:, prompt_length - 1 : -1, :]
+        token_log_probs, entropies = compute_per_token_logps_and_entropies_from_hidden_states(
+            model,
+            score_hidden_states,
+            targets,
+            token_chunk_size=lmhead_chunksize,
+            vocab_chunk_size=logprob_vocab_chunk_size,
+            return_entropy=True,
+        )
+    else:
+        logits = outputs.logits[:, prompt_length - 1 :]
+        logits = logits[:, :-1, :]
+        token_log_probs, entropies = compute_token_logps_and_entropies_chunked(
+            logits,
+            targets,
+            return_entropy=True,
+            chunk_size=logprob_vocab_chunk_size,
+        )
 
     values_full = model.value_head(hidden_states).squeeze(-1)
     values = values_full[:, prompt_length - 1 : -1]
@@ -135,6 +183,7 @@ def ppo_step(
     vf_coef: float,
     cliprange_value: float,
     entropy_coef: float,
+    logprob_vocab_chunk_size: int | None,
     loss_config: LossConfig | None = None,
     learning_rate_fn: optax.Schedule = None,
     partition_spec: PartitionSpec | None = None,
@@ -199,6 +248,7 @@ def ppo_step(
             input_ids,
             attention_mask,
             prompt_length,
+            logprob_vocab_chunk_size,
         )
 
         log_ratio = new_logps - old_logps

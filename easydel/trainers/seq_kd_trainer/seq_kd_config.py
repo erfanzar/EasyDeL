@@ -46,6 +46,9 @@ class SeqKDConfig(TrainingArguments):
         temperature_sampling: Sampling temperature for generation.
         top_k: Top-k sampling parameter for generation.
         top_p: Top-p (nucleus) sampling parameter for generation.
+        presence_penalty: Presence penalty for generation.
+        frequency_penalty: Frequency penalty for generation.
+        repetition_penalty: Repetition penalty for generation.
         skip_apply_chat_template: Whether to skip chat template application.
     """
 
@@ -80,6 +83,18 @@ class SeqKDConfig(TrainingArguments):
     top_p: float = field(
         default=0.95,
         metadata={"help": "Top-p (nucleus) sampling parameter for generation."},
+    )
+    presence_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Presence penalty applied during generation."},
+    )
+    frequency_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Frequency penalty applied during generation."},
+    )
+    repetition_penalty: float = field(
+        default=1.0,
+        metadata={"help": "Repetition penalty applied during generation."},
     )
     skip_apply_chat_template: bool = field(
         default=False,

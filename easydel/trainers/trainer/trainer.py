@@ -536,6 +536,8 @@ class Trainer(BaseTrainer):
                     state, metrics, run_exception = self._execute_train_step(state=state, batch=data_collator(batch))
                     metrics.execution_time = execution_time()
                     current_step = int(jax.device_get(state.step))
+            if run_exception is not None:
+                return state, run_exception, train_iter
             try:
                 mean_loss, mean_accuracy = metrics_tracker.update(
                     loss=metrics.loss,
@@ -794,6 +796,12 @@ class Trainer(BaseTrainer):
             TypeError,
         ) as run_exception:
             return state, metrics, run_exception
+        except Exception as run_exception:
+            if self._is_memory_oom_exception(run_exception):
+                annotated_exception = self._augment_memory_oom_exception(run_exception)
+                logger.error(str(annotated_exception))
+                return state, metrics, annotated_exception
+            raise
 
     def _finalize_training(self, output, run_exception):
         """

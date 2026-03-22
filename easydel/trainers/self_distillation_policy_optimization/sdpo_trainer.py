@@ -269,12 +269,13 @@ class SDPOTrainer(GRPOTrainer):
             self.teacher_prompt_length,
             self.arguments.beta,
             self.arguments.distillation_type,
+            self.arguments.logprob_vocab_chunk_size,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
         )
-        static_argnames = tuple(range(2, 12))
+        static_argnames = tuple(range(2, 13))
 
         self._train_shared_fn_static_args = (*shared_static, True, straight_through_emulator)
 
@@ -304,7 +305,13 @@ class SDPOTrainer(GRPOTrainer):
             with apply.mesh:
                 ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
                 mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
-                return get_per_token_logps(apply, ids, mask, self.arguments.max_prompt_length)
+                return get_per_token_logps(
+                    apply,
+                    ids,
+                    mask,
+                    self.arguments.max_prompt_length,
+                    logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+                )
 
         self.compute_refmodel_logps = ejit(
             partial(_compute_refmodel_logps, graphdef=self.model_state.graphdef),

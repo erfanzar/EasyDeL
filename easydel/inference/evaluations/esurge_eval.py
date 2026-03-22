@@ -51,13 +51,14 @@ Example:
 
 from __future__ import annotations
 
+import collections.abc
 import inspect
 import re
 import uuid
 from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import fields as dataclass_fields
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -67,6 +68,9 @@ from jax.scipy.special import logsumexp
 from easydel.infra.utils import ProcessingClassType
 
 from ..esurge import eSurge
+
+if TYPE_CHECKING:
+    from easydel.inference.sampling_params import SamplingParams
 
 logger = get_logger("eSurgeLMEvalAdapter")
 
@@ -227,6 +231,34 @@ def _normalize_stop_list(stop_value: Any) -> list[str]:
     if isinstance(stop_value, Iterable):
         return [str(s) for s in stop_value if s is not None]
     return [str(stop_value)]
+
+
+def _merge_stop_lists(existing_stops: Any, requested_stops: Any) -> list[str]:
+    """Merge stop strings while preserving order and avoiding duplicates."""
+    merged = _normalize_stop_list(existing_stops)
+    for stop in _normalize_stop_list(requested_stops):
+        if stop not in merged:
+            merged.append(stop)
+    return merged
+
+
+def _coerce_sampling_params_template(
+    sampling_params: SamplingParams | collections.abc.Mapping[str, Any] | None,
+) -> tuple[SamplingParams | None, frozenset[str]]:
+    """Normalize a benchmark sampling_params template into SamplingParams."""
+    if sampling_params is None:
+        return None, frozenset()
+
+    from easydel.inference.sampling_params import SamplingParams
+
+    if isinstance(sampling_params, SamplingParams):
+        explicit_fields = frozenset(field.name for field in dataclass_fields(SamplingParams) if field.init)
+        return sampling_params.clone(), explicit_fields
+    if isinstance(sampling_params, collections.abc.Mapping):
+        valid_fields = {field.name for field in dataclass_fields(SamplingParams) if field.init}
+        explicit_fields = frozenset(str(key) for key in sampling_params.keys() if str(key) in valid_fields)
+        return SamplingParams(**dict(sampling_params)), explicit_fields
+    raise TypeError("`sampling_params` must be a SamplingParams instance or a mapping of SamplingParams kwargs.")
 
 
 def _is_math_answer_task(task_name: str | None, task_hints: tuple[str, ...]) -> bool:
@@ -410,6 +442,7 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         top_p: float = 0.95,
         temperature: float = 0.0,
         batch_size: int | None = None,
+        sampling_params: SamplingParams | collections.abc.Mapping[str, Any] | None = None,
         normalize_math_answers: bool = True,
         math_answer_task_hints: tuple[str, ...] | list[str] | None = None,
     ):
@@ -445,6 +478,10 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
             temperature: Sampling temperature. Defaults to 0.0 (greedy).
             batch_size: Optional batch size override. If None, uses
                 surge's max_num_seqs setting.
+            sampling_params: Optional fixed SamplingParams template for all
+                benchmark generations. When provided, request-local sampling
+                kwargs do not override it; benchmark stop strings are still
+                merged into ``SamplingParams.stop``.
             normalize_math_answers: If True, normalize math-style generations for
                 GSM-like tasks by appending a `#### <number>` line when possible.
             math_answer_task_hints: Optional task-name hints used to decide where
@@ -476,6 +513,7 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
         )
         self.ignore_benchmark_eos_flags = bool(ignore_benchmark_eos_flags)
         self.top_p = top_p
+        self.sampling_params, self._sampling_params_template_fields = _coerce_sampling_params_template(sampling_params)
         self.truncation_side = str(getattr(surge, "truncate_mode", "left") or "left")
         self.normalize_math_answers = normalize_math_answers
         if math_answer_task_hints is None:
@@ -662,7 +700,29 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
             if normalize_gen_kwargs is not None:
                 raw_kwargs = normalize_gen_kwargs(raw_kwargs, self.max_gen_toks)
 
-            if self.hard_max_new_tokens:
+            forced_sampling_params = self.sampling_params.clone() if self.sampling_params is not None else None
+            force_sampling_template = forced_sampling_params is not None
+
+            if force_sampling_template:
+                template_has_explicit_max_tokens = (
+                    "max_tokens" in self._sampling_params_template_fields
+                    and forced_sampling_params.max_tokens is not None
+                )
+                if template_has_explicit_max_tokens:
+                    request_max_tokens = forced_sampling_params.max_tokens
+                elif self.hard_max_new_tokens:
+                    request_max_tokens = max_tokens if max_tokens is not None else self.max_gen_toks
+                else:
+                    request_max_tokens = raw_kwargs.get(
+                        "max_gen_toks",
+                        raw_kwargs.get("max_tokens", max_tokens if max_tokens is not None else self.max_gen_toks),
+                    )
+                raw_kwargs.pop("max_gen_toks", None)
+                raw_kwargs.pop("max_tokens", None)
+                if request_max_tokens is None:
+                    request_max_tokens = max_tokens if max_tokens is not None else self.max_gen_toks
+                forced_sampling_params.max_tokens = int(request_max_tokens)
+            elif self.hard_max_new_tokens:
                 raw_kwargs.pop("max_gen_toks", None)
                 raw_kwargs.pop("max_tokens", None)
                 request_max_tokens = max_tokens if max_tokens is not None else self.max_gen_toks
@@ -674,18 +734,18 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
             request_temperature = temperature if temperature is not None else self.temperature
             request_top_p = top_p if top_p is not None else self.top_p
 
-            if allow_per_request_sampling_overrides and "temperature" in raw_kwargs:
+            if not force_sampling_template and allow_per_request_sampling_overrides and "temperature" in raw_kwargs:
                 request_temperature = raw_kwargs.pop("temperature")
             else:
                 raw_kwargs.pop("temperature", None)
 
-            if allow_per_request_sampling_overrides and "top_p" in raw_kwargs:
+            if not force_sampling_template and allow_per_request_sampling_overrides and "top_p" in raw_kwargs:
                 request_top_p = raw_kwargs.pop("top_p")
             else:
                 raw_kwargs.pop("top_p", None)
 
             do_sample = _coerce_optional_bool(raw_kwargs.pop("do_sample", None))
-            if do_sample is False:
+            if do_sample is False and not force_sampling_template:
                 request_temperature = 0.0
                 request_top_p = 1.0
                 raw_kwargs.pop("top_k", None)
@@ -722,15 +782,32 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
                     prompt_text = prompts[i]
             prepared_prompts[i] = prompt_text
 
-            sampling_kwargs: dict[str, Any] = {
-                "max_tokens": int(request_max_tokens),
-                "temperature": float(self.temperature if request_temperature is None else request_temperature),
-                "top_p": float(self.top_p if request_top_p is None else request_top_p),
-                "stop": _normalize_stop_list(request_stops),
-                "skip_special_tokens": False,
-                "spaces_between_special_tokens": False,
-                "n": 1,
-            }
+            if force_sampling_template:
+                sampling_kwargs = {
+                    "max_tokens": int(request_max_tokens),
+                    "temperature": float(self.temperature if request_temperature is None else request_temperature),
+                    "top_p": float(self.top_p if request_top_p is None else request_top_p),
+                    "stop": _normalize_stop_list(request_stops),
+                    "skip_special_tokens": False,
+                    "spaces_between_special_tokens": False,
+                    "n": 1,
+                }
+                for field_name in sampling_param_fields:
+                    if field_name in self._sampling_params_template_fields:
+                        sampling_kwargs[field_name] = getattr(forced_sampling_params, field_name)
+                sampling_kwargs["max_tokens"] = int(request_max_tokens)
+                sampling_kwargs["n"] = 1
+                sampling_kwargs["stop"] = _merge_stop_lists(sampling_kwargs.get("stop"), request_stops)
+            else:
+                sampling_kwargs = {
+                    "max_tokens": int(request_max_tokens),
+                    "temperature": float(self.temperature if request_temperature is None else request_temperature),
+                    "top_p": float(self.top_p if request_top_p is None else request_top_p),
+                    "stop": _normalize_stop_list(request_stops),
+                    "skip_special_tokens": False,
+                    "spaces_between_special_tokens": False,
+                    "n": 1,
+                }
 
             extra_args = raw_kwargs.pop("extra_args", None)
             if isinstance(extra_args, dict):
@@ -739,6 +816,8 @@ class eSurgeLMEvalAdapter(LM):  # pyright: ignore[reportUntypedBaseClass]
                 passthrough_extra_args = {}
 
             for key, value in raw_kwargs.items():
+                if force_sampling_template and key in sampling_param_fields:
+                    continue
                 if key in sampling_param_fields and key not in {"n", "best_of"}:
                     sampling_kwargs[key] = value
                 else:

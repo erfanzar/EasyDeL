@@ -43,6 +43,15 @@ class KTOConfig(TrainingArguments):
         default=None,
         metadata={"help": "Maximum length for completion tokens. Defaults to max_length - max_prompt_length."},
     )
+    logprob_vocab_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Vocabulary chunk size used when computing selected-token log probabilities. "
+                "Set to `None` to disable chunking."
+            )
+        },
+    )
     beta: float = field(
         default=0.1,
         metadata={"help": "Scaling factor controlling deviation from the reference model."},
@@ -96,6 +105,9 @@ class KTOConfig(TrainingArguments):
         self._handle_deprecated_max_sequence_length(max_sequence_length)
         if self.max_completion_length is None and self.max_length is not None and self.max_prompt_length is not None:
             self.max_completion_length = max(self.max_length - self.max_prompt_length, 1)
+        if self.logprob_vocab_chunk_size is not None:
+            normalized_chunk_size = int(self.logprob_vocab_chunk_size)
+            self.logprob_vocab_chunk_size = normalized_chunk_size if normalized_chunk_size > 0 else None
         if hasattr(super(), "__post_init__"):
             super().__post_init__(
                 max_sequence_length=None,

@@ -27,6 +27,11 @@ from jax.sharding import PartitionSpec
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
+from easydel.trainers._logprob_utils import (
+    compute_sequence_scores_from_hidden_states,
+    compute_token_logps_and_entropies_chunked,
+    resolve_lmhead_chunksize,
+)
 from easydel.trainers.direct_preference_optimization_trainer._fn import concatenated_inputs
 
 from ..training_utils import (
@@ -52,6 +57,7 @@ def concatenated_forward(
     truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     aux_loss_enabled: bool = False,
     loss_type: LOSS_TYPES = "sigmoid",
+    logprob_vocab_chunk_size: int | None = None,
 ) -> dict[str, jax.Array]:
     """Runs the policy model on concatenated chosen/rejected sequences.
 
@@ -80,6 +86,7 @@ def concatenated_forward(
     prompt_attention_mask = concatenated_batch["prompt_attention_mask"]
     completion_input_ids = concatenated_batch["completion_input_ids"]
     completion_attention_mask = concatenated_batch["completion_attention_mask"]
+    lmhead_chunksize = None
 
     if is_encoder_decoder:
         labels = jnp.where(
@@ -123,6 +130,9 @@ def concatenated_forward(
             "attention_mask": attention_mask,
             **model_kwargs,
         }
+        lmhead_chunksize = resolve_lmhead_chunksize(model)
+        if lmhead_chunksize is not None:
+            call_kwargs["apply_lm_head"] = False
         call_kwargs = filter_kwargs_for_callable(model.__call__, call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         outputs = model(**call_kwargs)
@@ -130,28 +140,46 @@ def concatenated_forward(
         labels = jnp.roll(input_ids, shift=-1, axis=1)
         loss_mask = jnp.roll(loss_mask, shift=-1, axis=1).astype(bool)
 
-    if logits.shape[:2] != loss_mask.shape:
+    if logits is not None and logits.shape[:2] != loss_mask.shape:
         seq_len = loss_mask.shape[1]
         logits = logits[:, -seq_len:]
 
-    if is_encoder_decoder:
-        labels = labels
+    labels = jnp.where(loss_mask, labels, 0)
+
+    if not is_encoder_decoder and logits is None and lmhead_chunksize is not None:
+        hidden_states = outputs.last_hidden_state
+        if hidden_states is None:
+            raise TypeError(
+                f"{type(model).__name__} was called with `apply_lm_head=False` but did not return `last_hidden_state`."
+            )
+        if hidden_states.shape[:2] != labels.shape:
+            hidden_states = hidden_states[:, -labels.shape[1] :, :]
+        sum_logps, token_logit_sums, token_counts = compute_sequence_scores_from_hidden_states(
+            model=model,
+            hidden_states=hidden_states,
+            labels=labels,
+            loss_mask=loss_mask,
+            token_chunk_size=lmhead_chunksize,
+            vocab_chunk_size=logprob_vocab_chunk_size,
+        )
     else:
-        labels = jnp.where(loss_mask, labels, 0)
+        gathered_logps, _ = compute_token_logps_and_entropies_chunked(
+            logits,
+            labels,
+            return_entropy=False,
+            chunk_size=logprob_vocab_chunk_size,
+        )
+        per_token_logps = jnp.where(loss_mask, gathered_logps, 0.0)
+        if not is_encoder_decoder:
+            per_token_logps = jnp.roll(per_token_logps, shift=1, axis=1)
+        sum_logps = per_token_logps.sum(axis=1)
+        token_counts = jnp.sum(loss_mask.astype(jnp.float32), axis=1)
+        token_logit_sums = jnp.sum(
+            jnp.where(loss_mask, logits.astype(jnp.float32).sum(axis=-1), 0.0),
+            axis=1,
+        )
 
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
-    batch_size, seq_len = labels.shape
-    per_token_logps = jnp.where(
-        loss_mask,
-        log_probs[jnp.arange(batch_size)[:, None], jnp.arange(seq_len)[None, :], labels],
-        0,
-    )
-
-    if not is_encoder_decoder:
-        per_token_logps = jnp.roll(per_token_logps, shift=1, axis=1)
-
-    sum_logps = per_token_logps.sum(axis=1)
-    token_counts = jnp.maximum(loss_mask.sum(axis=1), 1)
+    token_counts = jnp.maximum(token_counts, 1.0)
     if loss_type in ("ipo", "simpo"):
         scaled_logps = jnp.where(token_counts > 0, sum_logps / token_counts, 0.0)
     else:
@@ -164,18 +192,10 @@ def concatenated_forward(
     chosen_lengths = token_counts[:num_examples]
     rejected_lengths = token_counts[num_examples:]
 
-    chosen_logits_sum = jnp.where(
-        loss_mask[:num_examples, :, None],
-        logits[:num_examples],
-        0,
-    ).sum()
-    rejected_logits_sum = jnp.where(
-        loss_mask[num_examples:, :, None],
-        logits[num_examples:],
-        0,
-    ).sum()
-    chosen_denom = jnp.maximum(jnp.sum(loss_mask[:num_examples]), 1)
-    rejected_denom = jnp.maximum(jnp.sum(loss_mask[num_examples:]), 1)
+    chosen_logits_sum = token_logit_sums[:num_examples].sum()
+    rejected_logits_sum = token_logit_sums[num_examples:].sum()
+    chosen_denom = jnp.maximum(chosen_lengths.sum(), 1.0)
+    rejected_denom = jnp.maximum(rejected_lengths.sum(), 1.0)
     mean_chosen_logits = chosen_logits_sum / chosen_denom
     mean_rejected_logits = rejected_logits_sum / rejected_denom
 

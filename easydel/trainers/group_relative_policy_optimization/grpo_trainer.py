@@ -157,7 +157,7 @@ class GRPOTrainer(Trainer):
         if isinstance(self.scale_rewards, str):
             self.scale_rewards = self.scale_rewards.lower()
         self.top_entropy_quantile = arguments.top_entropy_quantile
-        self.ref_logps_chunk_size = max(int(arguments.ref_logps_chunk_size or 0), 0)
+        self.ref_logps_chunk_size = arguments.ref_logps_chunk_size
 
         if not isinstance(model, EasyDeLState):
             model = model.to_state()
@@ -360,10 +360,11 @@ class GRPOTrainer(Trainer):
             self.top_entropy_quantile,
             self.arguments.completion_chunk_size,
             self.arguments.max_loss_completion_tokens,
+            self.arguments.logprob_vocab_chunk_size,
             straight_through_emulator,
         )
 
-        static_argnames = tuple(range(2, 18))
+        static_argnames = tuple(range(2, 19))
 
         sharded_training_step_function = ejit(
             grpo_step,
@@ -389,6 +390,7 @@ class GRPOTrainer(Trainer):
             self.top_entropy_quantile,
             self.arguments.completion_chunk_size,
             self.arguments.max_loss_completion_tokens,
+            self.arguments.logprob_vocab_chunk_size,
             straight_through_emulator,
         )
 
@@ -418,6 +420,7 @@ class GRPOTrainer(Trainer):
                     mask,
                     self.arguments.max_prompt_length,
                     model_kwargs=model_kwargs,
+                    logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
                 )
 
         self.compute_refmodel_logps = ejit(
@@ -506,7 +509,7 @@ class GRPOTrainer(Trainer):
             prompt_completion_mask = jnp.concatenate([ridmask, completion_mask], -1)
 
             with capture_time() as token_logps_time_fn:
-                if self.ref_logps_chunk_size > 0 and prompt_completion_ids.shape[0] > self.ref_logps_chunk_size:
+                if self.ref_logps_chunk_size is not None and prompt_completion_ids.shape[0] > self.ref_logps_chunk_size:
                     ref_chunks: list[jax.Array] = []
                     full_batch_size = int(prompt_completion_ids.shape[0])
                     for start in range(0, full_batch_size, self.ref_logps_chunk_size):

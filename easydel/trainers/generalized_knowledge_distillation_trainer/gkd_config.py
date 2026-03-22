@@ -53,11 +53,11 @@ class GKDConfig(SFTConfig):
         default=0.9,
         metadata={"help": "Generation temperature as well as the softmax temperature used when computing the GKD loss."},
     )
-    lmbda: float = field(
+    lmbda: float | None = field(
         default=0.5,
         metadata={
             "help": "Probability of performing on-policy student generation for a batch. "
-            "Set to 0 to disable on-policy sampling."
+            "Set to `None` to disable on-policy sampling; `0` is accepted for backward compatibility."
         },
     )
     beta: float = field(
@@ -91,8 +91,11 @@ class GKDConfig(SFTConfig):
             max_sequence_length=max_sequence_length,
             quantization_block=quantization_block,
         )
-        if not 0.0 <= self.lmbda <= 1.0:
-            raise ValueError("`lmbda` must be within [0, 1].")
+        if self.lmbda is not None:
+            normalized_lmbda = float(self.lmbda)
+            self.lmbda = normalized_lmbda if normalized_lmbda > 0.0 else None
+            if self.lmbda is not None and not 0.0 <= self.lmbda <= 1.0:
+                raise ValueError("`lmbda` must be within [0, 1].")
         if not 0.0 <= self.beta <= 1.0:
             raise ValueError("`beta` must be within [0, 1].")
         if self.max_new_tokens <= 0:

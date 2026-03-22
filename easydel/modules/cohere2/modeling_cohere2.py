@@ -798,7 +798,7 @@ class Cohere2ForCausalLM(BaseCausalLMModule[Cohere2Model, Cohere2Config]):
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = self.apply_lm_head(hidden_states)
+            lm_logits = self.compute_lm_logits(hidden_states)
 
         return CausalLMOutput(
             logits=lm_logits,

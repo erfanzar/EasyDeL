@@ -1096,7 +1096,7 @@ class RwkvForCausalLM(BaseCausalLMModule[RwkvModel, RwkvConfig]):  # type: ignor
         )
         hidden_states = rwkv_outputs[0]
 
-        logits = self.apply_lm_head(hidden_states)
+        logits = self.compute_lm_logits(hidden_states)
 
         return RwkvCausalLMOutput(
             logits=logits,

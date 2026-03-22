@@ -150,6 +150,14 @@ class GRPOConfig(TrainingArguments):
         default=None,
         metadata={"help": "Top-k sampling parameter. None disables top-k."},
     )
+    presence_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Presence penalty applied during generation."},
+    )
+    frequency_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Frequency penalty applied during generation."},
+    )
     min_p: float | None = field(
         default=None,
         metadata={"help": "Minimum token probability threshold (see HF top-p-min sampling)."},
@@ -174,17 +182,41 @@ class GRPOConfig(TrainingArguments):
         default=1.0,
         metadata={"help": "Keep only the top quantile of tokens by entropy in the loss (1.0 disables filtering)."},
     )
-    ref_logps_chunk_size: int = field(
-        default=0,
-        metadata={"help": "Chunk size for reference-model log-prob computation. Set to 0 to disable chunking."},
+    ref_logps_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Chunk size for reference-model log-prob computation. "
+                "Set to `None` to disable chunking; `0` is accepted for backward compatibility."
+            )
+        },
     )
-    completion_chunk_size: int = field(
-        default=0,
-        metadata={"help": "Chunk size for completion-loss computation. Set to 0 to disable chunked completion loss."},
+    completion_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Chunk size for completion-loss computation. "
+                "Set to `None` to disable chunked completion loss; `0` is accepted for backward compatibility."
+            )
+        },
     )
-    max_loss_completion_tokens: int = field(
-        default=0,
-        metadata={"help": "Optional cap on completion tokens used by the GRPO loss. Set to 0 to disable truncation."},
+    max_loss_completion_tokens: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional cap on completion tokens used by the GRPO loss. "
+                "Set to `None` to disable truncation; `0` is accepted for backward compatibility."
+            )
+        },
+    )
+    logprob_vocab_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Vocabulary chunk size used when computing per-token log probabilities and entropies. "
+                "Set to `None` to disable chunking."
+            )
+        },
     )
 
     def __post_init__(
@@ -231,9 +263,22 @@ class GRPOConfig(TrainingArguments):
         elif self.scale_rewards is False:
             self.scale_rewards = "none"
 
-        self.ref_logps_chunk_size = max(int(self.ref_logps_chunk_size or 0), 0)
-        self.completion_chunk_size = max(int(self.completion_chunk_size or 0), 0)
-        self.max_loss_completion_tokens = max(int(self.max_loss_completion_tokens or 0), 0)
+        if self.ref_logps_chunk_size is not None:
+            normalized_ref_chunk_size = int(self.ref_logps_chunk_size)
+            self.ref_logps_chunk_size = normalized_ref_chunk_size if normalized_ref_chunk_size > 0 else None
+        if self.completion_chunk_size is not None:
+            normalized_completion_chunk_size = int(self.completion_chunk_size)
+            self.completion_chunk_size = (
+                normalized_completion_chunk_size if normalized_completion_chunk_size > 0 else None
+            )
+        if self.max_loss_completion_tokens is not None:
+            normalized_max_loss_completion_tokens = int(self.max_loss_completion_tokens)
+            self.max_loss_completion_tokens = (
+                normalized_max_loss_completion_tokens if normalized_max_loss_completion_tokens > 0 else None
+            )
+        if self.logprob_vocab_chunk_size is not None:
+            normalized_chunk_size = int(self.logprob_vocab_chunk_size)
+            self.logprob_vocab_chunk_size = normalized_chunk_size if normalized_chunk_size > 0 else None
 
         if hasattr(super(), "__post_init__"):
             super().__post_init__(

@@ -19,6 +19,7 @@ from types import ModuleType
 
 import pytest
 
+from easydel.inference.sampling_params import SamplingParams
 from easydel.infra.elarge.model import eLargeModel
 
 
@@ -97,6 +98,44 @@ def test_eval_can_force_hard_max_new_tokens(monkeypatch):
 
     assert calls["adapter_kwargs"]["max_new_tokens"] == 123
     assert calls["adapter_kwargs"]["hard_max_new_tokens"] is True
+
+
+def test_eval_forwards_sampling_params_to_eval_adapter(monkeypatch):
+    """`sampling_params` should be forwarded to the eval adapter when configured."""
+    elm = object.__new__(eLargeModel)
+    sampling_params = SamplingParams(max_tokens=41, temperature=0.3, top_k=9)
+    elm._config = {
+        "model": {"name_or_path": "dummy-model"},
+        "esurge": {},
+        "eval": {"sampling_params": sampling_params},
+    }
+    elm._tokenizer = object()
+    elm.build_tokenizer = lambda: None
+    elm.build_esurge = lambda: object()
+
+    calls: dict[str, object] = {}
+
+    class _DummyEvalAdapter:
+        def __init__(self, **kwargs):
+            calls["adapter_kwargs"] = kwargs
+
+        def stop(self):
+            calls["stopped"] = True
+
+    def _simple_evaluate(**kwargs):
+        calls["simple_evaluate_kwargs"] = kwargs
+        return {"results": {}}
+
+    lm_eval_module = ModuleType("lm_eval")
+    lm_eval_module.evaluator = ModuleType("lm_eval.evaluator")
+    lm_eval_module.evaluator.simple_evaluate = _simple_evaluate
+
+    monkeypatch.setitem(sys.modules, "lm_eval", lm_eval_module)
+    monkeypatch.setattr("easydel.inference.evaluations.eSurgeLMEvalAdapter", _DummyEvalAdapter)
+
+    elm.eval(["gsm8k"])
+
+    assert calls["adapter_kwargs"]["sampling_params"] is sampling_params
 
 
 def test_eval_can_enable_thinking_for_chat_templating(monkeypatch):
@@ -502,6 +541,7 @@ def test_run_benchmarks_reuses_engine_and_merges_default_eval_overrides(monkeypa
     elm.build_esurge = lambda: engine
 
     run_calls: list[dict[str, object]] = []
+    sampling_params = SamplingParams(max_tokens=24, temperature=0.5, top_k=7)
 
     def _fake_run_lm_eval_with_esurge(**kwargs):
         run_calls.append(kwargs)
@@ -515,6 +555,7 @@ def test_run_benchmarks_reuses_engine_and_merges_default_eval_overrides(monkeypa
                 "name": "code",
                 "tasks": "humaneval",
                 "enable_thinking": True,
+                "sampling_params": sampling_params,
             }
         ],
         top_p=0.9,
@@ -527,6 +568,7 @@ def test_run_benchmarks_reuses_engine_and_merges_default_eval_overrides(monkeypa
     assert run_calls[0]["eval_config"]["temperature"] == 0.2
     assert run_calls[0]["eval_config"]["top_p"] == 0.9
     assert run_calls[0]["eval_config"]["enable_thinking"] is True
+    assert run_calls[0]["eval_config"]["sampling_params"] is sampling_params
     assert run_calls[0]["stop_engine"] is False
     assert engine.terminate_calls == 1
 

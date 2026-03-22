@@ -70,7 +70,10 @@ from typing import Any, Generic, TypeVar
 
 import jax
 from flax import nnx as nn
+from jax import lax
 from jax import numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
+from jaxtyping import Array
 
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -359,6 +362,118 @@ class BaseTaskModule(EasyDeLBaseModule, Generic[ModelT, ConfigT], ABC):
         """
         if self._logit_cap_feature is not None:
             return self._logit_cap_feature.apply(logits)
+        return logits
+
+    def _resolve_lmhead_chunksize(self, seq_len: int | None = None) -> int | None:
+        """Resolve the configured LM-head token chunk size for the current input.
+
+        Reads ``config.lmhead_chunksize`` and applies validation and clamping
+        logic to produce a usable chunk size value. The chunk size controls how
+        many tokens are projected through the LM head at once, which is useful
+        for reducing peak memory when the vocabulary is large.
+
+        The resolution rules are:
+        1. If ``config.lmhead_chunksize`` is ``None``, chunking is disabled
+           and ``None`` is returned.
+        2. If the configured value is ``<= 0``, chunking is disabled and
+           ``None`` is returned.
+        3. If ``seq_len`` is provided, the chunk size is clamped to
+           ``[1, seq_len]`` so it never exceeds the actual sequence length.
+        4. Otherwise, the raw (positive) chunk size is returned as-is.
+
+        Args:
+            seq_len: The sequence length of the current input. When provided,
+                the returned chunk size will be clamped to at most this value.
+                Pass ``None`` when the sequence length is unknown or not
+                applicable (e.g., for non-3D inputs).
+
+        Returns:
+            The resolved chunk size as a positive integer, or ``None`` if
+            chunking is not configured or has been disabled (value <= 0).
+        """
+
+        chunk_size = self.config.lmhead_chunksize
+        if chunk_size is None:
+            return None
+        chunk_size = int(chunk_size)
+        if chunk_size <= 0:
+            return None
+        if seq_len is None:
+            return chunk_size
+        return max(1, min(chunk_size, int(seq_len)))
+
+    def compute_lm_logits(self, hidden_states: Array) -> Array:
+        """Project hidden states to vocabulary logits, optionally chunking across tokens.
+
+        When ``lmhead_chunksize`` is configured on the model config, the
+        sequence/token dimension is split into fixed-size chunks and each
+        chunk is projected through the LM head independently. This avoids
+        materializing the full ``[batch, seq_len, vocab_size]`` logit tensor
+        at once, significantly reducing peak memory for long sequences or
+        large vocabularies.
+
+        Chunked projection is implemented with ``jax.checkpoint`` per chunk
+        (so activations are recomputed during the backward pass rather than
+        stored) and ``jax.lax.fori_loop`` to iterate over chunks without
+        unrolling the loop in the XLA computation graph.
+
+        If the hidden states are not 3-D, if chunking is not configured, or
+        if the sequence length is already within a single chunk, the
+        projection falls back to a single unchunked call.
+
+        Padding is applied when the sequence length is not evenly divisible
+        by the chunk size; the extra positions are sliced off before
+        returning.
+
+        Args:
+            hidden_states: Model hidden states to project. Expected shape is
+                ``(batch_size, seq_len, hidden_dim)`` for the chunked path.
+                Non-3-D inputs bypass chunking and are projected directly.
+
+        Returns:
+            Logit tensor of shape ``(batch_size, seq_len, vocab_size)`` (or
+            matching the input rank when chunking is bypassed), with logit
+            capping applied if configured.
+        """
+
+        chunk_size = self._resolve_lmhead_chunksize(hidden_states.shape[1] if hidden_states.ndim == 3 else None)
+        if chunk_size is None or hidden_states.ndim != 3 or hidden_states.shape[1] <= chunk_size:
+            logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
+            return self.apply_logit_cap(logits)
+
+        batch_size, seq_len, _hidden_dim = hidden_states.shape
+        pad_len = (-seq_len) % chunk_size
+        if pad_len:
+            hidden_states = jnp.pad(hidden_states, ((0, 0), (0, pad_len), (0, 0)))
+
+        padded_seq_len = hidden_states.shape[1]
+        num_chunks = padded_seq_len // chunk_size
+
+        def _project_chunk(chunk_hidden_states: Array) -> Array:
+            logits = checkpoint_name(self.apply_lm_head(chunk_hidden_states), "lm_head_output")
+            return self.apply_logit_cap(logits)
+
+        _project_chunk = jax.checkpoint(_project_chunk, prevent_cse=False)
+        first_chunk_hidden_states = lax.dynamic_slice_in_dim(hidden_states, 0, chunk_size, axis=1)
+        first_chunk_logits = _project_chunk(first_chunk_hidden_states)
+        # Seed the accumulator from the first projected chunk so tensor-parallel
+        # vocab sharding can propagate onto the full logits buffer.
+        logits = jnp.broadcast_to(
+            jnp.zeros_like(first_chunk_logits[:, :1, :]),
+            (batch_size, padded_seq_len, first_chunk_logits.shape[-1]),
+        )
+        logits = lax.dynamic_update_slice(logits, first_chunk_logits, (0, 0, 0))
+
+        def _write_chunk(i: int, logits_buffer: Array) -> Array:
+            start = i * chunk_size
+            chunk_hidden_states = lax.dynamic_slice_in_dim(hidden_states, start, chunk_size, axis=1)
+            chunk_logits = _project_chunk(chunk_hidden_states)
+            return lax.dynamic_update_slice(logits_buffer, chunk_logits, (0, start, 0))
+
+        if num_chunks > 1:
+            logits = lax.fori_loop(1, num_chunks, _write_chunk, logits)
+        if pad_len:
+            logits = logits[:, :seq_len, :]
         return logits
 
     def compute_router_aux_loss(self, outputs) -> Any:

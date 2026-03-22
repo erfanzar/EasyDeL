@@ -367,9 +367,10 @@ def run_lm_eval_with_esurge(
     ``lm_eval.evaluator.simple_evaluate``.  After evaluation the adapter is
     stopped if *stop_engine* is ``True``.
 
-    ELM-specific keys (``max_new_tokens``, ``temperature``, ``batch_size``,
-    ``code_eval_num_workers``, etc.) are popped from *eval_config* before the
-    remainder is forwarded to lm-eval so that no unknown keyword errors occur.
+    ELM-specific keys (``max_new_tokens``, ``temperature``, ``sampling_params``,
+    ``batch_size``, ``code_eval_num_workers``, etc.) are popped from
+    *eval_config* before the remainder is forwarded to lm-eval so that no
+    unknown keyword errors occur.
 
     Args:
         surge: A running :class:`~easydel.inference.eSurge` instance.
@@ -420,6 +421,7 @@ def run_lm_eval_with_esurge(
     ignore_benchmark_eos_flags = bool(config.pop("ignore_benchmark_eos_flags", False))
     temperature = config.pop("temperature", 0.0)
     top_p = config.pop("top_p", 0.95)
+    sampling_params = config.pop("sampling_params", None)
     device = config.pop("device", "cpu")
     num_fewshot = config.pop("num_fewshot", num_fewshot)
     normalize_math_answers = bool(config.pop("normalize_math_answers", True))
@@ -453,6 +455,7 @@ def run_lm_eval_with_esurge(
         batch_size=batch_size,
         temperature=temperature,
         top_p=top_p,
+        sampling_params=sampling_params,
         normalize_math_answers=normalize_math_answers,
         math_answer_task_hints=math_answer_task_hints,
     )

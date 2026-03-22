@@ -761,7 +761,7 @@ class GemmaForCausalLM(BaseCausalLMModule[GemmaModel, GemmaConfig]):
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
+            lm_logits = self.compute_lm_logits(hidden_states)
 
         return CausalLMOutput(
             logits=lm_logits,

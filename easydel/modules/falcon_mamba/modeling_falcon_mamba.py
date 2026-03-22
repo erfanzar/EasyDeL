@@ -1117,7 +1117,7 @@ class FalconMambaForCausalLM(BaseCausalLMModule[FalconMambaModel, FalconMambaCon
 
         logits = None
         if apply_lm_head:
-            logits = self.apply_lm_head(outputs.last_hidden_state)
+            logits = self.compute_lm_logits(outputs.last_hidden_state)
 
         return FalconMambaCausalLMOutput(
             last_hidden_state=outputs.last_hidden_state,

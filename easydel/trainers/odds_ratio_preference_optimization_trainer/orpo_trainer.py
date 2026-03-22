@@ -166,6 +166,7 @@ class ORPOTrainer(Trainer):
             tokenizer=self.processing_class,
             max_prompt_length=self.arguments.max_prompt_length,
             max_completion_length=self.arguments.max_completion_length,
+            tools=getattr(self.arguments, "tools", None),
             label_pad_token_id=self.arguments.label_pad_token_id,
         )
 
@@ -197,6 +198,7 @@ class ORPOTrainer(Trainer):
             label_pad_token_id=self.arguments.label_pad_token_id,
             padding_value=self.arguments.padding_value,
             max_length=self.arguments.max_length,
+            logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
         )
         jited_concatenated_forward = ejit(
             partial_concatenated_forward,

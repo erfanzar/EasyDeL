@@ -43,6 +43,11 @@ from jaxtyping import Array
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics, dynamic_cross_entropy_loss
+from easydel.trainers._logprob_utils import (
+    compute_sequence_scores_from_hidden_states,
+    compute_token_logps_and_entropies_chunked,
+    resolve_lmhead_chunksize,
+)
 
 from ..training_utils import (
     filter_kwargs_for_callable,
@@ -61,6 +66,7 @@ def concatenated_forward(
     label_pad_token_id: int,
     padding_value: tp.Any,
     max_length: int | None = None,
+    logprob_vocab_chunk_size: int | None = None,
 ) -> tuple[Array, Array, Array, Array, Array, Array]:
     """
     Computes log-probabilities and logits for both chosen and rejected examples by concatenating
@@ -85,8 +91,8 @@ def concatenated_forward(
             A tuple containing:
                 - chosen_log_probs: Log probabilities for the chosen examples.
                 - rejected_log_probs: Log probabilities for the rejected examples.
-                - chosen_logits: Logits for the chosen examples.
-                - rejected_logits: Logits for the rejected examples.
+                - chosen_logits: Per-example mean logit summaries for the chosen examples.
+                - rejected_logits: Per-example mean logit summaries for the rejected examples.
                 - chosen_nll_loss: Negative log-likelihood loss for the chosen examples.
                 - chosen_accuracy: Accuracy metric computed on the chosen examples.
     """
@@ -107,6 +113,11 @@ def concatenated_forward(
         if is_encoder_decoder
         else {}
     )
+    lmhead_chunksize = None
+    if not is_encoder_decoder:
+        lmhead_chunksize = resolve_lmhead_chunksize(state.model)
+        if lmhead_chunksize is not None:
+            model_kwargs["apply_lm_head"] = False
 
     # Forward pass through the model.
     call_kwargs = {
@@ -116,10 +127,11 @@ def concatenated_forward(
     }
     call_kwargs = filter_kwargs_for_callable(state.model.__call__, call_kwargs)
     call_kwargs = sanitize_model_call_kwargs(call_kwargs)
-    all_logits = state.model(**call_kwargs).logits
+    outputs = state.model(**call_kwargs)
+    all_logits = outputs.logits
 
     effective_labels = concatenated_batch["concatenated_labels"]
-    if is_encoder_decoder and effective_labels.shape != all_logits.shape[:-1]:
+    if is_encoder_decoder and all_logits is not None and effective_labels.shape != all_logits.shape[:-1]:
         candidate_labels = call_kwargs.get("labels")
         if candidate_labels is None:
             candidate_labels = call_kwargs.get("decoder_input_ids")
@@ -153,11 +165,16 @@ def concatenated_forward(
         if not is_encoder_decoder:
             logits = logits[..., :-1, :]
             labels = labels[..., 1:]
-        loss, accuracy = dynamic_cross_entropy_loss(
+        loss, _ = dynamic_cross_entropy_loss(
             logits,
             labels,
             ignore_index=label_pad_token_id,
         )
+        valid = labels != label_pad_token_id
+        safe_labels = jnp.where(valid, labels, 0)
+        accuracy = jnp.sum(
+            valid.astype(jnp.float32) * (jnp.argmax(logits, axis=-1) == safe_labels).astype(jnp.float32)
+        ) / jnp.maximum(jnp.sum(valid.astype(jnp.float32)), 1.0)
         return loss, accuracy
 
     # Set labels for computing loss.
@@ -168,26 +185,69 @@ def concatenated_forward(
         attention_mask = concatenated_batch["concatenated_attention_mask"]
         labels = jnp.where(attention_mask == 1, labels, label_pad_token_id)
 
-    # Compute negative log likelihood loss and accuracy for the chosen examples.
-    chosen_nll_loss, chosen_accuracy = cross_entropy_loss(
-        all_logits[:len_chosen],
-        labels[:len_chosen],
-    )
+    if not is_encoder_decoder and all_logits is None and lmhead_chunksize is not None:
+        shifted_labels = labels[:, 1:]
+        loss_mask = shifted_labels != label_pad_token_id
+        labels_safe = jnp.where(loss_mask, shifted_labels, 0)
+        hidden_states = outputs.last_hidden_state
+        if hidden_states is None:
+            raise TypeError(
+                f"{type(state.model).__name__} was called with `apply_lm_head=False` but did not return `last_hidden_state`."
+            )
+        hidden_states = hidden_states[:, :-1, :]
+        sum_logps, token_logit_sums, token_counts, correct_counts = compute_sequence_scores_from_hidden_states(
+            model=state.model,
+            hidden_states=hidden_states,
+            labels=labels_safe,
+            loss_mask=loss_mask,
+            token_chunk_size=lmhead_chunksize,
+            vocab_chunk_size=logprob_vocab_chunk_size,
+            return_correct_counts=True,
+        )
+        token_counts = jnp.maximum(token_counts, 1.0)
+        all_log_probs = sum_logps / token_counts
+        chosen_log_probs = all_log_probs[:len_chosen]
+        rejected_log_probs = all_log_probs[len_chosen:]
+        chosen_logits = jnp.where(
+            token_counts[:len_chosen] > 0,
+            token_logit_sums[:len_chosen] / token_counts[:len_chosen],
+            0.0,
+        )
+        rejected_logits = jnp.where(
+            token_counts[len_chosen:] > 0,
+            token_logit_sums[len_chosen:] / token_counts[len_chosen:],
+            0.0,
+        )
+        chosen_nll_loss = -sum_logps[:len_chosen].sum() / jnp.maximum(token_counts[:len_chosen].sum(), 1.0)
+        chosen_accuracy = correct_counts[:len_chosen].sum() / jnp.maximum(token_counts[:len_chosen].sum(), 1.0)
+    else:
+        # Compute negative log likelihood loss and accuracy for the chosen examples.
+        chosen_nll_loss, chosen_accuracy = cross_entropy_loss(
+            all_logits[:len_chosen],
+            labels[:len_chosen],
+        )
 
-    # Compute log probabilities for the entire batch.
-    all_log_probs = get_batch_logps(
-        all_logits,
-        effective_labels,
-        average_log_prob=True,
-        is_encoder_decoder=is_encoder_decoder,
-        label_pad_token_id=label_pad_token_id,
-    )
+        # Compute log probabilities for the entire batch.
+        all_log_probs = get_batch_logps(
+            all_logits,
+            effective_labels,
+            average_log_prob=True,
+            is_encoder_decoder=is_encoder_decoder,
+            label_pad_token_id=label_pad_token_id,
+            logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+        )
 
-    # Split log probabilities and logits into chosen and rejected.
-    chosen_log_probs = all_log_probs[:len_chosen]
-    rejected_log_probs = all_log_probs[len_chosen:]
-    chosen_logits = all_logits[:len_chosen]
-    rejected_logits = all_logits[len_chosen:]
+        # Split log probabilities and logit summaries into chosen and rejected.
+        chosen_log_probs = all_log_probs[:len_chosen]
+        rejected_log_probs = all_log_probs[len_chosen:]
+        all_logit_summaries = get_batch_mean_logit_summaries(
+            all_logits,
+            effective_labels,
+            label_pad_token_id=label_pad_token_id,
+            is_encoder_decoder=is_encoder_decoder,
+        )
+        chosen_logits = all_logit_summaries[:len_chosen]
+        rejected_logits = all_logit_summaries[len_chosen:]
     return (
         chosen_log_probs,
         rejected_log_probs,
@@ -204,6 +264,7 @@ def get_batch_logps(
     average_log_prob: bool = False,
     label_pad_token_id: int = -100,
     is_encoder_decoder: bool = False,
+    logprob_vocab_chunk_size: int | None = None,
 ) -> Array:
     """
     Computes the log probabilities for a batch of sequences given the model logits and labels.
@@ -235,16 +296,75 @@ def get_batch_logps(
     loss_mask = labels != label_pad_token_id
     # Replace pad token indices in labels with 0 (since they are masked out later).
     labels = jnp.expand_dims(jnp.where(labels == label_pad_token_id, 0, labels), -1)
-    # Compute the log softmax along the vocabulary dimension.
-    lsmax = jax.nn.log_softmax(logits, axis=-1)
-    # Extract log probabilities for the corresponding label tokens.
-    per_token_logps = jnp.take_along_axis(lsmax, axis=2, indices=labels).squeeze(2)
+    per_token_logps, _ = compute_token_logps_and_entropies_chunked(
+        logits,
+        jnp.squeeze(labels, axis=-1),
+        return_entropy=False,
+        chunk_size=logprob_vocab_chunk_size,
+    )
 
     # Return averaged or summed log probabilities based on the flag.
     if average_log_prob:
         return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
     else:
         return (per_token_logps * loss_mask).sum(-1)
+
+
+def get_batch_mean_logit_summaries(
+    logits: Array,
+    labels: Array,
+    label_pad_token_id: int = -100,
+    is_encoder_decoder: bool = False,
+) -> Array:
+    """Compute a per-example mean logit summary over loss-bearing token positions.
+
+    This utility replaces the earlier approach of returning full logit tensors
+    (which are very large for big vocabularies) with a single scalar summary
+    per example.  For each example in the batch it:
+
+    1. Identifies the *loss-bearing* positions -- those whose label is not the
+       padding sentinel ``label_pad_token_id``.
+    2. Sums the raw logit values across the entire vocabulary at each
+       loss-bearing position.
+    3. Averages those sums over the number of loss-bearing tokens, producing
+       one scalar per example.
+
+    For decoder-only models (``is_encoder_decoder=False``), the labels and
+    logits are shifted so that position *t* of the logits predicts position
+    *t + 1* of the labels, matching the standard causal-LM alignment
+    convention.
+
+    Args:
+        logits: Float array of shape ``(batch, seq_len, vocab_size)`` with the
+            unnormalized model predictions.
+        labels: Integer array of shape ``(batch, seq_len)`` with target token
+            ids.  Positions set to ``label_pad_token_id`` are excluded from
+            the summary.
+        label_pad_token_id: The sentinel value used to mark padding / ignored
+            positions in *labels*.  Defaults to ``-100``.
+        is_encoder_decoder: If ``False`` (the default), the function applies
+            the standard causal shift (drop the last logit, drop the first
+            label) before computing the summary.
+
+    Returns:
+        Float array of shape ``(batch,)`` where each entry is the mean logit
+        sum across the loss-bearing positions of that example.
+
+    Raises:
+        ValueError: If the batch and sequence-length dimensions of *logits*
+            (ignoring the vocab axis) do not match the shape of *labels*.
+    """
+    if logits.shape[:-1] != labels.shape:
+        raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
+
+    if not is_encoder_decoder:
+        labels = labels[:, 1:]
+        logits = logits[:, :-1, :]
+
+    loss_mask = labels != label_pad_token_id
+    token_logit_sums = jnp.sum(logits.astype(jnp.float32), axis=-1)
+    token_counts = jnp.maximum(loss_mask.astype(jnp.float32).sum(-1), 1.0)
+    return jnp.where(loss_mask, token_logit_sums, 0.0).sum(-1) / token_counts
 
 
 def concatenated_inputs(
@@ -400,8 +520,8 @@ def orpo_step(
         if mode == "train" and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         (
-            mean_chosen_logits,
-            mean_rejected_logits,
+            policy_chosen_logps,
+            policy_rejected_logps,
             policy_chosen_logits,
             policy_rejected_logits,
             policy_nll_loss,
@@ -414,7 +534,7 @@ def orpo_step(
             rejected_rewards,
             log_odds_ratio,
             log_odds_chosen,
-        ) = odds_ratio_loss(beta, mean_chosen_logits, mean_rejected_logits)
+        ) = odds_ratio_loss(beta, policy_chosen_logps, policy_rejected_logps)
 
         loss = policy_nll_loss - losses.mean()
 
@@ -424,8 +544,8 @@ def orpo_step(
             "rewards/rejected": rejected_rewards.mean(),
             "rewards/accuracies": reward_accuracies.mean(),
             "rewards/margins": (chosen_rewards - rejected_rewards).mean(),
-            "logps/rejected": mean_rejected_logits.mean(),
-            "logps/chosen": mean_chosen_logits.mean(),
+            "logps/rejected": policy_rejected_logps.mean(),
+            "logps/chosen": policy_chosen_logps.mean(),
             "logits/rejected": policy_rejected_logits.mean(),
             "logits/chosen": policy_chosen_logits.mean(),
             "nll_loss": policy_nll_loss.mean(),

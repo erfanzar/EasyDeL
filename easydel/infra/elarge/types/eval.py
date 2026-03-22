@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import collections.abc
 from dataclasses import dataclass
-from typing import Any, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
+
+if TYPE_CHECKING:
+    from easydel.inference.sampling_params import SamplingParams
 
 BenchmarkTask = str | dict[str, Any] | Any
 """A single benchmark task specification: a task name string, a task config dict, or an lm-eval task object."""
@@ -47,6 +50,10 @@ class EvalKwargs(TypedDict, total=False):
             definitions.
         temperature: Sampling temperature for generation (0.0 = greedy).
         top_p: Nucleus sampling probability threshold.
+        sampling_params: Optional fixed SamplingParams template used for all
+            benchmark generations. When provided, request-local sampling
+            overrides are ignored except benchmark stop strings, which are
+            merged into SamplingParams.stop.
         normalize_math_answers: Whether to normalize mathematical answers before
             comparison.
         math_answer_task_hints: Task name patterns that indicate math answer
@@ -108,6 +115,7 @@ class EvalKwargs(TypedDict, total=False):
     ignore_benchmark_eos_flags: NotRequired[bool]
     temperature: NotRequired[float]
     top_p: NotRequired[float]
+    sampling_params: NotRequired[SamplingParams | dict[str, Any] | None]
     normalize_math_answers: NotRequired[bool]
     math_answer_task_hints: NotRequired[collections.abc.Sequence[str] | str | None]
     code_eval_num_workers: NotRequired[int | None]

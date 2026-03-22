@@ -124,6 +124,15 @@ class CPOConfig(TrainingArguments):
             )
         },
     )
+    logprob_vocab_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Vocabulary chunk size used when computing selected-token log probabilities. "
+                "Set to `None` to disable chunking."
+            )
+        },
+    )
     is_encoder_decoder: bool | None = field(
         default=None,
         metadata={"help": "Override automatic detection for encoder-decoder architectures."},
@@ -147,6 +156,9 @@ class CPOConfig(TrainingArguments):
         if self.loss_type == "alphapo":
             self.loss_type = "simpo"
             self.cpo_alpha = 0.0
+        if self.logprob_vocab_chunk_size is not None:
+            normalized_chunk_size = int(self.logprob_vocab_chunk_size)
+            self.logprob_vocab_chunk_size = normalized_chunk_size if normalized_chunk_size > 0 else None
 
         if hasattr(super(), "__post_init__"):
             super().__post_init__(

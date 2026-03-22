@@ -50,6 +50,11 @@ from easydel.utils.compiling_utils import ejit
 from easydel.utils.helpers import capture_time, get_logger  # pyright: ignore[reportPrivateLocalImportUsage]
 from easydel.utils.traversals import deepcopy_model
 
+from .._logprob_utils import (
+    compute_per_token_logps_and_entropies_from_hidden_states,
+    compute_token_logps_and_entropies_chunked,
+    resolve_lmhead_chunksize,
+)
 from ..prompt_transforms import GRPOPreprocessTransform
 from ..prompt_utils import apply_chat_template
 from ..trainer.trainer import Trainer
@@ -377,7 +382,8 @@ class PPOTrainer(Trainer):
             float(self.arguments.cliprange),
             float(self.arguments.vf_coef),
             float(self.arguments.cliprange_value),
-            float(self.arguments.entropy_coef),
+            0.0 if self.arguments.entropy_coef is None else float(self.arguments.entropy_coef),
+            self.arguments.logprob_vocab_chunk_size,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
@@ -385,7 +391,7 @@ class PPOTrainer(Trainer):
             True,  # is_train
             straight_through_emulator,
         )
-        static_argnums = tuple(range(2, 13))
+        static_argnums = tuple(range(2, 14))
         sharded_training_step_function = ejit(
             ppo_step,
             in_shardings=(self.state_shardings, empty_sharding),
@@ -399,7 +405,8 @@ class PPOTrainer(Trainer):
             float(self.arguments.cliprange),
             float(self.arguments.vf_coef),
             float(self.arguments.cliprange_value),
-            float(self.arguments.entropy_coef),
+            0.0 if self.arguments.entropy_coef is None else float(self.arguments.entropy_coef),
+            self.arguments.logprob_vocab_chunk_size,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
@@ -423,14 +430,35 @@ class PPOTrainer(Trainer):
             with apply.mesh:
                 ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
                 mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
-                # Reuse GRPO logps utility implementation via PPO step helpers (fast path).
-                outputs = apply(input_ids=ids, attention_mask=mask)
+                target_ids = ids[:, prompt_length:]
+                call_kwargs = {"input_ids": ids, "attention_mask": mask}
+                lmhead_chunksize = resolve_lmhead_chunksize(apply)
+                if lmhead_chunksize is not None:
+                    call_kwargs["apply_lm_head"] = False
+                outputs = apply(**call_kwargs)
+                if outputs.logits is None and lmhead_chunksize is not None:
+                    hidden_states = outputs.last_hidden_state
+                    if hidden_states is None:
+                        raise ValueError("Reference model outputs do not provide last_hidden_state for PPO scoring.")
+                    score_hidden_states = hidden_states[:, prompt_length - 1 : -1, :]
+                    token_log_probs, _ = compute_per_token_logps_and_entropies_from_hidden_states(
+                        apply,
+                        score_hidden_states,
+                        target_ids,
+                        token_chunk_size=lmhead_chunksize,
+                        vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+                        return_entropy=False,
+                    )
+                    return token_log_probs
                 logits = outputs.logits[:, prompt_length - 1 :]
                 logits = logits[:, :-1, :]
-                log_probs = jax.nn.log_softmax(logits, axis=-1)
-                target_ids = ids[:, prompt_length:]
-                token_log_probs = jnp.take_along_axis(log_probs, jnp.expand_dims(target_ids, axis=-1), axis=-1)
-                return jnp.squeeze(token_log_probs, axis=-1)
+                token_log_probs, _ = compute_token_logps_and_entropies_chunked(
+                    logits,
+                    target_ids,
+                    return_entropy=False,
+                    chunk_size=self.arguments.logprob_vocab_chunk_size,
+                )
+                return token_log_probs
 
         self.compute_refmodel_logps = ejit(
             partial(_compute_refmodel_logps, graphdef=self.ref_state.graphdef),
@@ -453,13 +481,16 @@ class PPOTrainer(Trainer):
             with apply.mesh:
                 ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
                 mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
-                outputs = apply(input_ids=ids, attention_mask=mask, output_hidden_states=True)
-                logits = outputs.logits[:, prompt_length - 1 :]
-                logits = logits[:, :-1, :]
-                log_probs = jax.nn.log_softmax(logits, axis=-1)
                 target_ids = ids[:, prompt_length:]
-                token_log_probs = jnp.take_along_axis(log_probs, jnp.expand_dims(target_ids, axis=-1), axis=-1)
-                token_log_probs = jnp.squeeze(token_log_probs, axis=-1)
+                call_kwargs = {
+                    "input_ids": ids,
+                    "attention_mask": mask,
+                    "output_hidden_states": True,
+                }
+                lmhead_chunksize = resolve_lmhead_chunksize(apply)
+                if lmhead_chunksize is not None:
+                    call_kwargs["apply_lm_head"] = False
+                outputs = apply(**call_kwargs)
 
                 hidden_states = getattr(outputs, "last_hidden_state", None)
                 if hidden_states is None:
@@ -467,6 +498,26 @@ class PPOTrainer(Trainer):
                     if hidden_states is None:
                         raise ValueError("Model outputs do not provide hidden states; cannot compute value outputs.")
                     hidden_states = hidden_states[-1]
+
+                if outputs.logits is None and lmhead_chunksize is not None:
+                    score_hidden_states = hidden_states[:, prompt_length - 1 : -1, :]
+                    token_log_probs, _ = compute_per_token_logps_and_entropies_from_hidden_states(
+                        apply,
+                        score_hidden_states,
+                        target_ids,
+                        token_chunk_size=lmhead_chunksize,
+                        vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+                        return_entropy=False,
+                    )
+                else:
+                    logits = outputs.logits[:, prompt_length - 1 :]
+                    logits = logits[:, :-1, :]
+                    token_log_probs, _ = compute_token_logps_and_entropies_chunked(
+                        logits,
+                        target_ids,
+                        return_entropy=False,
+                        chunk_size=self.arguments.logprob_vocab_chunk_size,
+                    )
 
                 values_full = apply.value_head(hidden_states).squeeze(-1)
                 values = values_full[:, prompt_length - 1 : -1]

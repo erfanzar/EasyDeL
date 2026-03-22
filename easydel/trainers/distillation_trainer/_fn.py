@@ -459,14 +459,14 @@ def distillation_step(
     attention_layers: tuple[int, ...] | None = None,
     attention_normalize: bool = False,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
-    logits_chunk_size: int = 0,
+    logits_chunk_size: int | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Perform a single knowledge-distillation training or evaluation step.
 
     Runs the teacher model on the batch (with gradients stopped), then
     computes the distillation loss between student and teacher outputs.
     Optionally includes hidden-state MSE and attention-matrix MSE losses
-    for deeper distillation.  When ``logits_chunk_size > 0``, uses a
+    for deeper distillation. When ``logits_chunk_size`` is set, uses a
     memory-efficient chunked strategy that avoids materialising the full
     ``[B, L, V]`` logit tensor.
 
@@ -503,8 +503,8 @@ def distillation_step(
             before computing the distillation loss.
         straight_through_emulator: Optional function for quantization-aware
             straight-through gradient estimation.
-        logits_chunk_size: When > 0, compute the KL loss in chunks of this
-            many tokens to save memory. 0 uses the standard full-logits path.
+        logits_chunk_size: When set, compute the KL loss in chunks of this
+            many tokens to save memory. ``None`` uses the standard full-logits path.
 
     Returns:
         tuple[EasyDeLState, LossMetrics] | LossMetrics: When ``is_training``
@@ -523,7 +523,7 @@ def distillation_step(
 
     request_hidden_states = hidden_state_weight != 0.0
     request_attentions = attention_weight != 0.0
-    use_chunked = logits_chunk_size > 0
+    use_chunked = logits_chunk_size is not None and logits_chunk_size > 0
 
     teacher_call_kwargs = dict(batch)
     teacher_call_kwargs.pop("labels", None)
@@ -594,7 +594,7 @@ def distillation_step(
                 use_hard_labels=(labels is not None),
                 temperature=temperature,
                 alpha=alpha,
-                chunk_size=logits_chunk_size,
+                chunk_size=int(logits_chunk_size),
             )
         else:
             total_loss, loss_components = distillation_loss(

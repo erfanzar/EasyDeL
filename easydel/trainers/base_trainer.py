@@ -158,6 +158,20 @@ class BaseTrainer(BaseTrainerProtocol):
     model_state: EasyDeLState | None
     _train_source: ShardedDataSource | None
     _eval_source: ShardedDataSource | None
+    _RUNTIME_MODEL_OVERRIDE_STATE_ATTRS: tp.ClassVar[frozenset[str]] = frozenset(
+        {"model_state", "reference_state", "ref_state", "teacher_state"}
+    )
+
+    def __setattr__(self, name: str, value: tp.Any) -> None:
+        object.__setattr__(self, name, value)
+        if name not in self._RUNTIME_MODEL_OVERRIDE_STATE_ATTRS or value is None:
+            return
+
+        arguments = self.__dict__.get("arguments")
+        if arguments is None:
+            return
+
+        self._apply_runtime_model_config_overrides_to_state(value, arguments)
 
     def __init__(
         self,
@@ -238,6 +252,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 logger.warning(f"Resuming from checkpoint failed: {e}. Starting fresh training.")
 
         self.model_state = model_state
+        self._apply_runtime_model_config_overrides()
         self._apply_step_start_point()
         self._model = flax.nnx.eval_shape(lambda: self.model_state.model)
         self.dataset_train = dataset_train
@@ -301,6 +316,56 @@ class BaseTrainer(BaseTrainerProtocol):
         self._initialize_attributes()
         self.initialize_trainer_utils()
 
+    @staticmethod
+    def _apply_runtime_model_config_overrides_to_state(
+        state: EasyDeLState | None,
+        arguments: TrainingArguments,
+    ) -> None:
+        """Propagate training argument overrides onto a model state's config.
+
+        Certain training arguments (e.g. ``lmhead_chunksize``) need to be
+        reflected in the model configuration attached to a given state so
+        that the model forward pass picks them up at runtime.  This static
+        method writes those values into ``state.model.config`` in-place.
+
+        Args:
+            state: The model state whose config should be updated.  If
+                ``None``, the call is a no-op.
+            arguments: The training arguments containing the override values.
+                Currently inspects ``arguments.lmhead_chunksize``.
+
+        Returns:
+            None.  The state's config is mutated in-place.
+        """
+        if state is None:
+            return
+
+        lmhead_chunksize = getattr(arguments, "lmhead_chunksize", None)
+        if lmhead_chunksize is None:
+            return
+
+        model = getattr(state, "model", None)
+        config = getattr(model, "config", None)
+        if config is None:
+            return
+
+        config.lmhead_chunksize = int(lmhead_chunksize)
+
+    def _apply_runtime_model_config_overrides(self) -> None:
+        """Apply runtime model config overrides to all tracked model states.
+
+        Iterates over the primary ``model_state`` as well as any auxiliary
+        states that may exist on the trainer (``reference_state``,
+        ``ref_state``, ``teacher_state``) and delegates to
+        :meth:`_apply_runtime_model_config_overrides_to_state` for each.
+        This ensures that training-argument-driven config values such as
+        ``lmhead_chunksize`` are consistently propagated to every model
+        that participates in the training loop.
+        """
+        self._apply_runtime_model_config_overrides_to_state(self.model_state, self.arguments)
+        for attr_name in self._RUNTIME_MODEL_OVERRIDE_STATE_ATTRS - {"model_state"}:
+            self._apply_runtime_model_config_overrides_to_state(getattr(self, attr_name, None), self.arguments)
+
     def _apply_step_start_point(self) -> None:
         """Initialize a fresh training state from ``step_start_point`` when requested."""
         requested_step_value = self.arguments.step_start_point
@@ -362,6 +427,288 @@ class BaseTrainer(BaseTrainerProtocol):
         if updated["changed"]:
             self.model_state = self.model_state.replace(opt_state=opt_state)
             logger.info(f"Aligned optimizer/scheduler counters to step_start_point={requested_step}.")
+
+    @staticmethod
+    def _is_memory_oom_exception(exc: BaseException) -> bool:
+        """Determine whether an exception represents an out-of-memory error.
+
+        The method converts the exception's type name and message to
+        lowercase and checks for the presence of known OOM marker strings
+        that are emitted by JAX, XLA, CUDA, and cuDNN runtimes.
+
+        Args:
+            exc: The exception instance to inspect.
+
+        Returns:
+            ``True`` if any recognised OOM marker is found in the
+            exception's string representation, ``False`` otherwise.
+        """
+        message = f"{type(exc).__name__}: {exc}".lower()
+        markers = (
+            "resource_exhausted",
+            "compiletimehbmoom",
+            "compile time hbm oom",
+            "memory space hbm",
+            "exceeded hbm capacity",
+            "ran out of memory",
+            "out of memory",
+            "cuda out of memory",
+            "cudnn_status_alloc_failed",
+        )
+        has_oom_marker = any(marker in message for marker in markers)
+        jax_runtime_error = getattr(jax.errors, "JaxRuntimeError", None)
+        if jax_runtime_error is not None and isinstance(exc, jax_runtime_error):
+            return has_oom_marker
+        return has_oom_marker
+
+    def _memory_optimization_trainer_name(self) -> str:
+        """Return a human-readable trainer name for memory optimization messages.
+
+        If a ``trainer_prefix`` is set in the training arguments, it is
+        used as-is (after stripping whitespace).  Otherwise, the concrete
+        class name of the trainer instance is returned.
+
+        Returns:
+            A string identifying the trainer, suitable for inclusion in
+            user-facing hint messages.
+        """
+        prefix = self.arguments.trainer_prefix
+        if isinstance(prefix, str) and prefix.strip():
+            return prefix.strip()
+        return type(self).__name__
+
+    def _memory_optimization_hints(self) -> list[str]:
+        """Inspect training arguments and build a list of memory optimization hints.
+
+        Each hint is a human-readable string describing a chunking or
+        capping parameter in :class:`TrainingArguments` that, if adjusted,
+        could reduce peak memory usage.  The method examines parameters
+        such as ``logprob_vocab_chunk_size``, ``lmhead_chunksize``,
+        ``logits_chunk_size``, ``ref_logps_chunk_size``,
+        ``completion_chunk_size``, and ``max_loss_completion_tokens``.
+        For each parameter that is currently set, a suggestion to lower
+        it is produced; for each parameter that is disabled, a suggestion
+        to enable it is produced.
+
+        Returns:
+            A list of hint strings.  An empty list is returned when no
+            actionable suggestions can be made (e.g. ``arguments`` is
+            ``None``).
+        """
+        args = self.arguments
+        if args is None:
+            return []
+
+        hints: list[str] = []
+
+        def _add(text: str) -> None:
+            if text not in hints:
+                hints.append(text)
+
+        def _int_attr(name: str) -> int | None:
+            value = getattr(args, name, None)
+            if value is None:
+                return None
+            return int(value)
+
+        logprob_chunk_raw = getattr(args, "logprob_vocab_chunk_size", None)
+        if hasattr(args, "logprob_vocab_chunk_size"):
+            if logprob_chunk_raw is not None and int(logprob_chunk_raw) > 0:
+                logprob_vocab_chunk_size = int(logprob_chunk_raw)
+                lowered = max(logprob_vocab_chunk_size // 2, 1)
+                _add(
+                    "`logprob_vocab_chunk_size` "
+                    f"(current: {logprob_vocab_chunk_size}): lower it to `{lowered}` or `512` "
+                    "to reduce peak memory during vocab-side log-prob and entropy computation."
+                )
+            else:
+                _add(
+                    "`logprob_vocab_chunk_size` (current: disabled): enable it with a value like "
+                    "`1024` or `2048` to chunk vocab-side log-prob and entropy computation."
+                )
+
+        lmhead_chunksize = getattr(args, "lmhead_chunksize", None)
+        if lmhead_chunksize is not None:
+            lowered = max(int(lmhead_chunksize) // 2, 1)
+            _add(
+                "`lmhead_chunksize` "
+                f"(current: {lmhead_chunksize}): lower it to `{lowered}` or `512` "
+                "to chunk the LM-head projection over the sequence dimension."
+            )
+        elif hasattr(args, "lmhead_chunksize"):
+            _add(
+                "`lmhead_chunksize` (current: disabled): enable it with a value like `2048` or `4096` "
+                "to chunk the LM-head projection over the sequence dimension."
+            )
+
+        if hasattr(args, "logits_chunk_size"):
+            logits_chunk_size = _int_attr("logits_chunk_size")
+            if logits_chunk_size is not None and logits_chunk_size > 0:
+                lowered = max(logits_chunk_size // 2, 1)
+                _add(
+                    "`logits_chunk_size` "
+                    f"(current: {logits_chunk_size}): lower it to `{lowered}` or `2048` "
+                    "to compute distillation KL loss over smaller token chunks."
+                )
+            else:
+                _add(
+                    "`logits_chunk_size` (current: disabled): enable it with a value like `2048` or `4096` "
+                    "to avoid materializing full `[batch, seq, vocab]` distillation logits."
+                )
+
+        if hasattr(args, "ref_logps_chunk_size"):
+            ref_logps_chunk_size = _int_attr("ref_logps_chunk_size")
+            if ref_logps_chunk_size is not None and ref_logps_chunk_size > 0:
+                lowered = max(ref_logps_chunk_size // 2, 1)
+                _add(
+                    "`ref_logps_chunk_size` "
+                    f"(current: {ref_logps_chunk_size}): lower it to `{lowered}` to chunk the reference-model "
+                    "log-prob pass over smaller batches."
+                )
+            else:
+                _add(
+                    "`ref_logps_chunk_size` (current: disabled): enable it with a value like `2` or `4` "
+                    "to chunk reference-model log-prob computation."
+                )
+
+        if hasattr(args, "completion_chunk_size"):
+            completion_chunk_size = _int_attr("completion_chunk_size")
+            if completion_chunk_size is not None and completion_chunk_size > 0:
+                lowered = max(completion_chunk_size // 2, 1)
+                _add(
+                    "`completion_chunk_size` "
+                    f"(current: {completion_chunk_size}): lower it to `{lowered}` to process completion-loss "
+                    "batches in smaller chunks."
+                )
+            else:
+                _add(
+                    "`completion_chunk_size` (current: disabled): enable it with a value like `2` or `4` "
+                    "to chunk completion-loss computation."
+                )
+
+        if hasattr(args, "max_loss_completion_tokens"):
+            max_loss_completion_tokens = _int_attr("max_loss_completion_tokens")
+            if max_loss_completion_tokens is not None and max_loss_completion_tokens > 0:
+                lowered = max(max_loss_completion_tokens // 2, 1)
+                _add(
+                    "`max_loss_completion_tokens` "
+                    f"(current: {max_loss_completion_tokens}): lower it to `{lowered}` "
+                    "to cap the completion tokens that participate in the loss."
+                )
+            else:
+                _add(
+                    "`max_loss_completion_tokens` (current: disabled): set it to a cap like `2048` or `4096` "
+                    "to truncate the loss-bearing completion window."
+                )
+
+        total_batch_size = _int_attr("total_batch_size")
+        if total_batch_size is not None:
+            lowered = max(total_batch_size // 2, 1)
+            _add(
+                "`total_batch_size` "
+                f"(current: {total_batch_size}): lower it to `{lowered}` "
+                "to shrink per-step activation and temporary-buffer memory."
+            )
+
+        gradient_accumulation_steps = _int_attr("gradient_accumulation_steps")
+        if gradient_accumulation_steps is not None:
+            next_steps = max(gradient_accumulation_steps + 1, 2)
+            _add(
+                "`gradient_accumulation_steps` "
+                f"(current: {gradient_accumulation_steps}): raise it to `{next_steps}` or higher after lowering "
+                "`total_batch_size` if you need to preserve the effective batch size."
+            )
+
+        prompt_length = _int_attr("max_prompt_length")
+        if prompt_length is not None:
+            lowered = max(prompt_length // 2, 1)
+            _add(
+                "`max_prompt_length` "
+                f"(current: {prompt_length}): lower it to `{lowered}` to reduce prompt-side attention and activation memory."
+            )
+
+        completion_length = _int_attr("max_completion_length")
+        if completion_length is not None:
+            lowered = max(completion_length // 2, 1)
+            _add(
+                "`max_completion_length` "
+                f"(current: {completion_length}): lower it to `{lowered}` to reduce completion-side attention, logits, and loss memory."
+            )
+
+        max_length = _int_attr("max_length")
+        if max_length is not None and prompt_length is None and completion_length is None:
+            lowered = max(max_length // 2, 1)
+            _add(
+                "`max_length` "
+                f"(current: {max_length}): lower it to `{lowered}` to cut sequence length and attention memory."
+            )
+
+        max_new_tokens = _int_attr("max_new_tokens")
+        if max_new_tokens is not None:
+            lowered = max(max_new_tokens // 2, 1)
+            _add(
+                f"`max_new_tokens` (current: {max_new_tokens}): lower it to `{lowered}` to shorten generated sequences."
+            )
+
+        num_return_sequences = _int_attr("num_return_sequences")
+        if num_return_sequences is not None and num_return_sequences > 1:
+            lowered = max(num_return_sequences // 2, 1)
+            _add(
+                "`num_return_sequences` "
+                f"(current: {num_return_sequences}): lower it to `{lowered}` or `1` "
+                "to generate fewer completions per prompt."
+            )
+
+        num_generations_per_prompt = _int_attr("num_generations_per_prompt")
+        if num_generations_per_prompt is not None and num_generations_per_prompt > 1:
+            lowered = max(num_generations_per_prompt // 2, 1)
+            _add(
+                "`num_generations_per_prompt` "
+                f"(current: {num_generations_per_prompt}): lower it to `{lowered}` or `1` "
+                "to generate fewer completions per prompt."
+            )
+
+        return hints
+
+    def _format_memory_optimization_hints(self) -> str | None:
+        """Format memory optimization hints into a single multiline message.
+
+        Calls :meth:`_memory_optimization_hints` and, if any hints are
+        available, assembles them into a bulleted list preceded by a
+        header that includes the trainer name.
+
+        Returns:
+            A formatted string ready for display to the user, or ``None``
+            if there are no hints to show.
+        """
+        hints = self._memory_optimization_hints()
+        if not hints:
+            return None
+        lines = [f"Memory optimization techniques available for trainer `{self._memory_optimization_trainer_name()}`:"]
+        lines.extend(f"- {hint}" for hint in hints)
+        return "\n".join(lines)
+
+    def _augment_memory_oom_exception(self, exc: BaseException) -> RuntimeError:
+        """Wrap an OOM exception with actionable memory optimization hints.
+
+        Creates a new :class:`jax.errors.JaxRuntimeError` whose message
+        contains the original exception text followed by the formatted
+        hint block produced by :meth:`_format_memory_optimization_hints`.
+        This gives users immediate guidance on which training arguments
+        to tune when they encounter an out-of-memory error.
+
+        Args:
+            exc: The original OOM exception to augment.
+
+        Returns:
+            A ``JaxRuntimeError`` containing the original message plus
+            any available memory optimization suggestions.
+        """
+        hint_text = self._format_memory_optimization_hints()
+        message = [str(exc)]
+        if hint_text is not None:
+            message.extend(["", hint_text])
+        return jax.errors.JaxRuntimeError("\n".join(message))
 
     @staticmethod
     def _normalize_esurge_prompts(
@@ -1057,6 +1404,9 @@ class BaseTrainer(BaseTrainerProtocol):
         kwargs: dict[str, tp.Any] = {}
         _maybe_insert(kwargs, "top_p", args.generation_top_p)
         _maybe_insert(kwargs, "top_k", args.generation_top_k)
+        _maybe_insert(kwargs, "presence_penalty", getattr(args, "generation_presence_penalty", None))
+        _maybe_insert(kwargs, "frequency_penalty", getattr(args, "generation_frequency_penalty", None))
+        _maybe_insert(kwargs, "repetition_penalty", getattr(args, "generation_repetition_penalty", None))
         _maybe_insert(kwargs, "temperature", args.generation_temperature)
         _maybe_insert(kwargs, "do_sample", args.generation_do_sample)
         _maybe_insert(kwargs, "num_return_sequences", args.generation_num_return_sequences)
@@ -1569,6 +1919,9 @@ class BaseTrainer(BaseTrainerProtocol):
             temperature=args.generation_temperature or 0.7,
             top_p=args.generation_top_p or 0.95,
             top_k=args.generation_top_k or 64,
+            presence_penalty=float(getattr(args, "generation_presence_penalty", 0.0) or 0.0),
+            frequency_penalty=float(getattr(args, "generation_frequency_penalty", 0.0) or 0.0),
+            repetition_penalty=float(getattr(args, "generation_repetition_penalty", 1.0) or 1.0),
             n=args.generation_num_return_sequences or 1,
         )
         if config_overrides:
@@ -1587,6 +1940,12 @@ class BaseTrainer(BaseTrainerProtocol):
             num_return_sequences = config_overrides.get("num_return_sequences")
             if num_return_sequences is not None:
                 sampling_params.n = int(num_return_sequences)
+            presence_penalty = config_overrides.get("presence_penalty")
+            if presence_penalty is not None:
+                sampling_params.presence_penalty = float(presence_penalty)
+            frequency_penalty = config_overrides.get("frequency_penalty")
+            if frequency_penalty is not None:
+                sampling_params.frequency_penalty = float(frequency_penalty)
             repetition_penalty = config_overrides.get("repetition_penalty")
             if repetition_penalty is not None:
                 sampling_params.repetition_penalty = float(repetition_penalty)
@@ -1642,6 +2001,9 @@ class BaseTrainer(BaseTrainerProtocol):
                 f" temperature={sampling_params.temperature},"
                 f" top_p={sampling_params.top_p},"
                 f" top_k={sampling_params.top_k},"
+                f" presence_penalty={sampling_params.presence_penalty},"
+                f" frequency_penalty={sampling_params.frequency_penalty},"
+                f" repetition_penalty={sampling_params.repetition_penalty},"
                 f" n={sampling_params.n})"
             )
             esurge_engine = None
@@ -3723,6 +4085,8 @@ class BaseTrainer(BaseTrainerProtocol):
                 logger.warning("Training reached maximum time limit. Saving current state...")
             elif isinstance(run_exception, EasyDeLPreemptionSignal):
                 ...  # simply just pass
+            elif self._is_memory_oom_exception(run_exception):
+                raise run_exception
             else:
                 raise RuntimeError(f"EasyDeL Runtime dumped due to {run_exception!s}") from run_exception
         checkpoint_path = "SAVING_SKIPPED"

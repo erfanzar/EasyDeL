@@ -60,6 +60,15 @@ class BCOConfig(TrainingArguments):
             "help": "Maximum number of completion tokens. Defaults to `max_length - max_prompt_length` if omitted."
         },
     )
+    logprob_vocab_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Vocabulary chunk size used when computing selected-token log probabilities. "
+                "Set to `None` to disable chunking."
+            )
+        },
+    )
     truncation_mode: tp.Literal["keep_end", "keep_start"] = field(
         default="keep_end",
         metadata={"help": "How to truncate sequences that exceed `max_length`.", "choices": ["keep_end", "keep_start"]},
@@ -118,6 +127,9 @@ class BCOConfig(TrainingArguments):
         if self.max_length is not None and self.max_prompt_length is not None:
             if self.max_completion_length is None:
                 self.max_completion_length = max(self.max_length - self.max_prompt_length, 0)
+        if self.logprob_vocab_chunk_size is not None:
+            normalized_chunk_size = int(self.logprob_vocab_chunk_size)
+            self.logprob_vocab_chunk_size = normalized_chunk_size if normalized_chunk_size > 0 else None
 
         if hasattr(super(), "__post_init__"):
             super().__post_init__(
