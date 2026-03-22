@@ -69,7 +69,6 @@ from dataclasses import dataclass
 import huggingface_hub
 import huggingface_hub.errors
 import jax
-import numpy as np
 from eformer.escale import PartitionAxis
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
@@ -518,10 +517,7 @@ class EasyBridgeMixin(PushToHubMixin):
                     continue
                 flat_state[key] = gather_fn(value)
             state_dict = unflatten_dict(flat_state)
-        state_dict = jax.tree_util.tree_map(
-            lambda x: jnp.asarray(x) if isinstance(x, (np.ndarray, np.generic)) else x,
-            state_dict,
-        )
+
         output_model_file = Checkpointer(
             base_path=str(save_directory),
             save_interval=None,
