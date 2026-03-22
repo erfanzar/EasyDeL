@@ -96,12 +96,12 @@ class DistillationConfig(TrainingArguments):
         default=None,
         metadata={"help": ("Deprecated alias for `assistant_only_loss`. If set, it overrides `assistant_only_loss`.")},
     )
-    hidden_state_loss_weight: float = field(
-        default=0.0,
+    hidden_state_loss_weight: float | None = field(
+        default=None,
         metadata={
             "help": (
                 "Optional coefficient for matching student and teacher hidden states. "
-                "Set to 0 to disable hidden-state distillation."
+                "Set to `None` to disable hidden-state distillation; `0` is accepted for backward compatibility."
             )
         },
     )
@@ -118,12 +118,12 @@ class DistillationConfig(TrainingArguments):
         default="mse",
         metadata={"help": "Distance function used for hidden-state distillation. Currently only 'mse' is supported."},
     )
-    attention_loss_weight: float = field(
-        default=0.0,
+    attention_loss_weight: float | None = field(
+        default=None,
         metadata={
             "help": (
                 "Optional coefficient for matching attention probability tensors. "
-                "Set to 0 to disable attention-head distillation."
+                "Set to `None` to disable attention-head distillation; `0` is accepted for backward compatibility."
             )
         },
     )
@@ -145,15 +145,16 @@ class DistillationConfig(TrainingArguments):
             )
         },
     )
-    logits_chunk_size: int = field(
-        default=0,
+    logits_chunk_size: int | None = field(
+        default=None,
         metadata={
             "help": (
                 "When > 0, compute the KL-divergence distillation loss in chunks of this many "
                 "tokens instead of materialising the full [B, L, V] logits tensor. This trades "
                 "a small amount of extra compute (lm_head is recomputed per chunk during "
                 "backward) for a massive memory saving — peak logit memory drops from "
-                "O(B*L*V) to O(B*chunk_size*V). Recommended values: 128-512 for large vocabs."
+                "O(B*L*V) to O(B*chunk_size*V). Recommended values: 128-512 for large vocabs. "
+                "Set to `None` to disable chunking; `0` is accepted for backward compatibility."
             )
         },
     )
@@ -170,6 +171,19 @@ class DistillationConfig(TrainingArguments):
             self.hidden_state_layers = tuple(int(i) for i in self.hidden_state_layers)
         if self.attention_layers is not None:
             self.attention_layers = tuple(int(i) for i in self.attention_layers)
+        if self.hidden_state_loss_weight is not None:
+            normalized_hidden_state_loss_weight = float(self.hidden_state_loss_weight)
+            self.hidden_state_loss_weight = (
+                normalized_hidden_state_loss_weight if normalized_hidden_state_loss_weight > 0.0 else None
+            )
+        if self.attention_loss_weight is not None:
+            normalized_attention_loss_weight = float(self.attention_loss_weight)
+            self.attention_loss_weight = (
+                normalized_attention_loss_weight if normalized_attention_loss_weight > 0.0 else None
+            )
+        if self.logits_chunk_size is not None:
+            normalized_logits_chunk_size = int(self.logits_chunk_size)
+            self.logits_chunk_size = normalized_logits_chunk_size if normalized_logits_chunk_size > 0 else None
         if not 0.0 <= float(self.alpha) <= 1.0:
             raise ValueError("`alpha` must be within [0, 1].")
         if float(self.temperature) <= 0.0:

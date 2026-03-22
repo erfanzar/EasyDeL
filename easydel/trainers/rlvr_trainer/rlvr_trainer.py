@@ -174,7 +174,7 @@ class RLVRTrainer(GRPOTrainer):
             verifiers.append(FormatVerifier(pattern=config.format_pattern))
             weights.append(config.format_reward_weight)
 
-        if config.length_penalty_target > 0 and config.length_penalty_weight > 0:
+        if config.length_penalty_target is not None and config.length_penalty_weight > 0:
             verifiers.append(LengthPenaltyVerifier(target_length=config.length_penalty_target))
             weights.append(config.length_penalty_weight)
 

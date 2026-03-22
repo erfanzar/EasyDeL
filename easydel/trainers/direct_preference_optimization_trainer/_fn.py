@@ -37,6 +37,7 @@ import flax
 import flax.nnx
 import jax
 from eformer.escale import with_sharding_constraint
+from jax import lax
 from jax import numpy as jnp
 from jax.nn import log_sigmoid as logsigmoid
 from jax.nn import relu, sigmoid
@@ -57,6 +58,280 @@ from ..training_utils import (
 )
 from ..utils import pad_to_length
 from .dpo_config import LOSS_FN_VARIANTS
+
+
+def _compute_token_logps_chunked(
+    logits: Array,
+    targets: Array,
+    *,
+    chunk_size: int | None,
+) -> Array:
+    """Compute selected token log-probabilities without materializing a full-vocab log-softmax.
+
+    This function avoids the O(batch * seq * vocab) memory cost of a naive
+    ``jax.nn.log_softmax`` by splitting the vocabulary dimension into chunks
+    and executing a numerically-stable 3-pass algorithm:
+
+    1. **Chunked max** -- Iterate over vocabulary chunks to find the per-token
+       maximum logit (used for numerical stability in the subsequent exp).
+    2. **Chunked sum-exp** -- Iterate again to compute
+       ``sum(exp(logit - max))`` for each token position, yielding the
+       log-partition function ``log_z = log(sum_exp) + max``.
+    3. **Gather & subtract** -- Gather the raw logit for each target token and
+       return ``target_logit - log_z``, which equals the log-probability.
+
+    Each chunked helper is wrapped with ``jax.checkpoint`` so that only one
+    vocabulary chunk is materialized at a time during the backward pass,
+    keeping peak memory proportional to ``chunk_size`` rather than
+    ``vocab_size``.
+
+    Args:
+        logits: Float array of shape ``(batch, seq_len, vocab_size)`` containing
+            the unnormalized log-probabilities (logits) produced by the model.
+        targets: Integer array of shape ``(batch, seq_len)`` holding the token
+            indices whose log-probabilities should be extracted.
+        chunk_size: Number of vocabulary entries to process in each chunk.
+            If ``None``, ``<= 0`` or ``>= vocab_size`` the entire vocabulary is processed
+            in a single pass (no chunking).
+
+    Returns:
+        Float array of shape ``(batch, seq_len)`` with the log-probability of
+        each target token at every sequence position.
+    """
+
+    vocab_size = logits.shape[-1]
+    if chunk_size is None or chunk_size <= 0 or chunk_size >= vocab_size:
+        chunk_size = vocab_size
+    num_full_chunks = vocab_size // chunk_size
+    tail = vocab_size - num_full_chunks * chunk_size
+
+    def _max_step(start: int, size: int, running_max: Array) -> Array:
+        chunk = lax.dynamic_slice_in_dim(logits, start, size, axis=-1).astype(jnp.float32)
+        return jnp.maximum(running_max, jnp.max(chunk, axis=-1))
+
+    _max_step = jax.checkpoint(_max_step, prevent_cse=False, static_argnums=(1,))
+
+    def max_body(i: int, running_max: Array) -> Array:
+        return _max_step(i * chunk_size, chunk_size, running_max)
+
+    logit_max = jnp.full(logits.shape[:-1], -jnp.inf, dtype=jnp.float32)
+    if num_full_chunks > 0:
+        logit_max = lax.fori_loop(0, num_full_chunks, max_body, logit_max)
+    if tail:
+        start = num_full_chunks * chunk_size
+        logit_max = _max_step(start, tail, logit_max)
+
+    def _sum_step(start: int, size: int, running_sum: Array) -> Array:
+        chunk = lax.dynamic_slice_in_dim(logits, start, size, axis=-1).astype(jnp.float32)
+        return running_sum + jnp.sum(jnp.exp(chunk - logit_max[..., None]), axis=-1)
+
+    _sum_step = jax.checkpoint(_sum_step, prevent_cse=False, static_argnums=(1,))
+
+    def sum_body(i: int, running_sum: Array) -> Array:
+        return _sum_step(i * chunk_size, chunk_size, running_sum)
+
+    exp_sum = jnp.zeros_like(logit_max)
+    if num_full_chunks > 0:
+        exp_sum = lax.fori_loop(0, num_full_chunks, sum_body, exp_sum)
+    if tail:
+        start = num_full_chunks * chunk_size
+        exp_sum = _sum_step(start, tail, exp_sum)
+
+    log_z = jnp.log(exp_sum) + logit_max
+    target_logits = jnp.take_along_axis(logits, targets[..., None], axis=-1).astype(jnp.float32)
+    return jnp.squeeze(target_logits, axis=-1) - log_z
+
+
+def _resolve_dpo_lmhead_chunksize(model: tp.Any) -> int | None:
+    """Return the configured LM-head token chunk size when headless DPO is supported.
+
+    Headless (hidden-state-only) DPO avoids materializing the full logit tensor
+    by projecting hidden states through the LM head in smaller sequence chunks.
+    This helper checks whether *model* exposes the two prerequisites for that
+    path:
+
+    1. A ``config`` attribute that carries a positive ``lmhead_chunksize`` value
+       (the number of sequence-dimension tokens to project at once).
+    2. A ``compute_lm_logits`` method used to perform the chunked projection.
+
+    Args:
+        model: The model instance to inspect.  No type constraint is enforced;
+            the function relies on duck-typing via ``hasattr`` checks.
+
+    Returns:
+        The chunk size as a positive ``int`` if the model supports headless DPO,
+        or ``None`` otherwise.
+    """
+
+    if not hasattr(model, "config") or not hasattr(model, "compute_lm_logits"):
+        return None
+    chunk_size = getattr(model.config, "lmhead_chunksize", None)
+    if chunk_size is None:
+        return None
+    chunk_size = int(chunk_size)
+    return chunk_size if chunk_size > 0 else None
+
+
+def _compute_dpo_outputs_from_hidden_states(
+    model: tp.Any,
+    hidden_states: Array,
+    labels: Array,
+    loss_mask: Array,
+    *,
+    num_examples: int,
+    chunk_size: int,
+    logprob_vocab_chunk_size: int | None,
+    loss_type: LOSS_FN_VARIANTS,
+) -> dict[str, Array]:
+    """Project DPO hidden states through the LM head chunk-by-chunk across the sequence dimension.
+
+    Instead of computing logits for the entire sequence at once (which would
+    require ``O(batch * seq * vocab)`` memory), this function slices the
+    sequence into fixed-size chunks and, for each chunk:
+
+    1. Projects hidden states to vocabulary logits via the model's
+       ``compute_lm_logits`` (optionally preceded by ``prepare_lm_head_inputs``).
+    2. Computes per-token log-probabilities with
+       :func:`_compute_token_logps_chunked`, further chunking along the
+       vocabulary axis to keep memory bounded.
+    3. Accumulates the masked per-example log-probability sums and the
+       weighted logit summary statistics (sum of logits and token counts
+       for chosen and rejected halves of the batch).
+
+    The batch is assumed to be structured so that the first ``num_examples``
+    rows correspond to *chosen* completions and the remaining rows to
+    *rejected* completions (as produced by ``concatenated_inputs``).
+
+    When ``loss_type`` is ``"ipo"``, the accumulated log-probabilities are
+    normalized by the number of loss-bearing tokens per example (as required
+    by the IPO objective).
+
+    Both the per-chunk projection and the per-chunk contribution helpers are
+    wrapped with ``jax.checkpoint`` to trade compute for memory during the
+    backward pass.
+
+    Args:
+        model: The language model instance.  Must expose ``compute_lm_logits``
+            and, optionally, ``prepare_lm_head_inputs``.
+        hidden_states: Float array of shape ``(batch, seq_len, hidden_dim)``
+            produced by the model's body (without the final LM head).
+        labels: Integer array of shape ``(batch, seq_len)`` with target token
+            ids.
+        loss_mask: Boolean or float array of shape ``(batch, seq_len)``
+            indicating which positions contribute to the loss.
+        num_examples: Number of *chosen* examples in the batch (the first
+            ``num_examples`` rows).  The remaining rows are treated as
+            rejected examples.
+        chunk_size: Maximum number of sequence positions to project through
+            the LM head in a single chunk.
+        logprob_vocab_chunk_size: Vocabulary-dimension chunk size forwarded to
+            :func:`_compute_token_logps_chunked` for the inner log-prob
+            computation.
+        loss_type: The DPO loss variant in use (e.g. ``"sigmoid"``,
+            ``"ipo"``).  Only ``"ipo"`` triggers per-example length
+            normalization of the returned log-probabilities.
+
+    Returns:
+        A dictionary with the following keys:
+
+        - ``"chosen_logps"`` -- Float array of shape ``(num_examples,)`` with
+          the summed (or length-normalized for IPO) log-probabilities for the
+          chosen completions.
+        - ``"rejected_logps"`` -- Float array of shape ``(num_examples,)`` for
+          the rejected completions.
+        - ``"mean_chosen_logits"`` -- Scalar float: the mean logit value
+          across all loss-bearing chosen tokens (a lightweight summary
+          replacing the full logit tensor).
+        - ``"mean_rejected_logits"`` -- Scalar float: the corresponding mean
+          for rejected tokens.
+    """
+
+    batch_size, seq_len = labels.shape
+    chunk_size = max(1, min(int(chunk_size), int(seq_len)))
+
+    def _project_chunk(chunk_hidden_states: Array) -> Array:
+        if hasattr(model, "prepare_lm_head_inputs"):
+            chunk_hidden_states = model.prepare_lm_head_inputs(chunk_hidden_states)
+        return model.compute_lm_logits(chunk_hidden_states)
+
+    _project_chunk = jax.checkpoint(_project_chunk, prevent_cse=False)
+
+    def _chunk_contributions(
+        chunk_hidden_states: Array,
+        chunk_labels: Array,
+        chunk_loss_mask: Array,
+    ) -> tuple[Array, Array, Array, Array, Array]:
+        chunk_logits = _project_chunk(chunk_hidden_states)
+        chunk_logps = _compute_token_logps_chunked(
+            chunk_logits,
+            chunk_labels,
+            chunk_size=logprob_vocab_chunk_size,
+        )
+        masked_logps = jnp.where(chunk_loss_mask, chunk_logps, 0.0)
+        chunk_token_logit_sums = chunk_logits.astype(jnp.float32).sum(axis=-1)
+        chosen_mask = chunk_loss_mask[:num_examples].astype(jnp.float32)
+        rejected_mask = chunk_loss_mask[num_examples:].astype(jnp.float32)
+        return (
+            masked_logps.sum(axis=-1),
+            jnp.sum(chunk_token_logit_sums[:num_examples] * chosen_mask),
+            jnp.sum(chunk_token_logit_sums[num_examples:] * rejected_mask),
+            jnp.sum(chosen_mask),
+            jnp.sum(rejected_mask),
+        )
+
+    _chunk_contributions = jax.checkpoint(_chunk_contributions, prevent_cse=False)
+
+    zero_logps = jnp.zeros((batch_size,), dtype=jnp.float32)
+    zero_scalar = jnp.array(0.0, dtype=jnp.float32)
+
+    def _accumulate_chunk(
+        start: int,
+        size: int,
+        carry: tuple[Array, Array, Array, Array, Array],
+    ) -> tuple[Array, Array, Array, Array, Array]:
+        chunk_hidden_states = lax.dynamic_slice_in_dim(hidden_states, start, size, axis=1)
+        chunk_labels = lax.dynamic_slice_in_dim(labels, start, size, axis=1)
+        chunk_loss_mask = lax.dynamic_slice_in_dim(loss_mask, start, size, axis=1)
+        (
+            chunk_logp_sums,
+            chosen_logit_sum,
+            rejected_logit_sum,
+            chosen_denom,
+            rejected_denom,
+        ) = _chunk_contributions(chunk_hidden_states, chunk_labels, chunk_loss_mask)
+        return (
+            carry[0] + chunk_logp_sums,
+            carry[1] + chosen_logit_sum,
+            carry[2] + rejected_logit_sum,
+            carry[3] + chosen_denom,
+            carry[4] + rejected_denom,
+        )
+
+    num_full_chunks = seq_len // chunk_size
+    tail = seq_len - num_full_chunks * chunk_size
+    carry = (zero_logps, zero_scalar, zero_scalar, zero_scalar, zero_scalar)
+
+    def _full_body(
+        i: int,
+        inner_carry: tuple[Array, Array, Array, Array, Array],
+    ) -> tuple[Array, Array, Array, Array, Array]:
+        return _accumulate_chunk(i * chunk_size, chunk_size, inner_carry)
+
+    if num_full_chunks > 0:
+        carry = lax.fori_loop(0, num_full_chunks, _full_body, carry)
+    if tail:
+        carry = _accumulate_chunk(num_full_chunks * chunk_size, tail, carry)
+
+    all_logps, chosen_logit_sum, rejected_logit_sum, chosen_denom, rejected_denom = carry
+    if loss_type == "ipo":
+        all_logps = all_logps / jnp.maximum(loss_mask.sum(axis=-1), 1)
+
+    return {
+        "chosen_logps": all_logps[:num_examples],
+        "rejected_logps": all_logps[num_examples:],
+        "mean_chosen_logits": chosen_logit_sum / jnp.maximum(chosen_denom, 1.0),
+        "mean_rejected_logits": rejected_logit_sum / jnp.maximum(rejected_denom, 1.0),
+    }
 
 
 def _get_reference_logps_from_batch(batch: dict[str, tp.Any]) -> tuple[tp.Any | None, tp.Any | None]:
@@ -623,6 +898,7 @@ def concatenated_forward(
     truncation_mode: str = "keep_end",
     aux_loss_enabled: bool = False,
     loss_type: str = "sigmoid",
+    logprob_vocab_chunk_size: int | None = None,
 ) -> dict[str, Array]:
     """
     Runs the model on concatenated chosen/rejected inputs for efficiency.
@@ -720,11 +996,14 @@ def concatenated_forward(
                 raise ValueError(
                     f"Unknown truncation mode: '{truncation_mode}'. Should be one of ['keep_end', 'keep_start']."
                 )
+        lmhead_chunksize = _resolve_dpo_lmhead_chunksize(model)
         call_kwargs = {
             **model_kwargs,
             "input_ids": input_ids,
             "attention_mask": attention_mask,
         }
+        if lmhead_chunksize is not None:
+            call_kwargs["apply_lm_head"] = False
         call_kwargs = filter_kwargs_for_callable(model.__call__, call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         outputs = model(**call_kwargs)
@@ -733,47 +1012,57 @@ def concatenated_forward(
         loss_mask = jnp.roll(loss_mask, shift=-1, axis=1).astype("bool")
 
     # Adjust logits shape if necessary.
-    if logits.shape[:2] != labels.shape[:2]:
+    if logits is not None and logits.shape[:2] != labels.shape[:2]:
         seq_len = labels.shape[1]
         logits = logits[:, -seq_len:]
 
     labels = jnp.where(loss_mask, labels, 0)
-    lsmax = jax.nn.log_softmax(logits, axis=-1)
-    batch_size, seq_len = labels.shape
-    per_token_logps = jnp.roll(
-        jnp.where(
-            loss_mask,
-            lsmax[jnp.arange(batch_size)[:, None], jnp.arange(seq_len)[None, :], labels],
-            0,
-        ),
-        shift=1,
-        axis=1,
-    )
-    all_logps = per_token_logps.sum(-1)
-
-    # Special handling for "ipo" loss type.
-    if loss_type == "ipo":
-        all_logps = all_logps / loss_mask.sum(-1)
-    output = {}
-    output["chosen_logps"] = all_logps[:num_examples]
-    output["rejected_logps"] = all_logps[num_examples:]
-
-    mean_chosen_logits = jnp.sum(
-        jnp.where(
-            loss_mask[:num_examples, :, None],
-            logits[:num_examples],
-            0,
+    if not is_encoder_decoder and logits is None and lmhead_chunksize is not None:
+        hidden_states = outputs.last_hidden_state
+        if hidden_states is None:
+            raise TypeError(
+                f"{type(model).__name__} was called with `apply_lm_head=False` but did not return `last_hidden_state`."
+            )
+        if hidden_states.shape[:2] != labels.shape[:2]:
+            hidden_states = hidden_states[:, -labels.shape[1] :, :]
+        output = _compute_dpo_outputs_from_hidden_states(
+            model=model,
+            hidden_states=hidden_states,
+            labels=labels,
+            loss_mask=loss_mask,
+            num_examples=num_examples,
+            chunk_size=lmhead_chunksize,
+            logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+            loss_type=loss_type,
         )
-    ) / jnp.sum(loss_mask[:num_examples])
-    mean_rejected_logits = jnp.sum(
-        jnp.where(
-            loss_mask[num_examples:, :, None],
-            logits[num_examples:],
-            0,
+    else:
+        gathered_logps = _compute_token_logps_chunked(
+            logits,
+            labels,
+            chunk_size=logprob_vocab_chunk_size,
         )
-    ) / jnp.sum(loss_mask[num_examples:])
-    output["mean_chosen_logits"] = mean_chosen_logits
-    output["mean_rejected_logits"] = mean_rejected_logits
+        per_token_logps = jnp.roll(
+            jnp.where(loss_mask, gathered_logps, 0.0),
+            shift=1,
+            axis=1,
+        )
+        all_logps = per_token_logps.sum(-1)
+
+        # Special handling for "ipo" loss type.
+        if loss_type == "ipo":
+            all_logps = all_logps / loss_mask.sum(-1)
+        output = {}
+        output["chosen_logps"] = all_logps[:num_examples]
+        output["rejected_logps"] = all_logps[num_examples:]
+
+        chosen_token_logit_sums = logits[:num_examples].sum(axis=-1)
+        rejected_token_logit_sums = logits[num_examples:].sum(axis=-1)
+        chosen_denom = jnp.maximum(jnp.sum(loss_mask[:num_examples]), 1)
+        rejected_denom = jnp.maximum(jnp.sum(loss_mask[num_examples:]), 1)
+        mean_chosen_logits = jnp.where(loss_mask[:num_examples], chosen_token_logit_sums, 0.0).sum() / chosen_denom
+        mean_rejected_logits = jnp.where(loss_mask[num_examples:], rejected_token_logit_sums, 0.0).sum() / rejected_denom
+        output["mean_chosen_logits"] = mean_chosen_logits
+        output["mean_rejected_logits"] = mean_rejected_logits
 
     if aux_loss_enabled and hasattr(outputs, "aux_loss"):
         output["aux_loss"] = outputs.aux_loss

@@ -41,6 +41,7 @@ def _compute_logps(
     prompt_mask: jax.Array,
     completion_ids: jax.Array,
     completion_mask: jax.Array,
+    logprob_vocab_chunk_size: int | None,
 ) -> jax.Array:
     """Compute per-token log probabilities for completion tokens.
 
@@ -60,7 +61,13 @@ def _compute_logps(
     input_ids = jnp.concatenate([prompt_ids, completion_ids], axis=1)
     attention_mask = jnp.concatenate([prompt_mask, completion_mask], axis=1)
     prompt_length = prompt_ids.shape[-1]
-    return get_per_token_logps(module, input_ids, attention_mask, prompt_length)
+    return get_per_token_logps(
+        module,
+        input_ids,
+        attention_mask,
+        prompt_length,
+        logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+    )
 
 
 def _sum_logps(token_logps: jax.Array, completion_mask: jax.Array) -> jax.Array:
@@ -81,6 +88,7 @@ def xpo_step(
     state: EasyDeLState,
     batch: dict[str, jax.Array],
     reference_state: EasyDeLState,
+    logprob_vocab_chunk_size: int | None,
     loss_config: LossConfig | None,
     learning_rate_fn,
     partition_spec: PartitionSpec | None,
@@ -125,6 +133,7 @@ def xpo_step(
             batch["prompt_mask"],
             batch["policy_completion_ids"],
             batch["policy_completion_mask"],
+            logprob_vocab_chunk_size,
         )
     )
     batch["_ref_on_ref"] = jax.lax.stop_gradient(
@@ -134,6 +143,7 @@ def xpo_step(
             batch["prompt_mask"],
             batch["ref_completion_ids"],
             batch["ref_completion_mask"],
+            logprob_vocab_chunk_size,
         )
     )
     del ref_module
@@ -153,8 +163,22 @@ def xpo_step(
         beta = minibatch["beta"][0]
         alpha = minibatch["alpha"][0]
 
-        policy_on_policy = _compute_logps(module, prompt_ids, prompt_mask, policy_completion_ids, policy_completion_mask)
-        policy_on_ref = _compute_logps(module, prompt_ids, prompt_mask, ref_completion_ids, ref_completion_mask)
+        policy_on_policy = _compute_logps(
+            module,
+            prompt_ids,
+            prompt_mask,
+            policy_completion_ids,
+            policy_completion_mask,
+            logprob_vocab_chunk_size,
+        )
+        policy_on_ref = _compute_logps(
+            module,
+            prompt_ids,
+            prompt_mask,
+            ref_completion_ids,
+            ref_completion_mask,
+            logprob_vocab_chunk_size,
+        )
         ref_on_policy = jax.lax.stop_gradient(minibatch["_ref_on_policy"])
         ref_on_ref = jax.lax.stop_gradient(minibatch["_ref_on_ref"])
 

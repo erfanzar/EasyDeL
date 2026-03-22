@@ -64,6 +64,7 @@ def sdpo_step(
     teacher_prompt_length: int,
     beta: float,
     distillation_type: str,
+    logprob_vocab_chunk_size: int | None,
     loss_config: LossConfig | None = None,
     learning_rate_fn: optax.Schedule = None,
     partition_spec: PartitionSpec | None = None,
@@ -133,10 +134,22 @@ def sdpo_step(
 
         student_input_ids = jnp.concatenate([prompt_ids.repeat(num_generations, 0), completion_ids], axis=1)
         student_attn_mask = jnp.concatenate([prompt_mask.repeat(num_generations, 0), completion_mask], axis=1)
-        student_logps = get_per_token_logps(module, student_input_ids, student_attn_mask, prompt_len)
+        student_logps = get_per_token_logps(
+            module,
+            student_input_ids,
+            student_attn_mask,
+            prompt_len,
+            logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+        )
 
         teacher_logps = jax.lax.stop_gradient(
-            get_per_token_logps(module, teacher_ids, teacher_mask, teacher_prompt_length)
+            get_per_token_logps(
+                module,
+                teacher_ids,
+                teacher_mask,
+                teacher_prompt_length,
+                logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+            )
         )
 
         if distillation_type == "kl":

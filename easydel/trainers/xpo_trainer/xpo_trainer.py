@@ -186,6 +186,7 @@ class XPOTrainer(GRPOTrainer):
         )
 
         self._train_shared_fn_static_args = (
+            self.arguments.logprob_vocab_chunk_size,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
@@ -194,6 +195,7 @@ class XPOTrainer(GRPOTrainer):
             straight_through_emulator,
         )
         self._eval_shared_fn_static_args = (
+            self.arguments.logprob_vocab_chunk_size,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
@@ -202,7 +204,7 @@ class XPOTrainer(GRPOTrainer):
             straight_through_emulator,
         )
 
-        static_argnums = (3, 4, 5, 6, 7, 8)
+        static_argnums = (3, 4, 5, 6, 7, 8, 9)
         sharded_training_step_function = ejit(
             xpo_step,
             in_shardings=(self.state_shardings, empty_sharding, self.ref_state.shardings),

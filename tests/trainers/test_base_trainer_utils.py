@@ -25,6 +25,7 @@ import pytest
 from easydel.infra.errors import EasyDeLPreemptionSignal
 from easydel.trainers.base_trainer import BaseTrainer, GenerationResults
 from easydel.trainers.proximal_policy_optimization_trainer.modeling_value_head import CausalLMWithValueHead
+from easydel.trainers.trainer.trainer import Trainer
 
 
 class _PreviewTrainer(BaseTrainer):
@@ -217,6 +218,105 @@ def test_apply_step_start_point_normalizes_matching_step_to_jax_array():
     assert isinstance(trainer.model_state.step, jax.Array)
     assert int(trainer.model_state.step) == 13
     assert any("step" in call and int(call["step"]) == 13 for call in trainer.model_state.replace_calls)
+
+
+def test_apply_runtime_model_config_overrides_sets_lmhead_chunksize_on_all_states():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(lmhead_chunksize=96)
+    trainer.model_state = SimpleNamespace(model=SimpleNamespace(config=SimpleNamespace(lmhead_chunksize=None)))
+    trainer.reference_state = SimpleNamespace(model=SimpleNamespace(config=SimpleNamespace(lmhead_chunksize=None)))
+    trainer.ref_state = SimpleNamespace(model=SimpleNamespace(config=SimpleNamespace(lmhead_chunksize=None)))
+    trainer.teacher_state = SimpleNamespace(model=SimpleNamespace(config=SimpleNamespace(lmhead_chunksize=None)))
+
+    BaseTrainer._apply_runtime_model_config_overrides(trainer)
+
+    assert trainer.model_state.model.config.lmhead_chunksize == 96
+    assert trainer.reference_state.model.config.lmhead_chunksize == 96
+    assert trainer.ref_state.model.config.lmhead_chunksize == 96
+    assert trainer.teacher_state.model.config.lmhead_chunksize == 96
+
+
+def test_apply_runtime_model_config_overrides_preserves_config_when_arg_missing():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(lmhead_chunksize=None)
+    trainer.model_state = SimpleNamespace(model=SimpleNamespace(config=SimpleNamespace(lmhead_chunksize=64)))
+
+    BaseTrainer._apply_runtime_model_config_overrides(trainer)
+
+    assert trainer.model_state.model.config.lmhead_chunksize == 64
+
+
+def test_apply_runtime_model_config_overrides_on_late_bound_reference_state_assignment():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(lmhead_chunksize=160)
+    trainer.ref_state = SimpleNamespace(model=SimpleNamespace(config=SimpleNamespace(lmhead_chunksize=None)))
+
+    assert trainer.ref_state.model.config.lmhead_chunksize == 160
+
+
+def test_memory_optimization_hints_are_trainer_specific():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        trainer_prefix="GRPO",
+        logprob_vocab_chunk_size=None,
+        lmhead_chunksize=None,
+        ref_logps_chunk_size=None,
+        completion_chunk_size=None,
+        max_loss_completion_tokens=None,
+        total_batch_size=8,
+        gradient_accumulation_steps=1,
+        max_prompt_length=1024,
+        max_completion_length=2048,
+        num_return_sequences=4,
+    )
+
+    hint_text = BaseTrainer._format_memory_optimization_hints(trainer)
+
+    assert hint_text is not None
+    assert "trainer `GRPO`" in hint_text
+    assert "`logprob_vocab_chunk_size` (current: disabled): enable it" in hint_text
+    assert "`ref_logps_chunk_size` (current: disabled): enable it" in hint_text
+    assert "`completion_chunk_size` (current: disabled): enable it" in hint_text
+    assert "`max_loss_completion_tokens` (current: disabled): set it" in hint_text
+    assert "`num_return_sequences` (current: 4): lower it" in hint_text
+
+
+def test_is_memory_oom_exception_uses_jax_runtime_error_type():
+    assert BaseTrainer._is_memory_oom_exception(jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: CompileTimeHbmOom"))
+    assert not BaseTrainer._is_memory_oom_exception(jax.errors.JaxRuntimeError("INVALID_ARGUMENT: shape mismatch"))
+
+
+def test_execute_train_step_annotates_memory_oom_with_supported_knobs():
+    trainer = object.__new__(Trainer)
+    trainer.pruning_module = None
+    trainer.arguments = SimpleNamespace(
+        trainer_prefix="DPO",
+        logprob_vocab_chunk_size=None,
+        lmhead_chunksize=None,
+        total_batch_size=4,
+        gradient_accumulation_steps=1,
+        max_length=4096,
+        max_prompt_length=2048,
+        max_completion_length=2048,
+    )
+    trainer._train_shared_fn_extra_args = ()
+    trainer._train_shared_fn_static_args = ()
+    trainer.sharded_training_step_function = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("RESOURCE_EXHAUSTED: CompileTimeHbmOom")
+    )
+
+    state, metrics, run_exception = Trainer._execute_train_step(
+        trainer,
+        state=SimpleNamespace(),
+        batch={"input_ids": np.arange(4, dtype=np.int32)},
+    )
+
+    assert state is not None
+    assert metrics is not None
+    assert isinstance(run_exception, RuntimeError)
+    assert "CompileTimeHbmOom" in str(run_exception)
+    assert "Memory optimization techniques available for trainer `DPO`" in str(run_exception)
+    assert "`logprob_vocab_chunk_size` (current: disabled): enable it" in str(run_exception)
 
 
 def test_apply_step_start_point_ignores_nonzero_state_step():
@@ -851,6 +951,96 @@ def test_generate_unified_esurge_releases_only_used_engine():
     assert results.generation_results == ["completion-text"]
     assert engine.pause_calls == 1
     assert engine.release_calls == [False]
+
+
+def test_generate_unified_esurge_propagates_generation_penalties():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        generation_max_new_tokens=2,
+        max_completion_length=None,
+        generation_temperature=0.7,
+        generation_top_p=0.95,
+        generation_top_k=64,
+        generation_presence_penalty=0.4,
+        generation_frequency_penalty=0.2,
+        generation_repetition_penalty=1.1,
+        generation_num_return_sequences=1,
+        esurge_hbm_utilization=None,
+        esurge_max_num_seqs=None,
+        esurge_min_input_pad=None,
+        esurge_page_size=None,
+        esurge_silent_mode=True,
+        esurge_runner_verbose=False,
+        esurge_max_num_batched_tokens=None,
+        esurge_enable_prefix_caching=None,
+        esurge_data_parallelism_axis=None,
+        esurge_max_num_seq_buckets=None,
+        total_batch_size=1,
+        max_length=8,
+        esurge_use_tqdm=False,
+        use_esurge_generation=True,
+    )
+    trainer._pad_token_id = 0
+    trainer.processing_class = "tok"
+
+    class _Completion:
+        def __init__(self, token_ids):
+            self.token_ids = token_ids
+
+    class _RequestOutput:
+        def __init__(self):
+            self.prompt_token_ids = [[11, 12]]
+            self.outputs = [_Completion([13])]
+            self.accumulated_text = "completion-text"
+            self.prompt = "prompt-text"
+
+    class _Engine:
+        def __init__(self):
+            self.pause_calls = 0
+            self.release_calls: list[bool] = []
+
+        def pause(self):
+            self.pause_calls += 1
+
+        def release_model_state(self, *, clear_compiled_cache: bool = False):
+            self.release_calls.append(clear_compiled_cache)
+
+    class _Model:
+        def __init__(self, engine):
+            self._engine = engine
+            self.call_esurge_engine_kwargs = None
+
+        def get_esurge(self, **kwargs):
+            self.get_esurge_kwargs = kwargs
+            return self._engine
+
+        def _call_esurge_engine(self, engine, **kwargs):
+            assert engine is self._engine
+            self.call_esurge_engine_kwargs = kwargs
+            return [_RequestOutput()]
+
+    engine = _Engine()
+    model = _Model(engine)
+    state = SimpleNamespace(model=model)
+
+    trainer.generate_unified(
+        prompts=["prompt-text"],
+        state=state,
+        use_esurge=True,
+        apply_chat_template=False,
+        shard_inputs=False,
+        all_gather=False,
+        config_overrides={
+            "presence_penalty": 0.6,
+            "frequency_penalty": 0.3,
+            "repetition_penalty": 1.4,
+        },
+    )
+
+    sampling_params = model.call_esurge_engine_kwargs["sampling_params"]
+    assert sampling_params.presence_penalty == pytest.approx(0.6)
+    assert sampling_params.frequency_penalty == pytest.approx(0.3)
+    assert sampling_params.repetition_penalty == pytest.approx(1.4)
 
 
 def test_maybe_generate_falls_back_to_per_prompt_after_batch_failure():

@@ -2222,7 +2222,7 @@ class RobertaForCausalLM(BaseCausalLMModule[RobertaModel, RobertaConfig]):  # ty
             partition_manager=self.config.partition_manager,
         )
 
-        logits = self.apply_lm_head(hidden_states)
+        logits = self.compute_lm_logits(hidden_states)
 
         return CausalLMOutputWithCrossAttentions(
             logits=logits,

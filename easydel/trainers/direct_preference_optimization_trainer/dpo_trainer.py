@@ -255,6 +255,7 @@ class DPOTrainer(Trainer):
             truncation_mode=self.arguments.truncation_mode,
             aux_loss_enabled=self.arguments.aux_loss_enabled,
             loss_type=self.arguments.loss_type,
+            logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
         )
 
         jited_concatenated_forward = ejit(
@@ -453,6 +454,7 @@ class DPOTrainer(Trainer):
                 truncation_mode=self.arguments.truncation_mode,
                 aux_loss_enabled=self.arguments.aux_loss_enabled,
                 loss_type=self.arguments.loss_type,
+                logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
             )
         else:
             outs = forward_fn(reference_model, batch=padded_batch)

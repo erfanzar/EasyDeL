@@ -386,7 +386,7 @@ class GFPOTrainer(GRPOTrainer):
             prompt_completion_mask = jnp.concatenate([ridmask, completion_mask], -1)
 
             with capture_time() as token_logps_time_fn:
-                if self.ref_logps_chunk_size > 0 and prompt_completion_ids.shape[0] > self.ref_logps_chunk_size:
+                if self.ref_logps_chunk_size is not None and prompt_completion_ids.shape[0] > self.ref_logps_chunk_size:
                     ref_chunks: list[jax.Array] = []
                     full_batch_size = int(prompt_completion_ids.shape[0])
                     for start in range(0, full_batch_size, self.ref_logps_chunk_size):

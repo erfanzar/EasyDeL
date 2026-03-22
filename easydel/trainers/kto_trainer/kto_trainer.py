@@ -232,6 +232,7 @@ class KTOTrainer(Trainer):
             max_prompt_length=self.arguments.max_prompt_length,
             max_completion_length=self.arguments.max_completion_length,
             label_pad_token_id=self.arguments.label_pad_token_id,
+            tools=getattr(self.arguments, "tools", None),
         )
 
     def _is_pretokenized(self) -> bool:
@@ -270,6 +271,7 @@ class KTOTrainer(Trainer):
                 max_length=self.arguments.max_length,
                 truncation_mode=self.arguments.truncation_mode,
                 aux_loss_enabled=self.aux_loss_enabled,
+                logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
             )
 
         self.concatenated_forward = ejit(forward_fn, static_argnames=())

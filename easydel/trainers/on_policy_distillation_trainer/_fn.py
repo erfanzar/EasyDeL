@@ -67,7 +67,7 @@ def on_policy_distillation_step(
     temperature: float = 4.0,
     alpha: float = 0.9,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
-    logits_chunk_size: int = 0,
+    logits_chunk_size: int | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Training/evaluation step for on-policy distillation.
 
@@ -92,7 +92,7 @@ def on_policy_distillation_step(
         temperature: Temperature for softening distributions in KL loss.
         alpha: Weight for distillation loss (1.0 = pure distillation).
         straight_through_emulator: Optional quantization emulator.
-        logits_chunk_size: If > 0, compute loss in chunks to save memory.
+        logits_chunk_size: If set, compute loss in chunks to save memory.
 
     Returns:
         If training: (updated_state, metrics)
@@ -105,7 +105,7 @@ def on_policy_distillation_step(
     )
     batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
-    use_chunked = logits_chunk_size > 0
+    use_chunked = logits_chunk_size is not None and logits_chunk_size > 0
 
     def loss_fn(tree, minibatch):
         if is_training and straight_through_emulator is not None:
@@ -178,7 +178,7 @@ def on_policy_distillation_step(
                 use_hard_labels=False,
                 temperature=temperature,
                 alpha=alpha,
-                chunk_size=logits_chunk_size,
+                chunk_size=int(logits_chunk_size),
             )
         else:
             total_loss, loss_components = distillation_loss(

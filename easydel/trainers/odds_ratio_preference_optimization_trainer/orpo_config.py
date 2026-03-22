@@ -99,6 +99,15 @@ class ORPOConfig(TrainingArguments):
             "max_length - max_prompt_length."
         },
     )
+    logprob_vocab_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Vocabulary chunk size used when computing selected-token log probabilities. "
+                "Set to `None` to disable chunking."
+            )
+        },
+    )
     beta: float = field(
         default=0.1,
         metadata={"help": "A hyperparameter beta."},
@@ -148,6 +157,9 @@ class ORPOConfig(TrainingArguments):
 
         if self.max_completion_length is None and self.max_length is not None and self.max_prompt_length is not None:
             self.max_completion_length = self.max_length - self.max_prompt_length
+        if self.logprob_vocab_chunk_size is not None:
+            normalized_chunk_size = int(self.logprob_vocab_chunk_size)
+            self.logprob_vocab_chunk_size = normalized_chunk_size if normalized_chunk_size > 0 else None
 
         # Call the post_init of the parent class if it exists.
         if hasattr(super(), "__post_init__"):

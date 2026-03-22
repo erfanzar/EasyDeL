@@ -185,6 +185,7 @@ class NashMDTrainer(GRPOTrainer):
         )
 
         self._train_shared_fn_static_args = (
+            self.arguments.logprob_vocab_chunk_size,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
@@ -193,6 +194,7 @@ class NashMDTrainer(GRPOTrainer):
             straight_through_emulator,
         )
         self._eval_shared_fn_static_args = (
+            self.arguments.logprob_vocab_chunk_size,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
@@ -201,7 +203,7 @@ class NashMDTrainer(GRPOTrainer):
             straight_through_emulator,
         )
 
-        static_argnums = (3, 4, 5, 6, 7, 8)
+        static_argnums = (3, 4, 5, 6, 7, 8, 9)
         sharded_training_step_function = ejit(
             nash_md_step,
             in_shardings=(self.state_shardings, empty_sharding, empty_sharding),
@@ -231,7 +233,13 @@ class NashMDTrainer(GRPOTrainer):
             with apply.mesh:
                 ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
                 mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
-                return get_per_token_logps(apply, ids, mask, self.arguments.max_prompt_length)
+                return get_per_token_logps(
+                    apply,
+                    ids,
+                    mask,
+                    self.arguments.max_prompt_length,
+                    logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
+                )
 
         self.compute_refmodel_logps = ejit(
             partial(_compute_model_logps, graphdef=self.model_state.graphdef),

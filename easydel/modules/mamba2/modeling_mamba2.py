@@ -981,7 +981,7 @@ class Mamba2ForCausalLM(BaseCausalLMModule[Mamba2Model, Mamba2Config]):  # type:
 
         logits = None
         if apply_lm_head:
-            logits = self.apply_lm_head(mamba_outputs.last_hidden_state)
+            logits = self.compute_lm_logits(mamba_outputs.last_hidden_state)
 
         return Mamba2CausalLMOutput(
             logits=logits,

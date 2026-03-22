@@ -297,6 +297,10 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Configuration for the loss function."},
     )
+    lmhead_chunksize: int | None = field(
+        default=None,
+        metadata={"help": "Optional token chunk size for LM-head projection during training/inference."},
+    )
     quantization_mode: QuantizationMode | None = field(
         default=None,
         metadata={
@@ -393,6 +397,18 @@ class TrainingArguments:
     generation_top_k: int | None = field(
         default=None,
         metadata={"help": "Default top-k sampling threshold used for preview generations."},
+    )
+    generation_presence_penalty: float | None = field(
+        default=None,
+        metadata={"help": "Default presence penalty used for preview generations."},
+    )
+    generation_frequency_penalty: float | None = field(
+        default=None,
+        metadata={"help": "Default frequency penalty used for preview generations."},
+    )
+    generation_repetition_penalty: float | None = field(
+        default=None,
+        metadata={"help": "Default repetition penalty used for preview generations."},
     )
     generation_temperature: float | None = field(
         default=None,
@@ -837,6 +853,8 @@ class TrainingArguments:
 
         if self.backend not in AVAILABLE_BACKENDS:
             raise ValueError(f"Backend {self.backend} is not recognized. Available backends: {AVAILABLE_BACKENDS}")
+        if self.lmhead_chunksize is not None and self.lmhead_chunksize <= 0:
+            raise ValueError("`lmhead_chunksize` must be > 0 when specified.")
         if self.quantization_group_size is not None and self.quantization_group_size <= 0:
             raise ValueError("`quantization_group_size` must be > 0 when specified.")
         if self.quantization_bits is not None and self.quantization_bits <= 0:
@@ -976,6 +994,7 @@ class TrainingArguments:
         self.clip_grad = _coerce_float(self.clip_grad)
         self.warmup_steps = _coerce_int(self.warmup_steps)
         self.gradient_accumulation_steps = _coerce_int(self.gradient_accumulation_steps)
+        self.lmhead_chunksize = _coerce_int(self.lmhead_chunksize)
         self.quantization_group_size = _coerce_int(self.quantization_group_size)
         self.quantization_bits = _coerce_int(self.quantization_bits)
 
@@ -1006,6 +1025,11 @@ class TrainingArguments:
             raise TypeError(
                 "`gradient_accumulation_steps` must be an int, got "
                 f"{type(self.gradient_accumulation_steps).__name__}: {self.gradient_accumulation_steps!r}"
+            )
+        if self.lmhead_chunksize is not None and not isinstance(self.lmhead_chunksize, (int, np.integer)):
+            raise TypeError(
+                "`lmhead_chunksize` must be an int when provided, got "
+                f"{type(self.lmhead_chunksize).__name__}: {self.lmhead_chunksize!r}"
             )
         if self.quantization_group_size is not None and not isinstance(self.quantization_group_size, (int, np.integer)):
             raise TypeError(
@@ -1068,12 +1092,18 @@ class TrainingArguments:
         _inherit_generation_attr("generation_num_return_sequences", "num_return_sequences")
         _inherit_generation_attr("generation_top_p", "top_p")
         _inherit_generation_attr("generation_top_k", "top_k")
+        _inherit_generation_attr("generation_presence_penalty", "presence_penalty")
+        _inherit_generation_attr("generation_frequency_penalty", "frequency_penalty")
+        _inherit_generation_attr("generation_repetition_penalty", "repetition_penalty")
         _inherit_generation_attr("generation_temperature", "temperature_sampling")
         _inherit_generation_attr("generation_max_new_tokens", "max_completion_length")
 
         self.generation_top_p = _coerce_float(self.generation_top_p)
         self.generation_temperature = _coerce_float(self.generation_temperature)
         self.generation_top_k = _coerce_int(self.generation_top_k)
+        self.generation_presence_penalty = _coerce_float(self.generation_presence_penalty)
+        self.generation_frequency_penalty = _coerce_float(self.generation_frequency_penalty)
+        self.generation_repetition_penalty = _coerce_float(self.generation_repetition_penalty)
         self.generation_num_return_sequences = _coerce_int(self.generation_num_return_sequences)
         self.generation_max_new_tokens = _coerce_int(self.generation_max_new_tokens)
 
@@ -1095,12 +1125,18 @@ class TrainingArguments:
                 )
             generation_extra_kwargs.update(generation_kwargs)
 
+        for attr_name, kwarg_name in (("min_p", "min_p"),):
+            value = getattr(self, attr_name, None)
+            if value is not None and kwarg_name not in generation_extra_kwargs:
+                generation_extra_kwargs[kwarg_name] = value
         for attr_name, kwarg_name in (
-            ("min_p", "min_p"),
+            ("presence_penalty", "presence_penalty"),
+            ("frequency_penalty", "frequency_penalty"),
             ("repetition_penalty", "repetition_penalty"),
         ):
             value = getattr(self, attr_name, None)
-            if value is not None and kwarg_name not in generation_extra_kwargs:
+            generation_value = getattr(self, f"generation_{attr_name}", None)
+            if value is not None and generation_value is None and kwarg_name not in generation_extra_kwargs:
                 generation_extra_kwargs[kwarg_name] = value
         self.generation_extra_kwargs = generation_extra_kwargs or None
 

@@ -58,14 +58,16 @@ class RLVRConfig(GRPOConfig):
         format_reward_weight: Weight for the format compliance
             reward (combined with content rewards).
         length_penalty_target: Target completion length for
-            the length penalty verifier. Set to 0 to disable.
+            the length penalty verifier. Set to ``None`` to disable;
+            ``0`` is accepted for backward compatibility.
         length_penalty_weight: Weight for the length penalty
             reward component.
         max_len_mask: If True, mask out completions that hit
             the maximum length (no EOS token) from the loss.
         reward_clip_range: Clip raw rewards to
             ``[-reward_clip_range, reward_clip_range]``.
-            Set to 0 to disable clipping.
+            Set to ``None`` to disable clipping; ``0`` is accepted for
+            backward compatibility.
         difficulty_key: Optional column name for per-sample
             difficulty scores used in weighted loss computation.
         difficulty_loss_weight: If True, weight the loss by
@@ -103,9 +105,11 @@ class RLVRConfig(GRPOConfig):
         default=0.0,
         metadata={"help": "Weight for format compliance reward component."},
     )
-    length_penalty_target: int = field(
-        default=0,
-        metadata={"help": "Target length for length penalty verifier. 0 disables."},
+    length_penalty_target: int | None = field(
+        default=None,
+        metadata={
+            "help": "Target length for length penalty verifier. `None` disables; `0` is accepted for backward compatibility."
+        },
     )
     length_penalty_weight: float = field(
         default=0.0,
@@ -115,9 +119,11 @@ class RLVRConfig(GRPOConfig):
         default=True,
         metadata={"help": "Mask completions without EOS from the loss."},
     )
-    reward_clip_range: float = field(
-        default=0.0,
-        metadata={"help": "Clip rewards to [-range, range]. 0 disables."},
+    reward_clip_range: float | None = field(
+        default=None,
+        metadata={
+            "help": "Clip rewards to [-range, range]. `None` disables; `0` is accepted for backward compatibility."
+        },
     )
     difficulty_key: str | None = field(
         default=None,
@@ -137,6 +143,14 @@ class RLVRConfig(GRPOConfig):
             max_sequence_length=max_sequence_length,
             quantization_block=quantization_block,
         )
+        if self.length_penalty_target is not None:
+            normalized_length_penalty_target = int(self.length_penalty_target)
+            self.length_penalty_target = (
+                normalized_length_penalty_target if normalized_length_penalty_target > 0 else None
+            )
+        if self.reward_clip_range is not None:
+            normalized_reward_clip_range = float(self.reward_clip_range)
+            self.reward_clip_range = normalized_reward_clip_range if normalized_reward_clip_range > 0.0 else None
         if self.mask_truncated_completions is False and self.max_len_mask:
             self.mask_truncated_completions = True
 

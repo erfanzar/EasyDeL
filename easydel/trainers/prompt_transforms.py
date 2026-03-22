@@ -28,6 +28,9 @@ from collections.abc import Iterator
 from easydel.data.transforms.base import Example, ExpandTransform, Transform
 
 from .prompt_utils import (
+    apply_chat_template as apply_conversational_template,
+)
+from .prompt_utils import (
     maybe_apply_chat_template,
     maybe_convert_to_chatml,
     maybe_extract_prompt,
@@ -38,6 +41,10 @@ _TOKENIZED_FIELDS = {
     "attention_mask",
     "labels",
     "position_ids",
+    "pixel_values",
+    "pixel_attention_mask",
+    "pixel_values_videos",
+    "image_sizes",
     "completion_mask",
     "assistant_masks",
     "prompt_input_ids",
@@ -189,12 +196,17 @@ def extract_prompt_from_preference(example: dict) -> dict:
     Returns:
         Example with 'prompt' field extracted if applicable.
     """
-    result = maybe_extract_prompt(example)
+    # Preserve auxiliary payload columns (e.g. multimodal tensors) when prompt
+    # extraction rebuilds the text fields from chosen/rejected, but drop the
+    # reserved conversational keys that would collide with prompt/chosen/rejected
+    # chat-templating afterwards.
+    sideband = {key: value for key, value in dict(example).items() if key not in {"messages"}}
+    result = {**sideband, **maybe_extract_prompt(example)}
     if "prompt" in result:
         return result
     # Some RL datasets store the prompt as a single-turn chat under `messages`.
     # GRPO/PPO expect a prompt field (string or list-of-messages), so normalize it.
-    messages = result.get("messages")
+    messages = example.get("messages")
     if isinstance(messages, list):
         out = dict(result)
         out["prompt"] = messages
@@ -220,36 +232,7 @@ def apply_chat_template_to_preference(
     Raises:
         KeyError: If required fields (prompt, chosen, rejected) are missing.
     """
-    result = dict(example)
-
-    # Strict field access - will raise KeyError if missing
-    prompt = example["prompt"]
-    chosen = example["chosen"]
-    rejected = example["rejected"]
-
-    # Handle message list format
-    if isinstance(prompt, list):
-        result["prompt"] = tokenizer.apply_chat_template(
-            prompt,
-            tokenize=False,
-            add_generation_prompt=True,
-            tools=tools,
-        )
-
-        if isinstance(chosen, list):
-            result["chosen"] = tokenizer.apply_chat_template(
-                chosen,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-        if isinstance(rejected, list):
-            result["rejected"] = tokenizer.apply_chat_template(
-                rejected,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-
-    return result
+    return apply_conversational_template(example, tokenizer, tools)
 
 
 class GRPOPreprocessTransform(Transform):
@@ -432,6 +415,7 @@ class KTOPreprocessTransform(Transform):
         add_special_tokens: bool = False,
         label_pad_token_id: int = -100,
         embedding_tokenizer: tp.Any = None,
+        tools: list | None = None,
     ):
         self._tokenizer = tokenizer
         self._max_prompt_length = max_prompt_length
@@ -440,6 +424,7 @@ class KTOPreprocessTransform(Transform):
         self._label_pad_token_id = label_pad_token_id
         self._pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
         self._embedding_tokenizer = embedding_tokenizer
+        self._tools = tools
 
     def __call__(self, example: Example) -> Example:
         """Apply KTO preprocessing to example.
@@ -459,21 +444,12 @@ class KTOPreprocessTransform(Transform):
 
         # Convert from/value format to role/content if needed (ShareGPT → ChatML)
         example = maybe_convert_to_chatml(example)
-
-        result = dict(example)
+        result = maybe_apply_chat_template(dict(example), self._tokenizer, self._tools)
 
         # Strict field access - will raise KeyError if missing
-        prompt = example["prompt"]
-        completion = example["completion"]
-        label = example["label"]
-
-        # Handle conversational format
-        if isinstance(prompt, list):
-            prompt = self._tokenizer.apply_chat_template(
-                prompt,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+        prompt = result["prompt"]
+        completion = result["completion"]
+        label = result["label"]
 
         # Tokenize prompt and completion separately
         prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
@@ -637,11 +613,17 @@ class BCOPreprocessTransform(ExpandTransform):
         prompt = example["prompt"]
         chosen = example["chosen"]
         rejected = example["rejected"]
+        sideband_fields = {
+            key: value
+            for key, value in example.items()
+            if key not in {"prompt", "chosen", "rejected", "completion", "label", "messages", "text"}
+        }
 
         # Step 5: Yield TWO tokenized examples (unpair operation)
         # Chosen example (label=True)
         yield self._tokenize_unpaired(
             {
+                **sideband_fields,
                 "prompt": prompt,
                 "completion": chosen,
                 "label": True,
@@ -651,6 +633,7 @@ class BCOPreprocessTransform(ExpandTransform):
         # Rejected example (label=False)
         yield self._tokenize_unpaired(
             {
+                **sideband_fields,
                 "prompt": prompt,
                 "completion": rejected,
                 "label": False,
@@ -669,20 +652,13 @@ class BCOPreprocessTransform(ExpandTransform):
         Raises:
             KeyError: If required fields (prompt, completion, label) are missing.
         """
-        result = dict(example)
+        result = maybe_convert_to_chatml(dict(example))
+        result = maybe_apply_chat_template(result, self._tokenizer, self._tools)
 
         # Strict field access - will raise KeyError if missing
-        prompt = example["prompt"]
-        completion = example["completion"]
-        label = example["label"]
-
-        # Handle conversational format for prompt (if not already converted)
-        if isinstance(prompt, list):
-            prompt = self._tokenizer.apply_chat_template(
-                prompt,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+        prompt = result["prompt"]
+        completion = result["completion"]
+        label = result["label"]
 
         # Tokenize prompt and completion separately
         prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
@@ -813,12 +789,7 @@ class DPOPreprocessTransform(Transform):
         result = extract_prompt_from_preference(example)
 
         # Step 3: Apply chat template if conversational
-        if isinstance(result["prompt"], list):
-            result = apply_chat_template_to_preference(
-                result,
-                self._tokenizer,
-                self._tools,
-            )
+        result = maybe_apply_chat_template(result, self._tokenizer, self._tools)
 
         # Step 4: Tokenize
         return self._tokenize(result)
@@ -993,18 +964,23 @@ class RewardPreprocessTransform(Transform):
 
         # Convert from/value format to role/content if needed (ShareGPT → ChatML)
         example = maybe_convert_to_chatml(example)
-
-        result = dict(example)
+        had_prompt = "prompt" in example
+        had_conversational_prompt = isinstance(example.get("prompt"), list)
+        had_conversational_pair = any(isinstance(example.get(key), list) for key in ("chosen", "rejected"))
+        result = extract_prompt_from_preference(example)
+        result = maybe_apply_chat_template(result, self._tokenizer)
 
         # Strict field access - will raise KeyError if missing
-        chosen = example["chosen"]
-        rejected = example["rejected"]
+        chosen = result["chosen"]
+        rejected = result["rejected"]
+        prompt = result.get("prompt", "")
 
-        # Handle conversational format
-        if isinstance(chosen, list):
-            chosen = self._tokenizer.apply_chat_template(chosen, tokenize=False)
-        if isinstance(rejected, list):
-            rejected = self._tokenizer.apply_chat_template(rejected, tokenize=False)
+        prompt_was_extracted = (not had_prompt) and ("prompt" in result)
+        should_prefix_prompt = prompt_was_extracted or had_conversational_prompt or had_conversational_pair
+
+        if should_prefix_prompt and prompt:
+            chosen = prompt + chosen
+            rejected = prompt + rejected
 
         # Tokenize both
         chosen_tokens = self._tokenizer(
@@ -1246,28 +1222,25 @@ class SFTPreprocessTransform(Transform):
 
     def _tokenize_prompt_completion(self, example: dict) -> dict:
         """Tokenize prompt/completion format with optional masking."""
-        result = dict(example)
+        raw_example = maybe_convert_to_chatml(dict(example))
+        raw_prompt = raw_example.get("prompt")
+        result = maybe_apply_chat_template(raw_example, self._tokenizer)
 
-        prompt = example["prompt"]
-        completion = example["completion"]
+        prompt = result["prompt"]
+        completion = result["completion"]
 
         # Add EOS to completion if needed
         if self._add_eos and not completion.endswith(self._tokenizer.eos_token):
             completion = completion + self._tokenizer.eos_token
 
-        # Check if conversational prompt
-        if isinstance(prompt, list):
+        if isinstance(raw_prompt, list):
             prompt_ids = self._tokenizer.apply_chat_template(
-                prompt,
+                raw_prompt,
                 add_generation_prompt=True,
-            )
-            full_text = self._tokenizer.apply_chat_template(
-                [*prompt, {"role": "assistant", "content": completion}],
-                tokenize=False,
             )
         else:
             prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
-            full_text = prompt + completion
+        full_text = prompt + completion
 
         # Use tokenizer for truncation and padding
         tokens = self._tokenizer(

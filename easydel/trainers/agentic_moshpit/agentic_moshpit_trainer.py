@@ -439,7 +439,7 @@ class AgenticMoshPitTrainer(GRPOTrainer):
                     model_callable=self.ref_state.model.__call__,
                 )
 
-                if self.ref_logps_chunk_size > 0 and sequences.shape[0] > self.ref_logps_chunk_size:
+                if self.ref_logps_chunk_size is not None and sequences.shape[0] > self.ref_logps_chunk_size:
                     ref_chunks: list[jax.Array] = []
                     full_batch_size = int(sequences.shape[0])
                     for start in range(0, full_batch_size, self.ref_logps_chunk_size):

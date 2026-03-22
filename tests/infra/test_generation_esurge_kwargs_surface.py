@@ -16,6 +16,14 @@ import hashlib
 import pprint
 from inspect import signature
 
+import jax.numpy as jnp
+from transformers.generation.configuration_utils import GenerationConfig
+
+from easydel.inference.logits_process import (
+    FrequencyPenaltyLogitsProcessor,
+    PresencePenaltyLogitsProcessor,
+    RepetitionPenaltyLogitsProcessor,
+)
 from easydel.infra.mixins import generation as generation_module
 from easydel.infra.mixins.generation import EasyGenerationMixin
 
@@ -292,3 +300,53 @@ def test_get_esurge_skips_redundant_refresh_for_fresh_engine(monkeypatch):
 
     assert engine is created_engines[0]
     assert engine.update_calls == 0
+
+
+def test_generate_accepts_penalty_kwargs_for_compiled_generation():
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "is_encoder_decoder": False,
+                    "max_position_embeddings": 128,
+                },
+            )()
+            self.generation_config = GenerationConfig(
+                do_sample=True,
+                max_new_tokens=1,
+                pad_token_id=0,
+                eos_token_id=2,
+            )
+
+        def _sample(
+            self,
+            input_ids,
+            max_length,
+            pad_token_id,
+            eos_token_id,
+            prng_key,
+            *,
+            logits_warper=None,
+            logits_processor=None,
+            trace=True,
+            model_kwargs=None,
+        ):
+            del input_ids, max_length, pad_token_id, eos_token_id, prng_key, logits_warper, trace, model_kwargs
+            return logits_processor
+
+    model = DummyModel()
+    processors = model.generate(
+        jnp.asarray([[1, 2]], dtype=jnp.int32),
+        do_sample=True,
+        max_new_tokens=1,
+        presence_penalty=0.4,
+        frequency_penalty=0.2,
+        repetition_penalty=1.3,
+        trace=False,
+    )
+
+    assert any(isinstance(processor, PresencePenaltyLogitsProcessor) for processor in processors)
+    assert any(isinstance(processor, FrequencyPenaltyLogitsProcessor) for processor in processors)
+    assert any(isinstance(processor, RepetitionPenaltyLogitsProcessor) for processor in processors)

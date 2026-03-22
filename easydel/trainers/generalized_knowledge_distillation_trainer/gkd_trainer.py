@@ -86,7 +86,7 @@ class GKDTrainer(SFTTrainer):
         else:
             student_state = model.to_state()
 
-        self.lmbda = float(arguments.lmbda)
+        self.lmbda = None if arguments.lmbda is None else float(arguments.lmbda)
         self.seq_kd = bool(arguments.seq_kd)
         self._on_policy_rng = random.Random(getattr(arguments, "seed", None))
         self._warned_missing_prompt = False
@@ -256,7 +256,7 @@ class GKDTrainer(SFTTrainer):
         Returns:
             True if student sampling should be performed.
         """
-        if self.lmbda <= 0:
+        if self.lmbda is None or self.lmbda <= 0:
             return False
         return self._on_policy_rng.random() <= self.lmbda
 

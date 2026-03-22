@@ -25,6 +25,11 @@ from jax.sharding import PartitionSpec
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
+from easydel.trainers._logprob_utils import (
+    compute_sequence_scores_from_hidden_states,
+    compute_token_logps_and_entropies_chunked,
+    resolve_lmhead_chunksize,
+)
 
 from ..training_utils import (
     filter_kwargs_for_callable,
@@ -103,6 +108,7 @@ def concatenated_forward(
     max_length: int | None = None,
     truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
     aux_loss_enabled: bool = False,
+    logprob_vocab_chunk_size: int | None = None,
 ) -> dict[str, jax.Array]:
     """Run model forward pass to compute completion log probabilities.
 
@@ -137,6 +143,8 @@ def concatenated_forward(
     if "image_sizes" in batch:
         model_kwargs["image_sizes"] = batch["image_sizes"]
 
+    lmhead_chunksize = None
+
     if is_encoder_decoder:
         call_kwargs = {
             "input_ids": prompt_input_ids,
@@ -150,15 +158,20 @@ def concatenated_forward(
         outputs = model(**call_kwargs)
         logits = outputs.logits
         loss_mask = completion_attention_mask.astype(bool)
-        # Compute log-probs and mean logits for encoder-decoder models
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
         labels_safe = jnp.where(loss_mask, completion_labels, 0)
-        seq_len = labels_safe.shape[1]
-        per_token = log_probs[jnp.arange(log_probs.shape[0])[:, None], jnp.arange(seq_len)[None, :], labels_safe]
-        completion_logps = jnp.where(loss_mask, per_token, 0.0).sum(axis=1)
-        mean_logits = jnp.where(loss_mask[..., None], logits, 0.0).sum() / jnp.maximum(
-            loss_mask.sum(), jnp.array(1, dtype=jnp.int32)
+        gathered_logps, _ = compute_token_logps_and_entropies_chunked(
+            logits,
+            labels_safe,
+            return_entropy=False,
+            chunk_size=logprob_vocab_chunk_size,
         )
+        completion_logps = jnp.where(loss_mask, gathered_logps, 0.0).sum(axis=1)
+        token_logit_sums = jnp.sum(
+            jnp.where(loss_mask, logits.astype(jnp.float32).sum(axis=-1), 0.0),
+            axis=1,
+        )
+        token_counts = jnp.sum(loss_mask.astype(jnp.float32), axis=1)
+        mean_logits = token_logit_sums.sum() / jnp.maximum(token_counts.sum(), 1.0)
     else:
         input_ids = completion_input_ids
         attention_mask = completion_attention_mask
@@ -179,27 +192,48 @@ def concatenated_forward(
             "attention_mask": attention_mask,
             **model_kwargs,
         }
+        lmhead_chunksize = resolve_lmhead_chunksize(model)
+        if lmhead_chunksize is not None:
+            call_kwargs["apply_lm_head"] = False
         call_kwargs = filter_kwargs_for_callable(model.__call__, call_kwargs)
         call_kwargs = sanitize_model_call_kwargs(call_kwargs)
         outputs = model(**call_kwargs)
         logits = outputs.logits
 
-        logits_shifted = logits[:, :-1, :]
         labels_shifted = completion_labels[:, 1:]
-
         loss_mask = labels_shifted != label_pad_token_id
-
         labels_safe = jnp.where(loss_mask, labels_shifted, 0)
+        if logits is None and lmhead_chunksize is not None:
+            hidden_states = outputs.last_hidden_state
+            if hidden_states is None:
+                raise TypeError(
+                    f"{type(model).__name__} was called with `apply_lm_head=False` but did not return `last_hidden_state`."
+                )
+            hidden_states = hidden_states[:, :-1, :]
+            completion_logps, token_logit_sums, token_counts = compute_sequence_scores_from_hidden_states(
+                model=model,
+                hidden_states=hidden_states,
+                labels=labels_safe,
+                loss_mask=loss_mask,
+                token_chunk_size=lmhead_chunksize,
+                vocab_chunk_size=logprob_vocab_chunk_size,
+            )
+        else:
+            logits_shifted = logits[:, :-1, :]
+            gathered_logps, _ = compute_token_logps_and_entropies_chunked(
+                logits_shifted,
+                labels_safe,
+                return_entropy=False,
+                chunk_size=logprob_vocab_chunk_size,
+            )
+            completion_logps = jnp.where(loss_mask, gathered_logps, 0.0).sum(axis=1)
+            token_logit_sums = jnp.sum(
+                jnp.where(loss_mask, logits_shifted.astype(jnp.float32).sum(axis=-1), 0.0),
+                axis=1,
+            )
+            token_counts = jnp.sum(loss_mask.astype(jnp.float32), axis=1)
 
-        log_probs = jax.nn.log_softmax(logits_shifted, axis=-1)
-
-        seq_len = labels_safe.shape[1]
-        per_token = log_probs[jnp.arange(log_probs.shape[0])[:, None], jnp.arange(seq_len)[None, :], labels_safe]
-        completion_logps = jnp.where(loss_mask, per_token, 0.0).sum(axis=1)
-
-        mean_logits = jnp.where(loss_mask[..., None], logits_shifted, 0.0).sum() / jnp.maximum(
-            loss_mask.sum(), jnp.array(1, dtype=jnp.int32)
-        )
+        mean_logits = token_logit_sums.sum() / jnp.maximum(token_counts.sum(), 1.0)
 
     output = {
         "completion_logps": completion_logps,

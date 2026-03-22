@@ -42,6 +42,9 @@ class OnPolicyDistillationConfig(DistillationConfig):
             from distillation temperature).
         top_k: Top-k sampling parameter for generation.
         top_p: Top-p (nucleus) sampling parameter for generation.
+        presence_penalty: Presence penalty for generation.
+        frequency_penalty: Frequency penalty for generation.
+        repetition_penalty: Repetition penalty for generation.
         generate_with_teacher: If True, teacher generates completions instead
             of student.
         skip_apply_chat_template: Whether to skip chat template application.
@@ -81,6 +84,18 @@ class OnPolicyDistillationConfig(DistillationConfig):
     top_p: float = field(
         default=0.95,
         metadata={"help": "Top-p (nucleus) sampling parameter for generation."},
+    )
+    presence_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Presence penalty applied during generation."},
+    )
+    frequency_penalty: float = field(
+        default=0.0,
+        metadata={"help": "Frequency penalty applied during generation."},
+    )
+    repetition_penalty: float = field(
+        default=1.0,
+        metadata={"help": "Repetition penalty applied during generation."},
     )
     generate_with_teacher: bool = field(
         default=False,

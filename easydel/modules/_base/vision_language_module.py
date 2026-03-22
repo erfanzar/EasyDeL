@@ -75,7 +75,6 @@ from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import numpy as jnp
-from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
 from easydel.caching import (
@@ -855,8 +854,7 @@ class BaseVisionLanguageModule(BaseConditionalGenerationModule[ModelT, ConfigT])
 
         lm_logits = None
         if apply_lm_head:
-            lm_logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
-            lm_logits = self.apply_logit_cap(lm_logits)
+            lm_logits = self.compute_lm_logits(hidden_states)
 
         # Get optional outputs
         rope_deltas = getattr(outputs, "rope_deltas", None)

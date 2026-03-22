@@ -196,6 +196,7 @@ class CPOTrainer(Trainer):
             truncation_mode=self.arguments.truncation_mode,
             aux_loss_enabled=self.arguments.aux_loss_enabled,
             loss_type=self.arguments.loss_type,
+            logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
         )
         self.concatenated_forward = ejit(
             partial_concatenated_forward,

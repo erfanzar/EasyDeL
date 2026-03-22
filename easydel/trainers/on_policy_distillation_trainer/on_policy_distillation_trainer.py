@@ -195,7 +195,7 @@ class OnPolicyDistillationTrainer(Trainer):
             self.arguments.temperature,
             self.arguments.alpha,
             straight_through_emulator,
-            int(self.arguments.logits_chunk_size),
+            self.arguments.logits_chunk_size,
         )
 
         static_argnames = tuple(range(3, 12))
@@ -217,7 +217,7 @@ class OnPolicyDistillationTrainer(Trainer):
             self.arguments.temperature,
             self.arguments.alpha,
             None,  # straight_through_emulator
-            int(self.arguments.logits_chunk_size),
+            self.arguments.logits_chunk_size,
         )
 
         sharded_evaluation_step_function = ejit(

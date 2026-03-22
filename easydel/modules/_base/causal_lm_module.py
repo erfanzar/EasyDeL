@@ -64,7 +64,6 @@ from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from flax import nnx as nn
 from jax import numpy as jnp
-from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
 from easydel.caching import (
@@ -581,10 +580,9 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         )
 
     def compute_lm_logits(self, hidden_states: Array) -> Array:
-        """Project hidden states to final logits using the module's full LM-head path."""
+        """Project hidden states to logits using the shared LM-head path."""
 
-        logits = checkpoint_name(self.apply_lm_head(hidden_states), "lm_head_output")
-        return self.apply_logit_cap(logits)
+        return super().compute_lm_logits(hidden_states)
 
     def get_task_head(self):
         """Returns the language modeling head module.

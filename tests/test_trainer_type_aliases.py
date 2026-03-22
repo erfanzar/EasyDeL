@@ -42,6 +42,32 @@ def test_ppo_normalized_and_defaults_present():
     assert config["trainer_prefix"] == "PPO"
     assert "cliprange" in config
     assert "vf_coef" in config
+    assert config["entropy_coef"] is None
+    assert config["logprob_vocab_chunk_size"] is None
+    assert config["presence_penalty"] == 0.0
+    assert config["frequency_penalty"] == 0.0
+    assert config["repetition_penalty"] == 1.0
+
+
+@pytest.mark.skipif(not _REQUIRES_PY311, reason="EasyDeL requires Python 3.11+")
+def test_grpo_normalized_and_logprob_chunk_default_present():
+    trainer_types = _load_trainer_types_module()
+    config = trainer_types.normalize_trainer_config({"trainer_type": "grpo"})
+    assert config["trainer_type"] == "grpo"
+    assert config["trainer_prefix"] == "GRPO"
+    assert config["ref_logps_chunk_size"] is None
+    assert config["completion_chunk_size"] is None
+    assert config["max_loss_completion_tokens"] is None
+    assert config["logprob_vocab_chunk_size"] is None
+
+
+@pytest.mark.skipif(not _REQUIRES_PY311, reason="EasyDeL requires Python 3.11+")
+def test_dpo_normalized_and_logprob_chunk_default_present():
+    trainer_types = _load_trainer_types_module()
+    config = trainer_types.normalize_trainer_config({"trainer_type": "dpo"})
+    assert config["trainer_type"] == "dpo"
+    assert config["trainer_prefix"] == "DPO"
+    assert config["logprob_vocab_chunk_size"] is None
 
 
 @pytest.mark.skipif(not _REQUIRES_PY311, reason="EasyDeL requires Python 3.11+")
@@ -70,8 +96,19 @@ def test_on_policy_distillation_normalized_and_defaults_present():
     assert config["trainer_prefix"] == "OnPolicyDistillation"
     assert config["alpha"] == 0.9
     assert config["temperature"] == 2.0
+    assert config["logits_chunk_size"] is None
     assert config["max_prompt_length"] == 512
     assert config["max_completion_length"] == 256
+
+
+@pytest.mark.skipif(not _REQUIRES_PY311, reason="EasyDeL requires Python 3.11+")
+def test_rlvr_normalized_and_disable_defaults_present():
+    trainer_types = _load_trainer_types_module()
+    config = trainer_types.normalize_trainer_config({"trainer_type": "rlvr"})
+    assert config["trainer_type"] == "rlvr"
+    assert config["trainer_prefix"] == "RLVR"
+    assert config["length_penalty_target"] is None
+    assert config["reward_clip_range"] is None
 
 
 @pytest.mark.skipif(not _REQUIRES_PY311, reason="EasyDeL requires Python 3.11+")

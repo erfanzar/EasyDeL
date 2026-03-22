@@ -48,6 +48,7 @@ def test_normalized_configs_construct_every_training_arguments_class():
                 "quantization_mode": "nf4",
                 "quantization_group_size": 64,
                 "quantization_bits": 4,
+                "lmhead_chunksize": 128,
                 "esurge_use_tqdm": True,
                 "esurge_enable_prefix_caching": False,
                 "esurge_data_parallelism_axis": "dp",
@@ -70,6 +71,7 @@ def test_normalized_configs_construct_every_training_arguments_class():
         assert args.quantization_mode == "nf4"
         assert args.quantization_group_size == 64
         assert args.quantization_bits == 4
+        assert args.lmhead_chunksize == 128
         assert args.esurge_use_tqdm is True
         assert args.esurge_enable_prefix_caching is False
         assert args.esurge_data_parallelism_axis == "dp"
@@ -142,6 +144,155 @@ def test_normalize_trainer_config_defaults_step_start_point_to_none():
     assert config["step_start_point"] is None
 
 
+def test_normalize_trainer_config_defaults_lmhead_chunksize_to_none():
+    config = normalize_trainer_config(
+        {
+            "trainer_type": "sft",
+            "total_batch_size": 1,
+        }
+    )
+
+    assert "lmhead_chunksize" in config
+    assert config["lmhead_chunksize"] is None
+
+
+def test_normalize_trainer_config_defaults_dpo_logprob_vocab_chunk_size():
+    config = normalize_trainer_config(
+        {
+            "trainer_type": "dpo",
+            "total_batch_size": 1,
+        }
+    )
+
+    assert "logprob_vocab_chunk_size" in config
+    assert config["logprob_vocab_chunk_size"] is None
+
+
+@pytest.mark.parametrize(
+    "trainer_type",
+    ["cpo", "bco", "kto", "orpo", "grpo", "ppo", "sdpo", "xpo", "nash-md"],
+)
+def test_normalize_trainer_config_defaults_chunked_logprob_trainers(trainer_type: str):
+    config = normalize_trainer_config(
+        {
+            "trainer_type": trainer_type,
+            "total_batch_size": 1,
+        }
+    )
+
+    assert "logprob_vocab_chunk_size" in config
+    assert config["logprob_vocab_chunk_size"] is None
+
+
+def test_normalize_trainer_config_defaults_grpo_chunking_knobs_to_none():
+    config = normalize_trainer_config(
+        {
+            "trainer_type": "grpo",
+            "total_batch_size": 1,
+        }
+    )
+
+    assert config["ref_logps_chunk_size"] is None
+    assert config["completion_chunk_size"] is None
+    assert config["max_loss_completion_tokens"] is None
+
+
+def test_normalize_trainer_config_defaults_distillation_chunk_size_to_none():
+    config = normalize_trainer_config(
+        {
+            "trainer_type": "distillation",
+            "total_batch_size": 1,
+        }
+    )
+
+    assert config["logits_chunk_size"] is None
+
+
+def test_normalize_trainer_config_defaults_ppo_entropy_coef_to_none():
+    config = normalize_trainer_config(
+        {
+            "trainer_type": "ppo",
+            "total_batch_size": 1,
+        }
+    )
+
+    assert config["entropy_coef"] is None
+
+
+def test_normalize_trainer_config_defaults_rlvr_disable_knobs_to_none():
+    config = normalize_trainer_config(
+        {
+            "trainer_type": "rlvr",
+            "total_batch_size": 1,
+        }
+    )
+
+    assert config["length_penalty_target"] is None
+    assert config["reward_clip_range"] is None
+
+
+@pytest.mark.parametrize(
+    ("trainer_type", "overrides", "expected_none_fields"),
+    [
+        (
+            "grpo",
+            {
+                "ref_logps_chunk_size": 0,
+                "completion_chunk_size": 0,
+                "max_loss_completion_tokens": 0,
+            },
+            ("ref_logps_chunk_size", "completion_chunk_size", "max_loss_completion_tokens"),
+        ),
+        (
+            "distillation",
+            {
+                "hidden_state_loss_weight": 0.0,
+                "attention_loss_weight": 0.0,
+                "logits_chunk_size": 0,
+            },
+            ("hidden_state_loss_weight", "attention_loss_weight", "logits_chunk_size"),
+        ),
+        (
+            "ppo",
+            {
+                "entropy_coef": 0.0,
+            },
+            ("entropy_coef",),
+        ),
+        (
+            "rlvr",
+            {
+                "length_penalty_target": 0,
+                "reward_clip_range": 0.0,
+            },
+            ("length_penalty_target", "reward_clip_range"),
+        ),
+        (
+            "gkd",
+            {
+                "lmbda": 0.0,
+            },
+            ("lmbda",),
+        ),
+    ],
+)
+def test_zero_disabled_trainer_knobs_normalize_to_none(
+    trainer_type: str,
+    overrides: dict[str, float | int],
+    expected_none_fields: tuple[str, ...],
+):
+    args_cls = get_training_arguments_class(trainer_type)
+    args = args_cls(
+        model_name="dummy",
+        total_batch_size=1,
+        use_wandb=False,
+        **overrides,
+    )
+
+    for field_name in expected_none_fields:
+        assert getattr(args, field_name) is None
+
+
 def test_training_arguments_default_tpu_preemption_checkpoint_settings():
     args = TrainingArguments(
         model_name="dummy",
@@ -149,3 +300,21 @@ def test_training_arguments_default_tpu_preemption_checkpoint_settings():
     )
 
     assert args.save_tpu_preemption_checkpoints is True
+
+
+def test_ppo_penalties_inherit_into_generation_preview_fields():
+    args_cls = get_training_arguments_class("ppo")
+    args = args_cls(
+        model_name="dummy",
+        total_batch_size=1,
+        max_length=256,
+        max_prompt_length=128,
+        presence_penalty=0.4,
+        frequency_penalty=0.2,
+        repetition_penalty=1.3,
+        use_wandb=False,
+    )
+
+    assert args.generation_presence_penalty == pytest.approx(0.4)
+    assert args.generation_frequency_penalty == pytest.approx(0.2)
+    assert args.generation_repetition_penalty == pytest.approx(1.3)

@@ -40,6 +40,7 @@ def _compute_policy_logps(
     prompt_mask: jax.Array,
     completion_ids: jax.Array,
     completion_mask: jax.Array,
+    logprob_vocab_chunk_size: int | None,
 ) -> jax.Array:
     """Compute policy log probabilities for completion tokens.
 
@@ -57,13 +58,20 @@ def _compute_policy_logps(
     input_ids = jnp.concatenate([prompt_ids, completion_ids], axis=1)
     attention_mask = jnp.concatenate([prompt_mask, completion_mask], axis=1)
     prompt_length = prompt_ids.shape[-1]
-    return get_per_token_logps(module, input_ids, attention_mask, prompt_length)
+    return get_per_token_logps(
+        module,
+        input_ids,
+        attention_mask,
+        prompt_length,
+        logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+    )
 
 
 def nash_md_step(
     state: EasyDeLState,
     batch: dict[str, jax.Array],
     beta: float,
+    logprob_vocab_chunk_size: int | None,
     loss_config: LossConfig | None,
     learning_rate_fn,
     partition_spec: PartitionSpec | None,
@@ -107,7 +115,14 @@ def nash_md_step(
         ref_token_logps = minibatch["ref_token_logps"]
         probabilities = minibatch["probabilities"]
 
-        policy_token_logps = _compute_policy_logps(module, prompt_ids, prompt_mask, completion_ids, completion_mask)
+        policy_token_logps = _compute_policy_logps(
+            module,
+            prompt_ids,
+            prompt_mask,
+            completion_ids,
+            completion_mask,
+            logprob_vocab_chunk_size,
+        )
         mask = completion_mask.astype(policy_token_logps.dtype)
         policy_token_logps = policy_token_logps * mask
         ref_token_logps = ref_token_logps * mask

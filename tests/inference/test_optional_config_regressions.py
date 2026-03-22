@@ -465,6 +465,132 @@ def test_esurge_eval_keeps_greedy_until_deterministic_even_with_request_sampling
     assert sampling_params.top_k == 0
 
 
+def test_esurge_eval_can_force_sampling_params_template_and_merge_until():
+    """A benchmark-level sampling_params template should override request sampling kwargs."""
+    surge = _RecordingSurge()
+    template = SamplingParams(
+        max_tokens=33,
+        temperature=0.6,
+        top_p=0.4,
+        top_k=12,
+        include_stop_str_in_output=True,
+        stop=["DONE"],
+    )
+    adapter = eSurgeLMEvalAdapter(
+        _DummySurge(),
+        _DummyProcessor(),
+        sampling_params=template,
+    )
+    adapter.surge = surge
+
+    outputs = adapter.generate_until(
+        [
+            SimpleNamespace(
+                arguments=[
+                    "prompt",
+                    {
+                        "until": ["\ndef"],
+                        "max_gen_toks": 17,
+                        "temperature": 0.0,
+                        "top_p": 0.91,
+                        "top_k": 3,
+                        "include_stop_str_in_output": False,
+                    },
+                ],
+                task_name="task",
+            ),
+        ]
+    )
+
+    assert outputs == ["pass"]
+    sampling_params = surge.calls[0]["sampling_params"]
+    assert sampling_params.max_tokens == 33
+    assert sampling_params.temperature == pytest.approx(0.6)
+    assert sampling_params.top_p == pytest.approx(0.4)
+    assert sampling_params.top_k == 12
+    assert sampling_params.include_stop_str_in_output is True
+    assert sampling_params.stop[0] == "DONE"
+    assert "\ndef" in sampling_params.stop
+    assert template.stop == ["DONE"]
+
+
+def test_esurge_eval_partial_sampling_params_template_inherits_adapter_defaults():
+    """Partial sampling_params mappings should leave adapter-level defaults in place."""
+    surge = _RecordingSurge()
+    adapter = eSurgeLMEvalAdapter(
+        _DummySurge(),
+        _DummyProcessor(),
+        temperature=0.15,
+        top_p=0.82,
+        sampling_params={"top_k": 50},
+    )
+    adapter.surge = surge
+
+    outputs = adapter.generate_until(
+        [
+            SimpleNamespace(
+                arguments=[
+                    "prompt",
+                    {
+                        "until": ["STOP"],
+                        "max_gen_toks": 41,
+                        "temperature": 0.0,
+                        "top_p": 0.4,
+                    },
+                ],
+                task_name="task",
+            ),
+        ]
+    )
+
+    assert outputs == ["pass"]
+    sampling_params = surge.calls[0]["sampling_params"]
+    assert sampling_params.max_tokens == 41
+    assert sampling_params.temperature == pytest.approx(0.15)
+    assert sampling_params.top_p == pytest.approx(0.82)
+    assert sampling_params.top_k == 50
+    assert "STOP" in sampling_params.stop
+
+
+@pytest.mark.parametrize(
+    "template",
+    (
+        SamplingParams(max_tokens=None, top_k=9, temperature=0.4),
+        {"max_tokens": None, "top_k": 9, "temperature": 0.4},
+    ),
+)
+def test_esurge_eval_sampling_params_template_with_max_tokens_none_inherits_request_limit(template):
+    """`max_tokens=None` templates should still honor the request-level generation limit."""
+    surge = _RecordingSurge()
+    adapter = eSurgeLMEvalAdapter(
+        _DummySurge(),
+        _DummyProcessor(),
+        sampling_params=template,
+    )
+    adapter.surge = surge
+
+    outputs = adapter.generate_until(
+        [
+            SimpleNamespace(
+                arguments=[
+                    "prompt",
+                    {
+                        "max_gen_toks": 41,
+                        "until": ["STOP"],
+                    },
+                ],
+                task_name="task",
+            ),
+        ]
+    )
+
+    assert outputs == ["pass"]
+    sampling_params = surge.calls[0]["sampling_params"]
+    assert sampling_params.max_tokens == 41
+    assert sampling_params.top_k == 9
+    assert "STOP" in sampling_params.stop
+
+
 def test_esurge_eval_chat_template_disables_tokenizer_thinking():
     """Tokenizer chat rendering should suppress model-side thinking when supported."""
     processor = _ThinkingProcessor()

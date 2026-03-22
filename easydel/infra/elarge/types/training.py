@@ -302,6 +302,7 @@ class BaseTrainerCfg(TypedDict, total=False):
         model_parameters: Dictionary of model configuration parameters.
         frozen_parameters: Regex pattern for parameters to freeze during training.
         loss_config: Configuration for loss computation.
+        lmhead_chunksize: Optional token chunk size for LM-head projection during training/inference.
         jax_distributed_config: Configuration for JAX distributed setup.
         step_partition_spec: PartitionSpec for step function sharding.
         state_apply_fn_kwarguments_to_model: Keyword arguments passed to model
@@ -312,6 +313,9 @@ class BaseTrainerCfg(TypedDict, total=False):
         tx_mu_dtype: Data type for optimizer momentum terms.
         generation_top_p: Top-p (nucleus) sampling probability for generation preview.
         generation_top_k: Top-k sampling parameter for generation preview.
+        generation_presence_penalty: Presence penalty for generation preview.
+        generation_frequency_penalty: Frequency penalty for generation preview.
+        generation_repetition_penalty: Repetition penalty for generation preview.
         generation_temperature: Temperature for generation preview sampling.
         generation_do_sample: Whether to use sampling for generation preview.
         generation_num_return_sequences: Number of sequences to generate in preview.
@@ -471,6 +475,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     frozen_parameters: NotRequired[str | None]
 
     loss_config: NotRequired[LossConfig | None]
+    lmhead_chunksize: NotRequired[int | None]
     jax_distributed_config: NotRequired[dict | None]
     step_partition_spec: NotRequired[Any]
     state_apply_fn_kwarguments_to_model: NotRequired[dict | None]
@@ -484,6 +489,9 @@ class BaseTrainerCfg(TypedDict, total=False):
     # Generation preview configuration
     generation_top_p: NotRequired[float | None]
     generation_top_k: NotRequired[int | None]
+    generation_presence_penalty: NotRequired[float | None]
+    generation_frequency_penalty: NotRequired[float | None]
+    generation_repetition_penalty: NotRequired[float | None]
     generation_temperature: NotRequired[float | None]
     generation_do_sample: NotRequired[bool | None]
     generation_num_return_sequences: NotRequired[int | None]
@@ -567,6 +575,9 @@ class DPOTrainerCfg(BaseTrainerCfg):
             Controls interpolation between old and new reference.
         ref_model_sync_steps: Number of steps between reference model syncs.
         rpo_alpha: Alpha parameter for RPO loss variant.
+        logprob_vocab_chunk_size: Vocabulary chunk size used when computing
+            selected-token log probabilities for DPO. Set to None to disable
+            chunking.
         tools: List of tool definitions for tool-use training scenarios.
 
     Example:
@@ -614,6 +625,7 @@ class DPOTrainerCfg(BaseTrainerCfg):
     ref_model_mixup_alpha: NotRequired[float]
     ref_model_sync_steps: NotRequired[int]
     rpo_alpha: NotRequired[float | None]
+    logprob_vocab_chunk_size: NotRequired[int | None]
     tools: NotRequired[list[dict | Any] | None]
 
 
@@ -656,6 +668,7 @@ class ORPOTrainerCfg(BaseTrainerCfg):
     max_length: NotRequired[int | None]
     max_prompt_length: NotRequired[int | None]
     max_completion_length: NotRequired[int | None]
+    logprob_vocab_chunk_size: NotRequired[int | None]
     disable_dropout: NotRequired[bool]
     label_pad_token_id: NotRequired[int]
     padding_value: NotRequired[int | None]
@@ -688,13 +701,16 @@ class GRPOTrainerCfg(BaseTrainerCfg):
         skip_apply_chat_template: Whether to skip applying chat template to prompts.
         num_return_sequences: Number of completions to generate per prompt.
         ref_logps_chunk_size: Chunk size for reference-model log-prob computation.
-            Set to 0 to disable chunking.
+            Set to ``None`` to disable chunking.
         completion_chunk_size: Chunk size for completion-loss computation.
-            Set to 0 to disable chunking.
+            Set to ``None`` to disable chunking.
         max_loss_completion_tokens: Optional cap on completion tokens used by
-            the GRPO loss. Set to 0 to disable truncation.
+            the GRPO loss. Set to ``None`` to disable truncation.
         top_p: Top-p (nucleus) sampling probability threshold.
         top_k: Top-k sampling parameter.
+        presence_penalty: Presence penalty for generation.
+        frequency_penalty: Frequency penalty for generation.
+        repetition_penalty: Repetition penalty for generation.
         temperature: Sampling temperature for generation diversity.
 
     Example:
@@ -718,11 +734,15 @@ class GRPOTrainerCfg(BaseTrainerCfg):
     tools: NotRequired[list[dict | Any] | None]
     skip_apply_chat_template: NotRequired[bool]
     num_return_sequences: NotRequired[int]
-    ref_logps_chunk_size: NotRequired[int]
-    completion_chunk_size: NotRequired[int]
-    max_loss_completion_tokens: NotRequired[int]
+    ref_logps_chunk_size: NotRequired[int | None]
+    completion_chunk_size: NotRequired[int | None]
+    max_loss_completion_tokens: NotRequired[int | None]
+    logprob_vocab_chunk_size: NotRequired[int | None]
     top_p: NotRequired[float]
     top_k: NotRequired[int]
+    presence_penalty: NotRequired[float]
+    frequency_penalty: NotRequired[float]
+    repetition_penalty: NotRequired[float]
     temperature: NotRequired[float]
 
 
@@ -785,10 +805,10 @@ class RLVRTrainerCfg(GRPOTrainerCfg):
         test_key: Dataset column containing code test cases.
         format_pattern: Regex pattern for format compliance checking.
         format_reward_weight: Weight for format reward component.
-        length_penalty_target: Target length for length penalty. 0 disables.
+        length_penalty_target: Target length for length penalty. ``None`` disables.
         length_penalty_weight: Weight for length penalty component.
         max_len_mask: Mask completions without EOS from loss.
-        reward_clip_range: Clip rewards to [-range, range]. 0 disables.
+        reward_clip_range: Clip rewards to [-range, range]. ``None`` disables.
         difficulty_key: Dataset column for difficulty scores.
         difficulty_loss_weight: Weight loss by difficulty.
 
@@ -805,10 +825,10 @@ class RLVRTrainerCfg(GRPOTrainerCfg):
     test_key: NotRequired[str]
     format_pattern: NotRequired[str | None]
     format_reward_weight: NotRequired[float]
-    length_penalty_target: NotRequired[int]
+    length_penalty_target: NotRequired[int | None]
     length_penalty_weight: NotRequired[float]
     max_len_mask: NotRequired[bool]
-    reward_clip_range: NotRequired[float]
+    reward_clip_range: NotRequired[float | None]
     difficulty_key: NotRequired[str | None]
     difficulty_loss_weight: NotRequired[bool]
 
@@ -855,12 +875,16 @@ class PPOTrainerCfg(BaseTrainerCfg):
         whiten_rewards: Whether to normalize rewards across the batch.
         whiten_advantages: Whether to normalize advantages across the batch.
         entropy_coef: Coefficient for entropy bonus to encourage exploration.
+            ``None`` disables the bonus.
         missing_eos_penalty: Penalty applied when completion lacks EOS token.
         tools: List of tool definitions for tool-use scenarios.
         skip_apply_chat_template: Whether to skip applying chat template.
         num_return_sequences: Number of completions to generate per prompt.
         top_p: Top-p (nucleus) sampling probability threshold.
         top_k: Top-k sampling parameter.
+        presence_penalty: Presence penalty for generation.
+        frequency_penalty: Frequency penalty for generation.
+        repetition_penalty: Repetition penalty for generation.
         temperature: Sampling temperature for generation.
 
     Example:
@@ -887,13 +911,17 @@ class PPOTrainerCfg(BaseTrainerCfg):
     lam: NotRequired[float]
     whiten_rewards: NotRequired[bool]
     whiten_advantages: NotRequired[bool]
-    entropy_coef: NotRequired[float]
+    entropy_coef: NotRequired[float | None]
     missing_eos_penalty: NotRequired[float | None]
     tools: NotRequired[list[dict | Any] | None]
     skip_apply_chat_template: NotRequired[bool]
     num_return_sequences: NotRequired[int]
+    logprob_vocab_chunk_size: NotRequired[int | None]
     top_p: NotRequired[float]
     top_k: NotRequired[int]
+    presence_penalty: NotRequired[float]
+    frequency_penalty: NotRequired[float]
+    repetition_penalty: NotRequired[float]
     temperature: NotRequired[float]
 
 
@@ -1000,7 +1028,7 @@ class DistillationTrainerCfg(BaseTrainerCfg):
 
     temperature: NotRequired[float]
     alpha: NotRequired[float]
-    logits_chunk_size: NotRequired[int]
+    logits_chunk_size: NotRequired[int | None]
 
 
 class OnPolicyDistillationTrainerCfg(DistillationTrainerCfg):
@@ -1019,6 +1047,9 @@ class OnPolicyDistillationTrainerCfg(DistillationTrainerCfg):
         temperature_sampling: Sampling temperature for generation.
         top_k: Top-k sampling parameter for generation.
         top_p: Top-p sampling parameter for generation.
+        presence_penalty: Presence penalty for generation.
+        frequency_penalty: Frequency penalty for generation.
+        repetition_penalty: Repetition penalty for generation.
         generate_with_teacher: If True, teacher generates completions.
 
     Example:
@@ -1038,6 +1069,9 @@ class OnPolicyDistillationTrainerCfg(DistillationTrainerCfg):
     temperature_sampling: NotRequired[float]
     top_k: NotRequired[int | None]
     top_p: NotRequired[float]
+    presence_penalty: NotRequired[float]
+    frequency_penalty: NotRequired[float]
+    repetition_penalty: NotRequired[float]
     generate_with_teacher: NotRequired[bool]
 
 
@@ -1055,6 +1089,9 @@ class SeqKDTrainerCfg(BaseTrainerCfg):
         temperature_sampling: Sampling temperature for generation.
         top_k: Top-k sampling parameter for generation.
         top_p: Top-p sampling parameter for generation.
+        presence_penalty: Presence penalty for generation.
+        frequency_penalty: Frequency penalty for generation.
+        repetition_penalty: Repetition penalty for generation.
     """
 
     max_prompt_length: NotRequired[int]
@@ -1063,6 +1100,9 @@ class SeqKDTrainerCfg(BaseTrainerCfg):
     temperature_sampling: NotRequired[float]
     top_k: NotRequired[int | None]
     top_p: NotRequired[float]
+    presence_penalty: NotRequired[float]
+    frequency_penalty: NotRequired[float]
+    repetition_penalty: NotRequired[float]
 
 
 class SparseDistillationTrainerCfg(DistillationTrainerCfg):
@@ -1080,6 +1120,9 @@ class SparseDistillationTrainerCfg(DistillationTrainerCfg):
         temperature_sampling: Sampling temperature for generation.
         top_k: Top-k sampling parameter for generation.
         top_p: Top-p sampling parameter for generation.
+        presence_penalty: Presence penalty for generation.
+        frequency_penalty: Frequency penalty for generation.
+        repetition_penalty: Repetition penalty for generation.
     """
 
     top_k_teacher: NotRequired[int]
@@ -1089,6 +1132,9 @@ class SparseDistillationTrainerCfg(DistillationTrainerCfg):
     temperature_sampling: NotRequired[float]
     top_k: NotRequired[int | None]
     top_p: NotRequired[float]
+    presence_penalty: NotRequired[float]
+    frequency_penalty: NotRequired[float]
+    repetition_penalty: NotRequired[float]
 
 
 class KTOTrainerCfg(BaseTrainerCfg):
@@ -1139,6 +1185,7 @@ class KTOTrainerCfg(BaseTrainerCfg):
     max_length: NotRequired[int | None]
     max_prompt_length: NotRequired[int | None]
     max_completion_length: NotRequired[int | None]
+    logprob_vocab_chunk_size: NotRequired[int | None]
     is_encoder_decoder: NotRequired[bool | None]
     disable_dropout: NotRequired[bool]
     dataset_num_proc: NotRequired[int | None]
@@ -1190,6 +1237,7 @@ class BCOTrainerCfg(BaseTrainerCfg):
     max_length: NotRequired[int | None]
     max_prompt_length: NotRequired[int | None]
     max_completion_length: NotRequired[int | None]
+    logprob_vocab_chunk_size: NotRequired[int | None]
     disable_dropout: NotRequired[bool]
     generate_during_eval: NotRequired[bool]
     is_encoder_decoder: NotRequired[bool | None]
@@ -1255,6 +1303,7 @@ class CPOTrainerCfg(BaseTrainerCfg):
     max_length: NotRequired[int | None]
     max_prompt_length: NotRequired[int | None]
     max_completion_length: NotRequired[int | None]
+    logprob_vocab_chunk_size: NotRequired[int | None]
     is_encoder_decoder: NotRequired[bool | None]
     dataset_num_proc: NotRequired[int | None]
 
@@ -1272,6 +1321,7 @@ class GKDTrainerCfg(SFTTrainerCfg):
     Attributes:
         temperature: Temperature for softening teacher distributions.
         lmbda: Lambda parameter balancing on-policy and off-policy data.
+            ``None`` disables on-policy sampling.
         beta: Beta parameter for loss weighting.
         max_new_tokens: Maximum new tokens to generate for on-policy data.
         disable_dropout: Whether to disable dropout during training.
@@ -1289,7 +1339,7 @@ class GKDTrainerCfg(SFTTrainerCfg):
     """
 
     temperature: NotRequired[float]
-    lmbda: NotRequired[float]
+    lmbda: NotRequired[float | None]
     beta: NotRequired[float]
     max_new_tokens: NotRequired[int]
     disable_dropout: NotRequired[bool]
@@ -1499,6 +1549,7 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "performance_mode": False,
     "track_memory": False,
     "low_mem_usage": True,
+    "lmhead_chunksize": None,
     "sparsify_module": False,
     "sparse_module_type": "bcoo",
     # Generation preview defaults
@@ -1551,6 +1602,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "sync_ref_model": False,
         "ref_model_mixup_alpha": 0.9,
         "ref_model_sync_steps": 64,
+        "logprob_vocab_chunk_size": None,
     },
     "orpo": {
         "trainer_prefix": "ORPO",
@@ -1558,6 +1610,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "beta": 0.1,
         "max_length": 1024,
         "max_prompt_length": 512,
+        "logprob_vocab_chunk_size": None,
         "disable_dropout": True,
         "label_pad_token_id": -100,
         "generate_during_eval": False,
@@ -1574,8 +1627,15 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "ref_model_sync_steps": 64,
         "skip_apply_chat_template": False,
         "num_return_sequences": 1,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
         "top_p": 0.95,
         "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
         "temperature": 0.7,
     },
     "gfpo": {
@@ -1590,8 +1650,15 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "ref_model_sync_steps": 64,
         "skip_apply_chat_template": False,
         "num_return_sequences": 4,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
         "top_p": 0.95,
         "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
         "temperature": 0.7,
     },
     "gspo": {
@@ -1606,8 +1673,15 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "ref_model_sync_steps": 64,
         "skip_apply_chat_template": False,
         "num_return_sequences": 4,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
         "top_p": 0.95,
         "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
         "temperature": 0.7,
     },
     "agentic-moshpit": {
@@ -1627,8 +1701,15 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "step_reward_weight": 1.0,
         "tool_caller": None,
         "max_tool_calls_per_step": 5,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
         "top_p": 0.95,
         "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
         "temperature": 0.7,
     },
     "rlvr": {
@@ -1642,13 +1723,20 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "answer_key": "answer",
         "test_key": "tests",
         "format_reward_weight": 0.0,
-        "length_penalty_target": 0,
+        "length_penalty_target": None,
         "length_penalty_weight": 0.0,
         "max_len_mask": True,
-        "reward_clip_range": 0.0,
+        "reward_clip_range": None,
         "difficulty_loss_weight": False,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
         "top_p": 0.95,
         "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
         "temperature": 0.7,
     },
     "sdpo": {
@@ -1665,8 +1753,15 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "ref_model_sync_steps": 64,
         "skip_apply_chat_template": False,
         "num_return_sequences": 4,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
         "top_p": 0.95,
         "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
         "temperature": 0.7,
     },
     "ppo": {
@@ -1686,12 +1781,16 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "lam": 0.95,
         "whiten_rewards": False,
         "whiten_advantages": True,
-        "entropy_coef": 0.0,
+        "entropy_coef": None,
         "missing_eos_penalty": None,
         "skip_apply_chat_template": False,
         "num_return_sequences": 1,
+        "logprob_vocab_chunk_size": None,
         "top_p": 0.95,
         "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
         "temperature": 0.7,
     },
     "sft": {
@@ -1713,11 +1812,13 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "trainer_prefix": "Distillation",
         "temperature": 2.0,
         "alpha": 0.9,
+        "logits_chunk_size": None,
     },
     "on_policy_distillation": {
         "trainer_prefix": "OnPolicyDistillation",
         "temperature": 2.0,
         "alpha": 0.9,
+        "logits_chunk_size": None,
         "remove_unused_columns": False,
         "max_prompt_length": 512,
         "max_completion_length": 256,
@@ -1725,6 +1826,9 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "temperature_sampling": 0.7,
         "top_p": 0.95,
         "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
         "generate_with_teacher": False,
     },
     "seq_kd": {
@@ -1736,6 +1840,9 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "temperature_sampling": 0.7,
         "top_p": 0.95,
         "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
     },
     "sparse_distillation": {
         "trainer_prefix": "SparseDistillation",
@@ -1749,6 +1856,9 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "temperature_sampling": 0.7,
         "top_p": 0.95,
         "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
     },
     "kto": {
         "trainer_prefix": "KTO",
@@ -1760,6 +1870,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "label_pad_token_id": -100,
         "max_length": 1024,
         "max_prompt_length": 512,
+        "logprob_vocab_chunk_size": None,
         "disable_dropout": True,
         "precompute_ref_log_probs": False,
     },
@@ -1770,6 +1881,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "label_pad_token_id": -100,
         "max_length": 1024,
         "max_prompt_length": 512,
+        "logprob_vocab_chunk_size": None,
         "disable_dropout": True,
         "generate_during_eval": False,
         "precompute_ref_log_probs": False,
@@ -1790,6 +1902,7 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "label_pad_token_id": -100,
         "max_length": 1024,
         "max_prompt_length": 512,
+        "logprob_vocab_chunk_size": None,
     },
     "gkd": {
         "trainer_prefix": "GKD",
@@ -1818,8 +1931,15 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "ref_model_sync_steps": 64,
         "skip_apply_chat_template": False,
         "num_return_sequences": 1,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
         "top_p": 0.95,
         "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
         "temperature": 0.7,
     },
     "xpo": {
@@ -1836,8 +1956,15 @@ TRAINER_SPECIFIC_DEFAULTS: dict[str, TrainerConfig] = {
         "ref_model_sync_steps": 64,
         "skip_apply_chat_template": False,
         "num_return_sequences": 1,
+        "ref_logps_chunk_size": None,
+        "completion_chunk_size": None,
+        "max_loss_completion_tokens": None,
+        "logprob_vocab_chunk_size": None,
         "top_p": 0.95,
         "top_k": 50,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
         "temperature": 0.7,
     },
     "embedding": {

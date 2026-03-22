@@ -28,6 +28,7 @@ easydel.trainers package
    supervised_fine_tuning_trainer/index
    trainer/index
    xpo_trainer/index
+   _logprob_utils
    base_trainer
    metrics
    packer

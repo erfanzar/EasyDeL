@@ -77,9 +77,12 @@ from easydel.inference.logits_process import (
     ForcedBOSTokenLogitsProcessor,
     ForcedEOSTokenLogitsProcessor,
     ForceTokensLogitsProcessor,
+    FrequencyPenaltyLogitsProcessor,
     LogitsProcessorList,
     MinLengthLogitsProcessor,
     NoRepeatNGramLogitsProcessor,
+    PresencePenaltyLogitsProcessor,
+    RepetitionPenaltyLogitsProcessor,
     SuppressTokensAtBeginLogitsProcessor,
     SuppressTokensLogitsProcessor,
     TemperatureLogitsWarper,
@@ -2321,7 +2324,14 @@ class EasyGenerationMixin:
             generation_config = self.generation_config
 
         generation_config = copy.deepcopy(generation_config)
+        custom_generation_attributes = {}
+        for attr_name in ("presence_penalty", "frequency_penalty", "repetition_penalty"):
+            if attr_name in kwargs:
+                custom_generation_attributes[attr_name] = kwargs.pop(attr_name)
         model_kwargs = generation_config.update(**kwargs)
+        for attr_name, value in custom_generation_attributes.items():
+            if value is not None:
+                setattr(generation_config, attr_name, value)
         self._validate_model_kwargs(model_kwargs.copy())
 
         # Newer Transformers may leave generation fields as None by default.
@@ -2598,6 +2608,15 @@ class EasyGenerationMixin:
             processors.append(ForceTokensLogitsProcessor(forced_decoder_ids))
         if generation_config.no_repeat_ngram_size is not None and generation_config.no_repeat_ngram_size > 0:
             processors.append(NoRepeatNGramLogitsProcessor(generation_config.no_repeat_ngram_size))
+        presence_penalty = getattr(generation_config, "presence_penalty", 0.0)
+        if presence_penalty is not None and float(presence_penalty) != 0.0:
+            processors.append(PresencePenaltyLogitsProcessor(float(presence_penalty)))
+        frequency_penalty = getattr(generation_config, "frequency_penalty", 0.0)
+        if frequency_penalty is not None and float(frequency_penalty) != 0.0:
+            processors.append(FrequencyPenaltyLogitsProcessor(float(frequency_penalty)))
+        repetition_penalty = getattr(generation_config, "repetition_penalty", 1.0)
+        if repetition_penalty is not None and float(repetition_penalty) != 1.0:
+            processors.append(RepetitionPenaltyLogitsProcessor(float(repetition_penalty)))
         processors = self._merge_criteria_processor_list(processors, logits_processor)
 
         return processors

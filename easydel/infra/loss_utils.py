@@ -2189,7 +2189,7 @@ def causal_lm_loss_chunked_lm_head(
         config=config,
     )
 
-    batch_size, seq_len, hidden_dim = shift_hidden_states.shape
+    _batch_size, seq_len, _hidden_dim = shift_hidden_states.shape
     pad_len = (-seq_len) % chunk_size
 
     if pad_len:
@@ -2200,16 +2200,9 @@ def causal_lm_loss_chunked_lm_head(
 
     padded_seq_len = shift_hidden_states.shape[1]
     num_chunks = padded_seq_len // chunk_size
-
-    hidden_chunks = shift_hidden_states.reshape(batch_size, num_chunks, chunk_size, hidden_dim).transpose(1, 0, 2, 3)
-    label_chunks = shift_labels.reshape(batch_size, num_chunks, chunk_size).transpose(1, 0, 2)
-    mask_chunks = None
-    if shift_attn_m is not None:
-        mask_chunks = shift_attn_m.reshape(batch_size, num_chunks, chunk_size).transpose(1, 0, 2)
-    loss_weight_chunks = global_loss_batch["decoder_loss_weights"]
+    loss_weights = global_loss_batch["decoder_loss_weights"]
     if pad_len:
-        loss_weight_chunks = jnp.pad(loss_weight_chunks, ((0, 0), (0, pad_len)))
-    loss_weight_chunks = loss_weight_chunks.reshape(batch_size, num_chunks, chunk_size).transpose(1, 0, 2)
+        loss_weights = jnp.pad(loss_weights, ((0, 0), (0, pad_len)))
 
     def _chunk_loss(chunk_hidden_states, chunk_labels, chunk_attention_mask, chunk_loss_weights):
         logits = lm_head_fn(chunk_hidden_states)
@@ -2233,8 +2226,14 @@ def causal_lm_loss_chunked_lm_head(
 
     _chunk_loss = jax.checkpoint(_chunk_loss, prevent_cse=False)
 
-    def _scan_body(carry, xs):
-        chunk_hidden_states, chunk_labels, chunk_attention_mask, chunk_loss_weights = xs
+    def _accumulate_chunk(i: int, carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array]):
+        start = i * chunk_size
+        chunk_hidden_states = lax.dynamic_slice_in_dim(shift_hidden_states, start, chunk_size, axis=1)
+        chunk_labels = lax.dynamic_slice_in_dim(shift_labels, start, chunk_size, axis=1)
+        chunk_attention_mask = (
+            lax.dynamic_slice_in_dim(shift_attn_m, start, chunk_size, axis=1) if shift_attn_m is not None else None
+        )
+        chunk_loss_weights = lax.dynamic_slice_in_dim(loss_weights, start, chunk_size, axis=1)
         chunk_loss, chunk_z_loss, chunk_weight_sum, chunk_correct = _chunk_loss(
             chunk_hidden_states,
             chunk_labels,
@@ -2246,19 +2245,14 @@ def causal_lm_loss_chunked_lm_head(
             carry[1] + chunk_z_loss,
             carry[2] + chunk_weight_sum,
             carry[3] + chunk_correct,
-        ), None
+        )
 
     zero = jnp.array(0.0, dtype=compute_dtype)
-    scan_inputs = (
-        hidden_chunks,
-        label_chunks,
-        mask_chunks if mask_chunks is not None else jnp.full(label_chunks.shape, True, dtype=jnp.bool_),
-        loss_weight_chunks,
-    )
-    (total_loss, total_z_loss, weight_sum, correct_sum), _ = jax.lax.scan(
-        _scan_body,
+    total_loss, total_z_loss, weight_sum, correct_sum = jax.lax.fori_loop(
+        0,
+        num_chunks,
+        _accumulate_chunk,
         (zero, zero, zero, zero),
-        scan_inputs,
     )
 
     if global_loss_factor is not None:
@@ -2319,7 +2313,8 @@ def _should_chunk_causal_lm_loss(
     if loss_factor in {"NO_WEIGHT_NUM_REAL_TARGET_TOKENS", "AVERAGE_PER_SEQUENCE"}:
         return False
 
-    explicit_chunk = token_chunk_size is not None or config.chunk_token_size is not None
+    model_chunk_size = module.config.lmhead_chunksize
+    explicit_chunk = token_chunk_size is not None or config.chunk_token_size is not None or model_chunk_size is not None
     memory_tuned = explicit_chunk or config.chunk_block_size is not None or config.chunk_vocab_size is not None
     if not memory_tuned or labels.ndim < 2:
         return False
@@ -2395,11 +2390,14 @@ class CausalLMLossStrategy(BaseLossStrategy):
         the model runs normally.
         """
         del batch
+        token_chunk_size = loss_kwargs.get("token_chunk_size")
+        if token_chunk_size is None:
+            token_chunk_size = module.config.lmhead_chunksize
         if _should_chunk_causal_lm_loss(
             module=module,
             labels=labels,
             loss_config=loss_config,
-            token_chunk_size=loss_kwargs.get("token_chunk_size"),
+            token_chunk_size=token_chunk_size,
         ):
             return LossForwardPlan(forward_kwargs={"apply_lm_head": False})
         return LossForwardPlan()
@@ -2451,6 +2449,10 @@ class CausalLMLossStrategy(BaseLossStrategy):
         chunked_loss_kwargs = dict(loss_kwargs)
         if "num_items_in_batch" not in chunked_loss_kwargs and "num_items_in_batch" in batch:
             chunked_loss_kwargs["num_items_in_batch"] = batch["num_items_in_batch"]
+        if "token_chunk_size" not in chunked_loss_kwargs or chunked_loss_kwargs["token_chunk_size"] is None:
+            model_chunk_size = module.config.lmhead_chunksize
+            if model_chunk_size is not None:
+                chunked_loss_kwargs["token_chunk_size"] = model_chunk_size
 
         lm_head_inputs = (
             module.prepare_lm_head_inputs(last_hidden_state)

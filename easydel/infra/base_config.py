@@ -454,6 +454,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
     mask_max_position_embeddings: NotRequired[int]
     freq_max_position_embeddings: NotRequired[int]
     precompute_masks: NotRequired[bool]
+    lmhead_chunksize: NotRequired[int | None]
 
 
 class EasyDeLBaseConfig(PretrainedConfig):
@@ -503,6 +504,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         gradient_checkpointing_targets: Optional list of target names to include or
             exclude when using selective checkpointing policies.
         precompute_masks: Whether to precompute and cache causal masks on the mesh.
+        lmhead_chunksize: Optional token chunk size for chunked LM-head projection.
+            When set, models may project hidden states to logits in sequence chunks
+            instead of a single full-sequence LM-head matmul.
         kv_cache_quantization_config: Quantization config for KV cache tensors. Pass ``None`` to disable.
         quantization_config: Quantization config for linear layers. Pass ``None`` to disable.
         use_qmm_best_config: Whether quantized linear kernels should request
@@ -798,6 +802,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         gradient_checkpointing_targets: list[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS] | None = None,
         precompute_masks: bool = True,
+        lmhead_chunksize: int | None = None,
         kv_cache_quantization_config: QuantizationConfig | None = None,
         quantization_config: QuantizationConfig | None = None,
         use_qmm_best_config: bool = False,
@@ -883,6 +888,16 @@ class EasyDeLBaseConfig(PretrainedConfig):
             self, "gradient_checkpointing_targets", gradient_checkpointing_targets
         )
         self.precompute_masks = getattr(self, "precompute_masks", precompute_masks)
+        self.lmhead_chunksize = getattr(self, "lmhead_chunksize", lmhead_chunksize)
+        if self.lmhead_chunksize is not None:
+            if not isinstance(self.lmhead_chunksize, (int, np.integer)):
+                raise TypeError(
+                    "`lmhead_chunksize` must be an int when provided, got "
+                    f"{type(self.lmhead_chunksize).__name__}: {self.lmhead_chunksize!r}"
+                )
+            self.lmhead_chunksize = int(self.lmhead_chunksize)
+            if self.lmhead_chunksize <= 0:
+                raise ValueError("`lmhead_chunksize` must be positive when provided.")
 
         self.kv_cache_quantization_config = getattr(self, "kv_cache_quantization_config", kv_cache_quantization_config)
         self.quantization_config = getattr(self, "quantization_config", quantization_config)
@@ -1431,6 +1446,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
             "gradient_checkpointing",
             "gradient_checkpointing_targets",
             "precompute_masks",
+            "lmhead_chunksize",
             "kv_cache_quantization_config",
             "quantization_config",
             "use_qmm_best_config",

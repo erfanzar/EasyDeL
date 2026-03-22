@@ -369,6 +369,7 @@ class BCOTrainer(Trainer):
                 max_length=self.arguments.max_length,
                 truncation_mode=self.arguments.truncation_mode,
                 aux_loss_enabled=getattr(self.model_state.model, "output_router_logits", False),
+                logprob_vocab_chunk_size=self.arguments.logprob_vocab_chunk_size,
             )
 
         self.concatenated_forward = ejit(forward_fn, static_argnames=())

@@ -34,12 +34,16 @@ import typing as tp
 import jax
 import optax  # pyright: ignore[reportMissingTypeStubs]
 from eformer.escale import with_sharding_constraint
-from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
+from easydel.trainers._logprob_utils import (
+    compute_per_token_logps_and_entropies_from_hidden_states,
+    compute_token_logps_and_entropies_chunked,
+    resolve_lmhead_chunksize,
+)
 
 from ..training_utils import (
     compact_generation_model_kwargs,
@@ -56,70 +60,6 @@ from ..training_utils import (
 
 RewardFunc = EasyDeLState | tp.Callable[[list, list], list[float]]
 
-PER_TOKEN_LOGPROB_VOCAB_CHUNK_SIZE = 2048
-
-
-def _compute_token_logps_and_entropies(
-    logits: jax.Array,
-    targets: jax.Array,
-    *,
-    return_entropy: bool,
-    chunk_size: int = PER_TOKEN_LOGPROB_VOCAB_CHUNK_SIZE,
-) -> tuple[jax.Array, jax.Array | None]:
-    """Compute token log-probs without materializing a full-vocab log-softmax."""
-
-    vocab_size: int = logits.shape[-1]
-    num_full_chunks = vocab_size // chunk_size
-    tail = vocab_size - num_full_chunks * chunk_size
-
-    def max_body(i: int, running_max: jax.Array) -> jax.Array:
-        start = i * chunk_size
-        chunk = lax.dynamic_slice_in_dim(logits, start, chunk_size, axis=-1).astype(jnp.float32)
-        return jnp.maximum(running_max, jnp.max(chunk, axis=-1))
-
-    logit_max = jnp.full(logits.shape[:-1], -jnp.inf, dtype=jnp.float32)
-    logit_max = lax.fori_loop(0, num_full_chunks, max_body, logit_max)
-    if tail:
-        start = num_full_chunks * chunk_size
-        chunk = lax.dynamic_slice_in_dim(logits, start, tail, axis=-1).astype(jnp.float32)
-        logit_max = jnp.maximum(logit_max, jnp.max(chunk, axis=-1))
-
-    def sum_body(i: int, running_sum: jax.Array) -> jax.Array:
-        start = i * chunk_size
-        chunk = lax.dynamic_slice_in_dim(logits, start, chunk_size, axis=-1).astype(jnp.float32)
-        return running_sum + jnp.sum(jnp.exp(chunk - logit_max[..., None]), axis=-1)
-
-    exp_sum = jnp.zeros_like(logit_max)
-    exp_sum = lax.fori_loop(0, num_full_chunks, sum_body, exp_sum)
-    if tail:
-        start = num_full_chunks * chunk_size
-        chunk = lax.dynamic_slice_in_dim(logits, start, tail, axis=-1).astype(jnp.float32)
-        exp_sum = exp_sum + jnp.sum(jnp.exp(chunk - logit_max[..., None]), axis=-1)
-
-    log_z = jnp.log(exp_sum) + logit_max
-    target_logits = jnp.take_along_axis(logits, jnp.expand_dims(targets, axis=-1), axis=-1).astype(jnp.float32)
-    token_log_probs = jnp.squeeze(target_logits, axis=-1) - log_z
-
-    if not return_entropy:
-        return token_log_probs, None
-
-    def entropy_body(i: int, expected_logits: jax.Array) -> jax.Array:
-        start = i * chunk_size
-        chunk = lax.dynamic_slice_in_dim(logits, start, chunk_size, axis=-1).astype(jnp.float32)
-        probs = jnp.exp(chunk - log_z[..., None])
-        return expected_logits + jnp.sum(probs * chunk, axis=-1)
-
-    expected_logits = jnp.zeros_like(log_z)
-    expected_logits = lax.fori_loop(0, num_full_chunks, entropy_body, expected_logits)
-    if tail:
-        start = num_full_chunks * chunk_size
-        chunk = lax.dynamic_slice_in_dim(logits, start, tail, axis=-1).astype(jnp.float32)
-        probs = jnp.exp(chunk - log_z[..., None])
-        expected_logits = expected_logits + jnp.sum(probs * chunk, axis=-1)
-
-    entropies = log_z - expected_logits
-    return token_log_probs, entropies
-
 
 def _masked_sum_and_count(x: jax.Array, mask: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Return numerator/denominator matching the masked_mean semantics used below."""
@@ -129,7 +69,14 @@ def _masked_sum_and_count(x: jax.Array, mask: jax.Array) -> tuple[jax.Array, jax
     return jnp.sum(x * mask), jnp.maximum(jnp.sum(mask), 1.0).astype(jnp.float32)
 
 
-def get_per_token_logps(model, input_ids, attention_mask, prompt_length, model_kwargs=None):
+def get_per_token_logps(
+    model,
+    input_ids,
+    attention_mask,
+    prompt_length,
+    model_kwargs=None,
+    logprob_vocab_chunk_size: int | None = None,
+):
     """Compute per-token log probabilities for generated sequences.
 
     This function extracts log probabilities for each token in the completion
@@ -146,6 +93,10 @@ def get_per_token_logps(model, input_ids, attention_mask, prompt_length, model_k
             are only computed for tokens after this position.
         model_kwargs: Optional dictionary of extra model inputs (e.g. multimodal
             tensors like ``pixel_values`` or ``inputs_embeds``). Defaults to None.
+        logprob_vocab_chunk_size: When set to a positive value, the log-softmax over
+            the vocabulary is computed in chunks of this size to reduce peak
+            memory. ``None`` disables vocabulary chunking and computes the
+            full softmax in one pass.
 
     Returns:
         Array: Per-token log probabilities for the completion portion.
@@ -154,6 +105,10 @@ def get_per_token_logps(model, input_ids, attention_mask, prompt_length, model_k
     Note:
         The function shifts logits by one position to align with the autoregressive
         nature of language models, where each position predicts the next token.
+        When the model's ``lmhead_chunksize`` is configured, the forward pass
+        is run with ``apply_lm_head=False`` and log probabilities are computed
+        directly from hidden states in a chunked fashion, avoiding
+        materialization of the full logit tensor.
     """
 
     model_kwargs = compact_generation_model_kwargs(
@@ -176,12 +131,34 @@ def get_per_token_logps(model, input_ids, attention_mask, prompt_length, model_k
     }
     if model_kwargs.get("inputs_embeds", None) is None:
         call_kwargs["input_ids"] = input_ids
-    logits = model(**call_kwargs).logits[:, prompt_length - 1 :]
+    lmhead_chunksize = resolve_lmhead_chunksize(model)
+    if lmhead_chunksize is not None:
+        call_kwargs["apply_lm_head"] = False
+    outputs = model(**call_kwargs)
+    targets = input_ids[:, prompt_length:]
+    if outputs.logits is None and lmhead_chunksize is not None:
+        hidden_states = outputs.last_hidden_state
+        if hidden_states is None:
+            raise TypeError(
+                f"{type(model).__name__} was called with `apply_lm_head=False` but did not return `last_hidden_state`."
+            )
+        hidden_states = hidden_states[:, prompt_length - 1 : -1, :]
+        token_log_probs, _ = compute_per_token_logps_and_entropies_from_hidden_states(
+            model,
+            hidden_states,
+            targets,
+            token_chunk_size=lmhead_chunksize,
+            vocab_chunk_size=logprob_vocab_chunk_size,
+            return_entropy=False,
+        )
+        return token_log_probs
+    logits = outputs.logits[:, prompt_length - 1 :]
     logits = logits[:, :-1, :]
-    token_log_probs, _ = _compute_token_logps_and_entropies(
+    token_log_probs, _ = compute_token_logps_and_entropies_chunked(
         logits,
-        input_ids[:, prompt_length:],
+        targets,
         return_entropy=False,
+        chunk_size=logprob_vocab_chunk_size,
     )
     return token_log_probs
 
@@ -214,7 +191,14 @@ def compute_per_token_logps(logits, input_ids, prompt_length):
     return token_log_probs
 
 
-def get_per_token_logps_and_entropies(model, input_ids, attention_mask, prompt_length, model_kwargs=None):
+def get_per_token_logps_and_entropies(
+    model,
+    input_ids,
+    attention_mask,
+    prompt_length,
+    model_kwargs=None,
+    logprob_vocab_chunk_size: int | None = None,
+):
     """Compute per-token log probabilities and entropy for the completion portion.
 
     Similar to ``get_per_token_logps``, but also returns the per-token entropy
@@ -231,11 +215,21 @@ def get_per_token_logps_and_entropies(model, input_ids, attention_mask, prompt_l
             entropies are computed only for tokens after this position.
         model_kwargs: Optional dictionary of extra model inputs (e.g. multimodal
             tensors like ``pixel_values`` or ``inputs_embeds``). Defaults to None.
+        logprob_vocab_chunk_size: When set to a positive value, the log-softmax and
+            entropy computations over the vocabulary are performed in chunks
+            of this size to reduce peak memory usage. ``None`` disables
+            vocabulary chunking and computes the full softmax in a single pass.
 
     Returns:
         tuple[jax.Array, jax.Array]: A pair of arrays:
             - Per-token log probabilities, shape ``[batch_size, completion_len]``.
             - Per-token entropy of the predicted distribution, same shape.
+
+    Note:
+        When the model's ``lmhead_chunksize`` is configured, the forward
+        pass is run with ``apply_lm_head=False`` and both log probabilities
+        and entropies are computed directly from hidden states in a chunked
+        fashion, avoiding materialization of the full logit tensor.
     """
     model_kwargs = compact_generation_model_kwargs(
         normalize_generation_model_kwargs(model_kwargs, model_callable=model.__call__),
@@ -257,12 +251,34 @@ def get_per_token_logps_and_entropies(model, input_ids, attention_mask, prompt_l
     }
     if model_kwargs.get("inputs_embeds", None) is None:
         call_kwargs["input_ids"] = input_ids
-    logits = model(**call_kwargs).logits[:, prompt_length - 1 :]
+    lmhead_chunksize = resolve_lmhead_chunksize(model)
+    if lmhead_chunksize is not None:
+        call_kwargs["apply_lm_head"] = False
+    outputs = model(**call_kwargs)
+    targets = input_ids[:, prompt_length:]
+    if outputs.logits is None and lmhead_chunksize is not None:
+        hidden_states = outputs.last_hidden_state
+        if hidden_states is None:
+            raise TypeError(
+                f"{type(model).__name__} was called with `apply_lm_head=False` but did not return `last_hidden_state`."
+            )
+        hidden_states = hidden_states[:, prompt_length - 1 : -1, :]
+        token_log_probs, entropies = compute_per_token_logps_and_entropies_from_hidden_states(
+            model,
+            hidden_states,
+            targets,
+            token_chunk_size=lmhead_chunksize,
+            vocab_chunk_size=logprob_vocab_chunk_size,
+            return_entropy=True,
+        )
+        return token_log_probs, entropies
+    logits = outputs.logits[:, prompt_length - 1 :]
     logits = logits[:, :-1, :]
-    token_log_probs, entropies = _compute_token_logps_and_entropies(
+    token_log_probs, entropies = compute_token_logps_and_entropies_chunked(
         logits,
-        input_ids[:, prompt_length:],
+        targets,
         return_entropy=True,
+        chunk_size=logprob_vocab_chunk_size,
     )
     return token_log_probs, entropies
 
@@ -327,8 +343,9 @@ def grpo_step(
     delta: float | None = None,
     importance_sampling_level: str = "token",
     top_entropy_quantile: float = 1.0,
-    completion_chunk_size: int = 0,
-    max_loss_completion_tokens: int = 0,
+    completion_chunk_size: int | None = None,
+    max_loss_completion_tokens: int | None = None,
+    logprob_vocab_chunk_size: int | None = None,
     straight_through_emulator: tp.Callable[[tp.Any], tp.Any] | None = None,
 ) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
     """Perform a single GRPO training or evaluation step.
@@ -367,9 +384,9 @@ def grpo_step(
         top_entropy_quantile: Fraction of highest-entropy tokens to keep in
             the loss. 1.0 disables filtering.
         completion_chunk_size: Chunk size for memory-saving chunked completion
-            loss. Set to 0 to disable chunking.
+            loss. Set to ``None`` to disable chunking.
         max_loss_completion_tokens: Optional cap on completion tokens used by
-            the GRPO loss. Set to 0 to disable truncation.
+            the GRPO loss. Set to ``None`` to disable truncation.
         straight_through_emulator: Optional function for quantization-aware
             straight-through gradient estimation.
 
@@ -406,7 +423,7 @@ def grpo_step(
         )
 
         completion_was_truncated = False
-        if max_loss_completion_tokens > 0 and completion_ids.shape[1] > max_loss_completion_tokens:
+        if max_loss_completion_tokens is not None and completion_ids.shape[1] > max_loss_completion_tokens:
             completion_ids = completion_ids[:, :max_loss_completion_tokens]
             completion_mask = completion_mask[:, :max_loss_completion_tokens]
             completion_was_truncated = True
@@ -440,7 +457,9 @@ def grpo_step(
         completion_lengths = jnp.sum(completion_mask, axis=1)
 
         use_chunked_completion_loss = (
-            completion_chunk_size > 0 and completion_ids.shape[0] > completion_chunk_size and top_entropy_quantile >= 1.0
+            completion_chunk_size is not None
+            and completion_ids.shape[0] > completion_chunk_size
+            and top_entropy_quantile >= 1.0
         )
         if use_chunked_completion_loss:
             expanded_prompt_ids = prompt_ids.repeat(effective_num_generations, 0)
@@ -489,6 +508,7 @@ def grpo_step(
                     chunk_attention_mask,
                     prompt_len,
                     model_kwargs=chunk_model_kwargs,
+                    logprob_vocab_chunk_size=logprob_vocab_chunk_size,
                 )
                 chunk_ref_per_token_logps = (
                     minibatch["ref_per_token_logps"][start:end, : completion_ids.shape[1]]
@@ -638,6 +658,7 @@ def grpo_step(
                 attention_mask,
                 prompt_len,
                 model_kwargs=completion_model_kwargs,
+                logprob_vocab_chunk_size=logprob_vocab_chunk_size,
             )
         else:
             per_token_logps = get_per_token_logps(
@@ -646,6 +667,7 @@ def grpo_step(
                 attention_mask,
                 prompt_len,
                 model_kwargs=completion_model_kwargs,
+                logprob_vocab_chunk_size=logprob_vocab_chunk_size,
             )
 
         if beta != 0.0:
