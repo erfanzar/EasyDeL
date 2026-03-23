@@ -161,3 +161,51 @@ def test_save_model_files_normalizes_numpy_arrays_before_checkpoint_write(tmp_pa
 
     assert len(saved_trees) == 1
     assert isinstance(saved_trees[0]["weight"], jax.Array)
+
+
+def test_save_model_files_offloads_numpy_arrays_to_cpu_before_checkpoint_write(tmp_path, monkeypatch):
+    saved_trees: list[dict[str, object]] = []
+    device_put_calls: list[tuple[object, object]] = []
+    info_calls: list[tuple[object, ...]] = []
+
+    class _NumpyStateStub:
+        def to_pure_dict(self):
+            return {"layer": {"weight": np.ones((2, 2), dtype=np.float32)}}
+
+    class _CheckpointerStub:
+        def __init__(self, **kwargs):
+            pass
+
+        def save_pytree(self, *, tree, prefix, mesh, dtype):
+            saved_trees.append(tree)
+            return str(tmp_path / f"{prefix}.ckpt")
+
+    cpu_device = object()
+
+    def _fake_device_put(value, device):
+        device_put_calls.append((value, device))
+        return jnp.asarray(value)
+
+    monkeypatch.setattr("easydel.infra.mixins.bridge.nn.split", lambda *args, **kwargs: (None, _NumpyStateStub()))
+    monkeypatch.setattr("easydel.infra.mixins.bridge.Checkpointer", _CheckpointerStub)
+    monkeypatch.setattr(
+        "easydel.infra.mixins.bridge.jax.devices",
+        lambda platform=None: [cpu_device] if platform == "cpu" else [],
+    )
+    monkeypatch.setattr("easydel.infra.mixins.bridge.jax.device_put", _fake_device_put)
+    monkeypatch.setattr("easydel.infra.mixins.bridge.logger.info", lambda *args, **kwargs: info_calls.append(args))
+
+    EasyBridgeMixin._save_model_files(
+        _BridgeModelStub(),
+        save_directory=tmp_path,
+        gather_fns={},
+        float_dtype=None,
+        step=None,
+    )
+
+    assert len(saved_trees) == 1
+    assert isinstance(saved_trees[0]["layer"]["weight"], jax.Array)
+    assert len(device_put_calls) == 1
+    assert isinstance(device_put_calls[0][0], np.ndarray)
+    assert device_put_calls[0][1] is cpu_device
+    assert any("layer.weight" in str(call) for call in info_calls)
