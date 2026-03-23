@@ -339,6 +339,7 @@ class CompletionOutput:
     finish_reason: str | None = None
     tool_calls: list | None = None
     reasoning_content: str | None = None
+    raw_text: str | None = None
 
 
 @dataclass
@@ -376,6 +377,8 @@ class RequestOutput:
 
     accumulated_text: str = ""  # full text so far
     delta_text: str = ""  # only the latest decoded chunk
+    raw_accumulated_text: str = ""  # decoded text before reasoning/tool separation
+    raw_delta_text: str = ""  # latest raw decoded chunk before separation
     tokens_per_second: float = 0.0
     num_generated_tokens: int = 0
     time_spent_generating: float = 0.0

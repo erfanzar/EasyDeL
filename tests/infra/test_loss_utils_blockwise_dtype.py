@@ -26,6 +26,7 @@ from easydel.infra.loss_utils import (
     LossConfig,
     LossForwardPlan,
     LossMetrics,
+    _resolve_module_vocab_size,
     causal_lm_loss_chunked_lm_head,
     cross_entropy_blockwise_logits,
     fixed_cross_entropy,
@@ -75,6 +76,32 @@ class _ConfiguredChunkedCausalLMModule:
         lmhead_chunksize = 3
 
     config = _Config()
+
+    @staticmethod
+    def compute_lm_logits(hidden_states):
+        return hidden_states
+
+    def __call__(self, input_ids=None, apply_lm_head=True):
+        del input_ids, apply_lm_head
+        return None
+
+
+class _TextConfigOnlyConfig:
+    partition_axis = None
+    lmhead_chunksize = 3
+
+    def __init__(self):
+        self.text_config = types.SimpleNamespace(vocab_size=12345)
+
+    def get_text_config(self, decoder: bool = True):
+        del decoder
+        return self.text_config
+
+
+class _TextConfigOnlyChunkedCausalLMModule:
+    def __init__(self):
+        self.config = _TextConfigOnlyConfig()
+        self.vocab_size = 12345
 
     @staticmethod
     def compute_lm_logits(hidden_states):
@@ -549,6 +576,26 @@ def test_causal_lm_loss_strategy_skips_modules_without_apply_lm_head_forward_fla
     )
 
     assert plan.forward_kwargs == {}
+
+
+def test_resolve_module_vocab_size_falls_back_to_text_config():
+    module = _TextConfigOnlyChunkedCausalLMModule()
+
+    assert _resolve_module_vocab_size(module) == 12345
+
+
+def test_causal_lm_loss_strategy_supports_text_config_only_vocab_size():
+    strategy = resolve_loss_strategy(ForCausalLMLoss)
+    labels = jnp.ones((2, 8193), dtype=jnp.int32)
+    plan = strategy.plan_forward(
+        module=_TextConfigOnlyChunkedCausalLMModule(),
+        labels=labels,
+        loss_config=LossConfig(chunk_block_size=4096),
+        batch={},
+        loss_kwargs={},
+    )
+
+    assert plan.forward_kwargs == {"apply_lm_head": False}
 
 
 def test_resolve_loss_strategy_unwraps_wrapped_causal_lm_loss():

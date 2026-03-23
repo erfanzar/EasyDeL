@@ -303,6 +303,8 @@ class EngineRequestsMixin:
                 finished=False,
                 accumulated_text="",
                 delta_text="",
+                raw_accumulated_text="",
+                raw_delta_text="",
                 tokens_per_second=0.0,
                 num_generated_tokens=0,
                 time_spent_generating=0.0,

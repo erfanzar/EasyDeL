@@ -34,6 +34,7 @@ make eSurge reinitialize its KV cache ``N * max_steps`` times.
 
 from __future__ import annotations
 
+import json
 import math
 import typing as tp
 from dataclasses import dataclass, field
@@ -51,16 +52,96 @@ if tp.TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def _coerce_mapping_like(value: tp.Any) -> tp.Any:
+    """Coerce JSON-string payloads into mapping-like objects when possible."""
+
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
+    return value
+
+
+def _normalize_tool_call_payloads(tool_calls: tp.Any) -> list[dict[str, tp.Any]]:
+    """Normalize tool calls for HF/Jinja chat-template compatibility."""
+
+    if not isinstance(tool_calls, list):
+        return []
+
+    normalized_calls: list[dict[str, tp.Any]] = []
+    for raw_call in tool_calls:
+        if isinstance(raw_call, dict):
+            call = dict(raw_call)
+        elif hasattr(raw_call, "model_dump"):
+            try:
+                call = dict(raw_call.model_dump(exclude_none=True))
+            except Exception:
+                continue
+        else:
+            function_payload = getattr(raw_call, "function", None)
+            call = {}
+            call_id = getattr(raw_call, "id", None)
+            call_type = getattr(raw_call, "type", None)
+            if call_id is not None:
+                call["id"] = call_id
+            if call_type is not None:
+                call["type"] = call_type
+            if function_payload is not None:
+                if hasattr(function_payload, "model_dump"):
+                    try:
+                        call["function"] = dict(function_payload.model_dump(exclude_none=True))
+                    except Exception:
+                        pass
+                else:
+                    function_dict: dict[str, tp.Any] = {}
+                    function_name = getattr(function_payload, "name", None)
+                    function_arguments = getattr(function_payload, "arguments", None)
+                    if function_name is not None:
+                        function_dict["name"] = function_name
+                    if function_arguments is not None:
+                        function_dict["arguments"] = function_arguments
+                    if function_dict:
+                        call["function"] = function_dict
+            if not call:
+                continue
+
+        function_payload = call.get("function")
+        if isinstance(function_payload, dict):
+            function_dict = dict(function_payload)
+            arguments = _coerce_mapping_like(function_dict.get("arguments"))
+            if arguments is None:
+                arguments = {}
+            if not isinstance(arguments, dict):
+                arguments = {"value": str(arguments)}
+            function_dict["arguments"] = arguments
+            call["function"] = function_dict
+        elif isinstance(function_payload, str):
+            coerced = _coerce_mapping_like(function_payload)
+            if isinstance(coerced, dict):
+                call["function"] = coerced
+
+        normalized_calls.append(call)
+
+    return normalized_calls
+
+
 @dataclass
 class TurnRecord:
     """Record of a single interaction turn.
 
     Attributes:
         role: Message role ("user", "assistant", "tool", "system").
-        content: Text content of the turn.
+        content: Canonical conversation content stored in the trajectory.
+            For assistant turns this is the raw model output so future prompts
+            and training masks reflect the actual generated tokens.
         token_ids: Token IDs for this turn's content.
         is_response: Whether this turn is a model response (trained on).
         reward: Step reward received after this turn (if any).
+        visible_content: Parsed visible assistant content, if available.
+        raw_content: Raw unsplit assistant content, if available.
+        reasoning: Parsed reasoning content, if available.
+        tool_calls: Parsed tool calls, if available.
     """
 
     role: str
@@ -68,6 +149,29 @@ class TurnRecord:
     token_ids: np.ndarray | None = None
     is_response: bool = False
     reward: float = 0.0
+    visible_content: str | None = None
+    raw_content: str | None = None
+    reasoning: str | None = None
+    tool_calls: tp.Any | None = None
+
+
+def turn_record_to_message(turn: TurnRecord) -> dict[str, tp.Any]:
+    """Convert a stored turn into a chat-template message payload.
+
+    Assistant tool calls may be tracked separately from ``content`` when the
+    generation backend emits structured tool-call metadata instead of raw text
+    markup. In that case, rebuild the message from visible assistant content
+    plus ``tool_calls`` so downstream chat templates can serialize the call
+    instead of silently dropping it.
+    """
+
+    message: dict[str, tp.Any] = {"role": turn.role, "content": turn.content}
+    if turn.role == "assistant" and turn.tool_calls not in (None, []):
+        normalized_tool_calls = _normalize_tool_call_payloads(turn.tool_calls)
+        if normalized_tool_calls:
+            message["content"] = turn.visible_content if turn.visible_content is not None else turn.content
+            message["tool_calls"] = normalized_tool_calls
+    return message
 
 
 @dataclass
@@ -238,7 +342,7 @@ class RolloutManager:
             prompts = []
             for idx in active_indices:
                 ep = episodes[idx]
-                messages = [{"role": t.role, "content": t.content} for t in ep.turns]
+                messages = [turn_record_to_message(t) for t in ep.turns]
                 prompt_text = self.tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
@@ -248,23 +352,50 @@ class RolloutManager:
                 prompts.append(prompt_text)
 
             responses = generate_fn(prompts, num_return_sequences=1)
+            generation_metadata = getattr(generate_fn, "last_generation_metadata", None)
+            if not isinstance(generation_metadata, list):
+                generation_metadata = [{} for _ in responses]
+            elif len(generation_metadata) < len(responses):
+                generation_metadata = generation_metadata + [
+                    {} for _ in range(len(responses) - len(generation_metadata))
+                ]
 
             next_active: list[int] = []
             pending_verify: list[tuple[int, str]] = []
 
             for i, idx in enumerate(active_indices):
                 ep = episodes[idx]
-                response_text = responses[i]
+                action_text = responses[i]
+                metadata = generation_metadata[i] if i < len(generation_metadata) else {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                raw_text = metadata.get("raw_text")
+                if not isinstance(raw_text, str):
+                    raw_text = action_text
+                visible_content = metadata.get("text")
+                if not isinstance(visible_content, str):
+                    visible_content = action_text
+                reasoning = metadata.get("reasoning")
+                if not isinstance(reasoning, str):
+                    reasoning = None
+                tool_calls = metadata.get("tool_calls")
 
                 ep.turns.append(
                     TurnRecord(
                         role="assistant",
-                        content=response_text,
+                        content=raw_text,
                         is_response=True,
+                        visible_content=visible_content,
+                        raw_content=raw_text,
+                        reasoning=reasoning,
+                        tool_calls=tool_calls,
                     )
                 )
 
-                step_result = ep.env.step(response_text)
+                if isinstance(ep.env, ToolEnvWrapper):
+                    step_result = ep.env.step_with_tool_calls(action_text, tool_calls=tool_calls)
+                else:
+                    step_result = ep.env.step(action_text)
                 is_deferred = math.isnan(step_result.reward)
                 ep.step_rewards.append(0.0 if is_deferred else step_result.reward)
                 if not is_deferred:

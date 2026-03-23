@@ -17,6 +17,7 @@ import collections.abc
 import copy
 import gc
 import itertools
+import json
 import operator
 import os
 import pprint
@@ -78,6 +79,7 @@ from .training_configurations import MetricsType, TrainingArguments
 from .training_utils import (
     GENERATION_MODEL_INPUT_KEYS,
     compact_generation_model_kwargs,
+    filter_kwargs_for_callable,
     normalize_generation_model_kwargs,
     prepare_generation_model_kwargs_for_call,
     resolve_total_steps,
@@ -112,6 +114,11 @@ class GenerationResults(NamedTuple):
         sequences: Complete generated sequences including prompt (batch_size, max_seq_len + max_new_tokens)
         completion_ids: Token IDs for only the generated completions (batch_size, max_new_tokens) - right-padded
         completion_mask: Attention mask for completions (batch_size, max_new_tokens)
+        text: Parsed visible completion text aligned with generated completions.
+        reasoning: Parsed reasoning text aligned with generated completions.
+        tool_calls: Parsed tool call payloads aligned with generated completions.
+        raw_text: Raw unsplit completion text aligned with generated completions,
+            before reasoning/tool separation and without special-token stripping.
         completion_prompts: Optional prompt objects (text or chat dicts) aligned one-to-one with completions.
     """
 
@@ -123,6 +130,10 @@ class GenerationResults(NamedTuple):
     completion_mask: jax.Array
     decoded_prompts: str | list[str]
     completion_prompts: list[str | list[dict[str, str]]] | None = None
+    text: str | list[str] | None = None
+    reasoning: list[str | None] | None = None
+    tool_calls: list[list | None] | None = None
+    raw_text: str | list[str] | None = None
 
 
 class BaseTrainer(BaseTrainerProtocol):
@@ -159,7 +170,12 @@ class BaseTrainer(BaseTrainerProtocol):
     _train_source: ShardedDataSource | None
     _eval_source: ShardedDataSource | None
     _RUNTIME_MODEL_OVERRIDE_STATE_ATTRS: tp.ClassVar[frozenset[str]] = frozenset(
-        {"model_state", "reference_state", "ref_state", "teacher_state"}
+        {
+            "model_state",
+            "reference_state",
+            "ref_state",
+            "teacher_state",
+        }
     )
 
     def __setattr__(self, name: str, value: tp.Any) -> None:
@@ -872,6 +888,192 @@ class BaseTrainer(BaseTrainerProtocol):
                     seq = seq[seq != pad_token_id]
             prompts.append(processor.decode(seq, skip_special_tokens=skip_special_tokens))
         return prompts
+
+    @staticmethod
+    def _coerce_generation_texts(
+        values: str | collections.abc.Sequence[tp.Any] | None,
+        *,
+        fallback: str | collections.abc.Sequence[tp.Any] | None = None,
+    ) -> list[str]:
+        """Normalize generation text outputs into a list of strings."""
+        source = values if values is not None else fallback
+        if source is None:
+            return []
+        if isinstance(source, str):
+            return [source]
+        if isinstance(source, collections.abc.Sequence):
+            return [item if isinstance(item, str) else str(item) for item in source]
+        return [str(source)]
+
+    @staticmethod
+    def _coerce_optional_generation_texts(
+        values: str | collections.abc.Sequence[tp.Any] | None,
+        *,
+        target_len: int,
+    ) -> list[str | None]:
+        """Normalize optional generation text metadata to a fixed-length list."""
+        if values is None:
+            return [None] * target_len
+        if isinstance(values, str):
+            normalized: list[str | None] = [values]
+        elif isinstance(values, collections.abc.Sequence):
+            normalized = [item if isinstance(item, str) else (None if item is None else str(item)) for item in values]
+        else:
+            normalized = [str(values)]
+        if len(normalized) < target_len:
+            normalized.extend([None] * (target_len - len(normalized)))
+        return normalized[:target_len]
+
+    @staticmethod
+    def _coerce_generation_metadata_list(
+        values: collections.abc.Sequence[tp.Any] | tp.Any | None,
+        *,
+        target_len: int,
+    ) -> list[tp.Any | None]:
+        """Normalize non-text generation metadata to a fixed-length list."""
+        if values is None:
+            return [None] * target_len
+        if isinstance(values, collections.abc.Sequence) and not isinstance(values, (str, bytes)):
+            normalized = list(values)
+        else:
+            normalized = [values]
+        if len(normalized) < target_len:
+            normalized.extend([None] * (target_len - len(normalized)))
+        return normalized[:target_len]
+
+    @staticmethod
+    def _coerce_mapping_like(value: tp.Any) -> tp.Any:
+        """Coerce JSON-string payloads into mapping-like objects when possible."""
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception:
+                return value
+        return value
+
+    @classmethod
+    def _normalize_tool_call_payloads(cls, tool_calls: tp.Any) -> list[dict[str, tp.Any]]:
+        """Normalize structured tool-call payloads for chat-template rendering."""
+        if not isinstance(tool_calls, collections.abc.Sequence) or isinstance(tool_calls, (str, bytes)):
+            return []
+
+        normalized_calls: list[dict[str, tp.Any]] = []
+        for raw_call in tool_calls:
+            if isinstance(raw_call, dict):
+                call = dict(raw_call)
+            elif hasattr(raw_call, "model_dump"):
+                try:
+                    call = dict(raw_call.model_dump(exclude_none=True))
+                except Exception:
+                    continue
+            else:
+                function_payload = getattr(raw_call, "function", None)
+                call = {}
+                call_id = getattr(raw_call, "id", None)
+                call_type = getattr(raw_call, "type", None)
+                if call_id is not None:
+                    call["id"] = call_id
+                if call_type is not None:
+                    call["type"] = call_type
+                if function_payload is not None:
+                    if hasattr(function_payload, "model_dump"):
+                        try:
+                            call["function"] = dict(function_payload.model_dump(exclude_none=True))
+                        except Exception:
+                            pass
+                    else:
+                        function_dict: dict[str, tp.Any] = {}
+                        function_name = getattr(function_payload, "name", None)
+                        function_arguments = getattr(function_payload, "arguments", None)
+                        if function_name is not None:
+                            function_dict["name"] = function_name
+                        if function_arguments is not None:
+                            function_dict["arguments"] = function_arguments
+                        if function_dict:
+                            call["function"] = function_dict
+                if not call:
+                    continue
+
+            function_payload = call.get("function")
+            if isinstance(function_payload, dict):
+                function_dict = dict(function_payload)
+                arguments = cls._coerce_mapping_like(function_dict.get("arguments"))
+                if arguments is None:
+                    arguments = {}
+                if not isinstance(arguments, dict):
+                    arguments = {"value": str(arguments)}
+                function_dict["arguments"] = arguments
+                call["function"] = function_dict
+            elif isinstance(function_payload, str):
+                coerced = cls._coerce_mapping_like(function_payload)
+                if isinstance(coerced, dict):
+                    call["function"] = coerced
+
+            normalized_calls.append(call)
+        return normalized_calls
+
+    def _build_structured_assistant_messages(
+        self,
+        contents: list[str],
+        *,
+        tool_calls: list[tp.Any | None] | None = None,
+    ) -> list[list[dict[str, tp.Any]]]:
+        """Build assistant message payloads with normalized tool calls when present."""
+        if tool_calls is None:
+            tool_call_records = [None] * len(contents)
+        else:
+            tool_call_records = self._coerce_generation_metadata_list(tool_calls, target_len=len(contents))
+
+        messages: list[list[dict[str, tp.Any]]] = []
+        for content, tool_call_payload in zip(contents, tool_call_records, strict=False):
+            message: dict[str, tp.Any] = {"role": "assistant", "content": content}
+            normalized_tool_calls = self._normalize_tool_call_payloads(tool_call_payload)
+            if normalized_tool_calls:
+                message["tool_calls"] = normalized_tool_calls
+            messages.append([message])
+        return messages
+
+    def _reward_chat_template_tools(self) -> list[dict[str, tp.Any]] | None:
+        """Resolve optional tool schemas for reward-side chat-template rendering."""
+        arguments = getattr(self, "arguments", None)
+        if arguments is None:
+            return None
+        tool_schemas = getattr(arguments, "tool_schemas", None)
+        return tool_schemas if isinstance(tool_schemas, list) else None
+
+    def _build_reward_call_kwargs(
+        self,
+        reward_func: tp.Callable[..., tp.Any],
+        *,
+        prompts: tp.Any,
+        completions: tp.Any,
+        max_length: int,
+        raw_completions: tp.Any | None = None,
+        prompt_texts: list[str] | None = None,
+        completion_texts: list[str] | None = None,
+        raw_text: list[str] | None = None,
+        reasoning: list[str | None] | None = None,
+        tool_calls: list[tp.Any | None] | None = None,
+        batch: dict[str, tp.Any] | None = None,
+        **extra_kwargs: tp.Any,
+    ) -> dict[str, tp.Any]:
+        """Build filtered kwargs for callable reward functions."""
+        return filter_kwargs_for_callable(
+            reward_func,
+            {
+                "prompts": prompts,
+                "completions": completions,
+                "raw_completions": raw_completions,
+                "prompt_texts": prompt_texts,
+                "completion_texts": completion_texts,
+                "raw_text": raw_text,
+                "reasoning": reasoning,
+                "tool_calls": tool_calls,
+                "max_length": max_length,
+                "batch": batch,
+                **extra_kwargs,
+            },
+        )
 
     @staticmethod
     def _sanitize_text_prompt(prompt: str, processor: PreTrainedTokenizerBase | None) -> str:
@@ -2245,6 +2447,9 @@ class BaseTrainer(BaseTrainerProtocol):
             completion_id_rows: list[list[int]] = []
             completion_mask_rows: list[list[int]] = []
             output_records: list[str] = []
+            reasoning_records: list[str | None] = []
+            tool_call_records: list[list | None] = []
+            raw_output_records: list[str] = []
             completion_prompts: list[str | list[dict[str, str]]] = []
             prompt_indices: list[int | None] = []
 
@@ -2308,7 +2513,29 @@ class BaseTrainer(BaseTrainerProtocol):
                     completion_prompts.append(source_prompt)
                     prompt_indices.append(mapped_prompt_idx)
                     # Add prompt arrays
-                    output_records.append(output.accumulated_text)
+                    completion_text = getattr(completion, "text", None)
+                    if not isinstance(completion_text, str) or completion_text == "":
+                        output_get_text = getattr(output, "get_text", None)
+                        output_fallback_text = output_get_text() if callable(output_get_text) else ""
+                        completion_text = getattr(output, "accumulated_text", "") or output_fallback_text
+                    output_records.append(completion_text)
+
+                    completion_reasoning = getattr(completion, "reasoning_content", None)
+                    reasoning_records.append(completion_reasoning if isinstance(completion_reasoning, str) else None)
+
+                    completion_tool_calls = getattr(completion, "tool_calls", None)
+                    tool_call_records.append(completion_tool_calls if completion_tool_calls is not None else None)
+
+                    completion_raw_text = getattr(completion, "raw_text", None)
+                    if not isinstance(completion_raw_text, str) or completion_raw_text == "":
+                        output_get_text = getattr(output, "get_text", None)
+                        output_fallback_text = output_get_text() if callable(output_get_text) else ""
+                        completion_raw_text = (
+                            getattr(output, "raw_accumulated_text", "")
+                            or getattr(output, "accumulated_text", "")
+                            or output_fallback_text
+                        )
+                    raw_output_records.append(completion_raw_text)
 
                     # Extract completion tokens
                     completion_tokens: list[int] = []
@@ -2353,6 +2580,9 @@ class BaseTrainer(BaseTrainerProtocol):
                 completion_mask_rows = [completion_mask_rows[i] for i in new_order]
                 completion_prompts = [completion_prompts[i] for i in new_order]
                 output_records = [output_records[i] for i in new_order]
+                reasoning_records = [reasoning_records[i] for i in new_order]
+                tool_call_records = [tool_call_records[i] for i in new_order]
+                raw_output_records = [raw_output_records[i] for i in new_order]
                 sequence_rows = [sequence_rows[i] for i in new_order]
 
             # Use original prompt ids/masks (not per-completion duplicates); repeat only if needed to align shapes.
@@ -2383,6 +2613,10 @@ class BaseTrainer(BaseTrainerProtocol):
                     completion_mask=completion_mask,
                     decoded_prompts=return_prompts,
                     completion_prompts=completion_prompts,
+                    text=output_records,
+                    reasoning=reasoning_records,
+                    tool_calls=tool_call_records,
+                    raw_text=raw_output_records,
                 ),
                 state=state,
                 release_runtime_after_generation=release_runtime_after_generation,
@@ -2488,15 +2722,31 @@ class BaseTrainer(BaseTrainerProtocol):
                 )
             completion_prompts = completion_prompts[: completion_ids.shape[0]]
 
+            generated_texts = self._decode_prompt_batch(
+                processor,
+                sequences,
+                skip_special_tokens=True,
+                pad_token_id=pad_token_id,
+                pop_pad_tokens=True,
+            )
+            completion_texts = self._decode_prompt_batch(
+                processor,
+                completion_ids,
+                skip_special_tokens=True,
+                pad_token_id=pad_token_id,
+                pop_pad_tokens=True,
+            )
+            raw_completion_texts = self._decode_prompt_batch(
+                processor,
+                completion_ids,
+                skip_special_tokens=False,
+                pad_token_id=pad_token_id,
+                pop_pad_tokens=True,
+            )
+
             return self.maybe_release_generation_runtime(
                 GenerationResults(
-                    generation_results=self._decode_prompt_batch(
-                        processor,
-                        sequences,
-                        skip_special_tokens=True,
-                        pad_token_id=pad_token_id,
-                        pop_pad_tokens=True,
-                    ),
+                    generation_results=generated_texts,
                     prompt_ids=prompt_ids,
                     prompt_mask=prompt_mask,
                     sequences=sequences,
@@ -2504,6 +2754,10 @@ class BaseTrainer(BaseTrainerProtocol):
                     completion_mask=completion_mask,
                     decoded_prompts=decoded_prompt_texts,
                     completion_prompts=completion_prompts or None,
+                    text=completion_texts,
+                    reasoning=[None] * len(completion_texts),
+                    tool_calls=[None] * len(completion_texts),
+                    raw_text=raw_completion_texts,
                 ),
                 state=state,
                 release_runtime_after_generation=release_runtime_after_generation,
@@ -2612,7 +2866,12 @@ class BaseTrainer(BaseTrainerProtocol):
             prompts.append(sample)
         return prompts
 
-    def _prepare_generation_input(self, prompt: tp.Any) -> dict[str, tp.Any] | None:
+    def _prepare_generation_input(
+        self,
+        prompt: tp.Any,
+        *,
+        tools: tp.Any | None = None,
+    ) -> dict[str, tp.Any] | None:
         """Tokenize and pad a single prompt into model-ready input arrays.
 
         Handles raw strings, chat-format message lists, and dict samples that
@@ -2642,7 +2901,18 @@ class BaseTrainer(BaseTrainerProtocol):
             padding_side="left",
             add_generation_prompt=True,
         )
+
+        def _apply_chat_template(messages: list[dict[str, tp.Any]], **kwargs) -> tp.Any:
+            if tools is not None:
+                try:
+                    return processor.apply_chat_template(messages, tools=tools, **kwargs)
+                except TypeError as exc:
+                    if "tools" not in str(exc):
+                        raise
+            return processor.apply_chat_template(messages, **kwargs)
+
         if isinstance(prompt, dict):
+            sample_tools = tools if tools is not None else prompt.get("tools")
             if "input_ids" in prompt:
                 input_ids = prompt["input_ids"]
                 attention = prompt.get("attention_mask")
@@ -2650,10 +2920,10 @@ class BaseTrainer(BaseTrainerProtocol):
             else:
                 field = getattr(self.arguments, "generation_dataset_prompt_field", None)
                 if field and field in prompt:
-                    return self._prepare_generation_input(prompt[field])
+                    return self._prepare_generation_input(prompt[field], tools=sample_tools)
                 for key in ("prompt", "text"):
                     if key in prompt:
-                        return self._prepare_generation_input(prompt[key])
+                        return self._prepare_generation_input(prompt[key], tools=sample_tools)
                 log_debug_maybe("Dataset sample missing `input_ids`/`prompt` keys for preview generation; skipping")
                 return None
         elif isinstance(prompt, list):
@@ -2666,9 +2936,9 @@ class BaseTrainer(BaseTrainerProtocol):
 
             try:
                 processor.padding_side = "left"
-                encoded = processor.apply_chat_template(prompt, **encode_kwargs)
+                encoded = _apply_chat_template(prompt, **encode_kwargs)
                 try:
-                    prompt_text = processor.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+                    prompt_text = _apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
                 except Exception:  # pragma: no cover - best effort prompt display
                     prompt_text = str(prompt)
             except Exception as exc:  # pragma: no cover - tokenizer issues
@@ -2684,7 +2954,13 @@ class BaseTrainer(BaseTrainerProtocol):
 
             try:
                 processor.padding_side = "left"
-                encoded = processor.apply_chat_template([{"role": "user", "content": prompt}], **encode_kwargs)
+                messages = [{"role": "user", "content": prompt}]
+                encoded = _apply_chat_template(messages, **encode_kwargs)
+                if tools is not None:
+                    try:
+                        prompt_text = _apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                    except Exception:  # pragma: no cover - best effort prompt display
+                        prompt_text = prompt
             except Exception as exc:  # pragma: no cover - tokenizer issues
                 log_debug_maybe(f"Failed to tokenize generation prompt: {exc}")
                 return None
@@ -2748,6 +3024,30 @@ class BaseTrainer(BaseTrainerProtocol):
             return
 
         results: list[dict[str, tp.Any]] = []
+        no_reasoning_message = "No reasoning content ..."
+        no_tools_message = "No tools were called ..."
+
+        def _preview_reasoning_entries(
+            values: str | collections.abc.Sequence[tp.Any] | None,
+            *,
+            target_len: int,
+        ) -> list[str]:
+            normalized = self._coerce_optional_generation_texts(values, target_len=target_len)
+            return [value if value not in (None, "") else no_reasoning_message for value in normalized]
+
+        def _preview_tool_call_entries(
+            values: collections.abc.Sequence[tp.Any] | tp.Any | None,
+            *,
+            target_len: int,
+        ) -> list[str]:
+            normalized = self._coerce_generation_metadata_list(values, target_len=target_len)
+            entries: list[str] = []
+            for value in normalized:
+                if value in (None, "", []):
+                    entries.append(no_tools_message)
+                else:
+                    entries.append(pprint.pformat(value, compact=True))
+            return entries
 
         def _finalize_preview_results(records: list[dict[str, tp.Any]]) -> None:
             """Log and store completed preview generation results.
@@ -2772,18 +3072,35 @@ class BaseTrainer(BaseTrainerProtocol):
             if wandb is not None and args.use_wandb and args.can_log_metrics and args.generation_log_to_wandb:
                 if self.preview_log_table is None:
                     self.preview_log_table = wandb.Table(
-                        columns=["step", "prompt", "completion_id", "completion"],
+                        columns=["step", "prompt", "completion_id", "completion", "reasoning", "tool_calls"],
                         log_mode="INCREMENTAL",
                     )
                 for record in records:
                     prompt_repr = record["prompt"] if record["prompt"] is not None else "<prompt tokens>"
+                    reasoning = record.get("reasoning", [])
+                    tool_calls = record.get("tool_calls", [])
                     for idx, completion in enumerate(record["completions"]):
-                        self.preview_log_table.add_data(step, prompt_repr, idx, completion)
+                        reasoning_entry = reasoning[idx] if idx < len(reasoning) else no_reasoning_message
+                        tool_calls_entry = tool_calls[idx] if idx < len(tool_calls) else no_tools_message
+                        self.preview_log_table.add_data(
+                            step,
+                            prompt_repr,
+                            idx,
+                            completion,
+                            reasoning_entry,
+                            tool_calls_entry,
+                        )
                 wandb.log({"preview_generations": self.preview_log_table}, step=step)
             if args.generation_preview_print:
                 logger.info(f"[preview step {step}] prompt: {prompt_repr}")
+                reasoning = record.get("reasoning", [])
+                tool_calls = record.get("tool_calls", [])
                 for idx, completion in enumerate(record["completions"]):
+                    reasoning_entry = reasoning[idx] if idx < len(reasoning) else no_reasoning_message
+                    tool_calls_entry = tool_calls[idx] if idx < len(tool_calls) else no_tools_message
                     logger.info(f"  completion[{idx}]: {completion}")
+                    logger.info(f"  reasoning[{idx}]: {reasoning_entry}")
+                    logger.info(f"  tool_calls[{idx}]: {tool_calls_entry}")
 
         prepared_prompts: list[dict[str, tp.Any]] = []
         for prompt in prompts:
@@ -2888,13 +3205,18 @@ class BaseTrainer(BaseTrainerProtocol):
                     log_debug_maybe(f"Preview generation failed for one prompt: {single_exc}")
                     continue
 
-                single_completions_text = single_results.generation_results
-                if isinstance(single_completions_text, str):
-                    single_completions = [single_completions_text]
-                elif isinstance(single_completions_text, collections.abc.Sequence):
-                    single_completions = list(single_completions_text)
-                else:
-                    single_completions = [str(single_completions_text)]
+                single_completions = self._coerce_generation_texts(
+                    single_results.text,
+                    fallback=single_results.generation_results,
+                )
+                single_reasoning = _preview_reasoning_entries(
+                    single_results.reasoning,
+                    target_len=len(single_completions),
+                )
+                single_tool_calls = _preview_tool_call_entries(
+                    single_results.tool_calls,
+                    target_len=len(single_completions),
+                )
 
                 prompt_text = prepared.get("prompt_text")
                 if prompt_text is None:
@@ -2902,18 +3224,28 @@ class BaseTrainer(BaseTrainerProtocol):
                     if decoded:
                         prompt_text = decoded[0]
 
-                results.append({"prompt": prompt_text, "completions": single_completions, "step": step})
+                results.append(
+                    {
+                        "prompt": prompt_text,
+                        "completions": single_completions,
+                        "reasoning": single_reasoning,
+                        "tool_calls": single_tool_calls,
+                        "step": step,
+                    }
+                )
 
             _finalize_preview_results(results)
             return
 
-        completions_text = gen_results.generation_results
-        if isinstance(completions_text, str):
-            all_completions = [completions_text]
-        elif isinstance(completions_text, collections.abc.Sequence):
-            all_completions = list(completions_text)
-        else:
-            all_completions = [str(completions_text)]
+        all_completions = self._coerce_generation_texts(gen_results.text, fallback=gen_results.generation_results)
+        all_reasoning = _preview_reasoning_entries(
+            gen_results.reasoning,
+            target_len=len(all_completions),
+        )
+        all_tool_calls = _preview_tool_call_entries(
+            gen_results.tool_calls,
+            target_len=len(all_completions),
+        )
 
         num_return_sequences = max(int(args.generation_num_return_sequences or 1), 1)
         expected_total = sum(count * num_return_sequences for count in prompt_row_counts)
@@ -2935,8 +3267,18 @@ class BaseTrainer(BaseTrainerProtocol):
 
             completion_count = rows * num_return_sequences
             completions = all_completions[completion_cursor : completion_cursor + completion_count]
+            reasoning = all_reasoning[completion_cursor : completion_cursor + completion_count]
+            tool_calls = all_tool_calls[completion_cursor : completion_cursor + completion_count]
             completion_cursor += completion_count
-            results.append({"prompt": prompt_text, "completions": completions, "step": step})
+            results.append(
+                {
+                    "prompt": prompt_text,
+                    "completions": completions,
+                    "reasoning": reasoning,
+                    "tool_calls": tool_calls,
+                    "step": step,
+                }
+            )
 
         _finalize_preview_results(results)
 

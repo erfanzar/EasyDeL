@@ -59,6 +59,9 @@ class SeqKDTrainer(Trainer):
            generates completions via ``generate_unified``.
         2. **External teacher function** (``teacher_fn``): A callable
            ``(prompts: list[str]) -> list[str]`` for API-based teachers.
+           When ``num_generations_per_prompt > 1``, prompts are repeated in
+           prompt-major order and the callable must return one completion per
+           repeated prompt.
 
     Training loop:
         1. Sample prompts from the dataset
@@ -188,8 +191,9 @@ class SeqKDTrainer(Trainer):
     ) -> tuple[dict[str, tp.Any], dict[str, float | int | str]]:
         """Generate completions from teacher and prepare a CE training batch.
 
-        If ``teacher_fn`` is set, prompts are decoded to text, passed to the
-        callable, and the returned completions are re-tokenized.  Otherwise
+        If ``teacher_fn`` is set, prompts are decoded to text, optionally
+        repeated per prompt when ``num_generations_per_prompt > 1``, passed to
+        the callable, and the returned completions are re-tokenized.  Otherwise
         ``generate_unified`` is called on the local teacher model.
         """
         batch = self._purify_batch(batch)
@@ -204,8 +208,23 @@ class SeqKDTrainer(Trainer):
                         prompt_ids,
                         skip_special_tokens=True,
                     )
-                    completion_texts = self.teacher_fn(prompt_texts)
-
+                    generation_factor = int(
+                        getattr(self.arguments, "generation_num_return_sequences", None)
+                        or getattr(self.arguments, "num_generations_per_prompt", 1)
+                        or 1
+                    )
+                    generation_factor = max(generation_factor, 1)
+                    expanded_prompt_texts = [
+                        prompt_text for prompt_text in prompt_texts for _ in range(generation_factor)
+                    ]
+                    completion_texts = list(self.teacher_fn(expanded_prompt_texts))
+                    if len(completion_texts) != len(expanded_prompt_texts):
+                        raise ValueError(
+                            "`teacher_fn` must return exactly one completion per prompt. "
+                            f"Expected {len(expanded_prompt_texts)} completions for "
+                            f"{len(prompt_texts)} prompts with generation_factor={generation_factor}, "
+                            f"but got {len(completion_texts)}."
+                        )
                     encoded = self.processing_class(
                         completion_texts,
                         padding="max_length",

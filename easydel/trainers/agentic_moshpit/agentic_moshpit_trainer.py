@@ -54,12 +54,13 @@ except ImportError:
     wandb = None
 
 from ..group_relative_policy_optimization.grpo_trainer import GRPOTrainer
+from ..prompt_utils import apply_chat_template
 from ..training_utils import (
     normalize_generation_model_kwargs,
     slice_prompt_aligned_model_kwargs,
 )
 from .agentic_moshpit_config import AgenticMoshPitConfig
-from .env_manager import RolloutManager
+from .env_manager import RolloutManager, turn_record_to_message
 from .environment import AgenticEnvironment, ToolEnvWrapper, create_tool_call_parser
 from .self_play import LocalQuestionGenerator, SelfPlayEnvironment
 from .tools import Tool, make_tool
@@ -305,16 +306,187 @@ class AgenticMoshPitTrainer(GRPOTrainer):
                 config_overrides=overrides or None,
             )
 
-            if isinstance(results.generation_results, list):
-                texts = results.generation_results
-            else:
-                texts = [results.generation_results]
-
+            raw_texts = self._coerce_generation_texts(
+                results.raw_text,
+                fallback=results.text,
+            )
+            if not raw_texts:
+                raw_texts = self._coerce_generation_texts(results.generation_results)
+            visible_texts = self._coerce_generation_texts(
+                results.text,
+                fallback=raw_texts,
+            )
+            action_texts = list(visible_texts)
             if strip_thinking:
-                texts = [self._strip_thinking(t) for t in texts]
-            return texts
+                action_texts = [self._strip_thinking(text) for text in action_texts]
+            reasoning_records = self._coerce_optional_generation_texts(results.reasoning, target_len=len(action_texts))
+            tool_call_records = self._coerce_generation_metadata_list(results.tool_calls, target_len=len(action_texts))
+            generate_fn.last_generation_metadata = [
+                {
+                    "text": action_texts[i],
+                    "raw_text": raw_texts[i],
+                    "reasoning": reasoning_records[i],
+                    "tool_calls": tool_call_records[i],
+                }
+                for i in range(len(action_texts))
+            ]
+            return action_texts
 
         return generate_fn
+
+    @staticmethod
+    def _is_env_reward_placeholder(reward_func: tp.Any) -> bool:
+        return getattr(reward_func, "__name__", None) == "_env_reward_placeholder"
+
+    def _score_auxiliary_rewards(
+        self,
+        trajectories: list,
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        active_reward_indices = [
+            idx for idx, reward_func in enumerate(self.reward_funcs) if not self._is_env_reward_placeholder(reward_func)
+        ]
+        if not active_reward_indices:
+            return np.zeros(len(trajectories), dtype=np.float32), {}
+
+        prompt_messages: list[list[dict[str, tp.Any]]] = []
+        prompt_texts: list[str] = []
+        completion_texts: list[str] = []
+        raw_texts: list[str] = []
+        reasoning_records: list[str | None] = []
+        tool_call_records: list[tp.Any | None] = []
+        completion_messages: list[dict[str, tp.Any]] = []
+
+        for traj in trajectories:
+            response_indices = [i for i, turn in enumerate(traj.turns) if turn.is_response]
+            if not response_indices:
+                prompt_messages.append([{"role": "user", "content": ""}])
+                prompt_texts.append("")
+                completion_texts.append("")
+                raw_texts.append("")
+                reasoning_records.append(None)
+                tool_call_records.append(None)
+                completion_messages.append({"role": "assistant", "content": ""})
+                continue
+
+            final_idx = response_indices[-1]
+            final_turn = traj.turns[final_idx]
+            prefix_messages = [turn_record_to_message(turn) for turn in traj.turns[:final_idx]]
+            prompt_messages.append(prefix_messages)
+            try:
+                prompt_texts.append(
+                    self.processing_class.apply_chat_template(
+                        prefix_messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        tools=self.arguments.tool_schemas,
+                    )
+                )
+            except Exception:
+                prompt_texts.append(str(prefix_messages))
+
+            raw_texts.append(final_turn.raw_content if final_turn.raw_content is not None else final_turn.content)
+            completion_texts.append(
+                final_turn.visible_content if final_turn.visible_content is not None else final_turn.content
+            )
+            reasoning_records.append(final_turn.reasoning)
+            tool_call_records.append(final_turn.tool_calls)
+            completion_messages.append(turn_record_to_message(final_turn))
+
+        completions = [[dict(message)] for message in completion_messages]
+        raw_completions = []
+        for message, raw_text in zip(completion_messages, raw_texts, strict=False):
+            raw_message = dict(message)
+            raw_message["content"] = raw_text
+            raw_completions.append([raw_message])
+
+        total_rewards = np.zeros(len(trajectories), dtype=np.float32)
+        reward_breakdown: dict[str, np.ndarray] = {}
+        reward_weights = np.asarray(jax.device_get(self.reward_weights), dtype=np.float32)
+
+        for idx in active_reward_indices:
+            reward_func = self.reward_funcs[idx]
+            reward_processing_class = self.reward_processing_classes[idx]
+            name = self.reward_func_names[idx]
+
+            if isinstance(reward_func, EasyDeLState):
+                messages = [{"messages": [*p, c]} for p, c in zip(prompt_messages, completion_messages, strict=False)]
+                texts = [
+                    apply_chat_template(
+                        x,
+                        reward_processing_class,
+                        tools=self._reward_chat_template_tools(),
+                    )["text"]
+                    for x in messages
+                ]
+                values = np.asarray(
+                    jax.device_get(
+                        reward_func.apply_fn(
+                            reward_func.graphdef,
+                            reward_func.graphstate,
+                            reward_func.graphother,
+                            dict(
+                                reward_processing_class(
+                                    texts,
+                                    return_tensors="np",
+                                    padding="max_length",
+                                    padding_side="right",
+                                    add_special_tokens=False,
+                                    truncation=True,
+                                    return_attention_mask=True,
+                                    max_length=self.arguments.max_length,
+                                )
+                            ),
+                        ).logits[:, 0]
+                    ),
+                    dtype=np.float32,
+                )
+            else:
+                reward_call_kwargs = self._build_reward_call_kwargs(
+                    reward_func,
+                    prompts=prompt_messages,
+                    completions=completions,
+                    raw_completions=raw_completions,
+                    prompt_texts=prompt_texts,
+                    completion_texts=completion_texts,
+                    raw_text=raw_texts,
+                    reasoning=reasoning_records,
+                    tool_calls=tool_call_records,
+                    max_length=self.arguments.max_length,
+                    trajectories=trajectories,
+                )
+                outputs = reward_func(**reward_call_kwargs)
+                values = np.asarray([val if val is not None else np.nan for val in outputs], dtype=np.float32)
+
+            reward_breakdown[name] = values
+            total_rewards = total_rewards + np.nan_to_num(values) * reward_weights[idx]
+
+        return total_rewards, reward_breakdown
+
+    def _apply_auxiliary_rewards_to_trajectories(
+        self,
+        trajectories: list,
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        aux_rewards, reward_breakdown = self._score_auxiliary_rewards(trajectories)
+        if not trajectories or not np.any(np.nan_to_num(aux_rewards)):
+            return aux_rewards, reward_breakdown
+
+        estimator = self.arguments.advantage_estimator
+        for idx, (traj, aux_reward) in enumerate(zip(trajectories, aux_rewards, strict=False)):
+            env_reward = float(traj.episode_reward)
+            aux_value = float(np.nan_to_num(aux_reward))
+            traj.info["env_reward"] = env_reward
+            traj.info["aux_reward"] = aux_value
+            for name, values in reward_breakdown.items():
+                traj.info[f"aux_reward/{name}"] = float(np.nan_to_num(values[idx]))
+            traj.episode_reward = env_reward + aux_value
+            traj.info["combined_reward"] = traj.episode_reward
+            if estimator in ("step_reinforce", "agentic_reinforce"):
+                if traj.step_rewards:
+                    traj.step_rewards[-1] += aux_value
+                else:
+                    traj.step_rewards.append(aux_value)
+
+        return aux_rewards, reward_breakdown
 
     def _wrap_env_with_tools(self, env: AgenticEnvironment) -> AgenticEnvironment:
         """Wrap environment with tool support if tools are configured."""
@@ -372,6 +544,7 @@ class AgenticMoshPitTrainer(GRPOTrainer):
                     base_seed=self._rollout_step * self.arguments.num_env_groups,
                     num_groups=self.arguments.num_env_groups,
                 )
+                aux_rewards, aux_reward_breakdown = self._apply_auxiliary_rewards_to_trajectories(trajectories)
                 self._rollout_step += 1
 
             rollout_time = rollout_time_fn()
@@ -492,6 +665,10 @@ class AgenticMoshPitTrainer(GRPOTrainer):
             "avg_episode_steps": avg_steps,
             "frac_reward_zero_std": float(jnp.mean(jnp.isclose(std_rewards, 0.0).astype(jnp.float32))),
         }
+        if aux_reward_breakdown:
+            metrics_dict["aux_reward_mean"] = float(np.nanmean(aux_rewards))
+            for name, values in aux_reward_breakdown.items():
+                metrics_dict[f"aux_reward/{name}"] = float(np.nanmean(values))
 
         self._log_trajectories_to_wandb(trajectories, state)
 
@@ -528,7 +705,18 @@ class AgenticMoshPitTrainer(GRPOTrainer):
         cur_step = int(jax.device_get(state.step))
         rows = []
         for i, traj in enumerate(trajectories):
-            turns = [{"role": t.role, "content": t.content} for t in traj.turns]
+            turns = []
+            for turn in traj.turns:
+                row = {"role": turn.role, "content": turn.content}
+                if turn.visible_content is not None:
+                    row["visible_content"] = turn.visible_content
+                if turn.raw_content is not None:
+                    row["raw_content"] = turn.raw_content
+                if turn.reasoning is not None:
+                    row["reasoning"] = turn.reasoning
+                if turn.tool_calls is not None:
+                    row["tool_calls"] = turn.tool_calls
+                turns.append(row)
             rows.append(
                 [
                     cur_step,

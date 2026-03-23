@@ -12,11 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import threading
+import time
+
+from easydel.inference.esurge.engine_types import EngineCoreOutput, EngineCoreOutputs
+from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
 from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
 from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
 from easydel.inference.esurge.request import EngineRequest, EngineRequestStatus
 from easydel.inference.esurge.scheduler.utils import check_stop
+from easydel.inference.reasoning.parsers import DeepSeekR1ReasoningParser
 from easydel.inference.sampling_params import SamplingParams
+from easydel.workers.esurge.pipeline import DetokenizerResult
 
 
 class _StopPolicyHarness(EngineParsingMixin, EngineUtilsMixin):
@@ -29,6 +36,65 @@ class _SamplingParamsHarness(EngineUtilsMixin):
         self._sampling_params_callback = callback
         self._generation_config_dict = generation_config or {}
         self._primary_eos_token_id = primary_eos_token_id
+
+
+class _DummyTokenizer:
+    def __init__(self):
+        self._vocab = {"<think>": 1, "</think>": 2}
+
+    def get_vocab(self):
+        return dict(self._vocab)
+
+    def encode(self, text: str, add_special_tokens: bool = False):
+        if text in self._vocab:
+            return [self._vocab[text]]
+        return [99]
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        reverse = {v: k for k, v in self._vocab.items()}
+        return "".join(reverse.get(i, "") for i in token_ids)
+
+
+class _DetokenizerStub:
+    def reset(self, request_id: str):
+        return None
+
+
+class _ProcessHarness(EngineParsingMixin, EngineUtilsMixin):
+    def __init__(self, decoded_text: str, delta_text: str):
+        self.decode_interval_tokens = 1
+        self.decode_interval_secs = 0.0
+        self._decoded_text = decoded_text
+        self._delta_text = delta_text
+        self._request_lock = threading.Lock()
+        self._output_lock = threading.Lock()
+        self._scheduler_lock = threading.Lock()
+        self._request_events = {}
+        self._output_event = threading.Event()
+        self._active_requests = {}
+        self._request_outputs = {}
+        self._detokenizer_client = _DetokenizerStub()
+        self.scheduler = type("Sched", (), {"requests": {}})()
+
+    def _touch_activity(self):
+        return None
+
+    def _decode_with_pipeline(
+        self,
+        request_id,
+        decodable_tokens,
+        finished,
+        skip_special_tokens,
+        spaces_between_special_tokens,
+        prompt_context=None,
+    ):
+        return DetokenizerResult(
+            accumulated_text=self._decoded_text,
+            delta_text=self._delta_text,
+            last_decoded_index=len(decodable_tokens),
+            finished=finished,
+            detoktook=0.0,
+        )
 
 
 def test_check_stop_with_custom_stop_token_id():
@@ -189,3 +255,57 @@ def test_prepare_sampling_params_respects_ignore_eos_for_generation_config_ids()
 
     assert set(prepared.stop_token_ids) == {777}
     assert prepared.all_stop_token_ids == {777, 154820}
+
+
+def test_process_engine_outputs_keeps_raw_text_before_reasoning_split():
+    harness = _ProcessHarness(
+        decoded_text="<think>plan</think><tool_call>{}</tool_call>",
+        delta_text="<think>plan</think><tool_call>{}</tool_call>",
+    )
+    reasoning_parser = DeepSeekR1ReasoningParser(_DummyTokenizer())
+    request_id = "req-raw-before-parse"
+    harness._active_requests[request_id] = {
+        "parent_request_id": request_id,
+        "sample_index": 0,
+        "generated_tokens": [],
+        "last_decoded_index": 0,
+        "last_decode_time": 0.0,
+        "start_time": time.perf_counter(),
+        "first_token_time": None,
+        "reported_generated_count": 0,
+        "sampling_params": SamplingParams(max_tokens=16),
+        "prompt_token_ids": [1, 2],
+        "reasoning_parser_instance": reasoning_parser,
+        "tool_parser_instance": None,
+        "tool_parser_request": None,
+        "parser_previous_text": "",
+        "parser_previous_token_ids": [],
+        "accumulated_reasoning": "",
+        "accumulated_content": "",
+    }
+    harness._request_outputs[request_id] = RequestOutput(
+        request_id=request_id,
+        prompt="hi",
+        prompt_token_ids=[[1, 2]],
+        outputs=[CompletionOutput(index=0, text="", token_ids=[])],
+    )
+
+    harness._process_engine_outputs(
+        {
+            0: EngineCoreOutputs(
+                outputs=[
+                    EngineCoreOutput(
+                        request_id=request_id,
+                        new_token_ids=[11],
+                    )
+                ]
+            )
+        }
+    )
+
+    output = harness._request_outputs[request_id]
+    completion = output.outputs[0]
+    assert completion.raw_text == "<think>plan</think><tool_call>{}</tool_call>"
+    assert output.raw_accumulated_text == "<think>plan</think><tool_call>{}</tool_call>"
+    assert completion.reasoning_content == "plan"
+    assert completion.text == "<tool_call>{}</tool_call>"

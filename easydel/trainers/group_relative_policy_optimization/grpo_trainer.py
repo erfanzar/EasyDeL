@@ -539,24 +539,35 @@ class GRPOTrainer(Trainer):
                     )
             token_logps_time = token_logps_time_fn()
 
-            host_completion_ids = np.asarray(jax.device_get(completion_ids), dtype=np.int64)
-            host_completion_mask = np.asarray(jax.device_get(completion_mask), dtype=np.int32)
-            raw_completions_text = self._decode_prompt_batch(
-                self.processing_class,
-                host_completion_ids,
-                skip_special_tokens=False,
-                pad_token_id=self._pad_token_id,
-                pop_pad_tokens=True,
-                attention_mask=host_completion_mask,
+            raw_completions_text = self._coerce_generation_texts(
+                results.raw_text,
+                fallback=results.text,
             )
-            clean_completions_text = self._decode_prompt_batch(
-                self.processing_class,
-                host_completion_ids,
-                skip_special_tokens=True,
-                pad_token_id=self._pad_token_id,
-                pop_pad_tokens=True,
-                attention_mask=host_completion_mask,
+            clean_completions_text = self._coerce_generation_texts(
+                results.text,
+                fallback=raw_completions_text,
             )
+            if not raw_completions_text or not clean_completions_text:
+                host_completion_ids = np.asarray(jax.device_get(completion_ids), dtype=np.int64)
+                host_completion_mask = np.asarray(jax.device_get(completion_mask), dtype=np.int32)
+                if not raw_completions_text:
+                    raw_completions_text = self._decode_prompt_batch(
+                        self.processing_class,
+                        host_completion_ids,
+                        skip_special_tokens=False,
+                        pad_token_id=self._pad_token_id,
+                        pop_pad_tokens=True,
+                        attention_mask=host_completion_mask,
+                    )
+                if not clean_completions_text:
+                    clean_completions_text = self._decode_prompt_batch(
+                        self.processing_class,
+                        host_completion_ids,
+                        skip_special_tokens=True,
+                        pad_token_id=self._pad_token_id,
+                        pop_pad_tokens=True,
+                        attention_mask=host_completion_mask,
+                    )
 
             is_conversational = self.train_is_conversational if is_train else self.eval_is_conversational
 
@@ -568,6 +579,23 @@ class GRPOTrainer(Trainer):
             else:
                 raw_completions = raw_completions_text
                 clean_completions = clean_completions_text
+            target_len = len(clean_completions_text) or len(raw_completions_text) or int(completion_ids.shape[0])
+            reasoning_records = self._coerce_optional_generation_texts(
+                results.reasoning,
+                target_len=target_len,
+            )
+            tool_call_records = self._coerce_generation_metadata_list(
+                results.tool_calls,
+                target_len=target_len,
+            )
+            structured_clean_completions = (
+                self._build_structured_assistant_messages(
+                    clean_completions_text,
+                    tool_calls=tool_call_records,
+                )
+                if is_conversational
+                else clean_completions
+            )
 
             rewards_per_func = jnp.full(
                 (prompt_ids.shape[0] * generation_factor, len(self.reward_funcs)),
@@ -581,9 +609,17 @@ class GRPOTrainer(Trainer):
                     if isinstance(reward_func, EasyDeLState):
                         if is_conversational:
                             messages = [
-                                {"messages": p + c} for p, c in zip(completion_prompts, clean_completions, strict=False)
+                                {"messages": p + c}
+                                for p, c in zip(completion_prompts, structured_clean_completions, strict=False)
                             ]
-                            texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                            texts = [
+                                apply_chat_template(
+                                    x,
+                                    reward_processing_class,
+                                    tools=self._reward_chat_template_tools(),
+                                )["text"]
+                                for x in messages
+                            ]
                         else:
                             texts = [p + c for p, c in zip(completion_prompts, clean_completions, strict=False)]
 
@@ -606,15 +642,17 @@ class GRPOTrainer(Trainer):
                         ).logits[:, 0]
                     else:
                         in_prompts = completion_prompts
-                        reward_call_kwargs = filter_kwargs_for_callable(
+                        reward_call_kwargs = self._build_reward_call_kwargs(
                             reward_func,
-                            {
-                                "prompts": in_prompts,
-                                "completions": clean_completions,
-                                "raw_completions": raw_completions,
-                                "max_length": self.arguments.max_length,
-                                "batch": batch,
-                            },
+                            prompts=in_prompts,
+                            completions=clean_completions,
+                            raw_completions=raw_completions,
+                            completion_texts=clean_completions_text,
+                            raw_text=raw_completions_text,
+                            reasoning=reasoning_records,
+                            tool_calls=tool_call_records,
+                            max_length=self.arguments.max_length,
+                            batch=batch,
                         )
                         output_reward_func = reward_func(**reward_call_kwargs)
                         rew = jnp.array(

@@ -30,6 +30,7 @@ Rewards can be sparse (terminal only) or dense (per-step).
 from __future__ import annotations
 
 import abc
+import json
 import typing as tp
 from dataclasses import dataclass, field
 
@@ -277,27 +278,101 @@ class ToolEnvWrapper(AgenticEnvironment):
         self._tool_calls_this_step = 0
         return self.env.reset(seed=seed)
 
-    def step(self, action: str) -> StepResult:
-        parsed_calls = self.tool_call_parser(action)
-        if parsed_calls and self._tool_calls_this_step < self.max_tool_calls_per_step:
-            results = []
-            for tool_name, tool_args in parsed_calls:
-                if tool_name in self.tools and self._tool_calls_this_step < self.max_tool_calls_per_step:
-                    self._tool_calls_this_step += 1
-                    result = self.tools[tool_name].execute(tool_args)
-                    results.append(f"[{tool_name}]: {result}")
-            if results:
-                return StepResult(
-                    observation="\n".join(results),
-                    reward=0.0,
-                    terminated=False,
-                    truncated=False,
-                    info={
-                        "tool_calls": [{"name": n, "args": a} for n, a in parsed_calls if n in self.tools],
-                    },
-                )
+    @staticmethod
+    def _coerce_tool_args_json(tool_args: tp.Any) -> str:
+        if tool_args is None:
+            return "{}"
+        if isinstance(tool_args, str):
+            return tool_args
+        try:
+            return json.dumps(tool_args)
+        except (TypeError, ValueError):
+            return str(tool_args)
+
+    def _normalize_structured_tool_calls(
+        self,
+        tool_calls: tp.Any | None,
+    ) -> list[tuple[str, str]]:
+        if not isinstance(tool_calls, list):
+            return []
+
+        normalized: list[tuple[str, str]] = []
+        for call in tool_calls:
+            name = ""
+            args: tp.Any = "{}"
+            if isinstance(call, tuple) and len(call) == 2:
+                name, args = call
+            elif isinstance(call, dict):
+                function = call.get("function")
+                if isinstance(function, dict):
+                    name = function.get("name") or call.get("name") or ""
+                    args = (
+                        function.get("arguments")
+                        if function.get("arguments") is not None
+                        else call.get("arguments", call.get("args", "{}"))
+                    )
+                else:
+                    name = call.get("name") or ""
+                    args = call.get("arguments", call.get("args", "{}"))
+            else:
+                function = getattr(call, "function", None)
+                if function is not None:
+                    name = getattr(function, "name", "") or getattr(call, "name", "") or ""
+                    args = getattr(function, "arguments", None)
+                    if args is None:
+                        args = getattr(call, "arguments", getattr(call, "args", "{}"))
+                else:
+                    name = getattr(call, "name", "") or ""
+                    args = getattr(call, "arguments", getattr(call, "args", "{}"))
+
+            if name:
+                normalized.append((name, self._coerce_tool_args_json(args)))
+        return normalized
+
+    def _execute_tool_calls(self, parsed_calls: list[tuple[str, str]]) -> StepResult | None:
+        if not parsed_calls or self._tool_calls_this_step >= self.max_tool_calls_per_step:
+            return None
+
+        results = []
+        for tool_name, tool_args in parsed_calls:
+            if tool_name in self.tools and self._tool_calls_this_step < self.max_tool_calls_per_step:
+                self._tool_calls_this_step += 1
+                result = self.tools[tool_name].execute(tool_args)
+                results.append(f"[{tool_name}]: {result}")
+        if not results:
+            return None
+
+        return StepResult(
+            observation="\n".join(results),
+            reward=0.0,
+            terminated=False,
+            truncated=False,
+            info={
+                "tool_calls": [{"name": n, "args": a} for n, a in parsed_calls if n in self.tools],
+            },
+        )
+
+    def step_with_tool_calls(
+        self,
+        action: str,
+        *,
+        tool_calls: tp.Any | None = None,
+    ) -> StepResult:
         self._tool_calls_this_step = 0
+        parsed_calls = self._normalize_structured_tool_calls(tool_calls)
+        step_result = self._execute_tool_calls(parsed_calls)
+        if step_result is not None:
+            return step_result
+
+        parsed_calls = self.tool_call_parser(action)
+        step_result = self._execute_tool_calls(parsed_calls)
+        if step_result is not None:
+            return step_result
+
         return self.env.step(action)
+
+    def step(self, action: str) -> StepResult:
+        return self.step_with_tool_calls(action)
 
     def close(self) -> None:
         self.env.close()

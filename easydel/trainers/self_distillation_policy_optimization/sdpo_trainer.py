@@ -531,14 +531,61 @@ class SDPOTrainer(GRPOTrainer):
             generation_factor = max(generation_factor, 1)
             ridmask = prompt_mask.repeat(generation_factor, 0)
 
-            # HF tokenizers expect Python / NumPy token ids; JAX arrays can fail in Rust decode bindings.
-            completion_ids_for_decode = np.asarray(jax.device_get(completion_ids)).tolist()
-            completions_text = self.processing_class.batch_decode(completion_ids_for_decode, skip_special_tokens=True)
+            raw_completions_text = self._coerce_generation_texts(
+                results.raw_text,
+                fallback=results.text,
+            )
+            completions_text = self._coerce_generation_texts(
+                results.text,
+                fallback=raw_completions_text,
+            )
+            if not raw_completions_text or not completions_text:
+                # HF tokenizers expect Python / NumPy token ids; JAX arrays can fail in Rust decode bindings.
+                completion_ids_for_decode = np.asarray(jax.device_get(completion_ids)).tolist()
+                completion_mask_for_decode = np.asarray(jax.device_get(completion_mask), dtype=np.int32)
+                completion_ids_array = np.asarray(completion_ids_for_decode, dtype=np.int64)
+                if not raw_completions_text:
+                    raw_completions_text = self._decode_prompt_batch(
+                        self.processing_class,
+                        completion_ids_array,
+                        skip_special_tokens=False,
+                        pad_token_id=self._pad_token_id,
+                        pop_pad_tokens=True,
+                        attention_mask=completion_mask_for_decode,
+                    )
+                if not completions_text:
+                    completions_text = self._decode_prompt_batch(
+                        self.processing_class,
+                        completion_ids_array,
+                        skip_special_tokens=True,
+                        pad_token_id=self._pad_token_id,
+                        pop_pad_tokens=True,
+                        attention_mask=completion_mask_for_decode,
+                    )
             is_conv = self.train_is_conversational if is_train else self.eval_is_conversational
             if is_conv:
+                raw_completions = [[{"role": "assistant", "content": c}] for c in raw_completions_text]
                 completions = [[{"role": "assistant", "content": c}] for c in completions_text]
             else:
+                raw_completions = raw_completions_text
                 completions = completions_text
+            target_len = len(completions_text) or len(raw_completions_text) or int(completion_ids.shape[0])
+            reasoning_records = self._coerce_optional_generation_texts(
+                results.reasoning,
+                target_len=target_len,
+            )
+            tool_call_records = self._coerce_generation_metadata_list(
+                results.tool_calls,
+                target_len=target_len,
+            )
+            structured_completions = (
+                self._build_structured_assistant_messages(
+                    completions_text,
+                    tool_calls=tool_call_records,
+                )
+                if is_conv
+                else completions
+            )
 
             rewards_per_func = jnp.full(
                 (prompt_ids.shape[0] * generation_factor, len(self.reward_funcs)),
@@ -552,9 +599,17 @@ class SDPOTrainer(GRPOTrainer):
                     if isinstance(reward_func, EasyDeLState):
                         if is_conv:
                             messages = [
-                                {"messages": p + c} for p, c in zip(completion_prompts, completions, strict=False)
+                                {"messages": p + c}
+                                for p, c in zip(completion_prompts, structured_completions, strict=False)
                             ]
-                            texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                            texts = [
+                                apply_chat_template(
+                                    x,
+                                    reward_processing_class,
+                                    tools=self._reward_chat_template_tools(),
+                                )["text"]
+                                for x in messages
+                            ]
                         else:
                             texts = [p + c for p, c in zip(completion_prompts, completions, strict=False)]
                         rew = reward_func.apply_fn(
@@ -575,12 +630,19 @@ class SDPOTrainer(GRPOTrainer):
                             ),
                         ).logits[:, 0]
                     else:
-                        output_reward_func = reward_func(
+                        reward_call_kwargs = self._build_reward_call_kwargs(
+                            reward_func,
                             prompts=completion_prompts,
                             completions=completions,
+                            raw_completions=raw_completions,
+                            completion_texts=completions_text,
+                            raw_text=raw_completions_text,
+                            reasoning=reasoning_records,
+                            tool_calls=tool_call_records,
                             max_length=self.arguments.max_length,
                             batch=batch,
                         )
+                        output_reward_func = reward_func(**reward_call_kwargs)
                         rew = jnp.array(
                             [v if v is not None else jnp.nan for v in output_reward_func],
                             dtype="f4",

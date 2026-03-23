@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 from easydel.trainers.binary_classifier_optimization_trainer._fn import (
     concatenated_forward as bco_concatenated_forward,
@@ -745,3 +746,112 @@ def test_seq_kd_transform_uses_example_tools_when_present():
     assert transformed["attention_mask"][-2:] == [1, 1]
     assert tokenizer.calls
     assert tokenizer.calls[-1]["tools"] == example_tools
+
+
+def test_seq_kd_teacher_fn_repeats_prompts_for_multi_generation():
+    class _Tokenizer:
+        def batch_decode(self, prompt_ids, skip_special_tokens=True):
+            del skip_special_tokens
+            return [f"prompt-{idx}" for idx in range(prompt_ids.shape[0])]
+
+        def __call__(
+            self,
+            texts,
+            padding="max_length",
+            max_length=None,
+            truncation=True,
+            return_tensors="np",
+            add_special_tokens=False,
+        ):
+            del padding, truncation, return_tensors, add_special_tokens
+            rows = []
+            masks = []
+            for idx, _text in enumerate(texts):
+                tokens = [idx + 1, idx + 11][: max_length or 2]
+                pad_len = max((max_length or len(tokens)) - len(tokens), 0)
+                rows.append(tokens + [0] * pad_len)
+                masks.append([1] * len(tokens) + [0] * pad_len)
+            return {"input_ids": rows, "attention_mask": masks}
+
+    trainer = SeqKDTrainer.__new__(SeqKDTrainer)
+    trainer.processing_class = _Tokenizer()
+    trainer.arguments = SimpleNamespace(
+        max_completion_length=4,
+        generation_num_return_sequences=3,
+        num_generations_per_prompt=3,
+    )
+    trainer._purify_batch = lambda batch: batch
+    trainer._all_gather = lambda value: value
+    trainer._make_attn_mask = lambda ids: (ids != 0).astype(jnp.int32)
+
+    captured = {}
+
+    def teacher_fn(prompts):
+        captured["prompts"] = list(prompts)
+        return [f"completion-{idx}" for idx, _ in enumerate(prompts)]
+
+    trainer.teacher_fn = teacher_fn
+
+    batch, _ = SeqKDTrainer._preprocess_batch_input(
+        trainer,
+        state=SimpleNamespace(),
+        batch={
+            "input_ids": jnp.asarray([[1, 2, 0], [3, 4, 0]], dtype=jnp.int32),
+            "attention_mask": jnp.asarray([[1, 1, 0], [1, 1, 0]], dtype=jnp.int32),
+        },
+        is_train=True,
+    )
+
+    assert captured["prompts"] == [
+        "prompt-0",
+        "prompt-0",
+        "prompt-0",
+        "prompt-1",
+        "prompt-1",
+        "prompt-1",
+    ]
+    assert batch["input_ids"].shape[0] == 6
+    assert batch["attention_mask"].shape[0] == 6
+    assert batch["labels"].shape[0] == 6
+
+
+def test_seq_kd_teacher_fn_validates_multi_generation_length():
+    class _Tokenizer:
+        def batch_decode(self, prompt_ids, skip_special_tokens=True):
+            del skip_special_tokens
+            return [f"prompt-{idx}" for idx in range(prompt_ids.shape[0])]
+
+        def __call__(
+            self,
+            texts,
+            padding="max_length",
+            max_length=None,
+            truncation=True,
+            return_tensors="np",
+            add_special_tokens=False,
+        ):
+            del texts, padding, max_length, truncation, return_tensors, add_special_tokens
+            return {"input_ids": [[1, 2]], "attention_mask": [[1, 1]]}
+
+    trainer = SeqKDTrainer.__new__(SeqKDTrainer)
+    trainer.processing_class = _Tokenizer()
+    trainer.arguments = SimpleNamespace(
+        max_completion_length=4,
+        generation_num_return_sequences=2,
+        num_generations_per_prompt=2,
+    )
+    trainer._purify_batch = lambda batch: batch
+    trainer._all_gather = lambda value: value
+    trainer._make_attn_mask = lambda ids: (ids != 0).astype(jnp.int32)
+    trainer.teacher_fn = lambda prompts: ["only-one"] * (len(prompts) - 1)
+
+    with pytest.raises(ValueError, match="must return exactly one completion per prompt"):
+        SeqKDTrainer._preprocess_batch_input(
+            trainer,
+            state=SimpleNamespace(),
+            batch={
+                "input_ids": jnp.asarray([[1, 2, 0]], dtype=jnp.int32),
+                "attention_mask": jnp.asarray([[1, 1, 0]], dtype=jnp.int32),
+            },
+            is_train=True,
+        )
