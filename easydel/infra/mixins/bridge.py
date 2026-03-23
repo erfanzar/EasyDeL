@@ -69,6 +69,7 @@ from dataclasses import dataclass
 import huggingface_hub
 import huggingface_hub.errors
 import jax
+import numpy as np
 from eformer.escale import PartitionAxis
 from eformer.loggings import get_logger
 from eformer.paths import ePath, ePathLike
@@ -104,7 +105,14 @@ from transformers.utils.hub import PushToHubMixin
 
 from easydel.layers import QuantizationConfig
 from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
-from easydel.utils.traversals import flatten_dict, is_flatten, merge_model_and_tree, string_key_to_int, unflatten_dict
+from easydel.utils.traversals import (
+    flatten_dict,
+    is_flatten,
+    merge_model_and_tree,
+    string_key_to_int,
+    tree_path_to_string,
+    unflatten_dict,
+)
 
 from ..base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict, is_remote_url
 from ..base_config import download_url as _download_url
@@ -212,6 +220,28 @@ def _path_match_variants(path: str) -> tuple[str, ...]:
     dot_variants = {p.replace("/", ".") for p in slash_variants}
     all_variants = slash_variants | dot_variants
     return tuple(sorted(v for v in all_variants if v))
+
+
+def _checkpoint_cpu_device() -> jax.Device | None:  # pyright: ignore[reportInvalidTypeForm] #type: ignore
+    """Resolve a host CPU device for checkpoint-time array normalization."""
+    try:
+        cpu_devices = jax.devices("cpu")
+    except Exception:
+        return None
+    return cpu_devices[0] if cpu_devices else None
+
+
+def _normalize_checkpoint_leaf_to_jax(
+    value: tp.Any,
+    *,
+    cpu_device: jax.Device | None, # pyright: ignore[reportInvalidTypeForm]
+) -> tp.Any:
+    """Convert NumPy leaves into JAX arrays without consuming accelerator HBM."""
+    if not isinstance(value, (np.ndarray, np.generic)):
+        return value
+    if cpu_device is not None:
+        return jax.device_put(value, cpu_device)
+    return jnp.asarray(value)
 
 
 def _build_safe_checkpoint_partition_rules(
@@ -517,7 +547,25 @@ class EasyBridgeMixin(PushToHubMixin):
                     continue
                 flat_state[key] = gather_fn(value)
             state_dict = unflatten_dict(flat_state)
-
+        cpu_device = _checkpoint_cpu_device()
+        numpy_leaf_paths: list[str] = []
+        state_dict = jax.tree_util.tree_map_with_path(
+            lambda path, x: (
+                numpy_leaf_paths.append(tree_path_to_string(path, sep=".")),
+                _normalize_checkpoint_leaf_to_jax(x, cpu_device=cpu_device),
+            )[-1]
+            if isinstance(x, (np.ndarray, np.generic))
+            else x,
+            state_dict,
+        )
+        if numpy_leaf_paths:
+            preview_limit = 32
+            preview = ", ".join(numpy_leaf_paths[:preview_limit])
+            remainder = len(numpy_leaf_paths) - preview_limit
+            suffix = f" ... (+{remainder} more)" if remainder > 0 else ""
+            logger.info(
+                f"Normalizing {len(numpy_leaf_paths)} NumPy checkpoint leaves to CPU-backed JAX arrays before save: {preview}{suffix}"
+            )
         output_model_file = Checkpointer(
             base_path=str(save_directory),
             save_interval=None,
