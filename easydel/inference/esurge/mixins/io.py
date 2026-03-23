@@ -369,6 +369,7 @@ class EngineIOMixin:
 
         last_update_seq = -1
         last_accumulated_text = ""
+        last_raw_accumulated_text = ""
         last_accumulated_reasoning = ""
         from ..esurge_engine import CompletionOutput, RequestOutput
 
@@ -403,6 +404,7 @@ class EngineIOMixin:
                                     finish_reason=comp.finish_reason,
                                     tool_calls=comp.tool_calls,
                                     reasoning_content=comp.reasoning_content,
+                                    raw_text=comp.raw_text,
                                 )
                             )
 
@@ -410,6 +412,11 @@ class EngineIOMixin:
                             ro.accumulated_text,
                             last_accumulated_text,
                             ro.delta_text,
+                        )
+                        snapshot_raw_delta = self._compute_snapshot_delta_text(
+                            ro.raw_accumulated_text,
+                            last_raw_accumulated_text,
+                            ro.raw_delta_text or "",
                         )
                         snapshot_reasoning_delta = self._compute_snapshot_delta_text(
                             ro.reasoning_content or "",
@@ -426,6 +433,8 @@ class EngineIOMixin:
                             metrics=dict(ro.metrics) if ro.metrics is not None else None,
                             accumulated_text=ro.accumulated_text,
                             delta_text=snapshot_delta,
+                            raw_accumulated_text=ro.raw_accumulated_text,
+                            raw_delta_text=snapshot_raw_delta,
                             tokens_per_second=ro.tokens_per_second,
                             num_generated_tokens=ro.num_generated_tokens,
                             time_spent_generating=ro.time_spent_generating,
@@ -440,6 +449,7 @@ class EngineIOMixin:
                         )
                         last_update_seq = ro.update_seq
                         last_accumulated_text = ro.accumulated_text
+                        last_raw_accumulated_text = ro.raw_accumulated_text
                         last_accumulated_reasoning = ro.reasoning_content or ""
 
                 if snapshot is not None:
@@ -760,6 +770,7 @@ class EngineIOMixin:
 
         last_update_seq = -1
         last_accumulated_text = ""
+        last_raw_accumulated_text = ""
         last_accumulated_reasoning = ""
         from ..esurge_engine import CompletionOutput, RequestOutput
 
@@ -793,6 +804,7 @@ class EngineIOMixin:
                                     finish_reason=comp.finish_reason,
                                     tool_calls=comp.tool_calls,
                                     reasoning_content=comp.reasoning_content,
+                                    raw_text=comp.raw_text,
                                 )
                             )
 
@@ -800,6 +812,11 @@ class EngineIOMixin:
                             ro.accumulated_text,
                             last_accumulated_text,
                             ro.delta_text,
+                        )
+                        snapshot_raw_delta = self._compute_snapshot_delta_text(
+                            ro.raw_accumulated_text,
+                            last_raw_accumulated_text,
+                            ro.raw_delta_text or "",
                         )
                         snapshot_reasoning_delta = self._compute_snapshot_delta_text(
                             ro.reasoning_content or "",
@@ -816,6 +833,8 @@ class EngineIOMixin:
                             metrics=dict(ro.metrics) if ro.metrics is not None else None,
                             accumulated_text=ro.accumulated_text,
                             delta_text=snapshot_delta,
+                            raw_accumulated_text=ro.raw_accumulated_text,
+                            raw_delta_text=snapshot_raw_delta,
                             tokens_per_second=ro.tokens_per_second,
                             num_generated_tokens=ro.num_generated_tokens,
                             time_spent_generating=ro.time_spent_generating,
@@ -830,6 +849,7 @@ class EngineIOMixin:
                         )
                         last_update_seq = ro.update_seq
                         last_accumulated_text = ro.accumulated_text
+                        last_raw_accumulated_text = ro.raw_accumulated_text
                         last_accumulated_reasoning = ro.reasoning_content or ""
 
                 if snapshot is not None:

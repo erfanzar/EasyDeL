@@ -267,6 +267,11 @@ class NashMDTrainer(GRPOTrainer):
         self,
         prompts: list[str],
         completions: list[str],
+        *,
+        raw_text: list[str] | None = None,
+        reasoning: list[str | None] | None = None,
+        tool_calls: list[tp.Any | None] | None = None,
+        batch: dict[str, tp.Any] | None = None,
     ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
         """Compute reward scores for prompt-completion pairs.
 
@@ -307,11 +312,20 @@ class NashMDTrainer(GRPOTrainer):
                 ).logits[:, 0]
                 values = jnp.asarray(logits, dtype=jnp.float32)
             else:
-                outputs = reward_func(
+                reward_call_kwargs = self._build_reward_call_kwargs(
+                    reward_func,
                     prompts=prompts,
                     completions=completions,
+                    raw_completions=raw_text,
+                    prompt_texts=prompts,
+                    completion_texts=completions,
+                    raw_text=raw_text,
+                    reasoning=reasoning,
+                    tool_calls=tool_calls,
                     max_length=self.arguments.max_length,
+                    batch=batch,
                 )
+                outputs = reward_func(**reward_call_kwargs)
                 values = jnp.asarray(np.asarray(outputs, dtype=np.float32))
             rewards.append(values)
             breakdown[name] = values
@@ -400,17 +414,78 @@ class NashMDTrainer(GRPOTrainer):
         preprocessing_time = preprocessing_time_fn()
 
         host_prompt_ids = np.asarray(jax.device_get(prompt_ids))
-        host_completion_ids = np.asarray(jax.device_get(completion_ids))
-        host_mixture_completion_ids = np.asarray(jax.device_get(mixture_completion_ids))
-
         prompts_text = list(self.processing_class.batch_decode(host_prompt_ids, skip_special_tokens=True))
-        model_completions_text = list(self.processing_class.batch_decode(host_completion_ids, skip_special_tokens=True))
-        mixture_completions_text = list(
-            self.processing_class.batch_decode(host_mixture_completion_ids, skip_special_tokens=True)
+        host_take_policy = np.asarray(jax.device_get(take_policy)).reshape(-1).astype(bool)
+        model_completions_text = self._coerce_generation_texts(results.text)
+        ref_completions_text = self._coerce_generation_texts(mixture_results.text)
+        if not model_completions_text:
+            host_completion_ids = np.asarray(jax.device_get(completion_ids))
+            model_completions_text = list(
+                self.processing_class.batch_decode(host_completion_ids, skip_special_tokens=True)
+            )
+        if not ref_completions_text:
+            host_ref_completion_ids = np.asarray(jax.device_get(mixture_results.completion_ids))
+            ref_completions_text = list(
+                self.processing_class.batch_decode(host_ref_completion_ids, skip_special_tokens=True)
+            )
+        model_raw_texts = self._coerce_generation_texts(
+            results.raw_text,
+            fallback=model_completions_text,
+        )
+        ref_raw_texts = self._coerce_generation_texts(
+            mixture_results.raw_text,
+            fallback=ref_completions_text,
+        )
+        model_reasoning = self._coerce_optional_generation_texts(
+            results.reasoning,
+            target_len=len(model_completions_text),
+        )
+        model_tool_calls = self._coerce_generation_metadata_list(
+            results.tool_calls,
+            target_len=len(model_completions_text),
+        )
+        ref_reasoning = self._coerce_optional_generation_texts(
+            mixture_results.reasoning,
+            target_len=len(ref_completions_text),
+        )
+        ref_tool_calls = self._coerce_generation_metadata_list(
+            mixture_results.tool_calls,
+            target_len=len(ref_completions_text),
         )
 
-        model_scores, model_breakdown = self._score_rewards(prompts_text, model_completions_text)
-        mixture_scores, _ = self._score_rewards(prompts_text, mixture_completions_text)
+        mixture_completions_text = [
+            model_completions_text[idx] if take_policy_row else ref_completions_text[idx]
+            for idx, take_policy_row in enumerate(host_take_policy)
+        ]
+        mixture_raw_texts = [
+            model_raw_texts[idx] if take_policy_row else ref_raw_texts[idx]
+            for idx, take_policy_row in enumerate(host_take_policy)
+        ]
+        mixture_reasoning = [
+            model_reasoning[idx] if take_policy_row else ref_reasoning[idx]
+            for idx, take_policy_row in enumerate(host_take_policy)
+        ]
+        mixture_tool_calls = [
+            model_tool_calls[idx] if take_policy_row else ref_tool_calls[idx]
+            for idx, take_policy_row in enumerate(host_take_policy)
+        ]
+
+        model_scores, model_breakdown = self._score_rewards(
+            prompts_text,
+            model_completions_text,
+            raw_text=model_raw_texts,
+            reasoning=model_reasoning,
+            tool_calls=model_tool_calls,
+            batch=batch,
+        )
+        mixture_scores, _ = self._score_rewards(
+            prompts_text,
+            mixture_completions_text,
+            raw_text=mixture_raw_texts,
+            reasoning=mixture_reasoning,
+            tool_calls=mixture_tool_calls,
+            batch=batch,
+        )
 
         penalty = self.missing_eos_penalty
         eos_token_id = getattr(self.processing_class, "eos_token_id", None)

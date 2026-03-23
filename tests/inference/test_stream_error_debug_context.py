@@ -12,9 +12,76 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import threading
+
 from easydel.inference.esurge.esurge_engine import CompletionOutput, RequestOutput
+from easydel.inference.esurge.mixins.io import EngineIOMixin
+from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
 from easydel.inference.esurge.server.api_server import eSurgeApiServer
 from easydel.inference.openai_api_modules import DeltaMessage
+from easydel.inference.sampling_params import SamplingParams
+
+
+class _StreamHarness(EngineIOMixin, EngineUtilsMixin):
+    def __init__(self):
+        self._request_lock = threading.Lock()
+        self._output_lock = threading.Lock()
+        self._request_events = {}
+        self._request_outputs = {}
+        self._scheduler_running = True
+        self._max_request_outputs = None
+
+    def _generate_request_id(self):
+        return "req-1"
+
+    def _tokenize_prompt(self, request_id, prompt):
+        del request_id, prompt
+        return [1]
+
+    def _prepare_sampling_params_for_request(self, sampling_params, request_id=None, prompt=None):
+        del request_id, prompt
+        return sampling_params
+
+    def _add_request(self, request_id, prompt, sampling_params, prompt_token_ids=None, tool_parser_request=None):
+        del sampling_params, tool_parser_request
+        event = threading.Event()
+        event.set()
+        with self._request_lock:
+            self._request_events[request_id] = event
+        with self._output_lock:
+            self._request_outputs[request_id] = RequestOutput(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_token_ids=prompt_token_ids or [],
+                outputs=[CompletionOutput(index=0, text="", token_ids=[])],
+                accumulated_text="visible",
+                delta_text="visible",
+                raw_accumulated_text="<think>one</think>visible",
+                raw_delta_text="<think>one</think>visible",
+                update_seq=1,
+                finished=False,
+            )
+
+    def _ensure_scheduler_running(self, context=""):
+        del context
+        return None
+
+    def _raise_if_scheduler_failed(self):
+        return None
+
+    def _recover_orphaned_request(self, request_id):
+        del request_id
+        return False
+
+    def abort_request(self, request_id):
+        with self._output_lock:
+            self._request_outputs.pop(request_id, None)
+        with self._request_lock:
+            self._request_events.pop(request_id, None)
+
+    def _track_finished_output(self, request_id):
+        del request_id
+        return None
 
 
 def test_stream_debug_context_captures_key_shapes():
@@ -90,6 +157,69 @@ def test_stream_debug_context_includes_stream_error_and_tools_shape():
     assert context["tools_type"] == "list"
     assert context["tools_len"] == 1
     assert context["first_tool_type"] == "dict"
+
+
+def test_request_output_keeps_raw_and_parsed_text_separately():
+    output = RequestOutput(
+        request_id="req-raw",
+        prompt="hello",
+        prompt_token_ids=[1, 2],
+        outputs=[CompletionOutput(index=0, text="answer", token_ids=[11, 12, 13])],
+        accumulated_text="answer",
+        delta_text="answer",
+        raw_accumulated_text="<think>plan</think>answer",
+        raw_delta_text="</think>answer",
+    )
+
+    assert output.accumulated_text == "answer"
+    assert output.delta_text == "answer"
+    assert output.raw_accumulated_text == "<think>plan</think>answer"
+    assert output.raw_delta_text == "</think>answer"
+
+
+def test_stream_snapshot_keeps_exact_raw_delta_text():
+    harness = _StreamHarness()
+    stream = harness.stream("hello", sampling_params=SamplingParams(max_tokens=4))
+
+    first = next(stream)
+    assert first.raw_delta_text == "<think>one</think>visible"
+
+    with harness._output_lock:
+        output = harness._request_outputs["req-1"]
+        output.accumulated_text = "visible final"
+        output.delta_text = " final"
+        output.raw_accumulated_text = "<think>done</think>visible final"
+        output.raw_delta_text = "</think> final"
+        output.update_seq = 2
+        output.finished = True
+    with harness._request_lock:
+        harness._request_events["req-1"].set()
+
+    second = next(stream)
+    assert second.raw_delta_text == "</think> final"
+
+
+def test_stream_snapshot_does_not_replay_stale_raw_delta_text():
+    harness = _StreamHarness()
+    stream = harness.stream("hello", sampling_params=SamplingParams(max_tokens=4))
+
+    first = next(stream)
+    assert first.raw_delta_text == "<think>one</think>visible"
+
+    with harness._output_lock:
+        output = harness._request_outputs["req-1"]
+        output.delta_text = ""
+        output.raw_delta_text = "<think>one</think>visible"
+        output.delta_reasoning_content = " reasoning"
+        output.reasoning_content = "reasoning"
+        output.update_seq = 2
+        output.finished = True
+    with harness._request_lock:
+        harness._request_events["req-1"].set()
+
+    second = next(stream)
+    assert second.raw_delta_text == ""
+    assert second.delta_reasoning_content == "reasoning"
 
 
 def test_tool_protocol_text_detection_handles_partial_markers():

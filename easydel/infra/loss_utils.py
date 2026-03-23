@@ -115,6 +115,49 @@ class LossForwardPlan:
     forward_kwargs: dict[str, tp.Any] = dataclasses.field(default_factory=dict)
 
 
+def _resolve_module_vocab_size(module: tp.Any) -> int:
+    """Resolve vocab size for text and multimodal configs.
+
+    Some configs expose ``vocab_size`` on the root config, while others keep it
+    on ``text_config`` or behind ``get_text_config()``. Models may also cache it
+    directly on ``self.vocab_size``.
+    """
+
+    candidates: list[tp.Any] = [
+        getattr(getattr(module, "config", None), "vocab_size", None),
+        getattr(module, "vocab_size", None),
+    ]
+
+    config = getattr(module, "config", None)
+    if config is not None:
+        get_text_config = getattr(config, "get_text_config", None)
+        if callable(get_text_config):
+            try:
+                text_config = get_text_config()
+            except TypeError:
+                text_config = get_text_config(True)
+            except Exception:
+                text_config = None
+            candidates.append(getattr(text_config, "vocab_size", None))
+
+        text_config = getattr(config, "text_config", None)
+        candidates.append(getattr(text_config, "vocab_size", None))
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            return int(candidate)
+        except (TypeError, ValueError):
+            continue
+
+    raise AttributeError(
+        f"Could not resolve vocabulary size from module {type(module).__name__}; "
+        "expected one of `config.vocab_size`, `config.text_config.vocab_size`, "
+        "`config.get_text_config().vocab_size`, or `module.vocab_size`."
+    )
+
+
 class BaseLossStrategy:
     """Two-stage loss interface: plan the forward pass, then consume outputs.
 
@@ -2366,7 +2409,7 @@ def _should_chunk_causal_lm_loss(
         return False
 
     effective_seq_len = max(1, int(labels.shape[1]) - (1 if config.shift_tokens else 0))
-    projected_logit_elements = int(labels.shape[0]) * effective_seq_len * int(module.config.vocab_size)
+    projected_logit_elements = int(labels.shape[0]) * effective_seq_len * _resolve_module_vocab_size(module)
     return explicit_chunk or projected_logit_elements >= (1 << 28)
 
 
@@ -2510,7 +2553,7 @@ class CausalLMLossStrategy(BaseLossStrategy):
             hidden_states=lm_head_inputs,
             labels=labels,
             lm_head_fn=module.compute_lm_logits,
-            vocab_size=int(module.config.vocab_size),
+            vocab_size=_resolve_module_vocab_size(module),
             attention_mask=batch.get("attention_mask"),
             config=loss_config,
             batch=batch,

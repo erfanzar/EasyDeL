@@ -418,6 +418,8 @@ class EngineParsingMixin:
                             )
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index
                             rd["last_decode_time"] = now
+                            raw_accumulated_text = pipeline_result.accumulated_text
+                            raw_delta_text = pipeline_result.delta_text or ""
 
                             parsed, _visible_text, visible_delta, stop_hit, stop_reason = (
                                 self._parse_with_stop_string_policy(
@@ -436,6 +438,7 @@ class EngineParsingMixin:
                             # Update the specific sample's completion output
                             comp = ro.outputs[sample_index]
                             comp.text = parsed["accumulated_content"]
+                            comp.raw_text = raw_accumulated_text
                             comp.token_ids = list(rd["generated_tokens"])
                             if parsed["accumulated_reasoning"]:
                                 comp.reasoning_content = parsed["accumulated_reasoning"]
@@ -444,6 +447,8 @@ class EngineParsingMixin:
 
                             # For backwards compatibility, set ro fields to first sample
                             if sample_index == 0:
+                                ro.raw_accumulated_text = raw_accumulated_text
+                                ro.raw_delta_text = raw_delta_text or ""
                                 ro.accumulated_text = parsed["accumulated_content"]
                                 effective_delta = parsed["delta_content"]
                                 if effective_delta is None:
@@ -516,6 +521,8 @@ class EngineParsingMixin:
                                 prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
                             )
                             rd["last_decoded_index"] = pipeline_result.last_decoded_index
+                            raw_accumulated_text = pipeline_result.accumulated_text
+                            raw_delta_text = pipeline_result.delta_text or ""
                             parsed, _visible_text, visible_delta, stop_hit, stop_reason = (
                                 self._parse_with_stop_string_policy(
                                     rd,
@@ -530,6 +537,7 @@ class EngineParsingMixin:
 
                             # Update the specific sample's completion output
                             comp.text = parsed["accumulated_content"]
+                            comp.raw_text = raw_accumulated_text
                             comp.token_ids = list(rd["generated_tokens"])
                             if parsed["accumulated_reasoning"]:
                                 comp.reasoning_content = parsed["accumulated_reasoning"]
@@ -539,6 +547,8 @@ class EngineParsingMixin:
 
                             # For backwards compatibility, set ro fields to first sample
                             if sample_index == 0:
+                                ro.raw_accumulated_text = raw_accumulated_text
+                                ro.raw_delta_text = raw_delta_text or ""
                                 ro.accumulated_text = parsed["accumulated_content"]
                                 effective_delta = parsed["delta_content"]
                                 if effective_delta is None:

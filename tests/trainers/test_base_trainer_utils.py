@@ -673,6 +673,57 @@ def test_prepare_generation_input_accepts_chat_prompt_field():
     assert processor.calls[1][1]["tokenize"] is False
 
 
+def test_prepare_generation_input_passes_dataset_tools_to_chat_template():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(max_length=8, generation_dataset_prompt_field="generation_prompt")
+
+    class _Processor:
+        def __init__(self):
+            self.padding_side = "right"
+            self.calls: list[tuple[object, object, dict[str, object]]] = []
+
+        def apply_chat_template(self, messages, tools=None, **kwargs):
+            self.calls.append((messages, tools, kwargs))
+            if kwargs.get("tokenize", False):
+                return {
+                    "input_ids": np.asarray([[101, 102, 103]], dtype=np.int32),
+                    "attention_mask": np.asarray([[1, 1, 1]], dtype=np.int32),
+                }
+            return "<chat prompt with tools>"
+
+    processor = _Processor()
+    trainer.processing_class = processor
+    trainer._batch_decode_tokens = lambda token_ids: ["decoded"]
+
+    tools = [
+        {
+            "name": "lookup_weather",
+            "description": "Get the weather for a city.",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+        }
+    ]
+    prompt = {
+        "generation_prompt": [
+            {"role": "system", "content": "Use tools when needed."},
+            {"role": "user", "content": "What is the weather in Paris?"},
+        ],
+        "tools": tools,
+    }
+
+    prepared = BaseTrainer._prepare_generation_input(trainer, prompt)
+
+    assert prepared is not None
+    np.testing.assert_array_equal(np.asarray(prepared["input_ids"]), np.asarray([[101, 102, 103]], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(prepared["attention_mask"]), np.asarray([[1, 1, 1]], dtype=np.int32))
+    assert prepared["prompt_text"] == "<chat prompt with tools>"
+    assert len(processor.calls) == 2
+    assert processor.calls[0][0] == prompt["generation_prompt"]
+    assert processor.calls[0][1] == tools
+    assert processor.calls[0][2]["tokenize"] is True
+    assert processor.calls[1][1] == tools
+    assert processor.calls[1][2]["tokenize"] is False
+
+
 def test_maybe_generate_batches_prompts_and_maps_multiple_return_sequences():
     trainer = object.__new__(_PreviewTrainer)
     trainer.arguments = SimpleNamespace(
@@ -742,6 +793,8 @@ def test_maybe_generate_batches_prompts_and_maps_multiple_return_sequences():
             completion_mask=jnp.ones((4, 5), dtype=jnp.int32),
             decoded_prompts=["Prompt 1", "Prompt 2"],
             completion_prompts=["Prompt 1", "Prompt 1", "Prompt 2", "Prompt 2"],
+            reasoning=["r1-0", None, "r2-0", "r2-1"],
+            tool_calls=[[{"name": "lookup-0"}], None, [{"name": "lookup-2"}], []],
         )
 
     trainer.generate_unified = fake_generate_unified
@@ -771,11 +824,15 @@ def test_maybe_generate_batches_prompts_and_maps_multiple_return_sequences():
         {
             "prompt": "Prompt 1",
             "completions": ["prompt-1-completion-0", "prompt-1-completion-1"],
+            "reasoning": ["r1-0", "No reasoning content ..."],
+            "tool_calls": ["[{'name': 'lookup-0'}]", "No tools were called ..."],
             "step": 2,
         },
         {
             "prompt": "Prompt 2",
             "completions": ["prompt-2-completion-0", "prompt-2-completion-1"],
+            "reasoning": ["r2-0", "r2-1"],
+            "tool_calls": ["[{'name': 'lookup-2'}]", "No tools were called ..."],
             "step": 2,
         },
     ]
@@ -865,6 +922,75 @@ def test_maybe_generate_skips_malformed_prompt_when_batching():
         {
             "prompt": "Valid Prompt",
             "completions": ["valid-completion"],
+            "reasoning": ["No reasoning content ..."],
+            "tool_calls": ["No tools were called ..."],
+            "step": 1,
+        }
+    ]
+
+
+def test_maybe_generate_prefers_completion_aligned_text_field():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        generation_interval=1,
+        generation_num_return_sequences=1,
+        use_esurge_generation=True,
+        generation_shard_inputs=False,
+        use_wandb=False,
+        can_log_metrics=False,
+        generation_log_to_wandb=False,
+        generation_preview_print=False,
+    )
+    trainer._pad_token_id = 0
+    trainer.latest_generation_samples = []
+
+    trainer._collect_generation_prompts = lambda: ["prompt-1"]
+    trainer._prepare_generation_input = lambda prompt: {
+        "input_ids": jnp.asarray([[11, 12, 13]], dtype=jnp.int32),
+        "attention_mask": jnp.asarray([[1, 1, 1]], dtype=jnp.int32),
+        "prompt_text": "Prompt 1",
+    }
+    trainer._batch_decode_tokens = lambda token_ids: ["decoded"]
+
+    def fake_generate_unified(
+        *,
+        input_ids,
+        attention_mask,
+        state,
+        use_esurge,
+        apply_chat_template,
+        shard_inputs,
+        all_gather,
+    ):
+        del state, use_esurge, apply_chat_template, shard_inputs, all_gather
+        return GenerationResults(
+            generation_results=["legacy-sequence-text"],
+            prompt_ids=jnp.asarray(input_ids, dtype=jnp.int32),
+            prompt_mask=jnp.asarray(attention_mask, dtype=jnp.int32),
+            sequences=jnp.zeros((1, 8), dtype=jnp.int32),
+            completion_ids=jnp.zeros((1, 5), dtype=jnp.int32),
+            completion_mask=jnp.ones((1, 5), dtype=jnp.int32),
+            decoded_prompts=["Prompt 1"],
+            completion_prompts=["Prompt 1"],
+            text=["parsed-completion"],
+            reasoning=["step-by-step"],
+            tool_calls=[[{"name": "lookup", "arguments": "{}"}]],
+        )
+
+    trainer.generate_unified = fake_generate_unified
+
+    class _Model:
+        def pause_esurge(self, **kwargs):
+            del kwargs
+
+    trainer.maybe_generate(state=SimpleNamespace(model=_Model()), step=1)
+
+    assert trainer.latest_generation_samples == [
+        {
+            "prompt": "Prompt 1",
+            "completions": ["parsed-completion"],
+            "reasoning": ["step-by-step"],
+            "tool_calls": ["[{'arguments': '{}', 'name': 'lookup'}]"],
             "step": 1,
         }
     ]
@@ -900,12 +1026,17 @@ def test_generate_unified_esurge_releases_only_used_engine():
     class _Completion:
         def __init__(self, token_ids):
             self.token_ids = token_ids
+            self.text = "completion-text"
+            self.reasoning_content = "reasoning-text"
+            self.tool_calls = [{"type": "function", "function": {"name": "lookup", "arguments": "{}"}}]
+            self.raw_text = "<tool_call>completion-text</tool_call>"
 
     class _RequestOutput:
         def __init__(self):
             self.prompt_token_ids = [[11, 12]]
             self.outputs = [_Completion([13])]
             self.accumulated_text = "completion-text"
+            self.raw_accumulated_text = "<tool_call>completion-text</tool_call>"
             self.prompt = "prompt-text"
 
     class _Engine:
@@ -949,6 +1080,10 @@ def test_generate_unified_esurge_releases_only_used_engine():
     assert model.call_esurge_engine_kwargs is not None
     assert model.get_esurge_kwargs["runner_verbose"] is True
     assert results.generation_results == ["completion-text"]
+    assert results.text == ["completion-text"]
+    assert results.reasoning == ["reasoning-text"]
+    assert results.tool_calls == [[{"type": "function", "function": {"name": "lookup", "arguments": "{}"}}]]
+    assert results.raw_text == ["<tool_call>completion-text</tool_call>"]
     assert engine.pause_calls == 1
     assert engine.release_calls == [False]
 
@@ -1043,6 +1178,66 @@ def test_generate_unified_esurge_propagates_generation_penalties():
     assert sampling_params.repetition_penalty == pytest.approx(1.4)
 
 
+def test_generate_unified_compiled_populates_completion_aligned_text_fields():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        generation_max_new_tokens=2,
+        max_completion_length=None,
+        generation_temperature=0.7,
+        generation_top_p=0.95,
+        generation_top_k=64,
+        generation_presence_penalty=0.0,
+        generation_frequency_penalty=0.0,
+        generation_repetition_penalty=1.0,
+        generation_num_return_sequences=1,
+        use_esurge_generation=False,
+    )
+    trainer._pad_token_id = 0
+    trainer.generate_function = None
+    trainer.generate_function_with_model_kwargs = None
+    trainer.model_state = SimpleNamespace(model=SimpleNamespace())
+    trainer._model = SimpleNamespace(generation_config=SimpleNamespace(eos_token_id=99))
+
+    class _Processor:
+        pad_token_id = 0
+        eos_token_id = 99
+
+        @staticmethod
+        def decode(seq, skip_special_tokens=True):
+            values = [int(token) for token in np.asarray(seq).tolist()]
+            if skip_special_tokens:
+                values = [token for token in values if token not in (0, 99)]
+            return "|".join(str(token) for token in values)
+
+    trainer.processing_class = _Processor()
+
+    def fake_generate_aio(*, input_ids, attention_mask, **kwargs):
+        del kwargs
+        return (
+            jnp.asarray([[11, 12, 0, 99, 21]], dtype=jnp.int32),
+            jnp.asarray(input_ids, dtype=jnp.int32),
+            jnp.asarray(attention_mask, dtype=jnp.int32),
+        )
+
+    trainer.generate_aio = fake_generate_aio
+
+    results = trainer.generate_unified(
+        input_ids=jnp.asarray([[11, 12, 0]], dtype=jnp.int32),
+        attention_mask=jnp.asarray([[1, 1, 0]], dtype=jnp.int32),
+        state=trainer.model_state,
+        use_esurge=False,
+        shard_inputs=False,
+        release_runtime_after_generation=False,
+        all_gather=False,
+    )
+
+    assert results.generation_results == ["11|12|21"]
+    assert results.text == ["21"]
+    assert results.reasoning == [None]
+    assert results.tool_calls == [None]
+    assert results.raw_text == ["99|21"]
+
+
 def test_maybe_generate_falls_back_to_per_prompt_after_batch_failure():
     trainer = object.__new__(_PreviewTrainer)
     trainer.arguments = SimpleNamespace(
@@ -1122,6 +1317,8 @@ def test_maybe_generate_falls_back_to_per_prompt_after_batch_failure():
         {
             "prompt": "Good Prompt",
             "completions": ["good-completion"],
+            "reasoning": ["No reasoning content ..."],
+            "tool_calls": ["No tools were called ..."],
             "step": 1,
         }
     ]
