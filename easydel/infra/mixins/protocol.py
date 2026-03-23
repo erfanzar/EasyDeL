@@ -3384,6 +3384,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         gather_fns: dict[str, tp.Callable] | None = None,
         float_dtype: jnp.dtype | None = None,
         step: int | None = None,
+        upload_num_threads: int | None = None,
         **kwargs,
     ):
         """Saves the model, its configuration, and optionally pushes it to the Hugging Face Hub.
@@ -3395,6 +3396,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
             gather_fns: Custom gather functions for checkpoint saving.
             float_dtype: Data type for saving weights.
             step: Optional step number for checkpoint naming.
+            upload_num_threads: Number of concurrent upload threads to use for Hub commits.
+                If None, EasyDeL auto-selects a capped default.
             **kwargs: Additional keyword arguments for Hugging Face Hub.
         """
         ...
@@ -3414,6 +3417,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         mismatch_allowed: bool = True,
         revision: str | None = None,
         commit_description: str | None = None,
+        upload_num_threads: int | None = None,
     ) -> str:
         """Pushes the model to the Hugging Face Hub.
 
@@ -3430,6 +3434,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
             mismatch_allowed: If True, allows mismatch in parameters while loading.
             revision: The revision to push to.
             commit_description: The commit description for the push.
+            upload_num_threads: Number of concurrent upload threads to use for Hub commits.
+                If None, EasyDeL auto-selects a capped default.
 
         Returns:
             The URL of the created repository.

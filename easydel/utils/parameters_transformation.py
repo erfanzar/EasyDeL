@@ -137,7 +137,10 @@ class TensorConverter:
         """Convert JAX array to PyTorch tensor."""
         if check_bool_flag("EASY_SAFE_TRANSFER", True):
             x = jax.device_get(x)
-            return TensorConverter.get_torch().from_numpy(np.array(x.tolist(), dtype=x.dtype))
+            x = np.asarray(x)
+            if not x.flags.c_contiguous:
+                x = np.ascontiguousarray(x)
+            return TensorConverter.get_torch().from_numpy(x)
         else:
             from torch import cuda
             from torch.utils import dlpack as dlpack_pt

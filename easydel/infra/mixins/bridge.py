@@ -589,6 +589,7 @@ class EasyBridgeMixin(PushToHubMixin):
         gather_fns: dict[str, tp.Callable] | None = None,
         float_dtype: jnp.dtype | None = None,
         step: int | None = None,
+        upload_num_threads: int | None = None,
         **kwargs,
     ):
         """Saves the model, its configuration, and optionally pushes it to the Hugging Face Hub.
@@ -604,6 +605,8 @@ class EasyBridgeMixin(PushToHubMixin):
             float_dtype (jnp.dtype, optional): Data type for saving weights. Defaults to None.
             step (int, optional): The training step number for versioned checkpoints.
                 Defaults to None.
+            upload_num_threads (int | None, optional): Number of concurrent upload threads
+                to use for Hub commits. If None, EasyDeL auto-selects a capped default.
             **kwargs: Additional keyword arguments for Hugging Face Hub (e.g., repo_id,
                 commit_message).
         """
@@ -638,6 +641,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 files_timestamps,
                 commit_message=commit_message,
                 token=token,
+                upload_num_threads=upload_num_threads,
             )
 
     def push_to_hub(
@@ -654,6 +658,7 @@ class EasyBridgeMixin(PushToHubMixin):
         mismatch_allowed: bool = True,
         revision: str | None = None,
         commit_description: str | None = None,
+        upload_num_threads: int | None = None,
     ) -> tp.Any:
         """Pushes the model to the Hugging Face Hub.
 
@@ -670,6 +675,8 @@ class EasyBridgeMixin(PushToHubMixin):
             mismatch_allowed (bool, optional): If True, allows mismatch in parameters while loading. Defaults to True.
             revision (str, optional): The revision to push to.
             commit_description (str, optional): The commit description for the push.
+            upload_num_threads (int | None, optional): Number of concurrent upload threads
+                to use for Hub commits. If None, EasyDeL auto-selects a capped default.
 
         Returns:
             str: The URL of the created repository.
@@ -708,6 +715,7 @@ class EasyBridgeMixin(PushToHubMixin):
                 create_pr=create_pr,
                 revision=revision,
                 commit_description=commit_description,
+                upload_num_threads=upload_num_threads,
             )
 
     @classmethod
@@ -729,6 +737,7 @@ class EasyBridgeMixin(PushToHubMixin):
         create_pr: bool = False,
         revision: str | None = None,
         commit_description: str | None = None,
+        upload_num_threads: int | None = None,
     ):
         """
         Uploads all modified files under `working_dir` to `repo_id`, at arbitrary depth, based on `files_timestamps`.
@@ -782,6 +791,11 @@ class EasyBridgeMixin(PushToHubMixin):
             logger.info("No modified files found in %s; nothing to upload.", working_dir)
             return None
 
+        upload_num_threads = self._resolve_upload_num_threads(
+            upload_num_threads=upload_num_threads,
+            operation_count=len(operations),
+        )
+
         if revision is not None and not revision.startswith("refs/pr"):
             try:
                 create_branch(repo_id=repo_id, branch=revision, token=token, exist_ok=True)
@@ -792,7 +806,7 @@ class EasyBridgeMixin(PushToHubMixin):
                     raise
 
         logger.info(f"Uploading the files to {repo_id}")
-        return create_commit(
+        create_commit_kwargs = dict(
             repo_id=repo_id,
             operations=operations,
             commit_message=commit_message,
@@ -801,6 +815,25 @@ class EasyBridgeMixin(PushToHubMixin):
             create_pr=create_pr,
             revision=revision,
         )
+        if upload_num_threads is not None:
+            create_commit_kwargs["num_threads"] = upload_num_threads
+        return create_commit(**create_commit_kwargs)
+
+    @staticmethod
+    def _resolve_upload_num_threads(upload_num_threads: int | None, operation_count: int) -> int:
+        """Resolve Hub upload concurrency with a conservative automatic default."""
+        if upload_num_threads is not None:
+            return max(int(upload_num_threads), 1)
+
+        cpu_count = int(os.cpu_count() or 1)
+        auto_threads = max(1, min(cpu_count, 16, max(int(operation_count), 1)))
+        logger.info(
+            "Auto-selected upload_num_threads=%s (operations=%s, os.cpu_count()=%s).",
+            auto_threads,
+            int(operation_count),
+            cpu_count,
+        )
+        return auto_threads
 
     @classmethod
     def _load_model_weights(
@@ -1120,7 +1153,8 @@ class EasyBridgeMixin(PushToHubMixin):
             quantization_config (QuantizationConfig | None): Quantization configuration
                 for loading. Pass None to disable. Defaults to None.
             apply_quantization (bool): Whether to apply module-level quantization. Defaults to False.
-            **kwargs: Additional keyword arguments (e.g., proxies, trust_remote_code, subfolder).
+            **kwargs: Additional keyword arguments (e.g., proxies, trust_remote_code, subfolder,
+                max_workers for remote snapshot downloads).
 
         Returns:
             EasyDeLBaseModule: The loaded EasyDeL model with weights.
@@ -1153,6 +1187,11 @@ class EasyBridgeMixin(PushToHubMixin):
         from_auto_class = kwargs.pop("_from_auto", False)
         subfolder = kwargs.pop("subfolder", "")
         commit_hash = kwargs.pop("_commit_hash", None)
+        snapshot_max_workers = kwargs.pop("max_workers", None)
+        if snapshot_max_workers is None:
+            snapshot_max_workers = max(1, min(int(os.cpu_count() or 1), 16))
+        else:
+            snapshot_max_workers = max(int(snapshot_max_workers), 1)
 
         # Not relevant for Flax Models
         _ = kwargs.pop("adapter_kwargs", None)
@@ -1307,6 +1346,7 @@ class EasyBridgeMixin(PushToHubMixin):
                     proxies=proxies,
                     token=token,
                     local_files_only=local_files_only,
+                    max_workers=snapshot_max_workers,
                 )
 
             if is_local:
