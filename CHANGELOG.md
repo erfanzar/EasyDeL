@@ -2,6 +2,18 @@
 
 ---
 
+## 2026-03-24
+
+### refactor: remove save-time `gather_fns` plumbing and keep explicit gather APIs
+
+**Checkpoint Save API Cleanup** — Removed `gather_fns` from the save/export plumbing on `EasyDeLState.save_state`, trainer save helpers, and model `save_pretrained`/`push_to_hub`. Checkpoints are now written exactly from the current model/state tree instead of accepting per-save gather callbacks.
+
+**Explicit Gather Path Preserved** — `EasyDeLBaseModule.gather_model()` and `EasyDeLState.gather_model()` remain supported and are still the intended way to materialize gathered weights before export when needed.
+
+**Call Site Cleanup** — No in-tree save/export callers still depend on `gather_fns`. Remaining `gather_fns` references are limited to gather-model internals, auto-configuration helpers that still build shard/gather functions, and stale docs/changelog notes that describe the older API.
+
+---
+
 ## 2026-03-17
 
 ### feat: Add loss strategy abstraction, TPU preemption checkpointing, training resume improvements, and license headers

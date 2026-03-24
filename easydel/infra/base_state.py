@@ -1125,7 +1125,6 @@ class EasyDeLState(struct.PyTreeNode):
         float_dtype: jnp.dtype | None = None,
         save_optimizer: bool = True,
         step: int | None = None,
-        gather_fns: dict[str, tp.Callable] | None = None,
     ) -> None:
         """Save the complete EasyDeLState to a directory.
 
@@ -1145,9 +1144,6 @@ class EasyDeLState(struct.PyTreeNode):
                 Defaults to True.
             step (int | None): Training step to record in checkpoint metadata.
                 If None, uses the current `self.step` value. Defaults to None.
-            gather_fns (dict[str, Callable] | None): Optional parameter gather
-                functions forwarded to ``model.save_pretrained`` for callers
-                that need explicit sharded-weight gathering behavior.
 
         Returns:
             None
@@ -1176,6 +1172,8 @@ class EasyDeLState(struct.PyTreeNode):
             - Model configuration (config.json)
             - Model parameters (easydel-model.parameters or TensorStore)
             - Optimizer state if `save_optimizer=True` (TensorStore format)
+            - The current model tree exactly as stored in the state; call
+              ``state.gather_model()`` first if you need gathered weights
 
         See Also:
             - :meth:`load_state`: Load complete state from checkpoint.
@@ -1191,7 +1189,6 @@ class EasyDeLState(struct.PyTreeNode):
 
         self.model.save_pretrained(
             save_directory=save_directory,
-            gather_fns=gather_fns,
             float_dtype=float_dtype,
             step=step,
         )

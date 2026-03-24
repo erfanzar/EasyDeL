@@ -14,6 +14,7 @@
 
 import json
 
+import jax
 import jax.numpy as jnp
 
 from easydel.infra.base_state import EasyDeLState
@@ -36,21 +37,19 @@ class _StateStub:
         raise AssertionError("save_optimizer should not be called in this test")
 
 
-def test_save_state_forwards_gather_fns_and_writes_metadata(tmp_path):
+def test_save_state_forwards_standard_save_kwargs_and_writes_metadata(tmp_path):
     model = _ModelStub()
     state = _StateStub(model)
-    gather_fns = {"params": lambda x: x}
 
     EasyDeLState.save_state(
         state,
         save_directory=tmp_path,
         save_optimizer=False,
-        gather_fns=gather_fns,
     )
 
     assert len(model.calls) == 1
+    assert set(model.calls[0]) == {"save_directory", "float_dtype", "step"}
     assert str(model.calls[0]["save_directory"]) == str(tmp_path)
-    assert model.calls[0]["gather_fns"] is gather_fns
     assert model.calls[0]["float_dtype"] is None
     assert model.calls[0]["step"] == 7
     metadata = json.loads((tmp_path / "metadata.json").read_text())
@@ -58,7 +57,7 @@ def test_save_state_forwards_gather_fns_and_writes_metadata(tmp_path):
     assert metadata["is_temporary"] is False
 
 
-def test_save_optimizer_uses_compatibility_helper_in_multiprocess_mode(tmp_path, monkeypatch):
+def test_save_optimizer_preserves_tree_in_multiprocess_mode(tmp_path, monkeypatch):
     saved_trees: list[dict[str, object]] = []
 
     class _MeshCtx:
@@ -82,10 +81,6 @@ def test_save_optimizer_uses_compatibility_helper_in_multiprocess_mode(tmp_path,
     )()
 
     monkeypatch.setattr("easydel.infra.base_state.jax.process_count", lambda: 2)
-    monkeypatch.setattr(
-        "easydel.infra.base_state.ensure_multiprocess_checkpoint_compatible",
-        lambda tree, *, mesh, context: {"momentum": "compat"},
-    )
 
     EasyDeLState.save_optimizer(
         state,
@@ -93,4 +88,5 @@ def test_save_optimizer_uses_compatibility_helper_in_multiprocess_mode(tmp_path,
         checkpointer=_CheckpointerStub(),
     )
 
-    assert saved_trees == [{"momentum": "compat"}]
+    assert len(saved_trees) == 1
+    assert isinstance(saved_trees[0]["momentum"], jax.Array)

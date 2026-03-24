@@ -44,7 +44,6 @@ class TrainerOutput:
         state: The final EasyDeLState after training completion.
         mesh: The JAX sharding mesh used during training, if any.
         checkpoint_manager: Manager object for handling model checkpoints.
-        gather_fns: Functions for gathering sharded parameters to host.
         shard_fns: Functions for sharding parameters across devices.
         last_save_file_name: Name of the most recently saved checkpoint file.
         checkpoint_path: Full path to the checkpoint directory.
@@ -53,7 +52,6 @@ class TrainerOutput:
     state: EasyDeLState
     mesh: jax.sharding.Mesh | None
     checkpoint_manager: tp.Any
-    gather_fns: CallFN | None = None
     shard_fns: CallFN | None = None
     last_save_file_name: str | None = None
     checkpoint_path: str | None = None

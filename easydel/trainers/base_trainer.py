@@ -4161,12 +4161,8 @@ class BaseTrainer(BaseTrainerProtocol):
         directory_name.mkdir(exist_ok=True)
         self.arguments.save_arguments(directory_name / DEFAULT_ARGS_JSON_NAME)
         self._save_readme(directory_name)
-        gather_fns = kwargs.get("gather_fns")
-        if jax.process_count() > 1 and gather_fns is not None:
-            gather_fns = None
         state.save_state(
             save_directory=directory_name,
-            gather_fns=gather_fns,
             float_dtype=self.model.param_dtype,
             save_optimizer=self.arguments.save_optimizer_state,
         )
@@ -4501,7 +4497,6 @@ class BaseTrainer(BaseTrainerProtocol):
         self,
         state: EasyDeLState,
         save_directory: str | None = None,
-        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None = None,
         to_torch: bool = False,
         easystate_to_huggingface_model_kwargs: dict | None = None,
         torch_save_pretrained_kwargs: dict | None = None,
@@ -4511,7 +4506,6 @@ class BaseTrainer(BaseTrainerProtocol):
         Args:
             state: The model state to save.
             save_directory: Directory to save to. If None, uses default from arguments.
-            gather_fns: Optional gather functions for distributed parameter collection.
             to_torch: If True, converts and saves as a HuggingFace PyTorch model.
             easystate_to_huggingface_model_kwargs: Extra kwargs for EasyDeL-to-HF conversion.
             torch_save_pretrained_kwargs: Extra kwargs for HF save_pretrained.
@@ -4531,7 +4525,6 @@ class BaseTrainer(BaseTrainerProtocol):
         else:
             return self._save_state(
                 state=state,
-                gather_fns=gather_fns,
                 save_directory=save_directory,
             )
 
@@ -4825,8 +4818,6 @@ class BaseTrainer(BaseTrainerProtocol):
         self,
         state: EasyDeLState,
         exception: Exception,
-        shard_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
-        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
     ):
         """Handle training interruption gracefully."""
         if isinstance(exception, KeyboardInterrupt):
@@ -4837,9 +4828,6 @@ class BaseTrainer(BaseTrainerProtocol):
             raise RuntimeError("EasyDeL Runtime dumped") from exception
         return self._prepare_training_output(
             state=state,
-            checkpoint_manager=self.checkpoint_manager,
-            shard_fns=shard_fns,
-            gather_fns=gather_fns,
             run_exception=None,
         )
 

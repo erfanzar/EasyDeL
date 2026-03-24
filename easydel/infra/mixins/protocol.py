@@ -3095,11 +3095,6 @@ class BaseModuleProtocol(metaclass=ABCMeta):
     def _shard_fns(self):
         """property shard functions for model state and parameters."""
 
-    @property
-    @abstractmethod
-    def _gather_fns(self):
-        """property gather functions for model state and parameters."""
-
     @abstractmethod
     def quantize(
         self: Self,  # pyright: ignore[reportInvalidTypeVarUse]
@@ -3381,7 +3376,6 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         save_directory: str | os.PathLike,
         push_to_hub: bool = False,
         token: str | bool | None = None,
-        gather_fns: dict[str, tp.Callable] | None = None,
         float_dtype: jnp.dtype | None = None,
         step: int | None = None,
         upload_num_threads: int | None = None,
@@ -3393,7 +3387,6 @@ class BaseModuleProtocol(metaclass=ABCMeta):
             save_directory: Directory where to save the model.
             push_to_hub: If True, pushes the model to the Hugging Face Hub.
             token: The Hugging Face Hub token.
-            gather_fns: Custom gather functions for checkpoint saving.
             float_dtype: Data type for saving weights.
             step: Optional step number for checkpoint naming.
             upload_num_threads: Number of concurrent upload threads to use for Hub commits.
@@ -3411,7 +3404,6 @@ class BaseModuleProtocol(metaclass=ABCMeta):
         private: bool | None = None,
         token: bool | str | None = None,
         create_pr: bool = False,
-        gather_fns: dict[str, tp.Callable] | None = None,
         float_dtype: jnp.dtype | None = None,
         verbose: bool = True,
         mismatch_allowed: bool = True,
@@ -3428,7 +3420,6 @@ class BaseModuleProtocol(metaclass=ABCMeta):
             private: If True, creates a private repository.
             token: The Hugging Face Hub token.
             create_pr: If True, creates a pull request.
-            gather_fns: Custom gather functions for checkpoint saving.
             float_dtype: Data type for saving weights.
             verbose: Whether to print verbose messages.
             mismatch_allowed: If True, allows mismatch in parameters while loading.
