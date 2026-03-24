@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from easydel.data.core.protocols import ShardedDataSource, ShardInfo
 from easydel.infra.errors import EasyDeLPreemptionSignal
 from easydel.trainers.base_trainer import BaseTrainer, GenerationResults
 from easydel.trainers.proximal_policy_optimization_trainer.modeling_value_head import CausalLMWithValueHead
@@ -67,6 +68,38 @@ class _PreviewTrainer(BaseTrainer):
 
     def _finalize_training(self, *args, **kwargs):
         raise NotImplementedError
+
+
+class _PreviewShardedSource(ShardedDataSource[dict]):
+    def __init__(self, shards: dict[str, list[dict]], *, expose_row_counts: bool):
+        self._shards = shards
+        self._expose_row_counts = expose_row_counts
+        self.open_shard_calls: list[str] = []
+        self.open_shard_at_row_calls: list[tuple[str, int]] = []
+
+    @property
+    def shard_names(self):
+        return list(self._shards.keys())
+
+    def num_shards(self) -> int:
+        return len(self._shards)
+
+    def open_shard(self, shard_name: str):
+        self.open_shard_calls.append(shard_name)
+        yield from self._shards[shard_name]
+
+    def open_shard_at_row(self, shard_name: str, row: int):
+        self.open_shard_at_row_calls.append((shard_name, row))
+        yield from self._shards[shard_name][row:]
+
+    def get_shard_info(self, shard_name: str):
+        if not self._expose_row_counts:
+            return None
+        return ShardInfo(
+            shard_id=self.shard_names.index(shard_name),
+            shard_name=shard_name,
+            num_rows=len(self._shards[shard_name]),
+        )
 
 
 class _NoopTimer:
@@ -690,6 +723,55 @@ def test_prepare_generation_input_passes_dataset_tools_to_chat_template():
     assert processor.calls[0][2]["tokenize"] is True
     assert processor.calls[1][1] == tools
     assert processor.calls[1][2]["tokenize"] is False
+
+
+def test_sample_prompts_from_dataset_supports_sharded_source_with_row_metadata():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer._generation_rng = np.random.default_rng(0)
+    trainer.dataset_train = _PreviewShardedSource(
+        {
+            "shard_a": [
+                {"messages": [{"role": "user", "content": "a0"}], "tools": [{"name": "lookup_a0"}]},
+                {"messages": [{"role": "user", "content": "a1"}], "tools": [{"name": "lookup_a1"}]},
+            ],
+            "shard_b": [
+                {"messages": [{"role": "user", "content": "b0"}], "tools": [{"name": "lookup_b0"}]},
+                {"messages": [{"role": "user", "content": "b1"}], "tools": [{"name": "lookup_b1"}]},
+                {"messages": [{"role": "user", "content": "b2"}], "tools": [{"name": "lookup_b2"}]},
+            ],
+        },
+        expose_row_counts=True,
+    )
+
+    prompts = BaseTrainer._sample_prompts_from_dataset(trainer, 2)
+
+    assert len(prompts) == 2
+    assert all("messages" in prompt and "tools" in prompt for prompt in prompts)
+    assert trainer.dataset_train.open_shard_at_row_calls
+    assert trainer.dataset_train.open_shard_calls == []
+
+
+def test_sample_prompts_from_dataset_supports_sharded_source_without_row_metadata():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer._generation_rng = np.random.default_rng(0)
+    trainer.dataset_train = _PreviewShardedSource(
+        {
+            "shard_a": [
+                {"messages": [{"role": "user", "content": "a0"}], "tools": [{"name": "lookup_a0"}]},
+                {"messages": [{"role": "user", "content": "a1"}], "tools": [{"name": "lookup_a1"}]},
+            ],
+            "shard_b": [
+                {"messages": [{"role": "user", "content": "b0"}], "tools": [{"name": "lookup_b0"}]},
+            ],
+        },
+        expose_row_counts=False,
+    )
+
+    prompts = BaseTrainer._sample_prompts_from_dataset(trainer, 2)
+
+    assert len(prompts) == 2
+    assert all("messages" in prompt and "tools" in prompt for prompt in prompts)
+    assert trainer.dataset_train.open_shard_calls
 
 
 def test_maybe_generate_batches_prompts_and_maps_multiple_return_sequences():

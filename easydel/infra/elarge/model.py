@@ -108,6 +108,9 @@ class BuildTrainerKws(typing.TypedDict, total=False):
         reward_model: Reward model for GRPO training
         teacher_model: Teacher model for distillation training
         reward_funcs: Custom reward functions for GRPO/SDPO/PPO-style trainers
+        external_reward_funcs: Additional external reward functions for RLVR
+        external_reward_processing_classes: Processing classes for RLVR external reward functions
+        external_reward_weights: Weights for RLVR external reward functions
         feedback_func: Optional textual feedback callback for SDPO
         env_factory: Environment factory for AgenticMoshPit trainer
         tools: Tool instances for AgenticMoshPit trainer
@@ -121,6 +124,9 @@ class BuildTrainerKws(typing.TypedDict, total=False):
     reward_model: NotRequired[EasyDeLBaseModule | None]
     teacher_model: NotRequired[EasyDeLBaseModule | None]
     reward_funcs: NotRequired[Any | None]
+    external_reward_funcs: NotRequired[Any | None]
+    external_reward_processing_classes: NotRequired[list[typing.Callable] | None]
+    external_reward_weights: NotRequired[list[float] | None]
     feedback_func: NotRequired[typing.Callable | None]
     env_factory: NotRequired[typing.Callable | None]
     tools: NotRequired[list | None]
@@ -1421,6 +1427,9 @@ class eLargeModel:
                 - reward_model: Override reward model
                 - teacher_model: Override teacher model
                 - reward_funcs: Custom reward functions
+                - external_reward_funcs: Additional RLVR reward functions appended after built-in verifiers
+                - external_reward_processing_classes: Processing classes for RLVR external reward functions
+                - external_reward_weights: Weights for RLVR external reward functions
 
         Returns:
             Training results from the trainer, including metrics and final model state
@@ -1833,10 +1842,13 @@ class eLargeModel:
             trainer_kwargs["arguments"] = training_args
             trainer_kwargs["model"] = model
             trainer_kwargs["reward_funcs"] = reward_funcs
+            trainer_kwargs["external_reward_funcs"] = kwargs.get("external_reward_funcs")
             trainer_kwargs["train_dataset"] = train_dataset
             trainer_kwargs["eval_dataset"] = eval_dataset
             trainer_kwargs["processing_class"] = self._tokenizer
             trainer_kwargs["reward_processing_classes"] = kwargs.get("reward_processing_classes")
+            trainer_kwargs["external_reward_processing_classes"] = kwargs.get("external_reward_processing_classes")
+            trainer_kwargs["external_reward_weights"] = kwargs.get("external_reward_weights")
             trainer_kwargs["data_tokenize_fn"] = kwargs.get("data_tokenize_fn")
 
         elif trainer_type == "embedding":

@@ -2847,6 +2847,8 @@ class BaseTrainer(BaseTrainerProtocol):
         dataset = getattr(self, "dataset_train", None)
         if dataset is None or expected <= 0:
             return []
+        if isinstance(dataset, ShardedDataSource):
+            return self._sample_prompts_from_sharded_source(dataset, expected)
         try:
             dataset_len = len(dataset)
         except Exception as exc:  # pragma: no cover - some datasets are not sized
@@ -2864,6 +2866,114 @@ class BaseTrainer(BaseTrainerProtocol):
                 log_debug_maybe(f"Failed to sample dataset prompt at index {idx}: {exc}")
                 continue
             prompts.append(sample)
+        return prompts
+
+    def _sample_random_example_from_shard(
+        self,
+        source: ShardedDataSource[tp.Any],
+        shard_name: str,
+        *,
+        row_index: int | None = None,
+        shard_rows: int | None = None,
+    ) -> tp.Any | None:
+        """Sample a single example from one shard.
+
+        Prefers direct row seeks when a row index or row count is available.
+        Falls back to reservoir sampling over ``open_shard`` when shard sizes
+        are unknown.
+        """
+        try:
+            if row_index is not None:
+                return next(source.open_shard_at_row(shard_name, int(row_index)), None)
+            if shard_rows is not None and shard_rows > 0:
+                random_row = int(self._generation_rng.integers(shard_rows))
+                return next(source.open_shard_at_row(shard_name, random_row), None)
+            sampled = None
+            for seen, example in enumerate(source.open_shard(shard_name), start=1):
+                if int(self._generation_rng.integers(seen)) == 0:
+                    sampled = example
+            return sampled
+        except Exception as exc:  # pragma: no cover - best effort sampling for previews
+            log_debug_maybe(f"Failed to sample preview prompt from shard '{shard_name}': {exc}")
+            return None
+
+    def _sample_prompts_from_sharded_source(
+        self,
+        source: ShardedDataSource[tp.Any],
+        expected: int,
+    ) -> list[tp.Any]:
+        """Randomly sample raw examples from a :class:`ShardedDataSource`.
+
+        When shard row counts are available, samples globally across the full
+        source and uses ``open_shard_at_row`` for efficient random access.
+        Otherwise falls back to per-shard sampling with reservoir selection.
+        """
+        shard_names = list(source.shard_names)
+        if not shard_names or expected <= 0:
+            return []
+
+        shard_rows: list[int | None] = []
+        all_shard_sizes_known = True
+        for shard_name in shard_names:
+            row_count: int | None = None
+            try:
+                info = source.get_shard_info(shard_name)
+            except Exception as exc:  # pragma: no cover - metadata fetch can fail on remote sources
+                log_debug_maybe(f"Failed to fetch shard info for '{shard_name}': {exc}")
+                info = None
+            if info is not None and info.num_rows is not None:
+                row_count = max(int(info.num_rows), 0)
+            else:
+                all_shard_sizes_known = False
+            shard_rows.append(row_count)
+
+        prompts: list[tp.Any] = []
+        if all_shard_sizes_known:
+            total_rows = int(sum(row_count for row_count in shard_rows if row_count is not None))
+            if total_rows <= 0:
+                return []
+            count = min(expected, total_rows)
+            global_indices = np.asarray(self._generation_rng.choice(total_rows, size=count, replace=False))
+            cumulative_rows = np.cumsum(np.asarray([int(row_count or 0) for row_count in shard_rows], dtype=np.int64))
+            previous_cumulative_rows = np.concatenate((np.asarray([0], dtype=np.int64), cumulative_rows[:-1]))
+
+            for global_idx in np.atleast_1d(global_indices):
+                shard_idx = int(np.searchsorted(cumulative_rows, int(global_idx), side="right"))
+                local_row = int(int(global_idx) - int(previous_cumulative_rows[shard_idx]))
+                sampled = self._sample_random_example_from_shard(
+                    source,
+                    shard_names[shard_idx],
+                    row_index=local_row,
+                    shard_rows=shard_rows[shard_idx],
+                )
+                if sampled is not None:
+                    prompts.append(sampled)
+            return prompts
+
+        nonempty_weights = np.asarray(
+            [float(row_count) if row_count is not None and row_count > 0 else 0.0 for row_count in shard_rows],
+            dtype=np.float64,
+        )
+        sampling_probs: np.ndarray | None = None
+        if nonempty_weights.sum() > 0:
+            sampling_probs = nonempty_weights / nonempty_weights.sum()
+
+        attempts = 0
+        max_attempts = max(expected * 4, len(shard_names))
+        while len(prompts) < expected and attempts < max_attempts:
+            attempts += 1
+            if sampling_probs is None:
+                shard_idx = int(self._generation_rng.integers(len(shard_names)))
+            else:
+                shard_idx = int(self._generation_rng.choice(len(shard_names), p=sampling_probs))
+            sampled = self._sample_random_example_from_shard(
+                source,
+                shard_names[shard_idx],
+                shard_rows=shard_rows[shard_idx],
+            )
+            if sampled is not None:
+                prompts.append(sampled)
+
         return prompts
 
     def _prepare_generation_input(

@@ -41,6 +41,18 @@ Example:
     ...     processing_class=tokenizer,
     ... )
     >>> trainer.train()
+    >>>
+    >>> # Append an external rewarder on top of built-in verifiers
+    >>> def syntax_reward(*, completions, **kwargs):
+    ...     return [1.0 if "<tool_call>" in c else 0.0 for c in completions]
+    >>> trainer = RLVRTrainer(
+    ...     arguments=config,
+    ...     model=model,
+    ...     train_dataset=gsm8k,
+    ...     processing_class=tokenizer,
+    ...     external_reward_funcs=[syntax_reward],
+    ...     external_reward_weights=[0.25],
+    ... )
 """
 
 from .reward_verifiers import (
