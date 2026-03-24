@@ -608,7 +608,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         self,
         state: EasyDeLState,
         save_directory: str | None = None,
-        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None = None,
         to_torch: bool = False,
         easystate_to_huggingface_model_kwargs: dict | None = None,
         torch_save_pretrained_kwargs: dict | None = None,
@@ -733,8 +732,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         self,
         state: EasyDeLState,
         exception: Exception,
-        shard_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
-        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
     ):
         """
         Handle training interruption gracefully.
@@ -742,8 +739,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         Args:
             state: Current model state at interruption.
             exception: The exception that caused interruption.
-            shard_fns: Functions for sharding data.
-            gather_fns: Functions for gathering sharded data.
 
         Returns:
             TrainerOutput or similar containing saved state.
@@ -868,9 +863,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         state: EasyDeLState,
         metrics_tracker: MetricsTracker,
         step_metrics: StepMetrics,
-        start_time: float,
-        shard_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
-        gather_fns: tp.Any | collections.abc.Mapping[str, tp.Callable] | dict[str, tp.Callable] | None,
     ):
         """
         Execute the core training loop.
@@ -883,9 +875,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
             state: Initial model state
             metrics_tracker: Tracker for accumulating metrics
             step_metrics: Calculator for per-step metrics
-            start_time: Training start timestamp
-            shard_fns: Functions for sharding data
-            gather_fns: Functions for gathering sharded data
 
         Returns:
             Tuple of final output and any exception encountered

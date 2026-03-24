@@ -234,7 +234,7 @@ def _checkpoint_cpu_device() -> jax.Device | None:  # pyright: ignore[reportInva
 def _normalize_checkpoint_leaf_to_jax(
     value: tp.Any,
     *,
-    cpu_device: jax.Device | None, # pyright: ignore[reportInvalidTypeForm]
+    cpu_device: jax.Device | None,  # pyright: ignore[reportInvalidTypeForm]
 ) -> tp.Any:
     """Convert NumPy leaves into JAX arrays without consuming accelerator HBM."""
     if not isinstance(value, (np.ndarray, np.generic)):
@@ -495,7 +495,6 @@ class EasyBridgeMixin(PushToHubMixin):
     def _save_model_files(
         self,
         save_directory: ePathLike,
-        gather_fns: dict[str, tp.Callable] | None = None,
         float_dtype=None,
         *,
         step: int | None = None,
@@ -504,8 +503,6 @@ class EasyBridgeMixin(PushToHubMixin):
 
         Args:
             save_directory (ePathLike): The directory where the model files will be saved.
-            gather_fns (dict[Callable], optional): Custom gather functions for checkpoint saving.
-                Defaults to None, which uses the model's default gather functions.
             float_dtype (dtype, optional): Data type for saving weights. Defaults to None.
             step (int, optional): The training step number for versioned checkpoints.
                 Defaults to None.
@@ -524,38 +521,17 @@ class EasyBridgeMixin(PushToHubMixin):
 
         state = nn.split(self, nn.Param, ...)[1]
         state_dict = state.to_pure_dict()
-        if gather_fns is None:
-            if jax.process_count() == 1:
-                try:
-                    gather_fns = self._gather_fns
-                except (AttributeError, NotImplementedError):
-                    gather_fns = None
-            else:
-                logger.info("Skipping gather_fns during multiprocess save (preserve sharded arrays)")
-        if gather_fns is not None:
-            flat_state = flatten_dict(state_dict)
-            flat_gather_fns = gather_fns if is_flatten(gather_fns) else flatten_dict(gather_fns)
-            normalized_gather_fns: dict[tuple, tp.Callable] = {}
-            for key, gather_fn in flat_gather_fns.items():
-                if isinstance(key, str):
-                    normalized_gather_fns[tuple(key.split("."))] = gather_fn
-                else:
-                    normalized_gather_fns[key] = gather_fn
-            for key, gather_fn in normalized_gather_fns.items():
-                value = flat_state.get(key)
-                if value is None or not callable(gather_fn):
-                    continue
-                flat_state[key] = gather_fn(value)
-            state_dict = unflatten_dict(flat_state)
         cpu_device = _checkpoint_cpu_device()
         numpy_leaf_paths: list[str] = []
         state_dict = jax.tree_util.tree_map_with_path(
             lambda path, x: (
-                numpy_leaf_paths.append(tree_path_to_string(path, sep=".")),
-                _normalize_checkpoint_leaf_to_jax(x, cpu_device=cpu_device),
-            )[-1]
-            if isinstance(x, (np.ndarray, np.generic))
-            else x,
+                (
+                    numpy_leaf_paths.append(tree_path_to_string(path, sep=".")),
+                    _normalize_checkpoint_leaf_to_jax(x, cpu_device=cpu_device),
+                )[-1]
+                if isinstance(x, (np.ndarray, np.generic))
+                else x
+            ),
             state_dict,
         )
         if numpy_leaf_paths:
@@ -586,7 +562,6 @@ class EasyBridgeMixin(PushToHubMixin):
         save_directory: str | os.PathLike,
         push_to_hub: bool = False,
         token: str | bool | None = None,
-        gather_fns: dict[str, tp.Callable] | None = None,
         float_dtype: jnp.dtype | None = None,
         step: int | None = None,
         upload_num_threads: int | None = None,
@@ -600,8 +575,6 @@ class EasyBridgeMixin(PushToHubMixin):
                 Defaults to False.
             token (str or bool, optional): The Hugging Face Hub token for authentication.
                 Defaults to None.
-            gather_fns (dict[Callable], optional): Custom gather functions for checkpoint saving.
-                Defaults to None.
             float_dtype (jnp.dtype, optional): Data type for saving weights. Defaults to None.
             step (int, optional): The training step number for versioned checkpoints.
                 Defaults to None.
@@ -609,6 +582,10 @@ class EasyBridgeMixin(PushToHubMixin):
                 to use for Hub commits. If None, EasyDeL auto-selects a capped default.
             **kwargs: Additional keyword arguments for Hugging Face Hub (e.g., repo_id,
                 commit_message).
+
+        Note:
+            This method saves the model state exactly as it exists. Call
+            ``gather_model()`` first if you need gathered weights before export.
         """
 
         easy_directory = ePath(save_directory)
@@ -626,7 +603,6 @@ class EasyBridgeMixin(PushToHubMixin):
 
         self._save_model_files(
             save_directory=easy_directory,
-            gather_fns=gather_fns,
             float_dtype=float_dtype,
             step=step,
         )
@@ -652,7 +628,6 @@ class EasyBridgeMixin(PushToHubMixin):
         private: bool | None = None,
         token: bool | str | None = None,
         create_pr: bool = False,
-        gather_fns: dict[str, tp.Callable] | None = None,
         float_dtype: jnp.dtype | None = None,
         verbose: bool = True,
         mismatch_allowed: bool = True,
@@ -669,7 +644,6 @@ class EasyBridgeMixin(PushToHubMixin):
             private (bool, optional): If True, creates a private repository.
             token (str or bool, optional): The Hugging Face Hub token.
             create_pr (bool, optional): If True, creates a pull request.
-            gather_fns (dict[Callable], optional): Custom gather functions for checkpoint saving.
             float_dtype (dtype, optional): Data type for saving weights.
             verbose (bool, optional): Whether to print verbose messages. Defaults to True.
             mismatch_allowed (bool, optional): If True, allows mismatch in parameters while loading. Defaults to True.
@@ -680,6 +654,10 @@ class EasyBridgeMixin(PushToHubMixin):
 
         Returns:
             str: The URL of the created repository.
+
+        Note:
+            Call ``gather_model()`` before pushing if you need gathered weights in
+            the exported checkpoint.
         """
         working_dir = ePath(repo_id.split("/")[-1])
 
@@ -699,7 +677,6 @@ class EasyBridgeMixin(PushToHubMixin):
                 save_directory=work_dir,
                 push_to_hub=False,
                 token=token,
-                gather_fns=gather_fns,
                 float_dtype=float_dtype,
                 verbose=verbose,
                 mismatch_allowed=mismatch_allowed,
@@ -1044,7 +1021,10 @@ class EasyBridgeMixin(PushToHubMixin):
             for unexpected_key in unexpected_keys:
                 del state[unexpected_key]
 
+            cpu_device = _checkpoint_cpu_device()
+
             def _convert(x):
+                x = _normalize_checkpoint_leaf_to_jax(x, cpu_device=cpu_device)
                 if not hasattr(x, "astype"):
                     return x
                 dtype = getattr(x, "dtype", None)

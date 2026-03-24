@@ -1435,12 +1435,8 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             gather_fns.update(overlay_fns)
         return self._apply_sharding_fns(gather_fns)
 
-    def _make_shard_and_gather(self: Self):
-        """Build sanitized shard and gather functions from partition rules.
-
-        Returns:
-            tuple: A pair (shard_fns, gather_fns).
-        """
+    def _make_shard_fns(self: Self):
+        """Build sanitized shard functions from partition rules."""
         mesh = self._get_mesh(None)
         partition_specs = match_partition_rules(
             rules=self._get_partition_rules(None),
@@ -1451,10 +1447,11 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             shape_tree=self.graphtree_params_shape,
             mesh=mesh,
         )
-        return make_shard_and_gather_fns(
+        shard_fns, _ = make_shard_and_gather_fns(
             partition_specs=partition_specs,
             mesh=mesh,
         )
+        return shard_fns
 
     @property
     def _shard_fns(self: Self):
@@ -1464,17 +1461,7 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
             Mapping: A mapping from flattened parameter paths to sharding
                 functions that transform arrays to their sharded form.
         """
-        return self._make_shard_and_gather()[0]
-
-    @property
-    def _gather_fns(self: Self):
-        """Generate gathering functions based on the module's configuration.
-
-        Returns:
-            Mapping: A mapping from flattened parameter paths to gathering
-                functions that collect sharded arrays.
-        """
-        return self._make_shard_and_gather()[1]
+        return self._make_shard_fns()
 
     def apply_out_shardings(self, out_shardings):
         """Apply output sharding specifications to the module state.
