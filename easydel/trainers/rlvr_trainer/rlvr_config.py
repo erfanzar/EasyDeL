@@ -49,8 +49,10 @@ class RLVRConfig(GRPOConfig):
     and updates the policy — all without a critic network.
 
     Attributes:
-        answer_key: Column name in the dataset containing gold
-            answers for math verification.
+        answer_key: Optional column name in the dataset containing
+            gold answers for math verification. Set to ``None`` to
+            disable the built-in math verifier and rely entirely on
+            external rewarders.
         test_key: Column name containing code test cases for
             code verification.
         format_pattern: Optional regex pattern that completions
@@ -89,9 +91,11 @@ class RLVRConfig(GRPOConfig):
         metadata={"help": "Default prefix name for trainer."},
     )
 
-    answer_key: str = field(
+    answer_key: str | None = field(
         default="answer",
-        metadata={"help": "Dataset column containing gold answers for math verification."},
+        metadata={
+            "help": "Dataset column containing gold answers for math verification. Set to None to disable the math verifier."
+        },
     )
     test_key: str = field(
         default="tests",

@@ -81,13 +81,23 @@ class RLVRTrainer(GRPOTrainer):
     Args:
         arguments: ``RLVRConfig`` with training hyperparameters.
         model: Language model or state for the policy.
-        reward_funcs: Optional additional reward functions beyond
-            the built-in verifiers. These are appended to the
-            verifier ensemble.
-        train_dataset: Training dataset with prompts and gold answers.
+        reward_funcs: Backward-compatible alias for additional reward
+            functions beyond the built-in verifiers. These are appended
+            to the verifier ensemble.
+        external_reward_funcs: Explicit external reward functions to
+            append after the built-in verifiers.
+        train_dataset: Training dataset with prompts and optional
+            verifier sideband fields such as gold answers.
         eval_dataset: Optional evaluation dataset.
         processing_class: Tokenizer or processor.
-        reward_processing_classes: Tokenizers for reward models.
+        reward_processing_classes: Processing classes for the full
+            verifier + external reward list. This remains supported for
+            backward compatibility.
+        external_reward_processing_classes: Processing classes only for
+            ``external_reward_funcs``. When provided, built-in verifiers
+            are automatically padded with ``None``.
+        external_reward_weights: Optional weights for
+            ``external_reward_funcs`` only.
         data_tokenize_fn: Optional tokenization function.
 
     Example:
@@ -117,32 +127,55 @@ class RLVRTrainer(GRPOTrainer):
         arguments: RLVRConfig,
         model: EasyDeLBaseModule | EasyDeLState | None,
         reward_funcs: RewardFunc | list[RewardFunc] | None = None,
+        external_reward_funcs: RewardFunc | list[RewardFunc] | None = None,
         train_dataset: Dataset | IterableDataset | ShardedDataSource | None = None,
         eval_dataset: Dataset | IterableDataset | ShardedDataSource | dict[str, Dataset] | None = None,
         processing_class: ProcessingClassType | None = None,
         reward_processing_classes: ProcessingClassType | None = None,
+        external_reward_processing_classes: ProcessingClassType | list[ProcessingClassType] | None = None,
+        external_reward_weights: list[float] | None = None,
         data_tokenize_fn: tp.Callable | None = None,
     ):
         if not isinstance(arguments, RLVRConfig):
             raise TypeError(f"arguments must be RLVRConfig, got {type(arguments)}")
 
         verifiers, weights = self._build_verifiers(arguments)
+        external_rewards = self._coerce_reward_func_list(reward_funcs)
+        external_rewards.extend(self._coerce_reward_func_list(external_reward_funcs))
 
-        if reward_funcs is not None:
-            if not isinstance(reward_funcs, list):
-                reward_funcs = [reward_funcs]
-            verifiers.extend(reward_funcs)
-            user_weights = arguments.reward_weights or [1.0] * len(reward_funcs)
+        if external_rewards:
+            verifiers.extend(external_rewards)
+            if external_reward_weights is not None:
+                user_weights = list(external_reward_weights)
+            else:
+                user_weights = list(arguments.reward_weights or [1.0] * len(external_rewards))
+            if len(user_weights) != len(external_rewards):
+                raise ValueError(
+                    "The number of external reward weights must match the number of external reward functions."
+                )
             weights.extend(user_weights)
 
         if not verifiers:
-            verifiers = [MathVerifier(answer_key=arguments.answer_key)]
-            weights = [1.0]
-            logger.warning(
-                "No verifiers configured and no reward_funcs provided. "
-                "Falling back to MathVerifier with answer_key='%s'.",
-                arguments.answer_key,
-            )
+            if arguments.answer_key:
+                verifiers = [MathVerifier(answer_key=arguments.answer_key)]
+                weights = [1.0]
+                logger.warning(
+                    "No verifiers configured and no reward_funcs provided. "
+                    "Falling back to MathVerifier with answer_key='%s'.",
+                    arguments.answer_key,
+                )
+            else:
+                raise ValueError(
+                    "RLVR requires at least one verifier or external reward function. "
+                    "Set `answer_key`, `format_pattern`, or pass external rewarders."
+                )
+
+        reward_processing_classes = self._merge_reward_processing_classes(
+            verifier_count=len(verifiers) - len(external_rewards),
+            external_reward_count=len(external_rewards),
+            reward_processing_classes=reward_processing_classes,
+            external_reward_processing_classes=external_reward_processing_classes,
+        )
 
         arguments.reward_weights = weights
 
@@ -167,8 +200,9 @@ class RLVRTrainer(GRPOTrainer):
         verifiers: list[tp.Callable] = []
         weights: list[float] = []
 
-        verifiers.append(MathVerifier(answer_key=config.answer_key))
-        weights.append(1.0)
+        if config.answer_key:
+            verifiers.append(MathVerifier(answer_key=config.answer_key))
+            weights.append(1.0)
 
         if config.format_pattern and config.format_reward_weight > 0:
             verifiers.append(FormatVerifier(pattern=config.format_pattern))
@@ -179,3 +213,64 @@ class RLVRTrainer(GRPOTrainer):
             weights.append(config.length_penalty_weight)
 
         return verifiers, weights
+
+    @staticmethod
+    def _coerce_reward_func_list(
+        reward_funcs: RewardFunc | list[RewardFunc] | None,
+    ) -> list[RewardFunc]:
+        if reward_funcs is None:
+            return []
+        return list(reward_funcs) if isinstance(reward_funcs, list) else [reward_funcs]
+
+    @staticmethod
+    def _coerce_processing_class_list(
+        processing_classes: ProcessingClassType | list[ProcessingClassType] | None,
+        *,
+        expected_len: int,
+        field_name: str,
+    ) -> list[ProcessingClassType | None]:
+        if expected_len == 0:
+            return []
+        if processing_classes is None:
+            return [None] * expected_len
+        if isinstance(processing_classes, list):
+            if len(processing_classes) != expected_len:
+                raise ValueError(f"`{field_name}` must have length {expected_len}, got {len(processing_classes)}.")
+            return list(processing_classes)
+        if expected_len == 1:
+            return [processing_classes]
+        raise ValueError(
+            f"`{field_name}` must be a list of length {expected_len} when multiple reward functions are used."
+        )
+
+    @classmethod
+    def _merge_reward_processing_classes(
+        cls,
+        *,
+        verifier_count: int,
+        external_reward_count: int,
+        reward_processing_classes: ProcessingClassType | list[ProcessingClassType] | None,
+        external_reward_processing_classes: ProcessingClassType | list[ProcessingClassType] | None,
+    ) -> list[ProcessingClassType | None] | None:
+        if external_reward_processing_classes is not None and reward_processing_classes is not None:
+            raise ValueError(
+                "Pass either `reward_processing_classes` for the full reward list or "
+                "`external_reward_processing_classes` for external rewards only, not both."
+            )
+        total_count = verifier_count + external_reward_count
+        if total_count == 0:
+            return None
+        if reward_processing_classes is not None:
+            return cls._coerce_processing_class_list(
+                reward_processing_classes,
+                expected_len=total_count,
+                field_name="reward_processing_classes",
+            )
+        if external_reward_processing_classes is not None:
+            external_classes = cls._coerce_processing_class_list(
+                external_reward_processing_classes,
+                expected_len=external_reward_count,
+                field_name="external_reward_processing_classes",
+            )
+            return [None] * verifier_count + external_classes
+        return None
