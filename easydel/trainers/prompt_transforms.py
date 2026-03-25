@@ -80,16 +80,33 @@ def purify_example(example: dict, keep_fields: set[str] | None = None) -> dict:
 
     Args:
         example: Example dict that may contain both text and tokenized fields.
-        keep_fields: Optional set of additional field names to keep.
+        keep_fields: Optional set of additional field names to keep. ``tools``
+            is always preserved when present.
 
     Returns:
         Purified example with only JAX-compatible fields.
     """
     fields_to_keep = _TOKENIZED_FIELDS.copy()
+    fields_to_keep.add("tools")
     if keep_fields:
         fields_to_keep.update(keep_fields)
 
     return {k: v for k, v in example.items() if k in fields_to_keep}
+
+
+def resolve_example_tools(
+    example: dict[str, tp.Any],
+    fallback_tools: list | None = None,
+) -> list | None:
+    """Return per-example tool schemas when available, otherwise ``fallback_tools``."""
+
+    example_tools = example.get("tools")
+    if isinstance(example_tools, str):
+        try:
+            example_tools = json.loads(example_tools)
+        except json.JSONDecodeError:
+            pass
+    return example_tools if example_tools is not None else fallback_tools
 
 
 def is_conversational(example: dict) -> bool:
@@ -357,8 +374,9 @@ class GRPOPreprocessTransform(Transform):
         result["input_ids"] = input_ids
         result["attention_mask"] = attention_mask
 
-        # Remove non-tokenized fields
-        return purify_example(result)
+        # Preserve per-example sideband metadata such as `tools` for reward functions.
+        keep_fields = {"tools"} if "tools" in result else None
+        return purify_example(result, keep_fields=keep_fields)
 
     def __repr__(self) -> str:
         return f"GRPOPreprocessTransform(max_prompt={self._max_prompt_length})"
@@ -445,7 +463,11 @@ class KTOPreprocessTransform(Transform):
 
         # Convert from/value format to role/content if needed (ShareGPT → ChatML)
         example = maybe_convert_to_chatml(example)
-        result = maybe_apply_chat_template(dict(example), self._tokenizer, self._tools)
+        result = maybe_apply_chat_template(
+            dict(example),
+            self._tokenizer,
+            resolve_example_tools(example, self._tools),
+        )
 
         # Strict field access - will raise KeyError if missing
         prompt = result["prompt"]
@@ -608,7 +630,11 @@ class BCOPreprocessTransform(ExpandTransform):
         example = extract_prompt_from_preference(example)
 
         # Step 3: Apply chat template if conversational (uses maybe_apply_chat_template)
-        example = maybe_apply_chat_template(example, self._tokenizer, self._tools)
+        example = maybe_apply_chat_template(
+            example,
+            self._tokenizer,
+            resolve_example_tools(example, self._tools),
+        )
 
         # Step 4: Get fields with strict access - missing fields will raise KeyError
         prompt = example["prompt"]
@@ -654,7 +680,11 @@ class BCOPreprocessTransform(ExpandTransform):
             KeyError: If required fields (prompt, completion, label) are missing.
         """
         result = maybe_convert_to_chatml(dict(example))
-        result = maybe_apply_chat_template(result, self._tokenizer, self._tools)
+        result = maybe_apply_chat_template(
+            result,
+            self._tokenizer,
+            resolve_example_tools(result, self._tools),
+        )
 
         # Strict field access - will raise KeyError if missing
         prompt = result["prompt"]
@@ -790,7 +820,11 @@ class DPOPreprocessTransform(Transform):
         result = extract_prompt_from_preference(example)
 
         # Step 3: Apply chat template if conversational
-        result = maybe_apply_chat_template(result, self._tokenizer, self._tools)
+        result = maybe_apply_chat_template(
+            result,
+            self._tokenizer,
+            resolve_example_tools(result, self._tools),
+        )
 
         # Step 4: Tokenize
         return self._tokenize(result)
@@ -969,7 +1003,11 @@ class RewardPreprocessTransform(Transform):
         had_conversational_prompt = isinstance(example.get("prompt"), list)
         had_conversational_pair = any(isinstance(example.get(key), list) for key in ("chosen", "rejected"))
         result = extract_prompt_from_preference(example)
-        result = maybe_apply_chat_template(result, self._tokenizer)
+        result = maybe_apply_chat_template(
+            result,
+            self._tokenizer,
+            resolve_example_tools(result),
+        )
 
         # Strict field access - will raise KeyError if missing
         chosen = result["chosen"]
@@ -1150,9 +1188,7 @@ class SFTPreprocessTransform(Transform):
         result = dict(example)
 
         # Handle tools if present
-        tools = example.get("tools")
-        if isinstance(tools, str):
-            tools = json.loads(tools)
+        tools = resolve_example_tools(example)
 
         try:
             processed = self._tokenizer.apply_chat_template(
@@ -1225,7 +1261,11 @@ class SFTPreprocessTransform(Transform):
         """Tokenize prompt/completion format with optional masking."""
         raw_example = maybe_convert_to_chatml(dict(example))
         raw_prompt = raw_example.get("prompt")
-        result = maybe_apply_chat_template(raw_example, self._tokenizer)
+        result = maybe_apply_chat_template(
+            raw_example,
+            self._tokenizer,
+            resolve_example_tools(raw_example),
+        )
 
         prompt = result["prompt"]
         completion = result["completion"]
@@ -1238,6 +1278,7 @@ class SFTPreprocessTransform(Transform):
             prompt_ids = self._tokenizer.apply_chat_template(
                 raw_prompt,
                 add_generation_prompt=True,
+                tools=resolve_example_tools(raw_example),
             )
         else:
             prompt_ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]

@@ -33,6 +33,7 @@ except ImportError:
     pytest.skip("JAX unavailable", allow_module_level=True)
 
 from easydel.trainers.self_distillation_policy_optimization import SDPOConfig
+from easydel.trainers.self_distillation_policy_optimization import _fn as sdpo_fn
 from easydel.trainers.self_distillation_policy_optimization.sdpo_trainer import (
     _FEEDBACK_CORRECT,
     _FEEDBACK_TEMPLATE_SOLVE,
@@ -282,6 +283,98 @@ class TestSDPOStepLoss:
         assert batch["completion_ids"].shape == (12, 6)
         assert batch["teacher_ids"].shape == (12, 8 + 10 + 6)
         assert batch["teacher_mask"].shape == batch["teacher_ids"].shape
+
+    def test_max_loss_completion_tokens_truncates_scoring_inputs(self, monkeypatch):
+        captured_shapes = []
+
+        class _DummyState:
+            graphstate = object()
+
+            def merge(self, tree):
+                del tree
+                return object()
+
+        def _fake_get_per_token_logps(
+            module,
+            input_ids,
+            attention_mask,
+            prompt_length,
+            model_kwargs=None,
+            logprob_vocab_chunk_size=None,
+        ):
+            del module, attention_mask, model_kwargs, logprob_vocab_chunk_size
+            captured_shapes.append((tuple(input_ids.shape), int(prompt_length)))
+            return jnp.zeros((input_ids.shape[0], input_ids.shape[1] - prompt_length), dtype=jnp.float32)
+
+        monkeypatch.setattr(sdpo_fn, "get_per_token_logps", _fake_get_per_token_logps)
+
+        batch = self._make_dummy_batch(batch_size=1, num_gen=2, prompt_len=4, comp_len=6, feedback_len=3)
+        metrics = sdpo_fn.sdpo_step(
+            state=_DummyState(),
+            batch=batch,
+            num_generations=2,
+            teacher_prompt_length=7,
+            beta=0.0,
+            distillation_type="jsd",
+            logprob_vocab_chunk_size=8,
+            max_loss_completion_tokens=4,
+            completion_chunk_size=None,
+            loss_config=None,
+            learning_rate_fn=None,
+            partition_spec=None,
+            gradient_accumulation_steps=1,
+            is_training=False,
+            straight_through_emulator=None,
+        )
+
+        assert captured_shapes == [((2, 8), 4), ((2, 11), 7)]
+        assert jnp.allclose(metrics.loss, 0.0)
+
+    def test_completion_chunk_size_splits_scoring_batch(self, monkeypatch):
+        captured_shapes = []
+
+        class _DummyState:
+            graphstate = object()
+
+            def merge(self, tree):
+                del tree
+                return object()
+
+        def _fake_get_per_token_logps(
+            module,
+            input_ids,
+            attention_mask,
+            prompt_length,
+            model_kwargs=None,
+            logprob_vocab_chunk_size=None,
+        ):
+            del module, attention_mask, model_kwargs, logprob_vocab_chunk_size
+            captured_shapes.append((tuple(input_ids.shape), int(prompt_length)))
+            return jnp.zeros((input_ids.shape[0], input_ids.shape[1] - prompt_length), dtype=jnp.float32)
+
+        monkeypatch.setattr(sdpo_fn, "get_per_token_logps", _fake_get_per_token_logps)
+
+        batch = self._make_dummy_batch(batch_size=1, num_gen=2, prompt_len=4, comp_len=6, feedback_len=3)
+        metrics = sdpo_fn.sdpo_step(
+            state=_DummyState(),
+            batch=batch,
+            num_generations=2,
+            teacher_prompt_length=7,
+            beta=0.0,
+            distillation_type="jsd",
+            logprob_vocab_chunk_size=8,
+            max_loss_completion_tokens=4,
+            completion_chunk_size=1,
+            loss_config=None,
+            learning_rate_fn=None,
+            partition_spec=None,
+            gradient_accumulation_steps=1,
+            is_training=False,
+            straight_through_emulator=None,
+        )
+
+        assert captured_shapes == [((1, 8), 4), ((1, 11), 7), ((1, 8), 4), ((1, 11), 7)]
+        assert jnp.allclose(metrics.loss, 0.0)
 
 
 class TestSDPOPromptGuard:

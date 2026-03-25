@@ -58,11 +58,6 @@ from ..training_utils import (
 from ._fn import get_per_token_logps, grpo_step
 from .grpo_config import GRPOConfig
 
-try:
-    import wandb
-except ImportError:
-    wandb = None
-
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
@@ -249,13 +244,6 @@ class GRPOTrainer(Trainer):
         self._initialize_conversational_flags(train_dataset, eval_dataset)
 
         self.data_tokenize_fn = data_tokenize_fn
-        log_table = None
-        if self.arguments.use_wandb and self.arguments.can_log_metrics and wandb is not None:
-            log_table = wandb.Table(
-                columns=["generated_result", "input_prompt", "took", "length", "step"],
-                log_mode="INCREMENTAL",
-            )
-        self.log_table = log_table
 
         super().__init__(
             model_state=model,
@@ -455,8 +443,12 @@ class GRPOTrainer(Trainer):
         batch: dict[str, jax.Array],
         is_train: bool,
     ) -> tuple[dict[str, jax.Array], dict[str, float | int | str]]:
-        # Purify batch first to handle list of dicts (uncollated batch)
+        reward_batch = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
+        if reward_batch:
+            reward_batch = {**batch, **reward_batch}
+        else:
+            reward_batch = batch
         with capture_time() as preprocessing_time_fn:
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
             prompt_model_kwargs = extract_generation_model_kwargs(
@@ -652,7 +644,7 @@ class GRPOTrainer(Trainer):
                             reasoning=reasoning_records,
                             tool_calls=tool_call_records,
                             max_length=self.arguments.max_length,
-                            batch=batch,
+                            batch=reward_batch,
                         )
                         output_reward_func = reward_func(**reward_call_kwargs)
                         rew = jnp.array(
@@ -661,7 +653,6 @@ class GRPOTrainer(Trainer):
                         )
                     rewards_per_func = rewards_per_func.at[:, i].set(rew.reshape(-1))
             rewarding_time = rewarding_time_fn()
-            log_completion_ids = completion_ids
             log_completion_length = jnp.sum(completion_mask, -1)
 
             prompt_ids = self._all_gather(prompt_ids)
@@ -712,20 +703,16 @@ class GRPOTrainer(Trainer):
         }
         for i, reward_func_name in enumerate(self.reward_func_names):
             metrics_dict[reward_func_name] = float(jnp.nanmean(rewards_per_func[:, i]))
-        if self.log_table is not None:
-            cur_step = jax.device_get(state.step)
-            decoded_prompt = completion_prompts
-            decoded_text = self._decode_prompt_batch(
-                self.processing_class,
-                jax.device_get(log_completion_ids),
-                False,
-                self._pad_token_id,
-                True,
-            )
-            for decoded, prompt, length in zip(decoded_text, decoded_prompt, log_completion_length, strict=False):
-                prompt_repr = prompt if isinstance(prompt, str) else str(prompt)
-                self.log_table.add_data(decoded, prompt_repr, generation_time, float(jax.device_get(length)), cur_step)
-            wandb.log({"generations": self.log_table}, step=cur_step)
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=completion_prompts,
+            completions=clean_completions_text,
+            completion_lengths=log_completion_length,
+            generation_time=generation_time,
+            reasoning=reasoning_records,
+            tool_calls=tool_call_records,
+            source="policy",
+        )
 
         # i don't care who you are and what you do.
         # ill find you and ill gather u...

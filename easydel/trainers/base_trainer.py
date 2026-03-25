@@ -313,6 +313,9 @@ class BaseTrainer(BaseTrainerProtocol):
                     values = [item.get(key) for item in per_example]
                     if any(v is None for v in values):
                         continue
+                    if key == "tools":
+                        stacked[key] = values
+                        continue
                     try:
                         arrays = [jnp.asarray(v) for v in values]
                     except Exception:
@@ -1076,6 +1079,25 @@ class BaseTrainer(BaseTrainerProtocol):
         )
 
     @staticmethod
+    def _extract_reward_batch_sidechannels(batch: tp.Any) -> dict[str, tp.Any]:
+        """Preserve non-numeric batch metadata needed by callable reward functions."""
+        if isinstance(batch, dict):
+            if "tools" not in batch:
+                return {}
+            tools = batch["tools"]
+            if isinstance(tools, tuple):
+                tools = list(tools)
+            elif isinstance(tools, (np.ndarray, jax.Array)):
+                tools = np.asarray(jax.device_get(tools), dtype=object).tolist()
+            return {"tools": tools}
+
+        if isinstance(batch, (list, tuple)) and batch and isinstance(batch[0], dict):
+            tools = [example.get("tools") for example in batch]
+            if any(tool is not None for tool in tools):
+                return {"tools": tools}
+        return {}
+
+    @staticmethod
     def _sanitize_text_prompt(prompt: str, processor: PreTrainedTokenizerBase | None) -> str:
         """Remove pad token occurrences from a decoded text prompt.
 
@@ -1499,6 +1521,7 @@ class BaseTrainer(BaseTrainerProtocol):
         self.latest_generation_samples = getattr(self, "latest_generation_samples", [])
         self.latest_benchmark_results = getattr(self, "latest_benchmark_results", {})
         self.preview_log_table = getattr(self, "preview_log_table", None)
+        self.training_generation_log_table = getattr(self, "training_generation_log_table", None)
         self.benchmark_log_table = getattr(self, "benchmark_log_table", None)
         rng = getattr(self, "_generation_rng", None)
         seed = self.arguments.generation_seed
@@ -3549,6 +3572,136 @@ class BaseTrainer(BaseTrainerProtocol):
 
         if rows_added:
             wandb.log({"benchmark_results": self.benchmark_log_table}, step=step)
+
+    @staticmethod
+    def _wandb_stringify_generation_value(value: tp.Any) -> str | None:
+        """Convert prompt/completion metadata into a W&B-table-friendly string."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except TypeError:
+            return str(value)
+
+    def _log_training_generations_to_wandb(
+        self,
+        *,
+        state: EasyDeLState,
+        prompts: tp.Any,
+        completions: list[str] | tuple[str, ...] | None = None,
+        prompt_mask: jax.Array | np.ndarray | None = None,
+        completion_ids: jax.Array | np.ndarray | None = None,
+        completion_mask: jax.Array | np.ndarray | None = None,
+        completion_lengths: jax.Array | np.ndarray | None = None,
+        generation_time: float | None = None,
+        reasoning: list[tp.Any] | tuple[tp.Any, ...] | None = None,
+        tool_calls: list[tp.Any] | tuple[tp.Any, ...] | None = None,
+        source: str = "policy",
+    ) -> None:
+        """Log rollout generations used for training to an incremental W&B table."""
+        args = self.arguments
+        if (
+            args is None
+            or wandb is None
+            or not args.use_wandb
+            or not args.can_log_metrics
+            or not args.log_training_generations_to_wandb
+        ):
+            return
+
+        if self.training_generation_log_table is None:
+            self.training_generation_log_table = wandb.Table(
+                columns=[
+                    "step",
+                    "source",
+                    "sample_idx",
+                    "prompt",
+                    "completion",
+                    "completion_length",
+                    "generation_time",
+                    "reasoning",
+                    "tool_calls",
+                ],
+                log_mode="INCREMENTAL",
+            )
+
+        if hasattr(prompts, "shape"):
+            prompt_ids = np.asarray(jax.device_get(prompts))
+            prompt_attention_mask = None if prompt_mask is None else np.asarray(jax.device_get(prompt_mask), dtype=np.int32)
+            prompt_rows = self._decode_prompt_batch(
+                self.processing_class,
+                prompt_ids,
+                skip_special_tokens=True,
+                pad_token_id=self._pad_token_id,
+                pop_pad_tokens=True,
+                attention_mask=prompt_attention_mask,
+            )
+        elif isinstance(prompts, str):
+            prompt_rows = [prompts]
+        else:
+            prompt_rows = [self._wandb_stringify_generation_value(prompt) or "<prompt>" for prompt in prompts]
+
+        if completions is None:
+            if completion_ids is None:
+                return
+            host_completion_ids = np.asarray(jax.device_get(completion_ids))
+            host_completion_mask = (
+                None if completion_mask is None else np.asarray(jax.device_get(completion_mask), dtype=np.int32)
+            )
+            completion_rows = self._decode_prompt_batch(
+                self.processing_class,
+                host_completion_ids,
+                skip_special_tokens=True,
+                pad_token_id=self._pad_token_id,
+                pop_pad_tokens=True,
+                attention_mask=host_completion_mask,
+            )
+        elif isinstance(completions, str):
+            completion_rows = [completions]
+        else:
+            completion_rows = [
+                self._wandb_stringify_generation_value(completion) or "<completion>" for completion in completions
+            ]
+        if not completion_rows and completion_ids is not None:
+            host_completion_ids = np.asarray(jax.device_get(completion_ids))
+            host_completion_mask = (
+                None if completion_mask is None else np.asarray(jax.device_get(completion_mask), dtype=np.int32)
+            )
+            completion_rows = self._decode_prompt_batch(
+                self.processing_class,
+                host_completion_ids,
+                skip_special_tokens=True,
+                pad_token_id=self._pad_token_id,
+                pop_pad_tokens=True,
+                attention_mask=host_completion_mask,
+            )
+
+        if completion_lengths is None and completion_mask is not None:
+            completion_lengths = jnp.sum(jnp.asarray(completion_mask), axis=-1)
+        length_rows = None if completion_lengths is None else np.asarray(jax.device_get(completion_lengths)).reshape(-1)
+
+        cur_step = int(jax.device_get(state.step))
+        reasoning = list(reasoning or [])
+        tool_calls = list(tool_calls or [])
+
+        for idx, (prompt, completion) in enumerate(zip(prompt_rows, completion_rows, strict=False)):
+            reason = reasoning[idx] if idx < len(reasoning) else None
+            tools = tool_calls[idx] if idx < len(tool_calls) else None
+            completion_length = None if length_rows is None or idx >= len(length_rows) else float(length_rows[idx])
+            self.training_generation_log_table.add_data(
+                cur_step,
+                source,
+                idx,
+                prompt,
+                completion,
+                completion_length,
+                generation_time,
+                self._wandb_stringify_generation_value(reason),
+                self._wandb_stringify_generation_value(tools),
+            )
+        wandb.log({"training_generations": self.training_generation_log_table}, step=cur_step)
 
     def _one_to_all(self, arr: jax.Array) -> jax.Array:
         """Distribute array from one device to all devices.

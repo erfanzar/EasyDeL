@@ -521,6 +521,28 @@ class XPOTrainer(GRPOTrainer):
         }
         for name, value in reward_breakdown.items():
             metrics_dict[f"reward/{name}"] = float(jnp.mean(value))
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=prompt_texts if prompt_texts is not None else prompt_ids,
+            prompt_mask=None if prompt_texts is not None else prompt_mask,
+            completions=policy_texts,
+            completion_mask=policy_completion_mask,
+            generation_time=policy_generation_time,
+            reasoning=policy_reasoning,
+            tool_calls=policy_tool_calls,
+            source="policy",
+        )
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=prompt_texts if prompt_texts is not None else prompt_ids,
+            prompt_mask=None if prompt_texts is not None else prompt_mask,
+            completions=ref_texts,
+            completion_mask=ref_completion_mask,
+            generation_time=ref_generation_time,
+            reasoning=ref_reasoning,
+            tool_calls=ref_tool_calls,
+            source="reference",
+        )
 
         processed_batch = {
             "prompt_ids": self._all_gather(prompt_ids),

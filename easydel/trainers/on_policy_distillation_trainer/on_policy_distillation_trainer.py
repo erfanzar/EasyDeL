@@ -309,6 +309,23 @@ class OnPolicyDistillationTrainer(Trainer):
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
         }
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=expanded_prompt_ids,
+            prompt_mask=expanded_prompt_mask,
+            completion_ids=completion_ids,
+            completion_mask=completion_mask,
+            generation_time=generation_time,
+            reasoning=self._coerce_optional_generation_texts(
+                results.reasoning,
+                target_len=int(completion_ids.shape[0]),
+            ),
+            tool_calls=self._coerce_generation_metadata_list(
+                results.tool_calls,
+                target_len=int(completion_ids.shape[0]),
+            ),
+            source="teacher" if self.arguments.generate_with_teacher else "policy",
+        )
 
         return (
             {

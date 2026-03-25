@@ -504,6 +504,10 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Whether to log preview generations to WandB when available."},
     )
+    log_training_generations_to_wandb: bool = field(
+        default=True,
+        metadata={"help": "Whether to log rollout/training generations to WandB when available."},
+    )
     benchmark_interval: int | None = field(
         default=None,
         metadata={"help": "Run configured lm-eval benchmark suites every X training steps (disabled when None)."},

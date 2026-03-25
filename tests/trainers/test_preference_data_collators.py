@@ -19,6 +19,8 @@ try:
     from easydel.trainers.utils import (
         DataCollatorForPreferenceGrain,
         DataCollatorForPreferenceTFDS,
+        DPODataCollatorWithPaddingGrain,
+        DPODataCollatorWithPaddingTFDS,
     )
 except ImportError as exc:
     pytest.skip(f"Preference collators unavailable: {exc}", allow_module_level=True)
@@ -82,6 +84,69 @@ def test_grain_preference_collator_extracts_completion_tokens():
     assert batch["chosen_attention_mask"].tolist() == [1, 1, 0]
     assert batch["rejected_input_ids"].tolist() == [31, 0, 0]
     assert batch["rejected_attention_mask"].tolist() == [1, 0, 0]
+
+
+def test_tfds_preference_collator_preserves_tools():
+    collator = DataCollatorForPreferenceTFDS(
+        max_prompt_length=2,
+        max_completion_length=3,
+        pad_token_id=0,
+        label_pad_token_id=-100,
+    )
+
+    batch = collator(
+        [
+            {
+                **_full_sequence_feature(),
+                "tools": [{"type": "function", "function": {"name": "lookup"}}],
+            }
+        ]
+    )
+
+    assert batch["tools"] == [[{"type": "function", "function": {"name": "lookup"}}]]
+
+
+def test_grain_preference_collator_preserves_tools():
+    collator = DataCollatorForPreferenceGrain(
+        max_prompt_length=2,
+        max_completion_length=3,
+        pad_token_id=0,
+        label_pad_token_id=-100,
+    )
+
+    batch = collator(
+        {
+            **_full_sequence_feature(),
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        }
+    )
+
+    assert batch["tools"] == [{"type": "function", "function": {"name": "lookup"}}]
+
+
+def test_dpo_padding_collators_preserve_tools():
+    tfds_collator = DPODataCollatorWithPaddingTFDS(
+        max_prompt_length=2,
+        max_completion_length=4,
+        pad_token_id=0,
+        prepadded=False,
+    )
+    grain_collator = DPODataCollatorWithPaddingGrain(
+        max_prompt_length=2,
+        max_completion_length=4,
+        pad_token_id=0,
+        prepadded=False,
+    )
+    feature = {
+        **_full_sequence_feature(),
+        "tools": [{"type": "function", "function": {"name": "lookup"}}],
+    }
+
+    tfds_batch = tfds_collator([feature])
+    grain_batch = grain_collator(feature)
+
+    assert tfds_batch["tools"] == [[{"type": "function", "function": {"name": "lookup"}}]]
+    assert grain_batch["tools"] == [{"type": "function", "function": {"name": "lookup"}}]
 
 
 def test_dpo_transform_preserves_precomputed_reference_columns():

@@ -66,11 +66,6 @@ from ..training_utils import resolve_straight_through_emulator
 from ._fn import sdpo_step
 from .sdpo_config import SDPOConfig
 
-try:
-    import wandb  # type: ignore[import-untyped]
-except ImportError:
-    wandb = None
-
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
@@ -270,12 +265,14 @@ class SDPOTrainer(GRPOTrainer):
             self.arguments.beta,
             self.arguments.distillation_type,
             self.arguments.logprob_vocab_chunk_size,
+            self.arguments.max_loss_completion_tokens,
+            self.arguments.completion_chunk_size,
             self.arguments.loss_config,
             self.scheduler,
             self.arguments.step_partition_spec,
             self.arguments.gradient_accumulation_steps,
         )
-        static_argnames = tuple(range(2, 13))
+        static_argnames = tuple(range(2, 15))
 
         self._train_shared_fn_static_args = (*shared_static, True, straight_through_emulator)
 
@@ -494,7 +491,12 @@ class SDPOTrainer(GRPOTrainer):
         6. Optionally compute ref-model log-probs when ``beta > 0``.
         7. Return the batch dict consumed by :func:`sdpo_step`.
         """
+        reward_batch = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
+        if reward_batch:
+            reward_batch = {**batch, **reward_batch}
+        else:
+            reward_batch = batch
 
         with capture_time() as preprocessing_time_fn:
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
@@ -640,7 +642,7 @@ class SDPOTrainer(GRPOTrainer):
                             reasoning=reasoning_records,
                             tool_calls=tool_call_records,
                             max_length=self.arguments.max_length,
-                            batch=batch,
+                            batch=reward_batch,
                         )
                         output_reward_func = reward_func(**reward_call_kwargs)
                         rew = jnp.array(
@@ -686,6 +688,7 @@ class SDPOTrainer(GRPOTrainer):
                 else:
                     ref_per_token_logps = None
             token_logps_time = token_logps_time_fn()
+            log_completion_length = jnp.sum(completion_mask, -1)
 
             prompt_ids = self._all_gather(prompt_ids)
             prompt_mask = self._all_gather(prompt_mask)
@@ -712,6 +715,16 @@ class SDPOTrainer(GRPOTrainer):
         }
         for i, name in enumerate(self.reward_func_names):
             metrics_dict[name] = float(jnp.nanmean(rewards_per_func[:, i]))
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=completion_prompts,
+            completions=completions_text,
+            completion_lengths=log_completion_length,
+            generation_time=generation_time,
+            reasoning=reasoning_records,
+            tool_calls=tool_call_records,
+            source="policy",
+        )
 
         out_batch: dict[str, jax.Array] = {
             "prompt_ids": prompt_ids,
