@@ -341,6 +341,10 @@ def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
         idle_reset_seconds = float(idle_reset_seconds)
     idle_reset_min_interval = float(es.get("idle_reset_min_interval", 60.0))
 
+    long_prefill_token_threshold_val = es.get("long_prefill_token_threshold")
+    if long_prefill_token_threshold_val is not None:
+        long_prefill_token_threshold_val = int(long_prefill_token_threshold_val)
+
     extra_eos_token_ids = es.get("extra_eos_token_ids")
     if extra_eos_token_ids is not None:
         extra_eos_token_ids = list(extra_eos_token_ids)
@@ -396,6 +400,7 @@ def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
         tokenizer_endpoint=es.get("tokenizer_endpoint"),
         detokenizer_endpoint=es.get("detokenizer_endpoint"),
         sampling_params_callback=es.get("sampling_params_callback"),
+        long_prefill_token_threshold=long_prefill_token_threshold_val,
         extra_eos_token_ids=extra_eos_token_ids,
         extra_stops=extra_stops,
         silent_mode=False if silent_mode_val is None else bool(silent_mode_val),

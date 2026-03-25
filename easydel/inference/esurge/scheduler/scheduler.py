@@ -259,6 +259,7 @@ class Scheduler(SchedulerInterface):
         max_num_batched_tokens: int | None = None,
         enable_prefix_caching: bool = True,
         async_scheduling: bool = False,
+        long_prefill_token_threshold: int | None = None,
     ) -> Scheduler:
         """Create a Scheduler instance from an eSurgeRunner.
 
@@ -313,6 +314,7 @@ class Scheduler(SchedulerInterface):
                     max_model_len=runner.max_model_len,
                     max_num_seq_buckets=tuple(runner.max_num_seq_buckets),
                     async_scheduling=async_scheduling,
+                    long_prefill_token_threshold=long_prefill_token_threshold,
                 ),
                 cache_config=CacheConfig(
                     num_pages=metadata.num_pages,
@@ -498,7 +500,7 @@ class Scheduler(SchedulerInterface):
 
             num_new_tokens = min(num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens)
 
-            if num_new_tokens == 0:
+            if num_new_tokens <= 0:
                 req_index += 1
                 continue
 
@@ -634,19 +636,16 @@ class Scheduler(SchedulerInterface):
                         num_new_tokens = self.scheduler_config.long_prefill_token_threshold
 
                     if not self.scheduler_config.chunked_prefill_enabled and num_new_tokens > token_budget:
-                        # If the request is larger than the max batch size, we MUST allow it if the batch is empty,
-                        # otherwise it will never run.
-                        # If it's larger than available memory (reflected in token_budget via capacity),
-                        # allocate_slots will fail anyway.
                         is_inherently_too_large = (
-                            self.max_num_scheduled_tokens is not None and num_new_tokens > self.max_num_scheduled_tokens
+                            self.max_num_scheduled_tokens is not None and num_new_tokens >= self.max_num_scheduled_tokens
                         )
                         is_batch_empty = (
                             len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs) == 0
                         )
 
-                        if is_inherently_too_large and is_batch_empty:
-                            # Allow it to proceed to allocation
+                        if is_inherently_too_large:
+                            pass
+                        elif is_batch_empty:
                             pass
                         else:
                             self.waiting.pop_request()
