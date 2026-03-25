@@ -508,6 +508,7 @@ class eSurge(
         vision_cache_capacity_mb: int = 1024,
         tool_parser: ToolParserName | None = None,
         reasoning_parser: ReasoningParserName | None = None,
+        long_prefill_token_threshold: int | None = None,
         distributed_mode: bool = False,
         distributed_role: typing.Literal["auto", "leader", "worker"] = "auto",
         distributed_service_name: str | None = None,
@@ -1047,6 +1048,7 @@ class eSurge(
             max_num_batched_tokens=max_num_batched_tokens,
             enable_prefix_caching=enable_prefix_caching,
             async_scheduling=async_scheduling,
+            long_prefill_token_threshold=long_prefill_token_threshold,
         )
         self._scheduler_max_num_batched_tokens = max_num_batched_tokens
         self._scheduler_enable_prefix_caching = enable_prefix_caching

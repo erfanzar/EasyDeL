@@ -180,6 +180,7 @@ class eSurgeCfg(TypedDict, total=False):
     sampling_params_callback: NotRequired[
         tp.Callable[["SamplingParams", dict[str, tp.Any]], "SamplingParams | None"] | None
     ]
+    long_prefill_token_threshold: NotRequired[int | None]
     extra_eos_token_ids: NotRequired[list[int] | None]
     extra_stops: NotRequired[str | list[str] | None]
     silent_mode: NotRequired[bool]
