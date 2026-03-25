@@ -128,6 +128,53 @@ class StrictChatTokenizer(MockTokenizer):
         return text
 
 
+class ToolAwareTokenizer(MockTokenizer):
+    """Tokenizer that records tool schemas passed to chat templating."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        tools=None,
+        return_dict=False,
+        return_attention_mask=False,
+        **kwargs,
+    ):
+        self.calls.append(
+            {
+                "messages": messages,
+                "tools": tools,
+                "tokenize": tokenize,
+                "add_generation_prompt": add_generation_prompt,
+                "return_dict": return_dict,
+                "return_attention_mask": return_attention_mask,
+                **kwargs,
+            }
+        )
+        text = super().apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+        )
+        if return_dict:
+            token_ids = [ord(c) % 100 for c in text]
+            result = {"input_ids": token_ids}
+            if return_attention_mask:
+                result["attention_mask"] = [1] * len(token_ids)
+            if kwargs.get("return_assistant_tokens_mask"):
+                result["assistant_masks"] = [1] * len(token_ids)
+            return result
+        if tokenize:
+            return [ord(c) % 100 for c in text]
+        return text
+
+
 class PromptMaskTokenizer(MockTokenizer):
     """Tokenizer that exposes chat-template-only prompt prefix tokens."""
 
@@ -255,6 +302,27 @@ class TestSFTPreprocessTransform:
         assert "input_ids" in result
         assert "attention_mask" in result
 
+    def test_conversational_example_preserves_tools_and_uses_example_tools(self):
+        tokenizer = ToolAwareTokenizer()
+        transform = SFTPreprocessTransform(
+            tokenizer=tokenizer,
+            max_length=128,
+        )
+
+        tools = [{"type": "function", "function": {"name": "lookup"}}]
+        result = transform(
+            {
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi there!"},
+                ],
+                "tools": tools,
+            }
+        )
+
+        assert result["tools"] == tools
+        assert tokenizer.calls[-1]["tools"] == tools
+
     def test_messages_in_text_field(self):
         tokenizer = MockTokenizer()
         transform = SFTPreprocessTransform(
@@ -337,6 +405,30 @@ class TestSFTPreprocessTransform:
         assert result["input_ids"] == [99, 11, 12, 13, 14, tokenizer.eos_token_id] + [0] * 10
         assert result["completion_mask"] == [0, 0, 0, 0, 1, 1] + [0] * 10
 
+    def test_prompt_completion_conversational_suffix_uses_example_tools(self):
+        tokenizer = ToolAwareTokenizer()
+        transform = SFTPreprocessTransform(
+            tokenizer=tokenizer,
+            max_length=64,
+            mask_prompt=True,
+        )
+
+        tools = [{"type": "function", "function": {"name": "lookup"}}]
+        result = transform(
+            {
+                "prompt": [
+                    {"role": "user", "content": "Say hi."},
+                ],
+                "completion": [
+                    {"role": "assistant", "content": "Hello!"},
+                ],
+                "tools": tools,
+            }
+        )
+
+        assert result["tools"] == tools
+        assert tokenizer.calls[-1]["tools"] == tools
+
     def test_repr(self):
         """Test string representation."""
         tokenizer = MockTokenizer()
@@ -408,6 +500,32 @@ class TestDPOPreprocessTransform:
         assert "prompt_input_ids" in result
         assert "chosen_input_ids" in result
         assert "rejected_input_ids" in result
+
+    def test_conversational_preference_preserves_tools_and_uses_example_tools(self):
+        tokenizer = ToolAwareTokenizer()
+        transform = DPOPreprocessTransform(
+            tokenizer=tokenizer,
+            max_prompt_length=256,
+            max_completion_length=128,
+        )
+
+        tools = [{"type": "function", "function": {"name": "lookup"}}]
+        result = transform(
+            {
+                "chosen": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Good response"},
+                ],
+                "rejected": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Bad response"},
+                ],
+                "tools": tools,
+            }
+        )
+
+        assert result["tools"] == tools
+        assert tokenizer.calls[-1]["tools"] == tools
 
     def test_conversational_preference_drops_auxiliary_messages_column(self):
         tokenizer = MockTokenizer()
@@ -763,6 +881,35 @@ class TestBCOPreprocessTransform:
         assert "prompt_input_ids" in result
         assert "completion_input_ids" in result
         assert result["label"] is False
+
+    def test_conversational_completion_preserves_tools_and_uses_example_tools(self):
+        tokenizer = ToolAwareTokenizer()
+        transform = BCOPreprocessTransform(
+            tokenizer=tokenizer,
+            max_prompt_length=256,
+            max_completion_length=128,
+        )
+
+        tools = [{"type": "function", "function": {"name": "lookup"}}]
+        result = next(
+            iter(
+                transform(
+                    {
+                        "prompt": [
+                            {"role": "user", "content": "Say hi."},
+                        ],
+                        "completion": [
+                            {"role": "assistant", "content": "Hello!"},
+                        ],
+                        "label": False,
+                        "tools": tools,
+                    }
+                )
+            )
+        )
+
+        assert result["tools"] == tools
+        assert tokenizer.calls[-1]["tools"] == tools
 
     def test_paired_conversational_preference_preserves_multimodal_fields(self):
         tokenizer = StrictChatTokenizer()

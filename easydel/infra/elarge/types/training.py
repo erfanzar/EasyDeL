@@ -331,6 +331,7 @@ class BaseTrainerCfg(TypedDict, total=False):
         generation_seed: Random seed for generation preview.
         generation_preview_print: Whether to print generation preview to console.
         generation_log_to_wandb: Whether to log generation preview to WandB.
+        log_training_generations_to_wandb: Whether to log rollout/training generations to WandB.
         benchmark_interval: Run benchmark suites every N training steps.
         benchmarks: List of named benchmark configs to execute during training.
         use_esurge_generation: Whether to use eSurge for optimized generation.
@@ -507,6 +508,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     generation_seed: NotRequired[int | None]
     generation_preview_print: NotRequired[bool]
     generation_log_to_wandb: NotRequired[bool]
+    log_training_generations_to_wandb: NotRequired[bool]
     benchmark_interval: NotRequired[int | None]
     benchmarks: NotRequired[list[BenchmarkConfig] | BenchmarkConfig | None]
 
@@ -1559,6 +1561,7 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "generation_dataset_prompt_field": "prompt",
     "generation_preview_print": False,
     "generation_log_to_wandb": True,
+    "log_training_generations_to_wandb": True,
     "benchmark_interval": None,
     "benchmarks": [],
     # eSurge integration defaults

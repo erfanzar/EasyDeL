@@ -561,6 +561,14 @@ class AgenticMoshPitTrainer(GRPOTrainer):
             completion_mask = jnp.array(collated["completion_mask"])
             env_rewards = jnp.array(collated["rewards"])
             step_rewards_list = collated["step_rewards_list"]
+            rollout_reasoning = []
+            rollout_tool_calls = []
+            for traj in trajectories:
+                response_turns = [turn for turn in traj.turns if turn.is_response]
+                reasoning_entries = [turn.reasoning for turn in response_turns if turn.reasoning is not None]
+                tool_call_entries = [turn.tool_calls for turn in response_turns if turn.tool_calls not in (None, [])]
+                rollout_reasoning.append(reasoning_entries or None)
+                rollout_tool_calls.append(tool_call_entries or None)
 
             with capture_time() as advantage_time_fn:
                 group_size = self.arguments.group_size
@@ -642,6 +650,18 @@ class AgenticMoshPitTrainer(GRPOTrainer):
                     )
             ref_logps_time = ref_logps_time_fn()
 
+            self._log_training_generations_to_wandb(
+                state=state,
+                prompts=prompt_ids,
+                prompt_mask=prompt_mask,
+                completion_ids=completion_ids,
+                completion_mask=completion_mask,
+                generation_time=rollout_time,
+                reasoning=rollout_reasoning,
+                tool_calls=rollout_tool_calls,
+                source="policy",
+            )
+
             prompt_ids = self._all_gather(prompt_ids)
             prompt_mask = self._all_gather(prompt_mask)
             completion_ids = self._all_gather(completion_ids)
@@ -697,7 +717,12 @@ class AgenticMoshPitTrainer(GRPOTrainer):
         episode metadata. This gives full visibility into what the
         agent is doing at each training step.
         """
-        if not self.arguments.use_wandb or wandb is None or not self.arguments.can_log_metrics:
+        if (
+            not self.arguments.use_wandb
+            or wandb is None
+            or not self.arguments.can_log_metrics
+            or not self.arguments.log_training_generations_to_wandb
+        ):
             return
 
         import json as _json

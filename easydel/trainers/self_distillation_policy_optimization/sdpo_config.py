@@ -109,5 +109,12 @@ class SDPOConfig(GRPOConfig):
             max_sequence_length=max_sequence_length,
             quantization_block=quantization_block,
         )
+        # The teacher context is [prompt | feedback | completion] and all three
+        # must fit within max_length.  Rather than growing max_length (which
+        # would break even-sized allocations), shrink max_completion_length so
+        # that prompt + feedback + completion == max_length.
+        teacher_total = self.max_prompt_length + self.max_feedback_length + self.max_completion_length
+        if teacher_total > self.max_length:
+            self.max_completion_length = self.max_length - self.max_prompt_length - self.max_feedback_length
 
     __hash__ = hash_fn

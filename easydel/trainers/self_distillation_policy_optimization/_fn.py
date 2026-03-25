@@ -65,6 +65,8 @@ def sdpo_step(
     beta: float,
     distillation_type: str,
     logprob_vocab_chunk_size: int | None,
+    max_loss_completion_tokens: int | None,
+    completion_chunk_size: int | None,
     loss_config: LossConfig | None = None,
     learning_rate_fn: optax.Schedule = None,
     partition_spec: PartitionSpec | None = None,
@@ -100,6 +102,15 @@ def sdpo_step(
         beta: Weight of KL penalty toward the frozen reference model.
             Set to 0 to disable (default for SDPO). **STATIC**.
         distillation_type: ``'kl'`` or ``'jsd'``. **STATIC**.
+        max_loss_completion_tokens: Optional cap on completion tokens used by
+            the SDPO loss. When set, both the student and teacher scoring
+            paths are truncated to the first ``max_loss_completion_tokens``
+            completion tokens so the compiled graph does not scale with the
+            full sampled completion length. **STATIC**.
+        completion_chunk_size: Optional cap on the number of completions scored
+            in a single inner SDPO loss pass. When set, the student/teacher
+            scoring work is split across several smaller completion batches to
+            reduce peak activation and temporary-buffer memory. **STATIC**.
         loss_config: Optional loss / gradient-clipping configuration.
         learning_rate_fn: Learning-rate schedule used for metric logging.
         partition_spec: Partition spec for sharding the batch.
@@ -130,65 +141,167 @@ def sdpo_step(
         teacher_ids = minibatch["teacher_ids"]
         teacher_mask = minibatch["teacher_mask"]
 
-        prompt_len = prompt_ids.shape[-1]
+        completion_was_truncated = False
+        if max_loss_completion_tokens is not None and completion_ids.shape[1] > max_loss_completion_tokens:
+            completion_ids = completion_ids[:, :max_loss_completion_tokens]
+            completion_mask = completion_mask[:, :max_loss_completion_tokens]
+            teacher_ids = teacher_ids[:, : teacher_prompt_length + max_loss_completion_tokens]
+            teacher_mask = teacher_mask[:, : teacher_prompt_length + max_loss_completion_tokens]
+            completion_was_truncated = True
 
-        student_input_ids = jnp.concatenate([prompt_ids.repeat(num_generations, 0), completion_ids], axis=1)
-        student_attn_mask = jnp.concatenate([prompt_mask.repeat(num_generations, 0), completion_mask], axis=1)
-        student_logps = get_per_token_logps(
-            module,
-            student_input_ids,
-            student_attn_mask,
-            prompt_len,
-            logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+        prompt_len = prompt_ids.shape[-1]
+        completion_token_count = jnp.sum(completion_mask)
+        num_items = (
+            completion_token_count
+            if completion_was_truncated
+            else minibatch.get("num_items_in_batch", completion_token_count)
         )
 
-        teacher_logps = jax.lax.stop_gradient(
-            get_per_token_logps(
+        use_chunked_completion_loss = (
+            completion_chunk_size is not None and completion_ids.shape[0] > completion_chunk_size
+        )
+        if use_chunked_completion_loss:
+            expanded_prompt_ids = prompt_ids.repeat(num_generations, 0)
+            expanded_prompt_mask = prompt_mask.repeat(num_generations, 0)
+            completion_batch_size = int(completion_ids.shape[0])
+            loss_numerator = jnp.array(0.0, dtype=jnp.float32)
+            advantage_num = jnp.array(0.0, dtype=jnp.float32)
+            advantage_pos_num = jnp.array(0.0, dtype=jnp.float32)
+            student_logps_num = jnp.array(0.0, dtype=jnp.float32)
+            teacher_logps_num = jnp.array(0.0, dtype=jnp.float32)
+            per_token_loss_num = jnp.array(0.0, dtype=jnp.float32)
+            mean_kl_num = jnp.array(0.0, dtype=jnp.float32)
+            ref_logps_num = jnp.array(0.0, dtype=jnp.float32)
+
+            for start in range(0, completion_batch_size, completion_chunk_size):
+                end = min(start + completion_chunk_size, completion_batch_size)
+                chunk_completion_ids = completion_ids[start:end]
+                chunk_completion_mask = completion_mask[start:end]
+                chunk_student_input_ids = jnp.concatenate([expanded_prompt_ids[start:end], chunk_completion_ids], axis=1)
+                chunk_student_attn_mask = jnp.concatenate(
+                    [expanded_prompt_mask[start:end], chunk_completion_mask], axis=1
+                )
+                chunk_student_logps = get_per_token_logps(
+                    module,
+                    chunk_student_input_ids,
+                    chunk_student_attn_mask,
+                    prompt_len,
+                    logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+                )
+                chunk_teacher_logps = jax.lax.stop_gradient(
+                    get_per_token_logps(
+                        module,
+                        teacher_ids[start:end],
+                        teacher_mask[start:end],
+                        teacher_prompt_length,
+                        logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+                    )
+                )
+
+                if distillation_type == "kl":
+                    chunk_target_logps = chunk_teacher_logps
+                elif distillation_type == "jsd":
+                    chunk_target_logps = jnp.logaddexp(chunk_student_logps, chunk_teacher_logps) - jnp.log(2.0)
+                else:
+                    raise ValueError(f"Unknown distillation_type '{distillation_type}'. Must be 'kl' or 'jsd'.")
+
+                chunk_distill_weight = jax.lax.stop_gradient(chunk_student_logps - chunk_target_logps)
+                chunk_per_token_loss = chunk_distill_weight * chunk_student_logps
+
+                if beta != 0.0:
+                    ref_per_token_logps = minibatch["ref_per_token_logps"][start:end]
+                    if ref_per_token_logps.shape[1] != chunk_completion_ids.shape[1]:
+                        ref_per_token_logps = ref_per_token_logps[:, : chunk_completion_ids.shape[1]]
+                    chunk_per_token_kl = (
+                        jnp.exp(ref_per_token_logps - chunk_student_logps)
+                        - (ref_per_token_logps - chunk_student_logps)
+                        - 1
+                    )
+                    chunk_per_token_loss = chunk_per_token_loss + beta * chunk_per_token_kl
+                    mean_kl_num = mean_kl_num + jnp.sum(chunk_per_token_kl * chunk_completion_mask)
+                    ref_logps_num = ref_logps_num + jnp.sum(ref_per_token_logps * chunk_completion_mask)
+                else:
+                    chunk_per_token_kl = None
+
+                chunk_advantage = chunk_teacher_logps - chunk_student_logps
+                loss_numerator = loss_numerator + jnp.sum(chunk_per_token_loss * chunk_completion_mask)
+                advantage_num = advantage_num + jnp.sum(chunk_advantage * chunk_completion_mask)
+                advantage_pos_num = advantage_pos_num + jnp.sum(
+                    (chunk_advantage > 0).astype(jnp.float32) * chunk_completion_mask
+                )
+                student_logps_num = student_logps_num + jnp.sum(chunk_student_logps * chunk_completion_mask)
+                teacher_logps_num = teacher_logps_num + jnp.sum(chunk_teacher_logps * chunk_completion_mask)
+                per_token_loss_num = per_token_loss_num + jnp.sum(chunk_per_token_loss * chunk_completion_mask)
+
+            loss = loss_numerator / jnp.maximum(num_items, 1.0)
+            token_denom = jnp.maximum(completion_token_count, 1.0)
+            other_metrics: dict[str, jax.Array] = {
+                "sdpo/advantage_mean": advantage_num / token_denom,
+                "sdpo/advantage_pos_frac": advantage_pos_num / token_denom,
+                "sdpo/student_logps": student_logps_num / token_denom,
+                "sdpo/teacher_logps": teacher_logps_num / token_denom,
+                "sdpo/per_token_loss": per_token_loss_num / token_denom,
+            }
+            if beta != 0.0:
+                other_metrics["mean_kl"] = mean_kl_num / token_denom
+                other_metrics["ref_per_token_logps"] = ref_logps_num / token_denom
+        else:
+            student_input_ids = jnp.concatenate([prompt_ids.repeat(num_generations, 0), completion_ids], axis=1)
+            student_attn_mask = jnp.concatenate([prompt_mask.repeat(num_generations, 0), completion_mask], axis=1)
+            student_logps = get_per_token_logps(
                 module,
-                teacher_ids,
-                teacher_mask,
-                teacher_prompt_length,
+                student_input_ids,
+                student_attn_mask,
+                prompt_len,
                 logprob_vocab_chunk_size=logprob_vocab_chunk_size,
             )
-        )
 
-        if distillation_type == "kl":
-            target_logps = teacher_logps
-        elif distillation_type == "jsd":
-            target_logps = jnp.logaddexp(student_logps, teacher_logps) - jnp.log(2.0)
-        else:
-            raise ValueError(f"Unknown distillation_type '{distillation_type}'. Must be 'kl' or 'jsd'.")
-        distill_weight = jax.lax.stop_gradient(student_logps - target_logps)
-        per_token_loss = distill_weight * student_logps
+            teacher_logps = jax.lax.stop_gradient(
+                get_per_token_logps(
+                    module,
+                    teacher_ids,
+                    teacher_mask,
+                    teacher_prompt_length,
+                    logprob_vocab_chunk_size=logprob_vocab_chunk_size,
+                )
+            )
 
-        if beta != 0.0:
-            ref_per_token_logps = minibatch["ref_per_token_logps"]
-            per_token_kl = jnp.exp(ref_per_token_logps - student_logps) - (ref_per_token_logps - student_logps) - 1
-            per_token_loss = per_token_loss + beta * per_token_kl
-        else:
-            per_token_kl = None
+            if distillation_type == "kl":
+                target_logps = teacher_logps
+            elif distillation_type == "jsd":
+                target_logps = jnp.logaddexp(student_logps, teacher_logps) - jnp.log(2.0)
+            else:
+                raise ValueError(f"Unknown distillation_type '{distillation_type}'. Must be 'kl' or 'jsd'.")
+            distill_weight = jax.lax.stop_gradient(student_logps - target_logps)
+            per_token_loss = distill_weight * student_logps
 
-        num_items = minibatch.get("num_items_in_batch", jnp.sum(completion_mask))
-        loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(num_items, 1.0)
+            if beta != 0.0:
+                ref_per_token_logps = minibatch["ref_per_token_logps"]
+                if ref_per_token_logps.shape[1] != completion_ids.shape[1]:
+                    ref_per_token_logps = ref_per_token_logps[:, : completion_ids.shape[1]]
+                per_token_kl = jnp.exp(ref_per_token_logps - student_logps) - (ref_per_token_logps - student_logps) - 1
+                per_token_loss = per_token_loss + beta * per_token_kl
+            else:
+                per_token_kl = None
 
-        completion_token_count = jnp.sum(completion_mask)
+            loss = jnp.sum(per_token_loss * completion_mask) / jnp.maximum(num_items, 1.0)
 
-        def masked_mean(x):
-            return jnp.sum(x * completion_mask) / jnp.maximum(completion_token_count, 1.0)
+            def masked_mean(x):
+                return jnp.sum(x * completion_mask) / jnp.maximum(completion_token_count, 1.0)
 
-        per_token_advantage = teacher_logps - student_logps
+            per_token_advantage = teacher_logps - student_logps
 
-        other_metrics: dict[str, jax.Array] = {
-            "sdpo/advantage_mean": masked_mean(per_token_advantage),
-            "sdpo/advantage_pos_frac": masked_mean((per_token_advantage > 0).astype(jnp.float32)),
-            "sdpo/student_logps": masked_mean(student_logps),
-            "sdpo/teacher_logps": masked_mean(teacher_logps),
-            "sdpo/per_token_loss": masked_mean(per_token_loss),
-        }
+            other_metrics = {
+                "sdpo/advantage_mean": masked_mean(per_token_advantage),
+                "sdpo/advantage_pos_frac": masked_mean((per_token_advantage > 0).astype(jnp.float32)),
+                "sdpo/student_logps": masked_mean(student_logps),
+                "sdpo/teacher_logps": masked_mean(teacher_logps),
+                "sdpo/per_token_loss": masked_mean(per_token_loss),
+            }
 
-        if beta != 0.0 and per_token_kl is not None:
-            other_metrics["mean_kl"] = masked_mean(per_token_kl)
-            other_metrics["ref_per_token_logps"] = jnp.mean(minibatch["ref_per_token_logps"])
+            if beta != 0.0 and per_token_kl is not None:
+                other_metrics["mean_kl"] = masked_mean(per_token_kl)
+                other_metrics["ref_per_token_logps"] = jnp.mean(ref_per_token_logps)
 
         return loss, LossMetrics(
             loss=loss,

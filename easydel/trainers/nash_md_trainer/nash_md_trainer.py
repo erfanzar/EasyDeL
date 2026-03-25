@@ -514,6 +514,26 @@ class NashMDTrainer(GRPOTrainer):
         }
         for name, values in model_breakdown.items():
             metrics_dict[f"reward/{name}"] = float(jnp.mean(values))
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=prompts_text,
+            completions=model_completions_text,
+            completion_mask=completion_mask,
+            generation_time=generation_time,
+            reasoning=model_reasoning,
+            tool_calls=model_tool_calls,
+            source="policy",
+        )
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=prompts_text,
+            completions=mixture_completions_text,
+            completion_mask=mixture_completion_mask,
+            generation_time=generation_time,
+            reasoning=mixture_reasoning,
+            tool_calls=mixture_tool_calls,
+            source="mixture",
+        )
 
         processed_batch = {
             "prompt_ids": self._all_gather(prompt_ids),

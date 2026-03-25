@@ -361,6 +361,15 @@ class SparseDistillationTrainer(Trainer):
             "scoring_time": scoring_time,
             "preprocessing_time": preprocessing_time,
         }
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=expanded_prompt_ids,
+            prompt_mask=expanded_prompt_mask,
+            completion_ids=completion_ids,
+            completion_mask=completion_mask,
+            generation_time=generation_time,
+            source="student",
+        )
 
         return (
             {

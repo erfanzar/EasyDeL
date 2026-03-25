@@ -141,6 +141,9 @@ class Trainer(BaseTrainer):
         def collate_fn(batch):
             results = {}
             for key in batch[0].keys():
+                if key == "tools":
+                    results[key] = [example.get(key) for example in batch]
+                    continue
                 data_sample = batch[0][key]
                 try:
                     data_sample = jax.numpy.array(data_sample)

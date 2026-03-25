@@ -201,6 +201,7 @@ class SeqKDTrainer(Trainer):
         generation_time: float = 0.0
         with capture_time() as preprocessing_time_fn:
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
+            generated_completions_text: list[str] | None = None
 
             if self.teacher_fn is not None:
                 with capture_time() as generation_time_fn:
@@ -233,6 +234,7 @@ class SeqKDTrainer(Trainer):
                         return_tensors="np",
                         add_special_tokens=False,
                     )
+                    generated_completions_text = completion_texts
                     completion_ids = jnp.array(encoded["input_ids"])
                     completion_mask = jnp.array(encoded["attention_mask"])
                 generation_time = generation_time_fn()
@@ -249,6 +251,7 @@ class SeqKDTrainer(Trainer):
                     prompt_ids = results.prompt_ids
                     prompt_mask = results.prompt_mask
                     completion_ids = results.completion_ids
+                    generated_completions_text = self._coerce_generation_texts(results.text)
                 generation_time = generation_time_fn()
 
                 completion_mask = self._make_attn_mask(completion_ids)
@@ -282,6 +285,16 @@ class SeqKDTrainer(Trainer):
             "generation_time": generation_time,
             "preprocessing_time": preprocessing_time,
         }
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=expanded_prompt_ids,
+            prompt_mask=expanded_prompt_mask,
+            completions=generated_completions_text,
+            completion_ids=completion_ids,
+            completion_mask=completion_mask,
+            generation_time=generation_time,
+            source="teacher",
+        )
 
         return (
             {

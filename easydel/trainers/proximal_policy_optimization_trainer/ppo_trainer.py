@@ -68,11 +68,6 @@ from ._fn import ppo_step
 from .modeling_value_head import CausalLMWithValueHead
 from .ppo_config import PPOConfig
 
-try:
-    import wandb
-except ImportError:
-    wandb = None
-
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
 
@@ -262,13 +257,6 @@ class PPOTrainer(Trainer):
         self._initialize_conversational_flags(train_dataset, eval_dataset)
 
         self.data_tokenize_fn = data_tokenize_fn
-        log_table = None
-        if self.arguments.use_wandb and self.arguments.can_log_metrics and wandb is not None:
-            log_table = wandb.Table(
-                columns=["generated_result", "input_prompt", "took", "length", "step"],
-                log_mode="INCREMENTAL",
-            )
-        self.log_table = log_table
 
         super().__init__(
             model_state=model,
@@ -642,7 +630,12 @@ class PPOTrainer(Trainer):
                 - processed_batch: Dictionary with all tensors needed for PPO step.
                 - metrics: Dictionary with timing and reward statistics.
         """
+        reward_batch = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
+        if reward_batch:
+            reward_batch = {**batch, **reward_batch}
+        else:
+            reward_batch = batch
         with capture_time() as preprocessing_time_fn:
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
 
@@ -804,7 +797,7 @@ class PPOTrainer(Trainer):
                             reasoning=reasoning_records,
                             tool_calls=tool_call_records,
                             max_length=self.arguments.max_length,
-                            batch=batch,
+                            batch=reward_batch,
                         )
                         output_reward_func = reward_func(**reward_call_kwargs)
                         rew = jnp.array(
@@ -813,6 +806,7 @@ class PPOTrainer(Trainer):
                         )
                     rewards_per_func = rewards_per_func.at[:, i].set(rew.reshape(-1))
             rewarding_time = rewarding_time_fn()
+            log_completion_length = jnp.sum(completion_mask, axis=1)
 
             prompt_ids = self._all_gather(prompt_ids)
             prompt_mask = self._all_gather(prompt_mask)
@@ -870,6 +864,16 @@ class PPOTrainer(Trainer):
         }
         for i, reward_func_name in enumerate(self.reward_func_names):
             metrics_dict[reward_func_name] = float(jnp.nanmean(rewards_per_func[:, i]))
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=completion_prompts,
+            completions=completions_text,
+            completion_lengths=log_completion_length,
+            generation_time=generation_time,
+            reasoning=reasoning_records,
+            tool_calls=tool_call_records,
+            source="policy",
+        )
 
         return (
             {

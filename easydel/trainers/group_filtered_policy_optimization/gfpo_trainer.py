@@ -43,11 +43,6 @@ if tp.TYPE_CHECKING:
 
     from easydel.data.core.protocols import ShardedDataSource
 
-try:
-    import wandb
-except ImportError:
-    wandb = None
-
 
 RewardFunc = EasyDeLBaseModule | EasyDeLState | tp.Callable[[list, list], list[float]]
 GroupFilterFunc = tp.Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
@@ -336,7 +331,12 @@ class GFPOTrainer(GRPOTrainer):
         This method extends GRPO's preprocessing by adding a filtering step
         after reward computation to keep only the most efficient samples.
         """
+        reward_batch = self._extract_reward_batch_sidechannels(batch)
         batch = self._purify_batch(batch)
+        if reward_batch:
+            reward_batch = {**batch, **reward_batch}
+        else:
+            reward_batch = batch
         with capture_time() as preprocessing_time_fn:
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
             prompt_model_kwargs = extract_generation_model_kwargs(batch, model_callable=state.model.__call__)
@@ -526,7 +526,7 @@ class GFPOTrainer(GRPOTrainer):
                             reasoning=reasoning_records,
                             tool_calls=tool_call_records,
                             max_length=self.arguments.max_length,
-                            batch=batch,
+                            batch=reward_batch,
                         )
                         output_reward_func = reward_func(**reward_call_kwargs)
                         rew = jnp.array(
@@ -538,9 +538,6 @@ class GFPOTrainer(GRPOTrainer):
 
             # Compute rewards before filtering (for metrics)
             rewards = jnp.nansum(rewards_per_func * self.reward_weights[None, :], axis=1)
-
-            # Log pre-filter metrics
-            log_completion_ids = completion_ids
             log_completion_length = jnp.sum(completion_mask, -1)
 
             num_remains = self.arguments.num_remains_in_group
@@ -623,21 +620,16 @@ class GFPOTrainer(GRPOTrainer):
         }
         for i, reward_func_name in enumerate(self.reward_func_names):
             metrics_dict[reward_func_name] = float(jnp.nanmean(rewards_per_func[:, i]))
-
-        if self.log_table is not None:
-            cur_step = jax.device_get(state.step)
-            decoded_prompt = completion_prompts
-            decoded_text = self._decode_prompt_batch(
-                self.processing_class,
-                jax.device_get(log_completion_ids),
-                False,
-                self._pad_token_id,
-                True,
-            )
-            for decoded, prompt, length in zip(decoded_text, decoded_prompt, log_completion_length, strict=False):
-                prompt_repr = prompt if isinstance(prompt, str) else str(prompt)
-                self.log_table.add_data(decoded, prompt_repr, generation_time, float(jax.device_get(length)), cur_step)
-            wandb.log({"generations": self.log_table}, step=cur_step)
+        self._log_training_generations_to_wandb(
+            state=state,
+            prompts=completion_prompts,
+            completions=clean_completions_text,
+            completion_lengths=log_completion_length,
+            generation_time=generation_time,
+            reasoning=reasoning_records,
+            tool_calls=tool_call_records,
+            source="policy",
+        )
 
         return (
             {

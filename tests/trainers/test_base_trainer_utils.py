@@ -102,6 +102,32 @@ class _PreviewShardedSource(ShardedDataSource[dict]):
         )
 
 
+def test_trainer_tfds_collect_function_preserves_tools_sidechannel():
+    trainer = SimpleNamespace(model=SimpleNamespace(lossfn_type="ForCausalLM"))
+
+    collate_fn = Trainer.create_tfds_collect_function(
+        trainer,
+        max_sequence_length=8,
+        truncation_mode="keep_end",
+    )
+    batch = collate_fn(
+        [
+            {
+                "input_ids": [1, 2, 3],
+                "attention_mask": [1, 1, 1],
+                "tools": [{"name": "lookup_a"}],
+            },
+            {
+                "input_ids": [4, 5, 6],
+                "attention_mask": [1, 1, 1],
+                "tools": [{"name": "lookup_b"}],
+            },
+        ]
+    )
+
+    assert batch["tools"] == [[{"name": "lookup_a"}], [{"name": "lookup_b"}]]
+
+
 class _NoopTimer:
     class _Ctx:
         def __enter__(self):

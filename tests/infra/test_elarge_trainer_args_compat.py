@@ -302,6 +302,15 @@ def test_training_arguments_default_tpu_preemption_checkpoint_settings():
     assert args.save_tpu_preemption_checkpoints is True
 
 
+def test_training_arguments_default_training_generation_wandb_logging_enabled():
+    args = TrainingArguments(
+        model_name="dummy",
+        total_batch_size=1,
+    )
+
+    assert args.log_training_generations_to_wandb is True
+
+
 def test_ppo_penalties_inherit_into_generation_preview_fields():
     args_cls = get_training_arguments_class("ppo")
     args = args_cls(

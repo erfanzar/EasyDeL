@@ -444,6 +444,26 @@ def tolist(x):
     return x.tolist()
 
 
+def _attach_tools_sidechannel(
+    batch: dict[str, tp.Any],
+    features: list[dict[str, tp.Any]] | dict[str, tp.Any],
+) -> dict[str, tp.Any]:
+    """Preserve per-example tool schemas through collation when present."""
+
+    if isinstance(features, dict):
+        tools = features.get("tools")
+        if tools is not None:
+            batch["tools"] = tools
+        return batch
+
+    if not features:
+        return batch
+    tools = [feature.get("tools") for feature in features]
+    if any(tool is not None for tool in tools):
+        batch["tools"] = tools
+    return batch
+
+
 class DataCollatorForCompletionOnlyLM:
     """Data collator for training on assistant completions only.
 
@@ -748,6 +768,8 @@ class DataCollatorForCompletionOnlyLM:
                 if len(response_token_ids_idxs) < len(human_token_ids_idxs):
                     batch["labels"][i, human_token_ids_idxs[-1] :] = self.ignore_index
 
+        if isinstance(examples[0], collections.abc.Mapping):
+            _attach_tools_sidechannel(batch, examples)  # type: ignore[arg-type]
         return batch
 
 
@@ -866,6 +888,7 @@ class RewardDataCollatorWithPaddingTFDS:
         }
         if has_margin:
             batch["margin"] = jnp.asarray([f["margin"] for f in features], dtype=jnp.float32)
+        _attach_tools_sidechannel(batch, features)
         return batch
 
 
@@ -965,6 +988,7 @@ class RewardDataCollatorWithPaddingGrain:
         }
         if "margin" in features:
             batch["margin"] = np.asarray(features["margin"], dtype=np.float32)
+        _attach_tools_sidechannel(batch, features)
         return batch
 
 
@@ -1135,6 +1159,7 @@ class DataCollatorForPreferenceTFDS:
         if ref_chosen_logps is not None and ref_rejected_logps is not None:
             output["ref_chosen_logps"] = ref_chosen_logps
             output["ref_rejected_logps"] = ref_rejected_logps
+        _attach_tools_sidechannel(output, features)
         return output
 
 
@@ -1304,6 +1329,7 @@ class DataCollatorForPreferenceGrain:
         if ref_chosen_logps is not None and ref_rejected_logps is not None:
             output["ref_chosen_logps"] = ref_chosen_logps
             output["ref_rejected_logps"] = ref_rejected_logps
+        _attach_tools_sidechannel(output, features)
         return output
 
 
@@ -1421,6 +1447,7 @@ class BCODataCollatorTFDS(_BCODataCollatorMixin):
             reference_logps = np.asarray([f["reference_logps"] for f in features], dtype=np.float32)
             batch["reference_logps"] = jnp.asarray(reference_logps)
 
+        _attach_tools_sidechannel(batch, features)
         return batch
 
 
@@ -1484,6 +1511,7 @@ class BCODataCollatorGrain(_BCODataCollatorMixin):
         if "reference_logps" in feature:
             batch["reference_logps"] = np.asarray([feature["reference_logps"]], dtype=np.float32)
 
+        _attach_tools_sidechannel(batch, feature)
         return batch
 
 
@@ -1528,8 +1556,11 @@ class GRPODataCollatorTFDS:
                 if key in GENERATION_MODEL_INPUT_KEYS:
                     raise ValueError(
                         "GRPO batches must not mix present and missing generation kwargs. "
-                        f"Found mixed presence for `{key}` across one batch."
-                    )
+                            f"Found mixed presence for `{key}` across one batch."
+                        )
+                continue
+            if key == "tools":
+                batch[key] = values
                 continue
             try:
                 arrays = [np.asarray(value) for value in values]
@@ -1725,6 +1756,9 @@ class GRPODataCollatorGrain:
         }
         for key, value in feature.items():
             if key not in {"input_ids", "attention_mask"} and value is not None:
+                if key == "tools":
+                    batch[key] = value
+                    continue
                 try:
                     array = np.asarray(value)
                 except Exception:
@@ -1866,12 +1900,15 @@ class DPODataCollatorWithPaddingTFDS:
             else:
                 padded_batch[k] = [ex[k] for ex in features]
             if self.output_arrays_only:
+                if k == "tools":
+                    continue
                 val = padded_batch.get(k)
                 if hasattr(val, "dtype"):
                     if val.dtype not in [jnp.float64, jnp.float32, jnp.float16, jnp.int32, jnp.int16, jnp.int8]:
                         padded_batch.pop(k)
                 else:
                     padded_batch.pop(k)
+        _attach_tools_sidechannel(padded_batch, features)
         return padded_batch
 
 
@@ -1970,12 +2007,15 @@ class DPODataCollatorWithPaddingGrain:
             else:
                 padded_batch[k] = features[k]
             if self.output_arrays_only:
+                if k == "tools":
+                    continue
                 val = padded_batch.get(k)
                 if hasattr(val, "dtype"):
                     if val.dtype not in [np.float64, np.float32, np.float16, np.int32, np.int16, np.int8]:
                         padded_batch.pop(k)
                 else:
                     padded_batch.pop(k)
+        _attach_tools_sidechannel(padded_batch, features)
         return padded_batch
 
 
