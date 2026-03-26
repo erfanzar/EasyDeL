@@ -34,6 +34,8 @@ from .prompt_utils import (
     maybe_apply_chat_template,
     maybe_convert_to_chatml,
     maybe_extract_prompt,
+    normalize_message_payload,
+    resolve_example_tools,
 )
 
 _TOKENIZED_FIELDS = {
@@ -92,112 +94,6 @@ def purify_example(example: dict, keep_fields: set[str] | None = None) -> dict:
         fields_to_keep.update(keep_fields)
 
     return {k: v for k, v in example.items() if k in fields_to_keep}
-
-
-def resolve_example_tools(
-    example: dict[str, tp.Any],
-    fallback_tools: list | None = None,
-) -> list | None:
-    """Return per-example tool schemas when available, otherwise ``fallback_tools``."""
-
-    example_tools = example.get("tools")
-    if isinstance(example_tools, str):
-        try:
-            example_tools = json.loads(example_tools)
-        except json.JSONDecodeError:
-            pass
-    return example_tools if example_tools is not None else fallback_tools
-
-
-def is_conversational(example: dict) -> bool:
-    """Check if example has conversational format (messages/conversations field).
-
-    Args:
-        example: Dataset example to check.
-
-    Returns:
-        True if example contains messages or prompt list format.
-    """
-    return ("messages" in example and isinstance(example["messages"], list)) or (
-        "prompt" in example and isinstance(example["prompt"], list)
-    )
-
-
-def is_conversational_from_value(example: dict) -> bool:
-    """Check if example has from/value conversation format.
-
-    This is an alternative format where conversations use 'from' and 'value'
-    keys instead of 'role' and 'content'.
-
-    Args:
-        example: Dataset example to check.
-
-    Returns:
-        True if example has conversations in from/value format.
-    """
-    conversations_key = None
-    if "conversations" in example:
-        conversations_key = "conversations"
-    elif "conversation" in example:
-        conversations_key = "conversation"
-
-    if conversations_key is None:
-        return False
-
-    conversations = example[conversations_key]
-    if not isinstance(conversations, list) or len(conversations) == 0:
-        return False
-
-    first_turn = conversations[0]
-    return isinstance(first_turn, dict) and "from" in first_turn and "value" in first_turn
-
-
-def convert_to_chatml(example: dict) -> dict:
-    """Convert from/value format to standard role/content ChatML format.
-
-    Args:
-        example: Example with 'conversations' or 'conversation' field
-                using from/value format.
-
-    Returns:
-        Example with 'messages' field in role/content format.
-
-    Raises:
-        KeyError: If neither 'conversations' nor 'conversation' field exists.
-    """
-    if "conversations" in example:
-        conversations_key = "conversations"
-    elif "conversation" in example:
-        conversations_key = "conversation"
-    else:
-        raise KeyError("Example must have 'conversations' or 'conversation' field")
-    conversations = example[conversations_key]
-
-    role_mapping = {
-        "human": "user",
-        "gpt": "assistant",
-        "system": "system",
-        "user": "user",
-        "assistant": "assistant",
-    }
-
-    messages = []
-    for turn in conversations:
-        role = turn.get("from", "user")
-        content = turn.get("value", "")
-        messages.append(
-            {
-                "role": role_mapping.get(role, role),
-                "content": content,
-            }
-        )
-
-    result = dict(example)
-    result["messages"] = messages
-    # Remove old format keys
-    result.pop("conversations", None)
-    result.pop("conversation", None)
-    return result
 
 
 def extract_prompt_from_preference(example: dict) -> dict:
@@ -337,12 +233,11 @@ class GRPOPreprocessTransform(Transform):
 
         # Apply chat template if conversational format
         if isinstance(prompt, list) and not self._skip_apply_chat_template:
-            example_tools = result.get("tools")
             prompt = self._tokenizer.apply_chat_template(
                 prompt,
                 tokenize=False,
                 add_generation_prompt=True,
-                tools=example_tools if example_tools is not None else self._tools,
+                tools=resolve_example_tools(result, self._tools),
             )
 
         # Tokenize with left padding for generation
@@ -1133,19 +1028,24 @@ class SFTPreprocessTransform(Transform):
                 result = dict(example)
                 result[self._text_field] = str(formatted)
 
-        # Step 1: Convert from/value format to ChatML
-        if is_conversational_from_value(result):
-            result = convert_to_chatml(result)
+        # Step 1: Normalize conversational payloads (ChatML / stringified JSON / tools)
+        result = maybe_convert_to_chatml(result)
 
         # Step 2: Handle conversational format
-        if is_conversational(result):
-            messages = result.get(self._messages_field) or result.get("messages")
-            if messages:
-                return self._tokenize_conversational(result, messages)
+        raw_messages = result.get(self._messages_field)
+        if raw_messages is None and self._messages_field != "messages":
+            raw_messages = result.get("messages")
+        messages = normalize_message_payload(raw_messages, allow_plain_text=True)
+        if messages:
+            if self._messages_field in result:
+                result[self._messages_field] = messages
+            elif "messages" in result:
+                result["messages"] = messages
+            return self._tokenize_conversational(result, messages)
 
         text_value = result.get(self._text_field)
-        if isinstance(text_value, list) and text_value and all(isinstance(item, dict) for item in text_value):
-            messages = self._normalize_message_list(text_value)
+        messages = self._normalize_message_list(text_value)
+        if messages:
             return self._tokenize_conversational(result, messages)
 
         # Step 3: Handle prompt/completion format
@@ -1160,35 +1060,18 @@ class SFTPreprocessTransform(Transform):
         return result
 
     @staticmethod
-    def _normalize_message_list(messages: list[dict]) -> list[dict]:
-        if not messages:
-            return messages
-        first = messages[0]
-        if "role" in first and "content" in first:
-            return messages
-        if "from" in first and "value" in first:
-            role_mapping = {
-                "human": "user",
-                "gpt": "assistant",
-                "system": "system",
-                "user": "user",
-                "assistant": "assistant",
-            }
-            normalized: list[dict] = []
-            for turn in messages:
-                if not isinstance(turn, dict):
-                    continue
-                role = role_mapping.get(turn.get("from", "user"), turn.get("from", "user"))
-                normalized.append({"role": role, "content": turn.get("value", "")})
-            return normalized
-        return messages
+    def _normalize_message_list(messages: tp.Any) -> list[dict[str, tp.Any]] | None:
+        return normalize_message_payload(messages, allow_plain_text=False)
 
     def _tokenize_conversational(self, example: dict, messages: list) -> dict:
         """Tokenize conversational data using chat template."""
         result = dict(example)
+        normalized_messages = normalize_message_payload(messages, allow_plain_text=True)
+        if normalized_messages:
+            messages = normalized_messages
 
         # Handle tools if present
-        tools = resolve_example_tools(example)
+        tools = resolve_example_tools(result)
 
         try:
             processed = self._tokenizer.apply_chat_template(
@@ -1232,8 +1115,15 @@ class SFTPreprocessTransform(Transform):
         This handles cases where the tokenizer's chat template has strict
         requirements (e.g., tool messages must follow assistant tool calls).
         """
+        normalized_messages = normalize_message_payload(messages, allow_plain_text=True)
+        if normalized_messages:
+            messages = normalized_messages
+
         parts = []
         for msg in messages:
+            if not isinstance(msg, dict):
+                parts.append(f"<|user|>\n{msg}")
+                continue
             role = msg.get("role", "user")
             content = msg.get("content", "")
 
