@@ -323,6 +323,34 @@ class TestSFTPreprocessTransform:
         assert result["tools"] == tools
         assert tokenizer.calls[-1]["tools"] == tools
 
+    def test_conversational_example_decodes_stringified_messages_and_tools(self):
+        tokenizer = ToolAwareTokenizer()
+        transform = SFTPreprocessTransform(
+            tokenizer=tokenizer,
+            max_length=128,
+        )
+
+        result = transform(
+            {
+                "messages": [
+                    '{"role": "user", "content": "Hello"}',
+                    '{"role": "assistant", "content": "Hi there!"}',
+                ],
+                "tools": [
+                    '{"type": "function", "function": {"name": "lookup"}}',
+                ],
+            }
+        )
+
+        assert "input_ids" in result
+        assert "attention_mask" in result
+        assert result["tools"] == [{"type": "function", "function": {"name": "lookup"}}]
+        assert tokenizer.calls[-1]["messages"] == [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+        ]
+        assert tokenizer.calls[-1]["tools"] == [{"type": "function", "function": {"name": "lookup"}}]
+
     def test_messages_in_text_field(self):
         tokenizer = MockTokenizer()
         transform = SFTPreprocessTransform(
@@ -341,6 +369,25 @@ class TestSFTPreprocessTransform:
 
         assert "input_ids" in result
         assert "attention_mask" in result
+
+    def test_messages_json_string_in_text_field(self):
+        tokenizer = ToolAwareTokenizer()
+        transform = SFTPreprocessTransform(
+            tokenizer=tokenizer,
+            max_length=128,
+            text_field="text",
+        )
+
+        result = transform(
+            {"text": '[{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi there!"}]'}
+        )
+
+        assert "input_ids" in result
+        assert "attention_mask" in result
+        assert tokenizer.calls[-1]["messages"] == [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+        ]
 
     def test_messages_in_text_field_from_value(self):
         tokenizer = MockTokenizer()
@@ -526,6 +573,36 @@ class TestDPOPreprocessTransform:
 
         assert result["tools"] == tools
         assert tokenizer.calls[-1]["tools"] == tools
+
+    def test_conversational_preference_decodes_stringified_messages_and_tools(self):
+        tokenizer = ToolAwareTokenizer()
+        transform = DPOPreprocessTransform(
+            tokenizer=tokenizer,
+            max_prompt_length=256,
+            max_completion_length=128,
+        )
+
+        result = transform(
+            {
+                "chosen": [
+                    '{"role": "user", "content": "Hello"}',
+                    '{"role": "assistant", "content": "Good response"}',
+                ],
+                "rejected": [
+                    '{"role": "user", "content": "Hello"}',
+                    '{"role": "assistant", "content": "Bad response"}',
+                ],
+                "tools": [
+                    '{"type": "function", "function": {"name": "lookup"}}',
+                ],
+            }
+        )
+
+        assert "prompt_input_ids" in result
+        assert "chosen_input_ids" in result
+        assert "rejected_input_ids" in result
+        assert result["tools"] == [{"type": "function", "function": {"name": "lookup"}}]
+        assert tokenizer.calls[-1]["tools"] == [{"type": "function", "function": {"name": "lookup"}}]
 
     def test_conversational_preference_drops_auxiliary_messages_column(self):
         tokenizer = MockTokenizer()
@@ -991,6 +1068,29 @@ class TestGRPOPreprocessTransform:
         result = transform(example)
 
         assert "input_ids" in result
+
+    def test_conversational_prompt_decodes_stringified_messages_and_tools(self):
+        tokenizer = ToolAwareTokenizer()
+        transform = GRPOPreprocessTransform(
+            tokenizer=tokenizer,
+            max_prompt_length=1024,
+        )
+
+        result = transform(
+            {
+                "messages": [
+                    '{"role": "user", "content": "Tell me a joke"}',
+                ],
+                "tools": [
+                    '{"type": "function", "function": {"name": "lookup"}}',
+                ],
+            }
+        )
+
+        assert "input_ids" in result
+        assert result["tools"] == [{"type": "function", "function": {"name": "lookup"}}]
+        assert tokenizer.calls[-1]["messages"] == [{"role": "user", "content": "Tell me a joke"}]
+        assert tokenizer.calls[-1]["tools"] == [{"type": "function", "function": {"name": "lookup"}}]
 
     def test_mixed_preference_format_keeps_explicit_prompt(self):
         """Explicit prompt should not be replaced by empty extracted prefix."""

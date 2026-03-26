@@ -27,6 +27,7 @@ Key functionality:
 """
 
 import copy
+import json
 import typing as tp
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
@@ -54,6 +55,121 @@ OutputType = OutputDict | OutputListDict | None
 OpenAIMessageList = list[OpenAIMessage]
 TListOrMapping = tp.TypeVar("TListOrMapping", list, Mapping)
 DatasetLike = Dataset | DatasetDict
+
+_CHATML_ROLE_MAPPING = {
+    "human": "user",
+    "gpt": "assistant",
+    "system": "system",
+    "user": "user",
+    "assistant": "assistant",
+}
+
+
+def _maybe_json_load(value: str) -> tp.Any:
+    stripped = value.strip()
+    if not stripped or stripped[0] not in {"{", "["}:
+        return value
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+
+
+def normalize_message_payload(
+    payload: tp.Any,
+    *,
+    allow_plain_text: bool = False,
+) -> list[dict[str, tp.Any]] | None:
+    """Normalize chat payloads into ``[{role, content, ...}, ...]`` form."""
+
+    def _normalize_single(item: tp.Any) -> list[dict[str, tp.Any]] | None:
+        if isinstance(item, str):
+            parsed = _maybe_json_load(item)
+            if parsed is not item:
+                return normalize_message_payload(parsed, allow_plain_text=allow_plain_text)
+            if allow_plain_text:
+                return [{"role": "user", "content": item}]
+            return None
+
+        if isinstance(item, dict):
+            if "from" in item and "value" in item:
+                normalized = dict(item)
+                normalized["role"] = _CHATML_ROLE_MAPPING.get(item.get("from", "user"), item.get("from", "user"))
+                normalized["content"] = item.get("value", "")
+                normalized.pop("from", None)
+                normalized.pop("value", None)
+                return [normalized]
+
+            if "role" in item:
+                normalized = dict(item)
+                normalized.setdefault("content", "")
+                return [normalized]
+
+            if "content" in item and allow_plain_text:
+                normalized = dict(item)
+                normalized.setdefault("role", "user")
+                return [normalized]
+            return None
+
+        if isinstance(item, list):
+            return normalize_message_payload(item, allow_plain_text=allow_plain_text)
+
+        return None
+
+    if payload is None:
+        return None
+
+    if isinstance(payload, list):
+        normalized: list[dict[str, tp.Any]] = []
+        for item in payload:
+            turns = _normalize_single(item)
+            if turns is None:
+                return None
+            normalized.extend(turns)
+        return normalized
+
+    return _normalize_single(payload)
+
+
+def normalize_tool_payload(payload: tp.Any) -> tp.Any:
+    """Normalize stringified JSON tool payloads into dict/list form."""
+    if isinstance(payload, str):
+        parsed = _maybe_json_load(payload)
+        if parsed is not payload:
+            return normalize_tool_payload(parsed)
+        return payload
+
+    if isinstance(payload, list):
+        normalized: list[tp.Any] = []
+        for item in payload:
+            parsed = normalize_tool_payload(item)
+            if isinstance(parsed, list):
+                normalized.extend(parsed)
+            else:
+                normalized.append(parsed)
+        return normalized
+
+    if isinstance(payload, tuple):
+        return normalize_tool_payload(list(payload))
+
+    if isinstance(payload, dict):
+        return dict(payload)
+
+    return payload
+
+
+def resolve_example_tools(
+    example: dict[str, tp.Any],
+    fallback_tools: list | None = None,
+) -> list | None:
+    """Return per-example tool schemas when available, otherwise ``fallback_tools``."""
+
+    example_tools = normalize_tool_payload(example.get("tools"))
+    if isinstance(example_tools, dict):
+        example_tools = [example_tools]
+    if example_tools is not None and example.get("tools") is not example_tools:
+        example["tools"] = example_tools
+    return example_tools if example_tools is not None else fallback_tools
 
 
 def _is_valid_openai_message_list(data: tp.Any) -> bool:
@@ -329,20 +445,18 @@ def is_conversational(example: dict[str, tp.Any]) -> bool:
     Note:
         Used to determine whether to apply chat templates during processing.
     """
-    for key in ["prompt", "chosen", "rejected", "completion", "messages"]:
-        maybe_messages = example.get(key)
-        if isinstance(maybe_messages, list) and maybe_messages:
-            maybe_message = maybe_messages[0]
-            if isinstance(maybe_message, dict) and "role" in maybe_message and "content" in maybe_message:
-                return True
+    for key in ["prompt", "chosen", "rejected", "completion", "messages", "conversations", "conversation"]:
+        maybe_messages = normalize_message_payload(example.get(key), allow_plain_text=(key == "messages"))
+        if maybe_messages:
+            return True
 
     return False
 
 
 def _normalize_chat_suffix(
-    value: list[dict[str, str]] | str,
+    value: list[dict[str, tp.Any]] | str,
     field_name: str,
-) -> list[dict[str, str]]:
+) -> list[dict[str, tp.Any]]:
     """Normalize a prompt or completion suffix value into a conversational message list.
 
     This helper ensures that suffix values (which may come from dataset
@@ -366,8 +480,9 @@ def _normalize_chat_suffix(
     Raises:
         TypeError: If ``value`` is neither a string nor a list.
     """
-    if isinstance(value, list):
-        return value
+    normalized = normalize_message_payload(value, allow_plain_text=False)
+    if normalized is not None:
+        return normalized
     if isinstance(value, str):
         return [{"role": "assistant", "content": value}]
     raise TypeError(f"`{field_name}` must be a string or a list of chat messages, received {type(value)}.")
@@ -471,6 +586,9 @@ def apply_chat_template(
         Handles both single and multi-turn conversations.
         Preserves original structure while applying templates.
     """
+    example = maybe_convert_to_chatml(dict(example))
+    tools = resolve_example_tools(example, tools)
+
     supported_keys = ["prompt", "chosen", "rejected", "completion", "messages", "label"]
     example_keys = {key for key in example.keys() if key in supported_keys}
     if example_keys not in [
@@ -650,23 +768,23 @@ def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
                   {'role': 'assistant', 'content': 'It is blue.'}]}
     ```
     """
-    for key in ["prompt", "completion", "chosen", "rejected", "messages", "conversations", "conversation"]:
-        if key in example and isinstance(example[key], list):
-            messages = example[key]
-            for message in messages:
-                if isinstance(message, dict):
-                    if "from" in message:
-                        message["role"] = message.pop("from")
-                    if "value" in message:
-                        message["content"] = message.pop("value")
+    result = dict(example)
 
-    if "conversations" in example:
-        example["messages"] = example.pop("conversations")
+    if "conversations" in result:
+        result["messages"] = result.pop("conversations")
 
-    if "conversation" in example:
-        example["messages"] = example.pop("conversation")
+    if "conversation" in result:
+        result["messages"] = result.pop("conversation")
 
-    return example
+    for key in ["prompt", "completion", "chosen", "rejected", "messages"]:
+        if key not in result:
+            continue
+        normalized = normalize_message_payload(result[key], allow_plain_text=(key == "messages"))
+        if normalized is not None:
+            result[key] = normalized
+
+    resolve_example_tools(result)
+    return result
 
 
 def remove_none_values(example: TListOrMapping) -> TListOrMapping:
