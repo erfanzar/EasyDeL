@@ -27,9 +27,7 @@ from collections.abc import Iterator
 # Re-export base classes from data_managers
 from easydel.data.transforms.base import Example, ExpandTransform, Transform
 
-from .prompt_utils import (
-    apply_chat_template as apply_conversational_template,
-)
+from .prompt_utils import apply_chat_template as apply_conversational_template
 from .prompt_utils import (
     maybe_apply_chat_template,
     maybe_convert_to_chatml,

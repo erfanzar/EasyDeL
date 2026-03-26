@@ -1165,7 +1165,7 @@ class BaseTrainer(BaseTrainerProtocol):
             train_dataset: The training dataset to inspect.
             eval_dataset: The evaluation dataset to inspect.
         """
-        from .prompt_transforms import is_conversational
+        from .prompt_utils import is_conversational
 
         self.train_is_conversational = False
         self.eval_is_conversational = False
@@ -2415,7 +2415,9 @@ class BaseTrainer(BaseTrainerProtocol):
             reserve_tokens = esurge_kwargs.get("reserve_tokens")
             if reserve_tokens is None:
                 reserve_tokens = esurge_kwargs.get("max_num_seqs", 0)
-            esurge_kwargs["max_model_len"] = sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)  # pyright: ignore[reportOptionalOperand]
+            esurge_kwargs["max_model_len"] = (
+                sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)
+            )  # pyright: ignore[reportOptionalOperand]
 
             _log_kwargs = {k: v for k, v in esurge_kwargs.items() if k != "tokenizer"}
             logger.info_once(f"Creating eSurge {pprint.pformat(_log_kwargs)}")
@@ -3629,7 +3631,9 @@ class BaseTrainer(BaseTrainerProtocol):
 
         if hasattr(prompts, "shape"):
             prompt_ids = np.asarray(jax.device_get(prompts))
-            prompt_attention_mask = None if prompt_mask is None else np.asarray(jax.device_get(prompt_mask), dtype=np.int32)
+            prompt_attention_mask = (
+                None if prompt_mask is None else np.asarray(jax.device_get(prompt_mask), dtype=np.int32)
+            )
             prompt_rows = self._decode_prompt_batch(
                 self.processing_class,
                 prompt_ids,
