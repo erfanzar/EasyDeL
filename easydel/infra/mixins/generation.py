@@ -3303,28 +3303,8 @@ class EasyGenerationMixin:
 
         return BeamSearchOutput(sequences=sequences, scores=scores)
 
-    @property
-    def esurge_graphdef(self):
-        """Returns a graph definition compatible with eSurge inference engine.
-
-        eSurge requires models to use paged attention mechanisms compatible with its
-        continuous-batching KV cache (ragged v2/v3 or unified attention).
-        If the current model uses a different attention mechanism, this property
-        creates a new graph definition with a backend-compatible mechanism
-        (ragged v3 on TPU/CPU-like backends, unified attention on GPU).
-
-        Returns:
-            nn.GraphDef: Graph definition with eSurge-compatible attention mechanism.
-
-        Note:
-            This creates only the graph structure, not a complete model. Use
-            `esurge_compatible_model` if you need a full model instance.
-
-        Example:
-            >>> gdef = model.esurge_graphdef
-            >>> # Use gdef for creating eSurge-compatible model instances
-        """
-        gdef = self.graphdef
+    def _esurge_graphdef_from_graphdef(self, gdef):
+        """Adapt a graph definition to the eSurge-compatible attention setup."""
         backend = _resolve_backend_for_esurge(self.config)
         text_config = self.config.get_text_config()
         attn_mechanism = _normalize_attn_mechanism_value(getattr(self.config, "attn_mechanism", None))
@@ -3375,6 +3355,29 @@ class EasyGenerationMixin:
                 update_kwargs["mla_attn_mechanism"] = target_attn
             gdef = self.new_graphdef(**update_kwargs)
         return gdef
+
+    @property
+    def esurge_graphdef(self):
+        """Returns a graph definition compatible with eSurge inference engine.
+
+        eSurge requires models to use paged attention mechanisms compatible with its
+        continuous-batching KV cache (ragged v2/v3 or unified attention).
+        If the current model uses a different attention mechanism, this property
+        creates a new graph definition with a backend-compatible mechanism
+        (ragged v3 on TPU/CPU-like backends, unified attention on GPU).
+
+        Returns:
+            nn.GraphDef: Graph definition with eSurge-compatible attention mechanism.
+
+        Note:
+            This creates only the graph structure, not a complete model. Use
+            `esurge_compatible_model` if you need a full model instance.
+
+        Example:
+            >>> gdef = model.esurge_graphdef
+            >>> # Use gdef for creating eSurge-compatible model instances
+        """
+        return self._esurge_graphdef_from_graphdef(self.graphdef)
 
     @property
     def esurge_compatible_model(self):
@@ -3464,6 +3467,202 @@ class EasyGenerationMixin:
             return getattr(getattr(engine, "runner", None), "model", None) is not None
         except Exception:
             return False
+
+    @staticmethod
+    def _esurge_engine_graphdef(engine):
+        """Return the graphdef already attached to a cached eSurge engine, if available."""
+        try:
+            return getattr(getattr(engine, "runner", None), "executor_manager", None).graphdef
+        except Exception:
+            return None
+
+    @staticmethod
+    def _graphdef_layout_fingerprint(graphdef) -> int | None:
+        """Return a stable fingerprint for an NNX graph layout when possible."""
+        if graphdef is None:
+            return None
+        try:
+            return hash(graphdef)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _esurge_engine_source_graphdef_fingerprint(engine) -> int | None:
+        """Return the cached source-graph fingerprint associated with an engine."""
+        try:
+            return getattr(engine, "_easydel_source_graphdef_fingerprint", None)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _esurge_engine_source_layout_signature(engine) -> str | None:
+        """Return the cached source-layout signature associated with an engine."""
+        try:
+            return getattr(engine, "_easydel_source_layout_signature", None)
+        except Exception:
+            return None
+
+    def _source_layout_signature_for_esurge_metadata(self) -> str | None:
+        """Return a stable, cheap layout signature for cached eSurge refreshes.
+
+        Raw ``graphdef`` hashes can differ across equivalent reconstructed model
+        objects in long training loops. Keep a second signature that captures the
+        aspects of model layout we care about for safe graphdef reuse: wrapper
+        delegation, LoRA enablement, graphstate variable type, and config shape.
+        """
+        payload: dict[str, tp.Any] = {
+            "model_class": f"{type(self).__module__}.{type(self).__qualname__}",
+            "delegates_esurge_graphdef": type(self).__dict__.get("esurge_graphdef") is not None,
+        }
+
+        try:
+            graphstate_type = self.graphstate_type
+        except Exception:
+            graphstate_type = None
+        if graphstate_type is not None:
+            payload["graphstate_type"] = f"{graphstate_type.__module__}.{graphstate_type.__qualname__}"
+
+        try:
+            payload["lora_is_enabled"] = bool(self.lora_is_enabled)
+        except Exception:
+            pass
+
+        config_dict = None
+        try:
+            config = self.config
+        except Exception:
+            config = None
+        if config is not None:
+            try:
+                config_dict = config.to_dict()
+            except Exception:
+                try:
+                    config_dict = {
+                        key: value
+                        for key, value in vars(config).items()
+                        if not key.startswith("_") and not callable(value)
+                    }
+                except Exception:
+                    config_dict = None
+        if config_dict is not None:
+            payload["config"] = config_dict
+
+        try:
+            serialized = pprint.pformat(payload, sort_dicts=True).encode("utf-8")
+            return hashlib.md5(serialized).hexdigest()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_esurge_cache_value(value):
+        """Normalize cache-key values so equivalent processor instances hash the same."""
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, tuple):
+            return tuple(EasyGenerationMixin._normalize_esurge_cache_value(v) for v in value)
+        if isinstance(value, list):
+            return [EasyGenerationMixin._normalize_esurge_cache_value(v) for v in value]
+        if isinstance(value, dict):
+            return {k: EasyGenerationMixin._normalize_esurge_cache_value(v) for k, v in value.items()}
+
+        normalized = {"type": f"{type(value).__module__}.{type(value).__qualname__}"}
+        try:
+            name_or_path = getattr(value, "name_or_path", None)
+        except Exception:
+            name_or_path = None
+        if isinstance(name_or_path, str) and name_or_path:
+            normalized["name_or_path"] = name_or_path
+
+        try:
+            nested_tokenizer = getattr(value, "tokenizer", None)
+        except Exception:
+            nested_tokenizer = None
+        if nested_tokenizer is not None and nested_tokenizer is not value:
+            normalized["tokenizer"] = EasyGenerationMixin._normalize_esurge_cache_value(nested_tokenizer)
+
+        return normalized
+
+    @staticmethod
+    def _sync_esurge_processor_references(engine, processor_or_tokenizer) -> None:
+        """Keep cached engine processor/tokenizer refs aligned with the current caller."""
+        if processor_or_tokenizer is None or isinstance(processor_or_tokenizer, str):
+            return
+        try:
+            engine.processor = processor_or_tokenizer
+        except Exception:
+            pass
+        try:
+            nested_tokenizer = getattr(processor_or_tokenizer, "tokenizer", None)
+        except Exception:
+            nested_tokenizer = None
+        tokenizer_obj = nested_tokenizer if nested_tokenizer is not None else processor_or_tokenizer
+        try:
+            engine.tokenizer = tokenizer_obj
+        except Exception:
+            pass
+
+    def _remember_esurge_engine_source_graphdef(self, engine, graphdef) -> None:
+        """Remember which source-model graph layout a cached engine matches."""
+        fingerprint = self._graphdef_layout_fingerprint(graphdef)
+        layout_signature = self._source_layout_signature_for_esurge_metadata()
+        if fingerprint is None and layout_signature is None:
+            return
+        try:
+            if fingerprint is not None:
+                engine._easydel_source_graphdef_fingerprint = fingerprint
+            if layout_signature is not None:
+                engine._easydel_source_layout_signature = layout_signature
+        except Exception:
+            return
+
+    def _maybe_source_graphdef_for_esurge_metadata(self):
+        """Best-effort source graphdef for cache metadata.
+
+        Lightweight EasyGenerationMixin users are not required to expose a
+        ``graphdef`` property, so fingerprint bookkeeping must stay optional.
+        """
+        try:
+            return self.graphdef
+        except Exception:
+            return None
+
+    def _refresh_esurge_engine_weights(self, engine, *, restart_scheduler: bool = True) -> None:
+        """Refresh cached engine weights while tolerating older adapter signatures."""
+        update_model_weights = engine.update_model_weights
+        update_kwargs: dict[str, tp.Any] = {}
+
+        try:
+            params = inspect.signature(update_model_weights).parameters
+        except (TypeError, ValueError):
+            params = {}
+
+        accepts_var_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
+        if accepts_var_kwargs or "restart_scheduler" in params:
+            update_kwargs["restart_scheduler"] = restart_scheduler
+        current_source_graphdef = None
+        current_source_graphdef_fingerprint = None
+        current_source_layout_signature = self._source_layout_signature_for_esurge_metadata()
+        if accepts_var_kwargs or "graphdef" in params:
+            current_source_graphdef = self._maybe_source_graphdef_for_esurge_metadata()
+            current_source_graphdef_fingerprint = self._graphdef_layout_fingerprint(current_source_graphdef)
+            cached_source_graphdef_fingerprint = self._esurge_engine_source_graphdef_fingerprint(engine)
+            cached_source_layout_signature = self._esurge_engine_source_layout_signature(engine)
+            graphdef = self._esurge_engine_graphdef(engine)
+            if graphdef is not None and (
+                (
+                    current_source_graphdef_fingerprint is not None
+                    and cached_source_graphdef_fingerprint == current_source_graphdef_fingerprint
+                )
+                or (
+                    current_source_layout_signature is not None
+                    and cached_source_layout_signature == current_source_layout_signature
+                )
+            ):
+                update_kwargs["graphdef"] = graphdef
+
+        update_model_weights(self, **update_kwargs)
+        if current_source_graphdef_fingerprint is not None or current_source_layout_signature is not None:
+            self._remember_esurge_engine_source_graphdef(engine, current_source_graphdef)
 
     def _esurge_cache_scope(self) -> str:
         """Return a stable cache scope for this model instance.
@@ -3596,7 +3795,7 @@ class EasyGenerationMixin:
             if engine_id in _ESURGE_MAP_CACHE:
                 eng = _ESURGE_MAP_CACHE[engine_id]
                 if not self._esurge_engine_has_model_state(eng):
-                    eng.update_model_weights(self, restart_scheduler=False)
+                    self._refresh_esurge_engine_weights(eng, restart_scheduler=False)
                 eng.resume()
                 if not getattr(eng, "silent_mode", False):
                     logger.info(f"Resumed eSurge engine: {engine_id}")
@@ -3609,7 +3808,7 @@ class EasyGenerationMixin:
             for cache_key, engine in _ESURGE_MAP_CACHE.items():
                 if cache_key.startswith(f"{model_hash}-"):
                     if not self._esurge_engine_has_model_state(engine):
-                        engine.update_model_weights(self, restart_scheduler=False)
+                        self._refresh_esurge_engine_weights(engine, restart_scheduler=False)
                     engine.resume()
                     resumed_count += 1
                     should_log = should_log or not getattr(engine, "silent_mode", False)
@@ -3794,7 +3993,7 @@ class EasyGenerationMixin:
             cached_engine = self.get_relevant_esurge()
             if cached_engine is not None:
                 if not self._esurge_engine_has_model_state(cached_engine):
-                    cached_engine.update_model_weights(self, restart_scheduler=False)
+                    self._refresh_esurge_engine_weights(cached_engine, restart_scheduler=False)
                 # Auto-resume if paused
                 if hasattr(cached_engine, "_paused") and cached_engine._paused:
                     if not getattr(cached_engine, "silent_mode", False):
@@ -3894,7 +4093,7 @@ class EasyGenerationMixin:
         )
 
         # Check if this exact configuration exists in cache
-        extra_dict_str = pprint.pformat(extra_dict)
+        extra_dict_str = pprint.pformat(self._normalize_esurge_cache_value(extra_dict), sort_dicts=True)
         bytes_in = hashlib.md5(extra_dict_str.encode("utf-8")).digest()
         extra_dict_hash = int.from_bytes(bytes_in, byteorder="big", signed=True)
         esurge_hash = f"{model_hash}-{extra_dict_hash}"
@@ -3909,11 +4108,13 @@ class EasyGenerationMixin:
             esurge = eSurge(model=self, **extra_dict)
             _ESURGE_MAP_CACHE[esurge_hash] = esurge
             created_new_engine = True
+            self._remember_esurge_engine_source_graphdef(esurge, self._maybe_source_graphdef_for_esurge_metadata())
+        self._sync_esurge_processor_references(esurge, tokenizer)
 
         # Freshly created engines already carry current model weights.
         # Re-refreshing immediately forces an unnecessary scheduler restart.
         if not created_new_engine and esurge.num_running_requests == 0 and esurge.num_pending_requests == 0:
-            esurge.update_model_weights(self)
+            self._refresh_esurge_engine_weights(esurge)
 
         # Auto-resume only after weights/model state are refreshed.
         if hasattr(esurge, "_paused") and esurge._paused:
@@ -3956,7 +4157,7 @@ class EasyGenerationMixin:
 
         if is_chat_mode:
             # Chat mode: use engine.chat()
-            return engine.chat(
+            outputs = engine.chat(
                 messages=prompts,
                 tools=tools,
                 sampling_params=sampling_params,
@@ -3967,18 +4168,19 @@ class EasyGenerationMixin:
         else:
             # Completion mode: use engine.stream() or engine.generate()
             if stream:
-                return engine.stream(
+                outputs = engine.stream(
                     prompts=prompts,
                     sampling_params=sampling_params,
                     request_id=request_id,
                 )
             else:
-                return engine.generate(
+                outputs = engine.generate(
                     prompts=prompts,
                     sampling_params=sampling_params,
                     request_id=request_id,
                     use_tqdm=use_tqdm,
                 )
+        return outputs
 
     def esurge_generate(
         self,

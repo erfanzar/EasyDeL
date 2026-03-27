@@ -68,6 +68,44 @@ class EngineLifecycleMixin:
             "Non-DP-local page IDs detected" in msg or "Distributed step synchronization failure" in msg
         )
 
+    @staticmethod
+    def _model_overrides_esurge_graphdef(model: EasyDeLBaseModule) -> bool:
+        """Return whether the model delegates eSurge graph construction."""
+        return type(model).__dict__.get("esurge_graphdef") is not None
+
+    @classmethod
+    def _split_graph_components_for_weight_update(cls, model: EasyDeLBaseModule):
+        """Split graph components from the module that actually backs eSurge."""
+        split_model = model
+        if cls._model_overrides_esurge_graphdef(model):
+            try:
+                split_model = model.esurge_compatible_model
+            except Exception:
+                split_model = model
+        split_graphdef, split_graphstate, split_graphother = split_model.split_module()
+        return split_model, split_graphdef, split_graphstate, split_graphother
+
+    @classmethod
+    def _resolve_graphdef_for_weight_update(cls, model: EasyDeLBaseModule, split_graphdef=None):
+        """Resolve the graphdef to use for a model-weight refresh.
+
+        Some wrapper types override ``esurge_graphdef`` to delegate eSurge graph
+        construction to an underlying base LM because the wrapper itself cannot
+        be lazily rebuilt from config. Respect that override instead of forcing
+        ``_esurge_graphdef_from_graphdef(...)`` on the wrapper graphdef.
+        """
+        if cls._model_overrides_esurge_graphdef(model):
+            try:
+                compatible_model = model.esurge_compatible_model
+            except Exception:
+                compatible_model = None
+            if compatible_model is not None:
+                return split_graphdef if split_graphdef is not None else compatible_model.graphdef
+            return model.esurge_graphdef
+
+        base_graphdef = split_graphdef if split_graphdef is not None else model.graphdef
+        return model._esurge_graphdef_from_graphdef(base_graphdef)
+
     def _abort_scheduler_due_to_error(self, exc: BaseException) -> None:
         """Record a fatal scheduler error and wake all waiting callers.
 
@@ -560,7 +598,6 @@ class EngineLifecycleMixin:
             RuntimeError: If there are active or pending requests.
             ValueError: If no model/graph data is provided.
         """
-
         if self.num_running_requests > 0 or self.num_pending_requests > 0:
             raise RuntimeError("Cannot update model weights while requests are active or pending")
 
@@ -573,13 +610,30 @@ class EngineLifecycleMixin:
 
         self._drain_pipeline_workers("update_model_weights")
 
+        split_graphdef = None
+        split_graphstate = None
+        split_graphother = None
+        using_compatible_split = False
+        if model is not None and (graphdef is None or graphstate is None or graphother is None):
+            using_compatible_split = self._model_overrides_esurge_graphdef(model)
+            _split_model, split_graphdef, split_graphstate, split_graphother = (
+                self._split_graph_components_for_weight_update(model)
+            )
+
         if model is None:
             model = flax.nnx.merge(graphdef, graphstate, graphother)
-        if graphstate is None:
-            graphstate = model.graphstate
-        if graphother is None:
-            graphother = model.graphother
-        graphdef = model.esurge_graphdef
+        if using_compatible_split and graphdef is None:
+            if graphstate is None:
+                graphstate = split_graphstate
+            if graphother is None:
+                graphother = split_graphother
+        else:
+            if graphstate is None:
+                graphstate = split_graphstate
+            if graphother is None:
+                graphother = split_graphother
+        if graphdef is None:
+            graphdef = self._resolve_graphdef_for_weight_update(model, split_graphdef)
 
         self.runner.update_model_weights(
             graphdef=graphdef,

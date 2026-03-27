@@ -751,6 +751,37 @@ def test_prepare_generation_input_passes_dataset_tools_to_chat_template():
     assert processor.calls[1][2]["tokenize"] is False
 
 
+def test_prepare_generation_input_prefers_max_prompt_length_for_preview_padding():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        max_length=16,
+        max_prompt_length=8,
+        generation_dataset_prompt_field="prompt",
+    )
+
+    class _Processor:
+        def __init__(self):
+            self.padding_side = "right"
+            self.calls: list[tuple[object, dict[str, object]]] = []
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.calls.append((messages, kwargs))
+            return {
+                "input_ids": np.asarray([[101, 102, 103]], dtype=np.int32),
+                "attention_mask": np.asarray([[1, 1, 1]], dtype=np.int32),
+            }
+
+    processor = _Processor()
+    trainer.processing_class = processor
+    trainer._batch_decode_tokens = lambda token_ids: ["decoded"]
+
+    prepared = BaseTrainer._prepare_generation_input(trainer, "preview prompt")
+
+    assert prepared is not None
+    assert len(processor.calls) == 1
+    assert processor.calls[0][1]["max_length"] == 8
+
+
 def test_sample_prompts_from_dataset_supports_sharded_source_with_row_metadata():
     trainer = object.__new__(_PreviewTrainer)
     trainer._generation_rng = np.random.default_rng(0)
@@ -1072,7 +1103,171 @@ def test_maybe_generate_prefers_completion_aligned_text_field():
     ]
 
 
-def test_generate_unified_esurge_releases_only_used_engine():
+def test_maybe_generate_ignores_rollout_metrics_and_still_runs_preview():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        generation_interval=1,
+        generation_num_return_sequences=1,
+        use_esurge_generation=True,
+        generation_shard_inputs=False,
+        use_wandb=False,
+        can_log_metrics=False,
+        generation_log_to_wandb=False,
+        generation_preview_print=False,
+    )
+    trainer._pad_token_id = 0
+    trainer.latest_generation_samples = []
+    trainer._collect_generation_prompts = lambda: ["prompt-1"]
+    trainer._prepare_generation_input = lambda prompt: {
+        "input_ids": jnp.asarray([[11, 12, 13]], dtype=jnp.int32),
+        "attention_mask": jnp.asarray([[1, 1, 1]], dtype=jnp.int32),
+        "prompt_text": "Prompt 1",
+    }
+
+    generate_calls = 0
+
+    def fake_generate_unified(**kwargs):
+        del kwargs
+        nonlocal generate_calls
+        generate_calls += 1
+        return GenerationResults(
+            generation_results=["preview-completion"],
+            prompt_ids=jnp.asarray([[11, 12, 13]], dtype=jnp.int32),
+            prompt_mask=jnp.asarray([[1, 1, 1]], dtype=jnp.int32),
+            sequences=jnp.asarray([[11, 12, 13, 14]], dtype=jnp.int32),
+            completion_ids=jnp.asarray([[14]], dtype=jnp.int32),
+            completion_mask=jnp.asarray([[1]], dtype=jnp.int32),
+            text=["preview-completion"],
+            reasoning=[None],
+            tool_calls=[None],
+            raw_text=["preview-completion"],
+            completion_prompts=["Prompt 1"],
+        )
+
+    trainer.generate_unified = fake_generate_unified
+
+    metrics = SimpleNamespace(
+        other_metrics={
+            "generation_time": 12.3,
+            "completion_length": 64.0,
+        },
+    )
+    trainer.maybe_generate(state=SimpleNamespace(model=SimpleNamespace()), step=1, metrics=metrics)
+
+    assert generate_calls >= 1
+
+
+def test_generate_unified_esurge_releases_all_generation_runtimes():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        generation_max_new_tokens=2,
+        max_completion_length=None,
+        generation_temperature=0.7,
+        generation_top_p=0.95,
+        generation_top_k=64,
+        generation_num_return_sequences=1,
+        esurge_hbm_utilization=None,
+        esurge_max_num_seqs=None,
+        esurge_min_input_pad=None,
+        esurge_page_size=None,
+        esurge_silent_mode=True,
+        esurge_runner_verbose=True,
+        esurge_max_num_batched_tokens=None,
+        esurge_enable_prefix_caching=None,
+        esurge_data_parallelism_axis=None,
+        esurge_max_num_seq_buckets=None,
+        total_batch_size=1,
+        max_length=8,
+        esurge_use_tqdm=False,
+        use_esurge_generation=True,
+    )
+    trainer._pad_token_id = 0
+    trainer.processing_class = "tok"
+    trainer.generate_function = object()
+    trainer.generate_function_with_model_kwargs = object()
+
+    class _Completion:
+        def __init__(self, token_ids):
+            self.token_ids = token_ids
+            self.text = "completion-text"
+            self.reasoning_content = "reasoning-text"
+            self.tool_calls = [{"type": "function", "function": {"name": "lookup", "arguments": "{}"}}]
+            self.raw_text = "<tool_call>completion-text</tool_call>"
+
+    class _RequestOutput:
+        def __init__(self):
+            self.prompt_token_ids = [[11, 12]]
+            self.outputs = [_Completion([13])]
+            self.accumulated_text = "completion-text"
+            self.raw_accumulated_text = "<tool_call>completion-text</tool_call>"
+            self.prompt = "prompt-text"
+
+    class _Engine:
+        def __init__(self):
+            self.pause_calls = 0
+            self.release_calls: list[bool] = []
+
+        def pause(self):
+            self.pause_calls += 1
+
+        def release_model_state(self, *, clear_compiled_cache: bool = False):
+            self.release_calls.append(clear_compiled_cache)
+
+    class _Model:
+        def __init__(self, engine, other_engine):
+            self._engine = engine
+            self._other_engine = other_engine
+            self.call_esurge_engine_kwargs = None
+            self.pause_esurge_calls: list[tuple[bool, bool]] = []
+
+        def get_esurge(self, **kwargs):
+            self.get_esurge_kwargs = kwargs
+            return self._engine
+
+        def _call_esurge_engine(self, engine, **kwargs):
+            assert engine is self._engine
+            self.call_esurge_engine_kwargs = kwargs
+            return [_RequestOutput()]
+
+        def pause_esurge(self, *, release_model_state: bool = False, clear_compiled_cache: bool = False):
+            self.pause_esurge_calls.append((release_model_state, clear_compiled_cache))
+            self._engine.pause()
+            self._other_engine.pause()
+            if release_model_state:
+                self._engine.release_model_state(clear_compiled_cache=clear_compiled_cache)
+                self._other_engine.release_model_state(clear_compiled_cache=clear_compiled_cache)
+
+    engine = _Engine()
+    other_engine = _Engine()
+    model = _Model(engine, other_engine)
+    state = SimpleNamespace(model=model)
+
+    results = trainer.generate_unified(
+        prompts=["prompt-text"],
+        state=state,
+        use_esurge=True,
+        apply_chat_template=False,
+        shard_inputs=False,
+        all_gather=False,
+    )
+
+    assert model.call_esurge_engine_kwargs is not None
+    assert model.get_esurge_kwargs["runner_verbose"] is True
+    assert results.generation_results == ["completion-text"]
+    assert results.text == ["completion-text"]
+    assert results.reasoning == ["reasoning-text"]
+    assert results.tool_calls == [[{"type": "function", "function": {"name": "lookup", "arguments": "{}"}}]]
+    assert results.raw_text == ["<tool_call>completion-text</tool_call>"]
+    assert model.pause_esurge_calls == [(True, False)]
+    assert engine.pause_calls == 1
+    assert engine.release_calls == [False]
+    assert other_engine.pause_calls == 1
+    assert other_engine.release_calls == [False]
+    assert trainer.generate_function is None
+    assert trainer.generate_function_with_model_kwargs is None
+
+
+def test_generate_unified_esurge_ignores_cleanup_failures_after_success():
     trainer = object.__new__(_PreviewTrainer)
     trainer.arguments = SimpleNamespace(
         generation_max_new_tokens=2,
@@ -1103,16 +1298,103 @@ def test_generate_unified_esurge_releases_only_used_engine():
         def __init__(self, token_ids):
             self.token_ids = token_ids
             self.text = "completion-text"
-            self.reasoning_content = "reasoning-text"
-            self.tool_calls = [{"type": "function", "function": {"name": "lookup", "arguments": "{}"}}]
-            self.raw_text = "<tool_call>completion-text</tool_call>"
 
     class _RequestOutput:
         def __init__(self):
             self.prompt_token_ids = [[11, 12]]
             self.outputs = [_Completion([13])]
             self.accumulated_text = "completion-text"
-            self.raw_accumulated_text = "<tool_call>completion-text</tool_call>"
+            self.prompt = "prompt-text"
+
+    class _Engine:
+        def __init__(self):
+            self.pause_calls = 0
+            self.release_calls = 0
+
+        def pause(self):
+            self.pause_calls += 1
+            raise RuntimeError("pause failed")
+
+        def release_model_state(self, *, clear_compiled_cache: bool = False):
+            del clear_compiled_cache
+            self.release_calls += 1
+            raise RuntimeError("release failed")
+
+    class _Model:
+        def __init__(self, engine):
+            self._engine = engine
+            self.pause_esurge_calls = 0
+
+        def get_esurge(self, **kwargs):
+            self.get_esurge_kwargs = kwargs
+            return self._engine
+
+        def _call_esurge_engine(self, engine, **kwargs):
+            assert engine is self._engine
+            self.call_esurge_engine_kwargs = kwargs
+            return [_RequestOutput()]
+
+        def pause_esurge(self, **kwargs):
+            del kwargs
+            self.pause_esurge_calls += 1
+            raise RuntimeError("pause_esurge failed")
+
+    engine = _Engine()
+    model = _Model(engine)
+    state = SimpleNamespace(model=model)
+
+    results = trainer.generate_unified(
+        prompts=["prompt-text"],
+        state=state,
+        use_esurge=True,
+        apply_chat_template=False,
+        shard_inputs=False,
+        all_gather=False,
+    )
+
+    assert results.generation_results == ["completion-text"]
+    assert model.pause_esurge_calls == 1
+    assert engine.pause_calls == 0
+    assert engine.release_calls == 0
+
+
+def test_generate_unified_esurge_can_keep_runtime_alive():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        generation_max_new_tokens=2,
+        max_completion_length=None,
+        generation_temperature=0.7,
+        generation_top_p=0.95,
+        generation_top_k=64,
+        generation_num_return_sequences=1,
+        esurge_hbm_utilization=None,
+        esurge_max_num_seqs=None,
+        esurge_min_input_pad=None,
+        esurge_page_size=None,
+        esurge_silent_mode=True,
+        esurge_runner_verbose=True,
+        esurge_max_num_batched_tokens=None,
+        esurge_enable_prefix_caching=None,
+        esurge_data_parallelism_axis=None,
+        esurge_max_num_seq_buckets=None,
+        total_batch_size=1,
+        max_length=8,
+        esurge_use_tqdm=False,
+        use_esurge_generation=True,
+    )
+    trainer._pad_token_id = 0
+    trainer.processing_class = "tok"
+
+    class _Completion:
+        def __init__(self, token_ids):
+            self.token_ids = token_ids
+            self.text = "completion-text"
+
+    class _RequestOutput:
+        def __init__(self):
+            self.prompt_token_ids = [[11, 12]]
+            self.outputs = [_Completion([13])]
+            self.accumulated_text = "completion-text"
             self.prompt = "prompt-text"
 
     class _Engine:
@@ -1129,7 +1411,7 @@ def test_generate_unified_esurge_releases_only_used_engine():
     class _Model:
         def __init__(self, engine):
             self._engine = engine
-            self.call_esurge_engine_kwargs = None
+            self.pause_esurge_calls: list[tuple[bool, bool]] = []
 
         def get_esurge(self, **kwargs):
             self.get_esurge_kwargs = kwargs
@@ -1139,6 +1421,9 @@ def test_generate_unified_esurge_releases_only_used_engine():
             assert engine is self._engine
             self.call_esurge_engine_kwargs = kwargs
             return [_RequestOutput()]
+
+        def pause_esurge(self, *, release_model_state: bool = False, clear_compiled_cache: bool = False):
+            self.pause_esurge_calls.append((release_model_state, clear_compiled_cache))
 
     engine = _Engine()
     model = _Model(engine)
@@ -1150,18 +1435,94 @@ def test_generate_unified_esurge_releases_only_used_engine():
         use_esurge=True,
         apply_chat_template=False,
         shard_inputs=False,
+        release_runtime_after_generation=False,
         all_gather=False,
     )
 
-    assert model.call_esurge_engine_kwargs is not None
-    assert model.get_esurge_kwargs["runner_verbose"] is True
     assert results.generation_results == ["completion-text"]
-    assert results.text == ["completion-text"]
-    assert results.reasoning == ["reasoning-text"]
-    assert results.tool_calls == [[{"type": "function", "function": {"name": "lookup", "arguments": "{}"}}]]
-    assert results.raw_text == ["<tool_call>completion-text</tool_call>"]
+    assert model.pause_esurge_calls == []
+    assert engine.pause_calls == 0
+    assert engine.release_calls == []
+
+
+def test_generate_unified_esurge_cleans_up_after_post_generation_failure():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        generation_max_new_tokens=2,
+        max_completion_length=None,
+        generation_temperature=0.7,
+        generation_top_p=0.95,
+        generation_top_k=64,
+        generation_num_return_sequences=1,
+        esurge_hbm_utilization=None,
+        esurge_max_num_seqs=None,
+        esurge_min_input_pad=None,
+        esurge_page_size=None,
+        esurge_silent_mode=True,
+        esurge_runner_verbose=True,
+        esurge_max_num_batched_tokens=None,
+        esurge_enable_prefix_caching=None,
+        esurge_data_parallelism_axis=None,
+        esurge_max_num_seq_buckets=None,
+        total_batch_size=1,
+        max_length=8,
+        esurge_use_tqdm=False,
+        use_esurge_generation=True,
+    )
+    trainer._pad_token_id = 0
+    trainer.processing_class = "tok"
+
+    class _BrokenRequestOutput:
+        def __init__(self):
+            self.prompt_token_ids = [[11, 12]]
+            self.prompt = "prompt-text"
+
+    class _Engine:
+        def __init__(self):
+            self.pause_calls = 0
+            self.release_calls: list[bool] = []
+
+        def pause(self):
+            self.pause_calls += 1
+
+        def release_model_state(self, *, clear_compiled_cache: bool = False):
+            self.release_calls.append(clear_compiled_cache)
+
+    class _Model:
+        def __init__(self, engine):
+            self._engine = engine
+            self.pause_esurge_calls = 0
+
+        def get_esurge(self, **kwargs):
+            self.get_esurge_kwargs = kwargs
+            return self._engine
+
+        def _call_esurge_engine(self, engine, **kwargs):
+            assert engine is self._engine
+            self.call_esurge_engine_kwargs = kwargs
+            return [_BrokenRequestOutput()]
+
+        def pause_esurge(self, **kwargs):
+            del kwargs
+            self.pause_esurge_calls += 1
+
+    engine = _Engine()
+    model = _Model(engine)
+    state = SimpleNamespace(model=model)
+
+    with pytest.raises(AttributeError, match="outputs"):
+        trainer.generate_unified(
+            prompts=["prompt-text"],
+            state=state,
+            use_esurge=True,
+            apply_chat_template=False,
+            shard_inputs=False,
+            all_gather=False,
+        )
+
     assert engine.pause_calls == 1
     assert engine.release_calls == [False]
+    assert model.pause_esurge_calls == 0
 
 
 def test_generate_unified_esurge_propagates_generation_penalties():
@@ -1312,6 +1673,34 @@ def test_generate_unified_compiled_populates_completion_aligned_text_fields():
     assert results.reasoning == [None]
     assert results.tool_calls == [None]
     assert results.raw_text == ["99|21"]
+
+
+def test_sample_random_example_from_shard_caps_reservoir_scan_for_unbounded_source():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer._generation_rng = np.random.default_rng(0)
+
+    class _InfiniteSource(ShardedDataSource[dict]):
+        def __init__(self):
+            self.seen = 0
+
+        @property
+        def shard_names(self):
+            return ["infinite_shard"]
+
+        def num_shards(self) -> int:
+            return 1
+
+        def open_shard(self, shard_name: str):
+            assert shard_name == "infinite_shard"
+            while True:
+                self.seen += 1
+                yield {"prompt": f"row-{self.seen}"}
+
+    source = _InfiniteSource()
+    sampled = trainer._sample_random_example_from_shard(source, "infinite_shard")
+
+    assert sampled is not None
+    assert source.seen == 1024
 
 
 def test_maybe_generate_falls_back_to_per_prompt_after_batch_failure():

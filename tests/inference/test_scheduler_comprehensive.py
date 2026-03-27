@@ -6,7 +6,6 @@ import os
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 
-import pytest
 import jax.numpy as jnp
 
 from easydel.inference.esurge.config import CacheConfig, Config, SchedulerConfig

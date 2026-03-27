@@ -525,27 +525,34 @@ class AgenticMoshPitTrainer(GRPOTrainer):
         with capture_time() as total_time_fn:
             with capture_time() as rollout_time_fn:
                 generate_fn = self._make_generate_fn(state)
+                try:
 
-                def wrapped_env_factory():
-                    env = self.env_factory()
-                    if isinstance(env, SelfPlayEnvironment):
-                        env.set_generate_fn(generate_fn)
-                        gen = env._generator
-                        if isinstance(gen, LocalQuestionGenerator):
-                            if gen._tokenizer is None:
-                                gen._tokenizer = self.processing_class
-                            gen._strip_reasoning = self._strip_thinking
-                    return self._wrap_env_with_tools(env)
+                    def wrapped_env_factory():
+                        env = self.env_factory()
+                        if isinstance(env, SelfPlayEnvironment):
+                            env.set_generate_fn(generate_fn)
+                            gen = env._generator
+                            if isinstance(gen, LocalQuestionGenerator):
+                                if gen._tokenizer is None:
+                                    gen._tokenizer = self.processing_class
+                                gen._strip_reasoning = self._strip_thinking
+                        return self._wrap_env_with_tools(env)
 
-                trajectories = self._rollout_manager.run_grouped_episodes(
-                    env_factory=wrapped_env_factory,
-                    generate_fn=generate_fn,
-                    group_size=self.arguments.group_size,
-                    base_seed=self._rollout_step * self.arguments.num_env_groups,
-                    num_groups=self.arguments.num_env_groups,
-                )
-                aux_rewards, aux_reward_breakdown = self._apply_auxiliary_rewards_to_trajectories(trajectories)
-                self._rollout_step += 1
+                    trajectories = self._rollout_manager.run_grouped_episodes(
+                        env_factory=wrapped_env_factory,
+                        generate_fn=generate_fn,
+                        group_size=self.arguments.group_size,
+                        base_seed=self._rollout_step * self.arguments.num_env_groups,
+                        num_groups=self.arguments.num_env_groups,
+                    )
+                    aux_rewards, aux_reward_breakdown = self._apply_auxiliary_rewards_to_trajectories(trajectories)
+                    self._rollout_step += 1
+                finally:
+                    if self.arguments.use_esurge_generation:
+                        try:
+                            state.model.pause_esurge(release_model_state=True)
+                        except Exception as exc:  # pragma: no cover - best-effort rollout cleanup
+                            logger.debug("Failed to release eSurge runtime after agentic rollout: %s", exc)
 
             rollout_time = rollout_time_fn()
 

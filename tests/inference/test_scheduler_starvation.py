@@ -6,7 +6,6 @@ import os
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 
-import pytest
 import jax.numpy as jnp
 
 from easydel.inference.esurge.config import CacheConfig, Config, SchedulerConfig
@@ -94,18 +93,44 @@ class TestStarvation:
         _prefill_one(scheduler, "decode-0", 100)
 
         prompt_sizes = [
-            500, 1000, 2000, 4000, 8000, 9000, 10000, 12000,
-            15000, 20000, 25000, 30000, 500, 1000, 2000, 4000,
-            8000, 9000, 10000, 12000, 15000, 20000, 25000, 30000,
-            500, 1000, 2000, 4000, 8000, 9000, 10000,
+            500,
+            1000,
+            2000,
+            4000,
+            8000,
+            9000,
+            10000,
+            12000,
+            15000,
+            20000,
+            25000,
+            30000,
+            500,
+            1000,
+            2000,
+            4000,
+            8000,
+            9000,
+            10000,
+            12000,
+            15000,
+            20000,
+            25000,
+            30000,
+            500,
+            1000,
+            2000,
+            4000,
+            8000,
+            9000,
+            10000,
         ]
         for i, plen in enumerate(prompt_sizes):
             scheduler.add_request(_make_request(f"wait-{i}", plen))
 
         out = scheduler.schedule()
         assert out.total_num_scheduled_tokens > 1, (
-            f"starvation: only {out.total_num_scheduled_tokens} tokens scheduled "
-            f"with {out.num_waiting_reqs} waiting"
+            f"starvation: only {out.total_num_scheduled_tokens} tokens scheduled with {out.num_waiting_reqs} waiting"
         )
 
     def test_small_prompts_only(self):
@@ -128,8 +153,7 @@ class TestStarvation:
 
         out = scheduler.schedule()
         assert out.total_num_scheduled_tokens > 1, (
-            f"starvation: only {out.total_num_scheduled_tokens} tokens scheduled "
-            f"with {out.num_waiting_reqs} waiting"
+            f"starvation: only {out.total_num_scheduled_tokens} tokens scheduled with {out.num_waiting_reqs} waiting"
         )
         assert len(out.scheduled_new_reqs) >= 1
 

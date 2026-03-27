@@ -521,16 +521,16 @@ class ExecutionManager:
             ValueError: If neither a model nor explicit graph components are
                 provided.
         """
-
         if model is not None:
             self.model = model
             # Keep sub-executors in sync with the active model reference.
             self._model_executor.model = model
             self._sampler_executor.model = model
-            new_graphdef, new_graphstate, new_graphother = model.split_module()
-            graphdef = new_graphdef if graphdef is None else graphdef
-            graphstate = new_graphstate if graphstate is None else graphstate
-            graphother = new_graphother if graphother is None else graphother
+            if graphdef is None or graphstate is None or graphother is None:
+                new_graphdef, new_graphstate, new_graphother = model.split_module()
+                graphdef = new_graphdef if graphdef is None else graphdef
+                graphstate = new_graphstate if graphstate is None else graphstate
+                graphother = new_graphother if graphother is None else graphother
 
         if graphdef is None and graphstate is None and graphother is None:
             raise ValueError("No graph components supplied for update")

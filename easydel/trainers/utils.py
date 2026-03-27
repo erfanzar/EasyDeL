@@ -1556,8 +1556,8 @@ class GRPODataCollatorTFDS:
                 if key in GENERATION_MODEL_INPUT_KEYS:
                     raise ValueError(
                         "GRPO batches must not mix present and missing generation kwargs. "
-                            f"Found mixed presence for `{key}` across one batch."
-                        )
+                        f"Found mixed presence for `{key}` across one batch."
+                    )
                 continue
             if key == "tools":
                 batch[key] = values
