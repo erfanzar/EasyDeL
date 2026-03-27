@@ -50,6 +50,8 @@ import typing as tp
 from collections.abc import Mapping
 from typing import Any
 
+from eformer.loggings import get_logger
+
 if tp.TYPE_CHECKING:
     from datasets import Dataset, IterableDataset  # pyright: ignore[reportMissingTypeStubs]
     from transformers import PreTrainedTokenizerBase
@@ -77,6 +79,8 @@ from easydel.modules.auto import (
 
 from .processing import coerce_dtype, coerce_precision, materialize_base_config, normalize, resolve_task
 from .types import eLMConfig
+
+logger = get_logger(__name__)
 
 
 def to_from_pretrained_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
@@ -1183,6 +1187,24 @@ def _extract_dataset_name(inform_cfg: Mapping[str, Any], fallback_index: int = 0
     import os
     import re
 
+    generic_names = {
+        "data",
+        "dataset",
+        "datasets",
+        "split",
+        "splits",
+        "train",
+        "test",
+        "val",
+        "valid",
+        "validation",
+    }
+
+    def _normalize_name(raw: str) -> str:
+        cleaned = re.sub(r"[\*\?\[\]\{\}]", "", raw)
+        cleaned = cleaned.strip().strip("._- ")
+        return cleaned
+
     # Check for explicit name
     if inform_cfg.get("name"):
         return inform_cfg["name"]
@@ -1217,8 +1239,9 @@ def _extract_dataset_name(inform_cfg: Mapping[str, Any], fallback_index: int = 0
             # Clean glob patterns and extensions
             clean = part.rstrip("*").rstrip("/")
             name, _ = os.path.splitext(clean)
+            name = _normalize_name(name)
             # Skip if empty or looks like a bucket name (too generic)
-            if name and name not in ("data", "train", "test", "val", "dataset", "datasets"):
+            if name and name.lower() not in generic_names:
                 return name
             if name:
                 # Use it even if generic, but keep looking
@@ -1231,6 +1254,7 @@ def _extract_dataset_name(inform_cfg: Mapping[str, Any], fallback_index: int = 0
         # Fallback to last non-empty part
         if parts:
             name, _ = os.path.splitext(parts[-1].rstrip("*"))
+            name = _normalize_name(name)
             if name:
                 return name
 
@@ -1256,6 +1280,7 @@ def _extract_dataset_name(inform_cfg: Mapping[str, Any], fallback_index: int = 0
     if base_name:
         # Remove extension if present
         name, _ = os.path.splitext(base_name)
+        name = _normalize_name(name)
         if name:
             return name
 
@@ -1511,6 +1536,15 @@ def build_sharded_source(cfg_like: eLMConfig | Mapping[str, Any]) -> "ShardedDat
     for i, inform_cfg in enumerate(mixture_cfg.get("informs", [])):
         # Extract meaningful name from config
         name = _extract_dataset_name(inform_cfg, fallback_index=i)
+        if name in sources:
+            unique_name = f"{name}-{i}"
+            logger.warning(
+                "Duplicate dataset name '%s' detected in mixture config; using '%s' for the later source. "
+                "Set `mixture.informs[].name` explicitly to avoid ambiguity.",
+                name,
+                unique_name,
+            )
+            name = unique_name
         source = _create_source_from_inform(inform_cfg, mixture_cfg)
 
         # Apply format_callback if specified (custom transformation function)

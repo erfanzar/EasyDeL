@@ -191,8 +191,16 @@ class MixedShardedSource(ShardedDataSource[dict]):
             n = len(self._names)
             self._weights = {name: 1.0 / n for name in self._names}
         else:
-            total = sum(weights.values())
-            self._weights = {k: v / total for k, v in weights.items()}
+            missing = set(self._names) - set(weights.keys())
+            if missing:
+                raise ValueError(f"Weight keys must match source names. Missing: {sorted(missing)}")
+            extra = set(weights.keys()) - set(self._names)
+            if extra:
+                raise ValueError(f"Weight keys must match source names. Extra: {sorted(extra)}")
+            total = float(sum(weights[name] for name in self._names))
+            if total <= 0:
+                raise ValueError("Sum of mixture weights must be > 0.")
+            self._weights = {name: float(weights[name]) / total for name in self._names}
 
     @property
     def shard_names(self) -> "Sequence[str]":
