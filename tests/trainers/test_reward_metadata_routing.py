@@ -161,6 +161,45 @@ def test_agentic_generate_fn_keeps_raw_text_but_returns_post_strip_action_text()
     ]
 
 
+def test_agentic_rollout_releases_esurge_after_rollout_failure():
+    trainer = object.__new__(AgenticMoshPitTrainer)
+    trainer.arguments = SimpleNamespace(
+        use_esurge_generation=True,
+        group_size=1,
+        num_env_groups=1,
+    )
+    trainer._rollout_step = 0
+    trainer._strip_thinking = lambda text: text
+    trainer.processing_class = None
+    trainer.env_factory = lambda: _TerminalEnv()
+    trainer._wrap_env_with_tools = lambda env: env
+
+    class _RolloutManager:
+        def run_grouped_episodes(self, **kwargs):
+            del kwargs
+            raise RuntimeError("rollout failed")
+
+    trainer._rollout_manager = _RolloutManager()
+
+    pause_calls: list[tuple[bool, bool]] = []
+
+    class _Model:
+        def pause_esurge(self, *, release_model_state=False, clear_compiled_cache=False):
+            pause_calls.append((release_model_state, clear_compiled_cache))
+
+    state = SimpleNamespace(model=_Model())
+
+    with pytest.raises(RuntimeError, match="rollout failed"):
+        AgenticMoshPitTrainer._preprocess_batch_input(
+            trainer,
+            state=state,
+            batch={},
+            is_train=True,
+        )
+
+    assert pause_calls == [(True, False)]
+
+
 def test_rollout_manager_preserves_generation_metadata_on_turn_records():
     manager = RolloutManager(tokenizer=_TokenizerStub(), max_steps=2, max_seq_length=256)
 

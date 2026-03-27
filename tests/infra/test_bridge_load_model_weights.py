@@ -12,9 +12,7 @@ class _LoadConfigStub:
 class _LoadModelStub:
     def __init__(self):
         self.config = _LoadConfigStub()
-        self.graphtree_params_shape = {
-            "layer": {"weight": jax.ShapeDtypeStruct((2, 2), jnp.float32)}
-        }
+        self.graphtree_params_shape = {"layer": {"weight": jax.ShapeDtypeStruct((2, 2), jnp.float32)}}
 
     def _get_partition_rules(self, _):
         return None

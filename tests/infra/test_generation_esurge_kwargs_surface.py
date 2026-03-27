@@ -19,6 +19,9 @@ from inspect import signature
 import jax.numpy as jnp
 from transformers.generation.configuration_utils import GenerationConfig
 
+from easydel.inference.esurge.mixins.lifecycle import EngineLifecycleMixin
+from easydel.inference.esurge.runners import model_runner as model_runner_module
+from easydel.inference.esurge.runners.model_runner import eSurgeRunner
 from easydel.inference.logits_process import (
     FrequencyPenaltyLogitsProcessor,
     PresencePenaltyLogitsProcessor,
@@ -104,6 +107,286 @@ def test_get_esurge_refreshes_model_state_before_auto_resume(monkeypatch):
     assert resolved is engine
     assert engine.update_calls == 1
     assert engine.resume_calls == 1
+
+
+def test_get_esurge_default_cache_refreshes_legacy_engine_before_auto_resume(monkeypatch):
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "granted_freq_max_position_embedding": 1024,
+                },
+            )()
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+    class DummyEngine:
+        def __init__(self):
+            self._paused = True
+            self.silent_mode = True
+            self.num_running_requests = 0
+            self.num_pending_requests = 0
+            self.update_calls = 0
+            self.resume_calls = 0
+            self.runner = type("Runner", (), {"model": None})()
+
+        def update_model_weights(self, _model):
+            self.update_calls += 1
+            self.runner.model = object()
+
+        def resume(self):
+            assert self.update_calls > 0
+            self.resume_calls += 1
+            self._paused = False
+
+    monkeypatch.setattr(generation_module, "_ESURGE_MAP_CACHE", {})
+    model = DummyModel()
+    engine = DummyEngine()
+
+    generation_module._ESURGE_MAP_CACHE[f"{model._esurge_cache_scope()}-cached"] = engine
+
+    resolved = model.get_esurge()
+
+    assert resolved is engine
+    assert engine.update_calls == 1
+    assert engine.resume_calls == 1
+
+
+def test_refresh_esurge_engine_weights_reuses_cached_graphdef_only_for_matching_source_layout():
+    class DummyGraphDef:
+        def __init__(self, fingerprint):
+            self._fingerprint = fingerprint
+
+        def __hash__(self):
+            return self._fingerprint
+
+    class DummyConfig:
+        def __init__(self, marker):
+            self.marker = marker
+
+        def to_dict(self):
+            return {"marker": self.marker}
+
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self, graphdef):
+            self.graphdef = graphdef
+            self.config = DummyConfig("baseline-layout")
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+    class DummyEngine:
+        def __init__(self):
+            self.calls = []
+            self.runner = type(
+                "Runner",
+                (),
+                {"executor_manager": type("ExecMgr", (), {"graphdef": "cached-engine-graphdef"})()},
+            )()
+
+        def update_model_weights(self, _model, *, restart_scheduler=True, graphdef=None):
+            self.calls.append(
+                {
+                    "restart_scheduler": restart_scheduler,
+                    "graphdef": graphdef,
+                }
+            )
+
+    model = DummyModel(DummyGraphDef(11))
+    engine = DummyEngine()
+    model._remember_esurge_engine_source_graphdef(engine, model.graphdef)
+
+    model._refresh_esurge_engine_weights(engine)
+    assert engine.calls[-1]["graphdef"] == "cached-engine-graphdef"
+
+    model.graphdef = DummyGraphDef(22)
+    model.config = DummyConfig("changed-layout")
+    model._refresh_esurge_engine_weights(engine)
+    assert engine.calls[-1]["graphdef"] is None
+
+
+def test_refresh_esurge_engine_weights_reuses_cached_graphdef_when_layout_signature_matches():
+    class DummyGraphDef:
+        def __init__(self, fingerprint):
+            self._fingerprint = fingerprint
+
+        def __hash__(self):
+            return self._fingerprint
+
+    class DummyConfig:
+        def __init__(self, marker):
+            self.marker = marker
+
+        def to_dict(self):
+            return {"marker": self.marker}
+
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self, *, graphdef_fingerprint, config_marker):
+            self.graphdef = DummyGraphDef(graphdef_fingerprint)
+            self.config = DummyConfig(config_marker)
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+    class DummyEngine:
+        def __init__(self):
+            self.calls = []
+            self.runner = type(
+                "Runner",
+                (),
+                {"executor_manager": type("ExecMgr", (), {"graphdef": "cached-engine-graphdef"})()},
+            )()
+
+        def update_model_weights(self, _model, *, restart_scheduler=True, graphdef=None):
+            self.calls.append(
+                {
+                    "restart_scheduler": restart_scheduler,
+                    "graphdef": graphdef,
+                }
+            )
+
+    model = DummyModel(graphdef_fingerprint=11, config_marker="same-layout")
+    engine = DummyEngine()
+    model._remember_esurge_engine_source_graphdef(engine, model.graphdef)
+
+    model.graphdef = DummyGraphDef(22)
+    model._refresh_esurge_engine_weights(engine)
+    assert engine.calls[-1]["graphdef"] == "cached-engine-graphdef"
+
+    model.config = DummyConfig("changed-layout")
+    model.graphdef = DummyGraphDef(33)
+    model._refresh_esurge_engine_weights(engine)
+    assert engine.calls[-1]["graphdef"] is None
+
+
+def test_source_layout_signature_does_not_touch_esurge_compatible_model():
+    class DummyConfig:
+        def to_dict(self):
+            return {"marker": "baseline-layout"}
+
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = DummyConfig()
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+        @property
+        def graphstate_type(self):
+            return int
+
+        @property
+        def esurge_compatible_model(self):
+            raise AssertionError("layout signature must not construct esurge_compatible_model")
+
+    model = DummyModel()
+
+    signature = model._source_layout_signature_for_esurge_metadata()
+
+    assert isinstance(signature, str)
+    assert signature
+
+
+def test_lifecycle_update_graphdef_prefers_overridden_esurge_graphdef():
+    class WrapperLike:
+        graphdef = "wrapper-graphdef"
+
+        @property
+        def esurge_graphdef(self):
+            return "delegated-esurge-graphdef"
+
+        def _esurge_graphdef_from_graphdef(self, _graphdef):
+            raise AssertionError("wrapper helper should not be used when esurge_graphdef is overridden")
+
+    resolved = EngineLifecycleMixin._resolve_graphdef_for_weight_update(
+        WrapperLike(),
+        split_graphdef="split-wrapper-graphdef",
+    )
+
+    assert resolved == "delegated-esurge-graphdef"
+
+
+def test_lifecycle_split_graph_components_prefers_compatible_model_for_wrapper_delegate():
+    class CompatibleModel:
+        def split_module(self):
+            return ("compatible-graphdef", "compatible-graphstate", "compatible-graphother")
+
+    class WrapperLike:
+        def __init__(self):
+            self.model = CompatibleModel()
+
+        def split_module(self):
+            return ("wrapper-graphdef", "wrapper-graphstate", "wrapper-graphother")
+
+        @property
+        def esurge_graphdef(self):
+            return "delegated-esurge-graphdef"
+
+        @property
+        def esurge_compatible_model(self):
+            return self.model
+
+    split_model, graphdef, graphstate, graphother = EngineLifecycleMixin._split_graph_components_for_weight_update(
+        WrapperLike()
+    )
+
+    assert split_model.__class__.__name__ == "CompatibleModel"
+    assert (graphdef, graphstate, graphother) == (
+        "compatible-graphdef",
+        "compatible-graphstate",
+        "compatible-graphother",
+    )
+
+
+def test_model_runner_update_model_weights_replaces_explicit_graphdef_with_compatible_graphdef(monkeypatch):
+    raw_graphdef = object()
+    compatible_graphdef = object()
+
+    class CompatibleModel:
+        graphdef = compatible_graphdef
+
+    class RawModel:
+        @property
+        def esurge_compatible_model(self):
+            return CompatibleModel()
+
+    monkeypatch.setattr(model_runner_module.flax.nnx, "merge", lambda graphdef, graphstate, graphother: RawModel())
+
+    class DummyExecutorManager:
+        def __init__(self):
+            self.calls = []
+
+        def update_graphs(self, **kwargs):
+            self.calls.append(kwargs)
+
+    class DummyRunner:
+        def __init__(self):
+            self.requests = []
+            self.executor_manager = DummyExecutorManager()
+            self.model = None
+            self.setup_calls = 0
+
+        def _setup_variables(self):
+            self.setup_calls += 1
+
+    runner = DummyRunner()
+
+    eSurgeRunner.update_model_weights(
+        runner,
+        model=None,
+        graphdef=raw_graphdef,
+        graphstate="graphstate",
+        graphother="graphother",
+        reset_state=True,
+    )
+
+    assert isinstance(runner.model, CompatibleModel)
+    assert runner.executor_manager.calls[0]["graphdef"] is compatible_graphdef
+    assert runner.executor_manager.calls[0]["graphstate"] == "graphstate"
+    assert runner.executor_manager.calls[0]["graphother"] == "graphother"
 
 
 def test_get_esurge_preserves_existing_positional_argument_order():
@@ -300,6 +583,236 @@ def test_get_esurge_skips_redundant_refresh_for_fresh_engine(monkeypatch):
 
     assert engine is created_engines[0]
     assert engine.update_calls == 0
+
+
+def test_get_esurge_new_engine_does_not_require_graphdef_for_fingerprint(monkeypatch):
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "granted_freq_max_position_embedding": 1024,
+                },
+            )()
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+        @property
+        def graphdef(self):
+            raise AttributeError("graphdef unavailable")
+
+    class DummyEngine:
+        def __init__(self):
+            self._paused = False
+            self.silent_mode = True
+            self.num_running_requests = 0
+            self.num_pending_requests = 0
+
+    monkeypatch.setattr(generation_module, "_ESURGE_MAP_CACHE", {})
+
+    created_engines: list[DummyEngine] = []
+
+    def _fake_esurge_ctor(*_args, **_kwargs):
+        engine = DummyEngine()
+        created_engines.append(engine)
+        return engine
+
+    monkeypatch.setattr("easydel.inference.eSurge", _fake_esurge_ctor)
+
+    model = DummyModel()
+    engine = model.get_esurge(
+        tokenizer="tok",
+        max_model_len=512,
+        min_input_pad=16,
+        max_num_seqs=8,
+        max_num_seq_buckets=[1, 2, 4, 8],
+        max_num_batched_tokens=64,
+        hbm_utilization=0.5,
+        page_size=32,
+        enable_prefix_caching=True,
+        data_parallelism_axis="dp",
+        runner_verbose=False,
+        decode_truncated_prompt=True,
+        destroy_pages_on_pause=True,
+        silent_mode=True,
+    )
+
+    assert engine is created_engines[0]
+    assert not hasattr(engine, "_easydel_source_graphdef_fingerprint")
+
+
+def test_get_esurge_reuses_cached_engine_for_equivalent_tokenizer_instances(monkeypatch):
+    class DummyProcessor:
+        def __init__(self, name_or_path, *, padding_side="right"):
+            self.name_or_path = name_or_path
+            self.padding_side = padding_side
+
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "granted_freq_max_position_embedding": 1024,
+                },
+            )()
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+    class DummyEngine:
+        def __init__(self, processor):
+            self._paused = False
+            self.silent_mode = True
+            self.num_running_requests = 0
+            self.num_pending_requests = 0
+            self.update_calls = 0
+            self.processor = processor
+            self.tokenizer = processor
+            self.runner = type("Runner", (), {"model": object()})()
+
+        def update_model_weights(self, _model, *, restart_scheduler=True):
+            del restart_scheduler
+            self.update_calls += 1
+
+    monkeypatch.setattr(generation_module, "_ESURGE_MAP_CACHE", {})
+
+    created_engines: list[DummyEngine] = []
+
+    def _fake_esurge_ctor(*_args, **kwargs):
+        engine = DummyEngine(kwargs["tokenizer"])
+        created_engines.append(engine)
+        return engine
+
+    monkeypatch.setattr("easydel.inference.eSurge", _fake_esurge_ctor)
+
+    model = DummyModel()
+    first_processor = DummyProcessor("tok")
+    second_processor = DummyProcessor("tok")
+
+    first = model.get_esurge(
+        tokenizer=first_processor,
+        max_model_len=512,
+        min_input_pad=16,
+        max_num_seqs=8,
+        max_num_seq_buckets=[1, 2, 4, 8],
+        max_num_batched_tokens=64,
+        hbm_utilization=0.5,
+        page_size=32,
+        enable_prefix_caching=True,
+        data_parallelism_axis="dp",
+        runner_verbose=False,
+        decode_truncated_prompt=True,
+        destroy_pages_on_pause=True,
+        silent_mode=True,
+    )
+    second = model.get_esurge(
+        tokenizer=second_processor,
+        max_model_len=512,
+        min_input_pad=16,
+        max_num_seqs=8,
+        max_num_seq_buckets=[1, 2, 4, 8],
+        max_num_batched_tokens=64,
+        hbm_utilization=0.5,
+        page_size=32,
+        enable_prefix_caching=True,
+        data_parallelism_axis="dp",
+        runner_verbose=False,
+        decode_truncated_prompt=True,
+        destroy_pages_on_pause=True,
+        silent_mode=True,
+    )
+
+    assert first is second
+    assert len(created_engines) == 1
+    assert second.processor is second_processor
+    assert second.tokenizer is second_processor
+
+
+def test_get_esurge_reuses_cached_engine_when_tokenizer_padding_side_changes(monkeypatch):
+    class DummyProcessor:
+        def __init__(self, name_or_path, *, padding_side):
+            self.name_or_path = name_or_path
+            self.padding_side = padding_side
+
+    class DummyModel(EasyGenerationMixin):
+        def __init__(self):
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "granted_freq_max_position_embedding": 1024,
+                },
+            )()
+
+        def static_hash(self, _ignored):
+            return "dummy-model"
+
+    class DummyEngine:
+        def __init__(self, processor):
+            self._paused = False
+            self.silent_mode = True
+            self.num_running_requests = 0
+            self.num_pending_requests = 0
+            self.processor = processor
+            self.tokenizer = processor
+            self.runner = type("Runner", (), {"model": object()})()
+
+        def update_model_weights(self, _model, *, restart_scheduler=True):
+            del restart_scheduler
+
+    monkeypatch.setattr(generation_module, "_ESURGE_MAP_CACHE", {})
+
+    created_engines: list[DummyEngine] = []
+
+    def _fake_esurge_ctor(*_args, **kwargs):
+        engine = DummyEngine(kwargs["tokenizer"])
+        created_engines.append(engine)
+        return engine
+
+    monkeypatch.setattr("easydel.inference.eSurge", _fake_esurge_ctor)
+
+    model = DummyModel()
+    first = model.get_esurge(
+        tokenizer=DummyProcessor("tok", padding_side="right"),
+        max_model_len=512,
+        min_input_pad=16,
+        max_num_seqs=8,
+        max_num_seq_buckets=[1, 2, 4, 8],
+        max_num_batched_tokens=64,
+        hbm_utilization=0.5,
+        page_size=32,
+        enable_prefix_caching=True,
+        data_parallelism_axis="dp",
+        runner_verbose=False,
+        decode_truncated_prompt=True,
+        destroy_pages_on_pause=True,
+        silent_mode=True,
+    )
+    second_processor = DummyProcessor("tok", padding_side="left")
+    second = model.get_esurge(
+        tokenizer=second_processor,
+        max_model_len=512,
+        min_input_pad=16,
+        max_num_seqs=8,
+        max_num_seq_buckets=[1, 2, 4, 8],
+        max_num_batched_tokens=64,
+        hbm_utilization=0.5,
+        page_size=32,
+        enable_prefix_caching=True,
+        data_parallelism_axis="dp",
+        runner_verbose=False,
+        decode_truncated_prompt=True,
+        destroy_pages_on_pause=True,
+        silent_mode=True,
+    )
+
+    assert first is second
+    assert len(created_engines) == 1
+    assert second.processor is second_processor
+    assert second.tokenizer is second_processor
 
 
 def test_generate_accepts_penalty_kwargs_for_compiled_generation():

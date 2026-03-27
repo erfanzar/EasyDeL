@@ -2150,7 +2150,7 @@ class BaseTrainer(BaseTrainerProtocol):
         state: EasyDeLState | None = None,
         clear_esurge_compiled_cache: bool = False,
     ) -> None:
-        """Drop cached generation runtimes so rollout HBM is reclaimed before scoring."""
+        """Pause generation runtime while reclaiming rollout KV memory."""
 
         self.generate_function = None
         self.generate_function_with_model_kwargs = None
@@ -2200,7 +2200,7 @@ class BaseTrainer(BaseTrainerProtocol):
         *,
         state: EasyDeLState | None = None,
         release_runtime_after_generation: bool = True,
-        clear_esurge_compiled_cache_after_generation: bool = False,
+        clear_esurge_compiled_cache_after_generation: bool = True,
     ) -> GenerationResults:
         """Optionally release generation runtime after materializing outputs.
 
@@ -2303,6 +2303,8 @@ class BaseTrainer(BaseTrainerProtocol):
 
         state = state or self.model_state
         args = self.arguments
+        if shard_inputs is None:
+            shard_inputs = args.generation_shard_inputs
         processor = self._get_processing_class()
         normalized_model_kwargs, unsupported_model_kwargs = self._normalize_supported_generation_model_kwargs(
             state,
@@ -2330,7 +2332,6 @@ class BaseTrainer(BaseTrainerProtocol):
                 "falling back to compiled generation.",
             )
             use_esurge = False
-
         pad_token_id = self._pad_token_id
         max_tokens = args.generation_max_new_tokens
         if max_tokens is None:
@@ -2415,9 +2416,7 @@ class BaseTrainer(BaseTrainerProtocol):
             reserve_tokens = esurge_kwargs.get("reserve_tokens")
             if reserve_tokens is None:
                 reserve_tokens = esurge_kwargs.get("max_num_seqs", 0)
-            esurge_kwargs["max_model_len"] = (
-                sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)
-            )  # pyright: ignore[reportOptionalOperand]
+            esurge_kwargs["max_model_len"] = sampling_params.max_tokens + effective_prompt_len + int(reserve_tokens or 0)  # pyright: ignore[reportOptionalOperand]
 
             _log_kwargs = {k: v for k, v in esurge_kwargs.items() if k != "tokenizer"}
             logger.info_once(f"Creating eSurge {pprint.pformat(_log_kwargs)}")
@@ -2432,6 +2431,26 @@ class BaseTrainer(BaseTrainerProtocol):
                 f" n={sampling_params.n})"
             )
             esurge_engine = None
+
+            def _cleanup_failed_esurge_generation() -> None:
+                if esurge_engine is None:
+                    try:
+                        # If setup failed before returning an engine handle, fall back to
+                        # model-level pause to clean any partially initialized cached engine.
+                        state.model.pause_esurge()
+                    except Exception as cleanup_exc:  # pragma: no cover - best-effort resource cleanup
+                        log_debug_maybe(f"Failed to pause eSurge engine(s) after setup failure: {cleanup_exc}")
+                    return
+
+                try:
+                    esurge_engine.pause()
+                    if hasattr(esurge_engine, "release_model_state"):
+                        esurge_engine.release_model_state(
+                            clear_compiled_cache=clear_esurge_compiled_cache_after_generation
+                        )
+                except Exception as cleanup_exc:  # pragma: no cover - best-effort resource cleanup
+                    log_debug_maybe(f"Failed to pause/release eSurge engine after generation failure: {cleanup_exc}")
+
             try:
                 esurge_engine = state.model.get_esurge(**esurge_kwargs)
                 # Use the resolved engine directly to avoid a second get_esurge()/refresh pass.
@@ -2443,210 +2462,194 @@ class BaseTrainer(BaseTrainerProtocol):
                     use_tqdm=args.esurge_use_tqdm,
                 )
             except Exception:
-                if esurge_engine is None:
-                    try:
-                        # If setup failed before returning an engine handle, fall back to
-                        # model-level pause to clean any partially initialized cached engine.
-                        state.model.pause_esurge()
-                    except Exception as cleanup_exc:  # pragma: no cover - best-effort resource cleanup
-                        log_debug_maybe(f"Failed to pause eSurge engine(s) after setup failure: {cleanup_exc}")
+                _cleanup_failed_esurge_generation()
                 raise
-            finally:
-                if esurge_engine is not None:
-                    try:
-                        esurge_engine.pause()
-                        if hasattr(esurge_engine, "release_model_state"):
-                            esurge_engine.release_model_state(clear_compiled_cache=False)
-                    except Exception as exc:  # pragma: no cover - best-effort resource cleanup
-                        log_debug_maybe(f"Failed to pause/release eSurge engine after generation: {exc}")
 
-            # Build padded token arrays from eSurge outputs to ensure consistent shapes
-            max_seq_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
-            max_new_tokens = sampling_params.max_tokens if sampling_params.max_tokens is not None else 1024
-            max_total_len = max_seq_len + max_new_tokens
+            try:
+                # Build padded token arrays from eSurge outputs to ensure consistent shapes
+                max_seq_len = prompt_seq_len if prompt_seq_len is not None else (args.max_length or 2048)
+                max_new_tokens = sampling_params.max_tokens if sampling_params.max_tokens is not None else 1024
+                max_total_len = max_seq_len + max_new_tokens
 
-            # Track prompt arrays once per request
-            prompt_id_rows: list[list[int]] = []
-            prompt_mask_rows: list[list[int]] = []
-            sequence_rows: list[list[int]] = []
-            completion_id_rows: list[list[int]] = []
-            completion_mask_rows: list[list[int]] = []
-            output_records: list[str] = []
-            reasoning_records: list[str | None] = []
-            tool_call_records: list[list | None] = []
-            raw_output_records: list[str] = []
-            completion_prompts: list[str | list[dict[str, str]]] = []
-            prompt_indices: list[int | None] = []
+                # Track prompt arrays once per request
+                prompt_id_rows: list[list[int]] = []
+                prompt_mask_rows: list[list[int]] = []
+                sequence_rows: list[list[int]] = []
+                completion_id_rows: list[list[int]] = []
+                completion_mask_rows: list[list[int]] = []
+                output_records: list[str] = []
+                reasoning_records: list[str | None] = []
+                tool_call_records: list[list | None] = []
+                raw_output_records: list[str] = []
+                completion_prompts: list[str | list[dict[str, str]]] = []
+                prompt_indices: list[int | None] = []
 
-            def _strip_pad(tokens: list[int] | np.ndarray) -> tuple[int, ...]:
-                """Remove pad tokens for matching prompts across shuffled eSurge outputs."""
-                arr = np.asarray(tokens, dtype=np.int64).tolist()
-                return tuple(int(t) for t in arr if pad_token_id is None or t != pad_token_id)
+                def _strip_pad(tokens: list[int] | np.ndarray) -> tuple[int, ...]:
+                    """Remove pad tokens for matching prompts across shuffled eSurge outputs."""
+                    arr = np.asarray(tokens, dtype=np.int64).tolist()
+                    return tuple(int(t) for t in arr if pad_token_id is None or t != pad_token_id)
 
-            # If caller supplied tokenized prompts, keep them as-is for return values
-            if input_ids is not None:
-                base_prompt_ids = np.asarray(input_ids, dtype=np.int32)
-                if base_prompt_ids.ndim == 1:
-                    base_prompt_ids = base_prompt_ids[None, :]
-                base_prompt_mask = (
-                    np.ones_like(base_prompt_ids, dtype=np.int32)
-                    if attention_mask is None
-                    else np.asarray(attention_mask, dtype=np.int32)
+                # If caller supplied tokenized prompts, keep them as-is for return values
+                if input_ids is not None:
+                    base_prompt_ids = np.asarray(input_ids, dtype=np.int32)
+                    if base_prompt_ids.ndim == 1:
+                        base_prompt_ids = base_prompt_ids[None, :]
+                    base_prompt_mask = (
+                        np.ones_like(base_prompt_ids, dtype=np.int32)
+                        if attention_mask is None
+                        else np.asarray(attention_mask, dtype=np.int32)
+                    )
+                    for row in base_prompt_ids:
+                        prompt_id_rows.append(list(row))
+                    for row in base_prompt_mask:
+                        prompt_mask_rows.append(list(row))
+                    prompt_signature_map: dict[tuple[int, ...], list[int]] = {}
+                    for idx, row in enumerate(base_prompt_ids):
+                        sig = _strip_pad(row)
+                        prompt_signature_map.setdefault(sig, []).append(idx)
+                else:
+                    prompt_signature_map = {}
+
+                # When n>1, each RequestOutput has multiple CompletionOutput objects
+                for output_idx, output in enumerate(outputs):
+                    # Flatten and truncate prompt tokens
+                    flattened_prompt_tokens: list[int] = []
+                    if output.prompt_token_ids:
+                        for segment in output.prompt_token_ids:
+                            flattened_prompt_tokens.extend(segment)
+                    base_prompt_tokens = flattened_prompt_tokens[:max_seq_len]
+                    base_prompt_len = len(base_prompt_tokens)
+                    prompt_padding = max_seq_len - base_prompt_len
+
+                    # Left-pad prompts for RL training
+                    padded_prompt_ids = [pad_token_id] * prompt_padding + base_prompt_tokens
+                    padded_prompt_mask = [0] * prompt_padding + [1] * base_prompt_len
+                    if input_ids is None:
+                        # When prompts were strings, this represents the canonical prompt ids/masks.
+                        prompt_id_rows.append(padded_prompt_ids)
+                        prompt_mask_rows.append(padded_prompt_mask)
+
+                    mapped_prompt_idx = None
+                    if prompt_signature_map:
+                        sig = _strip_pad(base_prompt_tokens)
+                        if prompt_signature_map.get(sig):
+                            mapped_prompt_idx = prompt_signature_map[sig].pop(0)
+                            if not prompt_signature_map[sig]:
+                                prompt_signature_map.pop(sig, None)
+
+                    source_prompt = getattr(output, "prompt", return_prompts[output_idx] if return_prompts else None)
+
+                    # Process each completion (handles n>1 sampling)
+                    for completion in output.outputs:
+                        completion_prompts.append(source_prompt)
+                        prompt_indices.append(mapped_prompt_idx)
+                        completion_text = getattr(completion, "text", None)
+                        if not isinstance(completion_text, str) or completion_text == "":
+                            output_get_text = getattr(output, "get_text", None)
+                            output_fallback_text = output_get_text() if callable(output_get_text) else ""
+                            completion_text = getattr(output, "accumulated_text", "") or output_fallback_text
+                        output_records.append(completion_text)
+
+                        completion_reasoning = getattr(completion, "reasoning_content", None)
+                        reasoning_records.append(completion_reasoning if isinstance(completion_reasoning, str) else None)
+
+                        completion_tool_calls = getattr(completion, "tool_calls", None)
+                        tool_call_records.append(completion_tool_calls if completion_tool_calls is not None else None)
+
+                        completion_raw_text = getattr(completion, "raw_text", None)
+                        if not isinstance(completion_raw_text, str) or completion_raw_text == "":
+                            output_get_text = getattr(output, "get_text", None)
+                            output_fallback_text = output_get_text() if callable(output_get_text) else ""
+                            completion_raw_text = (
+                                getattr(output, "raw_accumulated_text", "")
+                                or getattr(output, "accumulated_text", "")
+                                or output_fallback_text
+                            )
+                        raw_output_records.append(completion_raw_text)
+
+                        completion_tokens: list[int] = []
+                        if completion:
+                            completion_tokens = list(getattr(completion, "token_ids", []) or [])
+
+                        if len(completion_tokens) > max_new_tokens:
+                            completion_tokens = completion_tokens[:max_new_tokens]
+
+                        completion_len = len(completion_tokens)
+                        completion_padding = max_new_tokens - completion_len
+                        padded_completion_ids = completion_tokens + [pad_token_id] * completion_padding
+                        padded_completion_mask = [1] * completion_len + [0] * completion_padding
+
+                        completion_id_rows.append(padded_completion_ids)
+                        completion_mask_rows.append(padded_completion_mask)
+
+                        sequence_tokens = [pad_token_id] * prompt_padding + base_prompt_tokens + completion_tokens
+                        remaining_padding = max_total_len - len(sequence_tokens)
+                        sequence_rows.append(sequence_tokens + [pad_token_id] * remaining_padding)
+
+                if not sequence_rows:
+                    raise RuntimeError("eSurge generation returned no completions")
+                if not prompt_id_rows or not prompt_mask_rows:
+                    raise RuntimeError("Could not determine prompt token metadata for eSurge generation")
+
+                if prompt_indices:
+                    num_prompts = len(prompt_id_rows)
+                    per_prompt: list[list[int]] = [[] for _ in range(num_prompts)]
+                    unmatched: list[int] = []
+                    for i, pidx in enumerate(prompt_indices):
+                        if pidx is None or pidx < 0 or pidx >= num_prompts:
+                            unmatched.append(i)
+                        else:
+                            per_prompt[pidx].append(i)
+                    new_order = [idx for group in per_prompt for idx in group] + unmatched
+                    completion_id_rows = [completion_id_rows[i] for i in new_order]
+                    completion_mask_rows = [completion_mask_rows[i] for i in new_order]
+                    completion_prompts = [completion_prompts[i] for i in new_order]
+                    output_records = [output_records[i] for i in new_order]
+                    reasoning_records = [reasoning_records[i] for i in new_order]
+                    tool_call_records = [tool_call_records[i] for i in new_order]
+                    raw_output_records = [raw_output_records[i] for i in new_order]
+                    sequence_rows = [sequence_rows[i] for i in new_order]
+
+                base_prompt_ids = jnp.array(np.asarray(prompt_id_rows, dtype=np.int32))
+                base_prompt_mask = jnp.array(np.asarray(prompt_mask_rows, dtype=np.int32))
+                prompt_ids = base_prompt_ids
+                prompt_mask = base_prompt_mask
+
+                sequences = jnp.array(np.asarray(sequence_rows, dtype=np.int32))
+                completion_ids = jnp.array(np.asarray(completion_id_rows, dtype=np.int32))
+                completion_mask = jnp.array(np.asarray(completion_mask_rows, dtype=np.int32))
+                total_seq_len = prompt_ids.shape[-1] + completion_ids.shape[-1]
+                sequences = sequences[:, :total_seq_len]
+
+                if all_gather:
+                    sequences = self._all_gather(sequences)
+                    prompt_ids = self._all_gather(prompt_ids)
+                    prompt_mask = self._all_gather(prompt_mask)
+                    completion_ids = self._all_gather(completion_ids)
+                    completion_mask = self._all_gather(completion_mask)
+                results = self.maybe_release_generation_runtime(
+                    GenerationResults(
+                        generation_results=output_records,
+                        prompt_ids=prompt_ids,
+                        prompt_mask=prompt_mask,
+                        sequences=sequences,
+                        completion_ids=completion_ids,
+                        completion_mask=completion_mask,
+                        decoded_prompts=return_prompts,
+                        completion_prompts=completion_prompts,
+                        text=output_records,
+                        reasoning=reasoning_records,
+                        tool_calls=tool_call_records,
+                        raw_text=raw_output_records,
+                    ),
+                    state=state,
+                    release_runtime_after_generation=release_runtime_after_generation,
+                    clear_esurge_compiled_cache_after_generation=clear_esurge_compiled_cache_after_generation,
                 )
-                for row in base_prompt_ids:
-                    prompt_id_rows.append(list(row))
-                for row in base_prompt_mask:
-                    prompt_mask_rows.append(list(row))
-                prompt_signature_map: dict[tuple[int, ...], list[int]] = {}
-                for idx, row in enumerate(base_prompt_ids):
-                    sig = _strip_pad(row)
-                    prompt_signature_map.setdefault(sig, []).append(idx)
-            else:
-                prompt_signature_map = {}
-
-            # When n>1, each RequestOutput has multiple CompletionOutput objects
-            for output_idx, output in enumerate(outputs):
-                # Flatten and truncate prompt tokens
-                flattened_prompt_tokens: list[int] = []
-                if output.prompt_token_ids:
-                    for segment in output.prompt_token_ids:
-                        flattened_prompt_tokens.extend(segment)
-                base_prompt_tokens = flattened_prompt_tokens[:max_seq_len]
-                base_prompt_len = len(base_prompt_tokens)
-                prompt_padding = max_seq_len - base_prompt_len
-
-                # Left-pad prompts for RL training
-                padded_prompt_ids = [pad_token_id] * prompt_padding + base_prompt_tokens
-                padded_prompt_mask = [0] * prompt_padding + [1] * base_prompt_len
-                if input_ids is None:
-                    # When prompts were strings, this represents the canonical prompt ids/masks.
-                    prompt_id_rows.append(padded_prompt_ids)
-                    prompt_mask_rows.append(padded_prompt_mask)
-
-                mapped_prompt_idx = None
-                if prompt_signature_map:
-                    sig = _strip_pad(base_prompt_tokens)
-                    if prompt_signature_map.get(sig):
-                        mapped_prompt_idx = prompt_signature_map[sig].pop(0)
-                        if not prompt_signature_map[sig]:
-                            prompt_signature_map.pop(sig, None)
-
-                source_prompt = getattr(output, "prompt", return_prompts[output_idx] if return_prompts else None)
-
-                # Process each completion (handles n>1 sampling)
-                for completion in output.outputs:
-                    completion_prompts.append(source_prompt)
-                    prompt_indices.append(mapped_prompt_idx)
-                    # Add prompt arrays
-                    completion_text = getattr(completion, "text", None)
-                    if not isinstance(completion_text, str) or completion_text == "":
-                        output_get_text = getattr(output, "get_text", None)
-                        output_fallback_text = output_get_text() if callable(output_get_text) else ""
-                        completion_text = getattr(output, "accumulated_text", "") or output_fallback_text
-                    output_records.append(completion_text)
-
-                    completion_reasoning = getattr(completion, "reasoning_content", None)
-                    reasoning_records.append(completion_reasoning if isinstance(completion_reasoning, str) else None)
-
-                    completion_tool_calls = getattr(completion, "tool_calls", None)
-                    tool_call_records.append(completion_tool_calls if completion_tool_calls is not None else None)
-
-                    completion_raw_text = getattr(completion, "raw_text", None)
-                    if not isinstance(completion_raw_text, str) or completion_raw_text == "":
-                        output_get_text = getattr(output, "get_text", None)
-                        output_fallback_text = output_get_text() if callable(output_get_text) else ""
-                        completion_raw_text = (
-                            getattr(output, "raw_accumulated_text", "")
-                            or getattr(output, "accumulated_text", "")
-                            or output_fallback_text
-                        )
-                    raw_output_records.append(completion_raw_text)
-
-                    # Extract completion tokens
-                    completion_tokens: list[int] = []
-                    if completion:
-                        completion_tokens = list(getattr(completion, "token_ids", []) or [])
-
-                    # Truncate completion if too long
-                    if len(completion_tokens) > max_new_tokens:
-                        completion_tokens = completion_tokens[:max_new_tokens]
-
-                    # Right-pad completions
-                    completion_len = len(completion_tokens)
-                    completion_padding = max_new_tokens - completion_len
-                    padded_completion_ids = completion_tokens + [pad_token_id] * completion_padding
-                    padded_completion_mask = [1] * completion_len + [0] * completion_padding
-
-                    completion_id_rows.append(padded_completion_ids)
-                    completion_mask_rows.append(padded_completion_mask)
-
-                    # Build full sequence: [left-padded prompt] + [generated tokens] + [right padding]
-                    sequence_tokens = [pad_token_id] * prompt_padding + base_prompt_tokens + completion_tokens
-                    remaining_padding = max_total_len - len(sequence_tokens)
-                    sequence_rows.append(sequence_tokens + [pad_token_id] * remaining_padding)
-
-            if not sequence_rows:
-                raise RuntimeError("eSurge generation returned no completions")
-            if not prompt_id_rows or not prompt_mask_rows:
-                raise RuntimeError("Could not determine prompt token metadata for eSurge generation")
-
-            # Reorder completions to align with original prompt order when possible.
-            if prompt_indices:
-                num_prompts = len(prompt_id_rows)
-                per_prompt: list[list[int]] = [[] for _ in range(num_prompts)]
-                unmatched: list[int] = []
-                for i, pidx in enumerate(prompt_indices):
-                    if pidx is None or pidx < 0 or pidx >= num_prompts:
-                        unmatched.append(i)
-                    else:
-                        per_prompt[pidx].append(i)
-                new_order = [idx for group in per_prompt for idx in group] + unmatched
-                completion_id_rows = [completion_id_rows[i] for i in new_order]
-                completion_mask_rows = [completion_mask_rows[i] for i in new_order]
-                completion_prompts = [completion_prompts[i] for i in new_order]
-                output_records = [output_records[i] for i in new_order]
-                reasoning_records = [reasoning_records[i] for i in new_order]
-                tool_call_records = [tool_call_records[i] for i in new_order]
-                raw_output_records = [raw_output_records[i] for i in new_order]
-                sequence_rows = [sequence_rows[i] for i in new_order]
-
-            # Use original prompt ids/masks (not per-completion duplicates); repeat only if needed to align shapes.
-            base_prompt_ids = jnp.array(np.asarray(prompt_id_rows, dtype=np.int32))
-            base_prompt_mask = jnp.array(np.asarray(prompt_mask_rows, dtype=np.int32))
-            prompt_ids = base_prompt_ids
-            prompt_mask = base_prompt_mask
-
-            sequences = jnp.array(np.asarray(sequence_rows, dtype=np.int32))
-            completion_ids = jnp.array(np.asarray(completion_id_rows, dtype=np.int32))
-            completion_mask = jnp.array(np.asarray(completion_mask_rows, dtype=np.int32))
-            total_seq_len = prompt_ids.shape[-1] + completion_ids.shape[-1]
-            sequences = sequences[:, :total_seq_len]
-
-            if all_gather:
-                sequences = self._all_gather(sequences)
-                prompt_ids = self._all_gather(prompt_ids)
-                prompt_mask = self._all_gather(prompt_mask)
-                completion_ids = self._all_gather(completion_ids)
-                completion_mask = self._all_gather(completion_mask)
-            return self.maybe_release_generation_runtime(
-                GenerationResults(
-                    generation_results=output_records,
-                    prompt_ids=prompt_ids,
-                    prompt_mask=prompt_mask,
-                    sequences=sequences,
-                    completion_ids=completion_ids,
-                    completion_mask=completion_mask,
-                    decoded_prompts=return_prompts,
-                    completion_prompts=completion_prompts,
-                    text=output_records,
-                    reasoning=reasoning_records,
-                    tool_calls=tool_call_records,
-                    raw_text=raw_output_records,
-                ),
-                state=state,
-                release_runtime_after_generation=release_runtime_after_generation,
-                clear_esurge_compiled_cache_after_generation=clear_esurge_compiled_cache_after_generation,
-            )
+            except Exception:
+                _cleanup_failed_esurge_generation()
+                raise
+            return results
 
         # Handle compiled generation path
         else:
@@ -2769,7 +2772,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 pop_pad_tokens=True,
             )
 
-            return self.maybe_release_generation_runtime(
+            results = self.maybe_release_generation_runtime(
                 GenerationResults(
                     generation_results=generated_texts,
                     prompt_ids=prompt_ids,
@@ -2788,6 +2791,7 @@ class BaseTrainer(BaseTrainerProtocol):
                 release_runtime_after_generation=release_runtime_after_generation,
                 clear_esurge_compiled_cache_after_generation=clear_esurge_compiled_cache_after_generation,
             )
+            return results
 
     def _get_processing_class(self):
         """Resolve the tokenizer or processor associated with the trainer.
@@ -2907,16 +2911,22 @@ class BaseTrainer(BaseTrainerProtocol):
         Falls back to reservoir sampling over ``open_shard`` when shard sizes
         are unknown.
         """
+        max_preview_reservoir_scan = 1024
         try:
             if row_index is not None:
-                return next(source.open_shard_at_row(shard_name, int(row_index)), None)
+                sample = next(source.open_shard_at_row(shard_name, int(row_index)), None)
+                return sample
             if shard_rows is not None and shard_rows > 0:
                 random_row = int(self._generation_rng.integers(shard_rows))
-                return next(source.open_shard_at_row(shard_name, random_row), None)
+                sample = next(source.open_shard_at_row(shard_name, random_row), None)
+                return sample
             sampled = None
+            seen = 0
             for seen, example in enumerate(source.open_shard(shard_name), start=1):
                 if int(self._generation_rng.integers(seen)) == 0:
                     sampled = example
+                if seen >= max_preview_reservoir_scan:
+                    break
             return sampled
         except Exception as exc:  # pragma: no cover - best effort sampling for previews
             log_debug_maybe(f"Failed to sample preview prompt from shard '{shard_name}': {exc}")
@@ -3024,12 +3034,16 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         processor = self._get_processing_class()
         prompt_text: str | None = None
+        prompt_max_length = getattr(self.arguments, "max_prompt_length", None)
+        if prompt_max_length is None:
+            prompt_max_length = self.arguments.max_length
+
         encode_kwargs = dict(
             truncation=True,
             truncation_side="left",
             tokenize=True,
             padding="max_length",
-            max_length=self.arguments.max_length,
+            max_length=prompt_max_length,
             return_attention_mask=True,
             return_tensors="np",
             return_dict=True,
@@ -3238,7 +3252,7 @@ class BaseTrainer(BaseTrainerProtocol):
                     logger.info(f"  tool_calls[{idx}]: {tool_calls_entry}")
 
         prepared_prompts: list[dict[str, tp.Any]] = []
-        for prompt in prompts:
+        for _prompt_idx, prompt in enumerate(prompts):
             try:
                 prepared = self._prepare_generation_input(prompt)
             except Exception as exc:  # pragma: no cover - preview should not break training
@@ -3325,7 +3339,7 @@ class BaseTrainer(BaseTrainerProtocol):
             )
         except Exception as exc:  # pragma: no cover - preview should not break training
             log_debug_maybe(f"Preview generation failed: {exc}")
-            for prepared in prepared_prompts:
+            for _prompt_idx, prepared in enumerate(prepared_prompts):
                 try:
                     single_results = self.generate_unified(
                         input_ids=prepared["input_ids"],
