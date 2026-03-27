@@ -101,6 +101,9 @@ class eSurgeCfg(TypedDict, total=False):
             paused.
         detokenizer_max_states: Maximum concurrent detokenizer states.
             ``None`` for unlimited.
+        worker_startup_timeout: Seconds to wait for spawned tokenizer and
+            detokenizer workers to bind. ``None`` uses the engine default
+            or environment override.
         idle_reset_seconds: Time in seconds of inactivity before
             resetting engine state. ``None`` to disable.
         idle_reset_min_interval: Minimum interval in seconds between idle
@@ -173,6 +176,7 @@ class eSurgeCfg(TypedDict, total=False):
     decode_truncated_prompt: NotRequired[bool]
     destroy_pages_on_pause: NotRequired[bool]
     detokenizer_max_states: NotRequired[int | None]
+    worker_startup_timeout: NotRequired[float | None]
     idle_reset_seconds: NotRequired[float | None]
     idle_reset_min_interval: NotRequired[float]
     tokenizer_endpoint: NotRequired[str | None]

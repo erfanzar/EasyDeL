@@ -77,6 +77,17 @@ def test_to_esurge_kwargs_forwards_bind_graphstate_for_aot():
     assert kwargs["bind_graphstate_for_aot"] is True
 
 
+def test_to_esurge_kwargs_forwards_worker_startup_timeout():
+    cfg = {
+        "model": {"name_or_path": "dummy-model"},
+        "esurge": {"worker_startup_timeout": "75.5"},
+    }
+
+    kwargs = to_esurge_kwargs(cfg)
+
+    assert kwargs["worker_startup_timeout"] == 75.5
+
+
 def test_to_esurge_kwargs_defaults_distributed_controls():
     cfg = {"model": {"name_or_path": "dummy-model"}}
 

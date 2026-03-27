@@ -495,6 +495,7 @@ class eSurge(
         detokenizer_max_states: int = DEFAULT_DETOKENIZER_MAX_STATES,
         tokenizer_endpoint: str | None = None,
         detokenizer_endpoint: str | None = None,
+        worker_startup_timeout: float | None = None,
         max_request_outputs: int | None = 1000,
         idle_reset_seconds: float | None = None,
         idle_reset_min_interval: float = 60.0,
@@ -583,6 +584,10 @@ class eSurge(
                 pause() to free memory, and lazily reinitializing it on resume().
             tokenizer_endpoint: ZMQ endpoint of the external tokenizer worker.
             detokenizer_endpoint: ZMQ endpoint of the external detokenizer worker.
+            worker_startup_timeout: Seconds to wait for spawned tokenizer and
+                detokenizer workers to bind. If None, uses
+                ``EASURGE_WORKER_STARTUP_TIMEOUT`` when set, otherwise defaults
+                to 120 seconds.
             max_request_outputs: Maximum number of completed RequestOutput objects
                 to retain in memory for post-hoc access. Set to None for unlimited
                 retention or <=0 to disable retention entirely.
@@ -851,7 +856,7 @@ class eSurge(
         tokenizer_endpoint = tokenizer_endpoint or os.environ.get("EASURGE_TOKENIZER_ENDPOINT")
         detokenizer_endpoint = detokenizer_endpoint or os.environ.get("EASURGE_DETOKENIZER_ENDPOINT")
 
-        self._worker_manager = WorkerManager(tokenizer_source)
+        self._worker_manager = WorkerManager(tokenizer_source, startup_timeout=worker_startup_timeout)
         self._tokenizer_client, self._detokenizer_client = self._worker_manager.start(
             detokenizer_max_states=detokenizer_max_states,
             tokenizer_endpoint=tokenizer_endpoint,
@@ -859,6 +864,7 @@ class eSurge(
         )
         self._tokenizer_endpoint = self._worker_manager.tokenizer_endpoint
         self._detokenizer_endpoint = self._worker_manager.detokenizer_endpoint
+        self._worker_startup_timeout = self._worker_manager._startup_timeout
 
         if isinstance(model, str):
             backend = jax.default_backend()
