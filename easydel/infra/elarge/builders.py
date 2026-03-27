@@ -249,7 +249,8 @@ def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
         - Execution: compile_runner, overlap_execution, use_aot_forward,
           bind_graphstate_for_aot
         - Truncation: auto_truncate_prompt, truncate_mode, strict_context
-        - Tokenization: detokenizer_max_states, extra_eos_token_ids, extra_stops
+        - Tokenization: detokenizer_max_states, worker_startup_timeout,
+          extra_eos_token_ids, extra_stops
         - Parsing: tool_parser, reasoning_parser
 
     Args:
@@ -339,6 +340,9 @@ def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
     detokenizer_max_states: int | str | None = es.get("detokenizer_max_states", DEFAULT_DETOKENIZER_MAX_STATES)
     if detokenizer_max_states is not None:
         detokenizer_max_states = int(detokenizer_max_states)
+    worker_startup_timeout = es.get("worker_startup_timeout")
+    if worker_startup_timeout is not None:
+        worker_startup_timeout = float(worker_startup_timeout)
 
     idle_reset_seconds = es.get("idle_reset_seconds")
     if idle_reset_seconds is not None:
@@ -399,6 +403,7 @@ def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
         decode_truncated_prompt=True if decode_truncated_prompt_val is None else bool(decode_truncated_prompt_val),
         destroy_pages_on_pause=True if destroy_pages_on_pause_val is None else bool(destroy_pages_on_pause_val),
         detokenizer_max_states=detokenizer_max_states,
+        worker_startup_timeout=worker_startup_timeout,
         idle_reset_seconds=idle_reset_seconds,
         idle_reset_min_interval=idle_reset_min_interval,
         tokenizer_endpoint=es.get("tokenizer_endpoint"),
