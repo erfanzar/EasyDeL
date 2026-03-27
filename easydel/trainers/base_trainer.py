@@ -82,7 +82,6 @@ from .training_utils import (
     filter_kwargs_for_callable,
     normalize_generation_model_kwargs,
     prepare_generation_model_kwargs_for_call,
-    resolve_total_steps,
 )
 from .utils import CollateMapTransform, HFDataSource, ToNumpy
 
@@ -102,6 +101,31 @@ logger = get_logger(__name__)
 log_debug_maybe = logger.debug
 
 DEFAULT_ARGS_JSON_NAME = "easydel-training-arguments.json"
+
+
+class _ReiterableDataLoader:
+    """Small wrapper that recreates a fresh iterator on every ``iter(...)`` call."""
+
+    def __init__(self, factory: tp.Callable[[], collections.abc.Iterator], length: int | None = None):
+        self._factory = factory
+        self._length = length
+
+    def __iter__(self):
+        return self._factory()
+
+    def __len__(self) -> int:
+        if self._length is None:
+            raise TypeError(f"{type(self).__name__} has no len()")
+        return self._length
+
+
+class _ResolvedStepCount(NamedTuple):
+    steps: int
+    num_examples: int | None
+    num_examples_exact: bool
+    source_label: str
+    auto_discovered: bool
+    auto_clamped: bool
 
 
 class GenerationResults(NamedTuple):
@@ -1222,6 +1246,184 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         return self.arguments.total_batch_size * self.arguments.gradient_accumulation_steps
 
+    def _length_is_exact(self, candidate: tp.Any) -> bool:
+        """Best-effort signal for whether ``len(candidate)`` is an exact count."""
+        if candidate is None:
+            return False
+
+        transform = getattr(candidate, "_transform", None)
+        if getattr(transform, "is_filter", False) or getattr(transform, "is_expand", False):
+            return False
+
+        source_type = type(candidate).__name__
+        if source_type == "PackedShardedSource":
+            return False
+
+        nested = getattr(candidate, "_source", None)
+        if nested is not None and source_type in {"TokenizedShardedSource", "TransformedShardedSource"}:
+            return self._length_is_exact(nested)
+
+        return True
+
+    def _sum_known_shard_rows(self, source: ShardedDataSource | None) -> int | None:
+        """Sum ``ShardInfo.num_rows`` when every shard advertises it."""
+        if source is None:
+            return None
+        try:
+            shard_names = list(source.shard_names)
+        except Exception:
+            return None
+
+        total = 0
+        for shard_name in shard_names:
+            try:
+                info = source.get_shard_info(shard_name)
+            except Exception:
+                return None
+            if info is None or info.num_rows is None:
+                return None
+            total += int(info.num_rows)
+        return total
+
+    def _discover_dataset_num_examples(
+        self,
+        dataset: "Dataset | IterableDataset | ShardedDataSource | None",
+        *,
+        source: ShardedDataSource | None = None,
+    ) -> tuple[int | None, bool, str]:
+        """Discover dataset cardinality from the most informative available object."""
+        candidates: list[tuple[str, tp.Any]] = []
+        if source is not None:
+            candidates.append(("sharded_source", source))
+        if dataset is not None and dataset is not source:
+            candidates.append(("dataset", dataset))
+
+        for label, candidate in candidates:
+            try:
+                return len(candidate), self._length_is_exact(candidate), label
+            except (TypeError, AttributeError):
+                pass
+
+            if isinstance(candidate, ShardedDataSource):
+                total = self._sum_known_shard_rows(candidate)
+                if total is not None:
+                    return total, self._length_is_exact(candidate), label
+
+        return None, False, "unknown"
+
+    def _set_dataset_size_metadata(
+        self,
+        *,
+        is_train: bool,
+        resolution: _ResolvedStepCount,
+    ) -> None:
+        prefix = "_train" if is_train else "_eval"
+        setattr(self, f"{prefix}_dataset_num_examples", resolution.num_examples)
+        setattr(self, f"{prefix}_dataset_num_examples_exact", resolution.num_examples_exact)
+        setattr(self, f"{prefix}_dataset_size_source_label", resolution.source_label)
+        setattr(self, f"{prefix}_dataset_steps_auto_discovered", resolution.auto_discovered)
+        setattr(self, f"{prefix}_dataset_steps_auto_clamped", resolution.auto_clamped)
+
+    def _resolve_step_count(
+        self,
+        dataset: "Dataset | IterableDataset | ShardedDataSource | None",
+        *,
+        source: ShardedDataSource | None,
+        is_train: bool,
+        drop_remainder: bool,
+    ) -> _ResolvedStepCount:
+        """Resolve configured steps and clamp to discovered dataset capacity when possible."""
+        forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
+        num_examples, num_examples_exact, source_label = self._discover_dataset_num_examples(dataset, source=source)
+        batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
+        num_epochs = self.arguments.num_train_epochs if is_train else 1
+
+        def _steps_from_examples(total_examples: int) -> int:
+            if batch_size <= 0:
+                raise ValueError("Batch size must be > 0.")
+            if num_epochs <= 0:
+                return 0
+            per_epoch = total_examples // batch_size if drop_remainder else (total_examples + batch_size - 1) // batch_size
+            return int(per_epoch * num_epochs)
+
+        if num_examples is None:
+            fallback_steps = (
+                self.arguments.per_epoch_training_steps if is_train else self.arguments.per_epoch_evaluation_steps
+            )
+            if forced_steps is None:
+                if fallback_steps is None:
+                    raise ValueError(
+                        f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
+                        "steps for a generator/streaming dataset."
+                    )
+                steps = int(fallback_steps) * num_epochs
+                return _ResolvedStepCount(
+                    steps=steps,
+                    num_examples=None,
+                    num_examples_exact=False,
+                    source_label="per_epoch_steps",
+                    auto_discovered=False,
+                    auto_clamped=False,
+                )
+            return _ResolvedStepCount(
+                steps=int(forced_steps),
+                num_examples=None,
+                num_examples_exact=False,
+                source_label=source_label,
+                auto_discovered=False,
+                auto_clamped=False,
+            )
+
+        auto_steps = _steps_from_examples(num_examples)
+
+        if forced_steps is None:
+            return _ResolvedStepCount(
+                steps=auto_steps,
+                num_examples=num_examples,
+                num_examples_exact=num_examples_exact,
+                source_label=source_label,
+                auto_discovered=True,
+                auto_clamped=False,
+            )
+
+        resolved_forced_steps = int(forced_steps)
+        if resolved_forced_steps > auto_steps:
+            if num_examples_exact:
+                logger.warning(
+                    "Requested %s=%d exceeds the discovered dataset capacity (%d steps from %d examples). "
+                    "Clamping to %d.",
+                    "max_training_steps" if is_train else "max_evaluation_steps",
+                    resolved_forced_steps,
+                    auto_steps,
+                    num_examples,
+                    auto_steps,
+                )
+                return _ResolvedStepCount(
+                    steps=auto_steps,
+                    num_examples=num_examples,
+                    num_examples_exact=True,
+                    source_label=source_label,
+                    auto_discovered=False,
+                    auto_clamped=True,
+                )
+            logger.warning(
+                "Requested %s=%d exceeds the discovered dataset estimate (%d steps from ~%d examples). "
+                "Keeping the configured value because the dataset length is not exact.",
+                "max_training_steps" if is_train else "max_evaluation_steps",
+                resolved_forced_steps,
+                auto_steps,
+                num_examples,
+            )
+
+        return _ResolvedStepCount(
+            steps=resolved_forced_steps,
+            num_examples=num_examples,
+            num_examples_exact=num_examples_exact,
+            source_label=source_label,
+            auto_discovered=False,
+            auto_clamped=False,
+        )
+
     @cached_property
     def is_process_zero(self):
         """Check if this is the main process (rank 0).
@@ -1449,6 +1651,16 @@ class BaseTrainer(BaseTrainerProtocol):
         self.dataloader_eval = getattr(self, "dataloader_eval", None)
         self.max_training_steps = getattr(self, "max_training_steps", None)
         self.max_evaluation_steps = getattr(self, "max_evaluation_steps", None)
+        self._train_dataset_num_examples = getattr(self, "_train_dataset_num_examples", None)
+        self._train_dataset_num_examples_exact = getattr(self, "_train_dataset_num_examples_exact", False)
+        self._train_dataset_size_source_label = getattr(self, "_train_dataset_size_source_label", "unknown")
+        self._train_dataset_steps_auto_discovered = getattr(self, "_train_dataset_steps_auto_discovered", False)
+        self._train_dataset_steps_auto_clamped = getattr(self, "_train_dataset_steps_auto_clamped", False)
+        self._eval_dataset_num_examples = getattr(self, "_eval_dataset_num_examples", None)
+        self._eval_dataset_num_examples_exact = getattr(self, "_eval_dataset_num_examples_exact", False)
+        self._eval_dataset_size_source_label = getattr(self, "_eval_dataset_size_source_label", "unknown")
+        self._eval_dataset_steps_auto_discovered = getattr(self, "_eval_dataset_steps_auto_discovered", False)
+        self._eval_dataset_steps_auto_clamped = getattr(self, "_eval_dataset_steps_auto_clamped", False)
 
         self.scheduler = getattr(self, "scheduler", None)
         self.tx = getattr(self, "tx", None)
@@ -4080,78 +4292,53 @@ class BaseTrainer(BaseTrainerProtocol):
                 read_options=grain.ReadOptions(num_threads=1, prefetch_buffer_size=128),
             )
 
-        def calculate_steps(dataset, is_train: bool) -> int:
-            """Compute the total number of training or evaluation steps.
-
-            Uses forced step counts from arguments when available, otherwise
-            derives the count from dataset length, batch size, and epoch count.
-
-            Args:
-                dataset: The training or evaluation dataset.
-                is_train: Whether the calculation is for training steps.
-
-            Returns:
-                Total number of optimizer steps for the run.
-
-            Raises:
-                ValueError: If dataset length cannot be determined and no
-                    per-epoch step count is configured.
-            """
-            forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
-            total_data_len: int | None = None
-            if forced_steps is None:
-                try:
-                    total_data_len = len(dataset)
-                except TypeError as e:
-                    total_data_len = (
-                        self.arguments.per_epoch_training_steps
-                        if is_train
-                        else self.arguments.per_epoch_evaluation_steps
-                    )
-                    if total_data_len is None:
-                        raise ValueError(
-                            f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
-                            "steps for a generator/streaming dataset."
-                        ) from e
-
-            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
-            num_epochs = self.arguments.num_train_epochs if is_train else 1
-            return resolve_total_steps(
-                forced_steps=forced_steps,
-                total_data_len=total_data_len,
-                batch_size=batch_size,
-                num_epochs=num_epochs,
-                gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
-                is_train=is_train,
-            )
-
-        max_training_steps = calculate_steps(self.dataset_train, is_train=True)
+        train_resolution = self._resolve_step_count(
+            self.dataset_train,
+            source=self._train_source,
+            is_train=True,
+            drop_remainder=True,
+        )
+        self._set_dataset_size_metadata(is_train=True, resolution=train_resolution)
+        max_training_steps = train_resolution.steps
 
         # Use _train_source if available (has transforms applied)
         if self._train_source is not None:
-            dataloader_train = self._create_dataloader_from_source(
-                source=self._train_source,
-                batch_size=self.training_batch_size,
-                is_train=True,
-                shuffle=self.arguments.shuffle_train_dataset,
-                num_epochs=self.arguments.num_train_epochs,
-                drop_remainder=True,
+            dataloader_train = _ReiterableDataLoader(
+                factory=lambda: self._create_dataloader_from_source(
+                    source=self._train_source,
+                    batch_size=self.training_batch_size,
+                    is_train=True,
+                    shuffle=self.arguments.shuffle_train_dataset,
+                    num_epochs=self.arguments.num_train_epochs,
+                    drop_remainder=True,
+                ),
+                length=max_training_steps,
             )
         else:
             dataloader_train = _create_grain_dataloader(self.dataset_train, is_train=True)
 
         dataloader_eval, max_evaluation_steps = None, 0
         if self.dataset_eval is not None and self.arguments.do_eval:
-            max_evaluation_steps = calculate_steps(self.dataset_eval, is_train=False)
+            eval_resolution = self._resolve_step_count(
+                self.dataset_eval,
+                source=self._eval_source,
+                is_train=False,
+                drop_remainder=True,
+            )
+            self._set_dataset_size_metadata(is_train=False, resolution=eval_resolution)
+            max_evaluation_steps = eval_resolution.steps
             # Use _eval_source if available (has transforms applied)
             if self._eval_source is not None:
-                dataloader_eval = self._create_dataloader_from_source(
-                    source=self._eval_source,
-                    batch_size=self.evaluation_batch_size,
-                    is_train=False,
-                    shuffle=False,
-                    num_epochs=1,
-                    drop_remainder=True,
+                dataloader_eval = _ReiterableDataLoader(
+                    factory=lambda: self._create_dataloader_from_source(
+                        source=self._eval_source,
+                        batch_size=self.evaluation_batch_size,
+                        is_train=False,
+                        shuffle=False,
+                        num_epochs=1,
+                        drop_remainder=True,
+                    ),
+                    length=max_evaluation_steps,
                 )
             else:
                 dataloader_eval = _create_grain_dataloader(self.dataset_eval, is_train=False)
@@ -4272,48 +4459,6 @@ class BaseTrainer(BaseTrainerProtocol):
                 .as_numpy_iterator()
             )
 
-        def calculate_steps(dataset: Dataset | IterableDataset, is_train: bool) -> int:
-            """
-            Calculates the number of training or evaluation steps based on dataset length and arguments.
-
-            Args:
-              dataset (tp.Union[Dataset, IterableDataset]): The dataset to calculate steps for.
-              is_train (bool): Whether the dataset is for training.
-
-            Returns:
-              int: The number of steps.
-
-            Raises:
-              ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
-            """
-            forced_steps = self.arguments.max_training_steps if is_train else self.arguments.max_evaluation_steps
-            total_data_len: int | None = None
-            if forced_steps is None:
-                try:
-                    total_data_len = len(dataset)
-                except TypeError as e:
-                    total_data_len = (
-                        self.arguments.per_epoch_training_steps
-                        if is_train
-                        else self.arguments.per_epoch_evaluation_steps
-                    )
-                    if total_data_len is None:
-                        raise ValueError(
-                            f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
-                            "steps for a generator/streaming dataset."
-                        ) from e
-
-            batch_size = self.arguments.total_batch_size if is_train else self.evaluation_batch_size
-            num_epochs = self.arguments.num_train_epochs if is_train else 1
-            return resolve_total_steps(
-                forced_steps=forced_steps,
-                total_data_len=total_data_len,
-                batch_size=batch_size,
-                num_epochs=num_epochs,
-                gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
-                is_train=is_train,
-            )
-
         def to_tf_dataloader(dataset: Dataset | IterableDataset, is_train: bool) -> collections.abc.Iterator[np.ndarray]:
             """
             Converts a Hugging Face Dataset to a TensorFlow dataloader.
@@ -4330,32 +4475,52 @@ class BaseTrainer(BaseTrainerProtocol):
             else:
                 return create_tf_dataset_from_iterable(dataset, is_train)
 
-        max_training_steps = calculate_steps(self.dataset_train, is_train=True)
+        train_resolution = self._resolve_step_count(
+            self.dataset_train,
+            source=self._train_source,
+            is_train=True,
+            drop_remainder=self._train_source is not None or hasattr(self.dataset_train, "__len__"),
+        )
+        self._set_dataset_size_metadata(is_train=True, resolution=train_resolution)
+        max_training_steps = train_resolution.steps
 
         # Use _train_source if available (has transforms applied)
         if self._train_source is not None:
-            dataloader_train = self._create_dataloader_from_source(
-                source=self._train_source,
-                batch_size=self.training_batch_size,
-                is_train=True,
-                shuffle=self.arguments.shuffle_train_dataset,
-                num_epochs=self.arguments.num_train_epochs,
-                drop_remainder=True,
+            dataloader_train = _ReiterableDataLoader(
+                factory=lambda: self._create_dataloader_from_source(
+                    source=self._train_source,
+                    batch_size=self.training_batch_size,
+                    is_train=True,
+                    shuffle=self.arguments.shuffle_train_dataset,
+                    num_epochs=self.arguments.num_train_epochs,
+                    drop_remainder=True,
+                ),
+                length=max_training_steps,
             )
         else:
             dataloader_train = to_tf_dataloader(self.dataset_train, is_train=True)
 
         if self.dataset_eval is not None and self.arguments.do_eval:
-            max_evaluation_steps = calculate_steps(self.dataset_eval, is_train=False)
+            eval_resolution = self._resolve_step_count(
+                self.dataset_eval,
+                source=self._eval_source,
+                is_train=False,
+                drop_remainder=self._eval_source is not None or hasattr(self.dataset_eval, "__len__"),
+            )
+            self._set_dataset_size_metadata(is_train=False, resolution=eval_resolution)
+            max_evaluation_steps = eval_resolution.steps
             # Use _eval_source if available (has transforms applied)
             if self._eval_source is not None:
-                dataloader_eval = self._create_dataloader_from_source(
-                    source=self._eval_source,
-                    batch_size=self.evaluation_batch_size,
-                    is_train=False,
-                    shuffle=False,
-                    num_epochs=1,
-                    drop_remainder=True,
+                dataloader_eval = _ReiterableDataLoader(
+                    factory=lambda: self._create_dataloader_from_source(
+                        source=self._eval_source,
+                        batch_size=self.evaluation_batch_size,
+                        is_train=False,
+                        shuffle=False,
+                        num_epochs=1,
+                        drop_remainder=True,
+                    ),
+                    length=max_evaluation_steps,
                 )
             else:
                 dataloader_eval = to_tf_dataloader(self.dataset_eval, is_train=False)
@@ -5123,16 +5288,29 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         # Calculate and log model size
         model_size = self.count_model_parameters(state.graphstate)
+        config_metrics = {
+            "Number of Model Parameters (Billion)": model_size,
+            "process_count": jax.process_count(),
+            "device_count": jax.device_count(),
+            "local_device_count": jax.local_device_count(),
+            "platform": jax.extend.backend.get_backend().platform,
+            "XLA_FLAGS": os.getenv("XLA_FLAGS", ""),
+            "LIBTPU_INIT_ARGS": os.getenv("LIBTPU_INIT_ARGS", ""),
+        }
+        if self._train_dataset_num_examples is not None:
+            config_metrics["train_dataset_num_examples"] = self._train_dataset_num_examples
+            config_metrics["train_dataset_num_examples_exact"] = self._train_dataset_num_examples_exact
+            config_metrics["train_dataset_size_source"] = self._train_dataset_size_source_label
+            config_metrics["train_steps_auto_discovered"] = self._train_dataset_steps_auto_discovered
+            config_metrics["train_steps_auto_clamped"] = self._train_dataset_steps_auto_clamped
+        if self._eval_dataset_num_examples is not None:
+            config_metrics["eval_dataset_num_examples"] = self._eval_dataset_num_examples
+            config_metrics["eval_dataset_num_examples_exact"] = self._eval_dataset_num_examples_exact
+            config_metrics["eval_dataset_size_source"] = self._eval_dataset_size_source_label
+            config_metrics["eval_steps_auto_discovered"] = self._eval_dataset_steps_auto_discovered
+            config_metrics["eval_steps_auto_clamped"] = self._eval_dataset_steps_auto_clamped
         self.arguments.log_metrics(
-            {
-                "Number of Model Parameters (Billion)": model_size,
-                "process_count": jax.process_count(),
-                "device_count": jax.device_count(),
-                "local_device_count": jax.local_device_count(),
-                "platform": jax.extend.backend.get_backend().platform,
-                "XLA_FLAGS": os.getenv("XLA_FLAGS", ""),
-                "LIBTPU_INIT_ARGS": os.getenv("LIBTPU_INIT_ARGS", ""),
-            },
+            config_metrics,
             step=0,
             log_as="config",
         )
