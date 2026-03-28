@@ -755,7 +755,7 @@ requires-dist = [
     { name = "ejkernel", specifier = "==0.0.72" },
     { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.72" },
     { name = "ejkernel", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "==0.0.72" },
-    { name = "eopod", marker = "extra == 'podutils'", specifier = "==0.0.35" },
+    { name = "eopod", marker = "extra == 'podutils'", specifier = "==0.0.36" },
     { name = "fastapi", specifier = ">=0.115.2" },
     { name = "flax", specifier = "==0.12.3" },
     { name = "gcsfs", specifier = ">=2024.2,<2026" },
@@ -866,7 +866,7 @@ triton = [
 
 [[package]]
 name = "eopod"
-version = "0.0.35"
+version = "0.0.36"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -874,9 +874,9 @@ dependencies = [
     { name = "rich" },
     { name = "tpu-info" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/01/7a/bcfc36f7023e1e9e2949d6bd3c1f984b2c887dd9bc307efc01c4b24c0d3e/eopod-0.0.35.tar.gz", hash = "sha256:52bce7c23a38042d6d59421079e1f5a545d7f82fa0b922d9842a816e0436f672", size = 21555, upload-time = "2026-02-12T16:44:05.085Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/52/df/f1264072f6a6727077215924524cb2f37696773d2276369a216b012df116/eopod-0.0.36.tar.gz", hash = "sha256:589f6b91833a63f843befc57415b14fd98f9a772e958be1df2b0f1482bf09f63", size = 22531, upload-time = "2026-03-28T11:07:33.205Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ac/40/a28f218bc0eb1b14b225c9e7eab4b46721d0e10990bcfdead995364bf2da/eopod-0.0.35-py3-none-any.whl", hash = "sha256:27d9042b82ef47c6595dd9cff8bd7a7c6d916fe7ed1342e1d8e706951e374c96", size = 23169, upload-time = "2026-02-12T16:44:03.809Z" },
+    { url = "https://files.pythonhosted.org/packages/3b/22/a34481df4dafe64636389dcaecf1c26ef35e65135668ac78faab030128dd/eopod-0.0.36-py3-none-any.whl", hash = "sha256:8306ffc863af7c1791343b04641f066e806f5519c0cfe64d50f19cf745dde0f2", size = 24142, upload-time = "2026-03-28T11:07:33.947Z" },
 ]
 
 [[package]]
