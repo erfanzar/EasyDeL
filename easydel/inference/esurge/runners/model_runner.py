@@ -618,6 +618,11 @@ class eSurgeRunner:
         self._window_frequency_penalties_cpu = np.zeros_like(self.sequence_buffer.frequency_penalties)
         self._window_presence_penalties_cpu = np.zeros_like(self.sequence_buffer.presence_penalties)
         self._window_repetition_penalties_cpu = np.ones_like(self.sequence_buffer.repetition_penalties)
+        self._window_row_indices_cpu = np.zeros((self.max_num_reqs,), dtype=np.int32)
+        self.executor_manager.invalidate_sampler_penalty_state(
+            self.sequence_buffer.token_ids,
+            self.sequence_buffer.num_tokens,
+        )
 
         # VLM host-side scratch buffers keyed by `num_tokens_static` (avoid repeated
         # large allocations while keeping the step-function input pytree stable).
@@ -789,15 +794,9 @@ class eSurgeRunner:
                 top_p_window_cpu[:row_count] = self.sequence_buffer.top_p[start_index:end_index]
                 top_k_window_cpu[:row_count] = self.sequence_buffer.top_k[start_index:end_index]
                 min_p_window_cpu[:row_count] = self.sequence_buffer.min_p[start_index:end_index]
-                frequency_penalties_window_cpu[:row_count] = self.sequence_buffer.frequency_penalties[
-                    start_index:end_index
-                ]
-                presence_penalties_window_cpu[:row_count] = self.sequence_buffer.presence_penalties[
-                    start_index:end_index
-                ]
-                repetition_penalties_window_cpu[:row_count] = self.sequence_buffer.repetition_penalties[
-                    start_index:end_index
-                ]
+                frequency_penalties_window_cpu[:row_count] = self.sequence_buffer.frequency_penalties[start_index:end_index]
+                presence_penalties_window_cpu[:row_count] = self.sequence_buffer.presence_penalties[start_index:end_index]
+                repetition_penalties_window_cpu[:row_count] = self.sequence_buffer.repetition_penalties[start_index:end_index]
 
         # The batch-preparer page-table cache key must distinguish different
         # row windows that share the same underlying page-table version.
@@ -1737,6 +1736,7 @@ class eSurgeRunner:
         execution_start_time = time.time()
 
         updating_states_start = time.time()
+        layout_version_before = self.sequence_buffer.layout_version
         self._update_states(scheduler_output)
         updating_states_time = time.time() - updating_states_start
 
@@ -1754,6 +1754,12 @@ class eSurgeRunner:
                 self._reorder_decode_first(scheduler_output)
             else:
                 self._reorder_decode_first_per_shard(scheduler_output, dp_size)
+
+        if self.sequence_buffer.layout_version != layout_version_before:
+            self.executor_manager.invalidate_sampler_penalty_state(
+                self.sequence_buffer.token_ids,
+                self.sequence_buffer.num_tokens,
+            )
 
         if not scheduler_output.total_num_scheduled_tokens:
             return ModelRunnerOutput(
@@ -1854,6 +1860,10 @@ class eSurgeRunner:
                 for i, rid in enumerate(req_ids_window):
                     if rid is not None:
                         active_mask_full_cpu[i] = True
+
+                window_row_indices_cpu = self._window_row_indices_cpu
+                window_row_indices_cpu.fill(0)
+                window_row_indices_cpu[:num_reqs] = window_row_indices
 
                 self.req_num_tokens_full_buf = jax.device_put(req_num_tokens_np, self._empty_sharding)
 
@@ -2048,6 +2058,7 @@ class eSurgeRunner:
                 scheduled_full_cpu=scheduled_full_cpu,
                 req_num_tokens_full=self.req_num_tokens_full_buf,
                 active_mask_full_cpu=active_mask_full_cpu,
+                window_row_indices_cpu=window_row_indices_cpu,
                 input_ids_buf=self.input_ids_buf,
                 position_ids_buf=self.position_ids_buf,
                 padded_num_reqs=padded_num_reqs,
