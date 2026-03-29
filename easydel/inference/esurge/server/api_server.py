@@ -351,15 +351,22 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         self._refine_chat_request_callback = refine_chat_request
         self._extra_stops = self._normalize_stop_sequences(extra_stops)
 
+        try:
+            esurge_max_concurrency = min(int(esurge.max_num_seqs) for esurge in esurge_map.values())
+        except (AttributeError, TypeError, ValueError) as e:
+            raise ValueError("Loaded eSurge instances must expose a positive `max_num_seqs`.") from e
+        if esurge_max_concurrency <= 0:
+            raise ValueError("Loaded eSurge instances must expose a positive `max_num_seqs`.")
+
         if max_concurrent_generations is not None:
             try:
                 max_slots = int(max_concurrent_generations)
             except (TypeError, ValueError):
                 max_slots = 0
         else:
-            inferred = [esurge.max_num_seqs for esurge in esurge_map.values() if hasattr(esurge, "max_num_seqs")]
-            max_slots = min(inferred) if inferred else 0
+            max_slots = esurge_max_concurrency
         max_slots = max(0, max_slots)
+        kwargs["max_workers"] = esurge_max_concurrency
 
         # Initialize authentication manager (either ZMQ worker or in-process)
         self._require_api_key = bool(require_api_key)
