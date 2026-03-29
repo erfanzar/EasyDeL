@@ -146,6 +146,39 @@ class EngineParsingMixin:
         )
         return parsed, visible_text, visible_delta, stop_hit, stop_reason
 
+    @staticmethod
+    def _resolve_parser_tokenizer(*parsers):
+        """Return the first tokenizer exposed by the provided parser instances."""
+        for parser in parsers:
+            tokenizer = getattr(parser, "model_tokenizer", None)
+            if tokenizer is not None:
+                return tokenizer
+        return None
+
+    def _retokenize_parser_view(self, text: str, *, tool_parser=None, reasoning_parser=None) -> list[int]:
+        """Retokenize a parser-visible text view so token IDs match stripped content."""
+        if not text:
+            return []
+
+        tokenizer = getattr(self, "tokenizer", None) or self._resolve_parser_tokenizer(tool_parser, reasoning_parser)
+        if tokenizer is None or not hasattr(tokenizer, "encode"):
+            return []
+
+        try:
+            token_ids = tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            try:
+                token_ids = tokenizer.encode(text)
+            except Exception:
+                return []
+        except Exception:
+            return []
+
+        try:
+            return [int(token_id) for token_id in token_ids]
+        except Exception:
+            return []
+
     def _run_output_parsers(
         self,
         rd: dict,
@@ -273,6 +306,10 @@ class EngineParsingMixin:
                     # For streaming, compute content deltas
                     if reasoning_parser is not None:
                         _, prev_content = reasoning_parser.extract_reasoning(prev_text)
+                        if prev_content is None:
+                            # Keep the tool parser's previous view aligned with the
+                            # already-exposed visible content instead of raw reasoning.
+                            prev_content = rd.get("accumulated_content", "")
                     else:
                         prev_content = prev_text
 
@@ -290,13 +327,35 @@ class EngineParsingMixin:
                             messages=[ChatMessage(role="user", content="")],
                         )
                     delta_ids = token_ids[len(prev_token_ids) :] if prev_token_ids else token_ids
+                    tool_previous_token_ids = prev_token_ids
+                    tool_current_token_ids = token_ids
+                    tool_delta_token_ids = delta_ids
+                    if reasoning_parser is not None:
+                        # Tool parsers must see the same projection in both text and
+                        # token-ID space; otherwise token-aware parsers can still
+                        # detect markers that were stripped from reasoning.
+                        tool_previous_token_ids = self._retokenize_parser_view(
+                            prev_content or "",
+                            tool_parser=tool_parser,
+                            reasoning_parser=reasoning_parser,
+                        )
+                        tool_current_token_ids = self._retokenize_parser_view(
+                            content_for_tools or "",
+                            tool_parser=tool_parser,
+                            reasoning_parser=reasoning_parser,
+                        )
+                        tool_delta_token_ids = self._retokenize_parser_view(
+                            content_delta or "",
+                            tool_parser=tool_parser,
+                            reasoning_parser=reasoning_parser,
+                        )
                     delta_msg = tool_parser.extract_tool_calls_streaming(
                         previous_text=prev_content,
                         current_text=content_for_tools,
                         delta_text=content_delta or "",
-                        previous_token_ids=prev_token_ids,
-                        current_token_ids=token_ids,
-                        delta_token_ids=delta_ids,
+                        previous_token_ids=tool_previous_token_ids,
+                        current_token_ids=tool_current_token_ids,
+                        delta_token_ids=tool_delta_token_ids,
                         request=tool_request,
                     )
                     if delta_msg is not None:

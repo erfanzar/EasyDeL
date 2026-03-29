@@ -15,6 +15,7 @@
 import pytest
 
 from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
+from easydel.inference.openai_api_modules import DeltaFunctionCall, DeltaMessage, DeltaToolCall
 from easydel.inference.reasoning.abstract_reasoning import ReasoningParserManager
 from easydel.inference.reasoning.parsers import (
     DeepSeekR1ReasoningParser,
@@ -59,6 +60,36 @@ class _DummyTokenizer:
 
     def decode(self, token_ids, skip_special_tokens=False):
         return "".join(self._id_to_token.get(i, "") for i in token_ids)
+
+
+class _TokenAwareToolParser:
+    """Tool parser stub that would misfire if raw reasoning token IDs leak through."""
+
+    def __init__(self, trigger_token_id: int):
+        self.trigger_token_id = trigger_token_id
+        self.seen_previous_text = None
+        self.seen_current_text = None
+        self.seen_current_token_ids = None
+
+    def extract_tool_calls(self, _content, _request):
+        return None
+
+    def extract_tool_calls_streaming(self, **kwargs):
+        self.seen_previous_text = kwargs["previous_text"]
+        self.seen_current_text = kwargs["current_text"]
+        self.seen_current_token_ids = list(kwargs["current_token_ids"])
+        if self.trigger_token_id in kwargs["current_token_ids"]:
+            return DeltaMessage(
+                tool_calls=[
+                    DeltaToolCall(
+                        index=0,
+                        type="function",
+                        id="call_leaked",
+                        function=DeltaFunctionCall(name="leaked_tool", arguments="{}"),
+                    )
+                ]
+            )
+        return None
 
 
 @pytest.fixture()
@@ -1122,6 +1153,45 @@ def test_esurge_output_parsers_step3_reasoning_only_delta_is_not_text(dummy_toke
     assert result["delta_reasoning"] == "thinking"
     assert result["delta_content"] == ""
     assert result["accumulated_content"] == ""
+
+
+def test_esurge_output_parsers_do_not_expose_reasoning_token_ids_to_tool_parser():
+    tokenizer = _DummyTokenizer({"<think>": 1, "</think>": 2, "<tool_call>": 99})
+    reasoning_parser = DeepSeekR1ReasoningParser(tokenizer)
+    tool_parser = _TokenAwareToolParser(trigger_token_id=99)
+    engine = _ParsingHarness()
+
+    rd = {
+        "reasoning_parser_instance": reasoning_parser,
+        "tool_parser_instance": tool_parser,
+        "parser_previous_text": "",
+        "parser_previous_token_ids": [],
+        "accumulated_reasoning": "",
+        "accumulated_content": "",
+    }
+
+    first = engine._run_output_parsers(
+        rd=rd,
+        accumulated_text="hello",
+        delta_text="hello",
+        token_ids=[10],
+        finished=False,
+    )
+    assert first["delta_tool_calls"] is None
+
+    second = engine._run_output_parsers(
+        rd=rd,
+        accumulated_text="hello<think><tool_call>",
+        delta_text="<think><tool_call>",
+        token_ids=[10, 1, 99],
+        finished=False,
+    )
+
+    assert second["delta_reasoning"] == "<tool_call>"
+    assert second["delta_tool_calls"] is None
+    assert tool_parser.seen_previous_text == "hello"
+    assert tool_parser.seen_current_text == "hello"
+    assert tool_parser.seen_current_token_ids == tokenizer.encode("hello", add_special_tokens=False)
 
 
 def test_esurge_output_parsers_minimax_tool_calls_survive_finished_parse_without_end_tag():
