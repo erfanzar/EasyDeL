@@ -74,10 +74,10 @@ from jax import numpy as jnp
 
 from easydel.utils import ejit
 
-from ...core.sampler import apply_history_penalties
+from ...core.sampler import apply_history_penalties_from_counts, update_token_counts
 from ...core.sampler import sample_tokens as sample_tokens_fn
 from ...core.sampling_metadata import SamplingMetadata
-from ..execution_types import BatchMetadata, StepFunctionInputs
+from ..execution_types import StepFunctionInputs
 
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
@@ -117,9 +117,10 @@ class SamplerExecutor:
         ...     active_mask,
         ...     logits,
         ...     rng_key,
-        ...     token_history,
-        ... )
-    """
+    ...     token_counts_full,
+    ...     window_row_indices,
+    ... )
+"""
 
     def __init__(
         self,
@@ -242,7 +243,7 @@ class SamplerExecutor:
         num_tokens: int,
         padded_num_reqs: int,
         inputs: StepFunctionInputs,
-        metadata: BatchMetadata,
+        metadata,
     ) -> None:
         """Compile and cache a sampler function for specific dimensions.
 
@@ -274,13 +275,29 @@ class SamplerExecutor:
         )
 
         sampler_args = (
-            metadata,
-            inputs.req_num_tokens_full,
-            inputs.active_mask_full,
+            jnp.ones((int(padded_num_reqs), 1), dtype=jnp.float32, out_sharding=self._empty_sharding),
+            jnp.ones((int(padded_num_reqs),), dtype=jnp.float32, out_sharding=self._empty_sharding),
+            jnp.zeros((int(padded_num_reqs),), dtype=jnp.int32, out_sharding=self._empty_sharding),
+            jnp.zeros((int(padded_num_reqs),), dtype=jnp.float32, out_sharding=self._empty_sharding),
+            jnp.zeros((int(padded_num_reqs),), dtype=jnp.float32, out_sharding=self._empty_sharding),
+            jnp.zeros((int(padded_num_reqs),), dtype=jnp.float32, out_sharding=self._empty_sharding),
+            jnp.ones((int(padded_num_reqs),), dtype=jnp.float32, out_sharding=self._empty_sharding),
+            jnp.arange(int(padded_num_reqs), dtype=jnp.int32),
+            jnp.ones((int(padded_num_reqs),), dtype=jnp.int32, out_sharding=self._empty_sharding),
+            jnp.ones((int(padded_num_reqs),), dtype=jnp.int32, out_sharding=self._empty_sharding),
+            jax.device_put(jnp.int32(int(padded_num_reqs)), self._empty_sharding),
+            jax.device_put(jnp.int32(int(num_tokens)), self._empty_sharding),
+            jnp.ones((int(padded_num_reqs),), dtype=inputs.req_num_tokens_full.dtype, out_sharding=self._empty_sharding),
+            jnp.ones((int(padded_num_reqs),), dtype=jnp.bool_, out_sharding=self._empty_sharding),
             dummy_logits,
             inputs.rng_key,
             jnp.zeros(
-                (int(inputs.req_num_tokens_full.shape[0]), int(self.max_model_len)),
+                (int(inputs.req_num_tokens_full.shape[0]), vocab_size),
+                dtype=jnp.uint32,
+                out_sharding=self._empty_sharding,
+            ),
+            jnp.zeros(
+                (int(padded_num_reqs),),
                 dtype=jnp.int32,
                 out_sharding=self._empty_sharding,
             ),
@@ -307,46 +324,83 @@ class SamplerExecutor:
         Note:
             The returned function signature is:
             (
-                metadata,
-                req_num_tokens_full,
-                active_mask_full,
+                temperatures,
+                top_ps,
+                top_ks,
+                min_ps,
+                frequency_penalties,
+                presence_penalties,
+                repetition_penalties,
+                sampling_seeds,
+                scheduled,
+                seq_lens,
+                num_requests,
+                total_tokens,
+                req_num_tokens,
+                active_mask,
                 logits,
                 rng_key,
-                token_history,
-            ) -> (updated_rng_key, sampled_tokens, valid_mask)
+                token_counts_full,
+                window_row_indices,
+            ) -> (updated_rng_key, sampled_tokens, valid_mask, updated_token_counts_full)
         """
 
         @ejit
         def _sampling_fn(
-            metadata: BatchMetadata,
-            req_num_tokens_full: jax.Array,
-            active_mask_full: jax.Array,
+            temperatures: jax.Array,
+            top_ps: jax.Array,
+            top_ks: jax.Array,
+            min_ps: jax.Array,
+            frequency_penalties: jax.Array,
+            presence_penalties: jax.Array,
+            repetition_penalties: jax.Array,
+            sampling_seeds: jax.Array,
+            scheduled: jax.Array,
+            seq_lens: jax.Array,
+            num_requests: jax.Array,
+            total_tokens: jax.Array,
+            req_num_tokens: jax.Array,
+            active_mask: jax.Array,
             logits: jax.Array,
             rng_key: jax.Array,
-            token_history: jax.Array,
+            token_counts_full: jax.Array,
+            window_row_indices: jax.Array,
         ):
             batch_size = logits.shape[0]
             i_reqs = jnp.arange(batch_size, dtype=jnp.int32)
 
-            active_mask = (i_reqs < metadata.num_requests) & active_mask_full[:batch_size]
+            active_mask = (i_reqs < num_requests) & active_mask[:batch_size]
 
-            temp = metadata.temperature.reshape(-1, 1).astype(logits.dtype)
+            temp = temperatures[:batch_size].reshape(-1, 1).astype(logits.dtype)
             temp = jnp.where(active_mask[:, None], temp, jnp.ones_like(temp))
-            topp = metadata.top_p.astype(logits.dtype)
-            topk = metadata.top_k.astype(jnp.int32)
-            minp = metadata.min_p.astype(logits.dtype)
+            topp = top_ps[:batch_size].astype(logits.dtype)
+            topk = top_ks[:batch_size].astype(jnp.int32)
+            minp = min_ps[:batch_size].astype(logits.dtype)
 
             is_all_greedy = jnp.all(jnp.where(active_mask[:, None], temp <= 0.0, True))
             need_min_p_sampling = jnp.any((minp > 0.0) & active_mask)
+            need_history_penalties = jnp.any(
+                active_mask
+                & (
+                    (presence_penalties[:batch_size] != 0.0)
+                    | (frequency_penalties[:batch_size] != 0.0)
+                    | (repetition_penalties[:batch_size] != 1.0)
+                )
+            )
+            window_rows = window_row_indices[:batch_size].astype(jnp.int32)
 
-            logits = apply_history_penalties(
+            logits = jax.lax.cond(
+                need_history_penalties,
+                lambda legi: apply_history_penalties_from_counts(
+                    legi,
+                    token_counts=token_counts_full[window_rows],
+                    active_mask=active_mask,
+                    presence_penalties=presence_penalties[:batch_size],
+                    frequency_penalties=frequency_penalties[:batch_size],
+                    repetition_penalties=repetition_penalties[:batch_size],
+                ),
+                lambda legi: legi,
                 logits,
-                token_history=token_history,
-                seq_lens=metadata.seq_lens,
-                active_mask=active_mask,
-                presence_penalties=metadata.presence_penalties,
-                frequency_penalties=metadata.frequency_penalties,
-                repetition_penalties=metadata.repetition_penalties,
             )
 
             sampling_metadata = SamplingMetadata(
@@ -354,7 +408,7 @@ class SamplerExecutor:
                 top_ps=topp,
                 top_ks=topk,
                 min_ps=minp,
-                sampling_seeds=None,
+                sampling_seeds=sampling_seeds[:batch_size],
                 is_all_greedy=is_all_greedy,
                 need_min_p_sampling=need_min_p_sampling,
                 do_penalties=False,
@@ -362,16 +416,25 @@ class SamplerExecutor:
             )
 
             sampled_flat = sample_tokens_fn(logits, sampling_metadata, rng_key)
-            total_tokens = metadata.query_start_loc[-1]
             rng_key = jax.random.fold_in(rng_key, jnp.int32(total_tokens))
 
-            scheduled_slice = metadata.scheduled[:batch_size]
-            seq_lens_now = metadata.seq_lens[:batch_size]
-            req_num_tokens_slice = req_num_tokens_full[:batch_size]
-            active_mask_slice = active_mask_full[:batch_size]
+            scheduled_slice = scheduled[:batch_size]
+            seq_lens_now = seq_lens[:batch_size]
+            req_num_tokens_slice = req_num_tokens[:batch_size]
             meets_len = seq_lens_now >= req_num_tokens_slice
-            valid_mask = (i_reqs < metadata.num_requests) & active_mask_slice & (scheduled_slice > 0) & meets_len
+            valid_mask = (i_reqs < num_requests) & active_mask & (scheduled_slice > 0) & meets_len
             out_tokens = jnp.where(valid_mask, sampled_flat, -1)
-            return rng_key, out_tokens, valid_mask
+            token_counts_full = jax.lax.cond(
+                need_history_penalties,
+                lambda counts: update_token_counts(
+                    counts,
+                    row_indices=window_rows,
+                    sampled_tokens=sampled_flat,
+                    valid_mask=valid_mask,
+                ),
+                lambda counts: counts,
+                token_counts_full,
+            )
+            return rng_key, out_tokens, valid_mask, token_counts_full
 
         return _sampling_fn

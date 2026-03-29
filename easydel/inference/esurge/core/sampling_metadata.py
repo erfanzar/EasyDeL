@@ -46,8 +46,9 @@ class SamplingMetadata:
             probability tokens are considered for sampling.
         min_ps: Min-p sampling thresholds [batch_size]. Filters tokens where
             p(token) < min_p * max(p(token)).
-        sampling_seeds: Optional random seeds for reproducible sampling [batch_size].
-            If provided, enables deterministic sampling for debugging.
+        sampling_seeds: Optional per-row RNG fold-in seeds [batch_size].
+            When omitted, rows use their local batch indices. Supplying seeds
+            preserves exact sampling identity when rows are compacted or reordered.
         is_all_greedy: Static flag indicating all requests use greedy decoding.
             When True, skips random sampling entirely for efficiency.
         need_min_p_sampling: Static flag indicating min-p filtering is needed

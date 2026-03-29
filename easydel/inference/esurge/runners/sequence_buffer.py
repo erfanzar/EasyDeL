@@ -333,6 +333,7 @@ class SequenceBuffer:
         self.logit_bias: list[dict[int, float] | None] = [None] * max_num_reqs
         self.bad_words_token_ids: dict[int, list[list[int]]] = {}
         self.allowed_token_ids_mask: jax.Array | None = None
+        self._layout_version = 0
 
     def _update_request_distribution(self) -> None:
         """Update the request distribution triple [decode_only, chunked_prefill, total]."""
@@ -353,6 +354,11 @@ class SequenceBuffer:
     def num_slots(self) -> int:
         """Number of materialized row slots (includes empty holes)."""
         return len(self._req_ids)
+
+    @property
+    def layout_version(self) -> int:
+        """Monotonic version for row-layout or membership changes."""
+        return self._layout_version
 
     @property
     def all_greedy(self) -> bool:
@@ -483,6 +489,7 @@ class SequenceBuffer:
         self._process_sampling_params(sampling_params, req_id, req_index)
         self._process_optional_params(request, sampling_params, req_id, req_index)
         self._update_request_distribution()
+        self._layout_version += 1
 
     def remove_request(self, req_id: str) -> int | None:
         """Remove a request from the buffer.
@@ -562,6 +569,7 @@ class SequenceBuffer:
             self.allowed_token_ids_mask = self.allowed_token_ids_mask.at[req_index].set(False)
 
         self._update_request_distribution()
+        self._layout_version += 1
         return req_index
 
     def compact_holes_in_range(self, lo: int, hi: int) -> None:
@@ -641,6 +649,7 @@ class SequenceBuffer:
         self.page_table.swap_row(i1, i2)
 
         self._update_request_distribution()
+        self._layout_version += 1
 
     def condense(self, empty_req_indices: list[int]) -> None:
         """Condense the buffer by removing gaps.
@@ -733,6 +742,7 @@ class SequenceBuffer:
 
         # Sparse/optional data
         self._move_sparse_data(from_idx, to_idx)
+        self._layout_version += 1
 
     def _move_sparse_data(self, from_idx: int, to_idx: int) -> None:
         """Move sparse and optional data between indices.
@@ -1076,6 +1086,7 @@ class SequenceBuffer:
             self.allowed_token_ids_mask = jnp.zeros_like(self.allowed_token_ids_mask, dtype=bool)
 
         self._update_request_distribution()
+        self._layout_version += 1
 
 
 @auto_pytree
