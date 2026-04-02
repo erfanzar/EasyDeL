@@ -84,6 +84,7 @@ from eformer.loggings import ProgressLogger, get_logger
 from eformer.pytree import key_path_to_str
 from ejkernel.ops import forward_autotune_only  # pyright: ignore[reportMissingTypeStubs]
 from jax import numpy as jnp
+from jax.experimental import multihost_utils
 
 from easydel.caching import (
     HybridCache,
@@ -94,6 +95,7 @@ from easydel.caching import (
     UnifiedAttentionCache,
     UnifiedAttentionCacheConfig,
 )
+from easydel.layers.quantization import TurboQuantConfig
 
 from ..core.sampler import build_history_token_counts
 from ..utils import model_uses_mrope
@@ -416,7 +418,9 @@ class ExecutionManager:
         self._use_request_distribution = not self._use_slot_mapping
 
         text_config = model.config.get_text_config()
-        quantizer = model._quant_class(quantization_config=text_config.kv_cache_quantization_config)
+        kv_quant_cfg = text_config.kv_cache_quantization_config
+        _is_turboquant = isinstance(kv_quant_cfg, TurboQuantConfig)
+        quantizer = model._quant_class(quantization_config=None if _is_turboquant else kv_quant_cfg)
 
         # Prefer HybridCache (per-operation cache views) as the universal container.
         # Keep paged-cache parameters consistent with the scheduler config.
@@ -567,8 +571,12 @@ class ExecutionManager:
         if self._sampler_penalty_rebuild_token_ids_cpu is None or self._sampler_penalty_rebuild_seq_lens_cpu is None:
             raise RuntimeError("Sampler penalty state rebuild requested without a full-sequence source.")
 
-        token_history = jax.device_put(self._sampler_penalty_rebuild_token_ids_cpu, self._empty_sharding)
-        seq_lens = jax.device_put(self._sampler_penalty_rebuild_seq_lens_cpu, self._empty_sharding)
+        _token_ids_cpu = self._sampler_penalty_rebuild_token_ids_cpu
+        _seq_lens_cpu = self._sampler_penalty_rebuild_seq_lens_cpu
+        if jax.process_count() > 1:
+            _token_ids_cpu, _seq_lens_cpu = multihost_utils.broadcast_one_to_all((_token_ids_cpu, _seq_lens_cpu))
+        token_history = jax.device_put(_token_ids_cpu, self._empty_sharding)
+        seq_lens = jax.device_put(_seq_lens_cpu, self._empty_sharding)
         self._sampler_token_counts = self._rebuild_penalty_counts(token_history, seq_lens)
         self._sampler_penalty_state_dirty = False
         self._sampler_penalty_state_ready = True
@@ -652,7 +660,9 @@ class ExecutionManager:
             + scheduled_window[sample_positions]
         )
         active_out[:sample_count] = True
-        temperature_out[:sample_count] = numpy.asarray(temperature_cpu[:padded_num_reqs], dtype=numpy.float32)[sample_positions]
+        temperature_out[:sample_count] = numpy.asarray(temperature_cpu[:padded_num_reqs], dtype=numpy.float32)[
+            sample_positions
+        ]
         top_p_out[:sample_count] = numpy.asarray(top_p_cpu[:padded_num_reqs], dtype=numpy.float32)[sample_positions]
         top_k_out[:sample_count] = numpy.asarray(top_k_cpu[:padded_num_reqs], dtype=numpy.int32)[sample_positions]
         min_p_out[:sample_count] = numpy.asarray(min_p_cpu[:padded_num_reqs], dtype=numpy.float32)[sample_positions]
@@ -1168,7 +1178,9 @@ class ExecutionManager:
         )
         if need_penalties:
             self._ensure_sampler_penalty_state()
-        token_counts_full = self._sampler_token_counts if self._sampler_penalty_state_ready else self._sampler_zero_token_counts
+        token_counts_full = (
+            self._sampler_token_counts if self._sampler_penalty_state_ready else self._sampler_zero_token_counts
+        )
         sampler_host_payload = (
             compact_temperature_cpu[:sampler_padded_num_reqs].reshape(sampler_padded_num_reqs, 1),
             compact_top_p_cpu[:sampler_padded_num_reqs],
@@ -1187,6 +1199,8 @@ class ExecutionManager:
             scatter_positions_cpu[:sampler_padded_num_reqs],
             compact_window_row_indices_cpu[:sampler_padded_num_reqs],
         )
+        if jax.process_count() > 1:
+            sampler_host_payload = multihost_utils.broadcast_one_to_all(sampler_host_payload)
         (
             temperatures,
             top_ps,
@@ -1369,7 +1383,7 @@ class ExecutionManager:
                 compilation_count,
                 total_compilations,
                 f"Compiling [{compilation_count + 1}/{total_compilations}]: {num_tokens:5d} tokens, "
-                f"{reqs_padd:2d} padded requests (sampler-only)",
+                f"{reqs_padd:2d} padded requests",
             )
             self._compile_sampler_variant(
                 num_tokens=num_tokens,

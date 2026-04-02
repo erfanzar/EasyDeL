@@ -97,6 +97,11 @@ from .recurrent import (
     RecurrentMetadata,
 )
 from .transformer import TransformerCache, TransformerCacheConfig, TransformerCacheView, TransformerMetadata
+from .turboquant_ragged_page import (
+    TurboQuantRaggedPagesCache,
+    TurboQuantRaggedPagesCacheConfig,
+    TurboQuantRaggedPagesCacheView,
+)
 from .unified_attention import UnifiedAttentionCache, UnifiedAttentionCacheConfig, UnifiedAttentionCacheView
 
 __all__ = (
@@ -139,6 +144,9 @@ __all__ = (
     "TransformerCacheConfig",
     "TransformerCacheView",
     "TransformerMetadata",
+    "TurboQuantRaggedPagesCache",
+    "TurboQuantRaggedPagesCacheConfig",
+    "TurboQuantRaggedPagesCacheView",
     "UnifiedAttentionCache",
     "UnifiedAttentionCacheConfig",
     "UnifiedAttentionCacheView",

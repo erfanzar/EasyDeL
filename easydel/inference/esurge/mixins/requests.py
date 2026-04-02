@@ -20,6 +20,8 @@ import uuid
 from collections.abc import Sequence
 from typing import Any
 
+import jax
+
 from easydel.inference.sampling_params import SamplingParams
 
 from ..logger import logger
@@ -410,6 +412,9 @@ class EngineRequestsMixin:
                     )
 
             with self._scheduler_lock:
+                # In multi-host mode, use a deterministic arrival_time so all
+                # hosts agree on preemption/priority ordering.
+                _arrival = float(self._request_counter) if jax.process_count() > 1 else None
                 self.scheduler.add_request(
                     EngineRequest(
                         request_id=child_request_id,
@@ -418,6 +423,7 @@ class EngineRequestsMixin:
                         eos_token_id=primary_eos_token_id,
                         parent_request_id=parent_id,
                         sample_index=sample_idx,
+                        arrival_time=_arrival,
                         # Vision-language model data (only for first sample to save memory)
                         pixel_values=pixel_values if sample_idx == 0 else None,
                         image_grid_thw=image_grid_thw if sample_idx == 0 else None,
@@ -438,15 +444,18 @@ class EngineRequestsMixin:
     def _generate_request_id(self) -> str:
         """Generate a unique request ID with overflow protection.
 
-        Uses UUID for uniqueness and a counter for ordering. The counter
-        uses modulo arithmetic to prevent unbounded growth in long-running
-        services.
+        In multi-host mode, uses a deterministic counter-only format so all
+        JAX processes produce identical IDs for the same request sequence.
+        In single-host mode, uses UUID for uniqueness plus a counter for
+        ordering.
 
         Returns:
-            Unique request ID with format 'req-{uuid}-{counter}'.
+            Unique request ID string.
         """
         with self._counter_lock:
-            self._request_counter = (self._request_counter + 1) % (1 << 32)  # Reset after ~4 billion requests
+            self._request_counter = (self._request_counter + 1) % (1 << 32)
+            if jax.process_count() > 1:
+                return f"req-{self._request_counter:010d}"
             return f"req-{uuid.uuid4().hex}-{self._request_counter}"
 
     def abort_request(self, request_id: str) -> None:

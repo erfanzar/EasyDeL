@@ -113,6 +113,7 @@ from ._straight_through import (
     straight_through_nf4,
     straight_through_nvfp8,
 )
+from ._turboquant import TurboQuantConfig, TurboQuantConstants
 
 # Backward-compatible alias for older API surface.
 EasyDeLQuantizationConfig = QuantizationConfig
@@ -122,6 +123,8 @@ __all__ = (
     "EasyQuantizer",
     "QuantizationConfig",
     "QuantizationType",
+    "TurboQuantConfig",
+    "TurboQuantConstants",
     "quantize",
     "straight_through",
     "straight_through_1bit",

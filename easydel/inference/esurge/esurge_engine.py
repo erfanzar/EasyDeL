@@ -111,7 +111,11 @@ MAX_CONSECUTIVE_SCHEDULER_ERRORS = int(os.environ.get("EASURGE_MAX_SCHEDULER_ERR
 WORKER_DRAIN_MAX_RETRIES = 3  # Maximum retry attempts for worker drain
 WORKER_DRAIN_INITIAL_DELAY = 0.1  # Initial retry delay in seconds
 SamplingCallable = typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None] | None
-MLA_RAGGED_ATTN_MECHANISM = "multi_latent_ragged_page_attention_v1"
+MLA_RAGGED_ATTN_MECHANISM = "multi_latent_ragged_page_attention_v2"
+_MLA_RAGGED_ATTN_MECHANISMS = {
+    "multi_latent_ragged_page_attention_v1",
+    "multi_latent_ragged_page_attention_v2",
+}
 
 
 def _set_requested_new(sp, n: int):  # pyright: ignore[reportUnusedFunction]
@@ -195,10 +199,10 @@ def _text_config_uses_mla(text_config: Any) -> bool:
         return False
 
     attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
-    if attn_mechanism == MLA_RAGGED_ATTN_MECHANISM:
+    if attn_mechanism in _MLA_RAGGED_ATTN_MECHANISMS:
         return True
     mla_attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "mla_attn_mechanism", None))
-    if mla_attn_mechanism == MLA_RAGGED_ATTN_MECHANISM:
+    if mla_attn_mechanism in _MLA_RAGGED_ATTN_MECHANISMS:
         return True
 
     attention_type = getattr(text_config, "attention_type", None)
@@ -956,7 +960,7 @@ class eSurge(
 
             if has_mla_attention and _mla_kernel_compatible:
                 attn_value = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
-                mla_compatible = attn_value == MLA_RAGGED_ATTN_MECHANISM
+                mla_compatible = attn_value in _MLA_RAGGED_ATTN_MECHANISMS
                 if jax.default_backend() == "gpu":
                     mla_compatible = mla_compatible or attn_value in {
                         AttentionMechanisms.UNIFIED_ATTENTION.value,
