@@ -111,6 +111,7 @@ class QuantizationType(enum.StrEnum):
     INT8 = "int8"
     TERNARY = "ternary"
     BINARY = "binary"
+    TURBOQUANT = "turboquant"
 
 
 @dataclass

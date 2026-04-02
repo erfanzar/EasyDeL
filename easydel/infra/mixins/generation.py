@@ -116,11 +116,15 @@ def _text_config_uses_mla(text_config: tp.Any) -> bool:
     if text_config is None:
         return False
 
+    _MLA_MECHANISMS = {
+        "multi_latent_ragged_page_attention_v1",
+        "multi_latent_ragged_page_attention_v2",
+    }
     attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
-    if attn_mechanism == "multi_latent_ragged_page_attention_v1":
+    if attn_mechanism in _MLA_MECHANISMS:
         return True
     mla_attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "mla_attn_mechanism", None))
-    if mla_attn_mechanism == "multi_latent_ragged_page_attention_v1":
+    if mla_attn_mechanism in _MLA_MECHANISMS:
         return True
 
     attention_type = getattr(text_config, "attention_type", None)
@@ -507,9 +511,7 @@ class EasyGenerationMixin:
                 page_size=page_size,
             )
 
-        quantizer = self._quant_class(
-            quantization_config=text_config.kv_cache_quantization_config,
-        )
+        quantizer = self._quant_class(quantization_config=text_config.kv_cache_quantization_config)
 
         return UnifiedAttentionCache.init_cache(
             mesh=text_config.mesh,
@@ -1102,7 +1104,7 @@ class EasyGenerationMixin:
         text_config = self.config.get_text_config()
         attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
 
-        if attn_mechanism == "multi_latent_ragged_page_attention_v1":
+        if attn_mechanism in ("multi_latent_ragged_page_attention_v1", "multi_latent_ragged_page_attention_v2"):
             return self._create_mla_ragged_page_cache_config(
                 max_length=max_length,
                 page_size=page_size,
@@ -1219,6 +1221,7 @@ class EasyGenerationMixin:
             UnifiedAttentionCacheConfig,
             UnifiedAttentionCacheView,
         )
+        from easydel.layers.quantization import TurboQuantConfig
 
         text_config = self.config.get_text_config()
         cache_view_mapping = self.get_operations_cache_view()
@@ -1305,7 +1308,25 @@ class EasyGenerationMixin:
                     f"got {type(ragged_config)}"
                 )
 
-        if needs_standard_ragged and shared_ragged_config is None:
+        # Check if TurboQuant KV cache quantization is configured
+        kv_quant_cfg = getattr(text_config, "kv_cache_quantization_config", None)
+        _is_turboquant = isinstance(kv_quant_cfg, TurboQuantConfig)
+
+        if needs_standard_ragged and _is_turboquant:
+            from easydel.caching.turboquant_ragged_page import TurboQuantRaggedPagesCacheConfig
+
+            shared_ragged_config = TurboQuantRaggedPagesCacheConfig.create(
+                mesh=text_config.mesh,
+                partition_manager=text_config.partition_manager,
+                turboquant_config=kv_quant_cfg,
+                num_hidden_layers=max(1, num_standard_ragged_layers),
+                num_kv_heads=text_config.num_key_value_heads,
+                max_model_length=max_length,
+                kv_head_dim_size=text_config.head_dim,
+                hbm_utilization=hbm_utilization,
+                page_size=page_size,
+            )
+        elif needs_standard_ragged and shared_ragged_config is None:
             shared_ragged_config = self._create_standard_ragged_page_cache_config(
                 max_length=max_length,
                 page_size=page_size,
@@ -1470,7 +1491,40 @@ class EasyGenerationMixin:
 
             views = [None] * num_hidden_layers
 
+            # Pre-scan for TurboQuant layers and batch-allocate them
+            # (5 allocations total vs 5 * num_layers).
+            _tq_batch_views: dict[int, "TurboQuantRaggedPagesCacheView"] = {}
+            try:
+                from easydel.caching.turboquant_ragged_page import TurboQuantRaggedPagesCacheConfig as _TQCfg
+                from easydel.caching.turboquant_ragged_page import TurboQuantRaggedPagesCacheView as _TQView
+
+                _tq_layers = []
+                _tq_config = None
+                for _i, _cfg in zip(range(num_hidden_layers), views_config, strict=False):
+                    _vc = cache_view_mapping.get(_i)
+                    if _vc in (RaggedPagesCacheView, MLARaggedPagesCacheView) and isinstance(_cfg, _TQCfg):
+                        _tq_layers.append(_i)
+                        if _tq_config is None:
+                            _tq_config = _cfg
+
+                if _tq_layers and _tq_config is not None:
+                    _batch_views = _TQView.init_all_layers(
+                        config=_tq_config,
+                        num_layers=len(_tq_layers),
+                        mesh=text_config.mesh,
+                        partition_manager=text_config.partition_manager,
+                    )
+                    for _li, _bv in zip(_tq_layers, _batch_views, strict=False):
+                        _tq_batch_views[_li] = _bv
+            except ImportError:
+                pass
+
             for idx, config_classes in zip(range(num_hidden_layers), views_config, strict=False):
+                # Use batch-allocated TurboQuant view if available
+                if idx in _tq_batch_views:
+                    views[idx] = _tq_batch_views[idx]
+                    continue
+
                 view_class = cache_view_mapping.get(idx)
                 if view_class is None:
                     raise ValueError(
@@ -1561,13 +1615,26 @@ class EasyGenerationMixin:
                         dtype=dtype,
                     )
                 elif view_class in (RaggedPagesCacheView, MLARaggedPagesCacheView):
-                    view = view_class.init(
-                        config=config_classes,
-                        layer_index=idx,
-                        mesh=text_config.mesh,
-                        partition_manager=text_config.partition_manager,
-                        quantizer=quantizer,
+                    from easydel.caching.turboquant_ragged_page import (
+                        TurboQuantRaggedPagesCacheConfig,
+                        TurboQuantRaggedPagesCacheView,
                     )
+
+                    if isinstance(config_classes, TurboQuantRaggedPagesCacheConfig):
+                        view = TurboQuantRaggedPagesCacheView.init(
+                            config=config_classes,
+                            layer_index=idx,
+                            mesh=text_config.mesh,
+                            partition_manager=text_config.partition_manager,
+                        )
+                    else:
+                        view = view_class.init(
+                            config=config_classes,
+                            layer_index=idx,
+                            mesh=text_config.mesh,
+                            partition_manager=text_config.partition_manager,
+                            quantizer=quantizer,
+                        )
                 elif view_class is UnifiedAttentionCacheView:
                     view = view_class.init(
                         config=config_classes,
@@ -1992,7 +2059,9 @@ class EasyGenerationMixin:
                 param = valid_params[name]
                 if param.annotation != inspect.Parameter.empty:
                     try:
-                        if getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None:  # pyright: ignore[reportDeprecated]
+                        if (
+                            getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None
+                        ):  # pyright: ignore[reportDeprecated]
                             expected_type = param.annotation.__args__[0]
                             if not isinstance(value, expected_type):
                                 print(
@@ -3313,13 +3382,16 @@ class EasyGenerationMixin:
         _mla_kernel_ok = int(_num_heads) > 0
         is_mla_model = has_mla_attention and _mla_kernel_ok
         if is_mla_model:
-            compatible = attn_mechanism == "multi_latent_ragged_page_attention_v1"
+            compatible = attn_mechanism in {
+                "multi_latent_ragged_page_attention_v1",
+                "multi_latent_ragged_page_attention_v2",
+            }
             if backend == "gpu":
                 compatible = compatible or attn_mechanism in {
                     "unified_attention",
                     "paged_flash_attention",
                 }
-            target_attn = "multi_latent_ragged_page_attention_v1"
+            target_attn = "multi_latent_ragged_page_attention_v2"
         elif backend == "tpu":
             compatible = attn_mechanism in [
                 "ragged_page_attention_v2",
@@ -3349,7 +3421,7 @@ class EasyGenerationMixin:
                     logger.warning(
                         "Detected mixed MLA and non-MLA full-attention layers, "
                         "forcing all inference layers to "
-                        "multi_latent_ragged_page_attention_v1."
+                        "multi_latent_ragged_page_attention_v2."
                     )
                 update_kwargs["decode_attn_mechanism"] = target_attn
                 update_kwargs["mla_attn_mechanism"] = target_attn
@@ -3415,13 +3487,16 @@ class EasyGenerationMixin:
         is_mla_model = has_mla_attention and _mla_kernel_ok
 
         if is_mla_model:
-            compatible = attn_mechanism == "multi_latent_ragged_page_attention_v1"
+            compatible = attn_mechanism in {
+                "multi_latent_ragged_page_attention_v1",
+                "multi_latent_ragged_page_attention_v2",
+            }
             if backend == "gpu":
                 compatible = compatible or attn_mechanism in {
                     "unified_attention",
                     "paged_flash_attention",
                 }
-            target_attn = "multi_latent_ragged_page_attention_v1"
+            target_attn = "multi_latent_ragged_page_attention_v2"
         elif backend == "tpu":
             compatible = attn_mechanism in [
                 "ragged_page_attention_v2",
@@ -3688,7 +3763,7 @@ class EasyGenerationMixin:
             num_heads = text_config.num_attention_heads or 0
             is_mla_model = has_mla_attention and int(num_heads) > 0
             if is_mla_model:
-                esurge_attn = "multi_latent_ragged_page_attention_v1"
+                esurge_attn = "multi_latent_ragged_page_attention_v2"
             elif backend == "gpu":
                 esurge_attn = "unified_attention"
             else:

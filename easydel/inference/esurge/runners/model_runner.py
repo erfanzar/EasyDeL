@@ -70,8 +70,10 @@ import jax
 import numpy as np
 from eformer.loggings import get_logger
 from jax import numpy as jnp
+from jax.experimental import multihost_utils
 
 from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
+from easydel.layers.quantization import TurboQuantConfig
 
 from ..core.dp_sharding import dp_shard_for_page_id, dp_shard_page_bounds, pages_per_dp_shard
 from ..metrics import get_metrics_collector
@@ -111,7 +113,9 @@ class RunnerPerfSample:
     ema_tps: float
 
 
-def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:  # pyright: ignore[reportUnusedFunction]
+def _get_padded_num_reqs_with_upper_limit(
+    x: int, upper_limit: int, min_input_pad: int
+) -> int:  # pyright: ignore[reportUnusedFunction]
     """Calculate padded request count for compilation efficiency.
 
     Pads the number of requests to the nearest power of 2 that is at least
@@ -794,9 +798,15 @@ class eSurgeRunner:
                 top_p_window_cpu[:row_count] = self.sequence_buffer.top_p[start_index:end_index]
                 top_k_window_cpu[:row_count] = self.sequence_buffer.top_k[start_index:end_index]
                 min_p_window_cpu[:row_count] = self.sequence_buffer.min_p[start_index:end_index]
-                frequency_penalties_window_cpu[:row_count] = self.sequence_buffer.frequency_penalties[start_index:end_index]
-                presence_penalties_window_cpu[:row_count] = self.sequence_buffer.presence_penalties[start_index:end_index]
-                repetition_penalties_window_cpu[:row_count] = self.sequence_buffer.repetition_penalties[start_index:end_index]
+                frequency_penalties_window_cpu[:row_count] = self.sequence_buffer.frequency_penalties[
+                    start_index:end_index
+                ]
+                presence_penalties_window_cpu[:row_count] = self.sequence_buffer.presence_penalties[
+                    start_index:end_index
+                ]
+                repetition_penalties_window_cpu[:row_count] = self.sequence_buffer.repetition_penalties[
+                    start_index:end_index
+                ]
 
         # The batch-preparer page-table cache key must distinguish different
         # row windows that share the same underlying page-table version.
@@ -1139,7 +1149,13 @@ class eSurgeRunner:
 
         logger.info("Reinitializing eSurgeRunner ragged KV cache pages")
         text_config = self.model.config.get_text_config()
-        quantizer = self.model._quant_class(quantization_config=text_config.kv_cache_quantization_config)
+        kv_quant_cfg = text_config.kv_cache_quantization_config
+        # TurboQuant handles compression internally; skip standard quantizer
+        _is_turboquant = isinstance(kv_quant_cfg, TurboQuantConfig)
+        if _is_turboquant:
+            quantizer = self.model._quant_class(quantization_config=None)
+        else:
+            quantizer = self.model._quant_class(quantization_config=kv_quant_cfg)
 
         self.executor_manager.kv_pages = self.model.init_operations_cache(
             batch_size=int(self.max_num_reqs),
@@ -1865,6 +1881,8 @@ class eSurgeRunner:
                 window_row_indices_cpu.fill(0)
                 window_row_indices_cpu[:num_reqs] = window_row_indices
 
+                if jax.process_count() > 1:
+                    req_num_tokens_np = multihost_utils.broadcast_one_to_all(req_num_tokens_np)
                 self.req_num_tokens_full_buf = jax.device_put(req_num_tokens_np, self._empty_sharding)
 
             mrope_position_ids_cpu: np.ndarray | None = None

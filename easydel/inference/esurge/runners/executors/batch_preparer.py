@@ -873,6 +873,13 @@ class BatchMetadataPreparer:
 
         device_put_start = time.time()
 
+        # Multi-host: broadcast host-side arrays from coordinator (process 0)
+        # so all hosts pass identical data to `device_put` with replicated sharding.
+        if jax.process_count() > 1:
+            from jax.experimental import multihost_utils
+
+            host_payload = multihost_utils.broadcast_one_to_all(host_payload)
+
         slot_mapping_dev = None
         num_kv_update_dev = None
         if self._use_slot_mapping:
@@ -1099,6 +1106,10 @@ class BatchMetadataPreparer:
         host_build_took = time.time() - host_build_start
 
         device_put_start = time.time()
+        if jax.process_count() > 1:
+            from jax.experimental import multihost_utils
+
+            host_payload = multihost_utils.broadcast_one_to_all(host_payload)
         self._pending_transfer = jax.device_put(host_payload, self._empty_sharding)
         device_put_took = time.time() - device_put_start
         self._pending_transfer_metadata = {

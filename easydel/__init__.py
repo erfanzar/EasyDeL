@@ -376,6 +376,7 @@ _import_structure = {
         "EasyDeLQuantizationConfig",
         "EasyQuantizer",
         "QuantizationType",
+        "TurboQuantConfig",
     ],
     "operations": [
         "AttentionConfig",
@@ -990,7 +991,7 @@ if _tp.TYPE_CHECKING:
     from .infra.factory import ConfigType, TaskType, register_config, register_module
     from .layers.attention import AttentionMechanisms, AttentionModule, FlexibleAttentionModule
     from .layers.moe import MoEMethods
-    from .layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer, QuantizationType
+    from .layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer, QuantizationType, TurboQuantConfig
     from .modules.arctic import ArcticConfig, ArcticForCausalLM, ArcticModel
     from .modules.auto import (
         AutoEasyDeLAnyToAnyModel,
@@ -1338,7 +1339,7 @@ else:
     )
 
     _targeted_eformer_versions = ["0.0.99.5"]
-    _targeted_ejkernel_versions = ["0.0.72"]
+    _targeted_ejkernel_versions = ["0.0.75"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version
