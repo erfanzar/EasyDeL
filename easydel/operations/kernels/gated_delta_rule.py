@@ -48,6 +48,7 @@ import jax.numpy as jnp
 from eformer.escale import with_sharding_constraint
 from eformer.pytree import auto_pytree
 from ejkernel.modules import gated_delta_rule
+from ejkernel.modules.operations.configs import GatedDeltaRuleConfig
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec
@@ -119,26 +120,39 @@ def _gdr_grouped_decode_kernel(
     scale = jnp.asarray(head_dim**-0.5, dtype=compute_dtype)
 
     for kh in range(num_k_heads):
-        q = query_ref[0, kh, :].astype(compute_dtype) * scale
-        k = key_ref[0, kh, :].astype(compute_dtype)
-        decay_kh = decay_ref[0, kh, :].astype(compute_dtype)
-        beta_kh = beta_ref[0, kh, :].astype(compute_dtype)
+        q = query_ref[0, kh, :].astype(compute_dtype) * scale  # [head_dim]
+        k = key_ref[0, kh, :].astype(compute_dtype)  # [head_dim]
 
-        for er in range(expand_ratio):
-            vh = kh * expand_ratio + er
+        if expand_ratio == 1:
+            vh = kh
             s = state_ref[0, vh, :, :].astype(compute_dtype)
-            d = decay_kh[er : er + 1].astype(jnp.float32)[0]
-            beta = beta_kh[er : er + 1].astype(jnp.float32)[0]
-            v = value_ref[0, kh, er, :].astype(compute_dtype)
+            d = decay_ref[0, kh, 0].astype(jnp.float32)
+            beta_val = beta_ref[0, kh, 0].astype(jnp.float32)
+            v = value_ref[0, kh, 0, :].astype(compute_dtype)
 
             s = s * jnp.exp(d).astype(compute_dtype)
             kv_mem = jnp.sum(k[:, None] * s, axis=0)
-            delta = (v - kv_mem) * jnp.asarray(beta, dtype=compute_dtype)
+            delta = (v - kv_mem) * jnp.asarray(beta_val, dtype=compute_dtype)
             s = s + k[:, None] * delta[None, :]
             out = jnp.sum(q[:, None] * s, axis=0)
 
             state_out_ref[0, vh, :, :] = s.astype(state_out_ref.dtype)
             output_ref[0, vh, :] = out.astype(output_ref.dtype)
+        else:
+            vh_start = kh * expand_ratio
+            s_all = state_ref[0, vh_start : vh_start + expand_ratio, :, :].astype(compute_dtype)
+            d_all = decay_ref[0, kh, :].astype(jnp.float32)  # [expand_ratio]
+            beta_all = beta_ref[0, kh, :].astype(jnp.float32)  # [expand_ratio]
+            v_all = value_ref[0, kh, :, :].astype(compute_dtype)  # [expand_ratio, value_dim]
+
+            s_all = s_all * jnp.exp(d_all)[:, None, None].astype(compute_dtype)
+            kv_mem_all = jnp.sum(k[None, :, None] * s_all, axis=1)
+            delta_all = (v_all - kv_mem_all) * beta_all[:, None].astype(compute_dtype)
+            s_all = s_all + k[None, :, None] * delta_all[:, None, :]
+            out_all = jnp.sum(q[None, :, None] * s_all, axis=1)
+
+            state_out_ref[0, vh_start : vh_start + expand_ratio, :, :] = s_all.astype(state_out_ref.dtype)
+            output_ref[0, vh_start : vh_start + expand_ratio, :] = out_all.astype(output_ref.dtype)
 
 
 def _fused_conv_decode_kernel(
@@ -815,6 +829,11 @@ class GatedDeltaRuleOp(OperationImpl):
         seq_len = query.shape[1]
         is_inference = seq_len == 1
         kernel_cfg = self.metadata.get_operation_config("gated_delta_rule")
+        if kernel_cfg is None and not is_inference:
+
+            adaptive_chunk = min(max(16, seq_len), 64)
+            adaptive_chunk = 1 << (adaptive_chunk.bit_length() - 1) if isinstance(adaptive_chunk, int) else 64
+            kernel_cfg = GatedDeltaRuleConfig(chunk_size=adaptive_chunk)
 
         mode = self.get_mode(query=query, BTHD=True)
         shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")

@@ -1124,7 +1124,7 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
         GLM4-MoE-Lite uses MLA, where the runtime attention head width is
         ``qk_nope_head_dim + qk_rope_head_dim`` (not ``config.head_dim``).
         """
-        from easydel.caching import MLARaggedPagesCacheConfig, RaggedPagesCacheConfig
+        from easydel.caching import RaggedPagesCacheConfig
         from easydel.layers.attention import AttentionMechanisms
 
         text_config = self.config.get_text_config()
@@ -1143,22 +1143,16 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
         attn_mechanism = getattr(text_config, "attn_mechanism", None)
         if hasattr(attn_mechanism, "value"):
             attn_mechanism = attn_mechanism.value
-        is_mla_ragged = str(attn_mechanism) == "multi_latent_ragged_page_attention_v1"
+        is_mla_ragged = str(attn_mechanism) in (
+            "multi_latent_ragged_page_attention_v1",
+            "multi_latent_ragged_page_attention_v2",
+        )
         if is_mla_ragged:
-            # Absorbed MLA: store compressed latent (kv_lora_rank) directly in
-            # cache without per-head decompression.  Query absorption happens at
-            # forward time so the kernel runs in the simpler non-head-aware path.
-            return MLARaggedPagesCacheConfig.create(
-                mesh=self.mesh,
-                partition_manager=text_config.partition_manager,
-                kvdtype=text_config.kvdtype if dtype is None else dtype,
-                max_model_length=max_length,
-                num_hidden_layers=self.config.num_hidden_layers,
-                num_kv_heads=self.config.num_attention_heads,
-                kv_lora_rank=self.config.kv_lora_rank,
-                qk_rope_head_dim=self.config.qk_rope_head_dim,
-                hbm_utilization=hbm_utilization,
+            return self._create_mla_ragged_page_cache_config(
+                max_length=max_length,
                 page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                dtype=dtype,
             )
 
         return RaggedPagesCacheConfig.create(
@@ -1174,6 +1168,39 @@ class Glm4MoeLiteForCausalLM(BaseCausalLMModule[Glm4MoeLiteModel, Glm4MoeLiteCon
             hbm_utilization=hbm_utilization,
             page_size=page_size,
             version=version,
+        )
+
+    def _create_mla_ragged_page_cache_config(
+        self,
+        max_length: int,
+        *,
+        page_size: int = 128,
+        hbm_utilization: float = 0.9,
+        dtype: jnp.dtype | None = None,
+        num_hidden_layers_override: int | None = None,
+    ):
+        """Create the MLA ragged cache using GLM4-MoE-Lite's compressed KV width."""
+        from easydel.caching import MLARaggedPagesCacheConfig
+
+        text_config = self.config.get_text_config()
+        kvdtype = text_config.kvdtype if dtype is None else dtype
+        num_hidden_layers = (
+            int(num_hidden_layers_override) if num_hidden_layers_override is not None else self.config.num_hidden_layers
+        )
+
+        # GLM4-MoE-Lite sends the absorbed MLA kernel the compressed latent
+        # ``compressed_kv`` with width ``kv_lora_rank`` plus the RoPE branch.
+        return MLARaggedPagesCacheConfig.create(
+            mesh=self.mesh,
+            partition_manager=text_config.partition_manager,
+            kvdtype=kvdtype,
+            max_model_length=max_length,
+            num_hidden_layers=num_hidden_layers,
+            num_kv_heads=self.config.num_attention_heads,
+            kv_lora_rank=self.config.kv_lora_rank,
+            qk_rope_head_dim=self.config.qk_rope_head_dim,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
         )
 
 

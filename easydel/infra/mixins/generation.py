@@ -1054,21 +1054,22 @@ class EasyGenerationMixin:
         if num_hidden_layers <= 0:
             num_hidden_layers = 1
 
-        # ejkernel MLA kernel stores decompressed k_nope (qk_nope_head_dim) in
-        # cache pages, not compressed_kv (kv_lora_rank).  Use qk_nope_head_dim
-        # as the "kv_lora_rank" parameter so that the cache page dimension
-        # matches the kernel expectation: padded(qk_nope_head_dim) + padded(qk_rope_head_dim).
-        qk_nope_head_dim = getattr(text_config, "qk_nope_head_dim", None)
-        if qk_nope_head_dim is None:
-            # Fallback: some configs only expose kv_lora_rank.
-            qk_nope_head_dim = getattr(text_config, "kv_lora_rank", None)
-            if qk_nope_head_dim is None:
-                qk_nope_head_dim = getattr(text_config, "kv_lora_dim", None)
+        # Shared MLA models cache the compressed latent ``compressed_kv`` with
+        # width ``kv_lora_rank`` (or ``kv_lora_dim``) plus the RoPE branch.
+        # Some model-specific overrides intentionally use a different layout, but
+        # the generic helper must follow the shared compressed-KV path.
+        kv_lora_rank = getattr(text_config, "kv_lora_rank", None)
+        if kv_lora_rank is None:
+            kv_lora_rank = getattr(text_config, "kv_lora_dim", None)
+        if kv_lora_rank is None:
+            # Backward-compatible fallback for configs that only expose the
+            # non-RoPE query width.
+            kv_lora_rank = getattr(text_config, "qk_nope_head_dim", None)
         qk_rope_head_dim = getattr(text_config, "qk_rope_head_dim", None)
-        if qk_nope_head_dim is None or int(qk_nope_head_dim) <= 0:
+        if kv_lora_rank is None or int(kv_lora_rank) <= 0:
             raise ValueError(
-                "MLA ragged cache requires positive `qk_nope_head_dim` "
-                "(or `kv_lora_rank` / `kv_lora_dim`) on text config."
+                "MLA ragged cache requires positive `kv_lora_rank` "
+                "(or `kv_lora_dim` / `qk_nope_head_dim`) on text config."
             )
         if qk_rope_head_dim is None or int(qk_rope_head_dim) < 0:
             raise ValueError("MLA ragged cache requires non-negative `qk_rope_head_dim` on text config.")
@@ -1086,7 +1087,7 @@ class EasyGenerationMixin:
             num_hidden_layers=int(num_hidden_layers),
             num_kv_heads=int(mla_num_heads),
             max_model_length=max_length,
-            kv_lora_rank=int(qk_nope_head_dim),
+            kv_lora_rank=int(kv_lora_rank),
             qk_rope_head_dim=int(qk_rope_head_dim),
             hbm_utilization=hbm_utilization,
             page_size=page_size,

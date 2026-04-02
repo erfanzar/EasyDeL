@@ -1362,7 +1362,10 @@ class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config
         attn_mechanism = getattr(text_config, "attn_mechanism", None)
         if hasattr(attn_mechanism, "value"):
             attn_mechanism = attn_mechanism.value
-        is_mla_ragged = str(attn_mechanism) == "multi_latent_ragged_page_attention_v1"
+        is_mla_ragged = str(attn_mechanism) in (
+            "multi_latent_ragged_page_attention_v1",
+            "multi_latent_ragged_page_attention_v2",
+        )
         if is_mla_ragged:
             return MLARaggedPagesCacheConfig.create(
                 mesh=self.mesh,
