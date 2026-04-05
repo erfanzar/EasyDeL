@@ -2451,6 +2451,9 @@ class EasyGenerationMixin:
             if num_hidden_layers is None:
                 num_hidden_layers = (max(cache_view_mapping.keys(), default=-1) + 1) if cache_view_mapping else 0
 
+            # KV-shared layers alias their donor's cache view — skip allocation.
+            kv_shared = text_config.get_kv_shared_layer_mapping()
+
             views = [None] * num_hidden_layers
 
             # Pre-scan for TurboQuant layers and batch-allocate them
@@ -2511,6 +2514,10 @@ class EasyGenerationMixin:
                 pass
 
             for idx, config_classes in zip(range(num_hidden_layers), views_config, strict=False):
+                # KV-shared layers are aliased to their donor after allocation.
+                if int(idx) in kv_shared:
+                    continue
+
                 # Use batch-allocated TurboQuant view if available
                 if idx in _tq_batch_views:
                     views[idx] = _tq_batch_views[idx]
@@ -2645,13 +2652,9 @@ class EasyGenerationMixin:
 
                 views[idx] = view
 
-            # KV sharing: shared layers reuse the donor layer's cache view
-            # instead of their own allocation.  The donor already wrote its
-            # K/V during the forward pass; the shared layer reads from it.
-            kv_shared_mapping = getattr(text_config, "get_kv_shared_layer_mapping", lambda: {})()
-            for shared_idx, donor_idx in kv_shared_mapping.items():
-                if 0 <= shared_idx < len(views) and 0 <= donor_idx < len(views) and views[donor_idx] is not None:
-                    views[shared_idx] = views[donor_idx]
+            # KV sharing: shared layers do NOT get their own cache views. They
+            # are left as None and the model loop passes the donor's cache view
+            # at runtime. This avoids duplicate JAX buffer donation errors.
 
             return HybridCache(views=views)
 
@@ -3058,7 +3061,9 @@ class EasyGenerationMixin:
                 param = valid_params[name]
                 if param.annotation != inspect.Parameter.empty:
                     try:
-                        if getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None:  # pyright: ignore[reportDeprecated]
+                        if (
+                            getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None
+                        ):  # pyright: ignore[reportDeprecated]
                             expected_type = param.annotation.__args__[0]
                             if not isinstance(value, expected_type):
                                 print(

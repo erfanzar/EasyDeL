@@ -2831,6 +2831,18 @@ class EasyDeLBaseConfig(PretrainedConfig):
             fcm_mask = None
         return fcm_mask
 
+    def get_kv_shared_layer_mapping(self) -> dict[int, int]:
+        """Return a mapping from KV-shared layer indices to their donor indices.
+
+        Layers beyond the ``num_kv_shared_layers`` threshold reuse K/V from
+        the last non-shared layer of the same attention type (sliding or full).
+
+        Returns:
+            Dict mapping ``shared_layer_idx -> donor_layer_idx``.  Empty when
+            ``num_kv_shared_layers`` is 0 or ``layer_types`` is not set.
+        """
+        return {}
+
     @staticmethod
     def _fix_parent_kws(kw1, kw2):
         """Merge two keyword argument dictionaries, with kw1 taking precedence.

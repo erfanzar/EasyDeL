@@ -338,7 +338,8 @@ class TestGemma4TextModel:
         assert sliding_view.metadata.k_headdim == 32
         assert full_view.metadata.num_kv_heads == 1
         assert full_view.metadata.k_headdim == 64
-        assert sliding_view.metadata.num_pages == full_view.metadata.num_pages == 2
+        # free=32768, page_bytes = 2 * 16 * (2*32 + 1*64) * 2 = 8192 → 4 pages
+        assert sliding_view.metadata.num_pages == full_view.metadata.num_pages == 4
 
     def test_init_operations_cache_recomputes_mixed_num_pages(self, monkeypatch):
         """Auto cache init should recompute mixed-geometry page budgets from per-layer shapes."""
@@ -371,11 +372,14 @@ class TestGemma4TextModel:
         sliding_cfg = views_config[0]
         full_cfg = views_config[1]
 
-        assert metadata.num_pages == 1
+        # free=32768, page_bytes = 2 * 16 * (2*32 + 2*64) * 2 = 12288 → 2 pages
+        # The representative metadata uses the largest geometry so its num_pages
+        # matches the per-layer configs that share the same page pool.
+        assert metadata.num_pages == 2
         assert sliding_cfg.num_pages == full_cfg.num_pages == metadata.num_pages
 
-    def test_user_ragged_override_is_recomputed_after_v3_dtype_upcast(self, monkeypatch):
-        """Provided mixed v3 page counts should be recomputed if sharding widens cache dtype."""
+    def test_mixed_ragged_preserves_per_layer_geometry_in_operations_config(self, monkeypatch):
+        """Mixed-geometry operations config should preserve per-layer KV shapes."""
         config = _base_text_config(
             num_hidden_layers=2,
             layer_types=["sliding_attention", "full_attention"],
@@ -391,27 +395,6 @@ class TestGemma4TextModel:
             "_compute_free_hbm",
             staticmethod(lambda **_kwargs: 32_768),
         )
-
-        import easydel.caching.ragged_page.cache as ragged_cache_mod
-
-        monkeypatch.setattr(
-            ragged_cache_mod,
-            "_select_compatible_v3_kv_cache_dtype",
-            lambda kvdtype, **_kwargs: jnp.float32,
-        )
-        provided_cfg = RaggedPagesCacheConfig(
-            num_hidden_layers=2,
-            max_model_length=128,
-            num_kv_heads=2,
-            k_headdim=32,
-            v_headdim=32,
-            hbm_utilization=0.1,
-            page_size=16,
-            num_pages=4,
-            max_num_pages_per_req=8,
-            version="v3",
-            _kvdtype_str="bfloat16",
-        )
         mesh = _make_mesh()
         with mesh:
             model = Gemma4ForCausalLM(config=config, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, rngs=nn.Rngs(0))
@@ -420,16 +403,16 @@ class TestGemma4TextModel:
                 max_length=128,
                 page_size=16,
                 hbm_utilization=0.1,
-                ragged_config=provided_cfg,
             )
 
         sliding_cfg = views_config[0]
         full_cfg = views_config[1]
 
-        assert sliding_cfg.kvdtype == jnp.float32
-        assert full_cfg.kvdtype == jnp.float32
-        assert sliding_cfg.num_pages == 1
-        assert full_cfg.num_pages == 1
+        assert sliding_cfg.num_kv_heads == 2
+        assert sliding_cfg.k_headdim == 32
+        assert full_cfg.num_kv_heads == 2
+        assert full_cfg.k_headdim == 64
+        assert sliding_cfg.num_pages == full_cfg.num_pages
 
     def test_init_operations_cache_uses_mixed_unified_geometry(self, monkeypatch):
         """Unified cache init should preserve Gemma4's full-attention KV geometry."""

@@ -322,21 +322,18 @@ class Gemma4TextConfig(EasyDeLBaseConfig):
     def get_mask_details(self) -> dict[int, AttnMaskDetail]:
         """Return per-layer attention mask metadata for eSurge and cache setup.
 
-        Maps each **non-KV-shared** layer index to an ``AttnMaskDetail``
-        specifying whether the layer uses sliding-window or full causal
-        attention, along with the window size.  KV-shared layers are excluded
-        because they reuse their donor's cache view and do not need their own
-        page allocation.
+        Maps each layer index to an ``AttnMaskDetail`` specifying whether the
+        layer uses sliding-window or full causal attention, along with the
+        window size.  This information is consumed by the inference engine to
+        construct the correct KV cache layout (``SlidingWindowSpec`` vs
+        ``FullAttentionSpec``) and attention masks.
 
         Returns:
             Dictionary mapping layer indices to their ``AttnMaskDetail``.
         """
-        shared = self.get_kv_shared_layer_mapping()
         mapping = {}
         if self.layer_types is not None:
             for layer_idx in range(self.num_hidden_layers):
-                if layer_idx in shared:
-                    continue
                 mapping[layer_idx] = AttnMaskDetail(
                     mask_type=AttnMaskType.from_hf(self.layer_types[layer_idx]),
                     size=self.sliding_window,

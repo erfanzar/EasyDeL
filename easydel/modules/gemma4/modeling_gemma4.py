@@ -2510,7 +2510,10 @@ class Gemma4TextModel(EasyDeLBaseModule):
 
         # KV sharing: shared layers reuse K/V from the last non-shared layer
         # of the same attention type instead of computing their own projections.
+        # For cached inference, shared layers also use the donor's cache view
+        # (their own views[idx] is None to avoid duplicate buffer donation).
         shared_kv: dict[int, tuple[Array, Array]] = {}
+        donor_cache_views: dict[int, typing.Any] = {}
 
         for idx, block in enumerate(self.layers):
             if output_hidden_states:
@@ -2524,12 +2527,17 @@ class Gemma4TextModel(EasyDeLBaseModule):
             attn = block.self_attn
             shared_key_value = shared_kv.get(attn.kv_shared_layer_index) if attn.is_kv_shared_layer else None
 
+            # Shared layers use the donor's cache view; their own slot is None.
+            cache_view = past_key_values.views[idx]
+            if cache_view is None and attn.is_kv_shared_layer:
+                cache_view = donor_cache_views.get(attn.kv_shared_layer_index)
+
             layer_outputs = block(
                 hidden_states=hidden_states,
                 mask_info=layer_mask_info,
                 position_ids=position_ids,
                 mode=mode,
-                cache_view=past_key_values.views[idx],
+                cache_view=cache_view,
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
                 frequencies=self.global_frequencies,
@@ -2544,10 +2552,13 @@ class Gemma4TextModel(EasyDeLBaseModule):
             if captured is not None and not attn.is_kv_shared_layer:
                 shared_kv[idx] = captured
                 object.__setattr__(attn, "_captured_kv", None)
+                # Track the donor's (potentially updated) cache view.
+                donor_cache_views[idx] = layer_outputs.cache_view
 
             if output_attentions:
                 all_attentions += (layer_outputs.attention_weight,)
-            past_key_values[idx] = layer_outputs.cache_view
+            if not attn.is_kv_shared_layer:
+                past_key_values[idx] = layer_outputs.cache_view
 
         hidden_states = self.norm(hidden_states)
         hidden_states = checkpoint_name(hidden_states, "model_output")
