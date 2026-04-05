@@ -93,6 +93,8 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, ToolParserName] = {
     "step3.5": "step3p5",
     "step3": "step3",
     "step": "step3",
+    "gemma4_text": "gemma4",
+    "gemma4": "gemma4",
     "gemma3": "hermes",
     "gemma2": "functiongemma",
     "gemma": "functiongemma",
@@ -128,6 +130,7 @@ _TEMPLATE_HINTS: list[tuple[str, ToolParserName]] = [
     ("<steptml:invoke", "step3"),
     ("functools[", "phi4_mini_json"),
     ("<tool_calls>", "hunyuan_a13b"),
+    ("<|tool_call>call:", "gemma4"),
     ("<arg_key>", "glm45"),
     ("<tool_call>", "hermes"),
 ]

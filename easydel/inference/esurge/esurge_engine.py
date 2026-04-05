@@ -1005,31 +1005,6 @@ class eSurge(
         if self._multimodal_manager is not None and self._multimodal_manager.model is None:
             self._multimodal_manager.model = model
 
-        # Profiling state
-        self._profiling_active = False
-        self._profiling_steps_remaining = 0
-        self._profiling_output_dir: str | None = None
-        self._profiling_host_level: int | None = None
-        self._profiling_python_level: int | None = None
-        self._possible_name = self._get_model_name(model)
-
-        self.runner = eSurgeRunner(
-            model=model.esurge_compatible_model,
-            hbm_utilization=hbm_utilization,
-            page_size=page_size,
-            max_model_len=max_model_len,
-            min_input_pad=min_input_pad,
-            max_num_seqs=max_num_seqs,
-            max_num_seq_buckets=max_num_seq_buckets,
-            async_scheduling=async_scheduling,
-            min_token_pad=min_token_pad,
-            use_aot_forward=use_aot_forward,
-            bind_graphstate_for_aot=bind_graphstate_for_aot,
-            verbose=runner_verbose,
-            enable_overlap_execution=overlap_execution,
-            enable_sampler_metrics=sampler_metrics,
-        )
-        self._overlap_execution = overlap_execution
         if max_num_batched_tokens is NOT_GIVEN and jax.default_backend() == "gpu":
             max_num_batched_tokens = min(max(2048, max_num_seqs), max_model_len)
             logger.info(
@@ -1046,6 +1021,33 @@ class eSurge(
             )
         elif max_num_batched_tokens is NOT_GIVEN:
             max_num_batched_tokens = None
+
+        # Profiling state
+        self._profiling_active = False
+        self._profiling_steps_remaining = 0
+        self._profiling_output_dir: str | None = None
+        self._profiling_host_level: int | None = None
+        self._profiling_python_level: int | None = None
+        self._possible_name = self._get_model_name(model)
+
+        self.runner = eSurgeRunner(
+            model=model.esurge_compatible_model,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+            min_input_pad=min_input_pad,
+            max_num_seqs=max_num_seqs,
+            max_num_seq_buckets=max_num_seq_buckets,
+            async_scheduling=async_scheduling,
+            min_token_pad=min_token_pad,
+            use_aot_forward=use_aot_forward,
+            bind_graphstate_for_aot=bind_graphstate_for_aot,
+            verbose=runner_verbose,
+            enable_overlap_execution=overlap_execution,
+            enable_sampler_metrics=sampler_metrics,
+        )
+        self._overlap_execution = overlap_execution
 
         if compile_runner:
             # Limit compilation to the scheduler's per-step token budget when provided.

@@ -530,7 +530,9 @@ class FlexibleAttentionModule(nn.Module):
         # untouched to preserve original dtypes (e.g. uint8 for TurboQuant pages).
         result = AttentionOutput(
             attention_outputs=jtu.tree_map(cast_to_dtype, output.attention_outputs),
-            attention_weights=jtu.tree_map(cast_to_dtype, output.attention_weights) if output.attention_weights is not None else None,
+            attention_weights=jtu.tree_map(cast_to_dtype, output.attention_weights)
+            if output.attention_weights is not None
+            else None,
             cache_view=output.cache_view,
         )
         return result

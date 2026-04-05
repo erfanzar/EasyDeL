@@ -148,6 +148,7 @@ class TestQwen3_5Moe:
             "image_grid_thw": image_grid_thw,
             "num_images": num_images_per_batch,
             "is_qwen_vl": True,
+            "use_mm_token_type_ids": True,
         }
 
     def test_causal_lm(self, qwen3_5_moe_text_config, small_model_config, hf_qwen3_5_moe_causal_class):

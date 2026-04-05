@@ -12,10 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
+import jax.numpy as jnp
 import numpy as np
 
+from easydel.caching import RaggedPagesCacheConfig
+from easydel.inference.esurge.core.interface import (
+    CacheGroupSpec,
+    FullAttentionSpec,
+    SlidingWindowSpec,
+    estimate_runtime_page_budget,
+)
 from easydel.inference.esurge.runners.execution_manager import ExecutionManager
 from easydel.inference.esurge.runners.model_runner import eSurgeRunner
+from easydel.modules.gemma4 import Gemma4TextConfig
+from easydel.modules.openelm import OpenELMConfig
 
 
 class _DummySequenceBuffer:
@@ -28,6 +40,9 @@ class _DummySequenceBuffer:
         self.top_p = np.linspace(0.7, 1.2, 6, dtype=np.float32)
         self.top_k = np.arange(10, 16, dtype=np.int32)
         self.min_p = np.linspace(0.01, 0.06, 6, dtype=np.float32)
+        self.frequency_penalties = np.linspace(0.0, 0.5, 6, dtype=np.float32)
+        self.presence_penalties = np.linspace(0.6, 1.1, 6, dtype=np.float32)
+        self.repetition_penalties = np.linspace(1.2, 1.7, 6, dtype=np.float32)
 
 
 class _DummyWindowSequenceBuffer:
@@ -62,6 +77,9 @@ def test_window_state_views_rebase_nonzero_window_and_bypass_page_cache():
     runner._window_top_p_cpu = np.full((8,), -1.0, dtype=np.float32)
     runner._window_top_k_cpu = np.full((8,), -1, dtype=np.int32)
     runner._window_min_p_cpu = np.full((8,), -1.0, dtype=np.float32)
+    runner._window_frequency_penalties_cpu = np.full((8,), -1.0, dtype=np.float32)
+    runner._window_presence_penalties_cpu = np.full((8,), -1.0, dtype=np.float32)
+    runner._window_repetition_penalties_cpu = np.full((8,), -1.0, dtype=np.float32)
 
     page_table_cpu = np.arange(18, dtype=np.int32).reshape(6, 3)
 
@@ -107,6 +125,9 @@ def test_window_state_views_keep_page_cache_for_first_window():
     runner._window_top_p_cpu = np.zeros((8,), dtype=np.float32)
     runner._window_top_k_cpu = np.zeros((8,), dtype=np.int32)
     runner._window_min_p_cpu = np.zeros((8,), dtype=np.float32)
+    runner._window_frequency_penalties_cpu = np.zeros((8,), dtype=np.float32)
+    runner._window_presence_penalties_cpu = np.zeros((8,), dtype=np.float32)
+    runner._window_repetition_penalties_cpu = np.zeros((8,), dtype=np.float32)
 
     page_table_cpu = np.arange(18, dtype=np.int32).reshape(6, 3)
 
@@ -128,6 +149,118 @@ def test_request_buckets_are_clamped_to_runtime_cap():
     # Even if user buckets never include the cap, the live cap itself must remain reachable.
     buckets = eSurgeRunner._clamp_request_buckets_to_runtime_cap([256, 512], 128)
     assert buckets == [128]
+
+
+def test_window_aware_runtime_estimate_counts_hybrid_group_pages():
+    """Hybrid full+sliding models should derive runtime caps from live page demand."""
+    groups = [
+        CacheGroupSpec(
+            kv_cache_spec=SlidingWindowSpec(
+                page_size=16,
+                num_kv_heads=2,
+                head_size=32,
+                dtype=jnp.bfloat16,
+                use_mla=False,
+                sliding_window=64,
+            ),
+            layer_names=["layer.0"],
+        ),
+        CacheGroupSpec(
+            kv_cache_spec=FullAttentionSpec(
+                page_size=16,
+                num_kv_heads=1,
+                head_size=64,
+                dtype=jnp.bfloat16,
+                use_mla=False,
+            ),
+            layer_names=["layer.5"],
+        ),
+    ]
+
+    estimate = estimate_runtime_page_budget(
+        num_pages=57,
+        kv_cache_groups=groups,
+        max_model_len=128,
+        max_num_batched_tokens=16,
+    )
+
+    assert estimate.per_group_pages == (6, 8)
+    assert estimate.pages_per_request == 14
+    assert estimate.max_num_seqs == 4
+
+
+def test_ragged_metadata_prefers_window_aware_runtime_cap():
+    """Runtime overrides should transparently replace heuristic request caps."""
+    metadata = RaggedPagesCacheConfig(
+        num_hidden_layers=1,
+        max_model_length=128,
+        num_kv_heads=1,
+        k_headdim=16,
+        v_headdim=16,
+        num_pages=32,
+        max_num_pages_per_req=8,
+    )
+    assert metadata.get_max_num_seqs() > 0
+
+    metadata.window_aware_max_num_seqs = 7
+    assert metadata.get_max_num_seqs() == 7
+
+
+def test_runner_builds_cache_groups_from_text_geometry_not_representative_metadata():
+    """Sliding groups should keep their text-config head size even when metadata is wider."""
+    config = Gemma4TextConfig(
+        vocab_size=1024,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        global_head_dim=64,
+        layer_types=["sliding_attention", "full_attention"],
+    )
+    runner = eSurgeRunner.__new__(eSurgeRunner)
+    runner.model = SimpleNamespace(config=config)
+    runner.metadata = SimpleNamespace(
+        page_size=16,
+        num_kv_heads=2,
+        k_headdim=64,
+        kvdtype=jnp.bfloat16,
+    )
+
+    groups = runner._build_kv_cache_groups()
+
+    sliding_spec = next(group.kv_cache_spec for group in groups if isinstance(group.kv_cache_spec, SlidingWindowSpec))
+    full_spec = next(group.kv_cache_spec for group in groups if isinstance(group.kv_cache_spec, FullAttentionSpec))
+
+    assert sliding_spec.head_size == 32
+    assert full_spec.head_size == 64
+
+
+def test_runner_builds_cache_groups_from_openelm_per_layer_kv_heads():
+    """OpenELM cache-group specs should preserve layer-wise KV-head counts."""
+    config = OpenELMConfig(
+        vocab_size=1024,
+        max_context_length=128,
+        num_transformer_layers=3,
+        model_dim=128,
+        head_dim=16,
+        qkv_multipliers=[1.0, 2.0],
+        num_gqa_groups=2,
+    )
+    runner = eSurgeRunner.__new__(eSurgeRunner)
+    runner.model = SimpleNamespace(config=config)
+    runner.metadata = SimpleNamespace(
+        page_size=16,
+        num_kv_heads=1,
+        k_headdim=16,
+        kvdtype=jnp.bfloat16,
+    )
+
+    groups = runner._build_kv_cache_groups()
+    group_kv_heads = sorted(group.kv_cache_spec.num_kv_heads for group in groups)
+
+    assert group_kv_heads == [4, 6, 8]
 
 
 def test_compile_pairs_skip_impossible_token_request_combinations():
@@ -324,6 +457,9 @@ def test_window_state_views_disable_page_cache_for_packed_rows():
     runner._window_top_p_cpu = np.full((8,), -1.0, dtype=np.float32)
     runner._window_top_k_cpu = np.full((8,), -1, dtype=np.int32)
     runner._window_min_p_cpu = np.full((8,), -1.0, dtype=np.float32)
+    runner._window_frequency_penalties_cpu = np.full((8,), -1.0, dtype=np.float32)
+    runner._window_presence_penalties_cpu = np.full((8,), -1.0, dtype=np.float32)
+    runner._window_repetition_penalties_cpu = np.full((8,), -1.0, dtype=np.float32)
 
     page_table_cpu = np.arange(18, dtype=np.int32).reshape(6, 3)
 

@@ -95,6 +95,7 @@ ToolParserName: TypeAlias = Literal[
     "hermes",
     "qwen3_coder",
     "functiongemma",
+    "gemma4",
     "llama4_pythonic",
     "mistral",
 ]

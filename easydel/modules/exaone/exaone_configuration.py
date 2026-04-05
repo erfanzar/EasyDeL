@@ -143,6 +143,14 @@ class ExaoneConfig(EasyDeLBaseConfig):
           bits (Optional[int], optional): Quantization bits. Defaults to None.
           **kwargs: Additional keyword arguments.
         """
+        # Tests and HF configs commonly pass ``num_hidden_layers`` via the
+        # standard Transformers name. Resolve it before deriving any per-layer
+        # defaults such as ``layer_types`` so the config stays internally
+        # consistent under strict validators.
+        num_hidden_layers = kwargs.pop("num_hidden_layers", None)
+        if num_hidden_layers is not None:
+            num_layers = num_hidden_layers
+
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size

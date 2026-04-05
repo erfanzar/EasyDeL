@@ -853,6 +853,8 @@ class BaseMoeModule(nn.Module, ABC):
         wu_bias: jax.Array | None = None,  # [E, H]
         wd_bias: jax.Array | None = None,  # [E, M]
         ffn_activation: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
+        gate_hidden_state: jax.Array | None = None,  # [B, S, H]
+        hooks: MoeFusedHooks | None = None,
         *,
         act_fn: Callable[[jax.Array], jax.Array],
     ):
@@ -930,20 +932,20 @@ class BaseMoeModule(nn.Module, ABC):
             >>> # logits.shape = (1024, 8)  # batch*seq, n_experts
         """
 
-        select_hook = self.moe_hooks.select_hook if self.moe_hooks else None
-        refine_weights_hook = self.moe_hooks.refine_weights_hook if self.moe_hooks else None
-        refine_inputs_hook = self.moe_hooks.refine_inputs_hook if self.moe_hooks else None
-        scale_replicated_inputs = self.moe_hooks.scale_replicated_inputs if self.moe_hooks else None
-        output_weights_hook = self.moe_hooks.output_weights_hook if self.moe_hooks else None
-
-        hooks = self.moe_hooks
+        hooks = self.moe_hooks if hooks is None else hooks
+        select_hook = hooks.select_hook if hooks else None
+        refine_weights_hook = hooks.refine_weights_hook if hooks else None
+        refine_inputs_hook = hooks.refine_inputs_hook if hooks else None
+        scale_replicated_inputs = hooks.scale_replicated_inputs if hooks else None
+        output_weights_hook = hooks.output_weights_hook if hooks else None
         _BS, _SQLN, HD = hidden_state.shape
 
         hidden_state = hidden_state.astype(self.dtype)
+        gate_hidden_state = hidden_state if gate_hidden_state is None else gate_hidden_state.astype(self.dtype)
         if hooks is not None and hooks.before_gate is not None:
-            hidden_state = hooks.before_gate(hidden_state)
+            gate_hidden_state = hooks.before_gate(gate_hidden_state)
 
-        prein_gate_logits = gate_layer(hidden_state.reshape(-1, HD))
+        prein_gate_logits = gate_layer(gate_hidden_state.reshape(-1, HD))
         if hooks is not None and hooks.after_gate is not None:
             prein_gate_logits = hooks.after_gate(prein_gate_logits)
 
@@ -1234,6 +1236,8 @@ class BaseMoeModule(nn.Module, ABC):
         wd_bias: jax.Array | None = None,  # [E, M]
         ffn_activation: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
         reform_router_probs_fn: typing.Callable[[jax.Array], jax.Array] | None = None,
+        hooks: MoeFusedHooks | None = None,
+        gate_hidden_state: jax.Array | None = None,
         *,
         act_fn: Callable[[jax.Array], jax.Array],
         output_metrics: bool = False,
@@ -1300,6 +1304,7 @@ class BaseMoeModule(nn.Module, ABC):
                 case MoEMethods.FUSED_MOE:
                     return self._sparse_moe_call(
                         hidden_state=hidden_state,
+                        gate_hidden_state=gate_hidden_state,
                         gate_layer=gate_layer,
                         wi_kernel=wi_kernel,
                         wu_kernel=wu_kernel,
@@ -1309,6 +1314,7 @@ class BaseMoeModule(nn.Module, ABC):
                         wd_bias=wd_bias,
                         act_fn=act_fn,
                         ffn_activation=ffn_activation,
+                        hooks=hooks,
                     )
                 case MoEMethods.DENSE_MOE:
                     logger.warn_once(
@@ -1316,6 +1322,7 @@ class BaseMoeModule(nn.Module, ABC):
                     )
                     return self._moe_call_dense(
                         hidden_state=hidden_state,
+                        gate_hidden_state=gate_hidden_state,
                         gate_layer=gate_layer,
                         wi_kernel=wi_kernel,
                         wu_kernel=wu_kernel,
@@ -1325,6 +1332,7 @@ class BaseMoeModule(nn.Module, ABC):
                         wd_bias=wd_bias,
                         act_fn=act_fn,
                         ffn_activation=ffn_activation,
+                        hooks=hooks,
                     )
                 case _:
                     raise NotImplementedError()
@@ -1340,6 +1348,8 @@ class BaseMoeModule(nn.Module, ABC):
         wu_bias: jax.Array | None = None,  # [E, M]
         wd_bias: jax.Array | None = None,  # [E, H]
         ffn_activation: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
+        gate_hidden_state: jax.Array | None = None,  # [B, S, H]
+        hooks: MoeFusedHooks | None = None,
         *,
         act_fn: Callable[[jax.Array], jax.Array],
         capacity_factor: float | None = None,
@@ -1404,17 +1414,19 @@ class BaseMoeModule(nn.Module, ABC):
             and as a fallback when grouped matmul kernels are unavailable.
         """
         self._configure_hooks_for_routing_strategy()
-        hooks = self.moe_hooks
+        hooks = self.moe_hooks if hooks is None else hooks
 
         hidden_state = hidden_state.astype(self.dtype)
+        gate_hidden_state = hidden_state if gate_hidden_state is None else gate_hidden_state.astype(self.dtype)
         if hooks.before_gate is not None:
-            hidden_state = hooks.before_gate(hidden_state)
+            gate_hidden_state = hooks.before_gate(gate_hidden_state)
 
         batch_size, seq_len, hidden_dim = hidden_state.shape
         tokens = batch_size * seq_len
         hidden_flat = hidden_state.reshape(tokens, hidden_dim)
+        gate_hidden_flat = gate_hidden_state.reshape(tokens, hidden_dim)
 
-        prein_gate_logits = gate_layer(hidden_flat)
+        prein_gate_logits = gate_layer(gate_hidden_flat)
         gate_logits = prein_gate_logits
         if hooks.after_gate is not None:
             gate_logits = hooks.after_gate(gate_logits)

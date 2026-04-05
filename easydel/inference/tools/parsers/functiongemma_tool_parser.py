@@ -79,6 +79,10 @@ class FunctionGemmaToolParser(ToolParser):
         buffered_delta_text: Buffer for handling partial tokens.
     """
 
+    tool_call_start_token: str = "<start_function_call>"
+    tool_call_end_token: str = "<end_function_call>"
+    escape_tokens: tuple[str, ...] = ("<escape>", '<|"|>')
+
     def __init__(self, tokenizer: AnyTokenizer):
         """Initialize the FunctionGemma tool parser.
 
@@ -95,14 +99,12 @@ class FunctionGemmaToolParser(ToolParser):
         self.current_tool_id: int = -1
         self.streamed_args_for_tool: list[str] = []
 
-        self.tool_call_start_token: str = "<start_function_call>"
-        self.tool_call_end_token: str = "<end_function_call>"
-
+        start_token = re.escape(self.tool_call_start_token)
+        end_token = re.escape(self.tool_call_end_token)
         self.tool_call_regex = re.compile(
-            r"<start_function_call>call:(\w+)\{(.*?)\}<end_function_call>|<start_function_call>call:(\w+)\{(.*)",
+            rf"{start_token}call:(\w+)\{{(.*?)\}}{end_token}|{start_token}call:(\w+)\{{(.*)",
             re.DOTALL,
         )
-        self.arg_regex = re.compile(r"(\w+):<escape>(.*?)<escape>", re.DOTALL)
 
         if self.model_tokenizer:
             self.tool_call_start_token_ids = self.model_tokenizer.encode(
@@ -118,6 +120,104 @@ class FunctionGemmaToolParser(ToolParser):
             self.tool_call_end_token_ids = []
 
         self.buffered_delta_text = ""
+
+    def _scan_escape_token(self, text: str, index: int) -> tuple[int, bool]:
+        """Advance across a configured escape token if present at *index*."""
+
+        for token in self.escape_tokens:
+            if text.startswith(token, index):
+                return len(token), True
+        return 0, False
+
+    def _split_top_level(self, text: str, separator: str) -> list[str]:
+        """Split *text* on *separator* while respecting nested JSON-like syntax."""
+
+        segments: list[str] = []
+        depth_brace = 0
+        depth_bracket = 0
+        in_escaped_string = False
+        start = 0
+        index = 0
+
+        while index < len(text):
+            advance, is_escape = self._scan_escape_token(text, index)
+            if is_escape:
+                in_escaped_string = not in_escaped_string
+                index += advance
+                continue
+
+            char = text[index]
+            if not in_escaped_string:
+                if char == "{":
+                    depth_brace += 1
+                elif char == "}":
+                    depth_brace = max(0, depth_brace - 1)
+                elif char == "[":
+                    depth_bracket += 1
+                elif char == "]":
+                    depth_bracket = max(0, depth_bracket - 1)
+                elif char == separator and depth_brace == 0 and depth_bracket == 0:
+                    segments.append(text[start:index])
+                    start = index + 1
+            index += 1
+
+        segments.append(text[start:])
+        return segments
+
+    def _split_key_value(self, text: str) -> tuple[str, str] | None:
+        """Split a single top-level ``key:value`` segment."""
+
+        depth_brace = 0
+        depth_bracket = 0
+        in_escaped_string = False
+        index = 0
+
+        while index < len(text):
+            advance, is_escape = self._scan_escape_token(text, index)
+            if is_escape:
+                in_escaped_string = not in_escaped_string
+                index += advance
+                continue
+
+            char = text[index]
+            if not in_escaped_string:
+                if char == "{":
+                    depth_brace += 1
+                elif char == "}":
+                    depth_brace = max(0, depth_brace - 1)
+                elif char == "[":
+                    depth_bracket += 1
+                elif char == "]":
+                    depth_bracket = max(0, depth_bracket - 1)
+                elif char == ":" and depth_brace == 0 and depth_bracket == 0:
+                    return text[:index], text[index + 1 :]
+            index += 1
+
+        return None
+
+    def _normalize_argument_value(self, value: str) -> object:
+        """Convert Gemma/FunctionGemma escaped argument syntax into Python values."""
+
+        normalized = value.strip()
+        if not normalized:
+            return ""
+
+        if "<escape>" in normalized and '<|"|>' not in normalized:
+            stripped = normalized
+            if stripped.startswith("<escape>") and stripped.endswith("<escape>") and len(stripped) >= 16:
+                stripped = stripped[len("<escape>") : -len("<escape>")]
+            try:
+                return json.loads(stripped)
+            except json.JSONDecodeError:
+                return stripped
+
+        normalized = normalized.replace('<|"|>', '"')
+        normalized = normalized.replace("<escape>", "")
+
+        try:
+            return json.loads(normalized)
+        except json.JSONDecodeError:
+            return normalized
 
     def _parse_arguments(self, args_str: str) -> dict:
         """Parse the argument string into a dictionary.
@@ -136,12 +236,18 @@ class FunctionGemmaToolParser(ToolParser):
         if not args_str:
             return arguments
 
-        matches = self.arg_regex.findall(args_str)
-        for key, value in matches:
-            try:
-                arguments[key] = json.loads(value)
-            except json.JSONDecodeError:
-                arguments[key] = value
+        for segment in self._split_top_level(args_str, ","):
+            segment = segment.strip()
+            if not segment:
+                continue
+            key_value = self._split_key_value(segment)
+            if key_value is None:
+                continue
+            key, value = key_value
+            key = key.strip()
+            if not key:
+                continue
+            arguments[key] = self._normalize_argument_value(value)
         return arguments
 
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:

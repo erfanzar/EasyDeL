@@ -297,14 +297,16 @@ class Scheduler(SchedulerInterface):
         if max_num_batched_tokens is None:
             max_num_batched_tokens = runner.max_model_len
 
-        kv_cache_groups = create_kv_cache_specs_from_config(
-            config=model_config,
-            page_size=metadata.page_size,
-            num_kv_heads=metadata.num_kv_heads,
-            head_size=getattr(metadata, "k_headdim", None) or getattr(metadata, "head_dim", None),
-            dtype=metadata.kvdtype,
-            use_mla=False,
-        )
+        kv_cache_groups = getattr(runner, "kv_cache_groups", None)
+        if not kv_cache_groups:
+            kv_cache_groups = create_kv_cache_specs_from_config(
+                config=model_config,
+                page_size=metadata.page_size,
+                num_kv_heads=metadata.num_kv_heads,
+                head_size=getattr(metadata, "k_headdim", None) or getattr(metadata, "head_dim", None),
+                dtype=metadata.kvdtype,
+                use_mla=False,
+            )
 
         scheduler = Scheduler(
             config=Config(

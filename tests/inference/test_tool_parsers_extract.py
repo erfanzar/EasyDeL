@@ -96,6 +96,7 @@ def test_tool_parser_manager_includes_new_parsers():
         "deepseek_v32",
         "ernie45",
         "functiongemma",
+        "gemma4",
         "gigachat3",
         "glm47",
         "glm-4.7",

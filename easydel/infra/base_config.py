@@ -568,6 +568,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         "is_decoder": False,
         "tie_word_embeddings": True,
         "cross_attention_hidden_size": None,
+        "_output_attentions": False,
+        "_attn_implementation_internal": None,
+        "_experts_implementation_internal": None,
     }
 
     _rope_relevant_keys: tp.ClassVar[set[str]] = {
@@ -598,6 +601,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
             return None
 
         cls.get_partition_rules = _return_none_partition_rules
+        # PreTrainedConfig provides value-based equality, which causes Python to
+        # set ``__hash__ = None`` on subclasses unless we restore it explicitly.
+        # EasyDeL passes configs through static JIT paths, so config subclasses
+        # must remain hashable for graph definitions to compile.
+        if cls.__dict__.get("__hash__") is None:
+            cls.__hash__ = hash_fn
 
     @staticmethod
     def _normalize_rope_parameters_dict(

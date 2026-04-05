@@ -63,6 +63,10 @@ class TestFalconMamba:
         )
         assert result.success, f"FalconMamba generation failed: {result.error_message}"
 
+    def test_mask_details_are_disabled_for_recurrent_layers(self, falcon_mamba_config):
+        """Recurrent layers should bypass attention-mask detail conversion."""
+        assert falcon_mamba_config.get_mask_details() is None
+
     def test_left_padding_invariance(self, falcon_mamba_config, small_model_config):
         """FalconMamba generation should be invariant to left padding when masked."""
         from transformers import GenerationConfig

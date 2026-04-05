@@ -92,6 +92,7 @@ class TestGlm46V:
             "pixel_values_shape": (total_patches, patch_features),
             "image_grid_thw": image_grid_thw,
             "num_images": num_images_per_batch,
+            "use_mm_token_type_ids": True,
         }
 
     def test_vision_language(self, glm46v_config, small_model_config, vlm_config, hf_glm46v_class):

@@ -72,6 +72,33 @@ def test_ragged_page_budget_scales_with_mesh_dp_axis(monkeypatch):
     assert cfg_dp2.num_pages == cfg_no_dp.num_pages * 2
 
 
+def test_ragged_page_budget_replicates_kv_cache_when_tp_head_sharding_is_incompatible(monkeypatch):
+    monkeypatch.setattr(
+        ragged_cache_mod,
+        "per_device_hbm_budget_bytes",
+        lambda *_args, **_kwargs: 1 << 20,
+    )
+
+    pm = _partition_manager()
+    cfg = ragged_cache_mod.RaggedPagesCacheConfig.create(
+        mesh=_FakeMesh({"dp": 1, "tp": 4}),
+        partition_manager=pm,
+        kvdtype=jnp.bfloat16,
+        num_hidden_layers=1,
+        num_kv_heads=1,
+        max_model_length=32,
+        kv_head_dim_size=256,
+        hbm_utilization=0.9,
+        page_size=1,
+        version="v3",
+    )
+
+    _shape, axes = cfg.get_shape_and_axes()
+
+    assert cfg.kv_head_shards == 1
+    assert axes[2] == ragged_cache_mod.common_types.EMPTY
+
+
 def test_unified_page_budget_scales_with_mesh_dp_axis(monkeypatch):
     monkeypatch.setattr(
         unified_cache_mod,

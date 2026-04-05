@@ -78,11 +78,6 @@ from .types import DTypeLike, PrecisionLike, eLMConfig  # pyright: ignore[report
 logger = get_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------------------------
-
-
 def prune_nones(obj: Any) -> Any:
     """Recursively remove None values from nested data structures.
 
@@ -688,11 +683,6 @@ def write_text_atomic(path: str | os.PathLike | ePathLike, data: str, *, encodin
         raise
 
 
-# ---------------------------------------------------------------------------
-# Normalizer functions
-# ---------------------------------------------------------------------------
-
-
 def resolve_task(cfg: eLMConfig) -> TaskType:
     """Resolve the task type from an ELM configuration.
 
@@ -980,11 +970,6 @@ def validate(cfg_like: eLMConfig | Mapping[str, Any]) -> None:
         raise ValueError(f"sharding.axis_dims ({len(dims)}) must match sharding.axis_names ({len(names)})")
     if any((d == 0 or d < -1) for d in dims):
         raise ValueError("sharding.axis_dims must be positive or -1 (auto)")
-
-
-# ---------------------------------------------------------------------------
-# I/O functions
-# ---------------------------------------------------------------------------
 
 
 def save_elm_config(

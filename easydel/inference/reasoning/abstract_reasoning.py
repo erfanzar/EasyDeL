@@ -56,6 +56,7 @@ ReasoningParserName: TypeAlias = Literal[
     "step3.5",
     "openai_gptoss",
     "gptoss",
+    "gemma4",
     "identity",
     "none",
     "passthrough",

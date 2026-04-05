@@ -44,8 +44,9 @@ def test_grouped_gdr_output_dtype_matches_input(dtype):
         recurrent_state=recurrent_state,
     )
     assert output.dtype == dtype, f"Expected output dtype {dtype}, got {output.dtype}"
-    # Recurrent state stays in float32 for precision
-    assert new_state.dtype == jnp.float32
+    # Recurrent state follows recurrent_state input dtype (compute_dtype).
+    # With gdr_op, this is controlled by runtime_dtype.
+    assert new_state.dtype == recurrent_state.dtype
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])

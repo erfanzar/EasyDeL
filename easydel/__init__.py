@@ -534,6 +534,18 @@ _import_structure = {
         "Gemma3TextConfig",
         "Gemma3TextModel",
     ],
+    "modules.gemma4": [
+        "Gemma4Config",
+        "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration",
+        "Gemma4Model",
+        "Gemma4MultimodalEmbedder",
+        "Gemma4RMSNorm",
+        "Gemma4TextConfig",
+        "Gemma4TextModel",
+        "Gemma4VisionConfig",
+        "Gemma4VisionModel",
+    ],
     "modules.gidd": [
         "GiddConfig",
         "GiddModel",
@@ -1058,6 +1070,18 @@ if _tp.TYPE_CHECKING:
         Gemma3MultiModalProjector,
         Gemma3TextConfig,
         Gemma3TextModel,
+    )
+    from .modules.gemma4 import (
+        Gemma4Config,
+        Gemma4ForCausalLM,
+        Gemma4ForConditionalGeneration,
+        Gemma4Model,
+        Gemma4MultimodalEmbedder,
+        Gemma4RMSNorm,
+        Gemma4TextConfig,
+        Gemma4TextModel,
+        Gemma4VisionConfig,
+        Gemma4VisionModel,
     )
     from .modules.gidd import GiddConfig, GiddForDiffusionLM, GiddModel
     from .modules.glm import GlmConfig, GlmForCausalLM, GlmForSequenceClassification, GlmModel

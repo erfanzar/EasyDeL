@@ -840,9 +840,7 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
     ) -> AttentionOutput:
         """Run the MLA ragged-paged attention kernel (v2 implementation)."""
         if keys_pe is None:
-            raise ValueError(
-                "multi_latent_ragged_page_attention_v2 requires `keys_pe`."
-            )
+            raise ValueError("multi_latent_ragged_page_attention_v2 requires `keys_pe`.")
 
         queries_nope = _reshape_query_tensor(queries_nope, "queries_nope")
         queries_pe = _reshape_query_tensor(queries_pe, "queries_pe")
@@ -854,10 +852,7 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                 f"Got {queries_nope.shape[:2]} vs {queries_pe.shape[:2]}."
             )
         if keys_values.ndim not in (2, 3):
-            raise ValueError(
-                "`keys_values` must be rank-2 or rank-3. "
-                f"Got shape={keys_values.shape}."
-            )
+            raise ValueError(f"`keys_values` must be rank-2 or rank-3. Got shape={keys_values.shape}.")
         if keys_pe.ndim != 2:
             raise ValueError(f"`keys_pe` must be rank-2. Got shape={keys_pe.shape}.")
         if keys_values.shape[0] != queries_nope.shape[0]:
@@ -973,30 +968,52 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                 jax.shard_map,
                 mesh=self.metadata.mesh,
                 in_specs=(
-                    qaxes_nope, qaxes_pe, kv_values_axes, keys_pe_axes,
-                    kv_pages_spec, Ps(), Ps(), Ps(), Ps(),
+                    qaxes_nope,
+                    qaxes_pe,
+                    kv_values_axes,
+                    keys_pe_axes,
+                    kv_pages_spec,
+                    Ps(),
+                    Ps(),
+                    Ps(),
+                    Ps(),
                 ),
                 out_specs=(qaxes_nope, kv_pages_spec),
                 check_vma=False,
             )
             def _mapped(
-                local_queries_nope, local_queries_pe, local_keys_values,
-                local_keys_pe, local_kv_pages,
-                full_context_lens, full_pages_tables, full_query_start_loc, full_distribution,
+                local_queries_nope,
+                local_queries_pe,
+                local_keys_values,
+                local_keys_pe,
+                local_kv_pages,
+                full_context_lens,
+                full_pages_tables,
+                full_query_start_loc,
+                full_distribution,
             ):
                 del full_distribution
                 shard_idx = _axis_index(page_axis_names)
                 row_start = shard_idx * jnp.int32(rows_per_shard)
 
                 local_context_lens = jax.lax.dynamic_slice_in_dim(
-                    full_context_lens, start_index=row_start, slice_size=rows_per_shard, axis=0,
+                    full_context_lens,
+                    start_index=row_start,
+                    slice_size=rows_per_shard,
+                    axis=0,
                 )
                 local_pages_rows = jax.lax.dynamic_slice_in_dim(
-                    full_pages_tables, start_index=row_start, slice_size=rows_per_shard, axis=0,
+                    full_pages_tables,
+                    start_index=row_start,
+                    slice_size=rows_per_shard,
+                    axis=0,
                 )
                 local_block_tables = local_pages_rows.reshape((rows_per_shard * max_pages_per_req,))
                 local_query_start_loc = jax.lax.dynamic_slice_in_dim(
-                    full_query_start_loc, start_index=row_start, slice_size=rows_per_shard + 1, axis=0,
+                    full_query_start_loc,
+                    start_index=row_start,
+                    slice_size=rows_per_shard + 1,
+                    axis=0,
                 )
 
                 local_scheduled = local_query_start_loc[1:] - local_query_start_loc[:-1]
@@ -1034,31 +1051,55 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                 local_token_mask = jnp.any(active_rows & (token_ids >= starts) & (token_ids < ends), axis=0)
                 local_output = jnp.where(local_token_mask[:, None, None], local_output, jnp.zeros_like(local_output))
                 if len(page_axis_names) == 1:
-                    output = jax.lax.psum(local_output.astype(jnp.float32), page_axis_names[0]).astype(local_output.dtype)
+                    output = jax.lax.psum(local_output.astype(jnp.float32), page_axis_names[0]).astype(
+                        local_output.dtype
+                    )
                 else:
-                    output = jax.lax.psum(local_output.astype(jnp.float32), tuple(page_axis_names)).astype(local_output.dtype)
+                    output = jax.lax.psum(local_output.astype(jnp.float32), tuple(page_axis_names)).astype(
+                        local_output.dtype
+                    )
                 return output, local_kv_pages
 
             output, kv_pages = _mapped(
-                queries_nope, queries_pe, keys_values, keys_pe, kv_pages,
-                cache_metadata.context_lens, cache_metadata.pages_tables,
-                cache_metadata.query_start_loc, request_distribution,
+                queries_nope,
+                queries_pe,
+                keys_values,
+                keys_pe,
+                kv_pages,
+                cache_metadata.context_lens,
+                cache_metadata.pages_tables,
+                cache_metadata.query_start_loc,
+                request_distribution,
             )
         else:
+
             @partial(
                 jax.shard_map,
                 mesh=self.metadata.mesh,
                 in_specs=(
-                    qaxes_nope, qaxes_pe, kv_values_axes, keys_pe_axes,
-                    kv_pages_spec_replicated, Ps(), Ps(), Ps(), Ps(),
+                    qaxes_nope,
+                    qaxes_pe,
+                    kv_values_axes,
+                    keys_pe_axes,
+                    kv_pages_spec_replicated,
+                    Ps(),
+                    Ps(),
+                    Ps(),
+                    Ps(),
                 ),
                 out_specs=(qaxes_nope, kv_pages_spec_replicated),
                 check_vma=False,
             )
             def _mapped_global(
-                local_queries_nope, local_queries_pe, local_keys_values,
-                local_keys_pe, local_kv_pages,
-                full_context_lens, full_pages_tables, full_query_start_loc, full_distribution,
+                local_queries_nope,
+                local_queries_pe,
+                local_keys_values,
+                local_keys_pe,
+                local_kv_pages,
+                full_context_lens,
+                full_pages_tables,
+                full_query_start_loc,
+                full_distribution,
             ):
                 return multi_latent_ragged_page_attention_v2(
                     local_queries_nope,
@@ -1074,9 +1115,15 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                 )
 
             output, kv_pages = _mapped_global(
-                queries_nope, queries_pe, keys_values, keys_pe, kv_pages,
-                cache_metadata.context_lens, cache_metadata.pages_tables,
-                cache_metadata.query_start_loc, request_distribution,
+                queries_nope,
+                queries_pe,
+                keys_values,
+                keys_pe,
+                kv_pages,
+                cache_metadata.context_lens,
+                cache_metadata.pages_tables,
+                cache_metadata.query_start_loc,
+                request_distribution,
             )
 
         cache_view.kv_pages = kv_pages
