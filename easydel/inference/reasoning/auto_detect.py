@@ -89,6 +89,8 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, ReasoningParserName] = {
     "step3.5": "step3p5",
     "step3": "step3",
     "step": "step3",
+    "gemma4_text": "gemma4",
+    "gemma4": "gemma4",
     "gemma3": "deepseek_r1",
     "gemma2": "deepseek_r1",
     "gemma": "deepseek_r1",
@@ -121,6 +123,7 @@ _TEMPLATE_HINTS: list[tuple[str, ReasoningParserName]] = [
     ("[THINK]", "mistral"),
     ("Here's my thought process:", "granite"),
     ("Here is my thought process:", "granite"),
+    ("<|channel>", "gemma4"),
     ("<|channel|>", "gptoss"),
     ("<seed:think>", "seed_oss"),
     ("<think>", "deepseek_r1"),
@@ -132,6 +135,7 @@ Checked in order; the first match wins.
 
 _VOCAB_HINTS: list[tuple[str, ReasoningParserName]] = [
     ("[THINK]", "mistral"),
+    ("<|channel>", "gemma4"),
     ("<|channel|>", "gptoss"),
     ("<think>", "deepseek_r1"),
 ]
@@ -245,15 +249,34 @@ def make_reasoning_stripper(
     """
     import re
 
-    start, end = get_reasoning_tags(
+    name = detect_reasoning_parser(
         parser_name=parser_name,
         model_type=model_type,
         tokenizer=tokenizer,
     )
-    escaped_start = re.escape(start)
-    escaped_end = re.escape(end)
-    closed_re = re.compile(rf"{escaped_start}.*?{escaped_end}", re.DOTALL)
-    unclosed_re = re.compile(rf"{escaped_start}.*", re.DOTALL)
+    try:
+        parser_cls = ReasoningParserManager.get_reasoning_parser(name)
+    except KeyError:
+        parser_cls = None
+
+    if parser_cls is None:
+        start_tokens = ("<think>",)
+        end_token = "</think>"
+    else:
+        start_token = getattr(parser_cls, "start_token", "<think>")
+        end_token = getattr(parser_cls, "end_token", "</think>")
+        start_tokens = getattr(parser_cls, "reasoning_start_tokens", (start_token,))
+        if isinstance(start_tokens, str):
+            start_tokens = (start_tokens,)
+        else:
+            start_tokens = tuple(str(token) for token in start_tokens if token)
+        if not start_tokens:
+            start_tokens = (start_token,)
+
+    escaped_start_pattern = "|".join(sorted((re.escape(token) for token in start_tokens), key=len, reverse=True))
+    escaped_end = re.escape(end_token)
+    closed_re = re.compile(rf"(?:{escaped_start_pattern}).*?{escaped_end}", re.DOTALL)
+    unclosed_re = re.compile(rf"(?:{escaped_start_pattern}).*", re.DOTALL)
 
     def strip_reasoning(text: str) -> str:
         result = closed_re.sub("", text)

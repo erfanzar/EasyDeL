@@ -894,12 +894,12 @@ class GlmMoeDsaAttention(UnifiedAttention):
         compressed_kv = self.mla_kv_a_proj_with_mqa(hidden_states)
         k_pe = compressed_kv[..., self.kv_lora_rank :]
         compressed_kv = compressed_kv[..., : self.kv_lora_rank]
+        compressed_kv = self.mla_kv_a_layernorm(compressed_kv)
 
         k_pe = k_pe.reshape(bsz, q_len, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
 
         absorbed_w_v = None
         if _use_mla_ragged:
-            compressed_kv = self.mla_kv_a_layernorm(compressed_kv)
             k_nope = None
             value_states = None
         else:

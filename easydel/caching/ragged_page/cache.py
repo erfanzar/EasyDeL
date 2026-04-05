@@ -248,6 +248,54 @@ def _select_compatible_v3_kv_cache_dtype(
     )
 
 
+def _resolve_ragged_cache_layout(
+    kvdtype: jnp.dtype,
+    *,
+    version: str,
+    num_kv_heads: int,
+    k_headdim: int,
+    kv_head_shards: int,
+) -> tuple[jnp.dtype, int]:
+    """Resolve cache dtype and effective KV-head shard count for ragged caches."""
+    kvdtype = _canonicalize_dtype(kvdtype)
+    kv_head_shards = max(1, int(kv_head_shards))
+
+    if kv_head_shards <= 1:
+        return kvdtype, 1
+
+    if version == "v3":
+        try:
+            return (
+                _select_compatible_v3_kv_cache_dtype(
+                    kvdtype,
+                    num_kv_heads=int(num_kv_heads),
+                    k_headdim=int(k_headdim),
+                    kv_head_shards=kv_head_shards,
+                ),
+                kv_head_shards,
+            )
+        except ValueError:
+            logger.warning(
+                "Replicating ragged-page v3 KV cache across the kv-head axis because "
+                "num_kv_heads=%s and k_headdim=%s cannot be sharded across %s kv-head shards.",
+                num_kv_heads,
+                k_headdim,
+                kv_head_shards,
+            )
+            return kvdtype, 1
+
+    if version == "v2" and (int(num_kv_heads) * 2) % kv_head_shards != 0:
+        logger.warning(
+            "Replicating ragged-page v2 KV cache across the kv-head axis because "
+            "num_kv_heads=%s cannot be split across %s kv-head shards.",
+            num_kv_heads,
+            kv_head_shards,
+        )
+        return kvdtype, 1
+
+    return kvdtype, kv_head_shards
+
+
 def get_page_size_bytes(
     page_size: int,
     num_kv_heads: int,
@@ -299,6 +347,8 @@ def per_device_hbm_budget_bytes(util: float = 0.9, mode: str = "free", safety_ma
             s = d.memory_stats()
         except Exception:
             continue
+        if not s:
+            continue
         limit = s.get("bytes_limit") or s.get("bytes_reservable_limit") or s.get("bytes_total")
         used_in_use = s.get("bytes_in_use", 0)
         used_reserved = s.get("bytes_reserved", 0)
@@ -337,6 +387,9 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         hbm_utilization (float): Target HBM utilization fraction. Default: 0.9.
         data_parallel_size (int): Mesh ``dp`` axis size used for KV page
             sharding metadata.
+        kv_head_shards (int): Effective mesh shard count used for the cache's
+            KV-head axis. Falls back to ``1`` when the cache must replicate KV
+            groups instead of sharding them.
         page_size (int): Number of tokens per cache page. Default: 128.
         num_pages (int): Total number of pages allocated. Computed automatically.
         max_num_pages_per_req (int): Maximum pages per request. Computed from
@@ -366,22 +419,28 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
     v_headdim: int = field(pytree_node=False)
     hbm_utilization: float = field(pytree_node=False, default=0.9)
     data_parallel_size: int = field(pytree_node=False, default=1)
+    kv_head_shards: int = field(pytree_node=False, default=1)
     page_size: int = field(pytree_node=False, default=128)
     num_pages: int = field(pytree_node=False, default=-1)
     max_num_pages_per_req: int = field(pytree_node=False, default=-1)
     num_slices_per_kv_cache_update_page: int = field(pytree_node=False, default=-1)
     max_num_tokens: int = field(pytree_node=False, default=-1)
     max_num_reqs: int = field(pytree_node=False, default=-1)
+    window_aware_max_num_seqs: int = field(pytree_node=False, default=-1)
+    window_aware_pages_per_request: int = field(pytree_node=False, default=-1)
+    window_aware_max_num_batched_tokens: int = field(pytree_node=False, default=-1)
 
     version: str | tp.Literal["v3", "v2"] = field(pytree_node=False, default="v3")
 
     _kvdtype_str: str = field(pytree_node=False, default="bf16")
+    _mixed_layer_configs: dict[int, tp.Any] | None = field(pytree_node=False, default=None)
 
     @staticmethod
     def _compute_free_hbm(
         mesh: Mesh,
         partition_manager: PartitionManager,
         hbm_utilization: float,
+        kv_head_shards: int | None = None,
     ):
         """Compute available HBM for cache allocation across mesh.
 
@@ -394,12 +453,25 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             int: Available bytes used for KV page-pool sizing, scaled by
                 both KV-head and data-parallel page-axis factors.
         """
-        kv_head_axis = partition_manager.paxis.kv_head_axis
-        kv_head_size = _mesh_axis_size(mesh, kv_head_axis)
+        physical_kv_head_axis = partition_manager.paxis.kv_head_axis
+        physical_kv_head_size = _mesh_axis_size(mesh, physical_kv_head_axis)
+        kv_head_size = physical_kv_head_size if kv_head_shards is None else max(1, int(kv_head_shards))
         budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
         page_axis_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
         available_alloc = budget * kv_head_size * page_axis_size
-        logger.info(f"{kv_head_axis=} {kv_head_size=} {page_axis_size=} {budget=} {available_alloc=} {hbm_utilization=}")
+        effective_kv_head_axis = physical_kv_head_axis if kv_head_size > 1 else "replicated"
+        logger.info(
+            "physical_kv_head_axis=%r effective_kv_head_axis=%r physical_kv_head_size=%s "
+            "effective_kv_head_size=%s page_axis_size=%s budget=%s available_alloc=%s hbm_utilization=%s",
+            physical_kv_head_axis,
+            effective_kv_head_axis,
+            physical_kv_head_size,
+            kv_head_size,
+            page_axis_size,
+            budget,
+            available_alloc,
+            hbm_utilization,
+        )
         return available_alloc
 
     @classmethod
@@ -460,21 +532,22 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         if kv_head_dim_size is None or kv_head_dim_size <= 0:
             raise ValueError("`kv_head_dim_size` must be positive")
         data_parallel_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
-        kv_head_size = _mesh_axis_size(mesh, partition_manager.paxis.kv_head_axis)
+        physical_kv_head_size = _mesh_axis_size(mesh, partition_manager.paxis.kv_head_axis)
         kvdtype = _canonicalize_dtype(kvdtype)
-        if version == "v3":
-            kvdtype = _select_compatible_v3_kv_cache_dtype(
-                kvdtype,
-                num_kv_heads=num_kv_heads,
-                k_headdim=k_headdim,
-                kv_head_shards=kv_head_size,
-            )
+        kvdtype, effective_kv_head_shards = _resolve_ragged_cache_layout(
+            kvdtype,
+            version=version,
+            num_kv_heads=num_kv_heads,
+            k_headdim=k_headdim,
+            kv_head_shards=physical_kv_head_size,
+        )
         if data_parallel_size > 1:
             logger.info(f"Scaling KV page budget by data-parallel page axis: {data_parallel_size=}.")
         free = cls._compute_free_hbm(
             mesh=mesh,
             partition_manager=partition_manager,
             hbm_utilization=hbm_utilization,
+            kv_head_shards=effective_kv_head_shards,
         )
         bytes_av = jnp.finfo(kvdtype).bits // 8
         page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * kv_head_dim_size * bytes_av
@@ -499,6 +572,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             v_headdim=v_headdim,
             hbm_utilization=hbm_utilization,
             data_parallel_size=data_parallel_size,
+            kv_head_shards=effective_kv_head_shards,
             page_size=page_size,
             num_pages=num_pages,
             max_num_pages_per_req=cdiv(max_model_length, page_size),
@@ -607,6 +681,9 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         Returns:
             int: Estimated maximum concurrent sequences.
         """
+        if self.window_aware_max_num_seqs > 0:
+            return int(self.window_aware_max_num_seqs)
+
         num_page_per_req = cdiv(self.max_model_length, self.page_size)
         return 1024 * 1024 // 2 // num_page_per_req // 4
 
@@ -624,6 +701,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             ValueError: If version is unknown.
         """
         page_axis = ATTN_DP if self.data_parallel_size > 1 else common_types.EMPTY
+        kv_head_axis = common_types.HEAD if self.kv_head_shards > 1 else common_types.EMPTY
         if self.version == "v3":
             kv_pages_shape = (
                 self.num_pages,
@@ -632,7 +710,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
                 self.kv_head_packing,
                 self.storage_head_dim,
             )
-            axes = [page_axis, common_types.EMPTY, common_types.HEAD, common_types.EMPTY, common_types.EMPTY]
+            axes = [page_axis, common_types.EMPTY, kv_head_axis, common_types.EMPTY, common_types.EMPTY]
         elif self.version == "v2":
             kv_pages_shape = (
                 self.num_pages,
@@ -640,7 +718,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
                 self.num_kv_heads * 2,
                 self.k_headdim,
             )
-            axes = [page_axis, common_types.EMPTY, common_types.HEAD, common_types.EMPTY]
+            axes = [page_axis, common_types.EMPTY, kv_head_axis, common_types.EMPTY]
         else:
             raise ValueError(f"got unknown version {self.version} it should be v3/v2.")
         return kv_pages_shape, axes

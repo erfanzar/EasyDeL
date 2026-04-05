@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
+from easydel.inference.sampling_params import SamplingParams
 
 
 class _DummyTokenizer:
@@ -247,3 +248,45 @@ def test_format_chat_prompt_collapses_late_system_messages_to_front():
     assert used_messages[0]["role"] == "system"
     assert used_messages[0]["content"] == "base instructions\n\nfollow the schema strictly"
     assert [msg["role"] for msg in used_messages[1:]] == ["user", "assistant", "tool"]
+
+
+class _ToolAwareTokenizer(_DummyTokenizer):
+    def get_vocab(self):
+        return {
+            "<|tool_call>": 48,
+            "<tool_call|>": 49,
+            "<|tool>": 50,
+            "<tool|>": 51,
+            "<|tool_response>": 52,
+            "<tool_response|>": 53,
+        }
+
+
+def test_prepare_chat_sampling_params_hides_special_tokens_for_plain_chat():
+    engine = _DummyEngine()
+    engine.tokenizer = _ToolAwareTokenizer()
+
+    params = engine._prepare_chat_sampling_params(
+        None,
+        tools=None,
+        tool_choice=None,
+    )
+
+    assert params.skip_special_tokens is True
+    assert params.logit_bias is not None
+    assert params.logit_bias[48] == -100.0
+    assert params.logit_bias[52] == -100.0
+
+
+def test_prepare_chat_sampling_params_preserves_tool_protocol_when_tools_enabled():
+    engine = _DummyEngine()
+    engine.tokenizer = _ToolAwareTokenizer()
+
+    params = engine._prepare_chat_sampling_params(
+        SamplingParams(max_tokens=32, skip_special_tokens=True),
+        tools=[{"name": "lookup", "parameters": {"type": "object", "properties": {}}}],
+        tool_choice="auto",
+    )
+
+    assert params.skip_special_tokens is False
+    assert params.logit_bias is None

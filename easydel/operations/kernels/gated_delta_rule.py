@@ -123,36 +123,22 @@ def _gdr_grouped_decode_kernel(
         q = query_ref[0, kh, :].astype(compute_dtype) * scale  # [head_dim]
         k = key_ref[0, kh, :].astype(compute_dtype)  # [head_dim]
 
-        if expand_ratio == 1:
-            vh = kh
-            s = state_ref[0, vh, :, :].astype(compute_dtype)
-            d = decay_ref[0, kh, 0].astype(jnp.float32)
-            beta_val = beta_ref[0, kh, 0].astype(jnp.float32)
-            v = value_ref[0, kh, 0, :].astype(compute_dtype)
+        vh_start = kh * expand_ratio
+        # Load all expand_ratio value heads for this key head at once.
+        s_all = state_ref[0, vh_start : vh_start + expand_ratio, :, :].astype(compute_dtype)
+        d_all = decay_ref[0, kh, :].astype(jnp.float32)
+        beta_all = beta_ref[0, kh, :].astype(jnp.float32)
+        v_all = value_ref[0, kh, :, :].astype(compute_dtype)
 
-            s = s * jnp.exp(d).astype(compute_dtype)
-            kv_mem = jnp.sum(k[:, None] * s, axis=0)
-            delta = (v - kv_mem) * jnp.asarray(beta_val, dtype=compute_dtype)
-            s = s + k[:, None] * delta[None, :]
-            out = jnp.sum(q[:, None] * s, axis=0)
+        # Decay, kv_mem contraction, delta update, output contraction.
+        s_all = s_all * jnp.exp(d_all)[:, None, None].astype(compute_dtype)
+        kv_mem_all = jnp.sum(k[None, :, None] * s_all, axis=1)
+        delta_all = (v_all - kv_mem_all) * beta_all[:, None].astype(compute_dtype)
+        s_all = s_all + k[None, :, None] * delta_all[:, None, :]
+        out_all = jnp.sum(q[None, :, None] * s_all, axis=1)
 
-            state_out_ref[0, vh, :, :] = s.astype(state_out_ref.dtype)
-            output_ref[0, vh, :] = out.astype(output_ref.dtype)
-        else:
-            vh_start = kh * expand_ratio
-            s_all = state_ref[0, vh_start : vh_start + expand_ratio, :, :].astype(compute_dtype)
-            d_all = decay_ref[0, kh, :].astype(jnp.float32)  # [expand_ratio]
-            beta_all = beta_ref[0, kh, :].astype(jnp.float32)  # [expand_ratio]
-            v_all = value_ref[0, kh, :, :].astype(compute_dtype)  # [expand_ratio, value_dim]
-
-            s_all = s_all * jnp.exp(d_all)[:, None, None].astype(compute_dtype)
-            kv_mem_all = jnp.sum(k[None, :, None] * s_all, axis=1)
-            delta_all = (v_all - kv_mem_all) * beta_all[:, None].astype(compute_dtype)
-            s_all = s_all + k[None, :, None] * delta_all[:, None, :]
-            out_all = jnp.sum(q[None, :, None] * s_all, axis=1)
-
-            state_out_ref[0, vh_start : vh_start + expand_ratio, :, :] = s_all.astype(state_out_ref.dtype)
-            output_ref[0, vh_start : vh_start + expand_ratio, :] = out_all.astype(output_ref.dtype)
+        state_out_ref[0, vh_start : vh_start + expand_ratio, :, :] = s_all.astype(state_out_ref.dtype)
+        output_ref[0, vh_start : vh_start + expand_ratio, :] = out_all.astype(output_ref.dtype)
 
 
 def _fused_conv_decode_kernel(
@@ -500,23 +486,35 @@ class GatedDeltaRuleOp(OperationImpl):
         scale = jnp.asarray(head_dim**-0.5, dtype=compute_dtype)
         query = query * scale
 
-        grouped_state = recurrent_state.astype(compute_dtype).reshape(batch, num_k_heads, expand_ratio, head_dim, -1)
-
-        if decay is not None:
-            grouped_state = grouped_state * jnp.exp(decay.astype(compute_dtype))[:, :, :, None, None]
-
-        grouped_key = key[:, :, None, :, None]
-        kv_mem = jnp.sum(grouped_state * grouped_key, axis=-2)
-        delta = (value.astype(compute_dtype) - kv_mem) * beta.astype(compute_dtype)[:, :, :, None]
-        new_grouped_state = grouped_state + grouped_key * delta[:, :, :, None, :]
-
-        output = jnp.sum(new_grouped_state * query[:, :, None, :, None], axis=-2)
-
-        num_v_heads = num_k_heads * expand_ratio
         value_dim = value.shape[-1]
+        num_v_heads = num_k_heads * expand_ratio
+
+        # Reshape state to grouped 5D layout (free view, no copy).
+        # key/query stay at [batch, num_k_heads, head_dim] — no repeat needed.
+        gs = recurrent_state.astype(compute_dtype).reshape(batch, num_k_heads, expand_ratio, head_dim, value_dim)
+        value_c = value.astype(compute_dtype)
+        beta_c = beta.astype(compute_dtype)
+
+        # Decay: broadcast [batch, num_k_heads, expand_ratio] over [head_dim, value_dim].
+        if decay is not None:
+            gs = gs * jnp.exp(decay.astype(compute_dtype))[:, :, :, None, None]
+
+        # kv_mem: contract grouped_state with key over head_dim.
+        # einsum avoids materialising the broadcast product.
+        kv_mem = jnp.einsum("bkehv,bkh->bkev", gs, key)
+
+        # Gated delta update.
+        delta = (value_c - kv_mem) * beta_c[:, :, :, None]
+
+        # State update: rank-1 outer-product per (key-head, expand-group).
+        gs = gs + jnp.einsum("bkh,bkev->bkehv", key, delta)
+
+        # Output: contract updated state with query over head_dim.
+        output = jnp.einsum("bkehv,bkh->bkev", gs, query)
+
         return (
             output.reshape(batch, num_v_heads, value_dim).astype(recurrent_state.dtype),
-            new_grouped_state.reshape(batch, num_v_heads, head_dim, value_dim).astype(recurrent_state.dtype),
+            gs.reshape(batch, num_v_heads, head_dim, value_dim).astype(recurrent_state.dtype),
         )
 
     @staticmethod
@@ -830,7 +828,6 @@ class GatedDeltaRuleOp(OperationImpl):
         is_inference = seq_len == 1
         kernel_cfg = self.metadata.get_operation_config("gated_delta_rule")
         if kernel_cfg is None and not is_inference:
-
             adaptive_chunk = min(max(16, seq_len), 64)
             adaptive_chunk = 1 << (adaptive_chunk.bit_length() - 1) if isinstance(adaptive_chunk, int) else 64
             kernel_cfg = GatedDeltaRuleConfig(chunk_size=adaptive_chunk)

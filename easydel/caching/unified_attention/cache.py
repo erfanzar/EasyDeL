@@ -253,6 +253,9 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
     page_size: int = field(pytree_node=False, default=128)
     num_pages: int = field(pytree_node=False, default=-1)
     max_num_pages_per_req: int = field(pytree_node=False, default=-1)
+    window_aware_max_num_seqs: int = field(pytree_node=False, default=-1)
+    window_aware_pages_per_request: int = field(pytree_node=False, default=-1)
+    window_aware_max_num_batched_tokens: int = field(pytree_node=False, default=-1)
 
     # Used by eSurge's slot-mapping padding logic (v2-style cache updates).
     num_slices_per_kv_cache_update_page: int = field(pytree_node=False, default=-1)
@@ -425,6 +428,9 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
         Returns:
             int: Estimated maximum concurrent sequences.
         """
+        if self.window_aware_max_num_seqs > 0:
+            return int(self.window_aware_max_num_seqs)
+
         # Same heuristic as RaggedPagesCacheConfig.
         num_page_per_req = cdiv(self.max_model_length, self.page_size)
         return 1024 * 1024 // 2 // num_page_per_req // 4

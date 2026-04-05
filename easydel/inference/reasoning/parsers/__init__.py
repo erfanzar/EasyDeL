@@ -14,6 +14,7 @@
 from .deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
 from .deepseek_v3_reasoning_parser import DeepSeekV3ReasoningParser
 from .ernie45_reasoning_parser import Ernie45ReasoningParser
+from .gemma4_reasoning_parser import Gemma4ReasoningParser
 from .gptoss_reasoning_parser import GptOssReasoningParser
 from .granite_reasoning_parser import GraniteReasoningParser
 from .hunyuan_a13b_reasoning_parser import HunyuanA13BReasoningParser
@@ -30,6 +31,7 @@ __all__ = [
     "DeepSeekR1ReasoningParser",
     "DeepSeekV3ReasoningParser",
     "Ernie45ReasoningParser",
+    "Gemma4ReasoningParser",
     "GptOssReasoningParser",
     "GraniteReasoningParser",
     "HunyuanA13BReasoningParser",

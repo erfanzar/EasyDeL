@@ -79,6 +79,8 @@ class MambaConfig(EasyDeLBaseConfig):
         use_cache (`bool`, *optional*, defaults to `True`):
             Whether or not the model should return the last key/values attentions (not used by all models). Only
             relevant if `config.is_decoder=True`.
+        use_associative_scan (`bool`, *optional*, defaults to `True`):
+            Whether to use the associative-scan implementation when supported.
         gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
             The gradient checkpointing configuration.
     """
@@ -110,6 +112,8 @@ class MambaConfig(EasyDeLBaseConfig):
         time_step_floor: float = 1e-4,
         rescale_prenorm_residual: bool = False,
         use_cache: bool = True,
+        use_associative_scan: bool = True,
+        tie_word_embeddings: bool = True,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         use_mambapy: bool = False,
         **kwargs,
@@ -138,9 +142,27 @@ class MambaConfig(EasyDeLBaseConfig):
         self.rescale_prenorm_residual = rescale_prenorm_residual
         self.residual_in_fp32 = residual_in_fp32
         self.use_cache = use_cache
+        self.use_associative_scan = use_associative_scan
         self.gradient_checkpointing = gradient_checkpointing
         self.use_mambapy = use_mambapy
-        super().__init__(**kwargs)
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+
+    @property
+    def layer_types(self) -> list[str]:
+        """Return a uniform recurrent layer type list for pure Mamba models.
+
+        Returns:
+            List of ``"mamba"`` strings with length ``num_hidden_layers``.
+        """
+        return ["mamba"] * self.num_hidden_layers
+
+    def get_mask_details(self):
+        """Recurrent Mamba layers do not use attention-mask descriptors.
+
+        Returns:
+            Always ``None``, since Mamba layers have no attention masks.
+        """
+        return None
 
     def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
         """Returns partition rules for model sharding.

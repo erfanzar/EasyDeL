@@ -16,11 +16,14 @@ import pytest
 
 from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
 from easydel.inference.openai_api_modules import DeltaFunctionCall, DeltaMessage, DeltaToolCall
+from easydel.inference.reasoning import Gemma4ReasoningParser as PublicGemma4ReasoningParser
 from easydel.inference.reasoning.abstract_reasoning import ReasoningParserManager
+from easydel.inference.reasoning.auto_detect import detect_reasoning_parser, get_reasoning_tags, make_reasoning_stripper
 from easydel.inference.reasoning.parsers import (
     DeepSeekR1ReasoningParser,
     DeepSeekV3ReasoningParser,
     Ernie45ReasoningParser,
+    Gemma4ReasoningParser,
     GptOssReasoningParser,
     GraniteReasoningParser,
     HunyuanA13BReasoningParser,
@@ -119,9 +122,24 @@ def plain_tokenizer():
     return _DummyTokenizer(vocab, chat_template="plain template")
 
 
-# ---------------------------------------------------------------------------
-# Registry tests
-# ---------------------------------------------------------------------------
+@pytest.fixture()
+def gemma4_tokenizer():
+    """Provide a dummy tokenizer with Gemma4 channel-marker vocabulary.
+
+    Returns:
+        A ``_DummyTokenizer`` whose vocab contains ``<|channel>``,
+        ``<channel|>``, and the composite thought/analysis/final markers.
+    """
+    vocab = {
+        "<|channel>": 1,
+        "<channel|>": 2,
+        "<|channel>thought<channel|>": 3,
+        "<|channel>analysis<channel|>": 4,
+        "<|channel>final<channel|>": 5,
+    }
+    return _DummyTokenizer(vocab, chat_template="template with <|channel> markers")
+
+
 
 
 def test_reasoning_parser_manager_includes_parsers():
@@ -144,6 +162,7 @@ def test_reasoning_parser_manager_includes_parsers():
         "step3.5",
         "hunyuan_a13b",
         "ernie45",
+        "gemma4",
         "seed_oss",
         "openai_gptoss",
         "gptoss",
@@ -159,10 +178,6 @@ def test_reasoning_parser_manager_raises_for_unknown():
     with pytest.raises(KeyError, match="not found"):
         ReasoningParserManager.get_reasoning_parser("nonexistent_parser_xyz")
 
-
-# ---------------------------------------------------------------------------
-# Batch extraction tests
-# ---------------------------------------------------------------------------
 
 
 def test_deepseek_r1_extract_reasoning(dummy_tokenizer):
@@ -422,9 +437,45 @@ def test_gptoss_only_channel_tag(dummy_tokenizer):
     assert content is None
 
 
-# ---------------------------------------------------------------------------
-# Streaming extraction tests
-# ---------------------------------------------------------------------------
+def test_gemma4_extract_reasoning(gemma4_tokenizer):
+    parser = Gemma4ReasoningParser(gemma4_tokenizer)
+    output = "<|channel>thought<channel|>plan it out<|channel>final<channel|>The answer"
+    reasoning, content = parser.extract_reasoning(output)
+    assert reasoning == "plan it out"
+    assert content == "The answer"
+
+
+def test_gemma4_prompt_context_handles_open_thought_channel(gemma4_tokenizer):
+    parser = Gemma4ReasoningParser(gemma4_tokenizer)
+    parser.configure_prompt_context(prompt_text="...<|channel>thought<channel|>", prompt_token_ids=[])
+    reasoning, content = parser.extract_reasoning("plan it out<|channel>final<channel|>The answer")
+    assert reasoning == "plan it out"
+    assert content == "The answer"
+
+
+def test_gemma4_reasoning_helpers_strip_to_final_channel():
+    start_token, end_token = get_reasoning_tags(parser_name="gemma4")
+    assert start_token == "<|channel>thought<channel|>"
+    assert end_token == "<|channel>final<channel|>"
+
+    strip_reasoning = make_reasoning_stripper(parser_name="gemma4")
+    stripped = strip_reasoning("<|channel>thought<channel|>plan it out<|channel>final<channel|>The answer")
+    assert stripped == "The answer"
+
+
+def test_gemma4_reasoning_helpers_strip_analysis_channel():
+    strip_reasoning = make_reasoning_stripper(parser_name="gemma4")
+    stripped = strip_reasoning("<|channel>analysis<channel|>plan it out<|channel>final<channel|>The answer")
+    assert stripped == "The answer"
+
+
+def test_detect_reasoning_parser_maps_gemma4_text_to_gemma4():
+    assert detect_reasoning_parser(model_type="gemma4_text") == "gemma4"
+
+
+def test_gemma4_is_reexported_from_reasoning_package():
+    assert PublicGemma4ReasoningParser is Gemma4ReasoningParser
+
 
 
 def test_deepseek_r1_streaming_reasoning_then_content(dummy_tokenizer):
@@ -621,10 +672,6 @@ def test_step3_streaming(dummy_tokenizer):
     assert delta.content == "answer"
 
 
-# ---------------------------------------------------------------------------
-# BaseThinkingReasoningParser is_reasoning_end / extract_content_ids
-# ---------------------------------------------------------------------------
-
 
 def test_base_is_reasoning_end(dummy_tokenizer):
     parser = DeepSeekR1ReasoningParser(dummy_tokenizer)
@@ -644,11 +691,6 @@ def test_base_extract_content_ids_no_end_token(dummy_tokenizer):
     parser = DeepSeekR1ReasoningParser(dummy_tokenizer)
     content_ids = parser.extract_content_ids([1, 100, 101])
     assert content_ids == [1, 100, 101]
-
-
-# ---------------------------------------------------------------------------
-# Edge cases
-# ---------------------------------------------------------------------------
 
 
 def test_both_tags_in_single_delta(dummy_tokenizer):
@@ -684,10 +726,6 @@ def test_content_before_start_tag(dummy_tokenizer):
     assert "prefix" in content
     assert "response" in content
 
-
-# ---------------------------------------------------------------------------
-# Prompt-context tests (tag-based parsers with asymmetric output)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -926,12 +964,6 @@ def test_non_tag_parsers_prompt_context_configuration_is_noop(
     after = parser.extract_reasoning(model_output)
     assert before == expected
     assert after == expected
-
-
-# ---------------------------------------------------------------------------
-# assume_reasoning compatibility tests (manual override)
-# ---------------------------------------------------------------------------
-
 
 def test_deepseek_r1_assume_reasoning_batch(dummy_tokenizer):
     """Batch: when assume_reasoning is set, end-only output is parsed correctly."""

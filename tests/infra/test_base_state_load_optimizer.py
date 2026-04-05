@@ -150,10 +150,6 @@ def test_load_state_ignores_incompatible_optimizer_template(tmp_path, monkeypatc
     assert int(jax.device_get(restored.step)) == 0
 
 
-# ---------------------------------------------------------------------------
-# Unit tests for _is_optimizer_template_incompatibility
-# ---------------------------------------------------------------------------
-
 
 class TestIsOptimizerTemplateIncompatibility:
     def test_keyerror_missing_array(self):
@@ -180,10 +176,6 @@ class TestIsOptimizerTemplateIncompatibility:
         exc = TypeError("Array shape mismatch for key 'tx.leaf'")
         assert _is_optimizer_template_incompatibility(exc) is False
 
-
-# ---------------------------------------------------------------------------
-# ValueError ("Array shape mismatch") path through load_optimizer / load_state
-# ---------------------------------------------------------------------------
 
 
 def test_load_optimizer_rejects_incompatible_template_after_shape_mismatch(tmp_path):

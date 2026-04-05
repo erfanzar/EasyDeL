@@ -76,6 +76,7 @@ from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
 from easydel.layers.quantization import TurboQuantConfig
 
 from ..core.dp_sharding import dp_shard_for_page_id, dp_shard_page_bounds, pages_per_dp_shard
+from ..core.interface import create_kv_cache_specs_from_config, estimate_runtime_page_budget
 from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
 from ..scheduler import SchedulerOutput
@@ -113,9 +114,7 @@ class RunnerPerfSample:
     ema_tps: float
 
 
-def _get_padded_num_reqs_with_upper_limit(
-    x: int, upper_limit: int, min_input_pad: int
-) -> int:  # pyright: ignore[reportUnusedFunction]
+def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:  # pyright: ignore[reportUnusedFunction]
     """Calculate padded request count for compilation efficiency.
 
     Pads the number of requests to the nearest power of 2 that is at least
@@ -203,6 +202,7 @@ class eSurgeRunner:
         hbm_utilization: float = 0.5,
         page_size: int = 128,
         max_model_len: int = 2**13,
+        max_num_batched_tokens: int | None = None,
         min_input_pad: int = 256,
         min_token_pad: int | None = None,
         max_num_seqs: int = 16,
@@ -221,6 +221,8 @@ class eSurgeRunner:
             hbm_utilization: Target cache-memory utilization ratio.
             page_size: KV page size used by cache metadata.
             max_model_len: Maximum sequence length.
+            max_num_batched_tokens: Maximum scheduler token budget used for
+                window-aware runtime-cap estimation.
             min_input_pad: Minimum request-count bucket.
             min_token_pad: Optional minimum token bucket size.
             max_num_seqs: Maximum concurrent sequences.
@@ -276,12 +278,18 @@ class eSurgeRunner:
                 page_size=page_size,
                 max_length=max_model_len,
             )
+        self.max_num_batched_tokens = (
+            int(max_model_len)
+            if max_num_batched_tokens is None
+            else max(1, min(int(max_num_batched_tokens), int(max_model_len)))
+        )
+        self.max_model_len = max_model_len
+        self.kv_cache_groups = self._build_kv_cache_groups()
+        self.window_aware_runtime_estimate = self._apply_window_aware_runtime_cap(self.max_num_batched_tokens)
         self.max_num_seq_buckets = self._init_seq_buckets(max_num_seq_buckets, max_num_seqs, min_input_pad)
         self.max_num_seqs = max_num_seqs
         self.max_num_reqs = self.max_num_seq_buckets[-1]
         self.async_scheduling = bool(async_scheduling)
-
-        self.max_model_len = max_model_len
         self.min_input_pad = max(min_input_pad, self.max_num_seq_buckets[0])
         self.page_size = int(self.metadata.page_size)
         self.max_pages_per_req = int(self.metadata.max_num_pages_per_req)
@@ -327,6 +335,89 @@ class eSurgeRunner:
         self._executor: typing.Any = None  # ThreadPoolExecutor, typed as Any to avoid circular import
         logger.debug("eSurgeRunner initialization complete")
         self._log_startup_summary()
+
+    def _build_kv_cache_groups(self):
+        """Build cache-group specs for runtime-cap and scheduler estimation.
+
+        Inspects the model's text config to determine KV head count and head
+        dimension, then delegates to ``create_kv_cache_specs_from_config`` to
+        produce one ``CacheGroupSpec`` per distinct attention type. MLA models
+        return an empty list because their cache layout is handled separately.
+
+        Returns:
+            List of ``CacheGroupSpec`` objects, one per attention type group.
+            Empty for MLA-based models.
+        """
+
+        text_config = self.model.config.get_text_config()
+        attn_mechanism = str(getattr(text_config, "attn_mechanism", "") or "").lower()
+        if "multi_latent" in attn_mechanism:
+            return []
+
+        metadata = self.metadata
+        num_kv_heads = getattr(text_config, "num_kv_heads", None)
+        if isinstance(num_kv_heads, (list, tuple)):
+            num_kv_heads = int(num_kv_heads[0]) if len(num_kv_heads) > 0 else None
+        if num_kv_heads is None:
+            num_kv_heads = getattr(text_config, "num_key_value_heads", None)
+        if num_kv_heads is None:
+            num_kv_heads = getattr(text_config, "num_attention_heads", None)
+        if num_kv_heads is None or int(num_kv_heads) <= 0:
+            num_kv_heads = getattr(metadata, "num_kv_heads", 1)
+
+        head_size = getattr(text_config, "head_dim", None)
+        if head_size is None or int(head_size) <= 0:
+            hidden_size = getattr(text_config, "hidden_size", None)
+            num_attention_heads = getattr(text_config, "num_attention_heads", None)
+            if hidden_size and num_attention_heads:
+                head_size = int(hidden_size) // int(num_attention_heads)
+        if head_size is None or int(head_size) <= 0:
+            head_size = getattr(metadata, "k_headdim", None) or getattr(metadata, "head_dim", None) or 1
+
+        return create_kv_cache_specs_from_config(
+            config=text_config,
+            page_size=int(metadata.page_size),
+            num_kv_heads=int(num_kv_heads),
+            head_size=int(head_size),
+            dtype=metadata.kvdtype,
+            use_mla=False,
+        )
+
+    def _apply_window_aware_runtime_cap(self, max_num_batched_tokens: int):
+        """Attach a hybrid full/sliding runtime-cap estimate to cache metadata.
+
+        Calls ``estimate_runtime_page_budget`` using the runner's page pool and
+        cache groups, then writes the resulting concurrency limits back onto
+        ``self.metadata`` so the scheduler can use them.
+
+        Args:
+            max_num_batched_tokens: Maximum number of tokens batched in one
+                decode step; used to size each request's page demand.
+
+        Returns:
+            The ``RuntimePageBudgetEstimate`` if estimation succeeds, or
+            ``None`` if no cache groups are available or an error occurs.
+        """
+
+        if not self.kv_cache_groups:
+            return None
+
+        try:
+            estimate = estimate_runtime_page_budget(
+                num_pages=int(getattr(self.metadata, "num_pages", 0) or 0),
+                kv_cache_groups=list(self.kv_cache_groups),
+                max_model_len=int(self.max_model_len),
+                max_num_batched_tokens=int(max_num_batched_tokens),
+                data_parallel_size=int(getattr(self.metadata, "data_parallel_size", 1) or 1),
+            )
+        except Exception as exc:
+            logger.debug("Window-aware runtime-cap estimation skipped: %s", exc, exc_info=True)
+            return None
+
+        self.metadata.window_aware_max_num_seqs = int(estimate.max_num_seqs)
+        self.metadata.window_aware_pages_per_request = int(estimate.pages_per_request)
+        self.metadata.window_aware_max_num_batched_tokens = int(max_num_batched_tokens)
+        return estimate
 
     def _log_startup_summary(self) -> None:
         """Log a consolidated startup summary to the logger.
@@ -404,12 +495,15 @@ class eSurgeRunner:
                 seq_cap = int((n_pages * p_size) / 1000)
                 cache_parts.append(f"pages={n_pages:,} ({p_size} tok/page)")
                 cache_parts.append(f"sequence_capacity={seq_cap:,}K")
+            window_pages_per_req = int(getattr(self.metadata, "window_aware_pages_per_request", -1) or -1)
+            if window_pages_per_req > 0:
+                cache_parts.append(f"pages/request={window_pages_per_req}")
             if hasattr(self.metadata, "get_max_num_seqs"):
                 try:
-                    no_window_cap = min(int(self.metadata.get_max_num_seqs()), int(self.max_num_reqs))
-                    cache_parts.append(f"no_window_concurrency={no_window_cap:,} reqs")
+                    max_len_cap = min(int(self.metadata.get_max_num_seqs()), int(self.max_num_reqs))
+                    cache_parts.append(f"max_len_concurrency={max_len_cap:,} reqs")
                 except Exception:
-                    logger.debug("Could not compute no-window concurrency summary", exc_info=True)
+                    logger.debug("Could not compute runtime concurrency summary", exc_info=True)
 
             lines = [
                 f"Model : {model_type}",

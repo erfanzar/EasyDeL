@@ -1343,7 +1343,9 @@ class BaseTrainer(BaseTrainerProtocol):
                 raise ValueError("Batch size must be > 0.")
             if num_epochs <= 0:
                 return 0
-            per_epoch = total_examples // batch_size if drop_remainder else (total_examples + batch_size - 1) // batch_size
+            per_epoch = (
+                total_examples // batch_size if drop_remainder else (total_examples + batch_size - 1) // batch_size
+            )
             return int(per_epoch * num_epochs)
 
         if num_examples is None:

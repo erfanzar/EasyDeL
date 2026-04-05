@@ -76,6 +76,7 @@ References:
     - EasyDeL serving documentation
 """
 
+from dataclasses import replace as dataclass_replace
 from functools import partial
 
 import jax
@@ -108,6 +109,39 @@ from ..requirements import (
 logger = get_logger(__name__)
 USE_SHARDMAP = True
 ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
+
+
+def _clamp_tpu_ragged_page_v3_block_config(query, cfg):
+    """Avoid TPU scoped-VMEM OOMs for wide-head ragged page attention.
+
+    Gemma4 uses 256-wide local sliding heads and 512-wide global heads on TPU.
+    The default Pallas autotuner can pick ``num_kv_pages_per_block=16`` for the
+    local 256-wide case, which exceeds the 16MB scoped VMEM limit on this path.
+    Capping KV pages per block at 8 keeps both geometries under the limit while
+    preserving the tuned query block size selection.
+
+    Args:
+        query: Query tensor whose last dimension (head dim) is checked against
+            the 256-wide threshold.
+        cfg: Existing ``RaggedPageAttentionv3Config`` or ``None``. When
+            ``None`` a new config capped at 8 pages per block is created.
+
+    Returns:
+        The original *cfg* unchanged on non-TPU backends or narrow heads, or
+        a (possibly new) config with ``num_kv_pages_per_block`` clamped to 8.
+    """
+    if jax.default_backend() != "tpu" or query.shape[-1] < 256:
+        return cfg
+
+    from ejkernel.modules.operations.configs import RaggedPageAttentionv3Config
+
+    if cfg is None:
+        return RaggedPageAttentionv3Config(num_kv_pages_per_block=8)
+
+    current_block = getattr(cfg, "num_kv_pages_per_block", None)
+    if current_block is None or int(current_block) > 8:
+        return dataclass_replace(cfg, num_kv_pages_per_block=8)
+    return cfg
 
 
 def _normalize_axis_names(axis: str | tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
@@ -144,6 +178,12 @@ def _dp_page_axis(cache_view: RaggedPagesCacheView):
     """Resolve the logical page axis for the active cache view."""
     dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
     return ATTN_DP if dp_size > 1 else ct.EMPTY
+
+
+def _kv_axis(cache_view: RaggedPagesCacheView, sharded_axis: str):
+    """Return `sharded_axis` only when the cache keeps a sharded KV-head axis."""
+    kv_head_shards = max(1, int(getattr(cache_view.metadata, "kv_head_shards", 1)))
+    return sharded_axis if kv_head_shards > 1 else ct.EMPTY
 
 
 class _RaggedPageAttn(OperationImpl):
@@ -203,6 +243,7 @@ class _RaggedPageAttn(OperationImpl):
         resolve = manager.resolve
         num_seqs_flat: Array = cache_metadata.num_seqs.reshape(-1)
         page_axis = _dp_page_axis(cache_view)
+        kv_page_axis = _kv_axis(cache_view, ct.HEAD)
         qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
 
         aux_spec = PartitionSpec(None)
@@ -244,7 +285,7 @@ class _RaggedPageAttn(OperationImpl):
             in_specs=(
                 qaxes,
                 resolve(
-                    axes=[page_axis, ct.EMPTY, ct.HEAD, ct.EMPTY],
+                    axes=[page_axis, ct.EMPTY, kv_page_axis, ct.EMPTY],
                     mode=ct.MODE_PREFILL,
                     shape=kv_pages.shape,
                 ),
@@ -287,15 +328,16 @@ class _RaggedPageAttn(OperationImpl):
         manager = self.metadata.partition_manager
         resolve = manager.resolve
         page_axis = _dp_page_axis(cache_view)
+        kv_token_axis = _kv_axis(cache_view, ct.KV_HEAD)
 
         qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
         pages_4d_spec = resolve(
-            axes=[page_axis, ct.EMPTY, ct.KV_HEAD, ct.EMPTY],
+            axes=[page_axis, ct.EMPTY, kv_token_axis, ct.EMPTY],
             mode=ct.MODE_PREFILL,
             shape=cache_view.key_indices_pages.shape,
         )
         pages_3d_spec = resolve(
-            axes=[page_axis, ct.EMPTY, ct.KV_HEAD],
+            axes=[page_axis, ct.EMPTY, kv_token_axis],
             mode=ct.MODE_PREFILL,
             shape=cache_view.value_norms_pages.shape,
         )
@@ -527,6 +569,8 @@ class _RaggedPageAttn(OperationImpl):
         resolve = manager.resolve
         request_distribution = cache_metadata.request_distribution
         page_axis = _dp_page_axis(cache_view)
+        kv_token_axis = _kv_axis(cache_view, ct.KV_HEAD)
+        kv_page_axis = _kv_axis(cache_view, ct.HEAD)
 
         sinks_axis = None
 
@@ -535,23 +579,24 @@ class _RaggedPageAttn(OperationImpl):
             softmax_aux = softmax_aux.astype("f4")
 
         qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
-        kvaxes = resolve(axes=[ct.EMPTY, ct.KV_HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=key.shape)
+        kvaxes = resolve(axes=[ct.EMPTY, kv_token_axis, ct.EMPTY], mode=ct.MODE_PREFILL, shape=key.shape)
 
         kv_pages_spec = resolve(
-            axes=[page_axis, ct.EMPTY, ct.HEAD, ct.EMPTY, ct.EMPTY],
+            axes=[page_axis, ct.EMPTY, kv_page_axis, ct.EMPTY, ct.EMPTY],
             mode=ct.MODE_PREFILL,
             shape=kv_pages.shape,
         )
         page_axis_names = _normalize_axis_names(kv_pages_spec[0] if len(kv_pages_spec) > 0 else None)
         page_axis_size = _mesh_axis_size(self.metadata.mesh, page_axis_names)
         kv_pages_spec_replicated = resolve(
-            axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY, ct.EMPTY],
+            axes=[ct.EMPTY, ct.EMPTY, kv_page_axis, ct.EMPTY, ct.EMPTY],
             mode=ct.MODE_PREFILL,
             shape=kv_pages.shape,
         )
 
         platform = "pallas" if jax.default_backend() == "tpu" else "auto"
         cfg = self.metadata.get_operation_config("ragged_page_attention_v3")
+        cfg = _clamp_tpu_ragged_page_v3_block_config(query, cfg)
         common_call_kwargs = dict(
             softmax_scale=softmax_scale,
             logits_soft_cap=logits_soft_cap,

@@ -411,6 +411,9 @@ class EmbeddingInfo:
             May be modified for multimodal inputs.
         rope_deltas: Delta values for multi-dimensional RoPE computation.
             Used in models like Qwen2-VL for spatial-temporal positional encoding.
+        per_layer_inputs: Auxiliary per-layer token embeddings for models that
+            need extra residual inputs when calling the forward pass with
+            precomputed `inputs_embeds`.
         visual_pos_masks: Masks indicating positions of visual tokens in the
             sequence. Shape: (batch_size, sequence_length).
         deepstack_visual_embeds: List of visual embeddings at different layers
@@ -429,6 +432,7 @@ class EmbeddingInfo:
 
     position_ids: Array | None = None
     rope_deltas: Array | None = None
+    per_layer_inputs: Array | None = None
     visual_pos_masks: Array | None = None
     deepstack_visual_embeds: list[Array] | None = None
     deepstack_image_embeds: list[Array] | None = None

@@ -137,7 +137,7 @@ class TurboQuantRaggedPagesCacheConfig(RaggedPagesCacheConfig):
         if data_parallel_size > 1:
             num_pages = (num_pages // data_parallel_size) * data_parallel_size
         if num_pages <= 0:
-            raise ValueError("Computed `num_pages` is non-positive; increase `hbm_utilization` " "or reduce model size.")
+            raise ValueError("Computed `num_pages` is non-positive; increase `hbm_utilization` or reduce model size.")
 
         # Compare with uncompressed bf16 equivalent
         uncompressed_bytes = page_size * num_kv_heads * head_dim * 2 * 2  # K+V, bf16
@@ -270,6 +270,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
         *,
         mesh: "Mesh | None" = None,
         partition_manager: "PartitionManager | None" = None,
+        layer_indices: list[int] | None = None,
     ) -> list["TurboQuantRaggedPagesCacheView"]:
         """Batch-allocate cache views for all layers at once.
 
@@ -284,12 +285,19 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
             num_layers: Number of transformer layers.
             mesh: JAX device mesh for sharding.
             partition_manager: Partition manager.
+            layer_indices: Optional transformer layer indices. When provided,
+                generated constants and view metadata keep the original layer
+                numbering instead of using ``range(num_layers)``.
 
         Returns:
             List of ``num_layers`` initialized TurboQuantRaggedPagesCacheView.
         """
         if partition_manager is None:
             partition_manager = PartitionManager(PartitionAxis())
+        if layer_indices is None:
+            layer_indices = list(range(num_layers))
+        elif len(layer_indices) != int(num_layers):
+            raise ValueError("`layer_indices` length must match `num_layers` for TurboQuant batch cache init.")
 
         tq_config = config.turboquant_config
         head_dim = config.k_headdim
@@ -321,9 +329,9 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
         logger.info(f"Batch-allocating TurboQuant cache for {num_layers} layers via device_put")
 
         views = []
-        for idx in range(num_layers):
+        for _idx, layer_index in enumerate(layer_indices):
             dummy_kv = jax.device_put(np.zeros((), dtype=np.float32))
-            constants = TurboQuantConstants.generate(tq_config, head_dim, idx, mesh=mesh)
+            constants = TurboQuantConstants.generate(tq_config, head_dim, int(layer_index), mesh=mesh)
 
             ki_shape = shapes_and_shardings["ki"][0]
             ks_shape = shapes_and_shardings["ks"][0]
@@ -340,7 +348,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
             views.append(
                 cls(
                     metadata=config,
-                    layer_index=idx,
+                    layer_index=int(layer_index),
                     kv_pages=dummy_kv,
                     partition_manager=partition_manager,
                     key_indices_pages=ki,
@@ -380,7 +388,7 @@ class TurboQuantRaggedPagesCacheView(RaggedPagesCacheView):
 
     def __repr__(self) -> str:
         ki_shape = getattr(self.key_indices_pages, "shape", None)
-        return f"{self.__class__.__name__}(layer_index={self.layer_index}, " f"key_indices_shape={ki_shape})"
+        return f"{self.__class__.__name__}(layer_index={self.layer_index}, key_indices_shape={ki_shape})"
 
     __str__ = __repr__
 

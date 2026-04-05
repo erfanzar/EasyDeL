@@ -20,13 +20,102 @@ transfer weights between them, and load model classes from HuggingFace Hub.
 
 import copy
 import gc
+import inspect
 from typing import Any
 
 import transformers
 from flax import nnx as nn
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 import easydel as ed
 from easydel.infra.etils import EasyDeLGradientCheckPointers
+
+
+def _is_simple_config_value(value: Any) -> bool:
+    """Return True for config values we can safely round-trip through tests.
+
+    Args:
+        value: Arbitrary config attribute value to check.
+
+    Returns:
+        ``True`` if *value* is a primitive type (``bool``, ``str``, ``float``,
+        ``int``, ``None``) or a container (``list``, ``dict``) that can be
+        serialised and deserialised without loss.
+    """
+    return isinstance(value, bool | str | float | type(None) | int | list | dict)
+
+
+def _build_openelm_config_from_raw(config_dict: dict[str, Any], overrides: dict[str, Any] | None = None) -> Any:
+    """Build an ``OpenELMConfig`` from raw HF config data with derived fields recomputed.
+
+    Merges *config_dict* and *overrides* into constructor kwargs, recomputes
+    the FFN multiplier schedule when ``num_transformer_layers`` is changed,
+    and sets any non-constructor attributes as deferred post-init fields.
+
+    Args:
+        config_dict: Raw config dictionary (e.g. from ``config.json``).
+        overrides: Optional dict of values that take precedence over
+            *config_dict* entries.
+
+    Returns:
+        A fully initialised ``OpenELMConfig`` instance with derived fields
+        (e.g. ``ffn_multipliers``) recomputed for the target layer count.
+    """
+    overrides = overrides or {}
+    attr_map = getattr(ed.OpenELMConfig, "attribute_map", {})
+    init_params = set(inspect.signature(ed.OpenELMConfig.__init__).parameters) - {"self", "kwargs"}
+    deferred_attrs: dict[str, Any] = {}
+
+    def _merge(source: dict[str, Any], ctor_kwargs: dict[str, Any]) -> None:
+        """Merge simple config values from *source* into *ctor_kwargs*.
+
+        Keys that map to constructor parameters (after attribute-map
+        normalisation) are added to *ctor_kwargs*; all other safe keys are
+        collected in the outer ``deferred_attrs`` dict for post-init
+        assignment. HF-derived ``num_query_heads`` / ``num_kv_heads`` are
+        skipped because OpenELM computes them internally.
+
+        Args:
+            source: Raw config dictionary to merge from.
+            ctor_kwargs: Mutable dict of constructor keyword arguments
+                being accumulated.
+        """
+        for key, value in source.items():
+            if not _is_simple_config_value(value):
+                continue
+
+            normalized_key = attr_map.get(key, key)
+            if normalized_key in init_params:
+                ctor_kwargs[normalized_key] = value
+            elif key not in {"num_query_heads", "num_kv_heads"}:
+                deferred_attrs[key] = value
+
+    ctor_kwargs: dict[str, Any] = {}
+    _merge(config_dict, ctor_kwargs)
+    _merge(overrides, ctor_kwargs)
+
+    # Hub configs can carry fully expanded per-layer schedules from the
+    # original model depth. When tests shrink ``num_transformer_layers``,
+    # rebuild the FFN schedule eagerly as plain Python floats so the reduced
+    # config stays internally consistent and trace-safe under lazy init.
+    target_layers = int(ctor_kwargs.get("num_transformer_layers", config_dict.get("num_transformer_layers", 1)) or 1)
+    ffn_multipliers = ctor_kwargs.get("ffn_multipliers")
+    if isinstance(ffn_multipliers, list) and ffn_multipliers and len(ffn_multipliers) != target_layers:
+        if target_layers == 1:
+            ctor_kwargs["ffn_multipliers"] = [float(ffn_multipliers[0])]
+        else:
+            start = float(ffn_multipliers[0])
+            end = float(ffn_multipliers[-1])
+            ctor_kwargs["ffn_multipliers"] = [
+                round(start + ((end - start) * idx / (target_layers - 1)), 2) for idx in range(target_layers)
+            ]
+
+    conf = ed.OpenELMConfig(**ctor_kwargs)
+    if isinstance(conf.ffn_multipliers, list):
+        conf.ffn_multipliers = [float(value) for value in conf.ffn_multipliers]
+    for key, value in deferred_attrs.items():
+        setattr(conf, key, value)
+    return conf
 
 
 def get_hf_model_from_hub(
@@ -44,9 +133,32 @@ def get_hf_model_from_hub(
     Returns:
         Tuple of (model_class, config)
     """
-    conf = transformers.AutoConfig.from_pretrained(repo_id, trust_remote_code=True)
+    try:
+        conf = transformers.AutoConfig.from_pretrained(repo_id, trust_remote_code=True)
+    except TypeError as exc:
+        # Some remote-code configs (for example OpenELM) currently fail during
+        # AutoConfig instantiation because their config classes reject extra
+        # fields from config.json in __post_init__. Fall back to the raw config
+        # dict and load the remote model class directly.
+        if "unexpected keyword argument 'use_cache'" not in str(exc):
+            raise
+
+        config_dict, _ = transformers.PretrainedConfig.get_config_dict(repo_id)
+        if config_dict.get("model_type") != "openelm":
+            raise
+
+        conf = _build_openelm_config_from_raw(config_dict, small_model_config)
+
+        auto_map = config_dict.get("auto_map", {})
+        model_ref = auto_map.get(getattr(factory, "__name__", ""))
+        if model_ref is None:
+            raise
+
+        model = get_class_from_dynamic_module(model_ref, repo_id)
+        return model, conf
+
     for k, v in small_model_config.items():
-        if isinstance(v, bool | str | float | type(None) | int):
+        if _is_simple_config_value(v):
             setattr(conf, k, v)
     model = type(factory.from_config(conf, trust_remote_code=True))
     return model, conf
@@ -153,6 +265,26 @@ def create_hf_model(
     """
     hf_config = copy.deepcopy(config)
 
+    def _force_batched_mm_for_moe(cfg: Any) -> None:
+        """Set ``_experts_implementation`` to ``"batched_mm"`` on MoE configs.
+
+        Ensures HF MoE models use the deterministic batched-MM expert
+        implementation so that parity tests are not affected by non-
+        deterministic expert dispatch.
+
+        Args:
+            cfg: HF config object (or ``None``, which is a no-op).
+        """
+        if cfg is None:
+            return
+        if getattr(cfg, "_experts_implementation", None) is None:
+            has_moe_routing = any(
+                getattr(cfg, attr_name, None) is not None
+                for attr_name in ("n_routed_experts", "num_experts_per_tok", "num_local_experts", "num_experts")
+            )
+            if has_moe_routing:
+                cfg._experts_implementation = "batched_mm"
+
     # Ensure deterministic attention backend for strict parity checks.
     # HF defaults to SDPA which can introduce numerical differences vs EasyDeL/JAX.
     if getattr(hf_config, "model_type", None) in {"glm4v", "glm4v_moe", "glm46v", "gemma3", "mistral3", "glm_moe_dsa"}:
@@ -174,6 +306,20 @@ def create_hf_model(
         _force_eager(hf_config)
         for _sub_cfg_name in ("text_config", "vision_config", "audio_config", "encoder_config", "decoder_config"):
             _force_eager(getattr(hf_config, _sub_cfg_name, None))
+
+    # Transformers currently prefers grouped_mm for MoE blocks when the backend
+    # reports it as available. In these tests the HF reference model runs on CPU,
+    # where grouped_mm can still fail at runtime for some model families.
+    _force_batched_mm_for_moe(hf_config)
+    for _sub_cfg_name in (
+        "text_config",
+        "vision_config",
+        "audio_config",
+        "encoder_config",
+        "decoder_config",
+        "language_config",
+    ):
+        _force_batched_mm_for_moe(getattr(hf_config, _sub_cfg_name, None))
 
     hf_model = hf_class(config=hf_config)
     hf_model.eval()

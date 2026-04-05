@@ -120,7 +120,7 @@ class SamplerExecutor:
     ...     token_counts_full,
     ...     window_row_indices,
     ... )
-"""
+    """
 
     def __init__(
         self,
