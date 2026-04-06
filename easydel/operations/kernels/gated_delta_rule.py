@@ -926,6 +926,11 @@ class GatedDeltaRuleOp(OperationImpl):
             else:
                 platform = "pallas"
 
+        # The chunked Neumann-series path produces NaN under eSurge's packed
+        # prefill JIT due to numerical instability in the intra-chunk inverse.
+        # Use the recurrent (scan) path which is mathematically equivalent and
+        # numerically stable.  Set EASYDEL_CHUNKED_GDR=1 to force chunked.
+        use_chunked_gdr = check_bool_flag("EASYDEL_CHUNKED_GDR", False) and not bool(is_inference)
         outputs, new_recurrent_state = gated_delta_rule(
             query,
             key,
@@ -934,7 +939,7 @@ class GatedDeltaRuleOp(OperationImpl):
             decay,
             recurrent_state,
             use_qk_l2norm=use_qk_l2norm,
-            use_chunked=not bool(is_inference),
+            use_chunked=use_chunked_gdr,
             return_state=True,
             cfg=kernel_cfg,
             mesh=self.metadata.mesh,
