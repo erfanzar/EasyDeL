@@ -321,6 +321,8 @@ _import_structure = {
         "ejit",
         "ePath",
         "ePathLike",
+        "is_inference_mode",
+        "set_inference_mode",
         "traversals",
     ],
     "inference": [
@@ -1351,6 +1353,8 @@ if _tp.TYPE_CHECKING:
         ejit,
         ePath,
         ePathLike,
+        is_inference_mode,
+        set_inference_mode,
         traversals,
     )
 else:

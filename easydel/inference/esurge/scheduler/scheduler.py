@@ -258,7 +258,7 @@ class Scheduler(SchedulerInterface):
         runner: eSurgeRunner,
         max_num_batched_tokens: int | None = None,
         enable_prefix_caching: bool = True,
-        async_scheduling: bool = False,
+        async_scheduling: bool = True,
         long_prefill_token_threshold: int | None = None,
     ) -> Scheduler:
         """Create a Scheduler instance from an eSurgeRunner.
@@ -308,24 +308,29 @@ class Scheduler(SchedulerInterface):
                 use_mla=False,
             )
 
-        scheduler = Scheduler(
-            config=Config(
-                scheduler_config=SchedulerConfig(
-                    max_num_seqs=runner.max_num_seqs,
-                    max_num_batched_tokens=max_num_batched_tokens,
-                    max_model_len=runner.max_model_len,
-                    max_num_seq_buckets=tuple(runner.max_num_seq_buckets),
-                    async_scheduling=async_scheduling,
-                    long_prefill_token_threshold=long_prefill_token_threshold,
-                ),
-                cache_config=CacheConfig(
-                    num_pages=metadata.num_pages,
-                    page_size=metadata.page_size,
-                    enable_prefix_caching=enable_prefix_caching,
-                ),
+        config = Config(
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=runner.max_num_seqs,
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_model_len=runner.max_model_len,
+                max_num_seq_buckets=tuple(runner.max_num_seq_buckets),
+                async_scheduling=async_scheduling,
+                long_prefill_token_threshold=long_prefill_token_threshold,
             ),
-            kv_cache_config=CacheGroupsConfig(num_pages=metadata.num_pages, kv_cache_groups=kv_cache_groups),
+            cache_config=CacheConfig(
+                num_pages=metadata.num_pages,
+                page_size=metadata.page_size,
+                enable_prefix_caching=enable_prefix_caching,
+            ),
         )
+        kv_cache_cfg = CacheGroupsConfig(num_pages=metadata.num_pages, kv_cache_groups=kv_cache_groups)
+
+        if async_scheduling:
+            from .async_scheduler import AsyncScheduler
+
+            scheduler = AsyncScheduler(config=config, kv_cache_config=kv_cache_cfg)
+        else:
+            scheduler = Scheduler(config=config, kv_cache_config=kv_cache_cfg)
         scheduler.data_parallel_size = int(getattr(metadata, "data_parallel_size", 1) or 1)
         return scheduler
 

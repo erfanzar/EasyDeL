@@ -91,6 +91,7 @@ from easydel.inference.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
+from easydel.utils import set_inference_mode
 
 from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutput
@@ -2996,10 +2997,10 @@ class EasyGenerationMixin:
 
     def _call_generation_model_step(self, model, running_token, call_kwargs):
         """Run one generation step without forwarding incompatible prompt embeddings."""
-
-        if call_kwargs.get("inputs_embeds", None) is not None:
-            return model(**call_kwargs)
-        return model(running_token, **call_kwargs)
+        with set_inference_mode():
+            if call_kwargs.get("inputs_embeds", None) is not None:
+                return model(**call_kwargs)
+            return model(running_token, **call_kwargs)
 
     def _create_required_props_from_kwargs(
         self, model_kwargs: dict[str, Array]
@@ -3061,9 +3062,7 @@ class EasyGenerationMixin:
                 param = valid_params[name]
                 if param.annotation != inspect.Parameter.empty:
                     try:
-                        if (
-                            getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None
-                        ):  # pyright: ignore[reportDeprecated]
+                        if getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None:  # pyright: ignore[reportDeprecated]
                             expected_type = param.annotation.__args__[0]
                             if not isinstance(value, expected_type):
                                 print(
@@ -4315,8 +4314,9 @@ class EasyGenerationMixin:
                     (batch_size, num_beams, input_ids_length),
                 )
             )
-            # Leave mask_info as the base; cache layer will compute step-specific mask
-            model_outputs = model(input_token, **state.model_kwargs)
+            with set_inference_mode():
+                # Leave mask_info as the base; cache layer will compute step-specific mask
+                model_outputs = model(input_token, **state.model_kwargs)
 
             logits = unflatten_beam_dim(model_outputs.logits[:, -1], batch_size, num_beams)
             cache = jax.tree_util.tree_map(

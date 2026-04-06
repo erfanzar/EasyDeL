@@ -140,8 +140,6 @@ def gemma4_tokenizer():
     return _DummyTokenizer(vocab, chat_template="template with <|channel> markers")
 
 
-
-
 def test_reasoning_parser_manager_includes_parsers():
     for name in [
         "deepseek_r1",
@@ -177,7 +175,6 @@ def test_reasoning_parser_manager_includes_parsers():
 def test_reasoning_parser_manager_raises_for_unknown():
     with pytest.raises(KeyError, match="not found"):
         ReasoningParserManager.get_reasoning_parser("nonexistent_parser_xyz")
-
 
 
 def test_deepseek_r1_extract_reasoning(dummy_tokenizer):
@@ -477,7 +474,6 @@ def test_gemma4_is_reexported_from_reasoning_package():
     assert PublicGemma4ReasoningParser is Gemma4ReasoningParser
 
 
-
 def test_deepseek_r1_streaming_reasoning_then_content(dummy_tokenizer):
     parser = DeepSeekR1ReasoningParser(dummy_tokenizer)
 
@@ -672,7 +668,6 @@ def test_step3_streaming(dummy_tokenizer):
     assert delta.content == "answer"
 
 
-
 def test_base_is_reasoning_end(dummy_tokenizer):
     parser = DeepSeekR1ReasoningParser(dummy_tokenizer)
     # Token ID 2 = </think>
@@ -725,7 +720,6 @@ def test_content_before_start_tag(dummy_tokenizer):
     assert content is not None
     assert "prefix" in content
     assert "response" in content
-
 
 
 @pytest.mark.parametrize(
@@ -964,6 +958,7 @@ def test_non_tag_parsers_prompt_context_configuration_is_noop(
     after = parser.extract_reasoning(model_output)
     assert before == expected
     assert after == expected
+
 
 def test_deepseek_r1_assume_reasoning_batch(dummy_tokenizer):
     """Batch: when assume_reasoning is set, end-only output is parsed correctly."""
