@@ -780,6 +780,7 @@ class ExecutionManager:
         image_grid_thw: numpy.ndarray | None = None,
         pixel_values_videos: numpy.ndarray | None = None,
         video_grid_thw: numpy.ndarray | None = None,
+        wait_for_outputs: bool = True,
     ) -> tuple[
         jax.Array,
         jax.Array,
@@ -826,7 +827,9 @@ class ExecutionManager:
 
         Note:
             The KV cache (self.kv_pages) and random key (self.rng_key) are updated
-            in-place on self after execution completes.
+            in-place on self after dispatch. When ``wait_for_outputs`` is False,
+            the returned arrays may still be executing on device and the timing
+            metrics reflect host dispatch time rather than full completion time.
 
         Example:
             >>> results = executor.execute(
@@ -970,15 +973,20 @@ class ExecutionManager:
                 or numpy.any(repetition_penalties_cpu != 1.0)
             ),
         )
-        jax.block_until_ready(model_outputs.logits)
-        exec_took = time.time() - start_exec
-
-        start_sample = time.time()
         rng_key_out, out_tokens_full, valid_mask_full, token_counts_out = sampler_out
-        jax.block_until_ready(out_tokens_full)
         self.rng_key = rng_key_out
         self._sampler_token_counts = token_counts_out
-        sample_took = time.time() - start_sample
+        if wait_for_outputs:
+            jax.block_until_ready(model_outputs.logits)
+            exec_took = time.time() - start_exec
+
+            start_sample = time.time()
+            jax.block_until_ready(out_tokens_full)
+            sample_took = time.time() - start_sample
+        else:
+            exec_took = time.time() - start_exec
+            sample_took = 0.0
+
         execute_total_took = time.time() - start_prep
         execute_overhead_took = execute_total_took - (prep_took + exec_took + sample_took)
         execute_overhead_took = max(0.0, float(execute_overhead_took))
@@ -1360,7 +1368,7 @@ class ExecutionManager:
             backbone_progress.update(
                 idx,
                 len(model_tokens),
-                f"Compiling backbone [{idx + 1}/{len(model_tokens)}]: {num_tokens:5d} tokens",
+                f"Compiling [{idx + 1}/{len(model_tokens)}]: {num_tokens:5d} tokens",
             )
             self._compile_backbone_variant(
                 num_tokens=num_tokens,
@@ -1377,7 +1385,7 @@ class ExecutionManager:
             lm_head_progress.update(
                 phase2_idx,
                 total_phase2,
-                f"Compiling lm_head [{phase2_idx + 1}/{total_phase2}]: {reqs_padd:2d} padded requests",
+                f"Compiling [{phase2_idx + 1}/{total_phase2}]: {reqs_padd:2d} padded requests",
             )
             self._compile_lm_head_variant(
                 padded_num_reqs=reqs_padd,
@@ -1389,8 +1397,7 @@ class ExecutionManager:
             lm_head_progress.update(
                 phase2_idx,
                 total_phase2,
-                f"Compiling sampler [{phase2_idx + 1}/{total_phase2}]: "
-                f"{num_tokens:5d} tokens, {reqs_padd:2d} padded requests",
+                f"Compiling [{phase2_idx + 1}/{total_phase2}]: {num_tokens:5d} tokens, {reqs_padd:2d} padded requests",
             )
             self._compile_sampler_variant(
                 num_tokens=num_tokens,

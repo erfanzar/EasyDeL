@@ -83,7 +83,7 @@ from easydel.caching import (
     UnifiedAttentionCache,
     UnifiedAttentionCacheConfig,
 )
-from easydel.utils import ejit
+from easydel.utils import ejit, set_inference_mode
 
 from ..execution_types import BackboneOutputs, BatchMetadata, ModelStepOutputs, StepFunctionInputs
 
@@ -216,7 +216,6 @@ class ModelStepExecutor:
         cache.move_to_end(key)
         return value
 
-
     def _cache_put(self, key: tuple[int, int, str, str], value: tp.Any) -> None:
         self._lru_put(self._cache, key, value, self._cache_capacity)
 
@@ -241,7 +240,6 @@ class ModelStepExecutor:
     def has_lm_head(self, padded_num_reqs: int) -> bool:
         mode = "aot" if self.use_aot_forward else "jit"
         return (int(padded_num_reqs), "lm_head", mode) in self._lm_head_cache
-
 
     def get_compiled(self, *, num_tokens: int, padded_num_reqs: int) -> tp.Any:
         """Retrieve pre-compiled backbone + lm_head as a combined callable.
@@ -527,15 +525,15 @@ class ModelStepExecutor:
                     model_inputs = {"input_ids": None, "inputs_embeds": inputs_embeds}
                 else:
                     model_inputs = {"input_ids": jnp.expand_dims(input_ids_view, 0)}
-
-                output = model(
-                    **model_inputs,
-                    position_ids=position_ids,
-                    past_key_values=kv_pages,
-                    cache_metadata=cache_metadata,
-                    apply_lm_head=False,
-                    **external_inputs,
-                )
+                with set_inference_mode():
+                    output = model(
+                        **model_inputs,
+                        position_ids=position_ids,
+                        past_key_values=kv_pages,
+                        cache_metadata=cache_metadata,
+                        apply_lm_head=False,
+                        **external_inputs,
+                    )
                 hs = output.last_hidden_state.squeeze(0)
 
                 return BackboneOutputs(

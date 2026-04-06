@@ -14,19 +14,24 @@
 
 import hashlib
 import pprint
+import threading
 from inspect import signature
+from types import SimpleNamespace
 
 import jax.numpy as jnp
 from transformers.generation.configuration_utils import GenerationConfig
 
 from easydel.inference.esurge.mixins.lifecycle import EngineLifecycleMixin
+from easydel.inference.esurge.request import EngineRequest
 from easydel.inference.esurge.runners import model_runner as model_runner_module
 from easydel.inference.esurge.runners.model_runner import eSurgeRunner
+from easydel.inference.esurge.scheduler.output import CachedRequestData, SchedulerOutput
 from easydel.inference.logits_process import (
     FrequencyPenaltyLogitsProcessor,
     PresencePenaltyLogitsProcessor,
     RepetitionPenaltyLogitsProcessor,
 )
+from easydel.inference.sampling_params import SamplingParams
 from easydel.infra.mixins import generation as generation_module
 from easydel.infra.mixins.generation import EasyGenerationMixin
 
@@ -339,6 +344,186 @@ def test_lifecycle_split_graph_components_prefers_compatible_model_for_wrapper_d
         "compatible-graphstate",
         "compatible-graphother",
     )
+
+
+def test_lifecycle_prefetch_waits_for_async_decode_batches():
+    request = EngineRequest(
+        request_id="req-decode",
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=4),
+        eos_token_id=2,
+    )
+    request.num_computed_tokens = request.num_tokens
+    request.num_output_placeholders = 1
+    scheduler = SimpleNamespace(requests={request.request_id: request})
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_pages=[],
+        finished_req_ids=set(),
+        async_scheduling=True,
+    )
+
+    assert not EngineLifecycleMixin._can_prefetch_scheduler_output(scheduler, scheduler_output)
+
+
+def test_lifecycle_prefetch_allows_pure_prefill_batches():
+    request = EngineRequest(
+        request_id="req-prefill",
+        prompt_token_ids=[1, 2, 3, 4, 5],
+        sampling_params=SamplingParams(max_tokens=4),
+        eos_token_id=2,
+    )
+    request.num_computed_tokens = request.num_tokens - 1
+    scheduler = SimpleNamespace(requests={request.request_id: request})
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_pages=[],
+        finished_req_ids=set(),
+        async_scheduling=True,
+    )
+
+    assert EngineLifecycleMixin._can_prefetch_scheduler_output(scheduler, scheduler_output)
+
+
+def test_lifecycle_aborts_after_prefetched_overlap_drain_failure():
+    request = EngineRequest(
+        request_id="req-prefill",
+        prompt_token_ids=[1, 2, 3, 4, 5],
+        sampling_params=SamplingParams(max_tokens=4),
+        eos_token_id=2,
+    )
+    request.num_computed_tokens = request.num_tokens - 2
+
+    current_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_pages=[],
+        finished_req_ids=set(),
+        async_scheduling=True,
+    )
+    prefetched_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_pages=[],
+        finished_req_ids=set(),
+        async_scheduling=True,
+    )
+
+    class DummyScheduler:
+        def __init__(self):
+            self.requests = {request.request_id: request}
+            self.running = []
+            self.waiting = []
+            self.schedule_calls = 0
+
+        def schedule(self):
+            self.schedule_calls += 1
+            if self.schedule_calls == 1:
+                return current_output
+            if self.schedule_calls == 2:
+                return prefetched_output
+            raise AssertionError("scheduler loop should stop after aborting the prefetched overlap path")
+
+    class DummyRunner:
+        def __init__(self):
+            self.executor_manager = SimpleNamespace(kv_pages=object())
+            self.async_dispatches = 0
+
+        def execute_model_async(self, scheduler_output):
+            del scheduler_output
+            self.async_dispatches += 1
+            return "future"
+
+        def wait_for_execution(self, future):
+            del future
+            raise RuntimeError("drain failed")
+
+        def shutdown(self):
+            pass
+
+    class DummyEngine(EngineLifecycleMixin):
+        def __init__(self):
+            self._scheduler_lock = threading.Lock()
+            self._request_lock = threading.Lock()
+            self._output_lock = threading.Lock()
+            self._output_event = threading.Event()
+            self._request_events = {}
+            self._active_requests = {}
+            self._request_outputs = {}
+            self._finished_request_ids = set()
+            self._scheduler_running = False
+            self._scheduler_thread = None
+            self._scheduler_exception = None
+            self._scheduler_exception_tb = None
+            self._scheduler_heartbeat = None
+            self._profiling_active = False
+            self._profiling_steps_remaining = 0
+            self._profiling_output_dir = None
+            self._profiling_host_level = None
+            self._profiling_python_level = None
+            self._paused = True
+            self._overlap_execution = True
+            self._distributed_controller = None
+            self._kv_cache_valid = True
+            self.runner = DummyRunner()
+            self.scheduler = DummyScheduler()
+
+        def _touch_activity(self):
+            pass
+
+        def _start_idle_monitor(self):
+            pass
+
+        def _stop_idle_monitor(self):
+            pass
+
+        def _info(self, *_args, **_kwargs):
+            pass
+
+        def _update_scheduler_heartbeat(self):
+            pass
+
+        def _process_engine_outputs(self, _outputs):
+            raise AssertionError("engine outputs should not be processed after the drain failure")
+
+        def _handle_profiling_step(self):
+            pass
+
+        def _install_signal_diagnostics(self):
+            pass
+
+        def _is_nonrecoverable_scheduler_error(self, _exc):
+            return False
+
+        def _reset_runner_state_if_idle(self, _reason):
+            pass
+
+    engine = DummyEngine()
+    engine.initiate()
+    assert engine._scheduler_thread is not None
+    engine._scheduler_thread.join(timeout=1.0)
+
+    assert engine._scheduler_thread is not None
+    assert not engine._scheduler_thread.is_alive()
+    assert not engine._scheduler_running
+    assert isinstance(engine._scheduler_exception, RuntimeError)
+    assert "drain failed" in str(engine._scheduler_exception)
+    assert engine.scheduler.schedule_calls == 2
+    assert engine.runner.async_dispatches == 1
 
 
 def test_model_runner_update_model_weights_replaces_explicit_graphdef_with_compatible_graphdef(monkeypatch):

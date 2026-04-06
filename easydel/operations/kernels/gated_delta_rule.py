@@ -56,6 +56,7 @@ from jaxtyping import Array, Float
 
 from easydel.caching import RecurrentCacheView
 from easydel.layers.linear_attention._conv_state import apply_manual_depthwise_conv, shift_conv_state_left
+from easydel.utils import is_inference_mode
 from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
@@ -930,7 +931,7 @@ class GatedDeltaRuleOp(OperationImpl):
         # prefill JIT due to numerical instability in the intra-chunk inverse.
         # Use the recurrent (scan) path which is mathematically equivalent and
         # numerically stable.  Set EASYDEL_CHUNKED_GDR=1 to force chunked.
-        use_chunked_gdr = check_bool_flag("EASYDEL_CHUNKED_GDR", False) and not bool(is_inference)
+        use_chunked_gdr = check_bool_flag("EASYDEL_CHUNKED_GDR", True) and not is_inference_mode()
         outputs, new_recurrent_state = gated_delta_rule(
             query,
             key,
