@@ -68,12 +68,10 @@ def _panel(
 def _build_esurge_dashboard_model(datasource_uid: str) -> dict:
     """Return a complete Grafana dashboard dict for eSurge metrics."""
     panels = [
-        # ── Row 0: key stat panels ──
         _panel("Tokens / sec", "esurge_tokens_per_second", datasource_uid, 0, 0, 6, 4, 1, "stat", "ops"),
         _panel("Running Requests", "esurge_running_requests", datasource_uid, 6, 0, 6, 4, 2, "stat", "short"),
         _panel("Waiting Requests", "esurge_waiting_requests", datasource_uid, 12, 0, 6, 4, 3, "stat", "short"),
         _panel("Batch Size", "esurge_batch_size", datasource_uid, 18, 0, 6, 4, 4, "stat", "short"),
-        # ── Row 1: throughput & latency ──
         _panel("Throughput (tok/s)", "esurge_tokens_per_second", datasource_uid, 0, 4, 12, 8, 5, unit="ops"),
         _panel(
             "Request Latency (p50 / p99)",
@@ -86,7 +84,6 @@ def _build_esurge_dashboard_model(datasource_uid: str) -> dict:
             6,
             unit="s",
         ),
-        # ── Row 2: TTFT & schedule time ──
         _panel(
             "Time to First Token (p50 / p99)",
             "histogram_quantile(0.5, rate(esurge_time_to_first_token_seconds_bucket[1m]))",
@@ -109,11 +106,9 @@ def _build_esurge_dashboard_model(datasource_uid: str) -> dict:
             8,
             unit="s",
         ),
-        # ── Row 3: cache ──
         _panel("Cache Pages (total vs used)", "esurge_cache_pages_total", datasource_uid, 0, 20, 8, 8, 9),
         _panel("Cache Pages Used", "esurge_cache_pages_used", datasource_uid, 8, 20, 8, 8, 10),
         _panel("Cache Hit Rate", "esurge_cache_hit_rate", datasource_uid, 16, 20, 8, 8, 11, unit="percentunit"),
-        # ── Row 4: model execution ──
         _panel(
             "Model Execution Time (p50)",
             "histogram_quantile(0.5, rate(esurge_model_execution_duration_seconds_bucket[1m]))",

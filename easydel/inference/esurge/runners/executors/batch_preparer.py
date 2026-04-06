@@ -743,14 +743,18 @@ class BatchMetadataPreparer:
         packed_misc_i32[1] = np.int32(padded_num_reqs)
         packed_misc_i32[2:5] = request_distribution
 
+        # Transfer full max_num_reqs arrays (not sliced to padded_num_reqs) so
+        # that BatchMetadata shapes are fixed and the backbone can be compiled
+        # once per num_tokens bucket.  The extra transfer is ~9KB at
+        # max_num_reqs=256 — negligible vs the compilation savings.
         if self._use_slot_mapping:
             host_payload = (
                 input_ids,
                 positions,
                 packed_qsl_seqlens,
                 pages_tables_payload,
-                packed_i32_padded[:, :padded_num_reqs],
-                packed_f32_padded[:, :padded_num_reqs],
+                packed_i32_padded,
+                packed_f32_padded,
                 packed_misc_i32,
                 slot_mapping_cpu if slot_mapping_cpu is not None else slot_mapping_placeholder,
                 num_kv_update_cpu,
@@ -763,8 +767,8 @@ class BatchMetadataPreparer:
                 positions,
                 packed_qsl_seqlens,
                 pages_tables_payload,
-                packed_i32_padded[:, :padded_num_reqs],
-                packed_f32_padded[:, :padded_num_reqs],
+                packed_i32_padded,
+                packed_f32_padded,
                 packed_misc_i32,
                 scheduled_full_cpu,
                 active_mask_full_cpu,

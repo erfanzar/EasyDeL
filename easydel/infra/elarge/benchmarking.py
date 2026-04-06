@@ -33,6 +33,58 @@ from .types import BenchmarkConfig, BenchmarkTask, BenchmarkTasks, ResolvedBench
 
 logger = get_logger("eLargeModelBenchmarking")
 
+_cached_task_manager: Any = None
+_cached_task_manager_key: tuple | None = None
+
+
+def _get_or_create_task_manager(
+    *,
+    verbosity: str | None = None,
+    include_path: str | list | None = None,
+    include_defaults: bool = True,
+    metadata: dict | None = None,
+    summary_logger: Any = None,
+) -> Any:
+    """Return a cached ``lm_eval.tasks.TaskManager``, building one on first call.
+
+    The TaskManager eagerly indexes every registered lm-eval task (14k+
+    YAML files) which can be slow under CPU contention.  Caching by
+    ``(include_path, include_defaults)`` avoids repeating that work when
+    the same evaluation harness is invoked multiple times in one process.
+    """
+    global _cached_task_manager, _cached_task_manager_key
+    resolved_logger = summary_logger if summary_logger is not None else logger
+
+    ip = tuple(include_path) if isinstance(include_path, list) else include_path
+    key = (ip, include_defaults)
+
+    if _cached_task_manager is not None and _cached_task_manager_key == key:
+        resolved_logger.info(
+            "Reusing cached lm-eval TaskManager (%s indexed tasks).",
+            len(getattr(_cached_task_manager, "all_tasks", []) or []),
+        )
+        return _cached_task_manager
+
+    from lm_eval.tasks import TaskManager  # type:ignore
+
+    task_manager_start = time.perf_counter()
+    resolved_logger.info("Creating lm-eval TaskManager (this is a one-time cost per process).")
+    tm = TaskManager(
+        verbosity=verbosity,
+        include_path=include_path,
+        include_defaults=include_defaults,
+        metadata=metadata,
+    )
+    elapsed = time.perf_counter() - task_manager_start
+    resolved_logger.info(
+        "lm-eval TaskManager ready in %.2fs with %s indexed tasks.",
+        elapsed,
+        len(getattr(tm, "all_tasks", []) or []),
+    )
+    _cached_task_manager = tm
+    _cached_task_manager_key = key
+    return tm
+
 
 def override_lm_eval_code_exec(*, num_workers: int | None = None, timeout: float | None = None):
     """Return a context manager that patches lm-eval's code-execution scorer.
@@ -254,28 +306,53 @@ def maybe_resolve_instruct_task_variants(
     instruct variant automatically. Non-string task objects and already-resolved
     instruct task names are preserved unchanged.
     """
-    if not apply_chat_template or task_manager is None:
+    if not apply_chat_template:
         return list(tasks)
-    available_tasks = set(getattr(task_manager, "all_tasks", []) or [])
-    if not available_tasks:
-        return list(tasks)
-    resolved_tasks: list[BenchmarkTask] = []
-    resolved_logger = summary_logger or logger
-    for task in tasks:
+
+    candidates: list[tuple[int, str, str]] = []
+    for idx, task in enumerate(tasks):
         if not isinstance(task, str) or task.endswith("_instruct"):
-            resolved_tasks.append(task)
             continue
-        instruct_task = f"{task}_instruct"
-        if instruct_task in available_tasks:
+        candidates.append((idx, task, f"{task}_instruct"))
+
+    if not candidates:
+        return list(tasks)
+
+    if task_manager is not None:
+        available_tasks = set(getattr(task_manager, "all_tasks", []) or [])
+    else:
+        available_tasks = _probe_task_names([c[2] for c in candidates])
+
+    resolved_tasks = list(tasks)
+    resolved_logger = summary_logger or logger
+    for idx, orig, instruct in candidates:
+        if instruct in available_tasks:
             resolved_logger.info(
                 "apply_chat_template enabled; using instruct task variant %s instead of %s.",
-                instruct_task,
-                task,
+                instruct,
+                orig,
             )
-            resolved_tasks.append(instruct_task)
-        else:
-            resolved_tasks.append(task)
+            resolved_tasks[idx] = instruct
     return resolved_tasks
+
+
+def _probe_task_names(names: list[str]) -> set[str]:
+    """Check which task names are registered in lm-eval without building a full index.
+
+    Falls back to a full TaskManager if targeted lookup isn't possible.
+    """
+    try:
+        global _cached_task_manager
+        if _cached_task_manager is not None:
+            all_tasks = set(getattr(_cached_task_manager, "all_tasks", []) or [])
+            return {n for n in names if n in all_tasks}
+
+        tm = _get_or_create_task_manager()
+        all_tasks = set(getattr(tm, "all_tasks", []) or [])
+        return {n for n in names if n in all_tasks}
+    except Exception as exc:
+        logger.warning("Failed to probe lm-eval task names: %s", exc)
+        return set()
 
 
 def _task_declares_generation_prefix(task: BenchmarkTask, task_manager: Any | None) -> bool:
@@ -472,36 +549,12 @@ def run_lm_eval_with_esurge(
     resolved_logger.info("eSurge lm-eval adapter ready in %.2fs.", time.perf_counter() - adapter_start)
 
     if task_manager is None and (include_path is not None or not include_defaults):
-        from lm_eval.tasks import TaskManager  # type:ignore
-
-        task_manager_start = time.perf_counter()
-        resolved_logger.info("Creating lm-eval TaskManager (include overrides active).")
-        task_manager = TaskManager(
+        task_manager = _get_or_create_task_manager(
             verbosity=config.get("verbosity"),
             include_path=include_path,
             include_defaults=include_defaults,
             metadata=config.get("metadata"),
-        )
-        resolved_logger.info(
-            "lm-eval TaskManager ready in %.2fs with %s indexed tasks.",
-            time.perf_counter() - task_manager_start,
-            len(getattr(task_manager, "all_tasks", []) or []),
-        )
-    elif task_manager is None and apply_chat_template:
-        from lm_eval.tasks import TaskManager  # type:ignore
-
-        task_manager_start = time.perf_counter()
-        resolved_logger.info("Creating lm-eval TaskManager for chat-templated task resolution.")
-        task_manager = TaskManager(
-            verbosity=config.get("verbosity"),
-            include_path=include_path,
-            include_defaults=include_defaults,
-            metadata=config.get("metadata"),
-        )
-        resolved_logger.info(
-            "lm-eval TaskManager ready in %.2fs with %s indexed tasks.",
-            time.perf_counter() - task_manager_start,
-            len(getattr(task_manager, "all_tasks", []) or []),
+            summary_logger=resolved_logger,
         )
 
     task_list = maybe_resolve_instruct_task_variants(
@@ -510,9 +563,11 @@ def run_lm_eval_with_esurge(
         apply_chat_template=apply_chat_template,
         summary_logger=resolved_logger,
     )
+
+    effective_task_manager = task_manager or _cached_task_manager
     apply_chat_template = maybe_disable_chat_template_for_prefilled_tasks(
         task_list,
-        task_manager=task_manager,
+        task_manager=effective_task_manager,
         apply_chat_template=apply_chat_template,
         summary_logger=resolved_logger,
     )
@@ -542,7 +597,7 @@ def run_lm_eval_with_esurge(
                 num_fewshot=num_fewshot,
                 batch_size=batch_size,
                 device=device,
-                task_manager=task_manager,
+                task_manager=effective_task_manager,
                 **config,
             )
         resolved_logger.info("lm_eval.simple_evaluate finished in %.2fs.", time.perf_counter() - eval_start)

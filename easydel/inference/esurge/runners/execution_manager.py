@@ -907,7 +907,7 @@ class ExecutionManager:
         prep_took = time.time() - start_prep
         if DEBUG_MODE:
             model_hash = _tree_hash((self.graphstate, self.graphother, inputs))
-            model_hash_baseline = self._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_model"]
+            model_hash_baseline = self._debug_baselines[f"{num_tokens}_hash_in_backbone"]
             _tree_hash_diff(model_hash_baseline, model_hash)
 
         start_exec = time.time()
@@ -1346,44 +1346,51 @@ class ExecutionManager:
             }
         )
         if prune_infeasible_pairs:
-            compile_pairs = self._get_feasible_compile_pairs(num_tokens_paddings, reqs_padds)
             sampler_compile_pairs = self._get_feasible_compile_pairs(num_tokens_paddings, sampler_reqs_padds)
         else:
-            compile_pairs = [
-                (int(num_tokens), int(reqs_padd)) for num_tokens in num_tokens_paddings for reqs_padd in reqs_padds
-            ]
             sampler_compile_pairs = [
                 (int(num_tokens), int(reqs_padd))
                 for num_tokens in num_tokens_paddings
                 for reqs_padd in sampler_reqs_padds
             ]
-        compile_pair_set = set(compile_pairs)
-        extra_sampler_pairs = [pair for pair in sampler_compile_pairs if pair not in compile_pair_set]
-        total_compilations = len(compile_pairs) + len(extra_sampler_pairs)
-        compilation_count = 0
-        progress = ProgressLogger("eSurge", logger)
-        for num_tokens, reqs_padd in compile_pairs:
-            progress.update(
-                compilation_count,
-                total_compilations,
-                f"Compiling [{compilation_count + 1}/{total_compilations}]: {num_tokens:5d} tokens, "
-                f"{reqs_padd:2d} padded requests",
+
+        model_tokens = sorted({int(t) for t in num_tokens_paddings})
+        backbone_progress = ProgressLogger("eSurge-backbone", logger)
+        for idx, num_tokens in enumerate(model_tokens):
+            backbone_progress.update(
+                idx,
+                len(model_tokens),
+                f"Compiling backbone [{idx + 1}/{len(model_tokens)}]: {num_tokens:5d} tokens",
             )
-            self._step_compile(
+            self._compile_backbone_variant(
                 num_tokens=num_tokens,
-                num_reqs_max_model_len=num_reqs_max_model_len,
-                max_pages_per_req=max_pages_per_req,
                 max_num_reqs=max_num_reqs,
-                padded_num_reqs=reqs_padd,
                 metadata=metadata,
             )
-            compilation_count += 1
-        for num_tokens, reqs_padd in extra_sampler_pairs:
-            progress.update(
-                compilation_count,
-                total_compilations,
-                f"Compiling [{compilation_count + 1}/{total_compilations}]: {num_tokens:5d} tokens, "
-                f"{reqs_padd:2d} padded requests",
+        backbone_progress.complete(f"All {len(model_tokens)} backbone compilations completed")
+
+        all_reqs_padds = sorted({int(r) for _, r in sampler_compile_pairs})
+        lm_head_progress = ProgressLogger("eSurge-head", logger)
+        total_phase2 = len(all_reqs_padds) + len(sampler_compile_pairs)
+        phase2_idx = 0
+        for reqs_padd in all_reqs_padds:
+            lm_head_progress.update(
+                phase2_idx,
+                total_phase2,
+                f"Compiling lm_head [{phase2_idx + 1}/{total_phase2}]: {reqs_padd:2d} padded requests",
+            )
+            self._compile_lm_head_variant(
+                padded_num_reqs=reqs_padd,
+                max_num_reqs=max_num_reqs,
+                metadata=metadata,
+            )
+            phase2_idx += 1
+        for num_tokens, reqs_padd in sampler_compile_pairs:
+            lm_head_progress.update(
+                phase2_idx,
+                total_phase2,
+                f"Compiling sampler [{phase2_idx + 1}/{total_phase2}]: "
+                f"{num_tokens:5d} tokens, {reqs_padd:2d} padded requests",
             )
             self._compile_sampler_variant(
                 num_tokens=num_tokens,
@@ -1391,66 +1398,76 @@ class ExecutionManager:
                 padded_num_reqs=reqs_padd,
                 metadata=metadata,
             )
-            compilation_count += 1
-        progress.complete(f"All {total_compilations} compilations completed")
+            phase2_idx += 1
+        lm_head_progress.complete(f"All {total_phase2} lm_head + sampler compilations completed")
 
-    def _step_compile(
+    def _compile_backbone_variant(
         self,
+        *,
         num_tokens: int,
-        num_reqs_max_model_len: int,
-        max_pages_per_req: int,
         max_num_reqs: int,
-        padded_num_reqs: int,
         metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig,
     ) -> None:
-        """Compile a single step configuration.
+        """Compile the backbone (transformer forward) for a token bucket.
 
-        Internal method that compiles functions for a specific combination of
-        token count and padded request count.
-
-        Args:
-            num_tokens: Number of tokens in this configuration.
-            num_reqs_max_model_len: Maximum number of requests at max model length.
-            max_pages_per_req: Maximum number of pages per request.
-            max_num_reqs: Maximum number of requests.
-            padded_num_reqs: Padded number of requests for this configuration.
-            metadata: Pages cache metadata.
-
-        Note:
-            This method is called internally by compile() for each configuration.
+        Keyed by ``num_tokens`` only.  Uses ``max_num_reqs`` as the dummy
+        ``padded_num_reqs`` so that metadata shapes are fixed.
         """
+        if self._model_executor.has_backbone(num_tokens):
+            return
+
         compargs = self.get_compile_configurations(
             self.kv_pages,
             self.rng_key,
             num_tokens,
             max_num_reqs,
-            padded_num_reqs,
+            max_num_reqs,  # padded_num_reqs = max_num_reqs (shapes are fixed)
             metadata,
         )
         graphdef, graphstate, graphother, inputs = compargs
-
-        mode = "aot" if self.use_aot_forward else "jit"
-        model_key = (num_tokens, padded_num_reqs, "model", mode)
-        if not self._model_executor.has(model_key):
-            model_out = self._model_executor.compile(
-                num_tokens=num_tokens,
-                padded_num_reqs=padded_num_reqs,
-                graphdef=graphdef,
-                graphstate=graphstate,
-                graphother=graphother,
-                inputs=inputs,
-            )
-            if model_out is not None:
-                self.kv_pages = model_out.kv_pages
-            if self.use_aot_forward:
-                warm_args = (graphstate, graphother, inputs)
-                self._debug_baselines[f"{num_tokens}_{padded_num_reqs}_hash_in_model"] = _tree_hash(warm_args)
-
-        self._compile_sampler_variant(
+        backbone_out = self._model_executor.compile_backbone(
             num_tokens=num_tokens,
-            max_num_reqs=max_num_reqs,
+            graphdef=graphdef,
+            graphstate=graphstate,
+            graphother=graphother,
+            inputs=inputs,
+        )
+        if backbone_out is not None:
+            self.kv_pages = backbone_out.kv_pages
+        if self.use_aot_forward:
+            warm_args = (graphstate, graphother, inputs)
+            self._debug_baselines[f"{num_tokens}_hash_in_backbone"] = _tree_hash(warm_args)
+
+    def _compile_lm_head_variant(
+        self,
+        *,
+        padded_num_reqs: int,
+        max_num_reqs: int,
+        metadata: RaggedPagesCacheConfig | UnifiedAttentionCacheConfig,
+    ) -> None:
+        """Compile the lm_head (gather + project) for a request bucket.
+
+        Keyed by ``padded_num_reqs`` only.
+        """
+        if self._model_executor.has_lm_head(padded_num_reqs):
+            return
+
+        # We need graphdef/graphstate/graphother for the lm_head compilation.
+        # num_tokens is irrelevant for lm_head — use max_num_reqs as a safe dummy.
+        compargs = self.get_compile_configurations(
+            self.kv_pages,
+            self.rng_key,
+            max_num_reqs,  # num_tokens (irrelevant for lm_head, just needs valid value)
+            max_num_reqs,
+            max_num_reqs,
+            metadata,
+        )
+        graphdef, graphstate, graphother, inputs = compargs
+        self._model_executor.compile_lm_head(
             padded_num_reqs=padded_num_reqs,
-            metadata=metadata,
+            graphdef=graphdef,
+            graphstate=graphstate,
+            graphother=graphother,
             inputs=inputs,
         )
 
@@ -1735,24 +1752,27 @@ class ExecutionManager:
         return self._batch_preparer.get_async_prep_result()
 
     def get_compiled_key(self, num_tokens: int, padded_num_reqs: int):
-        """Retrieve pre-compiled model step function for given input dimensions.
+        """Retrieve pre-compiled model and sampler functions for given input dimensions.
 
         Args:
             num_tokens: Number of tokens in the input batch.
             padded_num_reqs: Padded number of requests for batching.
 
         Returns:
-            Compiled fused step function for the specified number of tokens.
+            Tuple of (compiled_model_fn, compiled_sampler_fn).
         """
 
         mode = "aot" if self.use_aot_forward else "jit"
-        model_key = (num_tokens, padded_num_reqs, "model", mode)
-        sampler_key = (num_tokens, padded_num_reqs, "sampler", mode)
-        if self._model_executor.has(model_key):
-            logger.debug(f"[CACHE HIT] model_key={model_key}")
+        if self._model_executor.has_backbone(num_tokens):
+            logger.debug(f"[CACHE HIT] backbone num_tokens={num_tokens}")
         else:
-            logger.warning(f"[CACHE MISS] key={model_key}! Will trigger recompilation (model)")
+            logger.warning(f"[CACHE MISS] backbone num_tokens={num_tokens}! Will trigger recompilation")
             logger.warning(f"Available keys in cache: {self._model_executor.cache_keys()}")
+        if self._model_executor.has_lm_head(padded_num_reqs):
+            logger.debug(f"[CACHE HIT] lm_head padded_num_reqs={padded_num_reqs}")
+        else:
+            logger.warning(f"[CACHE MISS] lm_head padded_num_reqs={padded_num_reqs}! Will trigger recompilation")
+        sampler_key = (num_tokens, padded_num_reqs, "sampler", mode)
         if self._sampler_executor.has(sampler_key):
             logger.debug(f"[CACHE HIT] sampler_key={sampler_key}")
         else:

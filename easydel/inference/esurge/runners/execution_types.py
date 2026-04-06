@@ -318,6 +318,24 @@ class BatchMetadata:
 
 
 @auto_pytree(frozen=True)
+class BackboneOutputs:
+    """Outputs from the transformer backbone (forward pass without lm_head).
+
+    Separating the backbone from the lm_head allows the backbone to be
+    compiled once per ``num_tokens`` bucket, while the lm_head (which
+    gathers by ``logits_indices[padded_num_reqs]``) is compiled separately
+    per ``padded_num_reqs`` bucket.
+
+    Attributes:
+        kv_pages: Updated key-value cache pages after the forward pass.
+        hidden_states: Last-layer hidden states ``[num_tokens, hidden_dim]``.
+    """
+
+    kv_pages: HybridCache | RaggedPagesCache | UnifiedAttentionCache
+    hidden_states: jax.Array
+
+
+@auto_pytree(frozen=True)
 class ModelStepOutputs:
     """Outputs returned from the pure model forward pass.
 
