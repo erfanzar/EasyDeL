@@ -64,7 +64,7 @@ from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float, Int
 
-from easydel.axis import ATTN_DP
+from easydel.axis import ATTN_DP, resolve_attention_data_parallel_axis
 from easydel.utils.helpers import check_bool_flag
 
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, OperationsMetadata, unwrap_metadata
@@ -82,6 +82,11 @@ MODE_PREFILL = common_types.MODE_PREFILL
 logger = get_logger(__name__)
 
 PERMITTED_KV_KERNELS = check_bool_flag("PERMITTED_KV_KERNELS")
+
+
+def _attention_dp_axis(partition_manager: PartitionManager):
+    """Resolve the concrete mesh axis used for KV-page data parallelism."""
+    return resolve_attention_data_parallel_axis(partition_manager, mode=MODE_PREFILL)
 
 
 def cdiv(a: int, b: int) -> int:
@@ -457,7 +462,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
         physical_kv_head_size = _mesh_axis_size(mesh, physical_kv_head_axis)
         kv_head_size = physical_kv_head_size if kv_head_shards is None else max(1, int(kv_head_shards))
         budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
-        page_axis_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
+        page_axis_size = _mesh_axis_size(mesh, _attention_dp_axis(partition_manager))
         available_alloc = budget * kv_head_size * page_axis_size
         effective_kv_head_axis = physical_kv_head_axis if kv_head_size > 1 else "replicated"
         logger.info(
@@ -531,7 +536,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             raise ValueError("`num_kv_heads` must be positive")
         if kv_head_dim_size is None or kv_head_dim_size <= 0:
             raise ValueError("`kv_head_dim_size` must be positive")
-        data_parallel_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
+        data_parallel_size = _mesh_axis_size(mesh, _attention_dp_axis(partition_manager))
         physical_kv_head_size = _mesh_axis_size(mesh, partition_manager.paxis.kv_head_axis)
         kvdtype = _canonicalize_dtype(kvdtype)
         kvdtype, effective_kv_head_shards = _resolve_ragged_cache_layout(
@@ -862,7 +867,7 @@ class RaggedPagesCacheView(BaseCacheView):
                 # Keep shard_map enabled so each shard can derive its own page index.
                 use_shardmap = True
 
-            data_parallel_axis = self.partition_manager.paxis.data_parallel_axis
+            data_parallel_axis = _attention_dp_axis(self.partition_manager)
 
             def _update_fn(
                 kv: Float[Array, "num_tokens num_kv_heads_x2 head_dim"],

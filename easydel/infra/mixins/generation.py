@@ -67,6 +67,7 @@ from jax import numpy as jnp
 from jaxtyping import Array
 from transformers.generation.configuration_utils import GenerationConfig
 
+from easydel.axis import resolve_attention_data_parallel_axis
 from easydel.caching import (
     MLARaggedPagesCache,
     MLARaggedPagesCacheConfig,
@@ -444,7 +445,7 @@ def _create_mixed_standard_ragged_page_cache_configs(
 
     kvdtype = _canonicalize_dtype(dtype)
     requested_kvdtype = kvdtype
-    data_parallel_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
+    data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
     physical_kv_head_shards = _mesh_axis_size(mesh, partition_manager.paxis.kv_head_axis)
     effective_kv_head_shards = physical_kv_head_shards
 
@@ -620,7 +621,7 @@ def _create_mixed_standard_unified_attention_cache_configs(
     partition_manager = text_config.partition_manager
     mesh = text_config.mesh
     kvdtype = dtype
-    data_parallel_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
+    data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
     bytes_av = jnp.finfo(kvdtype).bits // 8
 
     if num_pages_override is None:
@@ -742,7 +743,7 @@ def _create_mixed_turboquant_ragged_page_cache_configs(
     geometries = _resolve_standard_ragged_layer_geometries(text_config=text_config, layer_indices=layer_indices)
     partition_manager = text_config.partition_manager
     mesh = text_config.mesh
-    data_parallel_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
+    data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
     kv_head_size = _mesh_axis_size(mesh, partition_manager.paxis.kv_head_axis)
 
     def _page_bytes(num_kv_heads: int, head_dim: int) -> int:
@@ -3062,7 +3063,9 @@ class EasyGenerationMixin:
                 param = valid_params[name]
                 if param.annotation != inspect.Parameter.empty:
                     try:
-                        if getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None:  # pyright: ignore[reportDeprecated]
+                        if (
+                            getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None
+                        ):  # pyright: ignore[reportDeprecated]
                             expected_type = param.annotation.__args__[0]
                             if not isinstance(value, expected_type):
                                 print(

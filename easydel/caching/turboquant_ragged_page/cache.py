@@ -39,7 +39,7 @@ from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float
 
-from easydel.axis import ATTN_DP
+from easydel.axis import ATTN_DP, resolve_attention_data_parallel_axis
 from easydel.layers.quantization import TurboQuantConfig, TurboQuantConstants
 
 from .._abstracts import OperationsMetadata
@@ -108,7 +108,7 @@ class TurboQuantRaggedPagesCacheConfig(RaggedPagesCacheConfig):
         Returns:
             Configured TurboQuantRaggedPagesCacheConfig.
         """
-        data_parallel_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
+        data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
         kv_head_size = _mesh_axis_size(mesh, partition_manager.paxis.kv_head_axis)
 
         budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")

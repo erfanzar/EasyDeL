@@ -245,25 +245,33 @@ def _mesh_shape_ep(mesh, pm, fsdp_is_ep_bound, sp_is_ep_bound):
         _resolve_eformer_axis(SP, pm),
     )
 
-    # Resolve sizes
-    odpsize, ofsdpsize, oepsize, otpsize, ospsize = (
-        mesh.shape.get(dpname, 1),
-        mesh.shape.get(fsdpname, 1),
-        mesh.shape.get(epname, 1),
-        mesh.shape.get(tpname, 1),
-        mesh.shape.get(spname, 1),
-    )
+    axis_sizes = mesh.shape
+    assigned_axes: dict[str, str] = {}
+    size_by_group = {"dp": 1, "ep": 1, "tp": 1}
 
-    epsize = oepsize
-    if fsdp_is_ep_bound:
-        epsize *= ofsdpsize
-    else:
-        odpsize *= ofsdpsize
+    def assign_axis(axis_name: str | None, group: str) -> None:
+        if axis_name is None:
+            return
 
-    if sp_is_ep_bound:
-        epsize *= ospsize
-    else:
-        odpsize *= ospsize
+        existing_group = assigned_axes.get(axis_name)
+        if existing_group is not None:
+            return
+
+        assigned_axes[axis_name] = group
+        size_by_group[group] *= axis_sizes.get(axis_name, 1)
+
+    # Give dedicated TP/EP axes priority, then place DP and any bound axes.
+    # This keeps the folded mesh shape valid when multiple semantic roles alias
+    # the same physical mesh dimension.
+    assign_axis(tpname, "tp")
+    assign_axis(epname, "ep")
+    assign_axis(dpname, "dp")
+    assign_axis(fsdpname, "ep" if fsdp_is_ep_bound else "dp")
+    assign_axis(spname, "ep" if sp_is_ep_bound else "dp")
+
+    odpsize = size_by_group["dp"]
+    epsize = size_by_group["ep"]
+    otpsize = size_by_group["tp"]
     return (odpsize, epsize, otpsize), (dpname, epname, tpname)
 
 
