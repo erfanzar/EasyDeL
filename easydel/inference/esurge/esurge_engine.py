@@ -463,6 +463,32 @@ class eSurge(
         ...     print(output.delta_text, end="", flush=True)
     """
 
+    @staticmethod
+    def _auto_detect_tool_parser(
+        *,
+        tokenizer: PreTrainedTokenizerBase | None,
+        model_type: str | None,
+    ) -> ToolParserName | None:
+        """Infer the tool parser from tokenizer/template hints and model type."""
+
+        from easydel.inference.tools.auto_detect import detect_tool_parser
+
+        detected = detect_tool_parser(model_type=model_type, tokenizer=tokenizer)
+        return detected or None
+
+    @staticmethod
+    def _auto_detect_reasoning_parser_name(
+        *,
+        tokenizer: PreTrainedTokenizerBase | None,
+        model_type: str | None,
+    ) -> ReasoningParserName | None:
+        """Infer the reasoning parser from tokenizer/template hints and model type."""
+
+        from easydel.inference.reasoning.auto_detect import detect_reasoning_parser
+
+        detected = detect_reasoning_parser(model_type=model_type, tokenizer=tokenizer)
+        return detected or None
+
     def __init__(
         self,
         model: str | EasyDeLBaseModule,
@@ -526,6 +552,7 @@ class eSurge(
         distributed_step_timeout_s: float = 30.0,
         distributed_connect_timeout_s: float = 15.0,
         distributed_verify_sampling_digest: bool = True,
+        enable_window_aware_runtime_cap: bool = False,
         **kwargs,
     ):
         """Initialize the eSurge engine.
@@ -649,6 +676,10 @@ class eSurge(
             distributed_connect_timeout_s: Worker connect/handshake timeout.
             distributed_verify_sampling_digest: Validate sampled-token digest
                 from workers against leader output each step.
+            enable_window_aware_runtime_cap: Whether to derive the runtime
+                request cap from the model's live KV-window page demand.
+                When False, eSurge falls back to the cache metadata's
+                heuristic request-cap estimate instead.
             **kwargs: Additional configuration passed to model loading.
 
         Raises:
@@ -670,6 +701,7 @@ class eSurge(
 
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
+        self.enable_window_aware_runtime_cap = bool(enable_window_aware_runtime_cap)
         self.page_size = page_size
         self.data_parallelism_axis = _normalize_data_parallelism_axis(data_parallelism_axis)
         register_attention_data_parallel_axis(self.data_parallelism_axis)
@@ -812,50 +844,6 @@ class eSurge(
         self._idle_reset_last_reset = 0.0
         self._idle_monitor_event = threading.Event()
         self._idle_monitor_thread: threading.Thread | None = None
-
-        # Tool calling and reasoning parser initialization with auto-detection
-        _model_type: str | None = None
-        if not isinstance(model, str) and hasattr(model, "config"):
-            _model_type = getattr(model.config, "model_type", None)
-
-        if tool_parser is None and _model_type is not None:
-            from easydel.inference.tools.auto_detect import detect_tool_parser
-
-            _detected = detect_tool_parser(model_type=_model_type, tokenizer=self.tokenizer)
-            if _detected:
-                tool_parser = _detected
-
-        if reasoning_parser is None and _model_type is not None:
-            from easydel.inference.reasoning.auto_detect import detect_reasoning_parser
-
-            _detected = detect_reasoning_parser(model_type=_model_type, tokenizer=self.tokenizer)
-            if _detected:
-                reasoning_parser = _detected
-
-        self.tool_parser_name = tool_parser
-        self.reasoning_parser_name = reasoning_parser
-        self._tool_parser_class = None
-        self._reasoning_parser_class = None
-
-        if tool_parser:
-            try:
-                from easydel.inference.tools import ToolParserManager
-
-                self._tool_parser_class = ToolParserManager.get_tool_parser(tool_parser)
-                if not silent_mode:
-                    logger.info("Initialized tool parser: %s", tool_parser)
-            except KeyError:
-                logger.warning("Tool parser '%s' not found, function calling disabled", tool_parser)
-
-        if reasoning_parser:
-            try:
-                from easydel.inference.reasoning import ReasoningParserManager
-
-                self._reasoning_parser_class = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
-                if not silent_mode:
-                    logger.info("Initialized reasoning parser: %s", reasoning_parser)
-            except KeyError:
-                logger.warning("Reasoning parser '%s' not found, reasoning disabled", reasoning_parser)
 
         tokenizer_endpoint = tokenizer_endpoint or os.environ.get("EASURGE_TOKENIZER_ENDPOINT")
         detokenizer_endpoint = detokenizer_endpoint or os.environ.get("EASURGE_DETOKENIZER_ENDPOINT")
@@ -1005,6 +993,43 @@ class eSurge(
         if self._multimodal_manager is not None and self._multimodal_manager.model is None:
             self._multimodal_manager.model = model
 
+        detected_model_type = getattr(getattr(model, "config", None), "model_type", None)
+        if tool_parser is None:
+            tool_parser = self._auto_detect_tool_parser(
+                tokenizer=self.tokenizer,
+                model_type=detected_model_type,
+            )
+        if reasoning_parser is None:
+            reasoning_parser = self._auto_detect_reasoning_parser_name(
+                tokenizer=self.tokenizer,
+                model_type=detected_model_type,
+            )
+
+        self.tool_parser = tool_parser
+        self.reasoning_parser_name = reasoning_parser
+        self._tool_parser_class = None
+        self._reasoning_parser_class = None
+
+        if tool_parser:
+            try:
+                from easydel.inference.tools import ToolParserManager
+
+                self._tool_parser_class = ToolParserManager.get_tool_parser(tool_parser)
+                if not silent_mode:
+                    logger.info("Initialized tool parser: %s", tool_parser)
+            except KeyError:
+                logger.warning("Tool parser '%s' not found, function calling disabled", tool_parser)
+
+        if reasoning_parser:
+            try:
+                from easydel.inference.reasoning import ReasoningParserManager
+
+                self._reasoning_parser_class = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
+                if not silent_mode:
+                    logger.info("Initialized reasoning parser: %s", reasoning_parser)
+            except KeyError:
+                logger.warning("Reasoning parser '%s' not found, reasoning disabled", reasoning_parser)
+
         if max_num_batched_tokens is NOT_GIVEN and jax.default_backend() == "gpu":
             max_num_batched_tokens = min(max(2048, max_num_seqs), max_model_len)
             logger.info(
@@ -1036,6 +1061,7 @@ class eSurge(
             page_size=page_size,
             max_model_len=max_model_len,
             max_num_batched_tokens=max_num_batched_tokens,
+            enable_window_aware_runtime_cap=enable_window_aware_runtime_cap,
             min_input_pad=min_input_pad,
             max_num_seqs=max_num_seqs,
             max_num_seq_buckets=max_num_seq_buckets,
@@ -1159,6 +1185,7 @@ class eSurge(
                     if self.scheduler.max_num_scheduled_tokens is not None
                     else None
                 ),
+                "enable_window_aware_runtime_cap": bool(self.enable_window_aware_runtime_cap),
                 "scheduler_policy": str(
                     self.scheduler.policy.value if hasattr(self.scheduler.policy, "value") else self.scheduler.policy
                 ),
@@ -1397,6 +1424,7 @@ class eSurge(
             f"max_model_len={self.max_model_len}",
             f"max_num_seqs={self.max_num_seqs}",
             f"page_size={self.page_size}",
+            f"enable_window_aware_runtime_cap={self.enable_window_aware_runtime_cap}",
             f"data_parallelism_axis={self.data_parallelism_axis!r}",
             f"reserve_tokens={self.reserve_tokens}",
             f"auto_truncate_prompt={self.auto_truncate_prompt}",

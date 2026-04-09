@@ -301,6 +301,7 @@ def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
     hbm_utilization_val = es.get("hbm_utilization")
     use_aot_forward_val = es.get("use_aot_forward")
     bind_graphstate_for_aot_val = es.get("bind_graphstate_for_aot")
+    enable_window_aware_runtime_cap_val = es.get("enable_window_aware_runtime_cap")
     enable_prefix_caching_val = es.get("enable_prefix_caching")
     auto_shard_model_val = es.get("auto_shard_model")
     compile_runner_val = es.get("compile_runner")
@@ -385,6 +386,9 @@ def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
         page_size=int(page_size_val) if page_size_val is not None else 128,
         use_aot_forward=True if use_aot_forward_val is None else bool(use_aot_forward_val),
         bind_graphstate_for_aot=False if bind_graphstate_for_aot_val is None else bool(bind_graphstate_for_aot_val),
+        enable_window_aware_runtime_cap=(
+            False if enable_window_aware_runtime_cap_val is None else bool(enable_window_aware_runtime_cap_val)
+        ),
         enable_prefix_caching=True if enable_prefix_caching_val is None else bool(enable_prefix_caching_val),
         auto_shard_model=True if auto_shard_model_val is None else bool(auto_shard_model_val),
         sharding_axis_dims=sharding_axis_dims,

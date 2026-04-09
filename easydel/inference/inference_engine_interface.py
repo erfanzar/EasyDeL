@@ -33,7 +33,6 @@ import json
 import time
 import traceback
 import typing as tp
-import uuid
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
@@ -53,13 +52,36 @@ from pydantic import BaseModel, Field
 from .openai_api_modules import (
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatMessage,
     CompletionRequest,
     CompletionResponse,
+    ConversationReference,
     DeltaMessage,
     FunctionCallFormat,
+    FunctionDefinition,
     ResponsesRequest,
+    ToolDefinition,
 )
 from .sampling_params import SamplingParams
+from .stream_protocol import (
+    build_responses_function_call_items,
+    build_responses_message_item,
+    build_responses_object,
+    build_responses_output_items,
+    build_responses_reasoning_item,
+    coerce_stream_delta_message,
+    compute_stream_delta_text,
+    jsonify_tool_calls,
+    responses_assistant_message_from_output_items,
+    should_emit_responses_message_item,
+)
+from .typed_models import (
+    ResponseFunctionCallItem,
+    ResponseMessageItem,
+    ResponseReasoningItem,
+    ResponsesOutputItem,
+    ResponsesResponse,
+)
 
 if tp.TYPE_CHECKING:
     from ..utils import ReturnSample
@@ -649,47 +671,18 @@ class BaseInferenceApiServer(ABC):
         full accumulated text rather than relying on potentially incomplete
         ``delta_text`` values supplied by an inference engine.
         """
-
-        current_text = current_text or ""
-        previous_text = previous_text or ""
-        fallback_delta = fallback_delta or ""
-
-        if current_text.startswith(previous_text):
-            # If accumulated text did not grow, emit nothing. Replaying fallback
-            # deltas here can duplicate previously streamed content.
-            delta_text = current_text[len(previous_text) :]
-        else:
-            if not current_text and previous_text and not fallback_delta:
-                # Some tool parsers retroactively strip protocol markup, causing
-                # content snapshots to collapse to empty. Treat this as a
-                # no-op delta instead of warning every token tick.
-                return ""
-            max_overlap = min(len(previous_text), len(current_text))
-            for overlap in range(max_overlap, 0, -1):
-                if previous_text.endswith(current_text[:overlap]):
-                    return current_text[overlap:]
-            if len(current_text) < len(previous_text):
-                # Parser normalization can rewrite previous snapshots into a
-                # shorter canonical form. Suppress warnings in this benign case.
-                if fallback_delta and not previous_text.endswith(fallback_delta):
-                    return fallback_delta
-                return ""
-            if previous_text:
-                logger.warning(
-                    "Accumulated text doesn't start with previous text. "
-                    "prev_len=%s, curr_len=%s. This may indicate state corruption or generation reset.",
-                    len(previous_text),
-                    len(current_text),
-                )
-            delta_text = fallback_delta or current_text
-
-        if not delta_text and not previous_text:
-            delta_text = current_text
-
-        return delta_text
+        return compute_stream_delta_text(current_text, previous_text, fallback_delta)
 
     @asynccontextmanager
-    async def _acquire_generation_slot(self) -> AsyncIterator[None]:
+    async def _acquire_generation_slot(
+        self,
+        *,
+        endpoint: str | None = None,
+        request_id: str | None = None,
+        model: str | None = None,
+        raw_request: Request | None = None,
+        stream: bool | None = None,
+    ) -> AsyncIterator[None]:
         """Acquire a generation slot or raise HTTP 503 when the server is saturated."""
 
         queue = self._generation_slots
@@ -700,6 +693,43 @@ class BaseInferenceApiServer(ABC):
         try:
             token = queue.get_nowait()
         except asyncio.QueueEmpty as e:
+            client = getattr(raw_request, "client", None)
+            client_host = getattr(client, "host", None)
+            client_port = getattr(client, "port", None)
+            forwarded_for = None
+            headers = getattr(raw_request, "headers", None)
+            if headers is not None and hasattr(headers, "get"):
+                forwarded_for = headers.get("x-forwarded-for")
+
+            available_generation_slots = queue.qsize()
+            max_generation_slots = int(getattr(self, "_max_generation_slots", 0) or 0)
+            active_generation_slots = (
+                max(0, max_generation_slots - available_generation_slots) if max_generation_slots > 0 else None
+            )
+            status_value = getattr(self, "status", None)
+            if status_value is not None:
+                status_value = getattr(status_value, "value", status_value)
+
+            logger.warning(
+                "Rejecting request with HTTP 503 because all generation slots are busy. "
+                "endpoint=%s request_id=%s model=%s stream=%s client_host=%s client_port=%s "
+                "forwarded_for=%s server_status=%s active_http_requests=%s "
+                "max_generation_slots=%s available_generation_slots=%s active_generation_slots=%s "
+                "overload_message=%s",
+                endpoint,
+                request_id,
+                model,
+                stream,
+                client_host,
+                client_port,
+                forwarded_for,
+                status_value,
+                len(getattr(self, "_active_requests", ()) or ()),
+                max_generation_slots,
+                available_generation_slots,
+                active_generation_slots,
+                self._overload_message,
+            )
             raise HTTPException(status_code=HTTPStatus.SERVICE_UNAVAILABLE, detail=self._overload_message) from e
 
         try:
@@ -720,14 +750,21 @@ class BaseInferenceApiServer(ABC):
         queue: asyncio.Queue[tuple[str, tp.Any]] = asyncio.Queue()
 
         def _producer() -> None:
+            _QUEUE_TIMEOUT = 30  # seconds; prevents indefinite hang if event loop stalls
             try:
                 for output in stream_fn():
-                    asyncio.run_coroutine_threadsafe(queue.put(("data", output)), loop).result()
+                    asyncio.run_coroutine_threadsafe(queue.put(("data", output)), loop).result(timeout=_QUEUE_TIMEOUT)
             except Exception as exc:
                 exc.__stream_producer_traceback__ = traceback.format_exc()
-                asyncio.run_coroutine_threadsafe(queue.put(("error", exc)), loop).result()
+                try:
+                    asyncio.run_coroutine_threadsafe(queue.put(("error", exc)), loop).result(timeout=_QUEUE_TIMEOUT)
+                except Exception:
+                    pass  # If we can't report the error, at least send the end signal
             finally:
-                asyncio.run_coroutine_threadsafe(queue.put(("end", None)), loop).result()
+                try:
+                    asyncio.run_coroutine_threadsafe(queue.put(("end", None)), loop).result(timeout=_QUEUE_TIMEOUT)
+                except Exception:
+                    pass  # Best-effort; consumer will eventually time out
 
         self.thread_pool.submit(_producer)
         return queue
@@ -738,6 +775,10 @@ class BaseInferenceApiServer(ABC):
 
         if isinstance(value, str):
             return value.strip() or None
+        if isinstance(value, ConversationReference):
+            conv_id = value.id or value.conversation_id or value.conversation
+            if isinstance(conv_id, str):
+                return conv_id.strip() or None
         if isinstance(value, dict):
             conv_id = value.get("id") or value.get("conversation_id") or value.get("conversation")
             if isinstance(conv_id, str):
@@ -756,20 +797,20 @@ class BaseInferenceApiServer(ABC):
 
     @staticmethod
     def _conversation_from_messages(
-        messages: list[dict[str, tp.Any]],
-        assistant_turn: str | dict[str, tp.Any],
+        messages: list[ChatMessage],
+        assistant_turn: str | ChatMessage,
     ) -> list[dict[str, tp.Any]]:
         """Create conversation items (excluding ``instructions``) for storage."""
 
-        history = list(messages)
-        if isinstance(assistant_turn, dict):
-            history.append(assistant_turn)
+        history = [message.model_dump(exclude_none=True) for message in messages]
+        if isinstance(assistant_turn, ChatMessage):
+            history.append(assistant_turn.model_dump(exclude_none=True))
         else:
             history.append({"role": "assistant", "content": assistant_turn})
         return history
 
     @staticmethod
-    def _responses_reasoning_summary_requested(payload: dict[str, tp.Any]) -> bool:
+    def _responses_reasoning_summary_requested(request: ResponsesRequest) -> bool:
         """Return True when reasoning summaries should be emitted in output items.
 
         Behavior is default-on for local OpenAI-mock parity goals and can be
@@ -777,7 +818,7 @@ class BaseInferenceApiServer(ABC):
         ``reasoning.summary`` values like ``"none"``/``false``.
         """
 
-        include = payload.get("include")
+        include = request.include
         if isinstance(include, list):
             for entry in include:
                 if not isinstance(entry, str):
@@ -786,11 +827,11 @@ class BaseInferenceApiServer(ABC):
                 if normalized == "reasoning" or normalized.startswith("reasoning.summary"):
                     return True
 
-        reasoning = payload.get("reasoning")
+        reasoning = request.reasoning
         if isinstance(reasoning, bool):
             return reasoning
-        if isinstance(reasoning, dict):
-            summary = reasoning.get("summary")
+        if reasoning is not None:
+            summary = reasoning.summary
             if summary is None:
                 return True
             if isinstance(summary, bool):
@@ -802,11 +843,44 @@ class BaseInferenceApiServer(ABC):
         return True
 
     @staticmethod
+    def _normalize_chat_message(message: ChatMessage) -> ChatMessage:
+        """Canonicalize multimodal/text content parts in a typed chat message."""
+
+        content = message.content
+        if not isinstance(content, list):
+            return message.model_copy(deep=True)
+
+        normalized_parts: list[dict[str, tp.Any]] = []
+        for part in content:
+            if not isinstance(part, dict):
+                normalized_parts.append({"type": "text", "text": str(part)})
+                continue
+
+            part_type = part.get("type")
+            if part_type in {"input_text", "output_text"}:
+                normalized_parts.append({"type": "text", "text": part.get("text", part.get("content", ""))})
+            elif part_type == "text":
+                normalized_parts.append({"type": "text", "text": part.get("text", "")})
+            elif part_type == "input_image":
+                image_url = part.get("image_url") or part.get("image") or part.get("url")
+                if image_url is not None:
+                    normalized_parts.append({"type": "image_url", "image_url": image_url})
+            elif part_type == "input_video":
+                video = part.get("video")
+                if video is not None:
+                    normalized_parts.append({"type": "video", "video": video})
+            else:
+                normalized_parts.append(part)
+
+        return message.model_copy(update={"content": normalized_parts})
+
+    @classmethod
     def _responses_payload_to_messages(
-        payload: dict[str, tp.Any],
+        cls,
+        request: ResponsesRequest,
         *,
         include_instructions: bool = False,
-    ) -> list[dict[str, tp.Any]]:
+    ) -> list[ChatMessage]:
         """Convert OpenAI Responses API payload into OpenAI-style chat messages.
 
         Notes:
@@ -815,29 +889,40 @@ class BaseInferenceApiServer(ABC):
               implementing multi-turn state via ``previous_response_id``.
         """
 
-        messages: list[dict[str, tp.Any]] = []
+        messages: list[ChatMessage] = []
 
         if include_instructions:
-            instructions = payload.get("instructions")
+            instructions = request.instructions
             if isinstance(instructions, str) and instructions.strip():
-                messages.append({"role": "system", "content": instructions})
+                messages.append(ChatMessage(role="system", content=instructions.strip()))
 
-        if isinstance(payload.get("messages"), list):
-            messages.extend(tp.cast(list[dict[str, tp.Any]], payload["messages"]))
+        if request.messages:
+            messages.extend(cls._normalize_chat_message(message) for message in request.messages)
         else:
-            input_value = payload.get("input")
+            input_value = request.input
             if isinstance(input_value, str):
-                messages.append({"role": "user", "content": input_value})
+                messages.append(ChatMessage(role="user", content=input_value))
             elif isinstance(input_value, list):
-                if all(isinstance(item, dict) and "role" in item for item in input_value):
-                    messages.extend(tp.cast(list[dict[str, tp.Any]], input_value))
+                if all(
+                    (isinstance(item, ChatMessage)) or (isinstance(item, dict) and "role" in item)
+                    for item in input_value
+                ):
+                    for item in input_value:
+                        if isinstance(item, ChatMessage):
+                            messages.append(cls._normalize_chat_message(item))
+                        else:
+                            messages.append(cls._normalize_chat_message(ChatMessage.model_validate(item)))
                 elif all(isinstance(item, dict) and "type" in item for item in input_value):
                     for item in tp.cast(list[dict[str, tp.Any]], input_value):
                         item_type = str(item.get("type", "")).strip().lower()
                         if item_type == "message":
                             role = item.get("role")
                             role_value = str(role).strip() if isinstance(role, str) and role.strip() else "user"
-                            messages.append({"role": role_value, "content": item.get("content", "")})
+                            messages.append(
+                                cls._normalize_chat_message(
+                                    ChatMessage(role=role_value, content=item.get("content", ""))
+                                )
+                            )
                             continue
 
                         if item_type == "function_call_output":
@@ -853,9 +938,9 @@ class BaseInferenceApiServer(ABC):
                             else:
                                 output_text = str(output_value)
 
-                            tool_msg: dict[str, tp.Any] = {"role": "tool", "content": output_text}
+                            tool_msg = ChatMessage(role="tool", content=output_text)
                             if call_id is not None:
-                                tool_msg["tool_call_id"] = str(call_id)
+                                tool_msg.tool_call_id = str(call_id)
                             messages.append(tool_msg)
                             continue
 
@@ -863,50 +948,24 @@ class BaseInferenceApiServer(ABC):
                             text_value = item.get("text")
                             if text_value is None:
                                 text_value = item.get("content", "")
-                            messages.append({"role": "user", "content": str(text_value)})
+                            messages.append(ChatMessage(role="user", content=str(text_value)))
                             continue
 
-                        messages.append({"role": "user", "content": item})
+                        messages.append(ChatMessage(role="user", content=json.dumps(item, ensure_ascii=False)))
                 else:
-                    messages.append({"role": "user", "content": input_value})
+                    messages.append(ChatMessage(role="user", content=json.dumps(input_value, ensure_ascii=False)))
             elif input_value is not None:
-                messages.append({"role": "user", "content": str(input_value)})
-
-        for msg in messages:
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            normalized_parts: list[dict[str, tp.Any]] = []
-            for part in content:
-                if not isinstance(part, dict):
-                    normalized_parts.append({"type": "text", "text": str(part)})
-                    continue
-                part_type = part.get("type")
-                if part_type in {"input_text", "output_text"}:
-                    normalized_parts.append({"type": "text", "text": part.get("text", part.get("content", ""))})
-                elif part_type == "text":
-                    normalized_parts.append({"type": "text", "text": part.get("text", "")})
-                elif part_type == "input_image":
-                    image_url = part.get("image_url") or part.get("image") or part.get("url")
-                    if image_url is not None:
-                        normalized_parts.append({"type": "image_url", "image_url": image_url})
-                elif part_type == "input_video":
-                    video = part.get("video")
-                    if video is not None:
-                        normalized_parts.append({"type": "video", "video": video})
-                else:
-                    normalized_parts.append(part)
-            msg["content"] = normalized_parts
+                messages.append(ChatMessage(role="user", content=str(input_value)))
 
         return messages
 
     @staticmethod
-    def _flatten_messages_to_text(messages: list[dict[str, tp.Any]]) -> list[dict[str, tp.Any]]:
+    def _flatten_messages_to_text(messages: list[ChatMessage]) -> list[ChatMessage]:
         """Collapse content arrays into plain text for tool parsing and templating."""
 
-        flattened: list[dict[str, tp.Any]] = []
+        flattened: list[ChatMessage] = []
         for msg in messages:
-            content = msg.get("content")
+            content = msg.content
             if isinstance(content, list):
                 text_parts: list[str] = []
                 for part in content:
@@ -914,30 +973,31 @@ class BaseInferenceApiServer(ABC):
                         part_type = part.get("type")
                         if part_type in ("text", "input_text"):
                             text_parts.append(str(part.get("text", "")))
-                flattened.append({**msg, "content": " ".join(part_text for part_text in text_parts if part_text)})
+                flattened.append(
+                    msg.model_copy(update={"content": " ".join(part_text for part_text in text_parts if part_text)})
+                )
             else:
-                flattened.append(msg)
+                flattened.append(msg.model_copy(deep=True))
         return flattened
 
     @staticmethod
-    def _extract_responses_tools(payload: dict[str, tp.Any]) -> tuple[list[dict[str, tp.Any]] | None, list[dict] | None]:
+    def _extract_responses_tools(
+        request: ResponsesRequest,
+    ) -> tuple[list[ToolDefinition | FunctionDefinition] | None, list[dict[str, tp.Any]] | None]:
         """Return (raw_tools, tools_for_chat_template) from a Responses payload."""
 
-        raw_tools = payload.get("tools") or payload.get("functions")
-        if not isinstance(raw_tools, list) or not raw_tools:
+        raw_tools = request.tools or request.functions
+        if not raw_tools:
             return None, None
 
-        tools_for_template: list[dict] = []
+        tools_for_template: list[dict[str, tp.Any]] = []
         for tool in raw_tools:
-            if not isinstance(tool, dict):
-                continue
-            fn = tool.get("function")
-            if isinstance(fn, dict):
-                tools_for_template.append(fn)
-            elif isinstance(tool, dict):
-                tools_for_template.append(tool)
+            if isinstance(tool, ToolDefinition):
+                tools_for_template.append(tool.function.model_dump(exclude_none=True))
+            else:
+                tools_for_template.append(tool.model_dump(exclude_none=True))
 
-        return tp.cast(list[dict[str, tp.Any]], raw_tools), tools_for_template or None
+        return list(raw_tools), tools_for_template or None
 
     def _infer_sequence_length_from_engine(self, engine: tp.Any | None = None) -> int:
         """Infer maximum sequence length from the engine or fall back to 128 tokens."""
@@ -949,14 +1009,14 @@ class BaseInferenceApiServer(ABC):
                 pass
         return 128
 
-    def _parse_responses_max_tokens(self, payload: dict[str, tp.Any], engine: tp.Any | None) -> tuple[int, int | None]:
+    def _parse_responses_max_tokens(self, request: ResponsesRequest, engine: tp.Any | None) -> tuple[int, int | None]:
         """Return (requested_tokens_for_auth, max_tokens_for_sampling)."""
 
-        raw_value = payload.get("max_output_tokens")
+        raw_value = request.max_output_tokens
         if raw_value is None:
-            raw_value = payload.get("max_tokens")
+            raw_value = request.max_tokens
         if raw_value is None:
-            raw_value = payload.get("max_completion_tokens")
+            raw_value = request.max_completion_tokens
 
         if raw_value is None:
             return self._infer_sequence_length_from_engine(engine), None
@@ -972,11 +1032,11 @@ class BaseInferenceApiServer(ABC):
         return parsed, parsed or None
 
     @staticmethod
-    def _create_sampling_params_from_responses(payload: dict[str, tp.Any], max_tokens: int | None) -> SamplingParams:
+    def _create_sampling_params_from_responses(request: ResponsesRequest, max_tokens: int | None) -> SamplingParams:
         """Translate a Responses API payload into SamplingParams."""
 
-        temperature = payload.get("temperature", 1.0)
-        top_p = payload.get("top_p", 1.0)
+        temperature = 1.0 if request.temperature is None else request.temperature
+        top_p = 1.0 if request.top_p is None else request.top_p
 
         try:
             temperature_f = float(temperature)
@@ -989,10 +1049,10 @@ class BaseInferenceApiServer(ABC):
         except (TypeError, ValueError):
             top_p_f = 1.0
 
-        stop = payload.get("stop")
-        n = payload.get("n", 1)
+        stop = request.stop
+        n = 1 if request.n is None else request.n
 
-        raw_top_k = payload.get("top_k")
+        raw_top_k = request.top_k
         try:
             top_k = int(raw_top_k) if raw_top_k is not None else 0
         except (TypeError, ValueError):
@@ -1004,71 +1064,34 @@ class BaseInferenceApiServer(ABC):
             max_tokens=max_tokens,
             temperature=temperature_f,
             top_p=top_p_f,
-            presence_penalty=float(payload.get("presence_penalty", 0.0) or 0.0),
-            frequency_penalty=float(payload.get("frequency_penalty", 0.0) or 0.0),
-            repetition_penalty=float(payload.get("repetition_penalty", 1.0) or 1.0),
+            presence_penalty=float(request.presence_penalty or 0.0),
+            frequency_penalty=float(request.frequency_penalty or 0.0),
+            repetition_penalty=float(request.repetition_penalty or 1.0),
             top_k=top_k,
-            min_p=float(payload.get("min_p", 0.0) or 0.0),
+            min_p=float(request.min_p or 0.0),
             n=int(n or 1),
             stop=stop,
         )
 
     @staticmethod
-    def _build_responses_reasoning_item(reasoning_text: str) -> dict[str, tp.Any]:
-        return {
-            "id": f"rs_{uuid.uuid4().hex}",
-            "type": "reasoning",
-            "summary": [{"type": "summary_text", "text": reasoning_text}],
-        }
+    def _build_responses_reasoning_item(reasoning_text: str) -> ResponseReasoningItem:
+        return build_responses_reasoning_item(reasoning_text)
 
     @staticmethod
-    def _build_responses_function_call_items(tool_calls: list[tp.Any] | None) -> list[dict[str, tp.Any]]:
-        if not tool_calls:
-            return []
-
-        items: list[dict[str, tp.Any]] = []
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            function = tool_call.get("function")
-            if not isinstance(function, dict):
-                continue
-
-            name = function.get("name")
-            if not isinstance(name, str) or not name.strip():
-                continue
-
-            arguments = function.get("arguments", "")
-            if isinstance(arguments, (dict, list)):
-                arguments_text = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
-            else:
-                arguments_text = "" if arguments is None else str(arguments)
-
-            call_id = tool_call.get("id") or tool_call.get("call_id")
-            if not isinstance(call_id, str) or not call_id:
-                call_id = f"call_{uuid.uuid4().hex}"
-
-            items.append(
-                {
-                    "id": f"fc_{uuid.uuid4().hex}",
-                    "type": "function_call",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": arguments_text,
-                    "status": "completed",
-                }
-            )
-        return items
+    def _build_responses_function_call_items(tool_calls: list[tp.Any] | None) -> list[ResponseFunctionCallItem]:
+        return build_responses_function_call_items(tool_calls)
 
     @staticmethod
-    def _build_responses_message_item(output_text: str) -> dict[str, tp.Any]:
-        return {
-            "id": f"msg_{uuid.uuid4().hex}",
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "annotations": [], "logprobs": [], "text": output_text}],
-            "status": "completed",
-        }
+    def _build_responses_message_item(output_text: str) -> ResponseMessageItem:
+        return build_responses_message_item(output_text)
+
+    @staticmethod
+    def _should_emit_responses_message_item(
+        output_text: str,
+        tool_calls: list[tp.Any] | None = None,
+    ) -> bool:
+        """Return whether a Responses output should include a message item."""
+        return should_emit_responses_message_item(output_text, tool_calls)
 
     @classmethod
     def _build_responses_output_items(
@@ -1078,58 +1101,19 @@ class BaseInferenceApiServer(ABC):
         tool_calls: list[tp.Any] | None = None,
         reasoning_text: str | None = None,
         include_reasoning_summary: bool = False,
-    ) -> list[dict[str, tp.Any]]:
-        items: list[dict[str, tp.Any]] = []
-        if include_reasoning_summary and isinstance(reasoning_text, str) and reasoning_text.strip():
-            items.append(cls._build_responses_reasoning_item(reasoning_text))
-        items.extend(cls._build_responses_function_call_items(tool_calls))
-        items.append(cls._build_responses_message_item(output_text))
-        return items
+    ) -> list[ResponsesOutputItem]:
+        return build_responses_output_items(
+            output_text=output_text,
+            tool_calls=tool_calls,
+            reasoning_text=reasoning_text,
+            include_reasoning_summary=include_reasoning_summary,
+        )
 
     @staticmethod
     def _responses_assistant_message_from_output_items(
-        output_items: list[dict[str, tp.Any]],
-    ) -> dict[str, tp.Any]:
-        text_parts: list[str] = []
-        tool_calls: list[dict[str, tp.Any]] = []
-
-        for item in output_items:
-            if not isinstance(item, dict):
-                continue
-            item_type = item.get("type")
-
-            if item_type == "message":
-                content = item.get("content")
-                if isinstance(content, list):
-                    for part in content:
-                        if not isinstance(part, dict):
-                            continue
-                        if part.get("type") == "output_text":
-                            text_parts.append(str(part.get("text", "")))
-                elif isinstance(content, str):
-                    text_parts.append(content)
-                continue
-
-            if item_type == "function_call":
-                call_id = item.get("call_id")
-                name = item.get("name")
-                arguments = item.get("arguments", "")
-                if not isinstance(name, str) or not name.strip():
-                    continue
-                if not isinstance(call_id, str) or not call_id:
-                    call_id = f"call_{uuid.uuid4().hex}"
-                tool_calls.append(
-                    {
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": arguments if isinstance(arguments, str) else ""},
-                    }
-                )
-
-        assistant_message: dict[str, tp.Any] = {"role": "assistant", "content": "".join(text_parts)}
-        if tool_calls:
-            assistant_message["tool_calls"] = tool_calls
-        return assistant_message
+        output_items: list[ResponsesOutputItem],
+    ) -> ChatMessage:
+        return responses_assistant_message_from_output_items(output_items)
 
     @classmethod
     def _build_responses_object(
@@ -1143,46 +1127,23 @@ class BaseInferenceApiServer(ABC):
         tool_calls: list[tp.Any] | None = None,
         reasoning_text: str | None = None,
         include_reasoning_summary: bool = False,
-        output_items: list[dict[str, tp.Any]] | None = None,
-    ) -> dict[str, tp.Any]:
-        created_at = int(time.time())
-        if output_items is None:
-            output_items = cls._build_responses_output_items(
-                output_text=output_text,
-                tool_calls=tool_calls,
-                reasoning_text=reasoning_text,
-                include_reasoning_summary=include_reasoning_summary,
-            )
-
-        return {
-            "id": response_id,
-            "object": "response",
-            "created_at": created_at,
-            "model": model,
-            "status": "completed",
-            "output": output_items,
-            "usage": {
-                "input_tokens": int(prompt_tokens),
-                "output_tokens": int(completion_tokens),
-                "total_tokens": int(prompt_tokens) + int(completion_tokens),
-            },
-        }
+        output_items: list[ResponsesOutputItem] | None = None,
+    ) -> ResponsesResponse:
+        return build_responses_object(
+            response_id=response_id,
+            model=model,
+            output_text=output_text,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            tool_calls=tool_calls,
+            reasoning_text=reasoning_text,
+            include_reasoning_summary=include_reasoning_summary,
+            output_items=output_items,
+        )
 
     @staticmethod
     def _jsonify_tool_calls(tool_calls: tp.Any) -> list[tp.Any] | None:
-        if not tool_calls:
-            return None
-        if not isinstance(tool_calls, list):
-            return None
-        serialized: list[dict[str, tp.Any]] = []
-        for call in tool_calls:
-            if hasattr(call, "model_dump"):
-                payload = call.model_dump(exclude_unset=True, exclude_none=True)
-                if isinstance(payload, dict):
-                    serialized.append(payload)
-            elif isinstance(call, dict):
-                serialized.append(call)
-        return serialized or None
+        return jsonify_tool_calls(tool_calls)
 
     @classmethod
     def _coerce_stream_delta_message(
@@ -1193,48 +1154,20 @@ class BaseInferenceApiServer(ABC):
         default_role: str | None = None,
     ) -> DeltaMessage | None:
         """Normalize parser/engine streaming deltas into a safe DeltaMessage."""
-
-        if delta_message is None:
-            return None
-
-        normalized: DeltaMessage | None = None
-        if isinstance(delta_message, DeltaMessage):
-            normalized = delta_message
-        elif isinstance(delta_message, str):
-            normalized = DeltaMessage(content=delta_message)
-        elif isinstance(delta_message, dict):
-            try:
-                normalized = DeltaMessage(**delta_message)
-            except Exception:
-                normalized = None
-        elif hasattr(delta_message, "model_dump"):
-            payload = delta_message.model_dump(exclude_unset=True, exclude_none=True)
-            if isinstance(payload, dict):
-                try:
-                    normalized = DeltaMessage(**payload)
-                except Exception:
-                    normalized = None
-
-        if normalized is None:
-            if fallback_text:
-                normalized = DeltaMessage(content=fallback_text)
-            else:
-                return None
-
-        if default_role and not normalized.role:
-            normalized.role = default_role
-
-        if normalized.content is not None and not isinstance(normalized.content, (str, list)):
-            normalized.content = str(normalized.content)
-        if isinstance(normalized.content, list):
-            normalized.content = [part for part in normalized.content if isinstance(part, dict)] or None
-
-        normalized.tool_calls = cls._jsonify_tool_calls(normalized.tool_calls)
-        return normalized
+        return coerce_stream_delta_message(
+            delta_message,
+            fallback_text=fallback_text,
+            default_role=default_role,
+        )
 
     @staticmethod
-    def _sse_event(event: str, payload: dict[str, tp.Any]) -> str:
-        return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+    def _sse_event(event: str, payload: BaseModel | dict[str, tp.Any]) -> str:
+        payload_json = (
+            payload.model_dump_json(exclude_none=True)
+            if isinstance(payload, BaseModel)
+            else json.dumps(payload, separators=(",", ":"))
+        )
+        return f"event: {event}\ndata: {payload_json}\n\n"
 
     async def _response_store_get_response(self, response_id: str) -> dict[str, tp.Any] | None:
         if not self._enable_response_store:

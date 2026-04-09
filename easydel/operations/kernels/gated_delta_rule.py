@@ -47,7 +47,7 @@ import jax
 import jax.numpy as jnp
 from eformer.escale import with_sharding_constraint
 from eformer.pytree import auto_pytree
-from ejkernel.modules import gated_delta_rule
+from ejkernel.modules import gated_delta_rule, ragged_gated_delta_rule
 from ejkernel.modules.operations.configs import GatedDeltaRuleConfig
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -958,6 +958,189 @@ class GatedDeltaRuleOp(OperationImpl):
             attention_weights=None,
             conv_state=conv_state,
             recurrent_state=new_recurrent_state,
+        )
+
+    def forward_ragged(
+        self,
+        query: Float[Array, "total_tokens num_heads qk_head_dim"],
+        key: Float[Array, "total_tokens num_heads qk_head_dim"],
+        value: Float[Array, "total_tokens num_heads v_head_dim"],
+        beta: Float[Array, "total_tokens num_heads"],
+        decay: Float[Array, "total_tokens num_heads"] | None,
+        recurrent_state: Float[Array, "num_slots num_heads qk_head_dim v_head_dim"],
+        query_start_loc: jax.Array,
+        state_indices: jax.Array,
+        use_qk_l2norm: bool = True,
+        chunk_size: int = 64,
+    ) -> GatedDeltaRuleOutput:
+        """Ragged GDR forward for packed continuous-batching inference.
+
+        Processes variable-length sequences in a flat token stream using
+        ejkernel's ragged_gated_delta_rule. Handles both decode (seq_len=1)
+        and prefill (seq_len>1) requests in a single fused call.
+
+        This method is intended for eSurge inference mode where multiple
+        requests with different sequence lengths are packed together.
+
+        Args:
+            query: Flat queries, shape (total_tokens, num_heads, qk_head_dim).
+                For grouped-head models, Q/K heads must already be expanded
+                to match num_v_heads before calling.
+            key: Flat keys, shape (total_tokens, num_heads, qk_head_dim).
+            value: Flat values, shape (total_tokens, num_heads, v_head_dim).
+            beta: Per-token gating coefficients, shape (total_tokens, num_heads).
+            decay: Per-token log-space decay, shape (total_tokens, num_heads),
+                or None to skip decay.
+            recurrent_state: Global state pool, shape
+                (num_slots, num_heads, qk_head_dim, v_head_dim).
+            query_start_loc: CSR-style cumulative token offsets per request,
+                shape (num_requests + 1,).
+            state_indices: Request-to-slot mapping, shape (num_requests,).
+            use_qk_l2norm: Whether to L2-normalize queries and keys.
+            chunk_size: Chunk size for the prefill path.
+
+        Returns:
+            GatedDeltaRuleOutput with attention_outputs (total_tokens, num_heads, v_head_dim)
+            and recurrent_state (num_slots, num_heads, qk_head_dim, v_head_dim).
+        """
+        runtime_dtype = self.metadata.runtime_dtype
+        query = query.astype(runtime_dtype)
+        key = key.astype(runtime_dtype)
+        value = value.astype(runtime_dtype)
+        beta = beta.astype(runtime_dtype)
+        if decay is not None:
+            decay = decay.astype(runtime_dtype)
+        else:
+            decay = jnp.zeros_like(beta)
+        recurrent_state = recurrent_state.astype(runtime_dtype)
+
+        mesh = self.metadata.mesh
+        if mesh is not None:
+            from ejkernel.kernels._pallas.tpu.ragged_gated_delta_rule._interface import (
+                _decode_path,
+            )
+            from ejkernel.kernels._xla.ragged_gated_delta_rule._xla_impl_fwd import (
+                _ragged_gdr_chunked_prefill,
+            )
+
+            mode = self.get_mode(query=jnp.expand_dims(query, 0), BTHD=False)
+            shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
+            head_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None
+
+            token_head_spec = PartitionSpec(None, head_axis, None)
+            beta_spec = PartitionSpec(None, head_axis)
+            state_spec = PartitionSpec(None, head_axis, None, None)
+            PartitionSpec()
+            Ps = PartitionSpec
+
+            @jax.named_scope("ragged_gdr_decode_shard_map")
+            def _decode_shard(q, k, v, b, d, s, si):
+                return _decode_path(q, k, v, b, d, s, si, use_qk_l2norm)
+
+            decode_shard_fn = jax.shard_map(
+                _decode_shard,
+                mesh=mesh,
+                in_specs=(token_head_spec, token_head_spec, token_head_spec, beta_spec, beta_spec, state_spec, Ps()),
+                out_specs=(token_head_spec, state_spec),
+                check_vma=False,
+            )
+
+            _chunk_size = chunk_size
+            _use_l2norm = use_qk_l2norm
+
+            @jax.named_scope("ragged_gdr_prefill_shard_map")
+            def _prefill_shard(q, k, v, b, d, s, qsl, si):
+                new_s, out = _ragged_gdr_chunked_prefill(
+                    q,
+                    k,
+                    v,
+                    b,
+                    d,
+                    s,
+                    qsl,
+                    si,
+                    _chunk_size,
+                    _use_l2norm,
+                )
+                return out, new_s
+
+            prefill_shard_fn = jax.shard_map(
+                _prefill_shard,
+                mesh=mesh,
+                in_specs=(
+                    token_head_spec,
+                    token_head_spec,
+                    token_head_spec,
+                    beta_spec,
+                    beta_spec,
+                    state_spec,
+                    Ps(),
+                    Ps(),
+                ),
+                out_specs=(token_head_spec, state_spec),
+                check_vma=False,
+            )
+
+            seq_lengths = query_start_loc[1:] - query_start_loc[:-1]
+            is_all_decode = jnp.all(seq_lengths <= 1)
+
+            num_tokens = query.shape[0]
+            num_si = state_indices.shape[0]
+            if num_tokens > num_si:
+                decode_state_indices = jnp.pad(state_indices, (0, num_tokens - num_si))
+            elif num_tokens < num_si:
+                decode_state_indices = state_indices[:num_tokens]
+            else:
+                decode_state_indices = state_indices
+
+            def _run_decode(_):
+                return decode_shard_fn(
+                    query,
+                    key,
+                    value,
+                    beta,
+                    decay,
+                    recurrent_state,
+                    decode_state_indices,
+                )
+
+            def _run_prefill(_):
+                return prefill_shard_fn(
+                    query,
+                    key,
+                    value,
+                    beta,
+                    decay,
+                    recurrent_state,
+                    query_start_loc,
+                    state_indices,
+                )
+
+            output, new_state = jax.lax.cond(
+                is_all_decode,
+                _run_decode,
+                _run_prefill,
+                operand=None,
+            )
+        else:
+            output, new_state = ragged_gated_delta_rule(
+                query=query,
+                key=key,
+                value=value,
+                beta=beta,
+                decay=decay,
+                recurrent_state=recurrent_state,
+                query_start_loc=query_start_loc,
+                state_indices=state_indices,
+                chunk_size=chunk_size,
+                use_qk_l2norm=use_qk_l2norm,
+            )
+
+        return GatedDeltaRuleOutput(
+            attention_outputs=output,
+            attention_weights=None,
+            conv_state=None,
+            recurrent_state=new_state,
         )
 
     def forward_tpu(self, *args, **kwargs) -> GatedDeltaRuleOutput:

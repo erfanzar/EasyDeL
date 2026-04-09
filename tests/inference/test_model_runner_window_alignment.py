@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import jax.numpy as jnp
@@ -25,6 +26,7 @@ from easydel.inference.esurge.core.interface import (
     estimate_runtime_page_budget,
 )
 from easydel.inference.esurge.runners.execution_manager import ExecutionManager
+from easydel.inference.esurge.runners.executors.sampler_executor import SamplerExecutor
 from easydel.inference.esurge.runners.model_runner import eSurgeRunner
 from easydel.modules.gemma4 import Gemma4TextConfig
 from easydel.modules.openelm import OpenELMConfig
@@ -206,6 +208,26 @@ def test_ragged_metadata_prefers_window_aware_runtime_cap():
     assert metadata.get_max_num_seqs() == 7
 
 
+def test_runner_can_disable_window_aware_runtime_cap():
+    """Disabling window-aware runtime should clear overrides and skip estimation."""
+    runner = eSurgeRunner.__new__(eSurgeRunner)
+    runner.enable_window_aware_runtime_cap = False
+    runner.metadata = SimpleNamespace(
+        window_aware_max_num_seqs=7,
+        window_aware_pages_per_request=11,
+        window_aware_max_num_batched_tokens=128,
+    )
+    runner.kv_cache_groups = [object()]
+    runner.max_model_len = 256
+
+    estimate = runner._apply_window_aware_runtime_cap(64)
+
+    assert estimate is None
+    assert runner.metadata.window_aware_max_num_seqs == -1
+    assert runner.metadata.window_aware_pages_per_request == -1
+    assert runner.metadata.window_aware_max_num_batched_tokens == -1
+
+
 def test_runner_builds_cache_groups_from_text_geometry_not_representative_metadata():
     """Sliding groups should keep their text-config head size even when metadata is wider."""
     config = Gemma4TextConfig(
@@ -278,6 +300,22 @@ def test_compile_pairs_skip_impossible_token_request_combinations():
         (32, 16),
         (32, 32),
     ]
+
+
+def test_sampler_executor_cache_keeps_all_compiled_variants():
+    """Compiled sampler variants should remain cached until clear_cache()."""
+
+    executor = SamplerExecutor.__new__(SamplerExecutor)
+    executor._cache = OrderedDict()
+
+    first_key = (64, 1, "sampler", "aot")
+    for padded_num_reqs in range(1, 130):
+        key = (64, padded_num_reqs, "sampler", "aot")
+        executor._cache_put(key, f"compiled-{padded_num_reqs}")
+
+    assert len(executor._cache) == 129
+    assert first_key in executor._cache
+    assert executor._cache[first_key] == "compiled-1"
 
 
 def test_sampler_window_compacts_zero_token_rows_but_keeps_rng_row_ids():

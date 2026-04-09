@@ -30,7 +30,6 @@ def _make_min_executor(*, bind_graphstate_for_aot: bool) -> ModelStepExecutor:
     executor = ModelStepExecutor.__new__(ModelStepExecutor)
     executor.use_aot_forward = True
     executor.bind_graphstate_for_aot = bind_graphstate_for_aot
-    executor._cache_capacity = 8
     executor._cache = OrderedDict()
     executor._backbone_cache = OrderedDict()
     executor._lm_head_cache = OrderedDict()

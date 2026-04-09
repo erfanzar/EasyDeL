@@ -194,6 +194,52 @@ def test_format_chat_prompt_normalizes_tool_call_arguments_in_messages():
     assert arguments["path"] == "/tmp/a.txt"
 
 
+class _NoNoneContentTokenizer:
+    def __init__(self):
+        self.calls = []
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=False,
+        tools=None,
+        add_generation_prompt=True,
+        chat_template=None,
+        **_kwargs,
+    ):
+        self.calls.append((messages, tools))
+        for msg in messages:
+            assert msg.get("content") is not None
+        return "PROMPT"
+
+
+def test_format_chat_prompt_normalizes_none_content_for_tool_only_messages():
+    engine = _DummyEngine()
+    engine.tokenizer = _NoNoneContentTokenizer()
+
+    prompt = engine._format_chat_prompt(
+        messages=[
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"q":"abc"}'},
+                    }
+                ],
+            }
+        ],
+        tools=None,
+    )
+
+    assert prompt == "PROMPT"
+    assert len(engine.tokenizer.calls) == 1
+    used_messages, _ = engine.tokenizer.calls[0]
+    assert used_messages[0]["content"] == ""
+
+
 class _StrictSystemPositionTokenizer:
     def __init__(self):
         self.calls = []

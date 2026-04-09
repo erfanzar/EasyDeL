@@ -22,6 +22,7 @@ from typing import Any
 
 import jax
 
+from easydel.inference.parsing import DelegatingParser
 from easydel.inference.sampling_params import SamplingParams
 
 from ..logger import logger
@@ -266,22 +267,21 @@ class EngineRequestsMixin:
                 "requested_new_tokens_final": requested_new,
                 "reserve_tokens": self.reserve_tokens,
                 "max_model_len": max_model_len,
-                # Per-request parser instances (fresh per request for streaming state isolation)
-                "tool_parser_instance": self._tool_parser_class(self.tokenizer) if self._tool_parser_class else None,
-                "tool_parser_request": tool_parser_request,
-                "reasoning_parser_instance": (
-                    self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
-                ),
+                "delegating_parser": None,  # set below after prompt context config
                 "parser_previous_text": "",
                 "parser_previous_token_ids": [],
-                "accumulated_reasoning": "",
-                "accumulated_content": "",
             }
-            _rp = self._active_requests[request_id].get("reasoning_parser_instance")
+            _rp = self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
             self._configure_reasoning_parser_for_prompt(
                 reasoning_parser=_rp,
                 prompt_text=prompt_for_engine,
                 prompt_token_ids=token_ids,
+            )
+            _tp = self._tool_parser_class(self.tokenizer) if self._tool_parser_class else None
+            self._active_requests[request_id]["delegating_parser"] = DelegatingParser(
+                reasoning_parser=_rp,
+                tool_parser=_tp,
+                tool_request=tool_parser_request,
             )
 
         metrics_collector = get_metrics_collector()
@@ -391,24 +391,21 @@ class EngineRequestsMixin:
                         "max_model_len": max_model_len,
                         "sample_index": sample_idx,
                         "parent_request_id": request_id,
-                        # Per-request parser instances (fresh per sample)
-                        "tool_parser_instance": (
-                            self._tool_parser_class(self.tokenizer) if self._tool_parser_class else None
-                        ),
-                        "tool_parser_request": tool_parser_request,
-                        "reasoning_parser_instance": (
-                            self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
-                        ),
+                        "delegating_parser": None,  # set below
                         "parser_previous_text": "",
                         "parser_previous_token_ids": [],
-                        "accumulated_reasoning": "",
-                        "accumulated_content": "",
                     }
-                    _rp2 = self._active_requests[child_request_id].get("reasoning_parser_instance")
+                    _rp2 = self._reasoning_parser_class(self.tokenizer) if self._reasoning_parser_class else None
                     self._configure_reasoning_parser_for_prompt(
                         reasoning_parser=_rp2,
                         prompt_text=prompt_for_engine,
                         prompt_token_ids=token_ids,
+                    )
+                    _tp2 = self._tool_parser_class(self.tokenizer) if self._tool_parser_class else None
+                    self._active_requests[child_request_id]["delegating_parser"] = DelegatingParser(
+                        reasoning_parser=_rp2,
+                        tool_parser=_tp2,
+                        tool_request=tool_parser_request,
                     )
 
             with self._scheduler_lock:
@@ -471,16 +468,25 @@ class EngineRequestsMixin:
         parent_request_id = request_id
         sample_index = 0
         metrics_collector = get_metrics_collector()
+        before_running = 0
+        before_waiting = 0
+        after_running = 0
+        after_waiting = 0
+        abort_ids: set[str] = set()
+        rd_present = False
+        ro_present = False
 
         # Acquire all locks atomically to prevent race conditions
         with self._scheduler_lock, self._request_lock, self._output_lock:
+            before_running = len(self.scheduler.running)
+            before_waiting = len(self.scheduler.waiting)
             rd = self._active_requests.get(request_id)
+            rd_present = rd is not None
             if rd is not None:
                 parent_request_id = rd.get("parent_request_id", request_id)
                 sample_index = int(rd.get("sample_index", 0) or 0)
 
             # Resolve scheduler-side IDs to abort (n=1: request_id; n>1: children of parent)
-            abort_ids: set[str] = set()
             if request_id in self.scheduler.requests:
                 abort_ids.add(request_id)
                 parent_request_id = self.scheduler.requests[request_id].parent_request_id or parent_request_id
@@ -504,6 +510,7 @@ class EngineRequestsMixin:
 
             # Update output state
             ro = self._request_outputs.get(parent_request_id)
+            ro_present = ro is not None
             n_samples = len(ro.outputs) if ro is not None else 0
             if ro is not None:
                 if request_id == parent_request_id:
@@ -522,6 +529,8 @@ class EngineRequestsMixin:
 
             # Get event while still holding lock (streaming uses parent event)
             ev = self._request_events.get(parent_request_id)
+            after_running = len(self.scheduler.running)
+            after_waiting = len(self.scheduler.waiting)
 
             if not detokenizer_reset_ids:
                 detokenizer_reset_ids.add(request_id)
@@ -545,6 +554,32 @@ class EngineRequestsMixin:
         if ev:
             ev.set()
         self._output_event.set()
+        if abort_ids:
+            logger.warning(
+                "Aborted request %s: matched_scheduler_ids=%s parent_request_id=%s "
+                "scheduler_before(run=%s,wait=%s) scheduler_after(run=%s,wait=%s)",
+                request_id,
+                len(abort_ids),
+                parent_request_id,
+                before_running,
+                before_waiting,
+                after_running,
+                after_waiting,
+            )
+        else:
+            logger.warning(
+                "Abort requested for %s but no live scheduler requests matched. "
+                "parent_request_id=%s active_request_present=%s output_present=%s "
+                "scheduler_before(run=%s,wait=%s) scheduler_after(run=%s,wait=%s)",
+                request_id,
+                parent_request_id,
+                rd_present,
+                ro_present,
+                before_running,
+                before_waiting,
+                after_running,
+                after_waiting,
+            )
         log_metrics_summary()
         if ro is not None and ro.finished:
             with self._request_lock:

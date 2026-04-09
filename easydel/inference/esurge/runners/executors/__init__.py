@@ -33,7 +33,7 @@ Architecture:
     1. During startup, each executor pre-compiles functions for expected
        input configurations (token counts, batch sizes).
     2. At runtime, the appropriate compiled function is retrieved from
-       an LRU cache based on the current input dimensions.
+       the retained compile cache based on the current input dimensions.
     3. The function is executed with the actual input data.
 
     This separation allows:
