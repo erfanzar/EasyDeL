@@ -36,7 +36,7 @@ from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float
 
-from easydel.axis import ATTN_DP
+from easydel.axis import ATTN_DP, resolve_attention_data_parallel_axis
 
 from ..ragged_page.cache import (
     RaggedPagesCache,
@@ -98,7 +98,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
             Total allocatable bytes across all devices on the page axis.
         """
         budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
-        page_axis_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
+        page_axis_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
         available_alloc = budget * page_axis_size
         logger.info(f"{page_axis_size=} {budget=} {available_alloc=} {hbm_utilization=}")
         return available_alloc
@@ -185,7 +185,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
         if version != "v1":
             raise ValueError(f"MLA ragged cache only supports version='v1', got {version!r}")
 
-        data_parallel_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
+        data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
         if data_parallel_size > 1:
             logger.info(f"Scaling MLA KV page budget by data-parallel page axis: {data_parallel_size=}.")
 

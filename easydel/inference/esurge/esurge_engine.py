@@ -275,50 +275,6 @@ def _detect_mla_attention_mix(model: Any, text_config: Any = None) -> tuple[bool
     return has_mla_attention, has_non_mla_attention
 
 
-def _with_data_parallel_axis(partition_axis: Any, data_parallelism_axis: str) -> Any:
-    """Return partition-axis metadata with the data-parallel axis set.
-
-    Handles multiple input shapes: ``None``, plain ``dict``, objects with a
-    mutable ``data_parallel_axis`` attribute, and generic objects whose
-    ``__dict__`` can be merged into a new instance. Falls back to returning
-    a minimal dict when other strategies fail.
-
-    Args:
-        partition_axis: Existing partition-axis metadata. May be ``None``,
-            a ``dict``, or an object with ``data_parallel_axis``.
-        data_parallelism_axis: The axis name to assign for data parallelism.
-
-    Returns:
-        Updated partition-axis metadata (same type as input when possible,
-        otherwise a ``dict``).
-    """
-    if partition_axis is None:
-        return {"data_parallel_axis": data_parallelism_axis}
-
-    if isinstance(partition_axis, dict):
-        merged = dict(partition_axis)
-        merged["data_parallel_axis"] = data_parallelism_axis
-        return merged
-
-    if hasattr(partition_axis, "data_parallel_axis"):
-        try:
-            partition_axis.data_parallel_axis = data_parallelism_axis
-            return partition_axis
-        except Exception:
-            pass
-
-    attrs = getattr(partition_axis, "__dict__", None)
-    if isinstance(attrs, dict) and attrs:
-        merged = dict(attrs)
-        merged["data_parallel_axis"] = data_parallelism_axis
-        try:
-            return type(partition_axis)(**merged)
-        except Exception:
-            return merged
-
-    return {"data_parallel_axis": data_parallelism_axis}
-
-
 @dataclass
 class CompletionOutput:
     """Output of a single completion.
@@ -874,9 +830,7 @@ class eSurge(
                 attn_value = (
                     requested_attn.value
                     if isinstance(requested_attn, AttentionMechanisms)
-                    else str(requested_attn)
-                    if requested_attn is not None
-                    else None
+                    else str(requested_attn) if requested_attn is not None else None
                 )
                 if backend == "gpu" and attn_value in (
                     AttentionMechanisms.RAGGED_PAGE_ATTENTION_V2.value,
@@ -916,9 +870,8 @@ class eSurge(
             config_kwargs = dict(kwargs.pop("config_kwargs", {}) or {})
             config_partition_axis = config_kwargs.pop("partition_axis", None)
             kwargs_partition_axis = kwargs.pop("partition_axis", None)
-            resolved_partition_axis = _with_data_parallel_axis(
-                kwargs_partition_axis if kwargs_partition_axis is not None else config_partition_axis,
-                self.data_parallelism_axis,
+            resolved_partition_axis = (
+                kwargs_partition_axis if kwargs_partition_axis is not None else config_partition_axis
             )
 
             model = AutoEasyDeLModelForCausalLM.from_pretrained(
@@ -1278,28 +1231,13 @@ class eSurge(
         self._sampling_params_callback = callback
 
     def _apply_data_parallel_axis_to_model(self, model: EasyDeLBaseModule) -> None:
-        """Patch model config partition axes so eSurge KV-cache uses the requested DP axis."""
-        cfg = getattr(model, "config", None)
-        if cfg is None:
-            return
+        """Keep model partition axes unchanged.
 
-        maybe_text_cfg = getattr(cfg, "get_text_config", None)
-        text_cfg = maybe_text_cfg() if callable(maybe_text_cfg) else None
-
-        seen: set[int] = set()
-        for target_cfg in (cfg, text_cfg):
-            if target_cfg is None or id(target_cfg) in seen:
-                continue
-            seen.add(id(target_cfg))
-            current_axis = getattr(target_cfg, "partition_axis", None)
-            updated_axis = _with_data_parallel_axis(current_axis, self.data_parallelism_axis)
-            try:
-                target_cfg.partition_axis = updated_axis
-            except Exception:
-                logger.warning(
-                    "Failed to update model partition_axis with data_parallelism_axis=%r",
-                    self.data_parallelism_axis,
-                )
+        eSurge's KV-page parallelism uses the dedicated ``ATTN_DP`` semantic
+        axis registered during engine setup. Rewriting the model's standard
+        data-parallel axis here can alias DP with EP and break MoE shard maps.
+        """
+        del model
 
     def _distributed_execute_step(self, scheduler_output):
         """Execute a single scheduler step on worker ranks via control-plane RPC."""
