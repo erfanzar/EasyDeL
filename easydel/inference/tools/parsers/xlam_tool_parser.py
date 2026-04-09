@@ -122,6 +122,8 @@ class xLAMToolParser(ToolParser):
         # For backward compatibility with tests / serving code
         self.current_tools_sent: list[bool] = []
         self.prev_tool_call_arr: list[dict] = []
+        self.tool_call_start_token = "["
+        self.tool_call_end_token = "]"
 
         self.json_code_block_patterns = [
             r"```(?:json)?\s*([\s\S]*?)```",

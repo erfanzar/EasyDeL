@@ -96,8 +96,8 @@ class ModelStepExecutor:
 
     The ModelStepExecutor manages compilation and execution of the model
     forward pass, which computes hidden states and logits while updating
-    the paged KV cache. It maintains an LRU cache of compiled function
-    variants for different input dimensions.
+    the paged KV cache. It retains compiled function variants for different
+    input dimensions until the cache is explicitly cleared.
 
     The executor separates graph definition (static model structure) from
     graph state (weights) and graph other (auxiliary data), allowing weight
@@ -166,8 +166,8 @@ class ModelStepExecutor:
                 variants with graphstate/graphother closed over as constants
                 (runtime call signature is preserved). This enables weight-
                 concrete kernel policies (e.g. TPU predecode-once). Default: False.
-            cache_capacity: Maximum number of compiled variants to cache.
-                Defaults to 64. Uses LRU eviction when full.
+            cache_capacity: Deprecated compatibility argument. Compiled
+                variants are retained until ``clear_cache()`` is called.
         """
         self.model = model
         self.mesh = mesh
@@ -179,7 +179,7 @@ class ModelStepExecutor:
         self._empty_sharding = empty_sharding
         self.use_aot_forward = bool(use_aot_forward)
         self.bind_graphstate_for_aot = bool(bind_graphstate_for_aot)
-        self._cache_capacity = int(cache_capacity)
+        del cache_capacity
 
         self._backbone_fn = self._build_backbone_fn(
             kv_pages_template=kv_pages_template,
@@ -204,23 +204,21 @@ class ModelStepExecutor:
         self._cache.clear()
 
     @staticmethod
-    def _lru_put(cache: OrderedDict, key, value, capacity: int) -> None:
+    def _cache_store(cache: OrderedDict, key, value) -> None:
         cache[key] = value
         cache.move_to_end(key)
-        if len(cache) > capacity:
-            cache.popitem(last=False)
 
     @staticmethod
-    def _lru_get(cache: OrderedDict, key):
+    def _cache_lookup(cache: OrderedDict, key):
         value = cache[key]
         cache.move_to_end(key)
         return value
 
     def _cache_put(self, key: tuple[int, int, str, str], value: tp.Any) -> None:
-        self._lru_put(self._cache, key, value, self._cache_capacity)
+        self._cache_store(self._cache, key, value)
 
     def _cache_get(self, key: tuple[int, int, str, str]) -> tp.Any:
-        return self._lru_get(self._cache, key)
+        return self._cache_lookup(self._cache, key)
 
     def cache_keys(self) -> list:
         """Get all keys currently in backbone + lm_head caches."""
@@ -248,8 +246,8 @@ class ModelStepExecutor:
         a ``ModelStepOutputs`` — same interface as before the split.
         """
         mode = "aot" if self.use_aot_forward else "jit"
-        backbone_fn = self._lru_get(self._backbone_cache, (int(num_tokens), "backbone", mode))
-        lm_head_fn = self._lru_get(self._lm_head_cache, (int(padded_num_reqs), "lm_head", mode))
+        backbone_fn = self._cache_lookup(self._backbone_cache, (int(num_tokens), "backbone", mode))
+        lm_head_fn = self._cache_lookup(self._lm_head_cache, (int(padded_num_reqs), "lm_head", mode))
         _pnr = int(padded_num_reqs)
 
         def _combined(graphstate_, graphother_, kv_pages_, metadata_):
@@ -269,12 +267,12 @@ class ModelStepExecutor:
     def get_backbone(self, *, num_tokens: int) -> tp.Any:
         """Retrieve a pre-compiled backbone function."""
         mode = "aot" if self.use_aot_forward else "jit"
-        return self._lru_get(self._backbone_cache, (int(num_tokens), "backbone", mode))
+        return self._cache_lookup(self._backbone_cache, (int(num_tokens), "backbone", mode))
 
     def get_lm_head(self, *, padded_num_reqs: int) -> tp.Any:
         """Retrieve a pre-compiled lm_head function."""
         mode = "aot" if self.use_aot_forward else "jit"
-        return self._lru_get(self._lm_head_cache, (int(padded_num_reqs), "lm_head", mode))
+        return self._cache_lookup(self._lm_head_cache, (int(padded_num_reqs), "lm_head", mode))
 
     def compile(
         self,
@@ -339,19 +337,19 @@ class ModelStepExecutor:
                     del graphstate_, graphother_
                     return compiled_bound(kv_pages_, metadata_)
 
-                self._lru_put(self._backbone_cache, key, _wrapped_bound_backbone, self._cache_capacity)
+                self._cache_store(self._backbone_cache, key, _wrapped_bound_backbone)
             else:
                 compiled = self._backbone_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
                     *(graphdef, graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
                 ).compile()
-                self._lru_put(self._backbone_cache, key, compiled, self._cache_capacity)
+                self._cache_store(self._backbone_cache, key, compiled)
             return None
 
         def wrapped_backbone(graphstate_, graphother_, kv_pages_, metadata_):
             return self._backbone_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
 
         out = wrapped_backbone(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
-        self._lru_put(self._backbone_cache, key, wrapped_backbone, self._cache_capacity)
+        self._cache_store(self._backbone_cache, key, wrapped_backbone)
         return out
 
     def compile_lm_head(
@@ -394,19 +392,19 @@ class ModelStepExecutor:
                     del graphstate_, graphother_
                     return compiled_bound(hs_)
 
-                self._lru_put(self._lm_head_cache, key, _wrapped_bound_lm_head, self._cache_capacity)
+                self._cache_store(self._lm_head_cache, key, _wrapped_bound_lm_head)
             else:
                 compiled = self._lm_head_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
                     *(graphdef, graphstate, graphother, dummy_hs)
                 ).compile()
-                self._lru_put(self._lm_head_cache, key, compiled, self._cache_capacity)
+                self._cache_store(self._lm_head_cache, key, compiled)
             return
 
         def wrapped_lm_head(graphstate_, graphother_, hs_):
             return self._lm_head_fn(self.graphdef, graphstate_, graphother_, hs_)
 
         _ = wrapped_lm_head(graphstate, graphother, dummy_hs)
-        self._lru_put(self._lm_head_cache, key, wrapped_lm_head, self._cache_capacity)
+        self._cache_store(self._lm_head_cache, key, wrapped_lm_head)
 
     def _build_backbone_fn(
         self,

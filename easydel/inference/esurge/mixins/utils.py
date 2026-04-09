@@ -22,6 +22,7 @@ import typing
 from typing import Any
 
 from easydel.inference.sampling_params import SamplingParams
+from easydel.inference.stream_protocol import compute_stream_delta_text
 from easydel.workers.esurge.pipeline import DetokenizerResult
 
 from ..logger import logger
@@ -62,6 +63,8 @@ class EngineUtilsMixin:
         normalized_messages: list[dict[str, Any]] = []
         for message in messages:
             msg = dict(message)
+            if msg.get("content") is None:
+                msg["content"] = ""
 
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
@@ -533,42 +536,7 @@ class EngineUtilsMixin:
         chunks when text has not advanced. If prefix alignment is lost, attempt
         suffix-prefix overlap recovery before falling back.
         """
-
-        current_text = current_text or ""
-        previous_text = previous_text or ""
-        fallback_delta = fallback_delta or ""
-
-        if current_text.startswith(previous_text):
-            return current_text[len(previous_text) :]
-
-        if not current_text and previous_text and not fallback_delta:
-            # Tool-call parsers can collapse previously emitted protocol markup
-            # into empty visible content; treat as benign rollback.
-            return ""
-
-        max_overlap = min(len(previous_text), len(current_text))
-        for overlap in range(max_overlap, 0, -1):
-            if previous_text.endswith(current_text[:overlap]):
-                return current_text[overlap:]
-
-        if len(current_text) < len(previous_text):
-            # Parser normalization can rewrite previously emitted snapshots into a
-            # shorter canonical form (e.g. stripping protocol/control markup).
-            # Treat as benign realignment and avoid noisy warnings.
-            if fallback_delta and not previous_text.endswith(fallback_delta):
-                return fallback_delta
-            return ""
-
-        if previous_text:
-            logger.warning(
-                "Stream delta alignment mismatch. prev_len=%s, curr_len=%s; using guarded fallback.",
-                len(previous_text),
-                len(current_text),
-            )
-
-        if fallback_delta and (not previous_text or not previous_text.endswith(fallback_delta)):
-            return fallback_delta
-        return current_text if not previous_text else ""
+        return compute_stream_delta_text(current_text, previous_text, fallback_delta)
 
     @staticmethod
     def _to_python_scalar(value: Any) -> Any:
@@ -737,6 +705,51 @@ class EngineUtilsMixin:
         if self._idle_monitor_thread.is_alive():
             logger.debug("Idle monitor thread did not stop gracefully")
         self._idle_monitor_thread = None
+
+    _TOOL_TOKEN_PATTERNS = ("tool_call", "tool_response", "tool")
+
+    def _prepare_chat_sampling_params(
+        self,
+        sampling_params: SamplingParams | None,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
+    ) -> SamplingParams:
+        """Prepare sampling params with tool-token awareness.
+
+        When no tools are active, tool-related special tokens are suppressed
+        via ``logit_bias`` and ``skip_special_tokens`` is enabled.  When tools
+        are present, the protocol tokens are left untouched so the model can
+        emit tool calls.
+        """
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+        else:
+            sampling_params = self._clone_sampling_params(sampling_params)
+
+        if tools:
+            sampling_params.skip_special_tokens = False
+            sampling_params.logit_bias = None
+            return sampling_params
+
+        vocab: dict[str, int] = {}
+        if hasattr(self, "tokenizer") and hasattr(self.tokenizer, "get_vocab"):
+            try:
+                vocab = self.tokenizer.get_vocab()
+            except Exception:
+                pass
+
+        tool_token_ids: list[int] = []
+        for token_text, token_id in vocab.items():
+            for pattern in self._TOOL_TOKEN_PATTERNS:
+                if pattern in token_text.lower():
+                    tool_token_ids.append(token_id)
+                    break
+
+        if tool_token_ids:
+            sampling_params.logit_bias = {tid: -100.0 for tid in tool_token_ids}
+        sampling_params.skip_special_tokens = True
+        return sampling_params
 
     def _clone_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
         """Create a deep copy of sampling parameters.

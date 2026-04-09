@@ -17,6 +17,7 @@ import threading
 from easydel.inference.esurge.mixins.io import EngineIOMixin
 from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
 from easydel.inference.esurge.mixins.requests import EngineRequestsMixin
+from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
 from easydel.inference.openai_api_modules import (
     ChatCompletionRequest,
     DeltaFunctionCall,
@@ -26,10 +27,11 @@ from easydel.inference.openai_api_modules import (
     FunctionCall,
     ToolCall,
 )
+from easydel.inference.parsing import DelegatingParser
 from easydel.inference.sampling_params import SamplingParams
 
 
-class _ParsingHarness(EngineParsingMixin):
+class _ParsingHarness(EngineParsingMixin, EngineUtilsMixin):
     pass
 
 
@@ -38,33 +40,15 @@ class _RecordingToolParser:
 
     Always returns a fixed ``lookup`` tool call so tests can verify that the
     engine correctly wires tool-parser instances and forwards request metadata.
-
-    Attributes:
-        tokenizer: Tokenizer passed at construction (may be ``None``).
-        batch_tools: Tools list captured by the last ``extract_tool_calls`` call.
-        streaming_tools: Tools list captured by the last streaming extraction.
     """
 
     def __init__(self, tokenizer=None):
-        """Initialize the recording tool parser.
-
-        Args:
-            tokenizer: Optional tokenizer instance (stored but unused).
-        """
         self.tokenizer = tokenizer
+        self.model_tokenizer = tokenizer
         self.batch_tools = None
         self.streaming_tools = None
 
     def extract_tool_calls(self, _content, request):
-        """Record ``request.tools`` and return a fixed tool-call result.
-
-        Args:
-            _content: Model output text (ignored).
-            request: Request object whose ``tools`` field is captured.
-
-        Returns:
-            An ``ExtractedToolCallInformation`` with a single ``lookup`` call.
-        """
         self.batch_tools = request.tools
         return ExtractedToolCallInformation(
             tools_called=True,
@@ -78,15 +62,6 @@ class _RecordingToolParser:
         )
 
     def extract_tool_calls_streaming(self, **kwargs):
-        """Record ``request.tools`` and return a fixed streaming delta.
-
-        Args:
-            **kwargs: Must contain a ``request`` key whose ``tools`` field
-                is captured.
-
-        Returns:
-            A ``DeltaMessage`` with a single ``lookup`` delta tool call.
-        """
         self.streaming_tools = kwargs["request"].tools
         return DeltaMessage(
             tool_calls=[
@@ -224,13 +199,13 @@ def test_run_output_parsers_uses_request_tools_for_batch_tool_parsing():
     parser = _RecordingToolParser()
     request = _make_request()
     rd = {
-        "reasoning_parser_instance": None,
-        "tool_parser_instance": parser,
-        "tool_parser_request": request,
+        "delegating_parser": DelegatingParser(
+            reasoning_parser=None,
+            tool_parser=parser,
+            tool_request=request,
+        ),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-        "accumulated_reasoning": "",
-        "accumulated_content": "",
     }
 
     result = engine._run_output_parsers(
@@ -252,13 +227,13 @@ def test_run_output_parsers_uses_request_tools_for_streaming_tool_parsing():
     parser = _RecordingToolParser()
     request = _make_request()
     rd = {
-        "reasoning_parser_instance": None,
-        "tool_parser_instance": parser,
-        "tool_parser_request": request,
+        "delegating_parser": DelegatingParser(
+            reasoning_parser=None,
+            tool_parser=parser,
+            tool_request=request,
+        ),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-        "accumulated_reasoning": "",
-        "accumulated_content": "",
     }
 
     result = engine._run_output_parsers(
@@ -298,7 +273,7 @@ def test_build_tool_parser_request_wraps_chat_template_tool_dicts():
     assert request.tool_choice == "auto"
 
 
-def test_add_request_keeps_tool_parser_for_single_request_without_request_object():
+def test_add_request_creates_delegating_parser_for_single_request():
     engine = _RequestsHarness()
 
     engine._add_request(
@@ -309,5 +284,81 @@ def test_add_request_keeps_tool_parser_for_single_request_without_request_object
     )
 
     request_state = engine._active_requests["req-1"]
-    assert request_state["tool_parser_request"] is None
-    assert request_state["tool_parser_instance"] is not None
+    dp = request_state["delegating_parser"]
+    assert dp is not None
+    assert isinstance(dp, DelegatingParser)
+    assert dp.tool_parser is not None
+    assert dp.tool_request is None
+
+
+def test_build_tool_parser_request_returns_none_without_tools():
+    """When both tools and tool_choice are None, should return None."""
+    from easydel.inference.esurge.mixins.io import EngineIOMixin
+
+    result = EngineIOMixin._build_tool_parser_request(prompt="hi", tools=None, tool_choice=None)
+    assert result is None
+
+
+def test_build_tool_parser_request_with_tool_choice_only():
+    """When tool_choice is set but tools is None, should still create a request."""
+    from easydel.inference.esurge.mixins.io import EngineIOMixin
+
+    result = EngineIOMixin._build_tool_parser_request(prompt="hi", tools=None, tool_choice="auto")
+    assert result is not None
+    assert result.tool_choice == "auto"
+    assert result.tools is None
+
+
+def test_build_tool_parser_request_skips_non_dict_tools():
+    """Non-dict/non-model tools should be silently skipped."""
+    from easydel.inference.esurge.mixins.io import EngineIOMixin
+
+    result = EngineIOMixin._build_tool_parser_request(
+        prompt="hi",
+        tools=[
+            123,  # not a dict
+            "bad",  # not a dict
+            {"name": "valid_func", "parameters": {}},  # dict without "function" key -> wraps
+        ],
+    )
+    assert result is not None
+    assert len(result.tools) == 1
+    assert result.tools[0].function.name == "valid_func"
+
+
+def test_build_tool_parser_request_normalizes_nested_function():
+    """Tools with function.name structure should be preserved."""
+    from easydel.inference.esurge.mixins.io import EngineIOMixin
+
+    result = EngineIOMixin._build_tool_parser_request(
+        prompt="hi",
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "search", "parameters": {"type": "object", "properties": {}}},
+            }
+        ],
+    )
+    assert result is not None
+    assert result.tools[0].function.name == "search"
+
+
+def test_run_output_parsers_no_delegating_parser():
+    """When rd has no delegating_parser, should return passthrough result."""
+    engine = _ParsingHarness()
+    rd = {
+        "delegating_parser": None,
+        "parser_previous_text": "",
+        "parser_previous_token_ids": [],
+    }
+    result = engine._run_output_parsers(
+        rd=rd,
+        accumulated_text="hello world",
+        delta_text="hello world",
+        token_ids=[],
+        finished=False,
+    )
+    assert result["accumulated_content"] == "hello world"
+    assert result["delta_content"] == "hello world"
+    assert result["tool_calls"] is None
+    assert result["delta_reasoning"] is None

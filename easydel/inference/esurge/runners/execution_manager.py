@@ -40,7 +40,7 @@ Performance Characteristics:
     - Single host-device round-trip per inference step
     - Automatic kernel fusion via XLA compiler
     - Bucketed compilation: O(log N) unique compilations for N request sizes
-    - LRU cache with capacity of 64 compiled variants
+    - Compiled variants are retained until the cache is explicitly cleared
 
 Example:
     >>> from easydel.inference.esurge.runners import ExecutionManager
@@ -300,8 +300,8 @@ class ExecutionManager:
     Architecture:
         The manager splits the model into (graphdef, graphstate, graphother) for
         efficient functional transformations. The graphstate (weights) can be
-        updated without recompilation. Compiled functions are cached in an LRU
-        structure with 64-entry capacity.
+        updated without recompilation. Compiled functions are retained until
+        the cache is explicitly cleared.
 
     Compilation Strategy:
         Request counts are bucketed into powers of 2 (up to min_input_pad, then
@@ -329,7 +329,6 @@ class ExecutionManager:
         _batch_preparer: CPU-first batch metadata builder and async transfer helper.
         _model_executor: Model-step executor with compiled-variant cache.
         _sampler_executor: Sampler executor with compiled-variant cache.
-        _cache_capacity: Maximum cache entries (64).
         _debug_baselines: Hash baselines for debugging recompilations.
         _empty_sharding: Default sharding (replicated across mesh).
 
@@ -445,7 +444,6 @@ class ExecutionManager:
 
         self.rng_key = jax.device_put(jax.random.PRNGKey(0), self._empty_sharding)
 
-        self._cache_capacity = 64
         self._debug_baselines = {}
 
         self._batch_preparer = BatchMetadataPreparer(
@@ -468,14 +466,12 @@ class ExecutionManager:
             empty_sharding=self._empty_sharding,
             use_aot_forward=self.use_aot_forward,
             bind_graphstate_for_aot=self.bind_graphstate_for_aot,
-            cache_capacity=self._cache_capacity,
         )
         self._sampler_executor = SamplerExecutor(
             model=self.model,
             max_model_len=self.max_model_len,
             empty_sharding=self._empty_sharding,
             use_aot_forward=self.use_aot_forward,
-            cache_capacity=self._cache_capacity,
         )
         self._sampler_min_input_pad = 1
         self._sampler_vocab_size = int(self.model.config.get_text_config().vocab_size)

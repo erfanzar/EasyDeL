@@ -68,6 +68,9 @@ class eSurgeCfg(TypedDict, total=False):
             pass.
         bind_graphstate_for_aot: Whether to bind the graph state into the
             AOT-compiled function for reduced overhead.
+        enable_window_aware_runtime_cap: Whether to derive eSurge's runtime
+            request cap from live KV-window page demand instead of the
+            heuristic cache-cap estimate.
         enable_prefix_caching: Enable prefix caching to reuse the KV
             cache for shared prompt prefixes.
         auto_shard_model: Automatically shard the model across available
@@ -157,6 +160,7 @@ class eSurgeCfg(TypedDict, total=False):
     page_size: NotRequired[int]
     use_aot_forward: NotRequired[bool]
     bind_graphstate_for_aot: NotRequired[bool]
+    enable_window_aware_runtime_cap: NotRequired[bool]
     enable_prefix_caching: NotRequired[bool]
     auto_shard_model: NotRequired[bool]
     sharding_axis_dims: NotRequired[collections.abc.Sequence[int]]

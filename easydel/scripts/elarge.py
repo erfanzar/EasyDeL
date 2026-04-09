@@ -319,14 +319,32 @@ def _run_action(elm: Any, name: str, value: Any | None) -> None:
         except ImportError as e:
             raise SystemExit("Serving requires `fastapi` and `uvicorn` to be installed in your environment.") from e
 
-        tool_parser_name = params.get("tool_parser_name", "hermes")
+        tool_parser_name = params.get("tool_parser_name", "auto")
         if not isinstance(tool_parser_name, str) or not tool_parser_name.strip():
             raise SystemExit("`serve.tool_parser_name` must be a non-empty string.")
+        tool_parser_name = tool_parser_name.strip()
+        if tool_parser_name.lower() != "auto":
+            configured_tool_parser = elm.config.get("esurge", {}).get("tool_parser")
+            if configured_tool_parser is None:
+                logger.warning(
+                    "`serve.tool_parser_name=%s` is deprecated; migrating it to `esurge.tool_parser` for this run.",
+                    tool_parser_name,
+                )
+                elm.set_esurge(tool_parser=tool_parser_name)
+            elif str(configured_tool_parser).strip() != tool_parser_name:
+                raise SystemExit(
+                    "`serve.tool_parser_name` is deprecated and disagrees with `esurge.tool_parser`. "
+                    "Remove the `serve.tool_parser_name` override and keep only `esurge.tool_parser`."
+                )
+            else:
+                logger.warning(
+                    "`serve.tool_parser_name=%s` is deprecated and ignored; using `esurge.tool_parser`.",
+                    tool_parser_name,
+                )
 
         server_kwargs: dict[str, Any] = {
             "oai_like_processor": bool(params.get("oai_like_processor", True)),
             "enable_function_calling": bool(params.get("enable_function_calling", True)),
-            "tool_parser_name": tool_parser_name,
             "require_api_key": bool(params.get("require_api_key", False)),
             "admin_key": params.get("admin_key"),
         }

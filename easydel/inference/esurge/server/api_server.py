@@ -22,7 +22,7 @@ Key Features:
     - Full OpenAI API v1 compatibility (/v1/chat/completions, /v1/completions)
     - Multi-model support with automatic routing based on model name
     - Streaming responses using Server-Sent Events (SSE)
-    - Function/tool calling with pluggable parsers (Hermes, Qwen, etc.)
+    - Function/tool calling surfaced directly from eSurge parser outputs
     - Production-grade authentication with RBAC, rate limiting, and audit logging
     - Real-time metrics and health monitoring
     - Thread-safe request handling with configurable concurrency limits
@@ -55,13 +55,7 @@ Example:
             "llama-7b": eSurge.from_pretrained("model-a"),
             "llama-13b": eSurge.from_pretrained("model-b"),
         }
-        server = eSurgeApiServer(
-            esurge_map,
-            enable_function_calling=True,
-            tool_parser_name="hermes",
-            require_api_key=True,
-            admin_key="sk-admin-secret",
-        )
+        server = eSurgeApiServer(esurge_map, enable_function_calling=True, require_api_key=True, admin_key="sk-admin-secret")
         server.run()
 
 See Also:
@@ -73,6 +67,7 @@ See Also:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 import traceback
@@ -115,7 +110,8 @@ from ...openai_api_modules import (
     UsageInfo,
 )
 from ...sampling_params import SamplingParams
-from ...tools.tool_calling_mixin import ToolCallingMixin
+from ...stream_protocol import StreamEventFrame
+from ...typed_models import ResponseCompletedEvent, ResponsesFinalizationOptions, ResponsesOutputItem, ResponsesResponse
 from ..esurge_engine import RequestOutput, eSurge
 from .auth_endpoints import AuthEndpointsMixin
 
@@ -242,7 +238,7 @@ class eSurgeAdapter(InferenceEngineAdapter):
         return self.esurge.tokenizer
 
 
-class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMixin):
+class eSurgeApiServer(BaseInferenceApiServer, AuthEndpointsMixin):
     """eSurge-specific API server implementation with OpenAI compatibility.
 
     Provides a FastAPI-based REST API server that exposes eSurge engines
@@ -264,7 +260,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         esurge_map: dict[str, eSurge] | eSurge,
         oai_like_processor: bool = True,
         enable_function_calling: bool = True,
-        tool_parser_name: str = "hermes",
         require_api_key: bool = False,
         admin_key: str | None = None,
         enable_audit_logging: bool = True,
@@ -291,7 +286,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             esurge_map: Single eSurge instance or dict mapping model names to instances.
             oai_like_processor: Enable OpenAI-like processor compatibility for chat templates.
             enable_function_calling: Enable function/tool calling support.
-            tool_parser_name: Name of the tool parser to use (e.g., "hermes", "qwen", etc.)
             require_api_key: Enforce API key authentication for every endpoint.
             admin_key: Optional admin key for initial setup. If provided, creates an admin key.
             enable_audit_logging: Enable comprehensive audit logging for all auth operations.
@@ -301,10 +295,9 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             auto_save_interval: Seconds between automatic saves (default: 60.0).
             auth_worker_client: Optional AuthWorkerClient instance for ZMQ-based auth (default: None, uses in-process auth).
             response_store_worker_client: Optional ResponseStoreWorkerClient instance for persistent /v1/responses state.
-            tool_parser_worker_client: Optional ToolParserWorkerClient instance for ZMQ-based tool parsing. If None and use_tool_parser_worker=True, spawns a worker automatically.
-            use_tool_parser_worker: If True and enable_function_calling=True, automatically spawns a tool parser ZMQ worker (default: True).
             max_concurrent_generations: Maximum concurrent inference jobs allowed. Defaults to the smallest
-                ``max_num_seqs`` across loaded eSurge instances when not provided.
+                runtime request cap across loaded eSurge instances when not provided, falling back to
+                ``max_num_seqs`` when runtime metadata is unavailable.
             overload_message: Custom error message returned when all generation slots are busy.
             extra_stops: Global stop strings applied to every request in addition to request-level stop values.
                 Useful for enforcing server-side delimiters (for example ``\"<user>\"``) without requiring
@@ -323,8 +316,6 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         self.esurge_map = esurge_map
         self.adapters: dict[str, eSurgeAdapter] = {}
 
-        # Build processor map for tool parser initialization
-        model_processors = {}
         for name, esurge in esurge_map.items():
             if not isinstance(esurge, eSurge):
                 raise TypeError(f"Value for key '{name}' must be an instance of eSurge")
@@ -335,28 +326,22 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                     "can run eSurgeApiServer."
                 )
             self.adapters[name] = eSurgeAdapter(esurge, name)
-            model_processors[name] = esurge.tokenizer
-
-        # Initialize tool parsers using mixin
-        self.tool_parsers = self.initialize_tool_parsers(
-            model_processors=model_processors,
-            tool_parser_name=tool_parser_name,
-            enable_function_calling=enable_function_calling,
-        )
 
         self.oai_like_processor = oai_like_processor
-        self.tool_parser_name = tool_parser_name
-        self.model_processors = model_processors
         self._refine_sampling_params_callback = refine_sampling_params
         self._refine_chat_request_callback = refine_chat_request
         self._extra_stops = self._normalize_stop_sequences(extra_stops)
 
         try:
-            esurge_max_concurrency = min(int(esurge.max_num_seqs) for esurge in esurge_map.values())
+            esurge_max_concurrency = min(
+                self._resolve_esurge_runtime_request_cap(esurge) for esurge in esurge_map.values()
+            )
         except (AttributeError, TypeError, ValueError) as e:
-            raise ValueError("Loaded eSurge instances must expose a positive `max_num_seqs`.") from e
+            raise ValueError(
+                "Loaded eSurge instances must expose a positive runtime request cap or `max_num_seqs`."
+            ) from e
         if esurge_max_concurrency <= 0:
-            raise ValueError("Loaded eSurge instances must expose a positive `max_num_seqs`.")
+            raise ValueError("Loaded eSurge instances must expose a positive runtime request cap or `max_num_seqs`.")
 
         if max_concurrent_generations is not None:
             try:
@@ -366,7 +351,8 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         else:
             max_slots = esurge_max_concurrency
         max_slots = max(0, max_slots)
-        kwargs["max_workers"] = esurge_max_concurrency
+        self._resolved_generation_slot_cap = max_slots
+        kwargs["max_workers"] = esurge_max_concurrency * 2
 
         # Initialize authentication manager (either ZMQ worker or in-process)
         self._require_api_key = bool(require_api_key)
@@ -746,6 +732,73 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                     pass
         return 128
 
+    @staticmethod
+    def _get_engine_tool_parser(esurge: eSurge) -> str | None:
+        """Return the parser name configured on the eSurge engine, if any."""
+
+        engine_name = getattr(esurge, "tool_parser", None)
+        if isinstance(engine_name, str):
+            normalized = engine_name.strip()
+            return normalized or None
+        return None
+
+    @staticmethod
+    def _example_tool_definitions() -> list[dict[str, tp.Any]]:
+        """Return placeholder tool definitions for discovery endpoints."""
+
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "example_function",
+                    "description": "An example function for demonstration",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "param1": {
+                                "type": "string",
+                                "description": "First parameter",
+                            },
+                            "param2": {
+                                "type": "number",
+                                "description": "Second parameter",
+                            },
+                        },
+                        "required": ["param1"],
+                    },
+                },
+            }
+        ]
+
+    def _create_tools_response(self) -> dict[str, tp.Any]:
+        """Describe tool-calling capabilities as reported by each eSurge engine."""
+
+        tools_by_model: dict[str, dict[str, tp.Any]] = {}
+        for model_name, adapter in self.adapters.items():
+            tool_parser = self._get_engine_tool_parser(adapter.esurge) if self.enable_function_calling else None
+            tools_by_model[model_name] = {
+                "tools": self._example_tool_definitions(),
+                "tool_parser": tool_parser,
+                "formats_supported": [tool_parser] if tool_parser else [],
+                "parallel_calls": True,
+            }
+
+        return {"models": tools_by_model, "default_format": "openai"}
+
+    @staticmethod
+    def _create_tool_execution_placeholder_response() -> JSONResponse:
+        """Return the placeholder response for the unimplemented tool executor."""
+
+        return JSONResponse(
+            {
+                "error": {
+                    "message": "Tool execution endpoint is a placeholder. Implement based on your needs.",
+                    "type": HTTPStatus.NOT_IMPLEMENTED.name,
+                }
+            },
+            status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+        )
+
     def _ensure_request_max_tokens(
         self,
         request: ChatCompletionRequest | CompletionRequest,
@@ -887,6 +940,78 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             return len(value)
         return None
 
+    async def _abort_non_stream_request_on_disconnect(
+        self,
+        *,
+        raw_request: Request,
+        esurge: eSurge,
+        request_id: str,
+        endpoint: str,
+        model: str | None,
+        done_event: asyncio.Event,
+        poll_interval_s: float = 0.1,
+    ) -> None:
+        """Abort non-stream engine work when the HTTP client disconnects."""
+
+        disconnect_logged = False
+
+        while not done_event.is_set():
+            try:
+                disconnected = await raw_request.is_disconnected()
+            except Exception:
+                logger.debug(
+                    "Failed to probe disconnect state for non-stream request %s",
+                    request_id,
+                    exc_info=True,
+                )
+                disconnected = False
+
+            if disconnected:
+                if not disconnect_logged:
+                    client = getattr(raw_request, "client", None)
+                    logger.warning(
+                        "Client disconnected during non-stream request; attempting abort until completion. "
+                        "endpoint=%s request_id=%s model=%s client_host=%s client_port=%s",
+                        endpoint,
+                        request_id,
+                        model,
+                        getattr(client, "host", None),
+                        getattr(client, "port", None),
+                    )
+                    disconnect_logged = True
+
+                try:
+                    esurge.abort_request(request_id)
+                except Exception:
+                    logger.debug(
+                        "Failed to abort non-stream request %s after disconnect",
+                        request_id,
+                        exc_info=True,
+                    )
+
+            await asyncio.sleep(poll_interval_s)
+
+    @staticmethod
+    def _abort_request_after_handler_cancel(
+        *,
+        esurge: eSurge,
+        request_id: str,
+        endpoint: str,
+        model: str | None,
+    ) -> None:
+        """Abort engine work when the HTTP handler itself is cancelled."""
+
+        logger.warning(
+            "HTTP handler cancelled; aborting engine request. endpoint=%s request_id=%s model=%s",
+            endpoint,
+            request_id,
+            model,
+        )
+        try:
+            esurge.abort_request(request_id)
+        except Exception:
+            logger.debug("Failed to abort request %s after handler cancellation", request_id, exc_info=True)
+
     @classmethod
     def _build_stream_debug_context(
         cls,
@@ -927,16 +1052,16 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             "disconnected": disconnected,
             "tools_type": type(tools).__name__ if tools is not None else None,
             "tools_len": cls._stream_debug_len(tools),
-            "first_tool_type": (type(tools[0]).__name__ if isinstance(tools, list) and len(tools) > 0 else None),
+            "first_tool_type": type(tools[0]).__name__ if isinstance(tools, list) and len(tools) > 0 else None,
             "messages_type": type(messages).__name__ if messages is not None else None,
             "messages_len": cls._stream_debug_len(messages),
             "stream_error_type": type(stream_error).__name__ if stream_error is not None else None,
             "stream_error_message": str(stream_error) if stream_error is not None else None,
             "raw_delta_message_type": type(raw_delta_message).__name__ if raw_delta_message is not None else None,
             "delta_message_type": type(delta_message).__name__ if delta_message is not None else None,
-            "delta_tool_calls_raw_type": type(delta_tool_calls_raw).__name__
-            if delta_tool_calls_raw is not None
-            else None,
+            "delta_tool_calls_raw_type": (
+                type(delta_tool_calls_raw).__name__ if delta_tool_calls_raw is not None else None
+            ),
             "delta_tool_calls_raw_len": cls._stream_debug_len(delta_tool_calls_raw),
             "delta_text_type": type(delta_text).__name__ if delta_text is not None else None,
             "delta_text_len": cls._stream_debug_len(delta_text),
@@ -1039,6 +1164,39 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             seen.add(value)
             normalized.append(value)
         return normalized
+
+    @staticmethod
+    def _resolve_esurge_runtime_request_cap(esurge: eSurge) -> int:
+        """Infer the effective request cap for one engine.
+
+        Prefers the runner/cache runtime cap when available, then falls back to
+        the configured ``max_num_seqs``. The smaller positive value wins.
+        """
+
+        configured_cap = 0
+        try:
+            configured_cap = int(getattr(esurge, "max_num_seqs", 0) or 0)
+        except (TypeError, ValueError):
+            configured_cap = 0
+
+        runtime_cap = 0
+        runner = getattr(esurge, "runner", None)
+        metadata = getattr(runner, "metadata", None)
+        if metadata is not None and hasattr(metadata, "get_max_num_seqs"):
+            try:
+                runtime_cap = int(metadata.get_max_num_seqs())
+            except (TypeError, ValueError):
+                runtime_cap = 0
+        if runtime_cap <= 0 and runner is not None:
+            try:
+                runtime_cap = int(getattr(runner, "num_reqs_max_model_len", 0) or 0)
+            except (TypeError, ValueError):
+                runtime_cap = 0
+
+        candidates = [cap for cap in (runtime_cap, configured_cap) if cap > 0]
+        if not candidates:
+            raise ValueError("Loaded eSurge instances must expose a positive runtime request cap or `max_num_seqs`.")
+        return min(candidates)
 
     def _apply_extra_stops_to_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
         """Merge server-level stop strings into request sampling parameters."""
@@ -1143,7 +1301,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         Raises:
             RuntimeError: If chat template application fails.
         """
-        conversation = request.model_dump(exclude_unset=True)["messages"]
+        conversation = [message.model_dump(exclude_none=True) for message in request.messages]
         processor = esurge.tokenizer
 
         if isinstance(processor, ProcessorMixin) and self.oai_like_processor:
@@ -1323,7 +1481,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             Messages may be converted to OpenAI format if using a
             ProcessorMixin with `oai_like_processor` enabled.
         """
-        conversation = request.model_dump(exclude_unset=True)["messages"]
+        conversation = [message.model_dump(exclude_none=True) for message in request.messages]
         processor = esurge.tokenizer
 
         if isinstance(processor, ProcessorMixin) and self.oai_like_processor:
@@ -1436,30 +1594,29 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
         response_id = f"resp_{uuid.uuid4().hex}"
         payload_api_keys = self._extract_payload_api_keys(request)
-        payload = request.model_dump(exclude_none=True, exclude_unset=True)
 
         try:
-            store_flag = payload.get("store")
+            store_flag = request.store
             store_response = self._default_store_responses if store_flag is None else bool(store_flag)
 
-            previous_response_id = payload.get("previous_response_id")
+            previous_response_id = request.previous_response_id
             if not isinstance(previous_response_id, str):
                 previous_response_id = None
             else:
                 previous_response_id = previous_response_id.strip() or None
 
-            conversation_id = self._normalize_conversation_id(payload.get("conversation"))
+            conversation_id = self._normalize_conversation_id(request.conversation)
             if previous_response_id and conversation_id:
                 raise HTTPException(status_code=400, detail="Cannot use both 'previous_response_id' and 'conversation'")
 
-            model = payload.get("model")
+            model = request.model
             if not isinstance(model, str) or not model.strip():
                 raise HTTPException(400, "Field 'model' is required")
 
             adapter = self._get_adapter(model)
             esurge = adapter.esurge
 
-            requested_tokens, max_tokens = self._parse_responses_max_tokens(payload, esurge)
+            requested_tokens, max_tokens = self._parse_responses_max_tokens(request, esurge)
             self._authorize_request(
                 raw_request,
                 payload_api_keys=payload_api_keys,
@@ -1468,17 +1625,20 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                 requested_tokens=requested_tokens,
             )
 
-            input_messages = self._responses_payload_to_messages(payload, include_instructions=False)
+            input_messages = [
+                message if isinstance(message, ChatMessage) else ChatMessage.model_validate(message)
+                for message in self._responses_payload_to_messages(request, include_instructions=False)
+            ]
             if not input_messages:
                 raise HTTPException(400, "Field 'input' (or 'messages') cannot be empty")
 
-            instructions = payload.get("instructions")
+            instructions = request.instructions
             if not isinstance(instructions, str) or not instructions.strip():
                 instructions = None
             else:
                 instructions = instructions.strip()
 
-            history_messages: list[dict[str, tp.Any]] = []
+            history_messages: list[ChatMessage] = []
             if previous_response_id:
                 if not self._enable_response_store:
                     raise HTTPException(
@@ -1487,12 +1647,15 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                 prev = await self._response_store_get_response(previous_response_id)
                 if prev is None:
                     raise HTTPException(status_code=400, detail=f"Unknown previous_response_id '{previous_response_id}'")
-                history_messages = tp.cast(list[dict[str, tp.Any]], prev.get("conversation", []))
+                history_messages = [
+                    ChatMessage.model_validate(message)
+                    for message in tp.cast(list[dict[str, tp.Any]], prev.get("conversation", []))
+                ]
             elif conversation_id:
                 if not self._enable_response_store:
                     raise HTTPException(status_code=400, detail="conversation requires enable_response_store=True")
                 conversation_history = (await self._response_store_get_conversation(conversation_id)) or []
-                history_messages = list(conversation_history)
+                history_messages = [ChatMessage.model_validate(message) for message in conversation_history]
 
             # `full_messages` is the persisted conversation state for this response (excludes `instructions`).
             full_messages = list(history_messages) + list(input_messages)
@@ -1500,24 +1663,59 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             # `engine_messages` is what we send to the model (may include ephemeral instructions).
             engine_messages = list(full_messages)
             if instructions:
-                engine_messages.insert(0, {"role": "system", "content": instructions})
+                engine_messages.insert(0, ChatMessage(role="system", content=instructions))
 
-            raw_tools, tools_for_template = self._extract_responses_tools(payload)
+            engine_messages_payload = [message.model_dump(exclude_none=True) for message in engine_messages]
 
-            sampling_params = self._create_sampling_params_from_responses(payload, max_tokens)
+            raw_tools, tools_for_template = self._extract_responses_tools(request)
+
+            sampling_params = self._create_sampling_params_from_responses(request, max_tokens)
             sampling_params = self._apply_extra_stops_to_sampling_params(sampling_params)
-            stream = bool(payload.get("stream", False))
-            reasoning_summary_requested = self._responses_reasoning_summary_requested(payload)
+            stream = bool(request.stream)
+            reasoning_summary_requested = self._responses_reasoning_summary_requested(request)
+
+            final_response_overrides = ResponsesFinalizationOptions(
+                error=None,
+                incomplete_details=None,
+                instructions=instructions,
+                max_output_tokens=request.max_output_tokens,
+                previous_response_id=previous_response_id,
+                store=store_response,
+                temperature=1.0 if request.temperature is None else request.temperature,
+                top_p=1.0 if request.top_p is None else request.top_p,
+                truncation=request.truncation or "disabled",
+                tool_choice=request.tool_choice or "auto",
+                tools=list(raw_tools or []),
+                parallel_tool_calls=True if request.parallel_tool_calls is None else request.parallel_tool_calls,
+                metadata=request.metadata if isinstance(request.metadata, dict) else {},
+            )
 
             if not stream:
-                async with self._acquire_generation_slot():
+                async with self._acquire_generation_slot(
+                    endpoint="/v1/responses",
+                    request_id=response_id,
+                    model=model,
+                    raw_request=raw_request,
+                    stream=False,
+                ):
                     loop = asyncio.get_running_loop()
+                    disconnect_done = asyncio.Event()
+                    disconnect_task = asyncio.create_task(
+                        self._abort_non_stream_request_on_disconnect(
+                            raw_request=raw_request,
+                            esurge=esurge,
+                            request_id=response_id,
+                            endpoint="/v1/responses",
+                            model=model,
+                            done_event=disconnect_done,
+                        )
+                    )
 
                     def _run_chat() -> RequestOutput:
                         return tp.cast(
                             RequestOutput,
                             esurge.chat(
-                                messages=engine_messages,
+                                messages=engine_messages_payload,
                                 tools=tools_for_template,
                                 sampling_params=sampling_params,
                                 request_id=response_id,
@@ -1527,8 +1725,21 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
                     try:
                         output = await loop.run_in_executor(self.thread_pool, _run_chat)
+                    except asyncio.CancelledError:
+                        self._abort_request_after_handler_cancel(
+                            esurge=esurge,
+                            request_id=response_id,
+                            endpoint="/v1/responses",
+                            model=model,
+                        )
+                        raise
                     except ValueError as e:
                         raise HTTPException(status_code=400, detail=str(e)) from e
+                    finally:
+                        disconnect_done.set()
+                        disconnect_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await disconnect_task
 
                 completion_tokens = int(output.num_generated_tokens or 0)
                 prompt_tokens = self._prompt_token_count_from_output(output)
@@ -1567,24 +1778,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                     include_reasoning_summary=reasoning_summary_requested,
                     output_items=output_items,
                 )
-                response_obj.update(
-                    {
-                        "error": None,
-                        "incomplete_details": None,
-                        "instructions": instructions,
-                        "max_output_tokens": payload.get("max_output_tokens"),
-                        "previous_response_id": previous_response_id,
-                        "store": store_response,
-                        "temperature": payload.get("temperature", 1.0),
-                        "top_p": payload.get("top_p", 1.0),
-                        "truncation": payload.get("truncation", "disabled"),
-                        "tool_choice": payload.get("tool_choice", "auto"),
-                        "tools": raw_tools or [],
-                        "parallel_tool_calls": payload.get("parallel_tool_calls", True),
-                        "metadata": payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
-                        "text": {"format": {"type": "text"}},
-                    }
-                )
+                response_obj = response_obj.model_copy(update=final_response_overrides.as_update_dict())
 
                 if store_response and self._enable_response_store:
                     assistant_turn = self._responses_assistant_message_from_output_items(output_items)
@@ -1594,76 +1788,45 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                         {
                             "id": response_id,
                             "model": model,
-                            "created_at": response_obj.get("created_at"),
+                            "created_at": response_obj.created_at,
                             "previous_response_id": previous_response_id,
                             "conversation_id": conversation_id,
                             "conversation": conversation_after,
-                            "response": response_obj,
+                            "response": response_obj.model_dump(exclude_none=False),
                         },
                     )
                     if conversation_id:
                         await self._response_store_put_conversation(conversation_id, conversation_after)
 
-                return response_obj
+                return response_obj.model_dump(exclude_none=False)
+
+            created_at = int(time.time())
 
             async def generate_stream():
-                """Async generator yielding SSE events for Responses API streaming.
+                """Async generator yielding SSE events for Responses API streaming."""
 
-                Streams reasoning, tool call, and message output items as they
-                are produced, emitting incremental delta events compatible with
-                the OpenAI Responses API streaming protocol.
-                """
-                async with self._acquire_generation_slot():
-                    previous_text = ""
-                    previous_token_ids: list[int] = []
-                    prompt_tokens = 0
-                    completion_tokens = 0
-                    last_output: RequestOutput | None = None
+                async with self._acquire_generation_slot(
+                    endpoint="/v1/responses",
+                    request_id=response_id,
+                    model=model,
+                    raw_request=raw_request,
+                    stream=True,
+                ):
                     disconnected = False
-
-                    output_items_stream: list[dict[str, tp.Any]] = []
-                    next_output_index = 0
-
-                    reasoning_item_id: str | None = None
-                    reasoning_output_index: int | None = None
-                    reasoning_text_accum = ""
-                    reasoning_done = False
-
-                    function_states: dict[str, dict[str, tp.Any]] = {}
-                    function_order: list[str] = []
-                    saw_function_call_delta = False
-
-                    message_item: dict[str, tp.Any] | None = None
-                    message_item_id: str | None = None
-                    message_output_index: int | None = None
-                    message_text_accum = ""
-                    message_done = False
-                    content_index = 0
-
-                    yield self._sse_event(
-                        "response.created",
-                        {
-                            "type": "response.created",
-                            "response": {
-                                "id": response_id,
-                                "object": "response",
-                                "created_at": int(time.time()),
-                                "model": model,
-                                "status": "in_progress",
-                                "output": [],
-                            },
-                        },
-                    )
-
+                    final_obj: ResponsesResponse | None = None
                     queue = self._start_stream_task(
                         lambda: tp.cast(
-                            Iterator[RequestOutput],
-                            esurge.chat(
-                                messages=engine_messages,
+                            Iterator[StreamEventFrame],
+                            esurge.iter_responses_stream(
+                                response_id=response_id,
+                                model=model,
+                                messages=engine_messages_payload,
                                 tools=tools_for_template,
                                 sampling_params=sampling_params,
                                 request_id=response_id,
-                                stream=True,
+                                include_reasoning_summary=reasoning_summary_requested,
+                                final_response_overrides=final_response_overrides,
+                                created_at=created_at,
                             ),
                         )
                     )
@@ -1687,476 +1850,42 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                                 stream_error = tp.cast(Exception, stream_payload)  # pyright: ignore[reportUnusedVariable]
                                 raise tp.cast(Exception, stream_payload)
 
-                            output = tp.cast(RequestOutput, stream_payload)
-                            last_output = output
-                            if not prompt_tokens:
-                                prompt_tokens = self._prompt_token_count_from_output(output)
-                            completion_tokens = int(output.num_generated_tokens or 0)
+                            frame = tp.cast(StreamEventFrame, stream_payload)
+                            frame_event = frame.event
+                            frame_payload = frame.payload
+                            if frame_event == "response.completed" and isinstance(frame_payload, ResponseCompletedEvent):
+                                final_obj = frame_payload.response
 
-                            primary_output = output.outputs[0] if output.outputs else None
-                            current_text = output.accumulated_text or ""
-                            delta_text = self._compute_delta_text(current_text, previous_text, output.delta_text or "")
-                            delta_reasoning = output.delta_reasoning_content or ""
-                            delta_tool_calls_raw = output.delta_tool_calls
-
-                            engine_has_parsers = (
-                                hasattr(esurge, "_tool_parser_class") and esurge._tool_parser_class is not None
-                            ) or (
-                                hasattr(esurge, "_reasoning_parser_class") and esurge._reasoning_parser_class is not None
-                            )
-
-                            current_token_ids = primary_output.token_ids if primary_output is not None else []
-                            if engine_has_parsers:
-                                previous_text = current_text
-                                previous_token_ids = current_token_ids
-                            else:
-                                previous_text = current_text
-                                previous_token_ids = current_token_ids
-
-                            current_reasoning = output.reasoning_content or (
-                                primary_output.reasoning_content if primary_output is not None else ""
-                            )
-                            if (
-                                reasoning_summary_requested
-                                and isinstance(current_reasoning, str)
-                                and len(current_reasoning) > len(reasoning_text_accum)
-                                and not delta_reasoning
-                            ):
-                                delta_reasoning = current_reasoning[len(reasoning_text_accum) :]
-
-                            if reasoning_summary_requested and delta_reasoning:
-                                if reasoning_item_id is None:
-                                    reasoning_item = self._build_responses_reasoning_item("")
-                                    reasoning_item["status"] = "in_progress"
-                                    reasoning_item_id = tp.cast(str, reasoning_item["id"])
-                                    reasoning_output_index = next_output_index
-                                    next_output_index += 1
-                                    output_items_stream.append(reasoning_item)
-                                    yield self._sse_event(
-                                        "response.output_item.added",
-                                        {
-                                            "type": "response.output_item.added",
-                                            "output_index": reasoning_output_index,
-                                            "item": reasoning_item,
-                                        },
-                                    )
-
-                                reasoning_text_accum += delta_reasoning
-                                output_items_stream[reasoning_output_index]["summary"][0]["text"] = reasoning_text_accum
-                                yield self._sse_event(
-                                    "response.reasoning_summary_text.delta",
-                                    {
-                                        "type": "response.reasoning_summary_text.delta",
-                                        "output_index": reasoning_output_index,
-                                        "item_id": reasoning_item_id,
-                                        "summary_index": 0,
-                                        "delta": delta_reasoning,
-                                    },
-                                )
-
-                            delta_tool_calls = self._jsonify_tool_calls(delta_tool_calls_raw) or []
-                            if delta_tool_calls:
-                                saw_function_call_delta = True
-                            for position, delta_call in enumerate(delta_tool_calls):
-                                if not isinstance(delta_call, dict):
-                                    continue
-
-                                call_index_raw = delta_call.get("index")
-                                call_index = call_index_raw if isinstance(call_index_raw, int) else position
-
-                                delta_call_id = delta_call.get("id")
-                                if isinstance(delta_call_id, str) and delta_call_id:
-                                    call_key = delta_call_id
-                                    resolved_call_id = delta_call_id
-                                else:
-                                    call_key = f"idx:{call_index}"
-                                    resolved_call_id = f"call_{uuid.uuid4().hex}"
-
-                                state = function_states.get(call_key)
-                                if state is None:
-                                    function_item = {
-                                        "id": f"fc_{uuid.uuid4().hex}",
-                                        "type": "function_call",
-                                        "call_id": resolved_call_id,
-                                        "name": "",
-                                        "arguments": "",
-                                        "status": "in_progress",
-                                    }
-                                    state = {
-                                        "item": function_item,
-                                        "item_id": function_item["id"],
-                                        "output_index": next_output_index,
-                                        "done": False,
-                                    }
-                                    function_states[call_key] = state
-                                    function_order.append(call_key)
-                                    output_items_stream.append(function_item)
-                                    next_output_index += 1
-                                    yield self._sse_event(
-                                        "response.output_item.added",
-                                        {
-                                            "type": "response.output_item.added",
-                                            "output_index": state["output_index"],
-                                            "item": function_item,
-                                        },
-                                    )
-
-                                function_payload = delta_call.get("function")
-                                if not isinstance(function_payload, dict):
-                                    function_payload = {}
-
-                                name = function_payload.get("name")
-                                if isinstance(name, str) and name:
-                                    state["item"]["name"] = name
-
-                                arguments_delta = function_payload.get("arguments")
-                                if arguments_delta is None:
-                                    continue
-
-                                if isinstance(arguments_delta, str):
-                                    arguments_delta_text = arguments_delta
-                                elif isinstance(arguments_delta, (dict, list)):
-                                    arguments_delta_text = json.dumps(
-                                        arguments_delta, ensure_ascii=False, separators=(",", ":")
-                                    )
-                                else:
-                                    arguments_delta_text = str(arguments_delta)
-
-                                state["item"]["arguments"] += arguments_delta_text
-                                yield self._sse_event(
-                                    "response.function_call_arguments.delta",
-                                    {
-                                        "type": "response.function_call_arguments.delta",
-                                        "output_index": state["output_index"],
-                                        "item_id": state["item_id"],
-                                        "delta": arguments_delta_text,
-                                    },
-                                )
-
-                            if saw_function_call_delta:
-                                delta_text = ""
-
-                            if delta_text:
-                                if message_item is None:
-                                    message_item = {
-                                        "id": f"msg_{uuid.uuid4().hex}",
-                                        "type": "message",
-                                        "role": "assistant",
-                                        "content": [],
-                                        "status": "in_progress",
-                                    }
-                                    message_item_id = tp.cast(str, message_item["id"])
-                                    message_output_index = next_output_index
-                                    next_output_index += 1
-                                    output_items_stream.append(message_item)
-                                    yield self._sse_event(
-                                        "response.output_item.added",
-                                        {
-                                            "type": "response.output_item.added",
-                                            "output_index": message_output_index,
-                                            "item": message_item,
-                                        },
-                                    )
-                                    yield self._sse_event(
-                                        "response.content_part.added",
-                                        {
-                                            "type": "response.content_part.added",
-                                            "output_index": message_output_index,
-                                            "item_id": message_item_id,
-                                            "content_index": content_index,
-                                            "part": {
-                                                "type": "output_text",
-                                                "annotations": [],
-                                                "logprobs": [],
-                                                "text": "",
-                                            },
-                                        },
-                                    )
-
-                                message_text_accum += delta_text
-                                yield self._sse_event(
-                                    "response.output_text.delta",
-                                    {
-                                        "type": "response.output_text.delta",
-                                        "output_index": message_output_index,
-                                        "item_id": message_item_id,
-                                        "content_index": content_index,
-                                        "delta": delta_text,
-                                    },
-                                )
+                            yield self._sse_event(frame_event, frame_payload)
 
                         if disconnected:
                             return
 
-                        full_text = last_output.accumulated_text if last_output is not None else previous_text
-                        primary_output = (
-                            last_output.outputs[0] if (last_output is not None and last_output.outputs) else None
-                        )
-                        reasoning_text_final = last_output.reasoning_content if last_output is not None else None
-                        if not reasoning_text_final and primary_output is not None:
-                            reasoning_text_final = primary_output.reasoning_content
-
-                        tool_calls_payload = self._jsonify_tool_calls(
-                            (last_output.tool_calls if last_output is not None else None)
-                            or (primary_output.tool_calls if primary_output is not None else None)
-                        )
-
-                        if tool_calls_payload or saw_function_call_delta:
-                            full_text = ""
-
-                        if (
-                            reasoning_summary_requested
-                            and not reasoning_text_accum
-                            and isinstance(reasoning_text_final, str)
-                            and reasoning_text_final.strip()
-                        ):
-                            reasoning_text_accum = reasoning_text_final
-
-                        if last_output is not None:
-                            completion_tokens = int(last_output.num_generated_tokens or completion_tokens)
-
-                        if reasoning_summary_requested and reasoning_text_accum and not reasoning_done:
-                            if reasoning_item_id is None:
-                                reasoning_item = self._build_responses_reasoning_item(reasoning_text_accum)
-                                reasoning_item["status"] = "in_progress"
-                                reasoning_item_id = tp.cast(str, reasoning_item["id"])
-                                reasoning_output_index = next_output_index
-                                next_output_index += 1
-                                output_items_stream.append(reasoning_item)
-                                yield self._sse_event(
-                                    "response.output_item.added",
-                                    {
-                                        "type": "response.output_item.added",
-                                        "output_index": reasoning_output_index,
-                                        "item": reasoning_item,
-                                    },
-                                )
-
-                            output_items_stream[reasoning_output_index]["summary"][0]["text"] = reasoning_text_accum
-                            output_items_stream[reasoning_output_index]["status"] = "completed"
-                            yield self._sse_event(
-                                "response.reasoning_summary_text.done",
-                                {
-                                    "type": "response.reasoning_summary_text.done",
-                                    "output_index": reasoning_output_index,
-                                    "item_id": reasoning_item_id,
-                                    "summary_index": 0,
-                                    "text": reasoning_text_accum,
-                                },
-                            )
-                            yield self._sse_event(
-                                "response.output_item.done",
-                                {
-                                    "type": "response.output_item.done",
-                                    "output_index": reasoning_output_index,
-                                    "item": output_items_stream[reasoning_output_index],
-                                },
-                            )
-                            reasoning_done = True
-
-                        normalized_tool_calls = tool_calls_payload or []
-                        for idx, tool_call in enumerate(normalized_tool_calls):
-                            if not isinstance(tool_call, dict):
-                                continue
-                            function_payload = tool_call.get("function")
-                            if not isinstance(function_payload, dict):
-                                continue
-                            tool_call_id = tool_call.get("id")
-                            if isinstance(tool_call_id, str) and tool_call_id:
-                                call_key = tool_call_id
-                                resolved_call_id = tool_call_id
-                            else:
-                                call_key = f"idx:{idx}"
-                                resolved_call_id = f"call_{uuid.uuid4().hex}"
-
-                            state = function_states.get(call_key)
-                            if state is None:
-                                function_item = {
-                                    "id": f"fc_{uuid.uuid4().hex}",
-                                    "type": "function_call",
-                                    "call_id": resolved_call_id,
-                                    "name": "",
-                                    "arguments": "",
-                                    "status": "in_progress",
-                                }
-                                state = {
-                                    "item": function_item,
-                                    "item_id": function_item["id"],
-                                    "output_index": next_output_index,
-                                    "done": False,
-                                }
-                                function_states[call_key] = state
-                                function_order.append(call_key)
-                                output_items_stream.append(function_item)
-                                next_output_index += 1
-                                yield self._sse_event(
-                                    "response.output_item.added",
-                                    {
-                                        "type": "response.output_item.added",
-                                        "output_index": state["output_index"],
-                                        "item": function_item,
-                                    },
-                                )
-
-                            name = function_payload.get("name")
-                            if isinstance(name, str) and name:
-                                state["item"]["name"] = name
-
-                            arguments = function_payload.get("arguments", "")
-                            if isinstance(arguments, str):
-                                arguments_text = arguments
-                            elif isinstance(arguments, (dict, list)):
-                                arguments_text = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
-                            else:
-                                arguments_text = str(arguments)
-
-                            if arguments_text and not state["item"]["arguments"]:
-                                state["item"]["arguments"] = arguments_text
-                                yield self._sse_event(
-                                    "response.function_call_arguments.delta",
-                                    {
-                                        "type": "response.function_call_arguments.delta",
-                                        "output_index": state["output_index"],
-                                        "item_id": state["item_id"],
-                                        "delta": arguments_text,
-                                    },
-                                )
-                            elif arguments_text:
-                                state["item"]["arguments"] = arguments_text
-
-                        for call_key in function_order:
-                            state = function_states.get(call_key)
-                            if state is None or state.get("done"):
-                                continue
-                            state["item"]["status"] = "completed"
-                            yield self._sse_event(
-                                "response.function_call_arguments.done",
-                                {
-                                    "type": "response.function_call_arguments.done",
-                                    "output_index": state["output_index"],
-                                    "item_id": state["item_id"],
-                                    "arguments": state["item"]["arguments"],
-                                },
-                            )
-                            yield self._sse_event(
-                                "response.output_item.done",
-                                {
-                                    "type": "response.output_item.done",
-                                    "output_index": state["output_index"],
-                                    "item": state["item"],
-                                },
-                            )
-                            state["done"] = True
-
-                        if message_item is None:
-                            message_item = {
-                                "id": f"msg_{uuid.uuid4().hex}",
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [],
-                                "status": "in_progress",
-                            }
-                            message_item_id = tp.cast(str, message_item["id"])
-                            message_output_index = next_output_index
-                            next_output_index += 1
-                            output_items_stream.append(message_item)
-                            yield self._sse_event(
-                                "response.output_item.added",
-                                {
-                                    "type": "response.output_item.added",
-                                    "output_index": message_output_index,
-                                    "item": message_item,
-                                },
-                            )
-                            yield self._sse_event(
-                                "response.content_part.added",
-                                {
-                                    "type": "response.content_part.added",
-                                    "output_index": message_output_index,
-                                    "item_id": message_item_id,
-                                    "content_index": content_index,
-                                    "part": {"type": "output_text", "annotations": [], "logprobs": [], "text": ""},
-                                },
-                            )
-
-                        message_text_accum = full_text
-                        yield self._sse_event(
-                            "response.output_text.done",
-                            {
-                                "type": "response.output_text.done",
-                                "output_index": message_output_index,
-                                "item_id": message_item_id,
-                                "content_index": content_index,
-                                "text": full_text,
-                            },
-                        )
-                        message_item["content"] = [
-                            {"type": "output_text", "annotations": [], "logprobs": [], "text": full_text}
-                        ]
-                        message_item["status"] = "completed"
-                        if not message_done:
-                            yield self._sse_event(
-                                "response.output_item.done",
-                                {
-                                    "type": "response.output_item.done",
-                                    "output_index": message_output_index,
-                                    "item": message_item,
-                                },
-                            )
-                            message_done = True
-
-                        final_obj = self._build_responses_object(
-                            response_id=response_id,
-                            model=model,
-                            output_text=full_text,
-                            prompt_tokens=prompt_tokens,
-                            completion_tokens=completion_tokens,
-                            tool_calls=tool_calls_payload,
-                            reasoning_text=reasoning_text_accum or None,
-                            include_reasoning_summary=reasoning_summary_requested,
-                            output_items=output_items_stream,
-                        )
-                        final_obj.update(
-                            {
-                                "error": None,
-                                "incomplete_details": None,
-                                "instructions": instructions,
-                                "max_output_tokens": payload.get("max_output_tokens"),
-                                "previous_response_id": previous_response_id,
-                                "store": store_response,
-                                "temperature": payload.get("temperature", 1.0),
-                                "top_p": payload.get("top_p", 1.0),
-                                "truncation": payload.get("truncation", "disabled"),
-                                "tool_choice": payload.get("tool_choice", "auto"),
-                                "tools": raw_tools or [],
-                                "parallel_tool_calls": payload.get("parallel_tool_calls", True),
-                                "metadata": payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
-                                "text": {"format": {"type": "text"}},
-                            }
-                        )
+                        if final_obj is None:
+                            raise RuntimeError("Streaming finished without response.completed")
 
                         if store_response and self._enable_response_store:
-                            assistant_turn = self._responses_assistant_message_from_output_items(output_items_stream)
+                            output_items = list(tp.cast(list[ResponsesOutputItem], final_obj.output))
+                            assistant_turn = self._responses_assistant_message_from_output_items(output_items)
                             conversation_after = self._conversation_from_messages(full_messages, assistant_turn)
                             await self._response_store_put_response(
                                 response_id,
                                 {
                                     "id": response_id,
                                     "model": model,
-                                    "created_at": final_obj.get("created_at"),
+                                    "created_at": final_obj.created_at,
                                     "previous_response_id": previous_response_id,
                                     "conversation_id": conversation_id,
                                     "conversation": conversation_after,
-                                    "response": final_obj,
+                                    "response": final_obj.model_dump(exclude_none=False),
                                 },
                             )
                             if conversation_id:
                                 await self._response_store_put_conversation(conversation_id, conversation_after)
 
-                        yield self._sse_event(
-                            "response.completed", {"type": "response.completed", "response": final_obj}
-                        )
-
+                        usage = final_obj.usage
+                        prompt_tokens = int(usage.input_tokens if usage is not None else 0)
+                        completion_tokens = int(usage.output_tokens if usage is not None else 0)
                         self.metrics.total_tokens_generated += completion_tokens
                         self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
 
@@ -2168,21 +1897,11 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                             model=model,
                             queue_kind=locals().get("kind"),
                             disconnected=locals().get("disconnected"),
-                            output=locals().get("output"),
-                            last_output=locals().get("last_output"),
-                            previous_text=locals().get("previous_text"),
-                            current_text=locals().get("current_text"),
-                            delta_text=locals().get("delta_text"),
-                            previous_token_ids=locals().get("previous_token_ids"),
-                            current_token_ids=locals().get("current_token_ids"),
-                            delta_token_ids=locals().get("delta_token_ids"),
-                            raw_delta_message=locals().get("raw_delta_message"),
-                            delta_message=locals().get("delta_message"),
-                            delta_tool_calls_raw=locals().get("delta_tool_calls_raw"),
-                            saw_function_call_delta=locals().get("saw_function_call_delta"),
+                            delta_text=locals().get("frame_event"),
+                            raw_delta_message=locals().get("frame_payload"),
                             stream_error=locals().get("stream_error"),
                             tools=tools_for_template,
-                            messages=locals().get("engine_messages"),
+                            messages=engine_messages,
                         )
                         logger.exception("Error during /v1/responses streaming: %s | context=%s", e, debug_context)
                         error_response = create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e), response_id)
@@ -2235,7 +1954,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             if completion.tool_calls:
                 message = ChatMessage(
                     role="assistant",
-                    content="",
+                    content=None,
                     tool_calls=completion.tool_calls,
                     reasoning_content=completion.reasoning_content,
                 )
@@ -2278,9 +1997,26 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
     ) -> ChatCompletionResponse:
         """Handle non-streaming chat completion via eSurge.chat()."""
 
-        async with self._acquire_generation_slot():
+        async with self._acquire_generation_slot(
+            endpoint="/v1/chat/completions",
+            request_id=request_id,
+            model=request.model,
+            raw_request=raw_request,
+            stream=False,
+        ):
             sampling_params = self._prepare_sampling_params(request, esurge)
             loop = asyncio.get_running_loop()
+            disconnect_done = asyncio.Event()
+            disconnect_task = asyncio.create_task(
+                self._abort_non_stream_request_on_disconnect(
+                    raw_request=raw_request,
+                    esurge=esurge,
+                    request_id=request_id,
+                    endpoint="/v1/chat/completions",
+                    model=request.model,
+                    done_event=disconnect_done,
+                )
+            )
 
             def _run_chat() -> RequestOutput:
                 return tp.cast(
@@ -2298,8 +2034,21 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
 
             try:
                 output = await loop.run_in_executor(self.thread_pool, _run_chat)
+            except asyncio.CancelledError:
+                self._abort_request_after_handler_cancel(
+                    esurge=esurge,
+                    request_id=request_id,
+                    endpoint="/v1/chat/completions",
+                    model=request.model,
+                )
+                raise
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
+            finally:
+                disconnect_done.set()
+                disconnect_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await disconnect_task
 
             return self._build_chat_completion_response(request, esurge, output, raw_request)
 
@@ -2317,35 +2066,30 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         tools = self.extract_tools(request=request)
 
         async def generate_stream():
-            """Async generator yielding SSE events for chat completion streaming.
-
-            Streams incremental token deltas, tool call chunks, and reasoning
-            content as they are produced by the eSurge engine.
-            """
-            async with self._acquire_generation_slot():
-                prompt_tokens = 0
-                previous_text = ""
-                previous_token_ids: list[int] = []
+            """Async generator yielding SSE events for chat completion streaming."""
+            async with self._acquire_generation_slot(
+                endpoint="/v1/chat/completions",
+                request_id=request_id,
+                model=request.model,
+                raw_request=raw_request,
+                stream=True,
+            ):
                 queue = self._start_stream_task(
                     lambda: tp.cast(
-                        Iterator[RequestOutput],
-                        esurge.chat(
+                        Iterator[ChatCompletionStreamResponse],
+                        esurge.iter_chat_completion_stream(
+                            model=request.model,
                             messages=messages,
                             tools=tools,
                             tool_choice=request.tool_choice,
                             sampling_params=sampling_params,
                             request_id=request_id,
-                            stream=True,
                             chat_template_kwargs=request.chat_template_kwargs,
                         ),
                     )
                 )
-                total_generated = 0
-                generation_time = 0.0
-                tokens_per_second = 0.0
-                last_output: RequestOutput | None = None
+                last_chunk: ChatCompletionStreamResponse | None = None
                 disconnected = False
-                saw_tool_call_delta = False
 
                 try:
                     stream_error: Exception | None = None  # pyright: ignore[reportUnusedVariable]
@@ -2364,111 +2108,24 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                             stream_error = tp.cast(Exception, payload)  # pyright: ignore[reportUnusedVariable]
                             raise tp.cast(Exception, payload)
 
-                        output = tp.cast(RequestOutput, payload)
-                        last_output = output
-                        if not prompt_tokens:
-                            prompt_tokens = self._prompt_token_count_from_output(output)
-
-                        current_completion_tokens = int(output.num_generated_tokens or 0)
-                        current_tps = output.tokens_per_second
-                        elapsed_time = output.processing_time
-
-                        current_text = output.accumulated_text or ""
-                        delta_text = self._compute_delta_text(current_text, previous_text, output.delta_text or "")
-
-                        engine_has_parsers = (
-                            hasattr(esurge, "_tool_parser_class") and esurge._tool_parser_class is not None
-                        ) or (hasattr(esurge, "_reasoning_parser_class") and esurge._reasoning_parser_class is not None)
-
-                        if engine_has_parsers:
-                            previous_text = current_text
-                            current_token_ids = output.outputs[0].token_ids if output.outputs else []
-                            previous_token_ids = current_token_ids
-
-                            has_parsed_content = (
-                                output.delta_tool_calls or output.delta_reasoning_content or output.delta_text
-                            )
-                            if not has_parsed_content:
-                                continue
-
-                            delta_message = DeltaMessage(
-                                role="assistant",
-                                content=output.delta_text if output.delta_text else None,
-                                tool_calls=output.delta_tool_calls,
-                                reasoning_content=output.delta_reasoning_content,
-                            )
-                        else:
-                            previous_text = current_text
-                            current_token_ids = output.outputs[0].token_ids if output.outputs else []
-                            previous_token_ids = current_token_ids
-                            delta_message = DeltaMessage(content=delta_text, role="assistant")
-
-                        delta_message = self._coerce_stream_delta_message(
-                            delta_message,
-                            fallback_text=delta_text,
-                            default_role="assistant",
-                        )
-                        if delta_message is None:
-                            continue
-
-                        if delta_message and delta_message.tool_calls:
-                            saw_tool_call_delta = True
-
-                        chunk = ChatCompletionStreamResponse(
-                            model=request.model,
-                            choices=[
-                                ChatCompletionStreamResponseChoice(
-                                    index=0,
-                                    delta=delta_message,
-                                    finish_reason=None,
-                                )
-                            ],
-                            usage=UsageInfo(
-                                prompt_tokens=prompt_tokens,
-                                completion_tokens=current_completion_tokens,
-                                total_tokens=prompt_tokens + current_completion_tokens,
-                                tokens_per_second=current_tps,
-                                processing_time=elapsed_time,
-                                first_token_time=output.first_token_time,
-                            ),
-                        )
+                        chunk = tp.cast(ChatCompletionStreamResponse, payload)
+                        last_chunk = chunk
+                        delta_message = chunk.choices[0].delta if chunk.choices else None
                         yield f"data: {chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
-                        total_generated = current_completion_tokens
-                        generation_time = elapsed_time
-                        tokens_per_second = current_tps
 
                     if disconnected:
                         return
 
-                    if last_output is None:
+                    if last_chunk is None:
                         raise RuntimeError("Streaming finished without any output")
 
-                    usage = UsageInfo(
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=total_generated,
-                        total_tokens=prompt_tokens + total_generated,
-                        tokens_per_second=tokens_per_second,
-                        processing_time=generation_time,
-                        first_token_time=last_output.first_token_time,
-                    )
-
-                    final_chunk = ChatCompletionStreamResponse(
-                        model=request.model,
-                        choices=[
-                            ChatCompletionStreamResponseChoice(
-                                index=0,
-                                delta=DeltaMessage(content="", role="assistant"),
-                                finish_reason="tool_calls" if saw_tool_call_delta else "stop",
-                            )
-                        ],
-                        usage=usage,
-                    )
-
-                    yield f"data: {final_chunk.model_dump_json(exclude_unset=True)}\n\n"
                     yield "data: [DONE]\n\n"
 
-                    self.metrics.total_tokens_generated += total_generated
-                    self._record_api_key_usage(raw_request, prompt_tokens, total_generated)
+                    usage = last_chunk.usage
+                    prompt_tokens = int(usage.prompt_tokens or 0) if usage is not None else 0
+                    completion_tokens = int(usage.completion_tokens or 0) if usage is not None else 0
+                    self.metrics.total_tokens_generated += completion_tokens
+                    self._record_api_key_usage(raw_request, prompt_tokens, completion_tokens)
 
                 except Exception as e:
                     self._mark_stream_failure()
@@ -2478,17 +2135,11 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
                         model=request.model,
                         queue_kind=locals().get("kind"),
                         disconnected=locals().get("disconnected"),
-                        output=locals().get("output"),
-                        last_output=locals().get("last_output"),
-                        previous_text=locals().get("previous_text"),
-                        current_text=locals().get("current_text"),
-                        delta_text=locals().get("delta_text"),
-                        previous_token_ids=locals().get("previous_token_ids"),
-                        current_token_ids=locals().get("current_token_ids"),
-                        delta_token_ids=locals().get("delta_token_ids"),
-                        raw_delta_message=locals().get("raw_delta_message"),
+                        delta_text=locals().get("chunk").model_dump_json(exclude_unset=True, exclude_none=True)
+                        if "chunk" in locals()
+                        else None,
+                        raw_delta_message=locals().get("chunk"),
                         delta_message=locals().get("delta_message"),
-                        saw_tool_call_delta=locals().get("saw_tool_call_delta"),
                         stream_error=locals().get("stream_error"),
                         tools=tools,
                         messages=messages,
@@ -2579,15 +2230,46 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         Raises:
             RuntimeError: If generation fails.
         """
-        async with self._acquire_generation_slot():
+        async with self._acquire_generation_slot(
+            endpoint="/v1/completions",
+            request_id=request_id,
+            model=request.model,
+            raw_request=raw_request,
+            stream=False,
+        ):
             prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
             sampling_params = self._prepare_sampling_params(request, esurge)
             loop = asyncio.get_running_loop()
+            disconnect_done = asyncio.Event()
+            disconnect_task = asyncio.create_task(
+                self._abort_non_stream_request_on_disconnect(
+                    raw_request=raw_request,
+                    esurge=esurge,
+                    request_id=request_id,
+                    endpoint="/v1/completions",
+                    model=request.model,
+                    done_event=disconnect_done,
+                )
+            )
 
             def _run_generate() -> list[RequestOutput]:
-                return esurge.generate(prompt, sampling_params, use_tqdm=False)
+                return esurge.generate(prompt, sampling_params, request_id=request_id, use_tqdm=False)
 
-            outputs = await loop.run_in_executor(self.thread_pool, _run_generate)
+            try:
+                outputs = await loop.run_in_executor(self.thread_pool, _run_generate)
+            except asyncio.CancelledError:
+                self._abort_request_after_handler_cancel(
+                    esurge=esurge,
+                    request_id=request_id,
+                    endpoint="/v1/completions",
+                    model=request.model,
+                )
+                raise
+            finally:
+                disconnect_done.set()
+                disconnect_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await disconnect_task
 
             if not outputs:
                 raise RuntimeError("Generation failed to produce output")
@@ -2656,7 +2338,13 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             Streams incremental text deltas as they are produced by the
             eSurge engine for the /v1/completions endpoint.
             """
-            async with self._acquire_generation_slot():
+            async with self._acquire_generation_slot(
+                endpoint="/v1/completions",
+                request_id=request_id,
+                model=request.model,
+                raw_request=raw_request,
+                stream=True,
+            ):
                 prompt_tokens = len(esurge.tokenizer(prompt)["input_ids"])
                 previous_text = ""
                 queue = self._start_stream_task(lambda: esurge.stream(prompt, sampling_params, request_id=request_id))
@@ -2789,7 +2477,13 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             - timestamp: Current time
             - uptime_seconds: Server uptime
             - models: Loaded model information
-            - active_requests: Current request count
+            - active_requests: Current HTTP middleware request count
+            - active_http_requests: Alias for active_requests
+            - pending_requests: Total eSurge pending requests across loaded models
+            - running_requests: Total eSurge running requests across loaded models
+            - max_generation_slots: Configured generation-slot limit
+            - available_generation_slots: Currently free generation slots
+            - active_generation_slots: Currently occupied generation slots
 
             Status code 200 if READY, 503 otherwise.
         """
@@ -2797,19 +2491,43 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
         self.metrics.uptime_seconds = time.time() - self.metrics.start_time
 
         model_health_info = {}
+        total_pending_requests = 0
+        total_running_requests = 0
         for name, adapter in self.adapters.items():
+            pending_requests = int(getattr(adapter.esurge, "num_pending_requests", 0) or 0)
+            running_requests = int(getattr(adapter.esurge, "num_running_requests", 0) or 0)
+            total_pending_requests += pending_requests
+            total_running_requests += running_requests
             model_health_info[name] = {
                 "loaded": True,
                 "type": adapter.get_model_info()["type"],
                 "max_model_len": adapter.get_model_info()["max_model_len"],
+                "pending_requests": pending_requests,
+                "running_requests": running_requests,
             }
 
+        max_generation_slots = int(getattr(self, "_max_generation_slots", 0) or 0)
+        generation_slot_queue = getattr(self, "_generation_slots", None)
+        if generation_slot_queue is not None and max_generation_slots > 0:
+            available_generation_slots = int(generation_slot_queue.qsize())
+            active_generation_slots = max(0, max_generation_slots - available_generation_slots)
+        else:
+            available_generation_slots = None
+            active_generation_slots = None
+
+        active_http_requests = len(self._active_requests)
         health_status = {
             "status": self.status.value,
             "timestamp": time.time(),
             "uptime_seconds": self.metrics.uptime_seconds,
             "models": model_health_info,
-            "active_requests": len(self._active_requests),
+            "active_requests": active_http_requests,
+            "active_http_requests": active_http_requests,
+            "pending_requests": total_pending_requests,
+            "running_requests": total_running_requests,
+            "max_generation_slots": max_generation_slots,
+            "available_generation_slots": available_generation_slots,
+            "active_generation_slots": active_generation_slots,
         }
 
         status_code = 200 if self.status == ServerStatus.READY else 503
@@ -2911,16 +2629,13 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
     async def list_tools(self, raw_request: Request) -> JSONResponse:
         """List available tools/functions for each model.
 
-        Returns example tool definitions and supported formats.
-        This is a placeholder that can be extended with actual tools.
+        Returns example tool definitions and engine-reported parser metadata.
 
         Returns:
             JSONResponse with tool definitions per model.
         """
         self._authorize_request(raw_request)
-        model_names = list(self.adapters.keys())
-        tools_response = self.create_tools_response(model_names)
-        return JSONResponse(tools_response)
+        return JSONResponse(self._create_tools_response())
 
     async def _create_standard_response(
         self,
@@ -2984,7 +2699,7 @@ class eSurgeApiServer(BaseInferenceApiServer, ToolCallingMixin, AuthEndpointsMix
             specific tool execution requirements.
         """
         self._authorize_request(raw_request)
-        return self.create_tool_execution_placeholder()
+        return self._create_tool_execution_placeholder_response()
 
     @property
     def _endpoints(self) -> list:

@@ -27,6 +27,7 @@ from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
 from easydel.inference.esurge.request import EngineRequest, EngineRequestStatus
 from easydel.inference.esurge.scheduler.scheduler import Scheduler
 from easydel.inference.evaluations.esurge_eval import eSurgeLMEvalAdapter
+from easydel.inference.parsing import DelegatingParser
 from easydel.inference.reasoning.parsers.qwen3_reasoning_parser import Qwen3ReasoningParser
 from easydel.inference.sampling_params import SamplingParams
 from easydel.infra.utils import AttnMaskType
@@ -802,12 +803,9 @@ def test_stop_strings_can_ignore_matches_inside_reasoning():
             stop=["\nif"],
             ignore_stop_strings_in_reasoning=True,
         ),
-        "reasoning_parser_instance": Qwen3ReasoningParser(_DummyTokenizer()),
-        "tool_parser_instance": None,
+        "delegating_parser": DelegatingParser(reasoning_parser=Qwen3ReasoningParser(_DummyTokenizer())),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-        "accumulated_reasoning": "",
-        "accumulated_content": "",
         "decoder_visible_text": "",
     }
 

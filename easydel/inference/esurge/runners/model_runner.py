@@ -265,6 +265,7 @@ class eSurgeRunner:
         verbose: bool = False,
         enable_overlap_execution: bool = True,
         enable_sampler_metrics: bool = False,
+        enable_window_aware_runtime_cap: bool = False,
     ):
         """Initialize the model runner.
 
@@ -287,6 +288,10 @@ class eSurgeRunner:
             verbose: Enable verbose execution logs.
             enable_overlap_execution: Enable overlap execution path.
             enable_sampler_metrics: Enable sampler-side metrics.
+            enable_window_aware_runtime_cap: Whether to derive the runtime
+                request cap from the model's live KV-window page demand.
+                When False, the runner falls back to the cache metadata's
+                heuristic request cap instead.
         """
         self.model = model.esurge_compatible_model
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
@@ -335,6 +340,7 @@ class eSurgeRunner:
             if max_num_batched_tokens is None
             else max(1, min(int(max_num_batched_tokens), int(max_model_len)))
         )
+        self.enable_window_aware_runtime_cap = bool(enable_window_aware_runtime_cap)
         self.max_model_len = max_model_len
         self.kv_cache_groups = self._build_kv_cache_groups()
         self.window_aware_runtime_estimate = self._apply_window_aware_runtime_cap(self.max_num_batched_tokens)
@@ -435,6 +441,35 @@ class eSurgeRunner:
             use_mla=False,
         )
 
+    def _get_full_attention_page_table_index(self) -> int:
+        """Return the page table group index for the full-attention cache group.
+
+        For mixed-attention models (e.g., sliding window + full attention), the
+        kernel must receive the full-attention group's page table because it
+        keeps all pages valid. Sliding-window groups evict old pages, leaving
+        null entries that would cause VMEM out-of-range errors on TPU.
+
+        Returns:
+            0 if no cache groups are defined (single-group model), otherwise
+            the index of the first FullAttentionSpec group.
+        """
+        from ..core.interface import FullAttentionSpec
+
+        for i, group in enumerate(self.kv_cache_groups):
+            if isinstance(group.kv_cache_spec, FullAttentionSpec):
+                return i
+        return 0
+
+    def _clear_window_aware_runtime_cap_metadata(self) -> None:
+        """Reset runtime-cap metadata to the default non-window-aware state."""
+        for attr_name in (
+            "window_aware_max_num_seqs",
+            "window_aware_pages_per_request",
+            "window_aware_max_num_batched_tokens",
+        ):
+            if hasattr(self.metadata, attr_name):
+                setattr(self.metadata, attr_name, -1)
+
     def _apply_window_aware_runtime_cap(self, max_num_batched_tokens: int):
         """Attach a hybrid full/sliding runtime-cap estimate to cache metadata.
 
@@ -450,6 +485,11 @@ class eSurgeRunner:
             The ``RuntimePageBudgetEstimate`` if estimation succeeds, or
             ``None`` if no cache groups are available or an error occurs.
         """
+        self._clear_window_aware_runtime_cap_metadata()
+
+        if not self.enable_window_aware_runtime_cap:
+            logger.debug("Window-aware runtime-cap estimation disabled; using heuristic request caps.")
+            return None
 
         if not self.kv_cache_groups:
             return None
@@ -738,12 +778,13 @@ class eSurgeRunner:
         logger.debug(
             f"Creating sequence buffer for max_num_reqs={self.max_num_reqs}, max_model_len={self.max_model_len}"
         )
+        num_cache_groups = max(1, len(self.kv_cache_groups))
         self.sequence_buffer = SequenceBuffer(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
             vocab_size=self.model.config.get_text_config().vocab_size,
-            page_sizes=[self.metadata.page_size],
+            page_sizes=[self.metadata.page_size] * num_cache_groups,
             sharding=self._empty_sharding,
         )
 
@@ -2150,9 +2191,9 @@ class eSurgeRunner:
 
                     off += n
 
-            # Get page table as CPU array (already on CPU, no transfer needed)
-            page_table_cpu = self.sequence_buffer.page_table[0].get_cpu_tensor()
-            page_table_version = getattr(self.sequence_buffer.page_table[0], "cpu_version", None)
+            _pt_group_idx = self._get_full_attention_page_table_index()
+            page_table_cpu = self.sequence_buffer.page_table[_pt_group_idx].get_cpu_tensor()
+            page_table_version = getattr(self.sequence_buffer.page_table[_pt_group_idx], "cpu_version", None)
 
             # Preflight check: surface req_id + row details for DP-local page mismatches.
             if dp_size > 1:

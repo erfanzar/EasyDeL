@@ -648,6 +648,7 @@ class eLargeModel:
         max_num_seqs: int = 16,
         hbm_utilization: float = 0.85,
         bind_graphstate_for_aot: bool | object = _ESURGE_UNSET,
+        enable_window_aware_runtime_cap: bool | object = _ESURGE_UNSET,
         tool_parser: ToolParserName | None | object = _ESURGE_UNSET,
         reasoning_parser: ReasoningParserName | None | object = _ESURGE_UNSET,
         **kwargs,
@@ -667,6 +668,10 @@ class eLargeModel:
             bind_graphstate_for_aot: Optional override for AOT model-step
                 compilation behavior. When True, compiled model-step variants
                 capture graphstate/graphother as compile-time constants.
+                When omitted, keeps the current value (default config is False).
+            enable_window_aware_runtime_cap: Optional override for eSurge's
+                window-aware runtime-cap estimator. When False, runtime request
+                caps fall back to the cache metadata's heuristic estimate.
                 When omitted, keeps the current value (default config is False).
             tool_parser: Tool parser name to use for automatic function-call
                 extraction. Pass None to clear a previously configured parser.
@@ -717,6 +722,8 @@ class eLargeModel:
         esurge.update(kwargs)
         if bind_graphstate_for_aot is not _ESURGE_UNSET:
             esurge["bind_graphstate_for_aot"] = bool(bind_graphstate_for_aot)
+        if enable_window_aware_runtime_cap is not _ESURGE_UNSET:
+            esurge["enable_window_aware_runtime_cap"] = bool(enable_window_aware_runtime_cap)
         if tool_parser is not _ESURGE_UNSET:
             esurge["tool_parser"] = tool_parser
         if reasoning_parser is not _ESURGE_UNSET:

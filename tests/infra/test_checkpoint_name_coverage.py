@@ -20,6 +20,8 @@ from easydel.infra.etils import GRADIENT_CHECKPOINT_TARGETS
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULES_ROOT = REPO_ROOT / "easydel" / "modules"
 WRAPPER_MODELS_WITHOUT_LOCAL_CHECKPOINTS = {
+    "easydel/modules/glm46v/modeling_glm46v.py",
+    "easydel/modules/glm4v_moe/modeling_glm4v_moe.py",
     "easydel/modules/qwen3_5/modeling_qwen3_5.py",
     "easydel/modules/qwen3_5_moe/modeling_qwen3_5_moe.py",
 }

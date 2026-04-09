@@ -823,6 +823,202 @@ def _apply_qwen3_next_packed_updates_unified(
     return out_conv_states, out_recurrent_states, token_outputs
 
 
+def _apply_qwen3_next_packed_updates_ragged(
+    *,
+    conv_states: Float[Array, "num_slots conv_dim d_conv"],
+    recurrent_states: Float[Array, "num_slots num_v_heads head_dim value_dim"],
+    conv_input: Float[Array, "batch seq_len conv_dim"],
+    beta: Float[Array, "batch seq_len num_v_heads"],
+    decay: Float[Array, "batch seq_len num_v_heads"],
+    kernel: Float[Array, "conv_dim d_conv"],
+    query_start_loc: Int[Array, "num_slots_plus_1"],
+    num_requests: Int[Array, ""],
+    key_dim: int,
+    num_k_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+    expand_ratio: int,
+    conv_output_dtype: jnp.dtype,
+    gdr_op: GatedDeltaRuleOp,
+) -> tuple[
+    Float[Array, "num_slots conv_dim d_conv"],
+    Float[Array, "num_slots num_v_heads head_dim value_dim"],
+    Float[Array, "seq_len num_v_heads head_v_dim"],
+]:
+    """Packed update using ragged GDR for eSurge inference.
+
+    Two-stage approach:
+      Stage A: Run convolution for all tokens (single-token fast lane + causal prefill)
+      Stage B: Run a single ragged_gated_delta_rule call over all post-conv tokens
+
+    This replaces the interleaved conv+GDR approach in the unified version with
+    a cleaner separation, and the GDR portion collapses into one kernel call that
+    handles both decode and prefill requests simultaneously.
+    """
+    seq_len = conv_input.shape[1]
+    d_conv = kernel.shape[1]
+    num_slots = min(conv_states.shape[0], query_start_loc.shape[0] - 1)
+    prefill_chunk_size = QWEN3_NEXT_PACKED_PREFILL_BATCH_CAP
+    num_prefill_chunks = max((num_slots + prefill_chunk_size - 1) // prefill_chunk_size, 1)
+    slot_ids = jnp.arange(num_slots, dtype=jnp.int32)
+    starts = query_start_loc[:num_slots]
+    scheduled_tokens = query_start_loc[1 : num_slots + 1] - query_start_loc[:num_slots]
+    active_slots = (slot_ids < num_requests) & (scheduled_tokens > 0)
+    single_slot_mask = active_slots & (scheduled_tokens == 1)
+    multi_slot_mask = active_slots & (scheduled_tokens > 1)
+
+    conv_outputs_flat = jnp.zeros((seq_len, key_dim * 2 + num_v_heads * head_v_dim), dtype=conv_output_dtype)
+
+    if num_slots == 0:
+        token_outputs = jnp.zeros((seq_len, num_v_heads, head_v_dim), dtype=jnp.float32)
+        return conv_states, recurrent_states, token_outputs
+
+    prefix_conv_states = conv_states[:num_slots]
+    safe_single_indices = jnp.clip(starts, 0, seq_len - 1)
+    single_tokens = conv_input[0, safe_single_indices, :]
+
+    def _conv_single_tokens(operand):
+        conv_outputs_i, conv_states_i = operand
+        shifted_conv_states, conv_output = GatedDeltaRuleOp.fused_conv_decode(
+            conv_state=conv_states_i,
+            new_tokens=single_tokens,
+            kernel=kernel,
+            output_dtype=conv_output_dtype,
+        )
+        conv_states_i = jnp.where(single_slot_mask[:, None, None], shifted_conv_states, conv_states_i)
+        conv_output_masked = jnp.where(single_slot_mask[:, None], conv_output, 0)
+        conv_outputs_i = conv_outputs_i.at[safe_single_indices].add(conv_output_masked)
+        return conv_outputs_i, conv_states_i
+
+    conv_outputs_flat, base_conv_states = jax.lax.cond(
+        jnp.any(single_slot_mask),
+        _conv_single_tokens,
+        lambda operand: operand,
+        (conv_outputs_flat, prefix_conv_states),
+    )
+
+    packed_slots = jnp.where(
+        multi_slot_mask,
+        size=num_prefill_chunks * prefill_chunk_size,
+        fill_value=0,
+    )[0].reshape(num_prefill_chunks, prefill_chunk_size)
+    packed_valid = (
+        jnp.arange(num_prefill_chunks * prefill_chunk_size, dtype=jnp.int32) < jnp.sum(multi_slot_mask.astype(jnp.int32))
+    ).reshape(num_prefill_chunks, prefill_chunk_size)
+    prefill_offsets = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
+
+    empty_conv_updates = jnp.zeros(
+        (prefill_chunk_size, prefix_conv_states.shape[1], d_conv),
+        dtype=prefix_conv_states.dtype,
+    )
+
+    def _conv_prefill_chunk(
+        conv_outputs_carry,
+        scan_inputs,
+    ):
+        chunk_slots, chunk_valid = scan_inputs
+
+        def _apply_conv_chunk(operand):
+            conv_outputs_j, chunk_slots_j, chunk_valid_j = operand
+            chunk_starts = starts[chunk_slots_j]
+            chunk_lengths = scheduled_tokens[chunk_slots_j]
+            chunk_token_mask = chunk_valid_j[:, None] & (prefill_offsets < chunk_lengths[:, None])
+            chunk_token_indices = chunk_starts[:, None] + prefill_offsets
+            safe_chunk_indices = jnp.clip(chunk_token_indices, 0, seq_len - 1)
+            chunk_inputs = conv_input[0, safe_chunk_indices, :]
+            chunk_inputs = jnp.where(chunk_token_mask[:, :, None], chunk_inputs, 0)
+            chunk_prefix = base_conv_states[chunk_slots_j].transpose(0, 2, 1)
+            combined_inputs = jnp.concatenate([chunk_prefix, chunk_inputs], axis=1)
+            conv_output = _apply_qwen3_next_depthwise_conv_sequence(
+                combined_inputs,
+                kernel,
+                output_dtype=conv_output_dtype,
+            )[:, d_conv:, :]
+            flat_indices = safe_chunk_indices.reshape(-1)
+            flat_outputs = jnp.where(
+                chunk_token_mask[:, :, None],
+                conv_output,
+                0,
+            ).reshape(-1, conv_output.shape[-1])
+            conv_outputs_j = conv_outputs_j.at[flat_indices].add(flat_outputs)
+            updated_chunk_conv = _finalize_qwen3_next_conv_state_from_combined(
+                combined_inputs,
+                chunk_lengths + d_conv,
+                d_conv=d_conv,
+                output_dtype=base_conv_states.dtype,
+            )
+            return conv_outputs_j, (updated_chunk_conv, chunk_slots_j, chunk_valid_j)
+
+        def _skip_conv_chunk(operand):
+            conv_outputs_j, chunk_slots_j, chunk_valid_j = operand
+            return conv_outputs_j, (empty_conv_updates, chunk_slots_j, chunk_valid_j)
+
+        return jax.lax.cond(
+            jnp.any(chunk_valid),
+            _apply_conv_chunk,
+            _skip_conv_chunk,
+            (conv_outputs_carry, chunk_slots, chunk_valid),
+        )
+
+    def _run_conv_prefill(operand):
+        conv_outputs_i, conv_states_i = operand
+        conv_outputs_i, scan_outputs = jax.lax.scan(
+            _conv_prefill_chunk,
+            conv_outputs_i,
+            (packed_slots, packed_valid),
+        )
+        chunk_conv_updates, chunk_slots_out, chunk_valid_out = scan_outputs
+        flat_slots = chunk_slots_out.reshape(-1)
+        flat_valid = chunk_valid_out.reshape(-1)
+        conv_states_i = _scatter_qwen3_next_selected_updates(
+            conv_states_i,
+            flat_slots,
+            flat_valid,
+            chunk_conv_updates.reshape(-1, *chunk_conv_updates.shape[2:]),
+        )
+        return conv_outputs_i, conv_states_i
+
+    conv_outputs_flat, final_conv_states = jax.lax.cond(
+        jnp.any(multi_slot_mask),
+        _run_conv_prefill,
+        lambda operand: operand,
+        (conv_outputs_flat, base_conv_states),
+    )
+
+    q_flat = conv_outputs_flat[:, :key_dim].reshape(seq_len, num_k_heads, head_k_dim)
+    k_flat = conv_outputs_flat[:, key_dim : key_dim * 2].reshape(seq_len, num_k_heads, head_k_dim)
+    v_flat = conv_outputs_flat[:, key_dim * 2 :].reshape(seq_len, num_v_heads, head_v_dim)
+    beta_flat = beta[0, :seq_len]  # (seq_len, num_v_heads)
+    decay_flat = decay[0, :seq_len]  # (seq_len, num_v_heads)
+
+    if expand_ratio > 1:
+        q_flat = jnp.repeat(q_flat, expand_ratio, axis=1)  # (seq_len, num_v_heads, head_k_dim)
+        k_flat = jnp.repeat(k_flat, expand_ratio, axis=1)
+
+    state_indices = jnp.arange(num_slots, dtype=jnp.int32)
+
+    gdr_result = gdr_op.forward_ragged(
+        query=q_flat,
+        key=k_flat,
+        value=v_flat,
+        beta=beta_flat,
+        decay=decay_flat,
+        recurrent_state=recurrent_states[:num_slots],
+        query_start_loc=query_start_loc[: num_slots + 1],
+        state_indices=state_indices,
+        use_qk_l2norm=True,
+    )
+
+    token_outputs = gdr_result.attention_outputs  # (seq_len, num_v_heads, head_v_dim)
+    final_recurrent_states = recurrent_states.at[:num_slots].set(
+        gdr_result.recurrent_state.astype(recurrent_states.dtype)
+    )
+    out_conv_states = conv_states.at[:num_slots].set(final_conv_states)
+
+    return out_conv_states, final_recurrent_states, token_outputs.astype(jnp.float32)
+
+
 def _apply_qwen3_next_packed_updates(
     *,
     conv_states: Float[Array, "num_slots conv_dim d_conv"],
@@ -887,7 +1083,12 @@ def _apply_qwen3_next_packed_updates(
         A tuple of (updated conv_states, updated recurrent_states,
         token_outputs of shape ``[seq_len, num_v_heads, head_v_dim]``).
     """
-    return _apply_qwen3_next_packed_updates_unified(
+    from easydel.utils import is_inference_mode
+    from easydel.utils.helpers import check_bool_flag
+
+    use_ragged = is_inference_mode() and check_bool_flag("EASYDEL_RAGGED_GDR", True)
+    _impl = _apply_qwen3_next_packed_updates_ragged if use_ragged else _apply_qwen3_next_packed_updates_unified
+    return _impl(
         conv_states=conv_states,
         recurrent_states=recurrent_states,
         conv_input=conv_input,

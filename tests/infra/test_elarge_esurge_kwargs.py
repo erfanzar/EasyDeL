@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
+import easydel.inference as inference_module
 from easydel.infra.elarge.builders import to_esurge_kwargs
 from easydel.infra.elarge.model import eLargeModel
+from easydel.scripts.elarge import _run_action
 
 
 def test_to_esurge_kwargs_forwards_string_extra_stops():
@@ -45,6 +49,29 @@ def test_to_esurge_kwargs_keeps_extra_stops_none_by_default():
 
     assert kwargs["extra_stops"] is None
     assert kwargs["bind_graphstate_for_aot"] is False
+    assert kwargs["enable_window_aware_runtime_cap"] is False
+
+
+def test_to_esurge_kwargs_forwards_enable_window_aware_runtime_cap():
+    cfg = {
+        "model": {"name_or_path": "dummy-model"},
+        "esurge": {"enable_window_aware_runtime_cap": False},
+    }
+
+    kwargs = to_esurge_kwargs(cfg)
+
+    assert kwargs["enable_window_aware_runtime_cap"] is False
+
+
+def test_to_esurge_kwargs_treats_null_window_aware_runtime_cap_as_default_false():
+    cfg = {
+        "model": {"name_or_path": "dummy-model"},
+        "esurge": {"enable_window_aware_runtime_cap": None},
+    }
+
+    kwargs = to_esurge_kwargs(cfg)
+
+    assert kwargs["enable_window_aware_runtime_cap"] is False
 
 
 def test_to_esurge_kwargs_defaults_data_parallelism_axis_to_dp():
@@ -174,3 +201,89 @@ def test_set_esurge_bind_graphstate_for_aot_override_is_optional():
     elm.set_esurge(bind_graphstate_for_aot=False)
     esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
     assert esurge["bind_graphstate_for_aot"] is False  # pyright: ignore[reportTypedDictNotRequiredAccess]
+
+
+def test_set_esurge_window_aware_runtime_cap_override_is_optional():
+    elm = object.__new__(eLargeModel)
+    elm._config = {"model": {"name_or_path": "dummy-model"}, "esurge": {}}
+
+    elm.set_esurge(enable_window_aware_runtime_cap=False)
+    esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["enable_window_aware_runtime_cap"] is False  # pyright: ignore[reportTypedDictNotRequiredAccess]
+
+    elm.set_esurge(max_num_seqs=8)
+    esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["enable_window_aware_runtime_cap"] is False  # pyright: ignore[reportTypedDictNotRequiredAccess]
+
+    elm.set_esurge(enable_window_aware_runtime_cap=True)
+    esurge = elm.config["esurge"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    assert esurge["enable_window_aware_runtime_cap"] is True  # pyright: ignore[reportTypedDictNotRequiredAccess]
+
+
+def test_serve_action_migrates_deprecated_tool_parser_name_to_esurge(monkeypatch):
+    captured = {}
+
+    class FakeServer:
+        def __init__(self, surge, **kwargs):
+            captured["surge"] = surge
+            captured["server_kwargs"] = kwargs
+
+        def run(self, **kwargs):
+            captured["run_kwargs"] = kwargs
+
+    class FakeElm:
+        def __init__(self):
+            self.config = {"esurge": {}}
+            self.set_esurge_calls = []
+            self.validated = False
+
+        def set_esurge(self, **kwargs):
+            self.set_esurge_calls.append(kwargs)
+            self.config.setdefault("esurge", {}).update(kwargs)
+
+        def validate(self):
+            self.validated = True
+
+        @staticmethod
+        def build_esurge():
+            return "engine"
+
+    monkeypatch.setattr(inference_module, "eSurgeApiServer", FakeServer)
+
+    elm = FakeElm()
+    _run_action(
+        elm,
+        "serve",
+        {
+            "tool_parser_name": "hermes",
+            "host": "127.0.0.1",
+            "port": 9000,
+        },
+    )
+
+    assert elm.validated is True
+    assert elm.set_esurge_calls == [{"tool_parser": "hermes"}]
+    assert captured["surge"] == "engine"
+    assert "tool_parser_name" not in captured["server_kwargs"]
+    assert captured["run_kwargs"]["host"] == "127.0.0.1"
+    assert captured["run_kwargs"]["port"] == 9000
+
+
+def test_serve_action_rejects_deprecated_tool_parser_name_when_engine_disagrees():
+    class FakeElm:
+        def __init__(self):
+            self.config = {"esurge": {"tool_parser": "qwen3_xml"}}
+
+        def set_esurge(self, **kwargs):
+            raise AssertionError(f"Unexpected set_esurge call: {kwargs}")
+
+        @staticmethod
+        def validate():
+            raise AssertionError("validate should not run when config is invalid")
+
+        @staticmethod
+        def build_esurge():
+            raise AssertionError("build_esurge should not run when config is invalid")
+
+    with pytest.raises(SystemExit, match="disagrees with `esurge.tool_parser`"):  # noqa
+        _run_action(FakeElm(), "serve", {"tool_parser_name": "hermes"})

@@ -275,6 +275,9 @@ class HermesToolParser(ToolParser):
                 and prev_tool_end_count == cur_tool_end_count
                 and self.tool_call_end_token not in delta_text
             ):
+                if self.tool_call_start_token in delta_text:
+                    content_before = delta_text[: delta_text.index(self.tool_call_start_token)]
+                    return DeltaMessage(content=content_before) if content_before else None
                 return DeltaMessage(content=delta_text)
 
             if self.tool_call_end_token in delta_text:
@@ -305,24 +308,52 @@ class HermesToolParser(ToolParser):
                 text_portion = None
 
             elif cur_tool_start_count == cur_tool_end_count and cur_tool_end_count >= prev_tool_end_count:
+                if (self.prev_tool_call_arr is None or len(self.prev_tool_call_arr) == 0) and self.current_tool_id < 0:
+                    batch = self.extract_tool_calls(current_text, request)
+                    if batch.tools_called and batch.tool_calls:
+                        tc_deltas = []
+                        for i, tc in enumerate(batch.tool_calls):
+                            tc_deltas.append(
+                                DeltaToolCall(
+                                    index=i,
+                                    type="function",
+                                    id=f"chatcmpl-tool-{uuid4()}",
+                                    function=DeltaFunctionCall(
+                                        name=tc.function.name,
+                                        arguments=tc.function.arguments,
+                                    ).model_dump(exclude_none=True),
+                                )
+                            )
+                            self.current_tool_id = i
+                            self.current_tool_name_sent = True
+                            self.streamed_args_for_tool.append(tc.function.arguments)
+                        return DeltaMessage(tool_calls=tc_deltas)
+                    return None
+
                 if self.prev_tool_call_arr is None or len(self.prev_tool_call_arr) == 0:
                     return None
-                diff = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
-                if diff:
-                    diff = diff.encode("utf-8").decode("unicode_escape") if diff is str else diff
-                    if '"}' not in delta_text:
-                        return None
-                    end_loc = delta_text.rindex('"}')
-                    diff = delta_text[:end_loc] + '"}'
-                    self.streamed_args_for_tool[self.current_tool_id] += diff
-                    return DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_id,
-                                function=DeltaFunctionCall(arguments=diff).model_dump(exclude_none=True),
-                            )
-                        ]
+                if self.current_tool_id < 0 or self.current_tool_id >= len(self.prev_tool_call_arr):
+                    return None
+                final_args = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
+                if final_args:
+                    final_json = (
+                        json.dumps(final_args, ensure_ascii=False) if not isinstance(final_args, str) else final_args
                     )
+                    already_streamed = self.streamed_args_for_tool[self.current_tool_id]
+                    remaining = (
+                        final_json[len(already_streamed) :] if final_json.startswith(already_streamed) else final_json
+                    )
+                    if remaining:
+                        self.streamed_args_for_tool[self.current_tool_id] += remaining
+                        return DeltaMessage(
+                            tool_calls=[
+                                DeltaToolCall(
+                                    index=self.current_tool_id,
+                                    function=DeltaFunctionCall(arguments=remaining).model_dump(exclude_none=True),
+                                )
+                            ]
+                        )
+                return None
 
             else:
                 text = delta_text.replace(self.tool_call_start_token, "")
@@ -367,45 +398,14 @@ class HermesToolParser(ToolParser):
             if len(self.prev_tool_call_arr) <= self.current_tool_id:
                 self.prev_tool_call_arr.append({})
 
-            prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
+            self.prev_tool_call_arr[self.current_tool_id].get("arguments")
             cur_arguments = current_tool_call.get("arguments")
 
-            if not cur_arguments and not prev_arguments:
+            if not cur_arguments:
                 delta = None
-
-            elif not cur_arguments and prev_arguments:
+            else:
+                json.dumps(cur_arguments, ensure_ascii=False)
                 delta = None
-
-            elif cur_arguments and not prev_arguments:
-                cur_arguments_json = json.dumps(cur_arguments, ensure_ascii=False)
-                if delta_text not in cur_arguments_json[:-2]:
-                    return None
-                args_delta_start_loc = cur_arguments_json[:-2].rindex(delta_text) + len(delta_text)
-
-                arguments_delta = cur_arguments_json[:args_delta_start_loc]
-                delta = DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=self.current_tool_id,
-                            function=DeltaFunctionCall(arguments=arguments_delta).model_dump(exclude_none=True),
-                        )
-                    ]
-                )
-                self.streamed_args_for_tool[self.current_tool_id] += arguments_delta
-
-            elif cur_arguments and prev_arguments:
-                if isinstance(delta_text, str) and len(delta_text.rstrip()) >= 1 and delta_text.rstrip()[-1] == "}":
-                    delta_text = delta_text.rstrip()[:-1]
-
-                delta = DeltaMessage(
-                    tool_calls=[
-                        DeltaToolCall(
-                            index=self.current_tool_id,
-                            function=DeltaFunctionCall(arguments=delta_text).model_dump(exclude_none=True),
-                        )
-                    ]
-                )
-                self.streamed_args_for_tool[self.current_tool_id] += delta_text
 
             if self.current_tool_id == len(self.prev_tool_call_arr) - 1:
                 self.prev_tool_call_arr[self.current_tool_id] = current_tool_call

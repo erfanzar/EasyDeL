@@ -88,7 +88,8 @@ class SamplerExecutor:
 
     The SamplerExecutor manages compilation and execution of the sampler
     function, which converts model logits into sampled tokens. It maintains
-    an LRU cache of compiled function variants for different input dimensions.
+    compiled function variants for different input dimensions until the cache
+    is explicitly cleared.
 
     The sampler function performs:
         1. Extract sampling parameters (temperature, top_k, top_p, min_p)
@@ -143,14 +144,14 @@ class SamplerExecutor:
             use_aot_forward: If True, use ahead-of-time compilation via
                 lower().compile() for predictable latency. If False, use
                 JIT compilation on first call.
-            cache_capacity: Maximum number of compiled variants to cache.
-                Defaults to 64. Uses LRU eviction when full.
+            cache_capacity: Deprecated compatibility argument. Compiled
+                variants are retained until ``clear_cache()`` is called.
         """
         self.model = model
         self.max_model_len = int(max_model_len)
         self._empty_sharding = empty_sharding
         self.use_aot_forward = bool(use_aot_forward)
-        self._cache_capacity = int(cache_capacity)
+        del cache_capacity
 
         self._sampling_fn = self._build_sampling_fn()
         self._cache: OrderedDict[tuple[int, int, str, str], tp.Any] = OrderedDict()
@@ -165,20 +166,15 @@ class SamplerExecutor:
         self._cache.clear()
 
     def _cache_put(self, key: tuple[int, int, str, str], value: tp.Any) -> None:
-        """Add a compiled function to the cache with LRU eviction.
+        """Add a compiled function to the cache.
 
         Args:
             key: Cache key tuple (num_tokens, padded_num_reqs, "sampler", mode).
             value: Compiled function to cache.
-
-        Note:
-            If the cache exceeds capacity, the least recently used entry
-            is evicted.
         """
+
         self._cache[key] = value
         self._cache.move_to_end(key)
-        if len(self._cache) > self._cache_capacity:
-            self._cache.popitem(last=False)
 
     def _cache_get(self, key: tuple[int, int, str, str]) -> tp.Any:
         """Retrieve a compiled function from the cache.
@@ -193,8 +189,8 @@ class SamplerExecutor:
             KeyError: If the key is not in the cache.
 
         Note:
-            This method updates the LRU ordering by moving the accessed
-            entry to the end.
+            This method updates insertion order by moving the accessed entry
+            to the end.
         """
         value = self._cache[key]
         self._cache.move_to_end(key)
