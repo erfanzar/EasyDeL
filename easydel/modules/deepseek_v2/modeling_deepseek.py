@@ -1284,7 +1284,7 @@ class DeepseekV2ForCausalLM(BaseCausalLMModule[DeepseekV2Model, DeepseekV2Config
         )
         return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
-    def create_transformer_cache_config(self, batch_size: int, max_length: int):
+    def create_transformer_cache_config(self, batch_size: int, max_length: int, **kwargs):
         """Create cache configuration for MLA attention.
 
         MLA uses different dimensions for keys and values:

@@ -467,6 +467,7 @@ class ExecutionManager:
             use_aot_forward=self.use_aot_forward,
             bind_graphstate_for_aot=self.bind_graphstate_for_aot,
         )
+        self._sampler_vocab_size = int(self.model.config.get_text_config().vocab_size)
         self._sampler_executor = SamplerExecutor(
             model=self.model,
             max_model_len=self.max_model_len,
@@ -474,7 +475,6 @@ class ExecutionManager:
             use_aot_forward=self.use_aot_forward,
         )
         self._sampler_min_input_pad = 1
-        self._sampler_vocab_size = int(self.model.config.get_text_config().vocab_size)
         self._sampler_zero_token_counts = jnp.zeros(
             (self.max_num_reqs, self._sampler_vocab_size),
             dtype=jnp.uint32,

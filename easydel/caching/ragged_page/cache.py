@@ -1176,8 +1176,8 @@ class RaggedPagesMetadata:
             Shape: [3, num_slices] containing (cache_pos, new_pos, length)
         position_ids (Array, optional): Position IDs for tokens.
             Shape: [num_tokens]
-        request_distribution (Array, optional): v3 distribution counts.
-            Shape: [3] containing [decode_count, prefill_count, total_count]
+        request_distribution (Array, optional): v3 distribution bounds.
+            Shape: [3] containing [decode_end, prefill_end, total_count]
         num_kv_update_slices (Array, optional): v2 update slice count.
             Shape: [1]
         version (str): Metadata format version ("v2" or "v3").

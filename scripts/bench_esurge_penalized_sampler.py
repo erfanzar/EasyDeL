@@ -102,7 +102,9 @@ def main() -> None:
         return sample_tokens(adjusted, metadata, rng)
 
     @jax.jit
-    def optimized_full_sampler(logits, token_counts_full, row_indices, active_mask, presence, frequency, repetition, rng):
+    def optimized_full_sampler(
+        logits, token_counts_full, row_indices, active_mask, presence, frequency, repetition, rng
+    ):
         adjusted = apply_history_penalties_from_counts(
             logits,
             token_counts=token_counts_full[row_indices],
@@ -204,6 +206,7 @@ def main() -> None:
         spill = scatter_positions.shape[0]
 
         if identity_layout is not None:
+
             def _identity_output(_):
                 return sampled, active_mask, updated_counts
 
@@ -435,10 +438,10 @@ def main() -> None:
     }
 
     results["speedups"] = {
-        "active1_x": results["legacy_full_sampler_active1"]["mean_ms"] / results["optimized_full_sampler_active1"]["mean_ms"],
+        "active1_x": results["legacy_full_sampler_active1"]["mean_ms"]
+        / results["optimized_full_sampler_active1"]["mean_ms"],
         "active128_x": (
-            results["legacy_full_sampler_active128"]["mean_ms"]
-            / results["optimized_full_sampler_active128"]["mean_ms"]
+            results["legacy_full_sampler_active128"]["mean_ms"] / results["optimized_full_sampler_active128"]["mean_ms"]
         ),
         "compacted_active1_vs_optimized_x": (
             results["optimized_full_sampler_active1"]["mean_ms"] / results["compacted_full_sampler_active1"]["mean_ms"]

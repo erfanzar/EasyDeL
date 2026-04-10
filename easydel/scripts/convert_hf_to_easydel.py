@@ -65,6 +65,55 @@ except ModuleNotFoundError:  # pragma: no cover
 
 logger = get_logger("Convertor")
 
+IMAGE_TEXT_TO_TEXT_MODEL_TYPES = frozenset(
+    {
+        "gemma3",
+        "gemma4",
+        "glm4v",
+        "glm4v_moe",
+        "glm46v",
+        "idefics",
+        "idefics2",
+        "kimi_vl",
+        "llava",
+        "llama4",
+        "mistral3",
+        "paligemma",
+        "qwen2_vl",
+        "qwen2_5_vl",
+        "qwen2vl",
+        "qwen2_5vl",
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+    }
+)
+
+
+def _infer_task_from_hf_config(config) -> TaskType:
+    architectures = [str(a) for a in (getattr(config, "architectures", None) or [])]
+    joined = " ".join(architectures).lower()
+    model_type = str(getattr(config, "model_type", "") or "").lower()
+
+    if model_type in {"clip", "siglip"}:
+        return "zero_shot_image_classification"
+    if "forspeechseq2seq" in joined or model_type in {"whisper", "speech_to_text", "speech-to-text"}:
+        return "speech_seq2seq"
+    if "forimagetexttotext" in joined or "vision2seq" in joined or model_type in IMAGE_TEXT_TO_TEXT_MODEL_TYPES:
+        return "image_text_to_text"
+    if getattr(config, "is_encoder_decoder", False) or "forseq2seqlm" in joined:
+        return "seq2seq"
+    if "forzeroshotimageclassification" in joined or "zeroshotimageclassification" in joined:
+        return "zero_shot_image_classification"
+    if "forsequenceclassification" in joined or "sequenceclassification" in joined:
+        return "sequence_classification"
+    if "fordiffusionlm" in joined or model_type.endswith("diffusion"):
+        return "diffusion_lm"
+    if "forcausallm" in joined or "causallm" in joined or "forconditionalgeneration" in joined:
+        return "causal_lm"
+    return "causal_lm"
+
 
 def _parse_dtype(value: str):
     """Parse a dtype string into a JAX dtype.
@@ -285,48 +334,7 @@ def main(argv: list[str] | None = None) -> None:
 
     config = AutoConfig.from_pretrained(args.source, **hf_kwargs)
 
-    def infer_task_from_config():
-        architectures = [str(a) for a in (getattr(config, "architectures", None) or [])]
-        joined = " ".join(architectures).lower()
-        model_type = str(getattr(config, "model_type", "") or "").lower()
-
-        if model_type in {"clip", "siglip"}:
-            return "zero_shot_image_classification"
-        if "forspeechseq2seq" in joined or model_type in {"whisper", "speech_to_text", "speech-to-text"}:
-            return "speech_seq2seq"
-        if (
-            "forimagetexttotext" in joined
-            or "vision2seq" in joined
-            or model_type
-            in {
-                "llava",
-                "idefics",
-                "idefics2",
-                "qwen2_vl",
-                "qwen2_5_vl",
-                "qwen2vl",
-                "qwen2_5vl",
-                "paligemma",
-            }
-        ):
-            return "image_text_to_text"
-        if (
-            getattr(config, "is_encoder_decoder", False)
-            or "forconditionalgeneration" in joined
-            or "forseq2seqlm" in joined
-        ):
-            return "seq2seq"
-        if "forzeroshotimageclassification" in joined or "zeroshotimageclassification" in joined:
-            return "zero_shot_image_classification"
-        if "forsequenceclassification" in joined or "sequenceclassification" in joined:
-            return "sequence_classification"
-        if "fordiffusionlm" in joined or model_type.endswith("diffusion"):
-            return "diffusion_lm"
-        if "forcausallm" in joined or "causallm" in joined:
-            return "causal_lm"
-        return "causal_lm"
-
-    task = infer_task_from_config() if args.task == "auto" else args.task
+    task = _infer_task_from_hf_config(config) if args.task == "auto" else args.task
     logger.info(f"Task: {task}")
 
     task_to_cls = {

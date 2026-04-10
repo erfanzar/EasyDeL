@@ -27,6 +27,7 @@ The module supports:
 
 Key Functions:
     - build_model: Creates an EasyDeL model from configuration
+    - to_load_state_kwargs: Converts config to EasyDeLState.load_state kwargs
     - build_esurge: Creates an eSurge inference engine
     - build_dataset: Creates a dataset from mixture configuration
     - build_tokenized_dataset: End-to-end dataset tokenization pipeline
@@ -163,6 +164,110 @@ def to_from_pretrained_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[s
         verbose=bool(loader.get("verbose", True)),
         from_torch=loader.get("from_torch"),
         trust_remote_code=loader.get("trust_remote_code", False),
+        **(model.get("extra_kwargs") or {}),
+    )
+
+
+def to_load_state_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
+    """Convert ELM configuration to kwargs for :meth:`EasyDeLState.load_state`.
+
+    This helper mirrors :func:`to_from_pretrained_kwargs`, but targets
+    checkpoint/state restoration instead of raw model loading. It translates the
+    normalized ELM config into the argument names expected by
+    :meth:`easydel.infra.base_state.EasyDeLState.load_state`, forwarding the
+    same loader, sharding, platform, base-config, and quantization knobs that
+    eLarge already uses for model construction.
+
+    The mapping is intentionally conservative:
+
+    - ``model.name_or_path`` becomes ``load_directory``.
+    - loader dtype/precision settings are coerced into JAX-native values.
+    - sharding configuration is forwarded in the 5D EasyDeL layout
+      ``(dp, fsdp, ep, tp, sp)``.
+    - quantization settings are converted into a ``QuantizationConfig`` when
+      present.
+    - extra model kwargs are forwarded so custom checkpoint loaders can still
+      receive project-specific options.
+
+    Args:
+        cfg_like: ELM configuration dictionary or mapping containing the usual
+            model, loader, sharding, platform, base_config, and quantization
+            sections. The input is normalized before extraction, so omitted
+            sections still receive EasyDeL defaults.
+
+    Returns:
+        Dictionary of keyword arguments for ``EasyDeLState.load_state(...)``.
+        The configured ``model.name_or_path`` is forwarded as
+        ``load_directory``. Typical keys include:
+
+        - ``load_directory``: checkpoint directory to restore from
+        - ``device``: initial restore device
+        - ``dtype`` / ``param_dtype`` / ``precision``: runtime and parameter dtypes
+        - ``sharding_axis_dims`` / ``sharding_axis_names``: mesh layout
+        - ``config_kwargs``: materialized base-config overrides
+        - ``model_task``: resolved task binding
+        - ``quantization_config`` / ``apply_quantization``: optional quantized
+          restore settings
+
+    Note:
+        State loading defaults to ``device="cpu"`` when the loader section does
+        not specify a device, preserving ``EasyDeLState.load_state``'s safe
+        default behavior.
+
+    Example:
+        >>> cfg = {
+        ...     "model": {"name_or_path": "/checkpoints/step_1000"},
+        ...     "loader": {"dtype": "bf16"},
+        ...     "sharding": {"axis_dims": [1, -1, 1, 1, 1]},
+        ... }
+        >>> kwargs = to_load_state_kwargs(cfg)
+        >>> kwargs["load_directory"]
+        '/checkpoints/step_1000'
+        >>> kwargs["device"]
+        'cpu'
+
+    See Also:
+        - :func:`to_from_pretrained_kwargs`: Equivalent helper for model loading.
+        - :meth:`easydel.infra.base_state.EasyDeLState.load_state`: Final restore API.
+    """
+    cfg = normalize(cfg_like)
+    model = cfg["model"]
+    loader = cfg.get("loader", {})
+    sharding = cfg.get("sharding", {})
+    platform = cfg.get("platform", {})
+    quant = cfg.get("quantization", {})
+
+    config_kwargs = materialize_base_config(cfg, prefer="base")
+
+    config_kwargs.pop("partition_axis", None)
+    config_kwargs.pop("backend", None)
+    config_kwargs.pop("platform", None)
+    quant_model = quant.get("model")
+    if quant_model is not None:
+        quant_model = QuantizationConfig(**quant_model)
+    dcn_axis_dims = sharding.get("dcn_axis_dims")
+    device = loader["device"] if "device" in loader else "cpu"
+
+    return dict(
+        load_directory=model["name_or_path"],
+        device=device,
+        dtype=coerce_dtype(loader.get("dtype")),
+        param_dtype=coerce_dtype(loader.get("param_dtype")),
+        precision=coerce_precision(loader.get("precision")),
+        sharding_axis_dims=tuple(sharding.get("axis_dims", (1, 1, 1, -1, 1))),
+        sharding_dcn_axis_dims=tuple(dcn_axis_dims) if dcn_axis_dims else None,
+        sharding_axis_names=tuple(sharding.get("axis_names", ("dp", "fsdp", "ep", "tp", "sp"))),
+        partition_axis=sharding.get("partition_axis"),
+        shard_fns=sharding.get("shard_fns"),
+        backend=platform.get("backend"),
+        platform=platform.get("platform"),
+        config_kwargs=config_kwargs,
+        model_task=resolve_task(cfg),
+        auto_shard_model=bool(sharding.get("auto_shard_model", True)),
+        partition_rules=sharding.get("partition_rules"),
+        quantization_config=quant_model,
+        apply_quantization=bool(quant.get("apply_quantization", False)),
+        verbose=bool(loader.get("verbose", True)),
         **(model.get("extra_kwargs") or {}),
     )
 

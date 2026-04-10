@@ -14,7 +14,6 @@
 
 """Tests for ToolCallingMixin methods."""
 
-
 import typing
 
 from easydel.inference.tools.tool_calling_mixin import ToolCallingMixin

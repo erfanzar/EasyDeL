@@ -235,6 +235,49 @@ class EngineUtilsMixin:
         return normalized or None
 
     @staticmethod
+    def _normalize_wrapped_chat_template_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        """Normalize tools into OpenAI-style ``{"type":"function","function":...}`` wrappers.
+
+        Some tokenizer chat templates, including Gemma-style templates, expect
+        each tool entry to expose a ``function`` mapping rather than a bare
+        function payload. This helper sanitizes the inner function schema using
+        ``_normalize_chat_template_tools`` and wraps it back into the expected
+        outer structure.
+        """
+
+        normalized = EngineUtilsMixin._normalize_chat_template_tools(tools)
+        if not normalized:
+            return None
+
+        wrapped: list[dict[str, Any]] = []
+        source_tools = [tool for tool in (tools or []) if isinstance(tool, dict)]
+        for idx, payload in enumerate(normalized):
+            source = source_tools[idx] if idx < len(source_tools) else {}
+            tool_type = source.get("type") if isinstance(source.get("type"), str) and source.get("type") else "function"
+            wrapped.append({"type": tool_type, "function": payload})
+        return wrapped or None
+
+    @staticmethod
+    def _is_recoverable_chat_template_tool_error(exc: Exception) -> bool:
+        """Return True for template/tool shape mismatches we can retry around."""
+
+        if isinstance(exc, KeyError):
+            missing_key = exc.args[0] if len(exc.args) > 0 else None
+            if missing_key in {"items", "function"}:
+                return True
+
+        exc_text = str(exc)
+        if exc_text.strip("'\"") in {"items", "function"}:
+            return True
+
+        return (
+            "has no attribute 'items'" in exc_text
+            or "items" in exc_text
+            or "has no attribute 'function'" in exc_text
+            or "tool_data['function']" in exc_text
+        )
+
+    @staticmethod
     def _to_structured_text_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Convert message content into structured text-part arrays."""
 
@@ -371,6 +414,7 @@ class EngineUtilsMixin:
             chat_template_kwargs = {}
         normalized_messages = self._normalize_chat_template_messages(messages)
         normalized_tools = self._normalize_chat_template_tools(tools)
+        normalized_wrapped_tools = self._normalize_wrapped_chat_template_tools(tools)
         try:
             return self.tokenizer.apply_chat_template(
                 normalized_messages,
@@ -381,18 +425,18 @@ class EngineUtilsMixin:
                 **chat_template_kwargs,
             )
         except Exception as exc:
-            # Some tokenizer chat templates expect `.items()` on tools/content parts
-            # and can fail when malformed payloads are passed in.
-            exc_text = str(exc)
-            if tools is None or ("has no attribute 'items'" not in exc_text and "items" not in exc_text):
+            # Some tokenizer chat templates expect `.items()` on nested mappings,
+            # while others expect OpenAI-style tool wrappers with `.function`.
+            recoverable_tool_error = self._is_recoverable_chat_template_tool_error(exc)
+            if tools is None or not recoverable_tool_error:
                 raise
 
             structured_messages = self._to_structured_text_messages(normalized_messages)
 
             retries = [
-                ("normalized_tools", normalized_messages, normalized_tools),
+                ("wrapped_tools", normalized_messages, normalized_wrapped_tools),
                 ("structured_messages", structured_messages, normalized_tools),
-                ("structured_messages+normalized_tools", structured_messages, normalized_tools),
+                ("structured_messages+wrapped_tools", structured_messages, normalized_wrapped_tools),
                 ("structured_messages_no_tools", structured_messages, None),
             ]
             if len(normalized_tools or []) != len(tools or []):
@@ -417,8 +461,7 @@ class EngineUtilsMixin:
                     logger.warning("Recovered chat template rendering via %s fallback.", label)
                     return prompt
                 except Exception as retry_exc:
-                    retry_text = str(retry_exc)
-                    if "has no attribute 'items'" not in retry_text and "items" not in retry_text:
+                    if not self._is_recoverable_chat_template_tool_error(retry_exc):
                         raise
                     last_error = retry_exc
 
@@ -747,7 +790,10 @@ class EngineUtilsMixin:
                     break
 
         if tool_token_ids:
-            sampling_params.logit_bias = {tid: -100.0 for tid in tool_token_ids}
+            merged_logit_bias = dict(sampling_params.logit_bias or {})
+            for tid in tool_token_ids:
+                merged_logit_bias[tid] = min(float(merged_logit_bias.get(tid, 0.0)), -100.0)
+            sampling_params.logit_bias = merged_logit_bias
         sampling_params.skip_special_tokens = True
         return sampling_params
 

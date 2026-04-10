@@ -925,6 +925,7 @@ class eSurgeRunner:
         np.ndarray,
         np.ndarray,
         np.ndarray,
+        list[dict[int, float] | None],
         int | None,
     ]:
         """Return CPU-side state views aligned to the active scheduler window.

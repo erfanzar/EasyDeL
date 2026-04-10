@@ -573,7 +573,7 @@ def merge_state_and_tree(tree: dict, state: nnx.State, *, silence: bool = False)
             # Avoid type '<class 'jax._src.api.ShapeDtypeStruct'>' is not a valid JAX type
             params[keys].value = None
     if lost_data:
-        logger.info(f"tree-array strc keys {tree.keys()}")
+        logger.debug(f"tree-array strc keys {tree.keys()}")
     others = recreate_meta_values(others)
     state = refine_graphs(others, params)
     return state

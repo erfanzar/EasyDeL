@@ -14,7 +14,6 @@
 
 """Tests for eSurge server API helper functions and edge cases."""
 
-
 from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
 from easydel.inference.sampling_params import SamplingParams
 

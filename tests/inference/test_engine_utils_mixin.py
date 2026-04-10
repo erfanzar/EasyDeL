@@ -14,7 +14,6 @@
 
 """Tests for EngineUtilsMixin static helpers and instance methods."""
 
-
 from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
 from easydel.inference.sampling_params import SamplingParams
 

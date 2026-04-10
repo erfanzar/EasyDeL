@@ -117,8 +117,8 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 if self.end_token in model_output:
                     parts = model_output.split(self.end_token, 1)
                     reasoning = parts[0].strip()
-                    content = parts[1].strip() if len(parts) > 1 else None
-                    return reasoning or None, content
+                    content = parts[1] if len(parts) > 1 else None
+                    return reasoning or None, content if content else None
                 # If end token is missing, we are still inside reasoning.
                 reasoning = model_output.strip()
                 return reasoning or None, None
@@ -131,15 +131,14 @@ class BaseThinkingReasoningParser(ReasoningParser):
             # Incomplete reasoning (no end token) — treat all after start as reasoning
             return after_start.strip() or None, before_start.strip() or None
 
-        reasoning_part, content_part = after_start.split(self.end_token, 1)
+        reasoning_part, content = after_start.split(self.end_token, 1)
         reasoning = reasoning_part.strip()
-        content = content_part.strip()
 
         # Prepend any text before the start token to content
         if before_start.strip():
             content = before_start.strip() + ("\n" + content if content else "")
 
-        return reasoning or None, content or None
+        return reasoning or None, content if content else None
 
     def extract_reasoning_streaming(
         self,
