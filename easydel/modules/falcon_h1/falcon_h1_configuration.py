@@ -174,9 +174,11 @@ class FalconH1Config(EasyDeLBaseConfig):
         """Return layer types for hybrid cache configuration.
 
         FalconH1 uses parallel hybrid layers where both attention and SSM
-        run in parallel within each layer, so all layers are 'parallel_hybrid'.
+        run in parallel within each layer. Use the HF-compatible public label
+        ``"hybrid"`` here and normalize it to EasyDeL's internal
+        ``"parallel_hybrid"`` cache type where needed.
         """
-        return tuple("parallel_hybrid" for _ in range(self.num_hidden_layers))
+        return tuple("hybrid" for _ in range(self.num_hidden_layers))
 
     @property
     def mamba_intermediate_size(self) -> int:

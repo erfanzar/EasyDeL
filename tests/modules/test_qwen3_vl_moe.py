@@ -90,6 +90,7 @@ class TestQwen3VLMoE:
             "image_grid_thw": image_grid_thw,
             "num_images": num_images_per_batch,
             "is_qwen_vl": True,
+            "use_mm_token_type_ids": True,
         }
 
     def test_vision_language(self, qwen3_vl_moe_config, small_model_config, vlm_config, hf_qwen3_vl_moe_class):

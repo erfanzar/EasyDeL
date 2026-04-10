@@ -124,6 +124,7 @@ DEFAULTS: eLMConfig = {
         "hbm_utilization": 0.80,
         "page_size": 128,
         "bind_graphstate_for_aot": False,
+        "enable_window_aware_runtime_cap": False,
         "enable_prefix_caching": True,
         "extra_stops": None,
         "verbose": False,

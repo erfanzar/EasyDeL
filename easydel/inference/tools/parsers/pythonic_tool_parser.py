@@ -106,6 +106,8 @@ class PythonicToolParser(ToolParser):
                 token-level operations during streaming.
         """
         super().__init__(tokenizer)
+        self.tool_call_start_token = "["
+        self.tool_call_end_token = "]"
 
     @property
     def current_tool_index(self) -> int:
@@ -143,7 +145,7 @@ class PythonicToolParser(ToolParser):
         """
         is_tool_call_pattern = False
         try:
-            is_tool_call_pattern = self.TOOL_CALL_REGEX.match(model_output, timeout=1) is not None
+            is_tool_call_pattern = self.TOOL_CALL_REGEX.match(model_output) is not None
         except TimeoutError:
             logger.warning("Regex timeout occurred when matching tool call pattern.")
             logger.debug("Regex timeout occurred when matching user input: %s", model_output)

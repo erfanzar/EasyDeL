@@ -228,6 +228,12 @@ class FunctionDefinition(OpenAIBaseModel):
     required: list[str] | None = None
 
 
+class FunctionCallSelection(OpenAIBaseModel):
+    """Typed legacy function-call selector used by request models."""
+
+    name: str
+
+
 class ToolDefinition(OpenAIBaseModel):
     """Defines a tool that can be called by the model.
 
@@ -238,6 +244,33 @@ class ToolDefinition(OpenAIBaseModel):
 
     type: str = "function"
     function: FunctionDefinition
+
+
+class ToolChoiceFunction(OpenAIBaseModel):
+    """Typed tool-choice selector for OpenAI-compatible requests."""
+
+    name: str
+
+
+class ToolChoiceOption(OpenAIBaseModel):
+    """Typed tool-choice object preserving OpenAI wire compatibility."""
+
+    type: str = "function"
+    function: ToolChoiceFunction
+
+
+class ConversationReference(OpenAIBaseModel):
+    """Typed conversation reference for Responses API continuation."""
+
+    id: str | None = None
+    conversation_id: str | None = None
+    conversation: str | None = None
+
+
+class ResponseReasoningConfig(OpenAIBaseModel):
+    """Typed reasoning config for Responses API requests."""
+
+    summary: bool | str | None = None
 
 
 class ChatCompletionRequest(OpenAIBaseModel):
@@ -282,9 +315,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     min_p: float = 0.0
     suppress_tokens: list[int] = Field(default_factory=list)
     functions: list[FunctionDefinition] | None = None
-    function_call: str | dict[str, tp.Any] | None = None
+    function_call: str | FunctionCallSelection | None = None
     tools: list[ToolDefinition] | None = None
-    tool_choice: str | dict[str, tp.Any] | None = None
+    tool_choice: str | ToolChoiceOption | None = None
     n: int | None = 1
     stream: bool | None = False
     stop: str | list[str] | None = None
@@ -453,13 +486,13 @@ class ResponsesRequest(OpenAIBaseModel):
 
     model: str
     input: str | list[tp.Any] | None = None
-    messages: list[Mapping[str, tp.Any]] | None = None
+    messages: list[ChatMessage] | None = None
     instructions: str | None = None
 
     # Conversation state / storage
     store: bool | None = None
     previous_response_id: str | None = None
-    conversation: str | dict[str, tp.Any] | None = None
+    conversation: str | ConversationReference | None = None
 
     # Generation settings
     max_output_tokens: int | None = None
@@ -476,10 +509,11 @@ class ResponsesRequest(OpenAIBaseModel):
     n: int | None = None
 
     # Tools
-    tools: list[Mapping[str, tp.Any]] | None = None
-    functions: list[Mapping[str, tp.Any]] | None = None
-    tool_choice: str | dict[str, tp.Any] | None = None
+    tools: list[ToolDefinition] | None = None
+    functions: list[FunctionDefinition] | None = None
+    tool_choice: str | ToolChoiceOption | None = None
     parallel_tool_calls: bool | None = None
+    reasoning: bool | ResponseReasoningConfig | None = None
 
     # Streaming / misc
     stream: bool | None = False

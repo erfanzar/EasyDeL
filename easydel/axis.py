@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import typing as tp
 
-from eformer.common_types import DP, NOT_GIVEN
-from eformer.escale import PartitionAxis
+from eformer.common_types import DP, MODE_PREFILL, NOT_GIVEN
+from eformer.escale import PartitionAxis, PartitionManager
 
 ATTN_DP = "__ATTN_DP__"
 _DEFAULT_ATTN_DP_RULE = DP
@@ -64,6 +64,25 @@ def reset_attention_data_parallel_axis() -> None:
     register_attention_data_parallel_axis(_DEFAULT_ATTN_DP_RULE)
 
 
+def resolve_attention_data_parallel_axis(
+    partition_axis_or_manager: PartitionAxis | PartitionManager,
+    *,
+    mode: str = MODE_PREFILL,
+) -> tp.Any:
+    """Resolve the configured attention/KV-cache data-parallel axis rule.
+
+    This keeps eSurge's KV-page sharding independent from the model's standard
+    data-parallel axis. The returned value is suitable for mesh-size lookups,
+    ``jax.lax.axis_index``, and other low-level sharding helpers.
+    """
+    paxis = (
+        partition_axis_or_manager.paxis
+        if isinstance(partition_axis_or_manager, PartitionManager)
+        else partition_axis_or_manager
+    )
+    return paxis.resolve_axis([ATTN_DP], mode=mode)[0]
+
+
 try:
     PartitionAxis.register(ATTN_DP, _DEFAULT_ATTN_DP_RULE)
 except ValueError:
@@ -75,4 +94,5 @@ __all__ = [
     "ATTN_DP",
     "register_attention_data_parallel_axis",
     "reset_attention_data_parallel_axis",
+    "resolve_attention_data_parallel_axis",
 ]

@@ -62,6 +62,7 @@ from .deepseekv31_tool_parser import DeepSeekV31ToolParser
 from .deepseekv32_tool_parser import DeepSeekV32ToolParser
 from .ernie45_tool_parser import Ernie45ToolParser
 from .functiongemma_tool_parser import FunctionGemmaToolParser
+from .gemma4_tool_parser import Gemma4ToolParser
 from .gigachat3_tool_parser import GigaChat3ToolParser
 from .glm4_moe_tool_parser import Glm4MoeModelToolParser
 from .glm47_moe_tool_parser import Glm47MoeModelToolParser
@@ -95,6 +96,7 @@ __all__ = [
     "DeepSeekV32ToolParser",
     "Ernie45ToolParser",
     "FunctionGemmaToolParser",
+    "Gemma4ToolParser",
     "GigaChat3ToolParser",
     "Glm4MoeModelToolParser",
     "Glm47MoeModelToolParser",

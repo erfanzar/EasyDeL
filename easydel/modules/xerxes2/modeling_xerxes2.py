@@ -1137,7 +1137,7 @@ class Xerxes2ForCausalLM(BaseCausalLMModule[Xerxes2Model, Xerxes2Config]):  # ty
 
         return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
-    def create_transformer_cache_config(self, batch_size: int, max_length: int):
+    def create_transformer_cache_config(self, batch_size: int, max_length: int, **kwargs):
         """Create cache configuration for MLA-based key-value caching.
 
         Creates a TransformerCacheConfig with dimensions appropriate for Multi-head

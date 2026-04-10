@@ -321,6 +321,8 @@ _import_structure = {
         "ejit",
         "ePath",
         "ePathLike",
+        "is_inference_mode",
+        "set_inference_mode",
         "traversals",
     ],
     "inference": [
@@ -376,6 +378,7 @@ _import_structure = {
         "EasyDeLQuantizationConfig",
         "EasyQuantizer",
         "QuantizationType",
+        "TurboQuantConfig",
     ],
     "operations": [
         "AttentionConfig",
@@ -532,6 +535,18 @@ _import_structure = {
         "Gemma3MultiModalProjector",
         "Gemma3TextConfig",
         "Gemma3TextModel",
+    ],
+    "modules.gemma4": [
+        "Gemma4Config",
+        "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration",
+        "Gemma4Model",
+        "Gemma4MultimodalEmbedder",
+        "Gemma4RMSNorm",
+        "Gemma4TextConfig",
+        "Gemma4TextModel",
+        "Gemma4VisionConfig",
+        "Gemma4VisionModel",
     ],
     "modules.gidd": [
         "GiddConfig",
@@ -990,7 +1005,7 @@ if _tp.TYPE_CHECKING:
     from .infra.factory import ConfigType, TaskType, register_config, register_module
     from .layers.attention import AttentionMechanisms, AttentionModule, FlexibleAttentionModule
     from .layers.moe import MoEMethods
-    from .layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer, QuantizationType
+    from .layers.quantization import EasyDeLQuantizationConfig, EasyQuantizer, QuantizationType, TurboQuantConfig
     from .modules.arctic import ArcticConfig, ArcticForCausalLM, ArcticModel
     from .modules.auto import (
         AutoEasyDeLAnyToAnyModel,
@@ -1057,6 +1072,18 @@ if _tp.TYPE_CHECKING:
         Gemma3MultiModalProjector,
         Gemma3TextConfig,
         Gemma3TextModel,
+    )
+    from .modules.gemma4 import (
+        Gemma4Config,
+        Gemma4ForCausalLM,
+        Gemma4ForConditionalGeneration,
+        Gemma4Model,
+        Gemma4MultimodalEmbedder,
+        Gemma4RMSNorm,
+        Gemma4TextConfig,
+        Gemma4TextModel,
+        Gemma4VisionConfig,
+        Gemma4VisionModel,
     )
     from .modules.gidd import GiddConfig, GiddForDiffusionLM, GiddModel
     from .modules.glm import GlmConfig, GlmForCausalLM, GlmForSequenceClassification, GlmModel
@@ -1326,6 +1353,8 @@ if _tp.TYPE_CHECKING:
         ejit,
         ePath,
         ePathLike,
+        is_inference_mode,
+        set_inference_mode,
         traversals,
     )
 else:
@@ -1338,7 +1367,7 @@ else:
     )
 
     _targeted_eformer_versions = ["0.0.99.5"]
-    _targeted_ejkernel_versions = ["0.0.72"]
+    _targeted_ejkernel_versions = ["0.0.75", "0.0.76"]
 
     from eformer import __version__ as _eform_version
     from ejkernel import __version__ as _ejker_version

@@ -272,9 +272,6 @@ class PrometheusMetrics:
         system_metrics = collector.get_system_metrics()
 
         with collector._lock:
-            # ── Tokens-per-second: prefer live runner TPS, fall back to
-            #    completed-request average so the gauge is non-zero during
-            #    active generation.
             live_tps = 0.0
             scheduler_reports_running = (
                 bool(collector.scheduler_metrics) and collector.scheduler_metrics[-1].num_running_requests > 0
@@ -288,11 +285,6 @@ class PrometheusMetrics:
             else:
                 self.tokens_per_second.set(0.0)
 
-            # ── Process only NEW completed requests since last update ──
-            # collector.counters tracks the monotonic total; the deque may
-            # have wrapped so we cannot index into it.  Instead, compute
-            # how many new completions occurred since our last cursor and
-            # read that many items from the *tail* of the deque.
             total_now = collector.counters["total_completed"] + collector.counters["total_failed"]
             num_new = total_now - self._completions_cursor
             if num_new > len(collector.completed_requests):
@@ -315,7 +307,6 @@ class PrometheusMetrics:
 
                 self.tokens_generated_total.inc(req_metrics.generated_tokens)
 
-            # ── Scheduler metrics ──
             if collector.scheduler_metrics:
                 latest_scheduler = collector.scheduler_metrics[-1]
                 # Gauges: always set to latest value
@@ -328,7 +319,6 @@ class PrometheusMetrics:
                     lambda sm: self.schedule_duration.observe(sm.schedule_time),
                 )
 
-            # ── Runner metrics ──
             if collector.runner_metrics:
                 latest_runner = collector.runner_metrics[-1]
                 # Gauge: always set to latest
@@ -339,7 +329,6 @@ class PrometheusMetrics:
                     lambda rm: self.model_execution_duration.observe(rm.execution_time),
                 )
 
-            # ── Cache metrics ──
             if collector.cache_metrics:
                 latest_cache = collector.cache_metrics[-1]
                 self.cache_pages_total.set(latest_cache.total_pages)

@@ -20,6 +20,7 @@ import functools
 import gc
 import inspect
 import os
+import re
 import typing as tp
 import warnings
 from collections.abc import Mapping
@@ -389,6 +390,7 @@ class StateDictConverter:
         moe_block_path: list[str] | None = None,
         moe_path: list[str] | None = None,
         tensor_transform: tp.Callable | None = None,
+        reform_param: dict | None = None,
     ) -> tuple[dict[str, tp.Any], set[str]]:
         """
         Transform MoE weights from HuggingFace format (separate experts) to EasyDel format (stacked experts).
@@ -418,6 +420,11 @@ class StateDictConverter:
         moe_stacked_paths = {
             f"{block_path}.{expected_expert_name}.{moe_name}" for block_path in moe_block_path for moe_name in moe_names
         }
+        reform_param = reform_param or {}
+        fallback_reform_keys = {
+            key[:-1] if key.endswith("$") else key for key in reform_param if f".{expected_expert_name}." in key
+        }
+        sibling_expert_parents = {path.rsplit(".", 1)[0] for path in moe_path if f".{expected_expert_name}." in path}
 
         new_state_dict = {}
         moe_groups = {path: {} for path in moe_stacked_paths}
@@ -452,6 +459,17 @@ class StateDictConverter:
                         moe_groups[target_path][expert_idx] = value
                         is_moe_expert = True
                         break
+
+            if not is_moe_expert:
+                match = re.match(rf"^(.*\.{expected_expert_name})\.(\d+)\.([^.]+)\.weight$", key)
+                if match:
+                    expert_parent, expert_idx_str, moe_name = match.groups()
+                    target_path = f"{expert_parent}.{moe_name}"
+                    if expert_parent in sibling_expert_parents and (
+                        moe_name in moe_names_set or target_path in fallback_reform_keys
+                    ):
+                        moe_groups.setdefault(target_path, {})[int(expert_idx_str)] = value
+                        is_moe_expert = True
 
             if not is_moe_expert:
                 new_state_dict[key] = value
@@ -557,6 +575,7 @@ class StateDictConverter:
                 moe_path=moe_path,
                 moe_block_names=moe_block_names,
                 moe_block_path=moe_block_path,
+                reform_param=reform_param,
             )
 
         return StateDictConverter._base_huggingface_to_easydel(
@@ -610,6 +629,9 @@ class StateDictConverter:
         new_state_dict = {}
         processed_keys = set()
         expected_expert_name = moe_path[0].split(".")[-2] if moe_path else "experts"
+        sibling_expert_parents = {
+            path.rsplit(".", 1)[0] for path in moe_path or [] if f".{expected_expert_name}." in path
+        }
 
         for key, value in state_dict.items():
             is_stacked_moe = False
@@ -637,6 +659,21 @@ class StateDictConverter:
 
                             processed_keys.add(key)
                             break
+
+            if not is_stacked_moe:
+                match = re.match(rf"^(.*\.{expected_expert_name})\.([^.]+)\.weight$", key)
+                if match:
+                    expert_parent, moe_name = match.groups()
+                    if expert_parent in sibling_expert_parents and hasattr(value, "shape") and len(value.shape) >= 3:
+                        num_experts = value.shape[0]
+                        for expert_idx in range(num_experts):
+                            expert_tensor = value[expert_idx]
+                            if tensor_transform is not None:
+                                expert_tensor = tensor_transform(expert_tensor)
+                            new_key = f"{expert_parent}.{expert_idx}.{moe_name}.weight"
+                            new_state_dict[new_key] = expert_tensor
+                        processed_keys.add(key)
+                        is_stacked_moe = True
 
             if not is_stacked_moe:
                 new_state_dict[key] = value

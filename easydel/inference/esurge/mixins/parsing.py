@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import time
 
+from ...stream_protocol import compute_stream_delta_text
 from ..engine_types import EngineCoreOutputs
 from ..logger import logger
 from ..metrics import get_metrics_collector
@@ -101,7 +102,8 @@ class EngineParsingMixin:
             return False
         if not bool(getattr(sampling_params, "ignore_stop_strings_in_reasoning", False)):
             return False
-        return rd.get("reasoning_parser_instance") is not None
+        dp = rd.get("delegating_parser")
+        return dp is not None and dp.reasoning_parser is not None
 
     def _parse_with_stop_string_policy(
         self,
@@ -146,39 +148,6 @@ class EngineParsingMixin:
         )
         return parsed, visible_text, visible_delta, stop_hit, stop_reason
 
-    @staticmethod
-    def _resolve_parser_tokenizer(*parsers):
-        """Return the first tokenizer exposed by the provided parser instances."""
-        for parser in parsers:
-            tokenizer = getattr(parser, "model_tokenizer", None)
-            if tokenizer is not None:
-                return tokenizer
-        return None
-
-    def _retokenize_parser_view(self, text: str, *, tool_parser=None, reasoning_parser=None) -> list[int]:
-        """Retokenize a parser-visible text view so token IDs match stripped content."""
-        if not text:
-            return []
-
-        tokenizer = getattr(self, "tokenizer", None) or self._resolve_parser_tokenizer(tool_parser, reasoning_parser)
-        if tokenizer is None or not hasattr(tokenizer, "encode"):
-            return []
-
-        try:
-            token_ids = tokenizer.encode(text, add_special_tokens=False)
-        except TypeError:
-            try:
-                token_ids = tokenizer.encode(text)
-            except Exception:
-                return []
-        except Exception:
-            return []
-
-        try:
-            return [int(token_id) for token_id in token_ids]
-        except Exception:
-            return []
-
     def _run_output_parsers(
         self,
         rd: dict,
@@ -187,218 +156,353 @@ class EngineParsingMixin:
         token_ids: list[int],
         finished: bool,
     ) -> dict:
-        """Run reasoning and tool parsers on decoded text.
-
-        Reasoning runs first, then tool parsing on content portion only.
+        """Run reasoning and tool parsers on decoded text via DelegatingParser.
 
         Returns:
             Dict with keys: delta_reasoning, delta_content, accumulated_reasoning,
             accumulated_content, tool_calls, delta_tool_calls.
         """
-        result = {
-            "delta_reasoning": None,
-            "delta_content": delta_text,
-            "accumulated_reasoning": rd.get("accumulated_reasoning", ""),
-            "accumulated_content": rd.get("accumulated_content", ""),
-            "tool_calls": None,
-            "delta_tool_calls": None,
-        }
+        dp = rd.get("delegating_parser")
+        if dp is None:
+            return {
+                "delta_reasoning": None,
+                "delta_content": delta_text,
+                "accumulated_reasoning": "",
+                "accumulated_content": accumulated_text,
+                "tool_calls": None,
+                "delta_tool_calls": None,
+            }
 
-        reasoning_parser = rd.get("reasoning_parser_instance")
-        tool_parser = rd.get("tool_parser_instance")
         prev_text = rd.get("parser_previous_text", "")
         prev_token_ids = rd.get("parser_previous_token_ids", [])
 
-        content_for_tools = accumulated_text
-
-        # Step 1: Reasoning extraction
-        if reasoning_parser is not None:
-            try:
-                if finished:
-                    reasoning, content = reasoning_parser.extract_reasoning(accumulated_text)
-                    result["accumulated_reasoning"] = reasoning or ""
-                    if content is None:
-                        content_for_tools = "" if reasoning is not None else accumulated_text
-                    else:
-                        content_for_tools = content
-                    result["accumulated_content"] = content_for_tools
-                    # Calculate delta from previous
-                    old_reasoning = rd.get("accumulated_reasoning", "")
-                    if reasoning and len(reasoning) > len(old_reasoning):
-                        result["delta_reasoning"] = reasoning[len(old_reasoning) :]
-                    # Content delta: use content-only portion
-                    if content is not None:
-                        _, prev_content = reasoning_parser.extract_reasoning(prev_text)
-                        prev_content = prev_content or ""
-                        if len(content) > len(prev_content):
-                            result["delta_content"] = content[len(prev_content) :]
-                        else:
-                            result["delta_content"] = ""
-                    elif reasoning is not None:
-                        result["delta_content"] = ""
-                else:
-                    delta_ids = token_ids[len(prev_token_ids) :] if prev_token_ids else token_ids
-                    delta_msg = reasoning_parser.extract_reasoning_streaming(
-                        previous_text=prev_text,
-                        current_text=accumulated_text,
-                        delta_text=delta_text,
-                        previous_token_ids=prev_token_ids,
-                        current_token_ids=token_ids,
-                        delta_token_ids=delta_ids,
-                    )
-                    if delta_msg is not None:
-                        result["delta_reasoning"] = delta_msg.reasoning_content
-                        if delta_msg.content is not None:
-                            result["delta_content"] = delta_msg.content
-                        elif delta_msg.reasoning_content is not None:
-                            # Explicitly hide reasoning-only deltas from content.
-                            result["delta_content"] = ""
-                        # Accumulate reasoning
-                        if delta_msg.reasoning_content:
-                            result["accumulated_reasoning"] = (
-                                rd.get("accumulated_reasoning", "") + delta_msg.reasoning_content
-                            )
-
-                    reasoning, content = reasoning_parser.extract_reasoning(accumulated_text)
-                    reasoning_only_delta = (
-                        delta_msg is not None and delta_msg.reasoning_content is not None and delta_msg.content is None
-                    )
-                    unparseable_control_delta = delta_msg is None and (content is None or content == accumulated_text)
-
-                    if reasoning_only_delta or unparseable_control_delta:
-                        # Keep prior visible content for reasoning/control-token chunks.
-                        content_for_tools = rd.get("accumulated_content", "")
-                        result["accumulated_content"] = content_for_tools
-                        if unparseable_control_delta:
-                            result["delta_content"] = ""
-                    elif content is None:
-                        content_for_tools = "" if reasoning is not None else accumulated_text
-                        result["accumulated_content"] = content_for_tools
-                    else:
-                        content_for_tools = content
-                        result["accumulated_content"] = content_for_tools
-            except Exception:
-                result["accumulated_content"] = accumulated_text
-                logger.debug("Reasoning extraction failed for request", exc_info=True)
+        if finished:
+            result = dp.process_final(accumulated_text, token_ids)
         else:
-            result["accumulated_content"] = accumulated_text
+            result = dp.process_delta(accumulated_text, delta_text, token_ids, prev_text, prev_token_ids)
 
-        # Step 2: Tool call extraction on content portion
-        if tool_parser is not None and content_for_tools:
-            try:
-                tool_request = rd.get("tool_parser_request")
-                if finished:
-                    if tool_request is None:
-                        from easydel.inference.openai_api_modules import ChatCompletionRequest, ChatMessage
-
-                        tool_request = ChatCompletionRequest(
-                            model="dummy",
-                            messages=[ChatMessage(role="user", content="")],
-                        )
-                    extracted = tool_parser.extract_tool_calls(content_for_tools, tool_request)
-                    if extracted.tools_called and extracted.tool_calls:
-                        result["tool_calls"] = extracted.tool_calls
-                        # Update delta_content to exclude tool call markup
-                        if extracted.content is not None:
-                            result["accumulated_content"] = extracted.content
-                            result["delta_content"] = ""  # Content was already streamed
-                else:
-                    # For streaming, compute content deltas
-                    if reasoning_parser is not None:
-                        _, prev_content = reasoning_parser.extract_reasoning(prev_text)
-                        if prev_content is None:
-                            # Keep the tool parser's previous view aligned with the
-                            # already-exposed visible content instead of raw reasoning.
-                            prev_content = rd.get("accumulated_content", "")
-                    else:
-                        prev_content = prev_text
-
-                    if prev_content is None:
-                        prev_content = prev_text
-                    content_delta = result["delta_content"]
-                    if content_delta is None:
-                        content_delta = delta_text
-
-                    if tool_request is None:
-                        from easydel.inference.openai_api_modules import ChatCompletionRequest, ChatMessage
-
-                        tool_request = ChatCompletionRequest(
-                            model="dummy",
-                            messages=[ChatMessage(role="user", content="")],
-                        )
-                    delta_ids = token_ids[len(prev_token_ids) :] if prev_token_ids else token_ids
-                    tool_previous_token_ids = prev_token_ids
-                    tool_current_token_ids = token_ids
-                    tool_delta_token_ids = delta_ids
-                    if reasoning_parser is not None:
-                        # Tool parsers must see the same projection in both text and
-                        # token-ID space; otherwise token-aware parsers can still
-                        # detect markers that were stripped from reasoning.
-                        tool_previous_token_ids = self._retokenize_parser_view(
-                            prev_content or "",
-                            tool_parser=tool_parser,
-                            reasoning_parser=reasoning_parser,
-                        )
-                        tool_current_token_ids = self._retokenize_parser_view(
-                            content_for_tools or "",
-                            tool_parser=tool_parser,
-                            reasoning_parser=reasoning_parser,
-                        )
-                        tool_delta_token_ids = self._retokenize_parser_view(
-                            content_delta or "",
-                            tool_parser=tool_parser,
-                            reasoning_parser=reasoning_parser,
-                        )
-                    delta_msg = tool_parser.extract_tool_calls_streaming(
-                        previous_text=prev_content,
-                        current_text=content_for_tools,
-                        delta_text=content_delta or "",
-                        previous_token_ids=tool_previous_token_ids,
-                        current_token_ids=tool_current_token_ids,
-                        delta_token_ids=tool_delta_token_ids,
-                        request=tool_request,
-                    )
-                    if delta_msg is not None:
-                        if hasattr(delta_msg, "tool_calls") and delta_msg.tool_calls:
-                            result["delta_tool_calls"] = delta_msg.tool_calls
-                        # If tool parser consumed the content, clear delta_content
-                        if delta_msg.tool_calls and not delta_msg.content:
-                            result["delta_content"] = ""
-                        elif delta_msg.content is not None:
-                            result["delta_content"] = delta_msg.content
-            except Exception:
-                logger.debug("Tool call extraction failed for request", exc_info=True)
-
-        # Update tracking state
         rd["parser_previous_text"] = accumulated_text
         rd["parser_previous_token_ids"] = list(token_ids)
-        rd["accumulated_reasoning"] = result["accumulated_reasoning"]
-        rd["accumulated_content"] = result["accumulated_content"]
 
-        return result
+        return result.to_dict()
+
+    @staticmethod
+    def _resolve_public_finish_reason(outputs) -> str | None:
+        """Collapse per-sample completion reasons into a single public reason.
+
+        Priority: abort > length > tool_calls > stop.
+        tool_calls beats stop because the client needs to know to execute tools.
+        """
+        finish_reason = outputs[0].finish_reason if outputs else None
+        if any(output.finish_reason == "abort" for output in outputs):
+            return "abort"
+        if any(output.finish_reason == "length" for output in outputs):
+            return "length"
+        if any(output.finish_reason == "tool_calls" for output in outputs):
+            return "tool_calls"
+        if any(output.finish_reason == "stop" for output in outputs):
+            return "stop"
+        return finish_reason
+
+    def _finish_request_from_scheduler_signal(
+        self,
+        request_id: str,
+        *,
+        metrics_collector,
+    ) -> None:
+        """Finalize a request when the scheduler reports completion without token output."""
+
+        rd = self._active_requests.get(request_id)
+        if rd is None:
+            return
+
+        parent_request_id = rd.get("parent_request_id", request_id)
+        sample_index = int(rd.get("sample_index", 0) or 0)
+        ro = self._request_outputs.get(parent_request_id)
+        if ro is None:
+            self._active_requests.pop(request_id, None)
+            return
+        if sample_index < 0 or sample_index >= len(ro.outputs):
+            self._active_requests.pop(request_id, None)
+            return
+
+        comp = ro.outputs[sample_index]
+        if comp.finish_reason is None:
+            logger.warning(
+                "Finishing request %s from scheduler finished_requests without a terminal EngineCoreOutput; "
+                "defaulting finish_reason=abort.",
+                request_id,
+            )
+            comp.finish_reason = "abort"
+
+        start_time = rd.get("start_time")
+        if start_time is not None:
+            elapsed = max(0.0, time.perf_counter() - float(start_time))
+            ro.processing_time = max(ro.processing_time, elapsed)
+            ro.time_spent_generating = max(ro.time_spent_generating, elapsed)
+
+        if sample_index == 0:
+            ro.delta_text = ""
+            ro.raw_delta_text = ""
+            ro.delta_reasoning_content = None
+            ro.delta_tool_calls = None
+
+        if len(ro.outputs) == 1:
+            ro.finished = True
+        else:
+            ro.finished = all(output.finish_reason is not None for output in ro.outputs)
+
+        if ro.finished and metrics_collector:
+            metrics_collector.complete_request(
+                parent_request_id,
+                finish_reason=self._resolve_public_finish_reason(ro.outputs),
+            )
+
+        try:
+            self._detokenizer_client.reset(request_id)
+        except Exception:
+            logger.debug("Failed to reset detokenizer state for %s", request_id, exc_info=True)
+
+        self._active_requests.pop(request_id, None)
+        if ro.finished and parent_request_id != request_id:
+            self._active_requests.pop(parent_request_id, None)
+
+        ro.update_seq += 1
+        ev = self._request_events.get(parent_request_id)
+        if ev:
+            ev.set()
+
+    def _decode_and_parse(
+        self,
+        request_id: str,
+        rd: dict,
+        decodable_tokens: list[int],
+        now: float,
+        finished: bool,
+    ) -> tuple[dict | None, str, str, bool, str | None]:
+        """Decode tokens and run parser pipeline.
+
+        Returns:
+            (parsed, raw_accumulated_text, raw_delta_text, stop_hit, stop_reason)
+            or (None, "", "", False, None) if decode was skipped.
+        """
+        last_idx = rd["last_decoded_index"]
+        num_decodable = len(decodable_tokens)
+        sampling_params = rd.get("sampling_params")
+        skip_special_tokens = bool(getattr(sampling_params, "skip_special_tokens", False))
+        spaces_between_special_tokens = bool(getattr(sampling_params, "spaces_between_special_tokens", True))
+
+        if not finished:
+            has_stop_strings = bool(getattr(sampling_params, "stop", None))
+            if has_stop_strings:
+                interval_tokens = min(self.decode_interval_tokens, 4)
+                interval_secs = min(self.decode_interval_secs, 0.02)
+            else:
+                interval_tokens = self.decode_interval_tokens
+                interval_secs = self.decode_interval_secs
+
+            should_decode = (
+                num_decodable - last_idx >= interval_tokens or (now - rd.get("last_decode_time", now)) >= interval_secs
+            )
+            if not should_decode or num_decodable <= last_idx:
+                return None, "", "", False, None
+        else:
+            if num_decodable == 0 and last_idx == 0:
+                return None, "", "", False, None
+
+        prompt_ctx = rd.get("prompt_token_ids") if last_idx == 0 else None
+        pipeline_result = self._decode_with_pipeline(
+            request_id,
+            decodable_tokens,
+            finished=finished,
+            skip_special_tokens=skip_special_tokens,
+            spaces_between_special_tokens=spaces_between_special_tokens,
+            prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
+        )
+        rd["last_decoded_index"] = pipeline_result.last_decoded_index
+        if not finished:
+            rd["last_decode_time"] = now
+
+        raw_accumulated = pipeline_result.accumulated_text
+        raw_delta = pipeline_result.delta_text or ""
+
+        parsed, _visible, _vis_delta, stop_hit, stop_reason = self._parse_with_stop_string_policy(
+            rd,
+            accumulated_text=pipeline_result.accumulated_text,
+            delta_text=pipeline_result.delta_text,
+            token_ids=decodable_tokens,
+            finished=finished,
+        )
+        return parsed, raw_accumulated, raw_delta, stop_hit, stop_reason
+
+    @staticmethod
+    def _update_outputs(
+        comp,
+        ro,
+        sample_index: int,
+        parsed: dict,
+        raw_accumulated: str,
+        raw_delta: str,
+        visible_delta: str = "",
+    ) -> tuple[bool, bool]:
+        """Apply parsed results to CompletionOutput and RequestOutput.
+
+        Returns:
+            (text_changed, structured_changed) for event signaling decisions.
+        """
+        text_changed = False
+        structured_changed = False
+
+        comp.text = parsed["accumulated_content"]
+        comp.raw_text = raw_accumulated
+        if parsed["accumulated_reasoning"]:
+            comp.reasoning_content = parsed["accumulated_reasoning"]
+        if parsed["tool_calls"]:
+            comp.tool_calls = parsed["tool_calls"]
+
+        if sample_index == 0:
+            previous_accumulated_text = ro.accumulated_text
+            ro.raw_accumulated_text = raw_accumulated
+            ro.raw_delta_text = raw_delta or ""
+            ro.accumulated_text = parsed["accumulated_content"]
+            effective_delta = compute_stream_delta_text(
+                parsed["accumulated_content"],
+                previous_accumulated_text,
+                parsed["delta_content"] or visible_delta,
+            )
+            ro.delta_text = effective_delta or ""
+            ro.delta_reasoning_content = parsed["delta_reasoning"]
+            ro.reasoning_content = parsed["accumulated_reasoning"] or None
+            ro.delta_tool_calls = parsed["delta_tool_calls"]
+            if parsed["tool_calls"]:
+                ro.tool_calls = parsed["tool_calls"]
+            if effective_delta:
+                ro.delta_seq += 1
+                text_changed = True
+            if parsed["delta_reasoning"] is not None or parsed["delta_tool_calls"]:
+                structured_changed = True
+
+        return text_changed, structured_changed
+
+    @staticmethod
+    def _update_metrics(rd: dict, ro, now: float, num_generated: int) -> None:
+        """Update TTFT, tokens/sec, and timing metrics."""
+        elapsed = now - rd["start_time"]
+        ro.processing_time = elapsed
+        ro.time_spent_generating = elapsed
+
+        prev_reported = rd.get("reported_generated_count", 0)
+        if num_generated >= prev_reported:
+            ro.num_generated_tokens += num_generated - prev_reported
+            rd["reported_generated_count"] = num_generated
+        else:
+            rd["reported_generated_count"] = num_generated
+
+        if ro.first_token_time is not None and ro.num_generated_tokens > 0:
+            generation_time = elapsed - ro.first_token_time
+            ro.tokens_per_second = ro.num_generated_tokens / generation_time if generation_time > 0 else 0.0
+        else:
+            ro.tokens_per_second = 0.0
+
+    def _finalize_request(
+        self,
+        request_id: str,
+        rd: dict,
+        ro,
+        comp,
+        sample_index: int,
+        parent_request_id: str,
+        engine_output,
+        force_finished: bool,
+        stop_string_finishes: dict[str, str],
+        metrics_collector,
+        now: float,
+    ) -> tuple[bool, bool]:
+        """Handle request completion: final decode, finish_reason, cleanup.
+
+        Returns:
+            (text_changed, structured_changed) for event signaling.
+        """
+        text_changed = False
+        structured_changed = False
+
+        if force_finished and not engine_output.finished:
+            comp.finish_reason = "stop"
+        else:
+            comp.finish_reason = str(engine_output.finish_reason) if engine_output.finish_reason else "finished"
+
+        n_samples = len(ro.outputs)
+        if n_samples == 1:
+            ro.finished = True
+        else:
+            ro.finished = all(output.finish_reason is not None for output in ro.outputs)
+
+        decodable_tokens = self._filter_eos_tokens(rd["generated_tokens"])
+        parsed, raw_accumulated, raw_delta, stop_hit, stop_reason = self._decode_and_parse(
+            request_id,
+            rd,
+            decodable_tokens,
+            now,
+            finished=True,
+        )
+
+        if stop_hit and stop_reason:
+            stop_string_finishes[request_id] = stop_reason
+
+        if parsed is not None:
+            comp.token_ids = list(rd["generated_tokens"])
+            if parsed["tool_calls"]:
+                comp.finish_reason = "tool_calls"
+            text_changed, structured_changed = self._update_outputs(
+                comp,
+                ro,
+                sample_index,
+                parsed,
+                raw_accumulated,
+                raw_delta,
+            )
+
+        elapsed = now - rd["start_time"]
+        num_prompt_tokens = (
+            len(rd["prompt_token_ids"]) if "prompt_token_ids" in rd else sum(len(seg) for seg in ro.prompt_token_ids)
+        )
+        ro.processing_time = elapsed
+        ro.time_spent_generating = elapsed
+        if ro.first_token_time is not None and ro.num_generated_tokens > 0:
+            generation_time = elapsed - ro.first_token_time
+            ro.tokens_per_second = ro.num_generated_tokens / generation_time if generation_time > 0 else 0.0
+        else:
+            ro.tokens_per_second = 0.0
+        ro.metrics = {
+            "prompt_tokens": num_prompt_tokens,
+            "generated_tokens": ro.num_generated_tokens,
+            "total_tokens": num_prompt_tokens + ro.num_generated_tokens,
+            "processing_time": elapsed,
+            "first_token_time": ro.first_token_time,
+            "tokens_per_second": ro.tokens_per_second,
+        }
+
+        if metrics_collector and ro.finished:
+            metrics_collector.complete_request(
+                parent_request_id,
+                finish_reason=self._resolve_public_finish_reason(ro.outputs),
+            )
+        try:
+            self._detokenizer_client.reset(request_id)
+        except Exception:
+            logger.debug("Failed to reset detokenizer state for %s", request_id, exc_info=True)
+        self._active_requests.pop(request_id, None)
+        if ro.finished and parent_request_id != request_id:
+            self._active_requests.pop(parent_request_id, None)
+
+        return text_changed, structured_changed
 
     def _process_engine_outputs(self, engine_outputs: dict[int, EngineCoreOutputs]) -> None:
         """Process engine outputs and update request outputs (thread-safe).
 
-        Core method that processes tokens from the model, performs incremental
-        decoding, updates metrics, and signals waiting threads. Uses interval-based
-        decoding to reduce tokenizer overhead during streaming.
-
-        Args:
-            engine_outputs: Dictionary mapping client IDs to engine outputs containing
-                new tokens, completion status, and metadata.
-
-        Processing Flow:
-            1. Extracts new tokens from engine outputs
-            2. Performs interval-based decoding (every 4 tokens or 20ms)
-            3. Updates accumulated and delta text fields
-            4. Tracks performance metrics (TTFT, tokens/sec)
-            5. Handles request completion with final token flush
-            6. Signals per-request events for streaming consumers
-
-        Thread Safety:
-            Uses request_lock and output_lock to ensure atomic updates across
-            multiple concurrent requests and streaming consumers.
+        Decodes tokens, runs reasoning + tool parsers, updates metrics, and
+        signals streaming consumers. Uses interval-based decoding to reduce
+        tokenizer overhead.
         """
         metrics_collector = get_metrics_collector()
         if engine_outputs:
@@ -406,7 +510,6 @@ class EngineParsingMixin:
 
         stop_string_finishes: dict[str, str] = {}
 
-        # Update both request_data and public outputs atomically
         with self._request_lock, self._output_lock:
             for client_outputs in engine_outputs.values():
                 for engine_output in client_outputs.outputs:
@@ -415,7 +518,6 @@ class EngineParsingMixin:
                     if rd is None:
                         continue
 
-                    # Handle n>1 sampling: get parent request and sample index
                     parent_request_id = rd.get("parent_request_id", request_id)
                     sample_index = rd.get("sample_index", 0)
                     ro = self._request_outputs.get(parent_request_id)
@@ -423,15 +525,14 @@ class EngineParsingMixin:
                         continue
 
                     text_changed = False
+                    structured_changed = False
                     force_finished = False
                     new_tokens = engine_output.new_token_ids
                     now = time.perf_counter()
-                    elapsed = now - rd["start_time"]
+
                     if new_tokens:
                         rd["generated_tokens"].extend(new_tokens)
                         num_generated = len(rd["generated_tokens"])
-                        decodable_tokens = self._filter_eos_tokens(rd["generated_tokens"])
-                        num_decodable = len(decodable_tokens)
 
                         if rd["first_token_time"] is None and num_generated > 0:
                             rd["first_token_time"] = now - rd["start_time"]
@@ -442,238 +543,65 @@ class EngineParsingMixin:
                                     metrics_collector.record_first_token(parent_request_id)
                             else:
                                 ro.first_token_time = min(ro.first_token_time, rd["first_token_time"])
-
                         if metrics_collector:
                             metrics_collector.add_generated_tokens(parent_request_id, len(new_tokens))
 
-                        last_idx = rd["last_decoded_index"]
-                        sampling_params = rd.get("sampling_params")
-                        skip_special_tokens = bool(getattr(sampling_params, "skip_special_tokens", False))
-                        spaces_between_special_tokens = bool(
-                            getattr(sampling_params, "spaces_between_special_tokens", True)
+                        decodable_tokens = self._filter_eos_tokens(rd["generated_tokens"])
+                        parsed, raw_accumulated, raw_delta, stop_hit, stop_reason = self._decode_and_parse(
+                            request_id,
+                            rd,
+                            decodable_tokens,
+                            now,
+                            finished=False,
                         )
-                        has_stop_strings = bool(getattr(sampling_params, "stop", None))
-                        if has_stop_strings:
-                            stop_decode_interval_tokens = min(self.decode_interval_tokens, 4)
-                            stop_decode_interval_secs = min(self.decode_interval_secs, 0.02)
-                            should_decode = (
-                                num_decodable - last_idx >= stop_decode_interval_tokens
-                                or (now - rd.get("last_decode_time", now)) >= stop_decode_interval_secs
-                            )
-                        else:
-                            should_decode = (
-                                num_decodable - last_idx >= self.decode_interval_tokens
-                                or (now - rd.get("last_decode_time", now)) >= self.decode_interval_secs
-                            )
-                        if should_decode and num_decodable > last_idx:
-                            prompt_ctx = rd.get("prompt_token_ids") if last_idx == 0 else None
-                            pipeline_result = self._decode_with_pipeline(
-                                request_id,
-                                decodable_tokens,
-                                finished=False,
-                                skip_special_tokens=skip_special_tokens,
-                                spaces_between_special_tokens=spaces_between_special_tokens,
-                                prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
-                            )
-                            rd["last_decoded_index"] = pipeline_result.last_decoded_index
-                            rd["last_decode_time"] = now
-                            raw_accumulated_text = pipeline_result.accumulated_text
-                            raw_delta_text = pipeline_result.delta_text or ""
+                        if stop_hit:
+                            force_finished = True
+                            if stop_reason:
+                                stop_string_finishes[request_id] = stop_reason
 
-                            parsed, _visible_text, visible_delta, stop_hit, stop_reason = (
-                                self._parse_with_stop_string_policy(
-                                    rd,
-                                    accumulated_text=pipeline_result.accumulated_text,
-                                    delta_text=pipeline_result.delta_text,
-                                    token_ids=decodable_tokens,
-                                    finished=False,
-                                )
-                            )
-                            if stop_hit:
-                                force_finished = True
-                                if stop_reason:
-                                    stop_string_finishes[request_id] = stop_reason
-
-                            # Update the specific sample's completion output
+                        if parsed is not None:
                             comp = ro.outputs[sample_index]
-                            comp.text = parsed["accumulated_content"]
-                            comp.raw_text = raw_accumulated_text
                             comp.token_ids = list(rd["generated_tokens"])
-                            if parsed["accumulated_reasoning"]:
-                                comp.reasoning_content = parsed["accumulated_reasoning"]
-                            if parsed["tool_calls"]:
-                                comp.tool_calls = parsed["tool_calls"]
-
-                            # For backwards compatibility, set ro fields to first sample
-                            if sample_index == 0:
-                                ro.raw_accumulated_text = raw_accumulated_text
-                                ro.raw_delta_text = raw_delta_text or ""
-                                ro.accumulated_text = parsed["accumulated_content"]
-                                effective_delta = parsed["delta_content"]
-                                if effective_delta is None:
-                                    effective_delta = visible_delta
-                                ro.delta_text = effective_delta or ""
-                                ro.delta_reasoning_content = parsed["delta_reasoning"]
-                                ro.reasoning_content = parsed["accumulated_reasoning"] or None
-                                ro.delta_tool_calls = parsed["delta_tool_calls"]
-                                if parsed["tool_calls"]:
-                                    ro.tool_calls = parsed["tool_calls"]
-
-                            if visible_delta:
-                                ro.delta_seq += 1
-                                text_changed = True
-
-                        elapsed = now - rd["start_time"]
-                        ro.processing_time = elapsed
-                        ro.time_spent_generating = elapsed
-
-                        prev_reported = rd.get("reported_generated_count", 0)
-                        if num_generated >= prev_reported:
-                            ro.num_generated_tokens += num_generated - prev_reported
-                            rd["reported_generated_count"] = num_generated
-                        else:
-                            rd["reported_generated_count"] = num_generated
-
-                        if ro.first_token_time is not None and ro.num_generated_tokens > 0:
-                            generation_time = elapsed - ro.first_token_time
-                            ro.tokens_per_second = (
-                                ro.num_generated_tokens / generation_time if generation_time > 0 else 0.0
+                            text_changed, structured_changed = self._update_outputs(
+                                comp,
+                                ro,
+                                sample_index,
+                                parsed,
+                                raw_accumulated,
+                                raw_delta,
                             )
-                        else:
-                            ro.tokens_per_second = 0.0
+
+                        self._update_metrics(rd, ro, now, num_generated)
 
                     if engine_output.finished or force_finished:
                         comp = ro.outputs[sample_index]
-                        if force_finished and not engine_output.finished:
-                            comp.finish_reason = "stop"
-                        else:
-                            comp.finish_reason = (
-                                str(engine_output.finish_reason) if engine_output.finish_reason else "finished"
-                            )
-
-                        # For n>1, mark RequestOutput as finished only when ALL samples are done
-                        n_samples = len(ro.outputs)
-                        if n_samples == 1:
-                            ro.finished = True
-                        else:
-                            # Check if all samples have finish_reason set
-                            all_finished = all(output.finish_reason is not None for output in ro.outputs)
-                            ro.finished = all_finished
-
-                        num_generated = len(rd["generated_tokens"])
-                        decodable_tokens = self._filter_eos_tokens(rd["generated_tokens"])
-                        num_decodable = len(decodable_tokens)
-                        last_idx = rd["last_decoded_index"]
-                        sampling_params = rd.get("sampling_params")
-                        skip_special_tokens = bool(getattr(sampling_params, "skip_special_tokens", False))
-                        spaces_between_special_tokens = bool(
-                            getattr(sampling_params, "spaces_between_special_tokens", True)
+                        tc, sc = self._finalize_request(
+                            request_id,
+                            rd,
+                            ro,
+                            comp,
+                            sample_index,
+                            parent_request_id,
+                            engine_output,
+                            force_finished,
+                            stop_string_finishes,
+                            metrics_collector,
+                            now,
                         )
-                        if num_decodable > last_idx:
-                            prompt_ctx = rd.get("prompt_token_ids") if last_idx == 0 else None
-                            pipeline_result = self._decode_with_pipeline(
-                                request_id,
-                                decodable_tokens,
-                                finished=True,
-                                skip_special_tokens=skip_special_tokens,
-                                spaces_between_special_tokens=spaces_between_special_tokens,
-                                prompt_context=prompt_ctx[-8:] if prompt_ctx else None,
-                            )
-                            rd["last_decoded_index"] = pipeline_result.last_decoded_index
-                            raw_accumulated_text = pipeline_result.accumulated_text
-                            raw_delta_text = pipeline_result.delta_text or ""
-                            parsed, _visible_text, visible_delta, stop_hit, stop_reason = (
-                                self._parse_with_stop_string_policy(
-                                    rd,
-                                    accumulated_text=pipeline_result.accumulated_text,
-                                    delta_text=pipeline_result.delta_text,
-                                    token_ids=decodable_tokens,
-                                    finished=True,
-                                )
-                            )
-                            if stop_hit and stop_reason:
-                                stop_string_finishes[request_id] = stop_reason
+                        text_changed = text_changed or tc
+                        structured_changed = structured_changed or sc
 
-                            # Update the specific sample's completion output
-                            comp.text = parsed["accumulated_content"]
-                            comp.raw_text = raw_accumulated_text
-                            comp.token_ids = list(rd["generated_tokens"])
-                            if parsed["accumulated_reasoning"]:
-                                comp.reasoning_content = parsed["accumulated_reasoning"]
-                            if parsed["tool_calls"]:
-                                comp.tool_calls = parsed["tool_calls"]
-                                comp.finish_reason = "tool_calls"
-
-                            # For backwards compatibility, set ro fields to first sample
-                            if sample_index == 0:
-                                ro.raw_accumulated_text = raw_accumulated_text
-                                ro.raw_delta_text = raw_delta_text or ""
-                                ro.accumulated_text = parsed["accumulated_content"]
-                                effective_delta = parsed["delta_content"]
-                                if effective_delta is None:
-                                    effective_delta = visible_delta
-                                ro.delta_text = effective_delta or ""
-                                ro.delta_reasoning_content = parsed["delta_reasoning"]
-                                ro.reasoning_content = parsed["accumulated_reasoning"] or None
-                                ro.delta_tool_calls = parsed["delta_tool_calls"]
-                                if parsed["tool_calls"]:
-                                    ro.tool_calls = parsed["tool_calls"]
-
-                            if visible_delta:
-                                ro.delta_seq += 1
-                                text_changed = True
-
-                        num_prompt_tokens = (
-                            len(rd["prompt_token_ids"])
-                            if "prompt_token_ids" in rd
-                            else sum(len(seg) for seg in ro.prompt_token_ids)
-                        )
-
-                        ro.processing_time = elapsed
-                        ro.time_spent_generating = elapsed
-
-                        if ro.first_token_time is not None and ro.num_generated_tokens > 0:
-                            generation_time = elapsed - ro.first_token_time
-                            ro.tokens_per_second = (
-                                ro.num_generated_tokens / generation_time if generation_time > 0 else 0.0
-                            )
-                        else:
-                            ro.tokens_per_second = 0.0
-
-                        ro.metrics = {
-                            "prompt_tokens": num_prompt_tokens,
-                            "generated_tokens": ro.num_generated_tokens,
-                            "total_tokens": num_prompt_tokens + ro.num_generated_tokens,
-                            "processing_time": elapsed,
-                            "first_token_time": ro.first_token_time,
-                            "tokens_per_second": ro.tokens_per_second,
-                        }
-
-                        if metrics_collector and ro.finished:
-                            finish_reason = comp.finish_reason
-                            if any(out.finish_reason == "abort" for out in ro.outputs):
-                                finish_reason = "abort"
-                            elif any(out.finish_reason == "length" for out in ro.outputs):
-                                finish_reason = "length"
-                            elif any(out.finish_reason == "stop" for out in ro.outputs):
-                                finish_reason = "stop"
-                            metrics_collector.complete_request(
-                                parent_request_id,
-                                finish_reason=finish_reason,
-                            )
-                        try:
-                            self._detokenizer_client.reset(request_id)
-                        except Exception:
-                            logger.debug("Failed to reset detokenizer state for %s", request_id, exc_info=True)
-                        self._active_requests.pop(request_id, None)
-                        if ro.finished and parent_request_id != request_id:
-                            self._active_requests.pop(parent_request_id, None)
                     ro.update_seq += 1
-                    if text_changed or engine_output.finished or force_finished:
-                        # Signal the parent request event
+                    if text_changed or structured_changed or engine_output.finished or force_finished:
                         ev = self._request_events.get(parent_request_id)
                         if ev:
                             ev.set()
+
+                for finished_request_id in client_outputs.finished_requests or ():
+                    self._finish_request_from_scheduler_signal(
+                        finished_request_id,
+                        metrics_collector=metrics_collector,
+                    )
 
         if stop_string_finishes:
             with self._scheduler_lock:

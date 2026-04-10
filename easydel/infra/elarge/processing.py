@@ -78,11 +78,6 @@ from .types import DTypeLike, PrecisionLike, eLMConfig  # pyright: ignore[report
 logger = get_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------------------------
-
-
 def prune_nones(obj: Any) -> Any:
     """Recursively remove None values from nested data structures.
 
@@ -259,11 +254,9 @@ def coerce_dtype(x: DTypeLike | None) -> jnp.dtype:
     """
     if x is None:
         return jnp.float32
-    try:
-        return jnp.dtype(x)
-    except Exception:
-        s = str(x).lower()
-        fp8 = {
+    if isinstance(x, str):
+        s = x.lower()
+        _ABBREV: dict[str, jnp.dtype] = {
             "nvfp8": jnp.float8_e4m3,
             "mxfp8": jnp.float8_e5m2,
             "mxfp4": jnp.float4_e2m1fn,
@@ -281,17 +274,23 @@ def coerce_dtype(x: DTypeLike | None) -> jnp.dtype:
             "float8_e3m4": jnp.float8_e3m4,
             "fp8_e8m0fnu": jnp.float8_e8m0fnu,
             "float8_e8m0fnu": jnp.float8_e8m0fnu,
+            "bf16": jnp.bfloat16,
+            "bfloat16": jnp.bfloat16,
+            "fp16": jnp.float16,
+            "float16": jnp.float16,
+            "f16": jnp.float16,
+            "fp32": jnp.float32,
+            "float32": jnp.float32,
+            "f32": jnp.float32,
+            "fp64": jnp.float64,
+            "float64": jnp.float64,
+            "f64": jnp.float64,
         }
-        if s in fp8:
-            return fp8[s]
-        if s in ("bf16", "bfloat16"):
-            return jnp.bfloat16
-        if s in ("fp16", "float16", "f16"):
-            return jnp.float16
-        if s in ("fp32", "float32", "f32"):
-            return jnp.float32
-        if s in ("fp64", "float64", "f64"):
-            return jnp.float64
+        if s in _ABBREV:
+            return _ABBREV[s]
+    try:
+        return jnp.dtype(x)
+    except Exception:
         return jnp.float32
 
 
@@ -688,11 +687,6 @@ def write_text_atomic(path: str | os.PathLike | ePathLike, data: str, *, encodin
         raise
 
 
-# ---------------------------------------------------------------------------
-# Normalizer functions
-# ---------------------------------------------------------------------------
-
-
 def resolve_task(cfg: eLMConfig) -> TaskType:
     """Resolve the task type from an ELM configuration.
 
@@ -980,11 +974,6 @@ def validate(cfg_like: eLMConfig | Mapping[str, Any]) -> None:
         raise ValueError(f"sharding.axis_dims ({len(dims)}) must match sharding.axis_names ({len(names)})")
     if any((d == 0 or d < -1) for d in dims):
         raise ValueError("sharding.axis_dims must be positive or -1 (auto)")
-
-
-# ---------------------------------------------------------------------------
-# I/O functions
-# ---------------------------------------------------------------------------
 
 
 def save_elm_config(

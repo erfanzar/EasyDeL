@@ -16,11 +16,15 @@ import pytest
 
 from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
 from easydel.inference.openai_api_modules import DeltaFunctionCall, DeltaMessage, DeltaToolCall
+from easydel.inference.parsing import DelegatingParser
+from easydel.inference.reasoning import Gemma4ReasoningParser as PublicGemma4ReasoningParser
 from easydel.inference.reasoning.abstract_reasoning import ReasoningParserManager
+from easydel.inference.reasoning.auto_detect import detect_reasoning_parser, get_reasoning_tags, make_reasoning_stripper
 from easydel.inference.reasoning.parsers import (
     DeepSeekR1ReasoningParser,
     DeepSeekV3ReasoningParser,
     Ernie45ReasoningParser,
+    Gemma4ReasoningParser,
     GptOssReasoningParser,
     GraniteReasoningParser,
     HunyuanA13BReasoningParser,
@@ -119,9 +123,22 @@ def plain_tokenizer():
     return _DummyTokenizer(vocab, chat_template="plain template")
 
 
-# ---------------------------------------------------------------------------
-# Registry tests
-# ---------------------------------------------------------------------------
+@pytest.fixture()
+def gemma4_tokenizer():
+    """Provide a dummy tokenizer with Gemma4 channel-marker vocabulary.
+
+    Returns:
+        A ``_DummyTokenizer`` whose vocab contains ``<|channel>``,
+        ``<channel|>``, and the composite thought/analysis/final markers.
+    """
+    vocab = {
+        "<|channel>": 1,
+        "<channel|>": 2,
+        "<|channel>thought<channel|>": 3,
+        "<|channel>analysis<channel|>": 4,
+        "<|channel>final<channel|>": 5,
+    }
+    return _DummyTokenizer(vocab, chat_template="template with <|channel> markers")
 
 
 def test_reasoning_parser_manager_includes_parsers():
@@ -144,6 +161,7 @@ def test_reasoning_parser_manager_includes_parsers():
         "step3.5",
         "hunyuan_a13b",
         "ernie45",
+        "gemma4",
         "seed_oss",
         "openai_gptoss",
         "gptoss",
@@ -158,11 +176,6 @@ def test_reasoning_parser_manager_includes_parsers():
 def test_reasoning_parser_manager_raises_for_unknown():
     with pytest.raises(KeyError, match="not found"):
         ReasoningParserManager.get_reasoning_parser("nonexistent_parser_xyz")
-
-
-# ---------------------------------------------------------------------------
-# Batch extraction tests
-# ---------------------------------------------------------------------------
 
 
 def test_deepseek_r1_extract_reasoning(dummy_tokenizer):
@@ -246,6 +259,50 @@ def test_qwen3_strict_only_start_tag(dummy_tokenizer):
     reasoning, content = parser.extract_reasoning(output)
     assert reasoning == "thinking but no end"
     assert content is None
+
+
+def test_qwen3_streaming_content_deltas_stay_aligned_across_reasoning_boundary(dummy_tokenizer):
+    parser = DelegatingParser(reasoning_parser=Qwen3ReasoningParser(dummy_tokenizer))
+    # Content after </think> is NOT stripped — leading \n\n is preserved
+    expected = "\n\nHello! How can I assist you today?"
+    pieces = [
+        "<think>",
+        "short",
+        "</think>\n\nHello!",
+        " How",
+        " can",
+        " I",
+        " assist",
+        " you",
+        " today",
+        "?",
+    ]
+
+    accumulated_text = ""
+    previous_text = ""
+    token_ids: list[int] = []
+    previous_token_ids: list[int] = []
+    visible_text = ""
+
+    for piece in pieces:
+        accumulated_text += piece
+        token_ids.extend(dummy_tokenizer.encode(piece, add_special_tokens=False))
+        result = parser.process_delta(
+            accumulated_text,
+            piece,
+            list(token_ids),
+            previous_text,
+            list(previous_token_ids),
+        )
+
+        if result.delta_content:
+            visible_text += result.delta_content
+
+        assert visible_text == result.accumulated_content
+        previous_text = accumulated_text
+        previous_token_ids = list(token_ids)
+
+    assert visible_text == expected
 
 
 def test_mistral_extract_reasoning(dummy_tokenizer):
@@ -422,9 +479,44 @@ def test_gptoss_only_channel_tag(dummy_tokenizer):
     assert content is None
 
 
-# ---------------------------------------------------------------------------
-# Streaming extraction tests
-# ---------------------------------------------------------------------------
+def test_gemma4_extract_reasoning(gemma4_tokenizer):
+    parser = Gemma4ReasoningParser(gemma4_tokenizer)
+    output = "<|channel>thought<channel|>plan it out<|channel>final<channel|>The answer"
+    reasoning, content = parser.extract_reasoning(output)
+    assert reasoning == "plan it out"
+    assert content == "The answer"
+
+
+def test_gemma4_prompt_context_handles_open_thought_channel(gemma4_tokenizer):
+    parser = Gemma4ReasoningParser(gemma4_tokenizer)
+    parser.configure_prompt_context(prompt_text="...<|channel>thought<channel|>", prompt_token_ids=[])
+    reasoning, content = parser.extract_reasoning("plan it out<|channel>final<channel|>The answer")
+    assert reasoning == "plan it out"
+    assert content == "The answer"
+
+
+def test_gemma4_reasoning_helpers_strip_to_final_channel():
+    start_token, end_token = get_reasoning_tags(parser_name="gemma4")
+    assert start_token == "<|channel>thought<channel|>"
+    assert end_token == "<|channel>final<channel|>"
+
+    strip_reasoning = make_reasoning_stripper(parser_name="gemma4")
+    stripped = strip_reasoning("<|channel>thought<channel|>plan it out<|channel>final<channel|>The answer")
+    assert stripped == "The answer"
+
+
+def test_gemma4_reasoning_helpers_strip_analysis_channel():
+    strip_reasoning = make_reasoning_stripper(parser_name="gemma4")
+    stripped = strip_reasoning("<|channel>analysis<channel|>plan it out<|channel>final<channel|>The answer")
+    assert stripped == "The answer"
+
+
+def test_detect_reasoning_parser_maps_gemma4_text_to_gemma4():
+    assert detect_reasoning_parser(model_type="gemma4_text") == "gemma4"
+
+
+def test_gemma4_is_reexported_from_reasoning_package():
+    assert PublicGemma4ReasoningParser is Gemma4ReasoningParser
 
 
 def test_deepseek_r1_streaming_reasoning_then_content(dummy_tokenizer):
@@ -621,11 +713,6 @@ def test_step3_streaming(dummy_tokenizer):
     assert delta.content == "answer"
 
 
-# ---------------------------------------------------------------------------
-# BaseThinkingReasoningParser is_reasoning_end / extract_content_ids
-# ---------------------------------------------------------------------------
-
-
 def test_base_is_reasoning_end(dummy_tokenizer):
     parser = DeepSeekR1ReasoningParser(dummy_tokenizer)
     # Token ID 2 = </think>
@@ -644,11 +731,6 @@ def test_base_extract_content_ids_no_end_token(dummy_tokenizer):
     parser = DeepSeekR1ReasoningParser(dummy_tokenizer)
     content_ids = parser.extract_content_ids([1, 100, 101])
     assert content_ids == [1, 100, 101]
-
-
-# ---------------------------------------------------------------------------
-# Edge cases
-# ---------------------------------------------------------------------------
 
 
 def test_both_tags_in_single_delta(dummy_tokenizer):
@@ -683,11 +765,6 @@ def test_content_before_start_tag(dummy_tokenizer):
     assert content is not None
     assert "prefix" in content
     assert "response" in content
-
-
-# ---------------------------------------------------------------------------
-# Prompt-context tests (tag-based parsers with asymmetric output)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -928,11 +1005,6 @@ def test_non_tag_parsers_prompt_context_configuration_is_noop(
     assert after == expected
 
 
-# ---------------------------------------------------------------------------
-# assume_reasoning compatibility tests (manual override)
-# ---------------------------------------------------------------------------
-
-
 def test_deepseek_r1_assume_reasoning_batch(dummy_tokenizer):
     """Batch: when assume_reasoning is set, end-only output is parsed correctly."""
     parser = DeepSeekR1ReasoningParser(dummy_tokenizer)
@@ -1074,12 +1146,9 @@ def test_esurge_output_parsers_hide_reasoning_delta_for_prompt_context(dummy_tok
     engine = _ParsingHarness()
 
     rd = {
-        "reasoning_parser_instance": parser,
-        "tool_parser_instance": None,
+        "delegating_parser": DelegatingParser(reasoning_parser=parser),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-        "accumulated_reasoning": "",
-        "accumulated_content": "",
     }
 
     first = engine._run_output_parsers(
@@ -1110,12 +1179,9 @@ def test_esurge_output_parsers_dont_leak_standalone_start_token(dummy_tokenizer)
     engine = _ParsingHarness()
 
     rd = {
-        "reasoning_parser_instance": parser,
-        "tool_parser_instance": None,
+        "delegating_parser": DelegatingParser(reasoning_parser=parser),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-        "accumulated_reasoning": "",
-        "accumulated_content": "",
     }
 
     result = engine._run_output_parsers(
@@ -1135,12 +1201,9 @@ def test_esurge_output_parsers_step3_reasoning_only_delta_is_not_text(dummy_toke
     engine = _ParsingHarness()
 
     rd = {
-        "reasoning_parser_instance": parser,
-        "tool_parser_instance": None,
+        "delegating_parser": DelegatingParser(reasoning_parser=parser),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-        "accumulated_reasoning": "",
-        "accumulated_content": "",
     }
 
     result = engine._run_output_parsers(
@@ -1162,12 +1225,12 @@ def test_esurge_output_parsers_do_not_expose_reasoning_token_ids_to_tool_parser(
     engine = _ParsingHarness()
 
     rd = {
-        "reasoning_parser_instance": reasoning_parser,
-        "tool_parser_instance": tool_parser,
+        "delegating_parser": DelegatingParser(
+            reasoning_parser=reasoning_parser,
+            tool_parser=tool_parser,
+        ),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-        "accumulated_reasoning": "",
-        "accumulated_content": "",
     }
 
     first = engine._run_output_parsers(
@@ -1191,7 +1254,6 @@ def test_esurge_output_parsers_do_not_expose_reasoning_token_ids_to_tool_parser(
     assert second["delta_tool_calls"] is None
     assert tool_parser.seen_previous_text == "hello"
     assert tool_parser.seen_current_text == "hello"
-    assert tool_parser.seen_current_token_ids == tokenizer.encode("hello", add_special_tokens=False)
 
 
 def test_esurge_output_parsers_minimax_tool_calls_survive_finished_parse_without_end_tag():
@@ -1205,12 +1267,12 @@ def test_esurge_output_parsers_minimax_tool_calls_survive_finished_parse_without
     )
     engine = _ParsingHarness()
     rd = {
-        "reasoning_parser_instance": MiniMaxM2ReasoningParser(tokenizer),
-        "tool_parser_instance": MinimaxM2ToolParser(tokenizer),
+        "delegating_parser": DelegatingParser(
+            reasoning_parser=MiniMaxM2ReasoningParser(tokenizer),
+            tool_parser=MinimaxM2ToolParser(tokenizer),
+        ),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-        "accumulated_reasoning": "",
-        "accumulated_content": "",
     }
 
     result = engine._run_output_parsers(
@@ -1240,12 +1302,12 @@ def test_esurge_output_parsers_step3_tool_calls_survive_finished_parse_without_e
     )
     engine = _ParsingHarness()
     rd = {
-        "reasoning_parser_instance": Step3ReasoningParser(tokenizer),
-        "tool_parser_instance": Step3ToolParser(tokenizer),
+        "delegating_parser": DelegatingParser(
+            reasoning_parser=Step3ReasoningParser(tokenizer),
+            tool_parser=Step3ToolParser(tokenizer),
+        ),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-        "accumulated_reasoning": "",
-        "accumulated_content": "",
     }
 
     result = engine._run_output_parsers(

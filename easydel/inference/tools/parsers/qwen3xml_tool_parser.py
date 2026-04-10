@@ -103,6 +103,24 @@ class Qwen3XMLToolParser(Qwen3CoderToolParser):
         indices = [idx for idx in (text.find(self.tool_call_start_token), text.find("<function")) if idx >= 0]
         return min(indices) if indices else -1
 
+    def get_streaming_buffer_marker_pairs(self) -> Sequence[tuple[str, str | None]]:
+        """Extend buffer detection to bare ``<function ...>`` and ``<parameter ...>`` tags."""
+
+        return (
+            *super().get_streaming_buffer_marker_pairs(),
+            ("<function", self.function_end_token),
+            ("<parameter", self.parameter_end_token),
+        )
+
+    def get_streaming_buffer_hints(self) -> Sequence[str]:
+        """Include bare XML prefixes used by the Qwen3 XML protocol."""
+
+        hints = list(super().get_streaming_buffer_hints())
+        for hint in ("<function", "<parameter"):
+            if hint not in hints:
+                hints.append(hint)
+        return tuple(hints)
+
     def _extract_function_name_from_match(self, match: re.Match[str]) -> str | None:
         """Extract the function name from a ``function_start_regex`` match.
 

@@ -231,10 +231,10 @@ class AsyncScheduler(Scheduler):
             f"Request {request.request_id} has negative placeholders: {request.num_output_placeholders}"
         )
 
-        # Cache the new tokens for running requests (skip preempted)
-        # We cache based on num_computed_tokens minus remaining placeholders
-        # to ensure we only cache fully computed tokens
+        # Cache the new tokens for running requests (skip preempted).
+        # Use only the fully materialized token count, excluding any
+        # optimistic placeholders that still belong to prefetched steps.
         if status_before_update == EngineRequestStatus.RUNNING:
-            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens - request.num_output_placeholders)
+            self.kv_cache_manager.cache_pages(request, request.num_computed_tokens - request.num_output_placeholders)
 
         return new_token_ids, stopped

@@ -35,7 +35,7 @@ Example:
     >>> from easydel.inference.tools.auto_detect import detect_tool_parser
     >>> name = detect_tool_parser(model_type="qwen3")
     >>> name
-    'hermes'
+    'qwen3_xml'
     >>> name = detect_tool_parser(model_type="mistral")
     >>> name
     'mistral'
@@ -53,7 +53,7 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, ToolParserName] = {
     "qwen3_5_moe_text": "qwen3_coder",
     "qwen3_5_text": "qwen3_coder",
     "qwen3_moe": "hermes",
-    "qwen3_next": "hermes",
+    "qwen3_next": "qwen3_xml",
     "qwen3": "hermes",
     "qwen2_moe": "hermes",
     "qwen2": "hermes",
@@ -93,6 +93,8 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, ToolParserName] = {
     "step3.5": "step3p5",
     "step3": "step3",
     "step": "step3",
+    "gemma4_text": "gemma4",
+    "gemma4": "gemma4",
     "gemma3": "hermes",
     "gemma2": "functiongemma",
     "gemma": "functiongemma",
@@ -128,6 +130,9 @@ _TEMPLATE_HINTS: list[tuple[str, ToolParserName]] = [
     ("<steptml:invoke", "step3"),
     ("functools[", "phi4_mini_json"),
     ("<tool_calls>", "hunyuan_a13b"),
+    ("<|tool_call>call:", "gemma4"),
+    ("<function=", "qwen3_xml"),
+    ('<function name="', "qwen3_xml"),
     ("<arg_key>", "glm45"),
     ("<tool_call>", "hermes"),
 ]

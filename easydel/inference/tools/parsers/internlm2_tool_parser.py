@@ -85,6 +85,8 @@ class Internlm2ToolParser(ToolParser):
         """
         super().__init__(tokenizer)
         self.position = 0
+        self.tool_call_start_token = "<|action_start|><|plugin|>"
+        self.tool_call_end_token = "<|action_end|>"
 
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
         """Adjust the request settings for InternLM2 tool parsing.

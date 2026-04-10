@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING, Self
 from jax import numpy as jnp
 
 from ..utils import cdiv, get_dtype_size
+from .dp_sharding import dp_shard_page_bounds, pages_per_dp_shard, usable_pages_count
 
 if TYPE_CHECKING:
     from easydel.infra.base_config import EasyDeLBaseConfig
@@ -514,6 +515,230 @@ class CacheGroupsConfig:
     kv_cache_groups: list[CacheGroupSpec]
 
 
+@dataclass(frozen=True)
+class RuntimePageBudgetEstimate:
+    """Window-aware runtime page-budget estimate for eSurge.
+
+    Attributes:
+        pages_per_request: Total logical page IDs needed for one request at
+            the configured max-length/runtime-token-budget point.
+        max_num_seqs: Estimated number of concurrent max-length requests that
+            fit in the shared page pool.
+        usable_pages: Allocatable pages in the pool (excludes null page 0).
+        per_group_pages: Page demand for each cache group, in order.
+    """
+
+    pages_per_request: int
+    max_num_seqs: int
+    usable_pages: int
+    per_group_pages: tuple[int, ...]
+
+
+def _estimate_group_pages_per_request(
+    kv_cache_spec: CacheSpec,
+    *,
+    max_model_len: int,
+    max_num_batched_tokens: int,
+) -> int:
+    """Estimate logical page IDs needed for one request in a cache group.
+
+    Args:
+        kv_cache_spec: Cache specification describing page geometry and memory usage.
+        max_model_len: Maximum sequence length the model supports.
+        max_num_batched_tokens: Maximum number of tokens batched together in one step.
+
+    Returns:
+        Positive integer giving the number of logical pages a single request
+        requires in this cache group.
+
+    Raises:
+        ValueError: If the cache spec reports a non-positive ``page_size_bytes``.
+    """
+
+    page_size_bytes = int(getattr(kv_cache_spec, "page_size_bytes", 0) or 0)
+    if page_size_bytes <= 0:
+        raise ValueError(f"Cache spec {type(kv_cache_spec).__name__} returned non-positive page_size_bytes")
+
+    max_memory_usage_bytes = int(
+        kv_cache_spec.max_memory_usage_bytes(
+            max_model_len=int(max_model_len),
+            max_num_batched_tokens=int(max_num_batched_tokens),
+        )
+    )
+    return max(1, cdiv(max_memory_usage_bytes, page_size_bytes))
+
+
+def estimate_runtime_page_budget(
+    *,
+    num_pages: int,
+    kv_cache_groups: list[CacheGroupSpec],
+    max_model_len: int,
+    max_num_batched_tokens: int,
+    data_parallel_size: int = 1,
+) -> RuntimePageBudgetEstimate:
+    """Estimate window-aware max-length concurrency from KV-cache groups.
+
+    This converts each cache group's worst-case live-cache requirement into a
+    logical page count, sums those page demands per request, and then derives
+    how many such requests fit in the shared page pool.
+
+    Args:
+        num_pages: Total number of physical pages available in the page pool.
+        kv_cache_groups: List of ``CacheGroupSpec`` objects describing each
+            attention-type group's cache spec and layer indices.
+        max_model_len: Maximum sequence length the model supports.
+        max_num_batched_tokens: Maximum tokens batched in a single decode step.
+        data_parallel_size: Number of data-parallel shards (default ``1``).
+
+    Returns:
+        A ``RuntimePageBudgetEstimate`` with ``pages_per_request``,
+        ``max_num_seqs``, ``usable_pages``, and ``per_group_pages``.
+    """
+
+    groups = list(kv_cache_groups)
+    if not groups:
+        usable_pages = usable_pages_count(num_pages)
+        return RuntimePageBudgetEstimate(
+            pages_per_request=0,
+            max_num_seqs=max(1, usable_pages),
+            usable_pages=usable_pages,
+            per_group_pages=(),
+        )
+
+    max_model_len = max(1, int(max_model_len))
+    max_num_batched_tokens = max(1, min(int(max_num_batched_tokens), max_model_len))
+    num_pages = int(num_pages)
+    data_parallel_size = max(1, int(data_parallel_size))
+
+    per_group_pages = tuple(
+        _estimate_group_pages_per_request(
+            group.kv_cache_spec,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+        )
+        for group in groups
+    )
+    pages_per_request = int(sum(per_group_pages))
+    usable_pages = usable_pages_count(num_pages)
+
+    if pages_per_request <= 0 or usable_pages <= 0:
+        max_num_seqs = 1
+    else:
+        pages_per_shard = pages_per_dp_shard(num_pages, data_parallel_size)
+        if pages_per_shard is None:
+            max_num_seqs = max(1, usable_pages // pages_per_request)
+        else:
+            max_num_seqs = 0
+            for shard_idx in range(data_parallel_size):
+                lo, hi = dp_shard_page_bounds(shard_idx, pages_per_shard)
+                shard_usable_pages = max(0, hi - lo)
+                max_num_seqs += shard_usable_pages // pages_per_request
+            max_num_seqs = max(1, max_num_seqs)
+
+    return RuntimePageBudgetEstimate(
+        pages_per_request=pages_per_request,
+        max_num_seqs=max_num_seqs,
+        usable_pages=usable_pages,
+        per_group_pages=per_group_pages,
+    )
+
+
+def _resolve_positive_layer_config_value(
+    config: "EasyDeLBaseConfig",
+    attribute_names: tuple[str, ...],
+    *,
+    layer_idx: int | None = None,
+) -> int | None:
+    """Resolve a positive scalar or per-layer integer config value.
+
+    Looks up each name in *attribute_names* on *config* in order. If the
+    attribute is a list/tuple, the element at *layer_idx* (or the first
+    element when *layer_idx* is ``None``) is used. The first positive
+    integer found is returned.
+
+    Args:
+        config: Model configuration object to inspect.
+        attribute_names: Ordered sequence of attribute names to probe.
+        layer_idx: Optional layer index for per-layer list attributes.
+            When ``None``, the first element of any list attribute is used.
+
+    Returns:
+        The first positive ``int`` value found, or ``None`` if no positive
+        value could be resolved from any of the given attribute names.
+    """
+    for attribute_name in attribute_names:
+        value = getattr(config, attribute_name, None)
+        if isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                continue
+            if layer_idx is None:
+                value = value[0]
+            elif 0 <= layer_idx < len(value):
+                value = value[layer_idx]
+            else:
+                continue
+        if value is None:
+            continue
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _resolve_layer_attention_geometry(
+    config: "EasyDeLBaseConfig",
+    layer_idx: int,
+    default_num_kv_heads: int,
+    default_head_size: int,
+) -> tuple[int, int]:
+    """Resolve per-layer KV geometry for hybrid attention models like Gemma4.
+
+    For full-attention layers the function checks for wider ``global_head_dim``
+    and reduced ``num_global_key_value_heads`` overrides; sliding-window layers
+    use the standard defaults.
+
+    Args:
+        config: Model configuration with optional per-layer geometry attributes.
+        layer_idx: Zero-based index of the transformer layer.
+        default_num_kv_heads: Fallback number of KV heads when no per-layer
+            override is found.
+        default_head_size: Fallback head dimension when no per-layer override
+            is found.
+
+    Returns:
+        A ``(num_kv_heads, head_size)`` tuple for the requested layer.
+    """
+    resolved_num_kv_heads = _resolve_positive_layer_config_value(
+        config,
+        ("num_kv_heads", "num_key_value_heads"),
+        layer_idx=layer_idx,
+    )
+    num_kv_heads = int(resolved_num_kv_heads) if resolved_num_kv_heads is not None else int(default_num_kv_heads)
+    head_size = int(default_head_size)
+
+    layer_types = getattr(config, "layer_types", None)
+    if not isinstance(layer_types, (list, tuple)) or layer_idx < 0 or layer_idx >= len(layer_types):
+        return num_kv_heads, head_size
+
+    layer_type = str(layer_types[layer_idx]).lower()
+    is_full_attention = layer_type == "full_attention"
+
+    if is_full_attention:
+        global_head_dim = getattr(config, "global_head_dim", None)
+        if global_head_dim is not None and int(global_head_dim) > 0:
+            head_size = int(global_head_dim)
+
+        if bool(getattr(config, "attention_k_eq_v", False)):
+            global_num_kv_heads = getattr(config, "num_global_key_value_heads", None)
+            if global_num_kv_heads is not None and int(global_num_kv_heads) > 0:
+                num_kv_heads = int(global_num_kv_heads)
+
+    return num_kv_heads, head_size
+
+
 def create_kv_cache_specs_from_config(
     config: "EasyDeLBaseConfig",
     page_size: int,
@@ -558,22 +783,36 @@ def create_kv_cache_specs_from_config(
             )
         ]
 
-    groups: dict[AttnMaskType, list[tuple[int, int | None, int | None]]] = defaultdict(list)
+    groups: dict[tuple[AttnMaskType, int | None, int | None, int, int], list[int]] = defaultdict(list)
     for layer_idx, detail in mask_details.items():
-        groups[detail.mask_type].append((layer_idx, detail.size, detail.chunks))
+        layer_num_kv_heads, layer_head_size = _resolve_layer_attention_geometry(
+            config=config,
+            layer_idx=int(layer_idx),
+            default_num_kv_heads=num_kv_heads,
+            default_head_size=head_size,
+        )
+        groups[
+            (
+                detail.mask_type,
+                detail.size,
+                detail.chunks,
+                layer_num_kv_heads,
+                layer_head_size,
+            )
+        ].append(int(layer_idx))
 
     specs: list[CacheGroupSpec] = []
 
-    for mask_type, layers in groups.items():
-        layer_names = [f"layer.{idx}" for idx, _, _ in layers]
+    for (mask_type, sliding_window, chunk_size, group_num_kv_heads, group_head_size), layer_indices in groups.items():
+        layer_names = [f"layer.{idx}" for idx in layer_indices]
 
         if mask_type == AttnMaskType.FULL:
             specs.append(
                 CacheGroupSpec(
                     kv_cache_spec=FullAttentionSpec(
                         page_size=page_size,
-                        num_kv_heads=num_kv_heads,
-                        head_size=head_size,
+                        num_kv_heads=group_num_kv_heads,
+                        head_size=group_head_size,
                         dtype=dtype,
                         use_mla=use_mla,
                     ),
@@ -581,15 +820,14 @@ def create_kv_cache_specs_from_config(
                 )
             )
         elif mask_type == AttnMaskType.SLIDING:
-            sliding_window = layers[0][1]
             if sliding_window is None:
                 raise ValueError(f"Sliding window size is required for sliding attention layers: {layer_names}")
             specs.append(
                 CacheGroupSpec(
                     kv_cache_spec=SlidingWindowSpec(
                         page_size=page_size,
-                        num_kv_heads=num_kv_heads,
-                        head_size=head_size,
+                        num_kv_heads=group_num_kv_heads,
+                        head_size=group_head_size,
                         dtype=dtype,
                         use_mla=False,  # MLA is not supported for sliding window
                         sliding_window=sliding_window,
@@ -598,15 +836,14 @@ def create_kv_cache_specs_from_config(
                 )
             )
         elif mask_type == AttnMaskType.CHUNK:
-            chunk_size = layers[0][2]
             if chunk_size is None:
                 raise ValueError(f"Chunk size is required for chunked attention layers: {layer_names}")
             specs.append(
                 CacheGroupSpec(
                     kv_cache_spec=ChunkedLocalAttentionSpec(
                         page_size=page_size,
-                        num_kv_heads=num_kv_heads,
-                        head_size=head_size,
+                        num_kv_heads=group_num_kv_heads,
+                        head_size=group_head_size,
                         dtype=dtype,
                         use_mla=use_mla,
                         attention_chunk_size=chunk_size,

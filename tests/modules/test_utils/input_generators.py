@@ -114,6 +114,7 @@ def make_vlm_inputs(
     pixel_values_shape: tuple,
     num_images: int = 1,
     token_type_ids: bool = False,
+    mm_token_type_ids: bool = False,
     image_grid_hws: np.ndarray | None = None,
     image_grid_thw: np.ndarray | None = None,
     video_grid_thw: np.ndarray | None = None,
@@ -130,6 +131,8 @@ def make_vlm_inputs(
         pixel_values_shape: Shape of pixel_values tensor (batch, channels, height, width)
         num_images: Number of images to include
         token_type_ids: Whether to generate token_type_ids (for Gemma3)
+        mm_token_type_ids: Whether to generate multimodal token type ids
+            (e.g. GLM46V: text=0, image=1, video=2)
         image_grid_hws: Optional per-image (height, width) grid for models that
             accept `image_grid_hws` (e.g. Gemma3).
         image_grid_thw: Optional per-image (temporal, height, width) grid for
@@ -190,6 +193,17 @@ def make_vlm_inputs(
         result["torch"]["token_type_ids"] = torch.from_numpy(np_token_type_ids).to(torch.long)
         result["jax"]["token_type_ids"] = jnp.asarray(np_token_type_ids, dtype="i4")
 
+    if mm_token_type_ids:
+        np_mm_token_type_ids = np.zeros(input_shape, dtype=np.int64)
+        for img_idx in range(num_images):
+            img_start = 1 + img_idx * num_image_tokens
+            img_end = img_start + num_image_tokens
+            if img_end <= seq_len:
+                np_mm_token_type_ids[:, img_start:img_end] = 1
+
+        result["torch"]["mm_token_type_ids"] = torch.from_numpy(np_mm_token_type_ids).to(torch.long)
+        result["jax"]["mm_token_type_ids"] = jnp.asarray(np_mm_token_type_ids, dtype="i4")
+
     if image_grid_hws is not None:
         image_grid_hws = np.asarray(image_grid_hws, dtype=np.int64)
         result["torch"]["image_grid_hws"] = torch.from_numpy(image_grid_hws).to(torch.long)
@@ -219,6 +233,7 @@ def make_qwen_vlm_inputs(
     pixel_values_shape: tuple,
     image_grid_thw: np.ndarray,
     num_images: int = 1,
+    mm_token_type_ids: bool = False,
     seed: int = 42,
 ) -> dict:
     """Generate inputs for Qwen2-VL/Qwen3-VL models with mRoPE support.
@@ -234,6 +249,7 @@ def make_qwen_vlm_inputs(
         pixel_values_shape: Shape of pixel_values tensor
         image_grid_thw: Grid shape array (num_images, 3) with [T, H, W] per image
         num_images: Number of images
+        mm_token_type_ids: Whether to generate multimodal token type ids
         seed: Random seed
 
     Returns:
@@ -271,7 +287,7 @@ def make_qwen_vlm_inputs(
     # Both HuggingFace and EasyDeL compute 3D position_ids internally
     # using get_rope_index for proper mRoPE.
 
-    return {
+    result = {
         "torch": {
             "input_ids": torch.from_numpy(np_input_ids).to(torch.long),
             "pixel_values": torch.from_numpy(np_pixel_values).to(torch.float32),
@@ -285,6 +301,22 @@ def make_qwen_vlm_inputs(
             "image_grid_thw": jnp.asarray(image_grid_thw, dtype="i4"),
         },
     }
+
+    if mm_token_type_ids:
+        np_mm_token_type_ids = np.zeros(input_shape, dtype=np.int64)
+        if total_vision_tokens < seq_len - 1:
+            start_pos = 1
+            for img_idx in range(num_images):
+                base_pos = start_pos + img_idx * tokens_per_image
+                img_start = base_pos + 1
+                img_end = img_start + num_image_tokens
+                if img_end <= seq_len:
+                    np_mm_token_type_ids[:, img_start:img_end] = 1
+
+        result["torch"]["mm_token_type_ids"] = torch.from_numpy(np_mm_token_type_ids).to(torch.long)
+        result["jax"]["mm_token_type_ids"] = jnp.asarray(np_mm_token_type_ids, dtype="i4")
+
+    return result
 
 
 def make_seq2seq_inputs(

@@ -20,6 +20,7 @@ import transformers
 from flax import nnx as nn
 
 import easydel as ed
+from easydel.operations.kernels.glm_moe_dsa_indexer import GlmMoeDsaIndexerOp
 
 try:
     from .test_utils import CausalLMTester
@@ -153,6 +154,27 @@ class TestGLMMoeDSA:
 
         assert cache_cfg.head_dim == (config.qk_nope_head_dim + config.qk_rope_head_dim)
         assert cache_cfg.num_kv_heads == config.num_attention_heads
+
+    def test_indexer_preserves_negative_similarity_ranking(self):
+        """Indexer should keep the least-negative key when every similarity is < 0."""
+        op = object.__new__(GlmMoeDsaIndexerOp)
+        query_states = jnp.array([[[[-1.0]]]], dtype=jnp.float32)
+        key_states = jnp.array([[[1.0], [2.0], [3.0]]], dtype=jnp.float32)
+        head_weights = jnp.array([[[1.0]]], dtype=jnp.float32)
+        position_ids = jnp.array([[0]], dtype=jnp.int32)
+
+        output = GlmMoeDsaIndexerOp.forward_native(
+            op,
+            query_states=query_states,
+            key_states=key_states,
+            head_weights=head_weights,
+            position_ids=position_ids,
+            qk_rope_head_dim=0,
+            index_topk=1,
+            softmax_scale=1.0,
+        )
+
+        assert output.topk_indices.tolist() == [[[0]]]
 
 
 if __name__ == "__main__":

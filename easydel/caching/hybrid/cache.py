@@ -91,12 +91,12 @@ if tp.TYPE_CHECKING:
 else:
     # AutoPytree need these informations for optimizations
     KDACacheView, RecurrentCacheView, TransformerCacheView, RaggedPagesCacheView, UnifiedAttentionCacheView = [xTree] * 5
-
+HYBRID = "hybrid"
 FULL_ATTENTION = "full_attention"
 LINEAR_ATTENTION = "linear_attention"
 KDA_LINEAR_ATTENTION = "kda_linear_attention"
 PARALLEL_HYBRID = "parallel_hybrid"
-LayerType = tp.Literal["full_attention", "linear_attention", "kda_linear_attention", "parallel_hybrid"]
+LayerType = tp.Literal["full_attention", "linear_attention", "kda_linear_attention", "parallel_hybrid", "hybrid"]
 
 
 @auto_pytree
@@ -198,8 +198,10 @@ class HybridCacheConfig(BaseCacheConfig):
                 f"layer_types length ({len(layer_types)}) must match num_hidden_layers ({num_hidden_layers})"
             )
 
+        normalized_layer_types = [PARALLEL_HYBRID if lt == HYBRID else lt for lt in layer_types]
+
         # Validate layer types
-        valid_types = {FULL_ATTENTION, LINEAR_ATTENTION, KDA_LINEAR_ATTENTION, PARALLEL_HYBRID}
+        valid_types = {FULL_ATTENTION, LINEAR_ATTENTION, KDA_LINEAR_ATTENTION, PARALLEL_HYBRID, HYBRID}
         for i, lt in enumerate(layer_types):
             if lt not in valid_types:
                 raise ValueError(f"Invalid layer_type at index {i}: {lt}. Must be one of {valid_types}")
@@ -218,7 +220,7 @@ class HybridCacheConfig(BaseCacheConfig):
             d_conv=d_conv,
             d_state=d_state,
             num_attention_heads=num_attention_heads,
-            layer_types=tuple(layer_types),
+            layer_types=tuple(normalized_layer_types),
         )
 
     def is_full_attention(self, layer_idx: int) -> bool:

@@ -94,6 +94,9 @@ def main():
         max_num_seqs=args.max_num_seqs,
         hbm_utilization=args.hbm_utilization,
         enable_prefix_caching=True,
+        # Distributed serving runs in lockstep, so keep overlap disabled even
+        # though the engine default is now True.
+        overlap_execution=False,
         distributed_mode=args.distributed_mode,
         distributed_role=args.distributed_role,
         distributed_service_name=args.distributed_service_name,

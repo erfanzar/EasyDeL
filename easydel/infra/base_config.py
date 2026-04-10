@@ -245,25 +245,33 @@ def _mesh_shape_ep(mesh, pm, fsdp_is_ep_bound, sp_is_ep_bound):
         _resolve_eformer_axis(SP, pm),
     )
 
-    # Resolve sizes
-    odpsize, ofsdpsize, oepsize, otpsize, ospsize = (
-        mesh.shape.get(dpname, 1),
-        mesh.shape.get(fsdpname, 1),
-        mesh.shape.get(epname, 1),
-        mesh.shape.get(tpname, 1),
-        mesh.shape.get(spname, 1),
-    )
+    axis_sizes = mesh.shape
+    assigned_axes: dict[str, str] = {}
+    size_by_group = {"dp": 1, "ep": 1, "tp": 1}
 
-    epsize = oepsize
-    if fsdp_is_ep_bound:
-        epsize *= ofsdpsize
-    else:
-        odpsize *= ofsdpsize
+    def assign_axis(axis_name: str | None, group: str) -> None:
+        if axis_name is None:
+            return
 
-    if sp_is_ep_bound:
-        epsize *= ospsize
-    else:
-        odpsize *= ospsize
+        existing_group = assigned_axes.get(axis_name)
+        if existing_group is not None:
+            return
+
+        assigned_axes[axis_name] = group
+        size_by_group[group] *= axis_sizes.get(axis_name, 1)
+
+    # Give dedicated TP/EP axes priority, then place DP and any bound axes.
+    # This keeps the folded mesh shape valid when multiple semantic roles alias
+    # the same physical mesh dimension.
+    assign_axis(tpname, "tp")
+    assign_axis(epname, "ep")
+    assign_axis(dpname, "dp")
+    assign_axis(fsdpname, "ep" if fsdp_is_ep_bound else "dp")
+    assign_axis(spname, "ep" if sp_is_ep_bound else "dp")
+
+    odpsize = size_by_group["dp"]
+    epsize = size_by_group["ep"]
+    otpsize = size_by_group["tp"]
     return (odpsize, epsize, otpsize), (dpname, epname, tpname)
 
 
@@ -568,6 +576,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
         "is_decoder": False,
         "tie_word_embeddings": True,
         "cross_attention_hidden_size": None,
+        "_output_attentions": False,
+        "_attn_implementation_internal": None,
+        "_experts_implementation_internal": None,
     }
 
     _rope_relevant_keys: tp.ClassVar[set[str]] = {
@@ -598,6 +609,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
             return None
 
         cls.get_partition_rules = _return_none_partition_rules
+        # PreTrainedConfig provides value-based equality, which causes Python to
+        # set ``__hash__ = None`` on subclasses unless we restore it explicitly.
+        # EasyDeL passes configs through static JIT paths, so config subclasses
+        # must remain hashable for graph definitions to compile.
+        if cls.__dict__.get("__hash__") is None:
+            cls.__hash__ = hash_fn
 
     @staticmethod
     def _normalize_rope_parameters_dict(
@@ -2821,6 +2838,18 @@ class EasyDeLBaseConfig(PretrainedConfig):
         else:
             fcm_mask = None
         return fcm_mask
+
+    def get_kv_shared_layer_mapping(self) -> dict[int, int]:
+        """Return a mapping from KV-shared layer indices to their donor indices.
+
+        Layers beyond the ``num_kv_shared_layers`` threshold reuse K/V from
+        the last non-shared layer of the same attention type (sliding or full).
+
+        Returns:
+            Dict mapping ``shared_layer_idx -> donor_layer_idx``.  Empty when
+            ``num_kv_shared_layers`` is 0 or ``layer_types`` is not set.
+        """
+        return {}
 
     @staticmethod
     def _fix_parent_kws(kw1, kw2):

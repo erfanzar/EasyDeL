@@ -21,6 +21,7 @@ from easydel.inference.esurge.mixins.parsing import EngineParsingMixin
 from easydel.inference.esurge.mixins.utils import EngineUtilsMixin
 from easydel.inference.esurge.request import EngineRequest, EngineRequestStatus
 from easydel.inference.esurge.scheduler.utils import check_stop
+from easydel.inference.parsing import DelegatingParser
 from easydel.inference.reasoning.parsers import DeepSeekR1ReasoningParser
 from easydel.inference.sampling_params import SamplingParams
 from easydel.workers.esurge.pipeline import DetokenizerResult
@@ -275,13 +276,9 @@ def test_process_engine_outputs_keeps_raw_text_before_reasoning_split():
         "reported_generated_count": 0,
         "sampling_params": SamplingParams(max_tokens=16),
         "prompt_token_ids": [1, 2],
-        "reasoning_parser_instance": reasoning_parser,
-        "tool_parser_instance": None,
-        "tool_parser_request": None,
+        "delegating_parser": DelegatingParser(reasoning_parser=reasoning_parser),
         "parser_previous_text": "",
         "parser_previous_token_ids": [],
-        "accumulated_reasoning": "",
-        "accumulated_content": "",
     }
     harness._request_outputs[request_id] = RequestOutput(
         request_id=request_id,
@@ -309,3 +306,119 @@ def test_process_engine_outputs_keeps_raw_text_before_reasoning_split():
     assert output.raw_accumulated_text == "<think>plan</think><tool_call>{}</tool_call>"
     assert completion.reasoning_content == "plan"
     assert completion.text == "<tool_call>{}</tool_call>"
+
+
+def test_process_engine_outputs_marks_finished_requests_without_token_output():
+    harness = _ProcessHarness(decoded_text="", delta_text="")
+    request_id = "req-finished-only"
+    event = threading.Event()
+    harness._request_events[request_id] = event
+    harness._active_requests[request_id] = {
+        "parent_request_id": request_id,
+        "sample_index": 0,
+        "generated_tokens": [],
+        "last_decoded_index": 0,
+        "last_decode_time": 0.0,
+        "start_time": time.perf_counter(),
+        "first_token_time": None,
+        "reported_generated_count": 0,
+        "sampling_params": SamplingParams(max_tokens=16),
+        "prompt_token_ids": [1, 2],
+        "delegating_parser": DelegatingParser(),
+        "parser_previous_text": "",
+        "parser_previous_token_ids": [],
+    }
+    harness._request_outputs[request_id] = RequestOutput(
+        request_id=request_id,
+        prompt="hi",
+        prompt_token_ids=[[1, 2]],
+        outputs=[CompletionOutput(index=0, text="", token_ids=[])],
+    )
+
+    harness._process_engine_outputs({0: EngineCoreOutputs(finished_requests={request_id})})
+
+    output = harness._request_outputs[request_id]
+    assert event.is_set()
+    assert output.finished is True
+    assert output.outputs[0].finish_reason == "abort"
+    assert request_id not in harness._active_requests
+
+
+def test_find_first_stop_string_picks_earliest_match():
+    """Stop string matching should pick the earliest occurrence."""
+    result = EngineParsingMixin._find_first_stop_string("hello\nworld\nstop", ["\nstop", "\nworld"])
+    assert result is not None
+    idx, stop = result
+    assert stop == "\nworld"
+    assert idx == 5  # position of first \n before "world"
+
+
+def test_find_first_stop_string_prefers_longer_at_same_position():
+    """When two stop strings match at the same position, prefer the longer one."""
+    result = EngineParsingMixin._find_first_stop_string("hello\nworld", ["\n", "\nworld"])
+    assert result is not None
+    idx, stop = result
+    assert stop == "\nworld"  # longer match at same position
+    assert idx == 5
+
+
+def test_find_first_stop_string_ignores_empty():
+    """Empty stop strings should be skipped."""
+    result = EngineParsingMixin._find_first_stop_string("hello world", ["", "world"])
+    assert result is not None
+    _idx, stop = result
+    assert stop == "world"
+
+
+def test_find_first_stop_string_returns_none_when_no_match():
+    result = EngineParsingMixin._find_first_stop_string("hello world", ["xyz", "abc"])
+    assert result is None
+
+
+def test_apply_stop_string_policy_with_include_stop():
+    """When include_stop_str_in_output=True, the stop string should be included."""
+    harness = _StopPolicyHarness()
+    sp = SamplingParams(max_tokens=16, stop=["\nstop"])
+    sp.include_stop_str_in_output = True
+    rd = {"sampling_params": sp, "decoder_visible_text": ""}
+
+    visible, _delta, stop_hit, stop_reason = harness._apply_stop_string_policy(
+        rd, accumulated_text="hello\nstop world", fallback_delta="hello\nstop world"
+    )
+    assert stop_hit is True
+    assert stop_reason == "\nstop"
+    assert visible == "hello\nstop"  # includes the stop string
+
+
+def test_apply_stop_string_policy_without_include_stop():
+    """Default: stop string should NOT be included in output."""
+    harness = _StopPolicyHarness()
+    sp = SamplingParams(max_tokens=16, stop=["\nstop"])
+    rd = {"sampling_params": sp, "decoder_visible_text": ""}
+
+    visible, _delta, stop_hit, stop_reason = harness._apply_stop_string_policy(
+        rd, accumulated_text="hello\nstop world", fallback_delta="hello\nstop world"
+    )
+    assert stop_hit is True
+    assert stop_reason == "\nstop"
+    assert visible == "hello"  # excludes the stop string
+
+
+def test_decode_and_parse_skips_when_interval_not_reached():
+    """_decode_and_parse should return None when decode interval hasn't been reached."""
+    harness = _ProcessHarness(decoded_text="test", delta_text="test")
+    harness.decode_interval_tokens = 100  # Very high threshold
+    harness.decode_interval_secs = 100.0  # Very high timeout
+    rd = {
+        "last_decoded_index": 0,
+        "last_decode_time": time.perf_counter(),
+        "sampling_params": SamplingParams(max_tokens=16),
+        "delegating_parser": DelegatingParser(),
+        "parser_previous_text": "",
+        "parser_previous_token_ids": [],
+        "decoder_visible_text": "",
+    }
+    parsed, _raw, _raw_delta, _stop_hit, _stop_reason = harness._decode_and_parse(
+        "req-1", rd, [1], time.perf_counter(), finished=False
+    )
+    assert parsed is None  # Should skip because interval not reached

@@ -229,6 +229,8 @@ class OpenELMConfig(EasyDeLBaseConfig):
         self.bits = bits
         self.initializer_range = initializer_range
         self.use_cache = use_cache
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
         self.rope_scaling = rope_scaling
         self.gradient_checkpointing = gradient_checkpointing
         self.use_scan_mlp = use_scan_mlp
@@ -237,14 +239,7 @@ class OpenELMConfig(EasyDeLBaseConfig):
         if self.layer_types is None:
             self.layer_types = ["full_attention"] * self.num_transformer_layers
 
-        super().__init__(
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            use_scan_mlp=use_scan_mlp,
-            scan_mlp_chunk_size=scan_mlp_chunk_size,
-            bits=bits,
-            **kwargs,
-        )
+        super().__init__(**kwargs)
         self.__post_init__()
 
     def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
@@ -260,7 +255,7 @@ class OpenELMConfig(EasyDeLBaseConfig):
         """
         return None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, **_kwargs) -> None:
         """Performs post-initialization checks and calculations.
 
         This method validates the configuration and computes derived values like

@@ -32,6 +32,7 @@ from easydel.caching import (
     HybridCache,
     MLARaggedPagesCacheView,
     OperationsMetadata,
+    ParallelHybridCacheView,
     RaggedPagesCache,
     RaggedPagesCacheView,
     RaggedPagesMetadata,
@@ -872,6 +873,10 @@ class GlmMoeDsaAttention(UnifiedAttention):
         alibi: Float[Array, "batch_or_1 heads qseq_len_or_1 kvseq_len_or_1"] | None = None,
     ):
         bsz, q_len, _ = hidden_states.shape
+        _use_mla_ragged = isinstance(cache_view, MLARaggedPagesCacheView) or (
+            isinstance(cache_view, ParallelHybridCacheView)
+            and isinstance(getattr(cache_view, "transformer", None), MLARaggedPagesCacheView)
+        )
 
         q_resid = None
         if not self.use_mla_lora:
@@ -889,16 +894,22 @@ class GlmMoeDsaAttention(UnifiedAttention):
         compressed_kv = self.mla_kv_a_proj_with_mqa(hidden_states)
         k_pe = compressed_kv[..., self.kv_lora_rank :]
         compressed_kv = compressed_kv[..., : self.kv_lora_rank]
+        compressed_kv = self.mla_kv_a_layernorm(compressed_kv)
 
         k_pe = k_pe.reshape(bsz, q_len, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
 
-        kv = (
-            self.mla_kv_b_proj(self.mla_kv_a_layernorm(compressed_kv))
-            .reshape(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            .transpose(0, 2, 1, 3)
-        )
-        k_nope = kv[..., : self.qk_nope_head_dim]
-        value_states = kv[..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.v_head_dim]
+        absorbed_w_v = None
+        if _use_mla_ragged:
+            k_nope = None
+            value_states = None
+        else:
+            kv = (
+                self.mla_kv_b_proj(compressed_kv)
+                .reshape(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+                .transpose(0, 2, 1, 3)
+            )
+            k_nope = kv[..., : self.qk_nope_head_dim]
+            value_states = kv[..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.v_head_dim]
 
         freq_array = None
         if frequencies is not None:
@@ -916,18 +927,44 @@ class GlmMoeDsaAttention(UnifiedAttention):
                 q_pe = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
                 k_pe = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
 
-        query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
-        query_states = query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
-        query_states = query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
+        mla_kwargs: dict = {}
+        if _use_mla_ragged:
+            w = self.mla_kv_b_proj.kernel.value
+            local_heads = w.shape[1] // (self.qk_nope_head_dim + self.v_head_dim)
+            w = w.reshape(self.kv_lora_rank, local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            w_nope = w[:, :, : self.qk_nope_head_dim]
+            absorbed_w_v = w[:, :, self.qk_nope_head_dim :]
 
-        key_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), k_pe.dtype)
-        key_states = key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
-        key_states = key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
+            q_absorbed = jnp.einsum(
+                "bhsd,khd->bhsk",
+                q_nope.astype(jnp.float32),
+                w_nope.astype(jnp.float32),
+            ).astype(q_nope.dtype)
 
-        query_states = query_states.transpose(0, 2, 1, 3)
-        key_states = key_states.transpose(0, 2, 1, 3)
-        value_states = value_states.transpose(0, 2, 1, 3)
-        mla_value_states = value_states
+            query_states = q_absorbed.transpose(0, 2, 1, 3)
+            key_states = jnp.concatenate(
+                [compressed_kv[:, :, None, :], k_pe.transpose(0, 2, 1, 3)],
+                axis=-1,
+            )
+            value_states = key_states
+
+            mla_kwargs["queries_nope"] = query_states
+            mla_kwargs["queries_pe"] = q_pe.transpose(0, 2, 1, 3)
+            mla_kwargs["keys_values"] = compressed_kv
+            mla_kwargs["keys_pe"] = k_pe[:, 0, :, :]
+            mla_kwargs["softmax_scale"] = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
+        else:
+            query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
+            query_states = query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
+            query_states = query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
+
+            key_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), k_pe.dtype)
+            key_states = key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
+            key_states = key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
+
+            query_states = query_states.transpose(0, 2, 1, 3)
+            key_states = key_states.transpose(0, 2, 1, 3)
+            value_states = value_states.transpose(0, 2, 1, 3)
 
         causal_for_kernel = self.causal
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
@@ -1016,15 +1053,6 @@ class GlmMoeDsaAttention(UnifiedAttention):
         softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
         softmax_aux = getattr(softmax_aux, "value", softmax_aux)
 
-        # Pass decompressed MLA tensors when using MLA ragged cache
-        mla_kwargs: dict = {}
-        if isinstance(cache_view, MLARaggedPagesCacheView):
-            mla_kwargs["queries_nope"] = q_nope.transpose(0, 2, 1, 3)
-            mla_kwargs["queries_pe"] = q_pe.transpose(0, 2, 1, 3)
-            mla_kwargs["keys_values"] = k_nope.transpose(0, 2, 1, 3)
-            mla_kwargs["values"] = mla_value_states
-            mla_kwargs["keys_pe"] = k_pe[:, 0, :, :]
-
         attentions = self.attention_performer.forward(
             query_states=query_states,
             key_states=key_states,
@@ -1042,7 +1070,16 @@ class GlmMoeDsaAttention(UnifiedAttention):
         )
 
         attn_out = attentions.attention_outputs
-        if isinstance(cache_view, MLARaggedPagesCacheView) and attn_out.ndim == 3:
+        if absorbed_w_v is not None and attn_out.ndim == 3:
+            attn_out = jnp.einsum(
+                "thk,khv->thv",
+                attn_out.astype(jnp.float32),
+                absorbed_w_v.astype(jnp.float32),
+            ).astype(attn_out.dtype)
+            batch_size = hidden_states.shape[0]
+            seq_len = hidden_states.shape[1]
+            attn_output = attn_out.reshape(batch_size, seq_len, -1)
+        elif _use_mla_ragged and attn_out.ndim == 3:
             batch_size = hidden_states.shape[0]
             seq_len = hidden_states.shape[1]
             attn_output = attn_out.reshape(batch_size, seq_len, -1)
@@ -1443,7 +1480,7 @@ class GlmMoeDsaForCausalLM(BaseCausalLMModule[GlmMoeDsaModel, GlmMoeDsaConfig]):
         GLM-MoE-DSA uses MLA, where the runtime attention head width is
         ``qk_nope_head_dim + qk_rope_head_dim`` (not ``config.head_dim``).
         """
-        from easydel.caching import MLARaggedPagesCacheConfig, RaggedPagesCacheConfig
+        from easydel.caching import RaggedPagesCacheConfig
         from easydel.layers.attention import AttentionMechanisms
 
         text_config = self.config.get_text_config()
@@ -1462,23 +1499,16 @@ class GlmMoeDsaForCausalLM(BaseCausalLMModule[GlmMoeDsaModel, GlmMoeDsaConfig]):
         attn_mechanism = getattr(text_config, "attn_mechanism", None)
         if hasattr(attn_mechanism, "value"):
             attn_mechanism = attn_mechanism.value
-        is_mla_ragged = str(attn_mechanism) == "multi_latent_ragged_page_attention_v1"
+        is_mla_ragged = str(attn_mechanism) in (
+            "multi_latent_ragged_page_attention_v1",
+            "multi_latent_ragged_page_attention_v2",
+        )
         if is_mla_ragged:
-            # Head-aware MLA kernel uses 128-aligned per-head channels in cache.
-            padded_qk_nope = ((self.config.qk_nope_head_dim + 127) // 128) * 128
-            padded_v = ((self.config.v_head_dim + 127) // 128) * 128
-            packed_per_head_kv = padded_qk_nope + padded_v
-            return MLARaggedPagesCacheConfig.create(
-                mesh=self.mesh,
-                partition_manager=text_config.partition_manager,
-                kvdtype=text_config.kvdtype if dtype is None else dtype,
-                max_model_length=max_length,
-                num_hidden_layers=self.config.num_hidden_layers,
-                num_kv_heads=self.config.num_attention_heads,
-                kv_lora_rank=self.config.num_attention_heads * packed_per_head_kv,
-                qk_rope_head_dim=self.config.qk_rope_head_dim,
-                hbm_utilization=hbm_utilization,
+            return self._create_mla_ragged_page_cache_config(
+                max_length=max_length,
                 page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                dtype=dtype,
             )
 
         return RaggedPagesCacheConfig.create(
