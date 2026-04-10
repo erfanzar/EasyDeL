@@ -404,6 +404,13 @@ AVAILABLE_GRADIENT_CHECKPOINT_TARGETS = tp.Literal[
     "ssm_x_proj",
     "text_projection_output",
     "vision_attn_output",
+    "vision_embeddings",
+    "vision_layer_output",
+    "vision_mlp_down",
+    "vision_mlp_gate",
+    "vision_mlp_output",
+    "vision_mlp_up",
+    "vision_model_output",
     "visual_projection_output",
 ]
 
@@ -451,6 +458,13 @@ GRADIENT_CHECKPOINT_TARGETS: tuple[AVAILABLE_GRADIENT_CHECKPOINT_TARGETS, ...] =
     "ssm_x_proj",
     "text_projection_output",
     "vision_attn_output",
+    "vision_embeddings",
+    "vision_layer_output",
+    "vision_mlp_down",
+    "vision_mlp_gate",
+    "vision_mlp_output",
+    "vision_mlp_up",
+    "vision_model_output",
     "visual_projection_output",
 )
 

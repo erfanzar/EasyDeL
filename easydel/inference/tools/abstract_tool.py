@@ -95,6 +95,7 @@ ToolParserName: TypeAlias = Literal[
     "hermes",
     "qwen3_coder",
     "functiongemma",
+    "gemma4",
     "llama4_pythonic",
     "mistral",
 ]
@@ -235,6 +236,92 @@ class ToolParser:
             calling. Override this method to implement such adjustments.
         """
         return request
+
+    def _tool_protocol_has_unclosed_marker(
+        self,
+        text: str,
+        start_marker: str | None,
+        end_marker: str | None,
+    ) -> bool:
+        """Return whether *text* contains an unmatched tool/control marker."""
+
+        if not text or not isinstance(start_marker, str) or not start_marker:
+            return False
+        if start_marker not in text:
+            return False
+        if not isinstance(end_marker, str) or not end_marker:
+            return True
+
+        last_start = text.rfind(start_marker)
+        last_end = text.rfind(end_marker)
+        if last_end < last_start:
+            return True
+        return text.count(start_marker) > text.count(end_marker)
+
+    def get_streaming_buffer_marker_pairs(self) -> Sequence[tuple[str, str | None]]:
+        """Return parser-owned marker pairs used to detect buffered protocol."""
+
+        marker_pairs: list[tuple[str, str | None]] = []
+        for start_attr, end_attr in (
+            ("tool_call_start_token", "tool_call_end_token"),
+            ("tool_calls_start_token", "tool_calls_end_token"),
+            ("tool_call_prefix", "function_end_token"),
+            ("parameter_prefix", "parameter_end_token"),
+            ("bot_token", None),
+            ("bot_string", None),
+            ("tool_start_token", None),
+            ("trigger_start", None),
+            ("TOOL_CALLS_BEGIN", "TOOL_CALLS_END"),
+            ("TOOL_CALL_BEGIN", "TOOL_CALL_END"),
+        ):
+            start_marker = getattr(self, start_attr, None)
+            if not isinstance(start_marker, str) or not start_marker:
+                continue
+            end_marker = getattr(self, end_attr, None) if isinstance(end_attr, str) else None
+            marker_pairs.append((start_marker, end_marker if isinstance(end_marker, str) and end_marker else None))
+        return tuple(marker_pairs)
+
+    def get_streaming_buffer_hints(self) -> Sequence[str]:
+        """Return parser-owned substrings that hint a protocol chunk is in-flight."""
+
+        hints: list[str] = []
+        seen: set[str] = set()
+        for start_marker, _end_marker in self.get_streaming_buffer_marker_pairs():
+            for hint in (
+                start_marker,
+                start_marker[:-1] if start_marker.endswith(">") and len(start_marker) > 1 else None,
+            ):
+                if not isinstance(hint, str) or not hint or hint in seen:
+                    continue
+                seen.add(hint)
+                hints.append(hint)
+        return tuple(hints)
+
+    def is_buffering_protocol(
+        self,
+        *,
+        current_text: str,
+        delta_text: str,
+    ) -> bool:
+        """Return whether the parser is currently buffering unfinished tool protocol."""
+
+        if bool(getattr(self, "is_tool_call_started", False)):
+            return True
+
+        for start_marker, end_marker in self.get_streaming_buffer_marker_pairs():
+            if self._tool_protocol_has_unclosed_marker(current_text, start_marker, end_marker):
+                return True
+
+        normalized_current = current_text.strip()
+        for hint in self.get_streaming_buffer_hints():
+            if hint in delta_text or (normalized_current and hint in normalized_current):
+                return True
+            if not normalized_current or len(hint) < 2:
+                continue
+            window = normalized_current[-(len(hint) - 1) :]
+            if window and hint.startswith(window):
+                return True
+        return False
 
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
         """Extract tool calls from complete model output (batch mode).

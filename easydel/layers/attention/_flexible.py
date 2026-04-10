@@ -77,7 +77,7 @@ from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 from easydel.operations import AttentionOutput, OperationMetadata, OperationRegistry
 
-from ..quantization._quants import EasyQuantizer
+from ..quantization import EasyQuantizer, TurboQuantConfig
 
 logger = get_logger(__name__)
 
@@ -151,6 +151,7 @@ class AttentionMechanisms(StrEnum):
     RAGGED_PAGE_ATTENTION_V3: str = "ragged_page_attention_v3"
     RAGGED_PAGE_ATTENTION_V2: str = "ragged_page_attention_v2"
     MULTI_LATENT_RAGGED_PAGE_ATTENTION_V1: str = "multi_latent_ragged_page_attention_v1"
+    MULTI_LATENT_RAGGED_PAGE_ATTENTION_V2: str = "multi_latent_ragged_page_attention_v2"
     PAGED_ATTENTION: str = "page_attention"
     UNIFIED_ATTENTION: str = "unified_attention"
     PAGED_FLASH_ATTENTION: str = "paged_flash_attention"
@@ -436,6 +437,7 @@ class FlexibleAttentionModule(nn.Module):
                 "ragged_page_attention_v2",
                 "ragged_page_attention_v3",
                 "multi_latent_ragged_page_attention_v1",
+                "multi_latent_ragged_page_attention_v2",
             }
             if _impl_names and not (_impl_names & _ragged_impls):
                 raise ValueError(f"RaggedPagesCacheView requires a ragged-page impl but got {_impl_names}")
@@ -524,7 +526,15 @@ class FlexibleAttentionModule(nn.Module):
         def cast_to_dtype(x: tp.Any) -> tp.Any:
             return x.astype(target_dtype)
 
-        result: AttentionOutput = jtu.tree_map(cast_to_dtype, output)
+        # Only cast attention_outputs and attention_weights — leave cache_view
+        # untouched to preserve original dtypes (e.g. uint8 for TurboQuant pages).
+        result = AttentionOutput(
+            attention_outputs=jtu.tree_map(cast_to_dtype, output.attention_outputs),
+            attention_weights=(
+                jtu.tree_map(cast_to_dtype, output.attention_weights) if output.attention_weights is not None else None
+            ),
+            cache_view=output.cache_view,
+        )
         return result
 
     __call__ = forward
@@ -774,12 +784,19 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         Provides an EasyQuantizer instance based on the module's configuration.
 
         Used for quantizing KV cache entries if enabled in the config.
+        For TurboQuant configs, returns a no-op quantizer since TurboQuant
+        handles compression inside the kernel.
 
         Returns:
             EasyQuantizer: The quantizer instance.
         """
+        kv_quant_cfg = self.config.kv_cache_quantization_config
+
+        if isinstance(kv_quant_cfg, TurboQuantConfig):
+            return EasyQuantizer(quantization_config=None)
+
         quantizer_instance: EasyQuantizer = EasyQuantizer(
-            quantization_config=self.config.kv_cache_quantization_config,
+            quantization_config=kv_quant_cfg,
         )
         return quantizer_instance
 
@@ -975,7 +992,13 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
 
         @partial(jax.vmap, in_axes=(0, 0, 0, 0, 0, None), out_axes=(0, 0, 0))
         def _select_slices(ikey, ival, imsk, offset, index, mode_):
-            row = offset + jax.lax.broadcasted_iota(jnp.int32, (Q, 1), 0)  # (Q,1)
+            base_row = offset + jax.lax.broadcasted_iota(jnp.int32, (Q, 1), 0)  # (Q,1)
+            if mode_ == common_types.MODE_DECODE:
+                # `index` is the post-update cache length, so the active query rows
+                # correspond to the trailing `[index - Q, ..., index - 1]` range.
+                row = (index - Q) + base_row
+            else:
+                row = base_row
 
             col = jax.lax.broadcasted_iota(jnp.int32, (1, K), 1)  # (1,K)
             win = (col >= (row - left_window)) & (col <= (row + right_window))  # (Q,K)
@@ -983,10 +1006,10 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             imsk = imsk & win[None, :, :]  # (H=1, Q, K)
 
             if mode_ == common_types.MODE_DECODE:
-                # Slice to a centered (as possible) window at 'index'
-                start_k = jnp.clip(index - left_window, 0, jnp.maximum(K - width, 0))
-                # Reduce Q to the current row (Q->1)
-                imsk = jax.lax.dynamic_slice_in_dim(imsk, index, 1, axis=1)  # (H,1,K)
+                # The active query rows are already local to the current decode step
+                # (typically Q=1), so only the KV axis needs window slicing.
+                current_row = index - 1
+                start_k = jnp.clip(current_row - left_window, 0, jnp.maximum(K - width, 0))
                 imsk = jax.lax.dynamic_slice_in_dim(imsk, start_k, width, axis=2)  # (H,1,width)
                 # Slice KV tensors along K
                 ikey = jax.lax.dynamic_slice_in_dim(ikey, start_k, width, axis=0)  # (width, ...)
@@ -1006,7 +1029,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
 
         key, value, attn = _select_slices(key, value, attn, offsets, indexs, mode)
 
-        mask_info = mask_info.replace(attention_mask=attn)
+        mask_info = mask_info.replace(attention_mask=attn, sliding_window_baked_in=True)
 
         if cache_metadata is not None and mode == common_types.MODE_DECODE:
             passed = cache_metadata.indexs - cache_metadata.starts
@@ -1104,7 +1127,14 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
                 )
                 return bias
 
-            return key, value, mask_info, init_attention_bias, cache_view, cache_metadata  # pyright: ignore[reportReturnType]
+            return (
+                key,
+                value,
+                mask_info,
+                init_attention_bias,
+                cache_view,
+                cache_metadata,
+            )  # pyright: ignore[reportReturnType]
 
         if cache_view is not None and cache_view.key is not None:
             query_batch: int = query.shape[0]
@@ -1170,7 +1200,14 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             bias: Array = mask_info.create_bias(dtype_self)
             return bias
 
-        return key, value, mask_info, init_attention_bias, cache_view, cache_metadata  # pyright: ignore[reportReturnType]
+        return (
+            key,
+            value,
+            mask_info,
+            init_attention_bias,
+            cache_view,
+            cache_metadata,
+        )  # pyright: ignore[reportReturnType]
 
     def shard_attention_prod(
         self, attn_output: Float[JArray, "batch seq heads dim"]

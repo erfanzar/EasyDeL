@@ -330,7 +330,7 @@ class SchedulerOutput:
     suggested_bucket: int | None = None
     """Optimal bucket size hint for runner's buffer selection."""
 
-    async_scheduling: bool = False
+    async_scheduling: bool = True
     """Enable async token sampling for overlapped execution."""
 
     num_running_reqs: int = 0

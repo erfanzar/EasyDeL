@@ -111,7 +111,11 @@ MAX_CONSECUTIVE_SCHEDULER_ERRORS = int(os.environ.get("EASURGE_MAX_SCHEDULER_ERR
 WORKER_DRAIN_MAX_RETRIES = 3  # Maximum retry attempts for worker drain
 WORKER_DRAIN_INITIAL_DELAY = 0.1  # Initial retry delay in seconds
 SamplingCallable = typing.Callable[[SamplingParams, dict[str, typing.Any]], SamplingParams | None] | None
-MLA_RAGGED_ATTN_MECHANISM = "multi_latent_ragged_page_attention_v1"
+MLA_RAGGED_ATTN_MECHANISM = "multi_latent_ragged_page_attention_v2"
+_MLA_RAGGED_ATTN_MECHANISMS = {
+    "multi_latent_ragged_page_attention_v1",
+    "multi_latent_ragged_page_attention_v2",
+}
 
 
 def _set_requested_new(sp, n: int):  # pyright: ignore[reportUnusedFunction]
@@ -195,10 +199,10 @@ def _text_config_uses_mla(text_config: Any) -> bool:
         return False
 
     attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
-    if attn_mechanism == MLA_RAGGED_ATTN_MECHANISM:
+    if attn_mechanism in _MLA_RAGGED_ATTN_MECHANISMS:
         return True
     mla_attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "mla_attn_mechanism", None))
-    if mla_attn_mechanism == MLA_RAGGED_ATTN_MECHANISM:
+    if mla_attn_mechanism in _MLA_RAGGED_ATTN_MECHANISMS:
         return True
 
     attention_type = getattr(text_config, "attention_type", None)
@@ -269,50 +273,6 @@ def _detect_mla_attention_mix(model: Any, text_config: Any = None) -> tuple[bool
         has_mla_attention = True
 
     return has_mla_attention, has_non_mla_attention
-
-
-def _with_data_parallel_axis(partition_axis: Any, data_parallelism_axis: str) -> Any:
-    """Return partition-axis metadata with the data-parallel axis set.
-
-    Handles multiple input shapes: ``None``, plain ``dict``, objects with a
-    mutable ``data_parallel_axis`` attribute, and generic objects whose
-    ``__dict__`` can be merged into a new instance. Falls back to returning
-    a minimal dict when other strategies fail.
-
-    Args:
-        partition_axis: Existing partition-axis metadata. May be ``None``,
-            a ``dict``, or an object with ``data_parallel_axis``.
-        data_parallelism_axis: The axis name to assign for data parallelism.
-
-    Returns:
-        Updated partition-axis metadata (same type as input when possible,
-        otherwise a ``dict``).
-    """
-    if partition_axis is None:
-        return {"data_parallel_axis": data_parallelism_axis}
-
-    if isinstance(partition_axis, dict):
-        merged = dict(partition_axis)
-        merged["data_parallel_axis"] = data_parallelism_axis
-        return merged
-
-    if hasattr(partition_axis, "data_parallel_axis"):
-        try:
-            partition_axis.data_parallel_axis = data_parallelism_axis
-            return partition_axis
-        except Exception:
-            pass
-
-    attrs = getattr(partition_axis, "__dict__", None)
-    if isinstance(attrs, dict) and attrs:
-        merged = dict(attrs)
-        merged["data_parallel_axis"] = data_parallelism_axis
-        try:
-            return type(partition_axis)(**merged)
-        except Exception:
-            return merged
-
-    return {"data_parallel_axis": data_parallelism_axis}
 
 
 @dataclass
@@ -459,6 +419,32 @@ class eSurge(
         ...     print(output.delta_text, end="", flush=True)
     """
 
+    @staticmethod
+    def _auto_detect_tool_parser(
+        *,
+        tokenizer: PreTrainedTokenizerBase | None,
+        model_type: str | None,
+    ) -> ToolParserName | None:
+        """Infer the tool parser from tokenizer/template hints and model type."""
+
+        from easydel.inference.tools.auto_detect import detect_tool_parser
+
+        detected = detect_tool_parser(model_type=model_type, tokenizer=tokenizer)
+        return detected or None
+
+    @staticmethod
+    def _auto_detect_reasoning_parser_name(
+        *,
+        tokenizer: PreTrainedTokenizerBase | None,
+        model_type: str | None,
+    ) -> ReasoningParserName | None:
+        """Infer the reasoning parser from tokenizer/template hints and model type."""
+
+        from easydel.inference.reasoning.auto_detect import detect_reasoning_parser
+
+        detected = detect_reasoning_parser(model_type=model_type, tokenizer=tokenizer)
+        return detected or None
+
     def __init__(
         self,
         model: str | EasyDeLBaseModule,
@@ -469,7 +455,7 @@ class eSurge(
         min_token_pad: int | None = None,
         max_num_seqs: int = 256,
         max_num_seq_buckets: list[int] | None = None,
-        async_scheduling: bool = False,
+        async_scheduling: bool = True,
         max_num_batched_tokens: int | None | _Empty = NOT_GIVEN,
         hbm_utilization: float = 0.85,
         page_size: int = 128,
@@ -480,7 +466,7 @@ class eSurge(
         sharding_axis_dims: tuple[int, ...] = (1, 1, 1, -1, 1),
         compile_runner: bool = True,
         runner_verbose: bool = False,
-        overlap_execution: bool = False,
+        overlap_execution: bool = True,
         sampler_metrics: bool = False,
         data_parallelism_axis: str = "dp",
         esurge_name: str | None = None,
@@ -522,6 +508,7 @@ class eSurge(
         distributed_step_timeout_s: float = 30.0,
         distributed_connect_timeout_s: float = 15.0,
         distributed_verify_sampling_digest: bool = True,
+        enable_window_aware_runtime_cap: bool = False,
         **kwargs,
     ):
         """Initialize the eSurge engine.
@@ -645,6 +632,10 @@ class eSurge(
             distributed_connect_timeout_s: Worker connect/handshake timeout.
             distributed_verify_sampling_digest: Validate sampled-token digest
                 from workers against leader output each step.
+            enable_window_aware_runtime_cap: Whether to derive the runtime
+                request cap from the model's live KV-window page demand.
+                When False, eSurge falls back to the cache metadata's
+                heuristic request-cap estimate instead.
             **kwargs: Additional configuration passed to model loading.
 
         Raises:
@@ -666,6 +657,7 @@ class eSurge(
 
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
+        self.enable_window_aware_runtime_cap = bool(enable_window_aware_runtime_cap)
         self.page_size = page_size
         self.data_parallelism_axis = _normalize_data_parallelism_axis(data_parallelism_axis)
         register_attention_data_parallel_axis(self.data_parallelism_axis)
@@ -809,50 +801,6 @@ class eSurge(
         self._idle_monitor_event = threading.Event()
         self._idle_monitor_thread: threading.Thread | None = None
 
-        # Tool calling and reasoning parser initialization with auto-detection
-        _model_type: str | None = None
-        if not isinstance(model, str) and hasattr(model, "config"):
-            _model_type = getattr(model.config, "model_type", None)
-
-        if tool_parser is None and _model_type is not None:
-            from easydel.inference.tools.auto_detect import detect_tool_parser
-
-            _detected = detect_tool_parser(model_type=_model_type, tokenizer=self.tokenizer)
-            if _detected:
-                tool_parser = _detected
-
-        if reasoning_parser is None and _model_type is not None:
-            from easydel.inference.reasoning.auto_detect import detect_reasoning_parser
-
-            _detected = detect_reasoning_parser(model_type=_model_type, tokenizer=self.tokenizer)
-            if _detected:
-                reasoning_parser = _detected
-
-        self.tool_parser_name = tool_parser
-        self.reasoning_parser_name = reasoning_parser
-        self._tool_parser_class = None
-        self._reasoning_parser_class = None
-
-        if tool_parser:
-            try:
-                from easydel.inference.tools import ToolParserManager
-
-                self._tool_parser_class = ToolParserManager.get_tool_parser(tool_parser)
-                if not silent_mode:
-                    logger.info("Initialized tool parser: %s", tool_parser)
-            except KeyError:
-                logger.warning("Tool parser '%s' not found, function calling disabled", tool_parser)
-
-        if reasoning_parser:
-            try:
-                from easydel.inference.reasoning import ReasoningParserManager
-
-                self._reasoning_parser_class = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
-                if not silent_mode:
-                    logger.info("Initialized reasoning parser: %s", reasoning_parser)
-            except KeyError:
-                logger.warning("Reasoning parser '%s' not found, reasoning disabled", reasoning_parser)
-
         tokenizer_endpoint = tokenizer_endpoint or os.environ.get("EASURGE_TOKENIZER_ENDPOINT")
         detokenizer_endpoint = detokenizer_endpoint or os.environ.get("EASURGE_DETOKENIZER_ENDPOINT")
 
@@ -924,9 +872,8 @@ class eSurge(
             config_kwargs = dict(kwargs.pop("config_kwargs", {}) or {})
             config_partition_axis = config_kwargs.pop("partition_axis", None)
             kwargs_partition_axis = kwargs.pop("partition_axis", None)
-            resolved_partition_axis = _with_data_parallel_axis(
-                kwargs_partition_axis if kwargs_partition_axis is not None else config_partition_axis,
-                self.data_parallelism_axis,
+            resolved_partition_axis = (
+                kwargs_partition_axis if kwargs_partition_axis is not None else config_partition_axis
             )
 
             model = AutoEasyDeLModelForCausalLM.from_pretrained(
@@ -956,7 +903,7 @@ class eSurge(
 
             if has_mla_attention and _mla_kernel_compatible:
                 attn_value = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
-                mla_compatible = attn_value == MLA_RAGGED_ATTN_MECHANISM
+                mla_compatible = attn_value in _MLA_RAGGED_ATTN_MECHANISMS
                 if jax.default_backend() == "gpu":
                     mla_compatible = mla_compatible or attn_value in {
                         AttentionMechanisms.UNIFIED_ATTENTION.value,
@@ -1001,31 +948,43 @@ class eSurge(
         if self._multimodal_manager is not None and self._multimodal_manager.model is None:
             self._multimodal_manager.model = model
 
-        # Profiling state
-        self._profiling_active = False
-        self._profiling_steps_remaining = 0
-        self._profiling_output_dir: str | None = None
-        self._profiling_host_level: int | None = None
-        self._profiling_python_level: int | None = None
-        self._possible_name = self._get_model_name(model)
+        detected_model_type = getattr(getattr(model, "config", None), "model_type", None)
+        if tool_parser is None:
+            tool_parser = self._auto_detect_tool_parser(
+                tokenizer=self.tokenizer,
+                model_type=detected_model_type,
+            )
+        if reasoning_parser is None:
+            reasoning_parser = self._auto_detect_reasoning_parser_name(
+                tokenizer=self.tokenizer,
+                model_type=detected_model_type,
+            )
 
-        self.runner = eSurgeRunner(
-            model=model.esurge_compatible_model,
-            hbm_utilization=hbm_utilization,
-            page_size=page_size,
-            max_model_len=max_model_len,
-            min_input_pad=min_input_pad,
-            max_num_seqs=max_num_seqs,
-            max_num_seq_buckets=max_num_seq_buckets,
-            async_scheduling=async_scheduling,
-            min_token_pad=min_token_pad,
-            use_aot_forward=use_aot_forward,
-            bind_graphstate_for_aot=bind_graphstate_for_aot,
-            verbose=runner_verbose,
-            enable_overlap_execution=overlap_execution,
-            enable_sampler_metrics=sampler_metrics,
-        )
-        self._overlap_execution = overlap_execution
+        self.tool_parser = tool_parser
+        self.reasoning_parser_name = reasoning_parser
+        self._tool_parser_class = None
+        self._reasoning_parser_class = None
+
+        if tool_parser:
+            try:
+                from easydel.inference.tools import ToolParserManager
+
+                self._tool_parser_class = ToolParserManager.get_tool_parser(tool_parser)
+                if not silent_mode:
+                    logger.info("Initialized tool parser: %s", tool_parser)
+            except KeyError:
+                logger.warning("Tool parser '%s' not found, function calling disabled", tool_parser)
+
+        if reasoning_parser:
+            try:
+                from easydel.inference.reasoning import ReasoningParserManager
+
+                self._reasoning_parser_class = ReasoningParserManager.get_reasoning_parser(reasoning_parser)
+                if not silent_mode:
+                    logger.info("Initialized reasoning parser: %s", reasoning_parser)
+            except KeyError:
+                logger.warning("Reasoning parser '%s' not found, reasoning disabled", reasoning_parser)
+
         if max_num_batched_tokens is NOT_GIVEN and jax.default_backend() == "gpu":
             max_num_batched_tokens = min(max(2048, max_num_seqs), max_model_len)
             logger.info(
@@ -1042,6 +1001,34 @@ class eSurge(
             )
         elif max_num_batched_tokens is NOT_GIVEN:
             max_num_batched_tokens = None
+
+        # Profiling state
+        self._profiling_active = False
+        self._profiling_steps_remaining = 0
+        self._profiling_output_dir: str | None = None
+        self._profiling_host_level: int | None = None
+        self._profiling_python_level: int | None = None
+        self._possible_name = self._get_model_name(model)
+
+        self.runner = eSurgeRunner(
+            model=model.esurge_compatible_model,
+            hbm_utilization=hbm_utilization,
+            page_size=page_size,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+            enable_window_aware_runtime_cap=enable_window_aware_runtime_cap,
+            min_input_pad=min_input_pad,
+            max_num_seqs=max_num_seqs,
+            max_num_seq_buckets=max_num_seq_buckets,
+            async_scheduling=async_scheduling,
+            min_token_pad=min_token_pad,
+            use_aot_forward=use_aot_forward,
+            bind_graphstate_for_aot=bind_graphstate_for_aot,
+            verbose=runner_verbose,
+            enable_overlap_execution=overlap_execution,
+            enable_sampler_metrics=sampler_metrics,
+        )
+        self._overlap_execution = overlap_execution
 
         if compile_runner:
             # Limit compilation to the scheduler's per-step token budget when provided.
@@ -1153,6 +1140,7 @@ class eSurge(
                     if self.scheduler.max_num_scheduled_tokens is not None
                     else None
                 ),
+                "enable_window_aware_runtime_cap": bool(self.enable_window_aware_runtime_cap),
                 "scheduler_policy": str(
                     self.scheduler.policy.value if hasattr(self.scheduler.policy, "value") else self.scheduler.policy
                 ),
@@ -1245,28 +1233,13 @@ class eSurge(
         self._sampling_params_callback = callback
 
     def _apply_data_parallel_axis_to_model(self, model: EasyDeLBaseModule) -> None:
-        """Patch model config partition axes so eSurge KV-cache uses the requested DP axis."""
-        cfg = getattr(model, "config", None)
-        if cfg is None:
-            return
+        """Keep model partition axes unchanged.
 
-        maybe_text_cfg = getattr(cfg, "get_text_config", None)
-        text_cfg = maybe_text_cfg() if callable(maybe_text_cfg) else None
-
-        seen: set[int] = set()
-        for target_cfg in (cfg, text_cfg):
-            if target_cfg is None or id(target_cfg) in seen:
-                continue
-            seen.add(id(target_cfg))
-            current_axis = getattr(target_cfg, "partition_axis", None)
-            updated_axis = _with_data_parallel_axis(current_axis, self.data_parallelism_axis)
-            try:
-                target_cfg.partition_axis = updated_axis
-            except Exception:
-                logger.warning(
-                    "Failed to update model partition_axis with data_parallelism_axis=%r",
-                    self.data_parallelism_axis,
-                )
+        eSurge's KV-page parallelism uses the dedicated ``ATTN_DP`` semantic
+        axis registered during engine setup. Rewriting the model's standard
+        data-parallel axis here can alias DP with EP and break MoE shard maps.
+        """
+        del model
 
     def _distributed_execute_step(self, scheduler_output):
         """Execute a single scheduler step on worker ranks via control-plane RPC."""
@@ -1391,6 +1364,7 @@ class eSurge(
             f"max_model_len={self.max_model_len}",
             f"max_num_seqs={self.max_num_seqs}",
             f"page_size={self.page_size}",
+            f"enable_window_aware_runtime_cap={self.enable_window_aware_runtime_cap}",
             f"data_parallelism_axis={self.data_parallelism_axis!r}",
             f"reserve_tokens={self.reserve_tokens}",
             f"auto_truncate_prompt={self.auto_truncate_prompt}",

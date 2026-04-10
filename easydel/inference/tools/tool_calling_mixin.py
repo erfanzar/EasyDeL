@@ -96,7 +96,7 @@ class ToolCallingMixin:
     def initialize_tool_parsers(
         self,
         model_processors: dict[str, tp.Any],
-        tool_parser_name: str,
+        tool_parser_name: str | dict[str, str | None],
         enable_function_calling: bool,
     ) -> dict[str, ToolParser]:
         """Initialize tool parsers for all registered models.
@@ -109,9 +109,9 @@ class ToolCallingMixin:
             model_processors (dict[str, tp.Any]): Dictionary mapping model names
                 to their tokenizers/processors. Each processor should be compatible
                 with the tool parser's requirements.
-            tool_parser_name (str): Name of the tool parser to use. Must be a
-                registered parser name (e.g., "hermes", "qwen", "mistral").
-                See ToolParserManager for available parsers.
+            tool_parser_name (str | dict[str, str | None]): Name of the tool
+                parser to use for every model, or a per-model mapping of model
+                name to parser name.
             enable_function_calling (bool): Whether to enable function calling.
                 If False, returns an empty dictionary and no parsers are initialized.
 
@@ -141,11 +141,17 @@ class ToolCallingMixin:
 
         for model_name, processor in model_processors.items():
             try:
-                parser_class = ToolParserManager.get_tool_parser(tool_parser_name)
+                parser_name = (
+                    tool_parser_name.get(model_name) if isinstance(tool_parser_name, dict) else tool_parser_name
+                )
+                if not isinstance(parser_name, str) or not parser_name.strip():
+                    logger.warning(f"No tool parser resolved for model {model_name}, function calling disabled")
+                    continue
+                parser_class = ToolParserManager.get_tool_parser(parser_name)
                 tool_parsers[model_name] = parser_class(processor)
-                logger.info(f"Initialized {tool_parser_name} tool parser for model {model_name}")
+                logger.info(f"Initialized {parser_name} tool parser for model {model_name}")
             except KeyError:
-                logger.warning(f"Tool parser '{tool_parser_name}' not found, function calling disabled for {model_name}")
+                logger.warning(f"Tool parser '{parser_name}' not found, function calling disabled for {model_name}")
             except Exception as e:
                 logger.warning(f"Failed to initialize tool parser for {model_name}: {e}")
 

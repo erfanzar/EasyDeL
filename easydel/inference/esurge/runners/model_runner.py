@@ -70,15 +70,18 @@ import jax
 import numpy as np
 from eformer.loggings import get_logger
 from jax import numpy as jnp
+from jax.experimental import multihost_utils
 
 from easydel.caching import RaggedPagesCacheConfig, UnifiedAttentionCacheConfig
+from easydel.layers.quantization import TurboQuantConfig
 
 from ..core.dp_sharding import dp_shard_for_page_id, dp_shard_page_bounds, pages_per_dp_shard
+from ..core.interface import create_kv_cache_specs_from_config, estimate_runtime_page_budget
 from ..metrics import get_metrics_collector
 from ..outputs import ModelRunnerOutput
 from ..scheduler import SchedulerOutput
 from ..utils import model_uses_mrope
-from .async_types import AsyncPreResults
+from .async_types import AsyncPreResults, AsyncWindowResult
 from .execution_manager import ExecutionManager
 from .sequence_buffer import (
     SequenceBuffer,
@@ -109,6 +112,58 @@ class RunnerPerfSample:
     agg_tps: float
     req_tps: float
     ema_tps: float
+
+
+class _AsyncExecutionHandle:
+    """Deferred host-materialized model output for overlap execution."""
+
+    def __init__(
+        self,
+        model_runner_output: ModelRunnerOutput,
+        windows: list[AsyncWindowResult],
+        finalize: typing.Callable[[list[list[int]]], None] | None = None,
+    ) -> None:
+        self._model_runner_output = model_runner_output
+        self._windows = windows
+        self._finalize = finalize
+        self._resolved_output: ModelRunnerOutput | None = None
+
+    def get_output(self) -> ModelRunnerOutput:
+        if self._resolved_output is not None:
+            return self._resolved_output
+
+        sampled_token_ids: list[list[int]] = []
+        token_logprobs: dict[str, float] = {}
+
+        for window in self._windows:
+            tokens_cpu = np.asarray(window.sampled_token_ids)
+            logprobs_cpu = np.asarray(window.token_logprobs) if window.token_logprobs is not None else None
+            for row_pos, req_id, is_valid in zip(
+                window.row_positions,
+                window.req_ids,
+                window.valid_mask,
+                strict=False,
+            ):
+                if not is_valid:
+                    sampled_token_ids.append([])
+                    continue
+
+                sampled_token_ids.append([int(tokens_cpu[row_pos])])
+                if logprobs_cpu is not None and row_pos < logprobs_cpu.shape[0]:
+                    try:
+                        token_logprobs[req_id] = float(logprobs_cpu[row_pos])
+                    except Exception:
+                        pass
+
+        if self._finalize is not None:
+            self._finalize(sampled_token_ids)
+            self._finalize = None
+
+        output = self._model_runner_output
+        output.sampled_token_ids = sampled_token_ids
+        output.token_logprobs = token_logprobs or None
+        self._resolved_output = output
+        return output
 
 
 def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int, min_input_pad: int) -> int:  # pyright: ignore[reportUnusedFunction]
@@ -199,16 +254,18 @@ class eSurgeRunner:
         hbm_utilization: float = 0.5,
         page_size: int = 128,
         max_model_len: int = 2**13,
+        max_num_batched_tokens: int | None = None,
         min_input_pad: int = 256,
         min_token_pad: int | None = None,
         max_num_seqs: int = 16,
         max_num_seq_buckets: list[int] | None = None,
-        async_scheduling: bool = False,
+        async_scheduling: bool = True,
         use_aot_forward: bool = True,
         bind_graphstate_for_aot: bool = False,
         verbose: bool = False,
-        enable_overlap_execution: bool = False,
+        enable_overlap_execution: bool = True,
         enable_sampler_metrics: bool = False,
+        enable_window_aware_runtime_cap: bool = False,
     ):
         """Initialize the model runner.
 
@@ -217,6 +274,8 @@ class eSurgeRunner:
             hbm_utilization: Target cache-memory utilization ratio.
             page_size: KV page size used by cache metadata.
             max_model_len: Maximum sequence length.
+            max_num_batched_tokens: Maximum scheduler token budget used for
+                window-aware runtime-cap estimation.
             min_input_pad: Minimum request-count bucket.
             min_token_pad: Optional minimum token bucket size.
             max_num_seqs: Maximum concurrent sequences.
@@ -229,6 +288,10 @@ class eSurgeRunner:
             verbose: Enable verbose execution logs.
             enable_overlap_execution: Enable overlap execution path.
             enable_sampler_metrics: Enable sampler-side metrics.
+            enable_window_aware_runtime_cap: Whether to derive the runtime
+                request cap from the model's live KV-window page demand.
+                When False, the runner falls back to the cache metadata's
+                heuristic request cap instead.
         """
         self.model = model.esurge_compatible_model
         logger.debug(f"Initializing eSurgeRunner with {max_model_len=}, {max_num_seqs=}")
@@ -272,12 +335,19 @@ class eSurgeRunner:
                 page_size=page_size,
                 max_length=max_model_len,
             )
+        self.max_num_batched_tokens = (
+            int(max_model_len)
+            if max_num_batched_tokens is None
+            else max(1, min(int(max_num_batched_tokens), int(max_model_len)))
+        )
+        self.enable_window_aware_runtime_cap = bool(enable_window_aware_runtime_cap)
+        self.max_model_len = max_model_len
+        self.kv_cache_groups = self._build_kv_cache_groups()
+        self.window_aware_runtime_estimate = self._apply_window_aware_runtime_cap(self.max_num_batched_tokens)
         self.max_num_seq_buckets = self._init_seq_buckets(max_num_seq_buckets, max_num_seqs, min_input_pad)
         self.max_num_seqs = max_num_seqs
         self.max_num_reqs = self.max_num_seq_buckets[-1]
         self.async_scheduling = bool(async_scheduling)
-
-        self.max_model_len = max_model_len
         self.min_input_pad = max(min_input_pad, self.max_num_seq_buckets[0])
         self.page_size = int(self.metadata.page_size)
         self.max_pages_per_req = int(self.metadata.max_num_pages_per_req)
@@ -323,6 +393,123 @@ class eSurgeRunner:
         self._executor: typing.Any = None  # ThreadPoolExecutor, typed as Any to avoid circular import
         logger.debug("eSurgeRunner initialization complete")
         self._log_startup_summary()
+
+    def _build_kv_cache_groups(self):
+        """Build cache-group specs for runtime-cap and scheduler estimation.
+
+        Inspects the model's text config to determine KV head count and head
+        dimension, then delegates to ``create_kv_cache_specs_from_config`` to
+        produce one ``CacheGroupSpec`` per distinct attention type. MLA models
+        return an empty list because their cache layout is handled separately.
+
+        Returns:
+            List of ``CacheGroupSpec`` objects, one per attention type group.
+            Empty for MLA-based models.
+        """
+
+        text_config = self.model.config.get_text_config()
+        attn_mechanism = str(getattr(text_config, "attn_mechanism", "") or "").lower()
+        if "multi_latent" in attn_mechanism:
+            return []
+
+        metadata = self.metadata
+        num_kv_heads = getattr(text_config, "num_kv_heads", None)
+        if isinstance(num_kv_heads, (list, tuple)):
+            num_kv_heads = int(num_kv_heads[0]) if len(num_kv_heads) > 0 else None
+        if num_kv_heads is None:
+            num_kv_heads = getattr(text_config, "num_key_value_heads", None)
+        if num_kv_heads is None:
+            num_kv_heads = getattr(text_config, "num_attention_heads", None)
+        if num_kv_heads is None or int(num_kv_heads) <= 0:
+            num_kv_heads = getattr(metadata, "num_kv_heads", 1)
+
+        head_size = getattr(text_config, "head_dim", None)
+        if head_size is None or int(head_size) <= 0:
+            hidden_size = getattr(text_config, "hidden_size", None)
+            num_attention_heads = getattr(text_config, "num_attention_heads", None)
+            if hidden_size and num_attention_heads:
+                head_size = int(hidden_size) // int(num_attention_heads)
+        if head_size is None or int(head_size) <= 0:
+            head_size = getattr(metadata, "k_headdim", None) or getattr(metadata, "head_dim", None) or 1
+
+        return create_kv_cache_specs_from_config(
+            config=text_config,
+            page_size=int(metadata.page_size),
+            num_kv_heads=int(num_kv_heads),
+            head_size=int(head_size),
+            dtype=metadata.kvdtype,
+            use_mla=False,
+        )
+
+    def _get_full_attention_page_table_index(self) -> int:
+        """Return the page table group index for the full-attention cache group.
+
+        For mixed-attention models (e.g., sliding window + full attention), the
+        kernel must receive the full-attention group's page table because it
+        keeps all pages valid. Sliding-window groups evict old pages, leaving
+        null entries that would cause VMEM out-of-range errors on TPU.
+
+        Returns:
+            0 if no cache groups are defined (single-group model), otherwise
+            the index of the first FullAttentionSpec group.
+        """
+        from ..core.interface import FullAttentionSpec
+
+        for i, group in enumerate(self.kv_cache_groups):
+            if isinstance(group.kv_cache_spec, FullAttentionSpec):
+                return i
+        return 0
+
+    def _clear_window_aware_runtime_cap_metadata(self) -> None:
+        """Reset runtime-cap metadata to the default non-window-aware state."""
+        for attr_name in (
+            "window_aware_max_num_seqs",
+            "window_aware_pages_per_request",
+            "window_aware_max_num_batched_tokens",
+        ):
+            if hasattr(self.metadata, attr_name):
+                setattr(self.metadata, attr_name, -1)
+
+    def _apply_window_aware_runtime_cap(self, max_num_batched_tokens: int):
+        """Attach a hybrid full/sliding runtime-cap estimate to cache metadata.
+
+        Calls ``estimate_runtime_page_budget`` using the runner's page pool and
+        cache groups, then writes the resulting concurrency limits back onto
+        ``self.metadata`` so the scheduler can use them.
+
+        Args:
+            max_num_batched_tokens: Maximum number of tokens batched in one
+                decode step; used to size each request's page demand.
+
+        Returns:
+            The ``RuntimePageBudgetEstimate`` if estimation succeeds, or
+            ``None`` if no cache groups are available or an error occurs.
+        """
+        self._clear_window_aware_runtime_cap_metadata()
+
+        if not self.enable_window_aware_runtime_cap:
+            logger.debug("Window-aware runtime-cap estimation disabled; using heuristic request caps.")
+            return None
+
+        if not self.kv_cache_groups:
+            return None
+
+        try:
+            estimate = estimate_runtime_page_budget(
+                num_pages=int(getattr(self.metadata, "num_pages", 0) or 0),
+                kv_cache_groups=list(self.kv_cache_groups),
+                max_model_len=int(self.max_model_len),
+                max_num_batched_tokens=int(max_num_batched_tokens),
+                data_parallel_size=int(getattr(self.metadata, "data_parallel_size", 1) or 1),
+            )
+        except Exception as exc:
+            logger.debug("Window-aware runtime-cap estimation skipped: %s", exc, exc_info=True)
+            return None
+
+        self.metadata.window_aware_max_num_seqs = int(estimate.max_num_seqs)
+        self.metadata.window_aware_pages_per_request = int(estimate.pages_per_request)
+        self.metadata.window_aware_max_num_batched_tokens = int(max_num_batched_tokens)
+        return estimate
 
     def _log_startup_summary(self) -> None:
         """Log a consolidated startup summary to the logger.
@@ -400,12 +587,15 @@ class eSurgeRunner:
                 seq_cap = int((n_pages * p_size) / 1000)
                 cache_parts.append(f"pages={n_pages:,} ({p_size} tok/page)")
                 cache_parts.append(f"sequence_capacity={seq_cap:,}K")
+            window_pages_per_req = int(getattr(self.metadata, "window_aware_pages_per_request", -1) or -1)
+            if window_pages_per_req > 0:
+                cache_parts.append(f"pages/request={window_pages_per_req}")
             if hasattr(self.metadata, "get_max_num_seqs"):
                 try:
-                    no_window_cap = min(int(self.metadata.get_max_num_seqs()), int(self.max_num_reqs))
-                    cache_parts.append(f"no_window_concurrency={no_window_cap:,} reqs")
+                    max_len_cap = min(int(self.metadata.get_max_num_seqs()), int(self.max_num_reqs))
+                    cache_parts.append(f"max_len_concurrency={max_len_cap:,} reqs")
                 except Exception:
-                    logger.debug("Could not compute no-window concurrency summary", exc_info=True)
+                    logger.debug("Could not compute runtime concurrency summary", exc_info=True)
 
             lines = [
                 f"Model : {model_type}",
@@ -588,12 +778,13 @@ class eSurgeRunner:
         logger.debug(
             f"Creating sequence buffer for max_num_reqs={self.max_num_reqs}, max_model_len={self.max_model_len}"
         )
+        num_cache_groups = max(1, len(self.kv_cache_groups))
         self.sequence_buffer = SequenceBuffer(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.max_num_tokens,
             vocab_size=self.model.config.get_text_config().vocab_size,
-            page_sizes=[self.metadata.page_size],
+            page_sizes=[self.metadata.page_size] * num_cache_groups,
             sharding=self._empty_sharding,
         )
 
@@ -734,6 +925,7 @@ class eSurgeRunner:
         np.ndarray,
         np.ndarray,
         np.ndarray,
+        list[dict[int, float] | None],
         int | None,
     ]:
         """Return CPU-side state views aligned to the active scheduler window.
@@ -794,9 +986,15 @@ class eSurgeRunner:
                 top_p_window_cpu[:row_count] = self.sequence_buffer.top_p[start_index:end_index]
                 top_k_window_cpu[:row_count] = self.sequence_buffer.top_k[start_index:end_index]
                 min_p_window_cpu[:row_count] = self.sequence_buffer.min_p[start_index:end_index]
-                frequency_penalties_window_cpu[:row_count] = self.sequence_buffer.frequency_penalties[start_index:end_index]
-                presence_penalties_window_cpu[:row_count] = self.sequence_buffer.presence_penalties[start_index:end_index]
-                repetition_penalties_window_cpu[:row_count] = self.sequence_buffer.repetition_penalties[start_index:end_index]
+                frequency_penalties_window_cpu[:row_count] = self.sequence_buffer.frequency_penalties[
+                    start_index:end_index
+                ]
+                presence_penalties_window_cpu[:row_count] = self.sequence_buffer.presence_penalties[
+                    start_index:end_index
+                ]
+                repetition_penalties_window_cpu[:row_count] = self.sequence_buffer.repetition_penalties[
+                    start_index:end_index
+                ]
 
         # The batch-preparer page-table cache key must distinguish different
         # row windows that share the same underlying page-table version.
@@ -1139,7 +1337,13 @@ class eSurgeRunner:
 
         logger.info("Reinitializing eSurgeRunner ragged KV cache pages")
         text_config = self.model.config.get_text_config()
-        quantizer = self.model._quant_class(quantization_config=text_config.kv_cache_quantization_config)
+        kv_quant_cfg = text_config.kv_cache_quantization_config
+        # TurboQuant handles compression internally; skip standard quantizer
+        _is_turboquant = isinstance(kv_quant_cfg, TurboQuantConfig)
+        if _is_turboquant:
+            quantizer = self.model._quant_class(quantization_config=None)
+        else:
+            quantizer = self.model._quant_class(quantization_config=kv_quant_cfg)
 
         self.executor_manager.kv_pages = self.model.init_operations_cache(
             batch_size=int(self.max_num_reqs),
@@ -1494,19 +1698,17 @@ class eSurgeRunner:
         if self._pre_async_results is None:
             return
 
-        pre_req_ids = self._pre_async_results.req_ids
-        pre_next_tokens = self._pre_async_results.next_tokens
+        pre_windows = self._pre_async_results.windows
         pre_request_seq_lens = self._pre_async_results.request_seq_lens
-        pre_discard_indices = self._pre_async_results.discard_sampled_tokens_req_indices
 
-        # Block until tokens are ready (async copy to host completes)
-        next_tokens_cpu = np.asarray(jax.device_get(pre_next_tokens))
-        selected_token_ids = np.expand_dims(next_tokens_cpu[: len(pre_req_ids)], 1)
-
-        # Mask out discarded tokens
-        valid_sampled_token_ids = [token_id for token_id in selected_token_ids]
-        for i in pre_discard_indices:
-            valid_sampled_token_ids[i] = np.array([])
+        valid_sampled_token_ids: list[np.ndarray] = []
+        for window in pre_windows:
+            next_tokens_cpu = np.asarray(window.sampled_token_ids)
+            for row_pos, is_valid in zip(window.row_positions, window.valid_mask, strict=False):
+                if not is_valid:
+                    valid_sampled_token_ids.append(np.array([], dtype=np.int32))
+                    continue
+                valid_sampled_token_ids.append(np.array([int(next_tokens_cpu[row_pos])], dtype=np.int32))
 
         # Apply tokens to sequence buffer
         for pre_req_idx, _, req_state, _ in pre_request_seq_lens:
@@ -1515,8 +1717,8 @@ class eSurgeRunner:
                 continue
 
             # Check if request is still active
-            req_id = pre_req_ids[pre_req_idx]
-            if req_id not in self.sequence_buffer.req_id_to_index:
+            req_id = req_state.req_id
+            if req_id not in self.sequence_buffer.req_id_to_index or req_id not in self.requests:
                 continue
 
             req_idx = self.sequence_buffer.req_id_to_index[req_id]
@@ -1702,7 +1904,12 @@ class eSurgeRunner:
                     i += 1
                     j -= 1
 
-    def _execute_model_impl(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
+    def _execute_model_impl(
+        self,
+        scheduler_output: SchedulerOutput,
+        *,
+        return_async_output: bool = False,
+    ) -> ModelRunnerOutput | _AsyncExecutionHandle:
         """Execute the model on scheduled requests.
 
         Main entry point for model execution. Processes all scheduled requests
@@ -1722,7 +1929,11 @@ class eSurgeRunner:
                 - Finished/new/cached request information
 
         Returns:
-            ModelRunnerOutput: Contains:
+            ModelRunnerOutput or _AsyncExecutionHandle. The async handle is used
+            by overlap execution to defer the host block while preserving
+            same-thread TPU dispatch.
+
+            ModelRunnerOutput contains:
                 - req_ids: List of processed request IDs
                 - sampled_token_ids: Generated tokens per request
                 - logprobs: Log probabilities (if requested)
@@ -1775,6 +1986,7 @@ class eSurgeRunner:
                 num_nans_in_logits=None,
             )
 
+        needs_async_output = return_async_output or scheduler_output.async_scheduling
         start_index = 0
         total_step_time = 0.0
         total_post_proc_time = 0.0
@@ -1782,6 +1994,8 @@ class eSurgeRunner:
         req_ids_all: list[str] = []
         sampled_token_ids_all: list[list[int]] = []
         token_logprobs: dict[str, float] = {}
+        async_windows: list[AsyncWindowResult] = []
+        sync_finalize_entries: list[tuple[CachedRequestState | None, int | None, int | None]] = []
 
         # Window-level perf aggregation (a single scheduler step can span multiple windows).
         num_windows = 0
@@ -1796,7 +2010,6 @@ class eSurgeRunner:
         total_d2h_time = 0.0
         token_buckets_used: set[int] = set()
         req_buckets_used: set[int] = set()
-        tokens_np: np.ndarray = np.array([], dtype=np.int32)
         request_seq_lens: list[tuple[int, int, CachedRequestState, int]] = []
         discard_sampled_tokens_req_indices: list[int] = []
 
@@ -1865,6 +2078,8 @@ class eSurgeRunner:
                 window_row_indices_cpu.fill(0)
                 window_row_indices_cpu[:num_reqs] = window_row_indices
 
+                if jax.process_count() > 1:
+                    req_num_tokens_np = multihost_utils.broadcast_one_to_all(req_num_tokens_np)
                 self.req_num_tokens_full_buf = jax.device_put(req_num_tokens_np, self._empty_sharding)
 
             mrope_position_ids_cpu: np.ndarray | None = None
@@ -1977,9 +2192,9 @@ class eSurgeRunner:
 
                     off += n
 
-            # Get page table as CPU array (already on CPU, no transfer needed)
-            page_table_cpu = self.sequence_buffer.page_table[0].get_cpu_tensor()
-            page_table_version = getattr(self.sequence_buffer.page_table[0], "cpu_version", None)
+            _pt_group_idx = self._get_full_attention_page_table_index()
+            page_table_cpu = self.sequence_buffer.page_table[_pt_group_idx].get_cpu_tensor()
+            page_table_version = getattr(self.sequence_buffer.page_table[_pt_group_idx], "cpu_version", None)
 
             # Preflight check: surface req_id + row details for DP-local page mismatches.
             if dp_size > 1:
@@ -2047,7 +2262,7 @@ class eSurgeRunner:
             step_start = time.time()
             (
                 out_tokens_win,
-                valid_mask_win,
+                _valid_mask_win,
                 self.input_ids_buf,
                 self.position_ids_buf,
                 _hidden_states,
@@ -2078,6 +2293,7 @@ class eSurgeRunner:
                 prefill_embeds_mask_cpu=prefill_embeds_mask_cpu,
                 visual_pos_masks_cpu=visual_pos_masks_cpu,
                 deepstack_visual_embeds_cpu=deepstack_visual_embeds_cpu,
+                wait_for_outputs=not needs_async_output,
             )
 
             # account for device time (blocking already happened inside execute())
@@ -2093,62 +2309,155 @@ class eSurgeRunner:
             token_buckets_used.add(int(window_metrics.get("token_bucket", num_tokens_static)))
             req_buckets_used.add(int(window_metrics.get("padded_num_reqs", padded_num_reqs)))
 
+            up_wtime = time.time()
+            window_entries: list[tuple[int, str, CachedRequestState | None, int | None, int | None, bool]] = []
+            for i, rid in enumerate(req_ids_window):
+                if rid is None:
+                    continue
+
+                out_idx = len(req_ids_all)
+                req_ids_all.append(rid)
+
+                req_state = self.requests.get(rid)
+                req_idx = self.sequence_buffer.req_id_to_index.get(rid) if req_state is not None else None
+                seq_len: int | None = None
+                is_valid = False
+
+                if req_state is not None:
+                    seq_len = req_state.num_computed_tokens + scheduler_output.num_scheduled_tokens.get(rid, 0)
+                    global_row_index = int(window_row_indices[i])
+                    target_len = int(self.sequence_buffer.num_tokens[global_row_index])
+                    is_valid = int(scheduled_list[i]) > 0 and seq_len >= target_len
+
+                window_entries.append((i, rid, req_state, req_idx, seq_len, is_valid))
+
+                if scheduler_output.async_scheduling:
+                    if is_valid:
+                        if req_state is None or req_idx is None or seq_len is None:
+                            raise RuntimeError(f"Missing runner state for async request {rid!r}")
+                        request_seq_lens.append((out_idx, req_idx, req_state, seq_len))
+                    else:
+                        discard_sampled_tokens_req_indices.append(out_idx)
+                elif return_async_output:
+                    sync_finalize_entries.append((req_state, req_idx, seq_len))
+
+            if needs_async_output:
+                d2h_start = time.time()
+                row_positions = [row_pos for row_pos, *_rest in window_entries]
+                async_windows.append(
+                    AsyncWindowResult(
+                        req_ids=[rid for _, rid, *_rest in window_entries],
+                        row_positions=row_positions,
+                        sampled_token_ids=jax.copy_to_host_async(out_tokens_win[:num_reqs]),
+                        valid_mask=[is_valid for *_, is_valid in window_entries],
+                        token_logprobs=(
+                            jax.copy_to_host_async(_logits[:num_reqs])
+                            if self.enable_sampler_metrics and _logits is not None
+                            else None
+                        ),
+                    )
+                )
+                total_d2h_time += time.time() - d2h_start
+                total_post_proc_time += time.time() - up_wtime
+                start_index = next_start_index
+                continue
+
             d2h_start = time.time()
             tokens_np = np.asarray(out_tokens_win)
-            valid_np = np.asarray(valid_mask_win)
             _logits_maybe: typing.Any | None = _logits
             logits_np = np.asarray(_logits_maybe) if self.enable_sampler_metrics and _logits_maybe is not None else None
             total_d2h_time += time.time() - d2h_start
 
-            # Track for async scheduling
-            request_seq_lens: list[tuple[int, int, CachedRequestState, int]] = []
-            discard_sampled_tokens_req_indices: list[int] = []
-
-            up_wtime = time.time()
-            for i, rid in enumerate(req_ids_window):
-                if rid is None:
-                    continue
-                req_ids_all.append(rid)
-
-                if valid_np[i]:
-                    tid = int(tokens_np[i])
-
-                    # Get request state and sequence length
-                    if rid in self.requests:
-                        req_state = self.requests[rid]
-                        seq_len = req_state.num_computed_tokens + scheduler_output.num_scheduled_tokens.get(rid, 0)
-
-                        req_idx = self.sequence_buffer.req_id_to_index.get(rid)
-                        if req_idx is not None and 0 <= seq_len < self.max_model_len:
-                            self.sequence_buffer.token_ids[req_idx, seq_len] = tid
-
-                        # Check if async scheduling is enabled
-                        if scheduler_output.async_scheduling:
-                            # Async mode: don't append yet, will be done in next iteration
-                            if req_idx is None:
-                                raise RuntimeError(f"Missing sequence-buffer row for active request {rid!r}")
-                            request_seq_lens.append((i, req_idx, req_state, seq_len))
-                        else:
-                            # Sync mode: append immediately
-                            sampled_token_ids_all.append([tid])
-                            req_state.output_token_ids.append(tid)
-                    else:
-                        # No request state, append in sync mode
-                        sampled_token_ids_all.append([tid])
-
-                    if self.enable_sampler_metrics and logits_np is not None and i < logits_np.shape[0]:
-                        try:
-                            token_logprobs[rid] = logits_np[i]
-                        except Exception:
-                            pass
-                else:
+            for row_pos, rid, req_state, req_idx, seq_len, is_valid in window_entries:
+                if not is_valid:
                     sampled_token_ids_all.append([])
-                    discard_sampled_tokens_req_indices.append(i)
+                    continue
 
-            up_wtime_took = time.time() - up_wtime
-            total_post_proc_time += up_wtime_took
+                tid = int(tokens_np[row_pos])
+                if req_state is not None and seq_len is not None:
+                    if req_idx is not None and 0 <= seq_len < self.max_model_len:
+                        self.sequence_buffer.token_ids[req_idx, seq_len] = tid
+                    sampled_token_ids_all.append([tid])
+                    req_state.output_token_ids.append(tid)
+                else:
+                    sampled_token_ids_all.append([tid])
+
+                if self.enable_sampler_metrics and logits_np is not None and row_pos < logits_np.shape[0]:
+                    try:
+                        token_logprobs[rid] = logits_np[row_pos]
+                    except Exception:
+                        pass
+
+            total_post_proc_time += time.time() - up_wtime
 
             start_index = next_start_index
+
+        req_id_to_row_index = {
+            rid: int(req_idx)
+            for rid in req_ids_all
+            if (req_idx := self.sequence_buffer.req_id_to_index.get(rid)) is not None
+        }
+        req_id_to_out_index = {rid: i for i, rid in enumerate(req_ids_all)}
+
+        final_output: ModelRunnerOutput | _AsyncExecutionHandle
+        if needs_async_output:
+            if scheduler_output.async_scheduling:
+                self._update_placeholder(
+                    discard_sampled_tokens_req_indices,
+                    request_seq_lens,
+                )
+                self._pre_async_results = AsyncPreResults(
+                    windows=async_windows,
+                    request_seq_lens=request_seq_lens,
+                )
+
+            def _finalize_sync_runner_state(sampled_token_ids: list[list[int]]) -> None:
+                for sampled_ids, entry in zip(sampled_token_ids, sync_finalize_entries, strict=False):
+                    req_state, req_idx, seq_len = entry
+                    if not sampled_ids or req_state is None or seq_len is None:
+                        continue
+                    tid = int(sampled_ids[-1])
+                    if req_idx is not None and 0 <= seq_len < self.max_model_len:
+                        self.sequence_buffer.token_ids[req_idx, seq_len] = tid
+                    req_state.output_token_ids.append(tid)
+
+            async_output = _AsyncExecutionHandle(
+                model_runner_output=ModelRunnerOutput(
+                    req_ids=req_ids_all,
+                    req_id_to_index=req_id_to_out_index,
+                    req_id_to_row_index=req_id_to_row_index,
+                    sampled_token_ids=[],
+                    spec_token_ids=None,
+                    logprobs=None,
+                    prompt_logprobs_dict={rid: None for rid in req_ids_all},
+                    finished_sending=None,
+                    finished_recving=None,
+                    token_logprobs=None,
+                ),
+                windows=async_windows,
+                finalize=None if scheduler_output.async_scheduling else _finalize_sync_runner_state,
+            )
+            if return_async_output:
+                final_output = async_output
+            else:
+                d2h_finalize_start = time.time()
+                resolved_output = async_output.get_output()
+                total_d2h_time += time.time() - d2h_finalize_start
+                final_output = resolved_output
+                token_logprobs = resolved_output.token_logprobs or token_logprobs
+        else:
+            final_output = ModelRunnerOutput(
+                req_ids=req_ids_all,
+                req_id_to_index=req_id_to_out_index,
+                req_id_to_row_index=req_id_to_row_index,
+                sampled_token_ids=sampled_token_ids_all,
+                spec_token_ids=None,
+                logprobs=None,
+                prompt_logprobs_dict={rid: None for rid in req_ids_all},
+                finished_sending=None,
+                finished_recving=None,
+                token_logprobs=token_logprobs or None,
+            )
 
         metrics_start = time.time()
         metrics_collector = get_metrics_collector()
@@ -2252,62 +2561,7 @@ class eSurgeRunner:
             f"total={total_time * 1e3:.2f}ms"
         )
 
-        req_id_to_row_index = {
-            rid: int(req_idx)
-            for rid in req_ids_all
-            if (req_idx := self.sequence_buffer.req_id_to_index.get(rid)) is not None
-        }
-
-        # Handle async scheduling return
-        if scheduler_output.async_scheduling:
-            # Set placeholders for current batch
-            placeholder_req_id_to_index = self._update_placeholder(
-                discard_sampled_tokens_req_indices,
-                request_seq_lens,
-            )
-
-            # Async copy to host (non-blocking)
-            next_tokens_jax = jnp.array(tokens_np, dtype=jnp.int32)
-            next_tokens = jax.copy_to_host_async(next_tokens_jax)
-
-            # Store async results for next iteration
-            self._pre_async_results = AsyncPreResults(
-                req_ids=req_ids_all,
-                next_tokens=next_tokens,
-                request_seq_lens=request_seq_lens,
-                discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
-                placeholder_req_id_to_index=placeholder_req_id_to_index,
-            )
-
-            # Return immediately (non-blocking)
-            req_id_to_out_index = {rid: i for i, rid in enumerate(req_ids_all)}
-            return ModelRunnerOutput(
-                req_ids=req_ids_all,
-                req_id_to_index=req_id_to_out_index,
-                req_id_to_row_index=req_id_to_row_index,
-                sampled_token_ids=[],  # Empty, will be filled in next iteration
-                spec_token_ids=None,
-                logprobs=None,
-                prompt_logprobs_dict={rid: None for rid in req_ids_all},
-                finished_sending=None,
-                finished_recving=None,
-                token_logprobs=token_logprobs or None,
-            )
-
-        # Stable mapping for scheduler indexing
-        req_id_to_out_index = {rid: i for i, rid in enumerate(req_ids_all)}
-        return ModelRunnerOutput(
-            req_ids=req_ids_all,
-            req_id_to_index=req_id_to_out_index,
-            req_id_to_row_index=req_id_to_row_index,
-            sampled_token_ids=sampled_token_ids_all,
-            spec_token_ids=None,
-            logprobs=None,
-            prompt_logprobs_dict={rid: None for rid in req_ids_all},
-            finished_sending=None,
-            finished_recving=None,
-            token_logprobs=token_logprobs or None,
-        )
+        return final_output
 
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput:
         """Execute the model synchronously on scheduled requests.
@@ -2330,76 +2584,29 @@ class eSurgeRunner:
         """
         return self._execute_model_impl(scheduler_output)
 
-    def execute_model_async(self, scheduler_output: SchedulerOutput) -> Future[ModelRunnerOutput]:
-        """Execute model asynchronously in a background thread.
+    def execute_model_async(self, scheduler_output: SchedulerOutput) -> _AsyncExecutionHandle:
+        """Dispatch model work and defer the host-side token materialization.
 
-        This method enables async scheduling by executing the model in a separate
-        thread, allowing the caller to continue scheduling the next batch while
-        the current batch is being processed.
-
-        The async execution workflow:
-            1. Submit model execution to thread pool executor
-            2. Return immediately with a Future object
-            3. Caller can schedule next batch while this executes
-            4. Use wait_for_execution(future) to get results when needed
-
-        Args:
-            scheduler_output: Scheduling decisions for this iteration
-
-        Returns:
-            Future[ModelRunnerOutput]: Future that will contain the model output
-                when execution completes. Can be waited on using wait_for_execution().
-
-        Raises:
-            RuntimeError: If async execution is not enabled (executor not initialized)
-
-        Note:
-            This method requires async scheduling to be enabled and the executor
-            to be initialized. Initialize the executor by calling
-            initialize_async_executor() first.
-
-        Example:
-            >>> # Initialize async executor first
-            >>> runner.initialize_async_executor()
-            >>>
-            >>> # Execute asynchronously
-            >>> future = runner.execute_model_async(scheduler_output)
-            >>>
-            >>> # Do other work while model executes...
-            >>> next_schedule = scheduler.schedule()
-            >>>
-            >>> # Wait for current execution to finish
-            >>> output = runner.wait_for_execution(future)
+        TPU/JAX dispatch is already asynchronous on the calling thread. This
+        method exploits that by keeping execution on the scheduler thread,
+        returning an async handle once the device work and host copies have been
+        queued, and letting the lifecycle loop do scheduler prefetch work before
+        calling wait_for_execution().
         """
-        if self._executor is None:
-            raise RuntimeError(
-                "Async execution not enabled. Call initialize_async_executor() first "
-                "or check that async_scheduling is enabled in scheduler config."
-            )
-        return self._executor.submit(self._execute_model_impl, scheduler_output)
+        return self._execute_model_impl(scheduler_output, return_async_output=True)
 
     def initialize_async_executor(self) -> None:
-        """Initialize the thread pool executor for async model execution.
+        """Retained for API compatibility.
 
-        This method creates a single-threaded executor that will be used to
-        run model execution in the background, enabling async scheduling.
-
-        Side Effects:
-            - Creates self._executor as a ThreadPoolExecutor with 1 worker
-            - Existing executor is shutdown if present
-
-        Note:
-            This should be called before using execute_model_async().
-            The executor uses a single worker to maintain execution order.
+        Older overlap code used a background ThreadPoolExecutor here. TPU/JAX
+        proved unreliable when the compiled step ran on a different Python
+        thread, so overlap now uses same-thread async handles instead.
         """
         if self._executor is not None:
-            logger.debug("Shutting down existing executor before reinitializing")
+            logger.debug("Shutting down legacy async executor")
             self._executor.shutdown(wait=True)
-
-        from concurrent.futures import ThreadPoolExecutor
-
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eSurgeAsync")
-        logger.debug("Initialized async executor for model execution")
+            self._executor = None
+        logger.debug("Using same-thread async execution handles for overlap")
 
     def reset_state(self) -> None:
         """Clear sequence state and request bookkeeping.
@@ -2411,18 +2618,21 @@ class eSurgeRunner:
         self.sequence_buffer.clear()
         self._pre_async_results = None
 
-    def wait_for_execution(self, future: Future) -> ModelRunnerOutput:
+    def wait_for_execution(self, future: Future | _AsyncExecutionHandle) -> ModelRunnerOutput:
         """Wait for an async execution to complete and return the result.
 
         Args:
-            future: The Future object returned by execute_model_async()
+            future: The async handle returned by execute_model_async()
 
         Returns:
             ModelRunnerOutput: The completed model execution output
 
         Note:
-            This call blocks until the future completes.
+            This call blocks until sampled tokens have been copied to the host
+            and any deferred runner-side state updates have been applied.
         """
+        if isinstance(future, _AsyncExecutionHandle):
+            return future.get_output()
         return future.result()
 
     def shutdown(self) -> None:

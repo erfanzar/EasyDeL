@@ -83,9 +83,9 @@ from easydel.caching import (
     UnifiedAttentionCache,
     UnifiedAttentionCacheConfig,
 )
-from easydel.utils import ejit
+from easydel.utils import ejit, set_inference_mode
 
-from ..execution_types import BatchMetadata, ModelStepOutputs, StepFunctionInputs
+from ..execution_types import BackboneOutputs, BatchMetadata, ModelStepOutputs, StepFunctionInputs
 
 if tp.TYPE_CHECKING:
     from easydel.infra import EasyDeLBaseModule
@@ -96,8 +96,8 @@ class ModelStepExecutor:
 
     The ModelStepExecutor manages compilation and execution of the model
     forward pass, which computes hidden states and logits while updating
-    the paged KV cache. It maintains an LRU cache of compiled function
-    variants for different input dimensions.
+    the paged KV cache. It retains compiled function variants for different
+    input dimensions until the cache is explicitly cleared.
 
     The executor separates graph definition (static model structure) from
     graph state (weights) and graph other (auxiliary data), allowing weight
@@ -166,8 +166,8 @@ class ModelStepExecutor:
                 variants with graphstate/graphother closed over as constants
                 (runtime call signature is preserved). This enables weight-
                 concrete kernel policies (e.g. TPU predecode-once). Default: False.
-            cache_capacity: Maximum number of compiled variants to cache.
-                Defaults to 64. Uses LRU eviction when full.
+            cache_capacity: Deprecated compatibility argument. Compiled
+                variants are retained until ``clear_cache()`` is called.
         """
         self.model = model
         self.mesh = mesh
@@ -179,98 +179,100 @@ class ModelStepExecutor:
         self._empty_sharding = empty_sharding
         self.use_aot_forward = bool(use_aot_forward)
         self.bind_graphstate_for_aot = bool(bind_graphstate_for_aot)
-        self._cache_capacity = int(cache_capacity)
+        del cache_capacity
 
-        self._model_step_fn = self._build_model_step_fn(
+        self._backbone_fn = self._build_backbone_fn(
             kv_pages_template=kv_pages_template,
             graphstate_template=graphstate_template,
             graphother_template=graphother_template,
         )
+        self._lm_head_fn = self._build_lm_head_fn(
+            graphstate_template=graphstate_template,
+            graphother_template=graphother_template,
+        )
+        # Backbone cache: keyed by (num_tokens, "backbone", mode)
+        self._backbone_cache: OrderedDict[tuple[int, str, str], tp.Any] = OrderedDict()
+        # LM-head cache: keyed by (padded_num_reqs, "lm_head", mode)
+        self._lm_head_cache: OrderedDict[tuple[int, str, str], tp.Any] = OrderedDict()
+        # Legacy combined cache (kept for backward compat with tests)
         self._cache: OrderedDict[tuple[int, int, str, str], tp.Any] = OrderedDict()
 
     def clear_cache(self) -> None:
-        """Clear all cached compiled functions.
-
-        Removes all entries from the compilation cache, forcing recompilation
-        on subsequent calls. Useful when model weights change significantly
-        or when memory needs to be freed.
-        """
+        """Clear all cached compiled functions."""
+        self._backbone_cache.clear()
+        self._lm_head_cache.clear()
         self._cache.clear()
 
-    def _cache_put(self, key: tuple[int, int, str, str], value: tp.Any) -> None:
-        """Add a compiled function to the cache with LRU eviction.
+    @staticmethod
+    def _cache_store(cache: OrderedDict, key, value) -> None:
+        cache[key] = value
+        cache.move_to_end(key)
 
-        Args:
-            key: Cache key tuple (num_tokens, padded_num_reqs, "model", mode).
-            value: Compiled function to cache.
-
-        Note:
-            If the cache exceeds capacity, the least recently used entry
-            is evicted.
-        """
-        self._cache[key] = value
-        self._cache.move_to_end(key)
-        if len(self._cache) > self._cache_capacity:
-            self._cache.popitem(last=False)
-
-    def _cache_get(self, key: tuple[int, int, str, str]) -> tp.Any:
-        """Retrieve a compiled function from the cache.
-
-        Args:
-            key: Cache key tuple (num_tokens, padded_num_reqs, "model", mode).
-
-        Returns:
-            The cached compiled function.
-
-        Raises:
-            KeyError: If the key is not in the cache.
-
-        Note:
-            This method updates the LRU ordering by moving the accessed
-            entry to the end.
-        """
-        value = self._cache[key]
-        self._cache.move_to_end(key)
+    @staticmethod
+    def _cache_lookup(cache: OrderedDict, key):
+        value = cache[key]
+        cache.move_to_end(key)
         return value
 
-    def cache_keys(self) -> list[tuple[int, int, str, str]]:
-        """Get all keys currently in the cache.
+    def _cache_put(self, key: tuple[int, int, str, str], value: tp.Any) -> None:
+        self._cache_store(self._cache, key, value)
 
-        Returns:
-            List of cache key tuples.
-        """
-        return list(self._cache.keys())
+    def _cache_get(self, key: tuple[int, int, str, str]) -> tp.Any:
+        return self._cache_lookup(self._cache, key)
+
+    def cache_keys(self) -> list:
+        """Get all keys currently in backbone + lm_head caches."""
+        return list(self._backbone_cache.keys()) + list(self._lm_head_cache.keys())
 
     def has(self, key: tuple[int, int, str, str]) -> bool:
-        """Check if a key exists in the cache.
+        """Check if a (num_tokens, padded_num_reqs) pair is fully compiled."""
+        mode = key[3] if len(key) == 4 else ("aot" if self.use_aot_forward else "jit")
+        backbone_key = (key[0], "backbone", mode)
+        lm_head_key = (key[1], "lm_head", mode)
+        return backbone_key in self._backbone_cache and lm_head_key in self._lm_head_cache
 
-        Args:
-            key: Cache key tuple to check.
+    def has_backbone(self, num_tokens: int) -> bool:
+        mode = "aot" if self.use_aot_forward else "jit"
+        return (int(num_tokens), "backbone", mode) in self._backbone_cache
 
-        Returns:
-            True if the key is in the cache, False otherwise.
-        """
-        return key in self._cache
+    def has_lm_head(self, padded_num_reqs: int) -> bool:
+        mode = "aot" if self.use_aot_forward else "jit"
+        return (int(padded_num_reqs), "lm_head", mode) in self._lm_head_cache
 
     def get_compiled(self, *, num_tokens: int, padded_num_reqs: int) -> tp.Any:
-        """Retrieve a pre-compiled model step function for given dimensions.
+        """Retrieve pre-compiled backbone + lm_head as a combined callable.
 
-        Args:
-            num_tokens: Number of tokens (for bucket selection).
-            padded_num_reqs: Padded request count (for bucket selection).
-
-        Returns:
-            Compiled model step function matching the specified dimensions.
-            For AOT mode, returns the compiled XLA executable. For JIT mode,
-            returns a wrapped function that uses the current graphdef.
-
-        Raises:
-            KeyError: If no compiled function exists for this configuration.
-                Call compile() first to create the cached entry.
+        Returns a cached wrapper that calls backbone then lm_head, producing
+        a ``ModelStepOutputs`` — same interface as before the split.
         """
         mode = "aot" if self.use_aot_forward else "jit"
-        key = (int(num_tokens), int(padded_num_reqs), "model", mode)
-        return self._cache_get(key)
+        backbone_fn = self._cache_lookup(self._backbone_cache, (int(num_tokens), "backbone", mode))
+        lm_head_fn = self._cache_lookup(self._lm_head_cache, (int(padded_num_reqs), "lm_head", mode))
+        _pnr = int(padded_num_reqs)
+
+        def _combined(graphstate_, graphother_, kv_pages_, metadata_):
+            backbone_out = backbone_fn(graphstate_, graphother_, kv_pages_, metadata_)
+            # Gather outside the compiled lm_head so it always sees
+            # [padded_num_reqs, hidden_dim] regardless of num_tokens.
+            gathered_hs = backbone_out.hidden_states[metadata_.logits_indices[:_pnr]]
+            logits = lm_head_fn(graphstate_, graphother_, gathered_hs)
+            return ModelStepOutputs(
+                kv_pages=backbone_out.kv_pages,
+                hidden_states=backbone_out.hidden_states,
+                logits=logits,
+            )
+
+        return _combined
+
+    def get_backbone(self, *, num_tokens: int) -> tp.Any:
+        """Retrieve a pre-compiled backbone function."""
+        mode = "aot" if self.use_aot_forward else "jit"
+        return self._cache_lookup(self._backbone_cache, (int(num_tokens), "backbone", mode))
+
+    def get_lm_head(self, *, padded_num_reqs: int) -> tp.Any:
+        """Retrieve a pre-compiled lm_head function."""
+        mode = "aot" if self.use_aot_forward else "jit"
+        return self._cache_lookup(self._lm_head_cache, (int(padded_num_reqs), "lm_head", mode))
 
     def compile(
         self,
@@ -282,96 +284,145 @@ class ModelStepExecutor:
         graphother: tp.Any,
         inputs: StepFunctionInputs,
     ) -> ModelStepOutputs | None:
-        """Compile and cache a model step function for specific dimensions.
+        """Compile backbone and lm_head for the given dimensions.
 
-        Creates a compiled model step function for the given token count and
-        request count, caching it for later retrieval via get_compiled().
-        Skips compilation if an entry already exists for this configuration.
-
-        Args:
-            num_tokens: Number of tokens for this compilation variant.
-            padded_num_reqs: Padded request count for this variant.
-            graphdef: Model graph definition (static structure).
-            graphstate: Model graph state (weights).
-            graphother: Model auxiliary graph data.
-            inputs: Step function inputs (used for shape inference of
-                kv_pages and batch_metadata).
-
-        Returns:
-            For JIT mode, returns the ModelStepOutputs from the warmup call.
-            For AOT mode, returns None (no warmup call is made).
-
-        Note:
-            The graphdef is stored as an instance attribute so that JIT-mode
-            wrappers can follow weight updates without recompilation.
+        The backbone is keyed by ``num_tokens`` only; the lm_head by
+        ``padded_num_reqs`` only.  Each is skipped if already cached.
         """
-        # Keep graphdef as a mutable attribute so JIT-mode wrappers can follow updates.
+        self.graphdef = graphdef
+        backbone_out = self.compile_backbone(
+            num_tokens=num_tokens,
+            graphdef=graphdef,
+            graphstate=graphstate,
+            graphother=graphother,
+            inputs=inputs,
+        )
+        self.compile_lm_head(
+            padded_num_reqs=padded_num_reqs,
+            graphdef=graphdef,
+            graphstate=graphstate,
+            graphother=graphother,
+            inputs=inputs,
+        )
+        return backbone_out
+
+    def compile_backbone(
+        self,
+        *,
+        num_tokens: int,
+        graphdef: tp.Any,
+        graphstate: tp.Any,
+        graphother: tp.Any,
+        inputs: StepFunctionInputs,
+    ) -> BackboneOutputs | None:
+        """Compile the backbone (transformer forward) for a token bucket.
+
+        Keyed by ``num_tokens`` only — independent of ``padded_num_reqs``.
+        """
         self.graphdef = graphdef
         mode = "aot" if self.use_aot_forward else "jit"
-        key = (int(num_tokens), int(padded_num_reqs), "model", mode)
-        if key in self._cache:
+        key = (int(num_tokens), "backbone", mode)
+        if key in self._backbone_cache:
             return None
 
         if self.use_aot_forward:
             if self.bind_graphstate_for_aot:
 
-                def _bound_step(kv_pages_, metadata_):
-                    return self._model_step_fn(graphdef, graphstate, graphother, kv_pages_, metadata_)
+                def _bound_backbone(kv_pages_, metadata_):
+                    return self._backbone_fn(graphdef, graphstate, graphother, kv_pages_, metadata_)
 
-                compiled_bound = jax.jit(_bound_step).lower(inputs.kv_pages, inputs.batch_metadata).compile()
+                compiled_bound = jax.jit(_bound_backbone).lower(inputs.kv_pages, inputs.batch_metadata).compile()
 
-                def _wrapped_bound(graphstate_, graphother_, kv_pages_, metadata_):
+                def _wrapped_bound_backbone(graphstate_, graphother_, kv_pages_, metadata_):
                     del graphstate_, graphother_
                     return compiled_bound(kv_pages_, metadata_)
 
-                self._cache_put(key, _wrapped_bound)
+                self._cache_store(self._backbone_cache, key, _wrapped_bound_backbone)
             else:
-                compiled = self._model_step_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
+                compiled = self._backbone_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
                     *(graphdef, graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
                 ).compile()
-                self._cache_put(key, compiled)
+                self._cache_store(self._backbone_cache, key, compiled)
             return None
 
-        def wrapped(graphstate_, graphother_, kv_pages_, metadata_):
-            """Execute the model step function and trigger JIT tracing on first call.
+        def wrapped_backbone(graphstate_, graphother_, kv_pages_, metadata_):
+            return self._backbone_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
 
-            This wrapper is called once to produce the initial output and is then
-            cached so that subsequent calls use the JIT-compiled version.
-            """
-            return self._model_step_fn(self.graphdef, graphstate_, graphother_, kv_pages_, metadata_)
-
-        out = wrapped(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
-        self._cache_put(key, wrapped)
+        out = wrapped_backbone(graphstate, graphother, inputs.kv_pages, inputs.batch_metadata)
+        self._cache_store(self._backbone_cache, key, wrapped_backbone)
         return out
 
-    def _build_model_step_fn(
+    def compile_lm_head(
+        self,
+        *,
+        padded_num_reqs: int,
+        graphdef: tp.Any,
+        graphstate: tp.Any,
+        graphother: tp.Any,
+        inputs: StepFunctionInputs,
+        hidden_dim: int | None = None,
+        dtype: tp.Any = None,
+    ) -> None:
+        """Compile the lm_head for a request bucket.
+
+        Keyed by ``padded_num_reqs`` only — independent of ``num_tokens``.
+        """
+        self.graphdef = graphdef
+        mode = "aot" if self.use_aot_forward else "jit"
+        key = (int(padded_num_reqs), "lm_head", mode)
+        if key in self._lm_head_cache:
+            return
+
+        if hidden_dim is None:
+            hidden_dim = int(self.model.config.get_text_config().hidden_size)
+        if dtype is None:
+            dtype = self.model.dtype
+        # Input is pre-gathered: [padded_num_reqs, hidden_dim]
+        dummy_hs = jnp.zeros((int(padded_num_reqs), int(hidden_dim)), dtype=dtype)
+
+        if self.use_aot_forward:
+            if self.bind_graphstate_for_aot:
+
+                def _bound_lm_head(hs_):
+                    return self._lm_head_fn(graphdef, graphstate, graphother, hs_)
+
+                compiled_bound = jax.jit(_bound_lm_head).lower(dummy_hs).compile()
+
+                def _wrapped_bound_lm_head(graphstate_, graphother_, hs_):
+                    del graphstate_, graphother_
+                    return compiled_bound(hs_)
+
+                self._cache_store(self._lm_head_cache, key, _wrapped_bound_lm_head)
+            else:
+                compiled = self._lm_head_fn.lower(  # pyright: ignore[reportFunctionMemberAccess]
+                    *(graphdef, graphstate, graphother, dummy_hs)
+                ).compile()
+                self._cache_store(self._lm_head_cache, key, compiled)
+            return
+
+        def wrapped_lm_head(graphstate_, graphother_, hs_):
+            return self._lm_head_fn(self.graphdef, graphstate_, graphother_, hs_)
+
+        _ = wrapped_lm_head(graphstate, graphother, dummy_hs)
+        self._cache_store(self._lm_head_cache, key, wrapped_lm_head)
+
+    def _build_backbone_fn(
         self,
         *,
         kv_pages_template: HybridCache | RaggedPagesCache | UnifiedAttentionCache,
         graphstate_template: tp.Any,
         graphother_template: tp.Any,
-    ) -> tp.Callable[..., ModelStepOutputs]:
-        """Build the JIT-compiled model step function.
+    ) -> tp.Callable[..., BackboneOutputs]:
+        """Build the JIT-compiled backbone function (forward pass without lm_head).
 
-        Constructs the inner model step function that will be compiled and
-        cached. The function handles graph reconstruction, cache metadata
-        preparation, forward pass execution, and logits extraction.
-
-        Args:
-            kv_pages_template: Template KV cache for sharding inference.
-            graphstate_template: Template graph state for sharding inference.
-            graphother_template: Template graph other for sharding inference.
+        The backbone is compiled once per ``num_tokens`` bucket because its
+        input shapes depend only on the token-budget and fixed ``max_num_reqs``
+        arrays — *not* on ``padded_num_reqs``.
 
         Returns:
-            JIT-decorated model step function ready for compilation.
-
-        Note:
-            The returned function signature is:
-            (graphdef, graphstate, graphother, kv_pages, metadata)
-            -> ModelStepOutputs
-
-            The function uses the mesh context from self.model.mesh for
-            distributed execution.
+            JIT-decorated backbone function with signature:
+            ``(graphdef, graphstate, graphother, kv_pages, metadata)``
+            → ``BackboneOutputs``
         """
         max_num_reqs = int(self.max_num_reqs)
         num_reqs_max_model_len = min(int(self.metadata.get_max_num_seqs()), max_num_reqs)
@@ -394,10 +445,9 @@ class ModelStepExecutor:
 
         kv_pages_sharding = es.extract_shardings(kv_pages_template, self.mesh)
 
-        outputs_shardings = ModelStepOutputs(
+        backbone_out_shardings = BackboneOutputs(
             kv_pages=es.extract_shardings(kv_pages_template, self.mesh),
             hidden_states=self._empty_sharding,
-            logits=self._empty_sharding,
         )
 
         @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
@@ -409,15 +459,15 @@ class ModelStepExecutor:
                 kv_pages_sharding,
                 metadata_sharding,
             ),
-            out_shardings=outputs_shardings,
+            out_shardings=backbone_out_shardings,
         )
-        def _model_step(
+        def _backbone_step(
             graphdef,
             graphstate,
             graphother,
             kv_pages: HybridCache | RaggedPagesCache | UnifiedAttentionCache,
             metadata: BatchMetadata,
-        ) -> ModelStepOutputs:
+        ) -> BackboneOutputs:
             with self.model.mesh:
                 model: "EasyDeLBaseModule" = nn.merge(graphdef, graphstate, graphother)
                 input_ids_view = metadata.input_ids_buf
@@ -473,22 +523,68 @@ class ModelStepExecutor:
                     model_inputs = {"input_ids": None, "inputs_embeds": inputs_embeds}
                 else:
                     model_inputs = {"input_ids": jnp.expand_dims(input_ids_view, 0)}
-
-                output = model(
-                    **model_inputs,
-                    position_ids=position_ids,
-                    past_key_values=kv_pages,
-                    cache_metadata=cache_metadata,
-                    apply_lm_head=False,
-                    **external_inputs,
-                )
+                with set_inference_mode():
+                    output = model(
+                        **model_inputs,
+                        position_ids=position_ids,
+                        past_key_values=kv_pages,
+                        cache_metadata=cache_metadata,
+                        apply_lm_head=False,
+                        **external_inputs,
+                    )
                 hs = output.last_hidden_state.squeeze(0)
-                logits = model.apply_lm_head(hs[metadata.logits_indices])
 
-                return ModelStepOutputs(
+                return BackboneOutputs(
                     kv_pages=output.past_key_values,
                     hidden_states=hs,
-                    logits=logits,
                 )
 
-        return _model_step
+        return _backbone_step
+
+    def _build_lm_head_fn(
+        self,
+        *,
+        graphstate_template: tp.Any,
+        graphother_template: tp.Any,
+    ) -> tp.Callable[..., jax.Array]:
+        """Build the JIT-compiled lm_head function.
+
+        The lm_head gathers hidden states by ``logits_indices`` and projects
+        to vocab logits.  It is compiled per ``padded_num_reqs`` (cheap —
+        just a gather + matmul) while the backbone is compiled per
+        ``num_tokens`` (expensive — full transformer).
+
+        Returns:
+            JIT-decorated lm_head function with signature:
+            ``(graphdef, graphstate, graphother, gathered_hidden_states)``
+            → ``logits [padded_num_reqs, vocab_size]``
+
+        Note:
+            The gather ``hidden_states[logits_indices]`` is done *outside*
+            this function (in the ``_combined`` wrapper) so that the compiled
+            lm_head only sees ``[padded_num_reqs, hidden_dim]`` input —
+            independent of ``num_tokens``.
+        """
+
+        @ejit(  # pyright: ignore[reportUntypedFunctionDecorator]
+            static_argnums=(0,),
+            in_shardings=(
+                es.extract_shardings(graphstate_template, self.mesh),
+                es.extract_shardings(graphother_template, self.mesh),
+                self._empty_sharding,
+            ),
+            out_shardings=self._empty_sharding,
+        )
+        def _lm_head_step(
+            graphdef,
+            graphstate,
+            graphother,
+            gathered_hidden_states: jax.Array,
+        ) -> jax.Array:
+            with self.model.mesh:
+                # nn.merge only runs at trace/compile time (inside @ejit),
+                # not at inference runtime — XLA sees through it.
+                model: "EasyDeLBaseModule" = nn.merge(graphdef, graphstate, graphother)
+                return model.apply_lm_head(gathered_hidden_states)
+
+        return _lm_head_step

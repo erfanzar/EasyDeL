@@ -63,7 +63,7 @@ from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 from jaxtyping import Array, Float
 
-from easydel.axis import ATTN_DP
+from easydel.axis import ATTN_DP, resolve_attention_data_parallel_axis
 from easydel.caching.ragged_page.utils import kv_cache_update_jax
 
 from .._abstracts import BaseCache, BaseCacheConfig, BaseCacheView, unwrap_metadata
@@ -78,6 +78,11 @@ logger = get_logger(__name__)
 EMPTY = common_types.EMPTY
 KV_HEAD = common_types.KV_HEAD
 MODE_PREFILL = common_types.MODE_PREFILL
+
+
+def _attention_dp_axis(partition_manager: PartitionManager):
+    """Resolve the concrete mesh axis used for KV-page data parallelism."""
+    return resolve_attention_data_parallel_axis(partition_manager, mode=MODE_PREFILL)
 
 
 def cdiv(a: int, b: int) -> int:
@@ -253,6 +258,9 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
     page_size: int = field(pytree_node=False, default=128)
     num_pages: int = field(pytree_node=False, default=-1)
     max_num_pages_per_req: int = field(pytree_node=False, default=-1)
+    window_aware_max_num_seqs: int = field(pytree_node=False, default=-1)
+    window_aware_pages_per_request: int = field(pytree_node=False, default=-1)
+    window_aware_max_num_batched_tokens: int = field(pytree_node=False, default=-1)
 
     # Used by eSurge's slot-mapping padding logic (v2-style cache updates).
     num_slices_per_kv_cache_update_page: int = field(pytree_node=False, default=-1)
@@ -282,7 +290,7 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
         kv_head_axis = partition_manager.paxis.kv_head_axis
         kv_head_size = _mesh_axis_size(mesh, kv_head_axis)
         budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
-        page_axis_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
+        page_axis_size = _mesh_axis_size(mesh, _attention_dp_axis(partition_manager))
         available_alloc = budget * kv_head_size * page_axis_size
         logger.info(f"{kv_head_axis=} {kv_head_size=} {page_axis_size=} {budget=} {available_alloc=} {hbm_utilization=}")
         return available_alloc
@@ -333,7 +341,7 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
             raise ValueError("`page_size` must be positive")
         if max_model_length <= 0:
             raise ValueError("`max_model_length` must be positive")
-        data_parallel_size = _mesh_axis_size(mesh, partition_manager.paxis.data_parallel_axis)
+        data_parallel_size = _mesh_axis_size(mesh, _attention_dp_axis(partition_manager))
         if data_parallel_size > 1:
             logger.info(f"Scaling KV page budget by data-parallel page axis: {data_parallel_size=}.")
 
@@ -425,6 +433,9 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
         Returns:
             int: Estimated maximum concurrent sequences.
         """
+        if self.window_aware_max_num_seqs > 0:
+            return int(self.window_aware_max_num_seqs)
+
         # Same heuristic as RaggedPagesCacheConfig.
         num_page_per_req = cdiv(self.max_model_length, self.page_size)
         return 1024 * 1024 // 2 // num_page_per_req // 4
@@ -544,7 +555,7 @@ class UnifiedAttentionCacheView(BaseCacheView):
         key_tokens = key.reshape(-1, *key.shape[-2:]).astype(self.key_cache.dtype)
         value_tokens = value.reshape(-1, *value.shape[-2:]).astype(self.value_cache.dtype)
         data_parallel_size = max(1, int(getattr(self.metadata, "data_parallel_size", 1)))
-        data_parallel_axis = self.partition_manager.paxis.data_parallel_axis
+        data_parallel_axis = _attention_dp_axis(self.partition_manager)
         use_shardmap = data_parallel_size > 1
 
         def _update_pages(

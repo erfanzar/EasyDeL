@@ -1276,7 +1276,7 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         )
         return aux_loss + (aux_loss * self.config.router_aux_loss_coef)
 
-    def create_transformer_cache_config(self, batch_size: int, max_length: int):
+    def create_transformer_cache_config(self, batch_size: int, max_length: int, **kwargs):
         """Create cache configuration for MLA attention.
 
         MLA uses different dimensions for keys and values:
@@ -1354,7 +1354,10 @@ class DeepseekV3ForCausalLM(BaseCausalLMModule[DeepseekV3Model, DeepseekV3Config
         attn_mechanism = getattr(text_config, "attn_mechanism", None)
         if hasattr(attn_mechanism, "value"):
             attn_mechanism = attn_mechanism.value
-        is_mla_ragged = str(attn_mechanism) == "multi_latent_ragged_page_attention_v1"
+        is_mla_ragged = str(attn_mechanism) in (
+            "multi_latent_ragged_page_attention_v1",
+            "multi_latent_ragged_page_attention_v2",
+        )
         if is_mla_ragged:
             return MLARaggedPagesCacheConfig.create(
                 mesh=self.mesh,

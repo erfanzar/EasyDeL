@@ -128,7 +128,7 @@ class SchedulerConfig:
     max_num_seq_buckets: tuple[int, ...] | None = None
     """Optional explicit request-capacity buckets (e.g., (8, 16, 32, 64))."""
 
-    async_scheduling: bool = False
+    async_scheduling: bool = True
     """Enable async token sampling to overlap with next forward pass (30-40% latency reduction)."""
 
     def __post_init__(self):

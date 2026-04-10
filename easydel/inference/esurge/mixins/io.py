@@ -14,14 +14,23 @@
 
 from __future__ import annotations
 
+import typing as tp
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 from easydel.inference.sampling_params import SamplingParams
 
+from ...stream_protocol import (
+    RequestOutputLike,
+    StreamEventFrame,
+    iter_chat_completion_stream_responses,
+    iter_responses_stream_frames,
+)
+from ...typed_models import ResponsesFinalizationOptions
 from ..logger import logger
 
 if TYPE_CHECKING:
+    from ...openai_api_modules import ChatCompletionStreamResponse
     from ..esurge_engine import RequestOutput
 
 
@@ -600,6 +609,11 @@ class EngineIOMixin:
                 chat_template_kwargs=chat_template_kwargs,
             )
         else:
+            base_sampling_params = self._prepare_chat_sampling_params(
+                sampling_params or SamplingParams(max_tokens=128),
+                tools=tools,
+                tool_choice=tool_choice if isinstance(tool_choice, str) else None,
+            )
             prompt = self._format_chat_prompt(
                 messages,
                 tools=tools,
@@ -616,19 +630,85 @@ class EngineIOMixin:
             if stream:
                 return self.stream(
                     prompt,
-                    sampling_params=sampling_params,
+                    sampling_params=base_sampling_params,
                     request_id=request_id,
                     tool_parser_request=tool_parser_request,
                 )
             else:
                 outs = self.generate(
                     prompt,
-                    sampling_params=sampling_params,
+                    sampling_params=base_sampling_params,
                     request_id=request_id,
                     use_tqdm=False,
                     tool_parser_request=tool_parser_request,
                 )
                 return outs[0]
+
+    def iter_chat_completion_stream(
+        self,
+        *,
+        model: str,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> Iterator[ChatCompletionStreamResponse]:
+        """Yield OpenAI chat stream chunks assembled from engine snapshots."""
+
+        outputs = self.chat(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            stream=True,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        yield from iter_chat_completion_stream_responses(
+            tp.cast(Iterator[RequestOutputLike], outputs),
+            model=model,
+        )
+
+    def iter_responses_stream(
+        self,
+        *,
+        response_id: str,
+        model: str,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        sampling_params: SamplingParams | None = None,
+        request_id: str | None = None,
+        include_reasoning_summary: bool = False,
+        final_response_overrides: ResponsesFinalizationOptions | None = None,
+        created_at: int | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> Iterator[StreamEventFrame]:
+        """Yield Responses API stream frames assembled from engine snapshots."""
+
+        outputs = self.chat(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            stream=True,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        yield from iter_responses_stream_frames(
+            tp.cast(Iterator[RequestOutputLike], outputs),
+            response_id=response_id,
+            model=model,
+            include_reasoning_summary=include_reasoning_summary,
+            final_response_overrides=final_response_overrides,
+            created_at=created_at,
+        )
 
     def _messages_have_multimodal_content(self, messages: list[dict]) -> bool:
         """Check if messages contain multimodal content (images/videos).
@@ -689,7 +769,11 @@ class EngineIOMixin:
         if request_id is None:
             request_id = self._generate_request_id()
 
-        base_sampling_params = sampling_params or SamplingParams(max_tokens=128)
+        base_sampling_params = self._prepare_chat_sampling_params(
+            sampling_params or SamplingParams(max_tokens=128),
+            tools=tools,
+            tool_choice=tool_choice if isinstance(tool_choice, str) else None,
+        )
 
         images, videos = self._multimodal_manager.extract_media_from_messages(messages)
 

@@ -18,6 +18,7 @@ import pytest
 
 from easydel.inference.openai_api_modules import ChatCompletionRequest, ChatMessage
 from easydel.inference.tools.abstract_tool import ToolParserManager
+from easydel.inference.tools.auto_detect import detect_tool_parser
 from easydel.inference.tools.parsers import (
     DeepSeekV31ToolParser,
     DeepSeekV32ToolParser,
@@ -96,6 +97,7 @@ def test_tool_parser_manager_includes_new_parsers():
         "deepseek_v32",
         "ernie45",
         "functiongemma",
+        "gemma4",
         "gigachat3",
         "glm47",
         "glm-4.7",
@@ -107,6 +109,14 @@ def test_tool_parser_manager_includes_new_parsers():
         "xlam",
     ]:
         ToolParserManager.get_tool_parser(name)
+
+
+def test_detect_tool_parser_prefers_qwen3_xml_for_qwen3_family():
+    assert detect_tool_parser(model_type="qwen3") == "hermes"
+    assert detect_tool_parser(model_type="qwen3_moe") == "hermes"
+    assert detect_tool_parser(model_type="qwen3_next") == "qwen3_xml"
+    assert detect_tool_parser(model_type="qwen3_5_text") == "qwen3_coder"
+    assert detect_tool_parser(model_type="qwen3_5_moe_text") == "qwen3_coder"
 
 
 def test_deepseek_v31_extract_tool_calls(dummy_tokenizer):
@@ -261,6 +271,30 @@ def test_qwen3xml_extract_tool_calls(dummy_tokenizer):
     assert extracted.tool_calls[0].function.name == "foo"
     assert json.loads(extracted.tool_calls[0].function.arguments) == {"a": "1"}
     assert extracted.tool_calls[0].id
+
+
+def test_hermes_does_not_parse_qwen_xml_but_qwen3xml_does(dummy_tokenizer):
+    request = _make_request()
+    output = (
+        "<tool_call><function=read>"
+        "<parameter=filePath>/Users/erfan/Documents/Projects/Calute/README.md</parameter>"
+        "<parameter=offset>1</parameter>"
+        "</function></tool_call>"
+    )
+
+    hermes = ToolParserManager.get_tool_parser("hermes")(dummy_tokenizer)
+    qwen = Qwen3XMLToolParser(dummy_tokenizer)
+
+    hermes_extracted = hermes.extract_tool_calls(output, request)
+    qwen_extracted = qwen.extract_tool_calls(output, request)
+
+    assert hermes_extracted.tools_called is False
+    assert qwen_extracted.tools_called is True
+    assert qwen_extracted.tool_calls[0].function.name == "read"
+    assert json.loads(qwen_extracted.tool_calls[0].function.arguments) == {
+        "filePath": "/Users/erfan/Documents/Projects/Calute/README.md",
+        "offset": "1",
+    }
 
 
 def test_qwen3xml_extract_tool_calls_without_wrapper_and_with_named_attrs(dummy_tokenizer):

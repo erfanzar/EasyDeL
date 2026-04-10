@@ -102,6 +102,8 @@ class Olmo3PythonicToolParser(ToolParser):
             tokenizer: The tokenizer instance used for encoding/decoding tokens.
         """
         super().__init__(tokenizer)
+        self.tool_call_start_token = "<function_calls>"
+        self.tool_call_end_token = "</function_calls>"
 
     @property
     def current_tool_index(self) -> int:

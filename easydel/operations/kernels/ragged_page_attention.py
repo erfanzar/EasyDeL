@@ -76,6 +76,7 @@ References:
     - EasyDeL serving documentation
 """
 
+from dataclasses import replace as dataclass_replace
 from functools import partial
 
 import jax
@@ -92,6 +93,7 @@ from jaxtyping import Array, DTypeLike, Float
 
 from easydel.axis import ATTN_DP
 from easydel.caching import RaggedPagesCacheView, RaggedPagesMetadata
+from easydel.caching.turboquant_ragged_page import TurboQuantRaggedPagesCacheView
 from easydel.utils.helpers import check_bool_flag
 
 from .._attention_outputs import AttentionOutput
@@ -107,6 +109,39 @@ from ..requirements import (
 logger = get_logger(__name__)
 USE_SHARDMAP = True
 ENABLE_DP_LOCAL_PAGE_PATH = check_bool_flag("EASURGE_ENABLE_DP_LOCAL_PAGE_PATH", default=True)
+
+
+def _clamp_tpu_ragged_page_v3_block_config(query, cfg):
+    """Avoid TPU scoped-VMEM OOMs for wide-head ragged page attention.
+
+    Gemma4 uses 256-wide local sliding heads and 512-wide global heads on TPU.
+    The default Pallas autotuner can pick ``num_kv_pages_per_block=16`` for the
+    local 256-wide case, which exceeds the 16MB scoped VMEM limit on this path.
+    Capping KV pages per block at 8 keeps both geometries under the limit while
+    preserving the tuned query block size selection.
+
+    Args:
+        query: Query tensor whose last dimension (head dim) is checked against
+            the 256-wide threshold.
+        cfg: Existing ``RaggedPageAttentionv3Config`` or ``None``. When
+            ``None`` a new config capped at 8 pages per block is created.
+
+    Returns:
+        The original *cfg* unchanged on non-TPU backends or narrow heads, or
+        a (possibly new) config with ``num_kv_pages_per_block`` clamped to 8.
+    """
+    if jax.default_backend() != "tpu" or query.shape[-1] < 256:
+        return cfg
+
+    from ejkernel.modules.operations.configs import RaggedPageAttentionv3Config
+
+    if cfg is None:
+        return RaggedPageAttentionv3Config(num_kv_pages_per_block=8)
+
+    current_block = getattr(cfg, "num_kv_pages_per_block", None)
+    if current_block is None or int(current_block) > 8:
+        return dataclass_replace(cfg, num_kv_pages_per_block=8)
+    return cfg
 
 
 def _normalize_axis_names(axis: str | tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
@@ -139,10 +174,29 @@ def _axis_index(axis_names: tuple[str, ...]) -> jax.Array:
     return idx
 
 
+def _request_distribution_bounds(scheduled: Array, context_lens: Array) -> Array:
+    """Build the v3 request distribution `[decode_end, prefill_end, total]`."""
+    scheduled = jnp.asarray(scheduled, dtype=jnp.int32)
+    context_lens = jnp.asarray(context_lens, dtype=jnp.int32)
+
+    has_tokens = scheduled > 0
+    total = jnp.sum(has_tokens).astype(jnp.int32)
+    is_decode = (scheduled == 1) & (context_lens > 1) & has_tokens
+    decode = jnp.sum(is_decode).astype(jnp.int32)
+    prefill_count = jnp.sum(has_tokens & (~is_decode)).astype(jnp.int32)
+    return jnp.stack((decode, decode + prefill_count, total)).astype(jnp.int32)
+
+
 def _dp_page_axis(cache_view: RaggedPagesCacheView):
     """Resolve the logical page axis for the active cache view."""
     dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
     return ATTN_DP if dp_size > 1 else ct.EMPTY
+
+
+def _kv_axis(cache_view: RaggedPagesCacheView, sharded_axis: str):
+    """Return `sharded_axis` only when the cache keeps a sharded KV-head axis."""
+    kv_head_shards = max(1, int(getattr(cache_view.metadata, "kv_head_shards", 1)))
+    return sharded_axis if kv_head_shards > 1 else ct.EMPTY
 
 
 class _RaggedPageAttn(OperationImpl):
@@ -187,11 +241,22 @@ class _RaggedPageAttn(OperationImpl):
         vmem_limit_bytes: int | None = None,
         **ignore,
     ) -> AttentionOutput:
+        if isinstance(cache_view, TurboQuantRaggedPagesCacheView):
+            return self._forward_v2_turboquant(
+                query,
+                cache_view,
+                cache_metadata,
+                softmax_scale=softmax_scale,
+                logits_soft_cap=logits_soft_cap,
+                sliding_window=sliding_window,
+                softmax_aux=softmax_aux,
+            )
         kv_pages: Float[Array, "num_pages page_size num_kv_heads head_dim"] = cache_view.kv_pages
         manager = self.metadata.partition_manager
         resolve = manager.resolve
         num_seqs_flat: Array = cache_metadata.num_seqs.reshape(-1)
         page_axis = _dp_page_axis(cache_view)
+        kv_page_axis = _kv_axis(cache_view, ct.HEAD)
         qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
 
         aux_spec = PartitionSpec(None)
@@ -233,7 +298,7 @@ class _RaggedPageAttn(OperationImpl):
             in_specs=(
                 qaxes,
                 resolve(
-                    axes=[page_axis, ct.EMPTY, ct.HEAD, ct.EMPTY],
+                    axes=[page_axis, ct.EMPTY, kv_page_axis, ct.EMPTY],
                     mode=ct.MODE_PREFILL,
                     shape=kv_pages.shape,
                 ),
@@ -249,7 +314,245 @@ class _RaggedPageAttn(OperationImpl):
 
         return AttentionOutput(attention_weights=None, attention_outputs=output)
 
+    def _forward_v2_turboquant(
+        self,
+        query: Float[Array, "total_tokens num_q_heads head_dim"],
+        cache_view: "TurboQuantRaggedPagesCacheView",
+        cache_metadata: RaggedPagesMetadata,
+        softmax_scale: float | None = None,
+        logits_soft_cap: float | None = None,
+        sliding_window: int | None = None,
+        softmax_aux: Float[Array, "num_sinks"] | None = None,  # noqa
+        vmem_limit_bytes: int | None = None,
+        **ignore,
+    ) -> AttentionOutput:
+        """Forward pass for V2 (read-only) with TurboQuant-compressed KV cache."""
+        from ejkernel.modules.operations.ragged_page_attention_v2_turboquant import (
+            ragged_page_attention_v2_turboquant as rpa_v2_tq,
+        )
+
+        constants = cache_view.constants
+        tq_config = cache_view.metadata.turboquant_config
+        qjl_dim = constants.qjl_dim
+
+        platform = "pallas" if jax.default_backend() == "tpu" else "auto"
+        num_seqs_flat = cache_metadata.num_seqs.reshape(-1)
+
+        manager = self.metadata.partition_manager
+        resolve = manager.resolve
+        page_axis = _dp_page_axis(cache_view)
+        kv_token_axis = _kv_axis(cache_view, ct.KV_HEAD)
+
+        qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
+        pages_4d_spec = resolve(
+            axes=[page_axis, ct.EMPTY, kv_token_axis, ct.EMPTY],
+            mode=ct.MODE_PREFILL,
+            shape=cache_view.key_indices_pages.shape,
+        )
+        pages_3d_spec = resolve(
+            axes=[page_axis, ct.EMPTY, kv_token_axis],
+            mode=ct.MODE_PREFILL,
+            shape=cache_view.value_norms_pages.shape,
+        )
+        sinks_axis = None
+        if softmax_aux is not None:
+            sinks_axis = resolve(axes=[ct.EMPTY], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
+
+        output = rpa_v2_tq(
+            query,
+            cache_view.key_indices_pages,
+            cache_view.key_signs_pages,
+            cache_view.key_norms_pages,
+            cache_view.value_indices_pages,
+            cache_view.value_norms_pages,
+            cache_metadata.context_lens,
+            cache_metadata.pages_tables,
+            cache_metadata.query_start_loc,
+            num_seqs_flat,
+            constants.rotation_matrix,
+            constants.qjl_projection,
+            constants.key_codebook,
+            constants.value_codebook,
+            softmax_aux,
+            softmax_scale=softmax_scale,
+            logits_soft_cap=logits_soft_cap,
+            sliding_window=sliding_window,
+            bits=tq_config.bits,
+            qjl_dim=qjl_dim,
+            platform=platform,
+            mesh=self.metadata.mesh,
+            in_specs=(
+                qaxes,
+                pages_4d_spec,
+                pages_4d_spec,
+                pages_4d_spec,  # ki, ks, kn
+                pages_4d_spec,  # vi
+                pages_3d_spec,  # vn
+                Ps(),
+                Ps(),
+                Ps(),
+                Ps(),  # context_lens, block_tables, qsl, num_seqs
+                Ps(),
+                Ps(),
+                Ps(),
+                Ps(),  # rotation, projection, key_cb, val_cb
+                sinks_axis,
+            ),
+            out_specs=qaxes,
+        )
+
+        return AttentionOutput(attention_weights=None, attention_outputs=output)
+
     def forward_v3(
+        self,
+        query: Float[Array, "total_tokens num_q_heads head_dim"],
+        key: Float[Array, "total_tokens num_kv_heads head_dim"],
+        value: Float[Array, "total_tokens num_kv_heads head_dim"],
+        cache_view: RaggedPagesCacheView,
+        cache_metadata: RaggedPagesMetadata,
+        softmax_scale: float | None = None,
+        logits_soft_cap: float | None = None,
+        sliding_window: int | None = None,
+        **ignore,
+    ) -> AttentionOutput:
+        if isinstance(cache_view, TurboQuantRaggedPagesCacheView):
+            return self._forward_v3_turboquant(
+                query,
+                key,
+                value,
+                cache_view,
+                cache_metadata,
+                softmax_scale=softmax_scale,
+                logits_soft_cap=logits_soft_cap,
+                sliding_window=sliding_window,
+                **ignore,
+            )
+        return self._forward_v3_standard(
+            query,
+            key,
+            value,
+            cache_view,
+            cache_metadata,
+            softmax_scale=softmax_scale,
+            logits_soft_cap=logits_soft_cap,
+            sliding_window=sliding_window,
+            **ignore,
+        )
+
+    def _forward_v3_turboquant(
+        self,
+        query: Float[Array, "total_tokens num_q_heads head_dim"],
+        key: Float[Array, "total_tokens num_kv_heads head_dim"],
+        value: Float[Array, "total_tokens num_kv_heads head_dim"],
+        cache_view: TurboQuantRaggedPagesCacheView,
+        cache_metadata: RaggedPagesMetadata,
+        softmax_scale: float | None = None,
+        logits_soft_cap: float | None = None,
+        sliding_window: int | None = None,
+        softmax_aux: Float[Array, "num_sinks"] | None = None,  # noqa
+        vmem_limit_bytes: int | None = None,
+        **ignore,
+    ) -> AttentionOutput:
+        """Forward pass using TurboQuant-compressed KV cache via module operation."""
+        from ejkernel.modules import ragged_page_attention_v3_turboquant
+
+        constants = cache_view.constants
+        tq_config = cache_view.metadata.turboquant_config
+        qjl_dim = constants.qjl_dim
+        request_distribution = cache_metadata.request_distribution
+
+        manager = self.metadata.partition_manager
+        resolve = manager.resolve
+        page_axis = _dp_page_axis(cache_view)
+
+        sinks_axis = None
+        if softmax_aux is not None:
+            sinks_axis = resolve(axes=[ct.HEAD], mode=ct.MODE_PREFILL, shape=softmax_aux.shape)
+            softmax_aux = softmax_aux.astype("f4")
+
+        qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
+        kvaxes = resolve(axes=[ct.EMPTY, ct.KV_HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=key.shape)
+
+        pages_4d_spec = resolve(
+            axes=[page_axis, ct.EMPTY, ct.KV_HEAD, ct.EMPTY],
+            mode=ct.MODE_PREFILL,
+            shape=cache_view.key_indices_pages.shape,
+        )
+        pages_3d_spec = resolve(
+            axes=[page_axis, ct.EMPTY, ct.KV_HEAD],
+            mode=ct.MODE_PREFILL,
+            shape=cache_view.value_norms_pages.shape,
+        )
+
+        # Use XLA backend — no Pallas dispatch overhead (3.4ms/call savings).
+        platform = "xla"
+        cfg = self.metadata.get_operation_config("ragged_page_attention_v3_turboquant")
+
+        result = ragged_page_attention_v3_turboquant(
+            query,
+            key,
+            value,
+            cache_view.key_indices_pages,
+            cache_view.key_signs_pages,
+            cache_view.key_norms_pages,
+            cache_view.value_indices_pages,
+            cache_view.value_norms_pages,
+            cache_metadata.context_lens,
+            cache_metadata.pages_tables.reshape(-1),
+            cache_metadata.query_start_loc,
+            request_distribution,
+            constants.rotation_matrix,
+            constants.qjl_projection,
+            constants.key_codebook,
+            constants.value_codebook,
+            softmax_aux,
+            mesh=self.metadata.mesh,
+            in_specs=(
+                qaxes,
+                kvaxes,
+                kvaxes,
+                pages_4d_spec,
+                pages_4d_spec,
+                pages_4d_spec,  # ki, ks, kn
+                pages_4d_spec,  # vi
+                pages_3d_spec,  # vn
+                Ps(),
+                Ps(),
+                Ps(),
+                Ps(),  # kv_lens, block_tables, qsl, distribution
+                Ps(),
+                Ps(),
+                Ps(),
+                Ps(),  # rotation, projection, key_cb, val_cb
+                sinks_axis,
+            ),
+            out_specs=(
+                qaxes,
+                pages_4d_spec,
+                pages_4d_spec,
+                pages_4d_spec,  # ki, ks, kn
+                pages_4d_spec,  # vi
+                pages_3d_spec,  # vn
+            ),
+            softmax_scale=softmax_scale,
+            logits_soft_cap=logits_soft_cap,
+            sliding_window=sliding_window,
+            bits=tq_config.bits,
+            qjl_dim=qjl_dim,
+            cfg=cfg,
+            platform=platform,
+        )
+
+        output = result[0]
+        cache_view.key_indices_pages = result[1]
+        cache_view.key_signs_pages = result[2]
+        cache_view.key_norms_pages = result[3]
+        cache_view.value_indices_pages = result[4]
+        cache_view.value_norms_pages = result[5]
+
+        return AttentionOutput(attention_weights=None, attention_outputs=output, cache_view=cache_view)
+
+    def _forward_v3_standard(
         self,
         query: Float[Array, "total_tokens num_q_heads head_dim"],
         key: Float[Array, "total_tokens num_kv_heads head_dim"],
@@ -279,6 +582,8 @@ class _RaggedPageAttn(OperationImpl):
         resolve = manager.resolve
         request_distribution = cache_metadata.request_distribution
         page_axis = _dp_page_axis(cache_view)
+        kv_token_axis = _kv_axis(cache_view, ct.KV_HEAD)
+        kv_page_axis = _kv_axis(cache_view, ct.HEAD)
 
         sinks_axis = None
 
@@ -287,23 +592,24 @@ class _RaggedPageAttn(OperationImpl):
             softmax_aux = softmax_aux.astype("f4")
 
         qaxes = resolve(axes=[ct.EMPTY, ct.HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=query.shape)
-        kvaxes = resolve(axes=[ct.EMPTY, ct.KV_HEAD, ct.EMPTY], mode=ct.MODE_PREFILL, shape=key.shape)
+        kvaxes = resolve(axes=[ct.EMPTY, kv_token_axis, ct.EMPTY], mode=ct.MODE_PREFILL, shape=key.shape)
 
         kv_pages_spec = resolve(
-            axes=[page_axis, ct.EMPTY, ct.HEAD, ct.EMPTY, ct.EMPTY],
+            axes=[page_axis, ct.EMPTY, kv_page_axis, ct.EMPTY, ct.EMPTY],
             mode=ct.MODE_PREFILL,
             shape=kv_pages.shape,
         )
         page_axis_names = _normalize_axis_names(kv_pages_spec[0] if len(kv_pages_spec) > 0 else None)
         page_axis_size = _mesh_axis_size(self.metadata.mesh, page_axis_names)
         kv_pages_spec_replicated = resolve(
-            axes=[ct.EMPTY, ct.EMPTY, ct.HEAD, ct.EMPTY, ct.EMPTY],
+            axes=[ct.EMPTY, ct.EMPTY, kv_page_axis, ct.EMPTY, ct.EMPTY],
             mode=ct.MODE_PREFILL,
             shape=kv_pages.shape,
         )
 
         platform = "pallas" if jax.default_backend() == "tpu" else "auto"
         cfg = self.metadata.get_operation_config("ragged_page_attention_v3")
+        cfg = _clamp_tpu_ragged_page_v3_block_config(query, cfg)
         common_call_kwargs = dict(
             softmax_scale=softmax_scale,
             logits_soft_cap=logits_soft_cap,
@@ -367,14 +673,8 @@ class _RaggedPageAttn(OperationImpl):
                 )
 
                 local_scheduled = local_query_start_loc[1:] - local_query_start_loc[:-1]
-                local_has_tokens = local_scheduled > 0
-                local_total = jnp.sum(local_has_tokens).astype(jnp.int32)
-
-                local_is_decode = (local_scheduled == 1) & (local_context_lens > 1)
-                row_mask = jnp.arange(rows_per_shard, dtype=jnp.int32) < local_total
-                local_decode = jnp.sum(local_is_decode & row_mask).astype(jnp.int32)
-                local_prefill = local_decode
-                local_distribution = jnp.stack((local_decode, local_prefill, local_total)).astype(jnp.int32)
+                local_distribution = _request_distribution_bounds(local_scheduled, local_context_lens)
+                local_total = local_distribution[2]
 
                 local_num_pages = jnp.int32(local_kv_pages.shape[0])
                 page_offset = shard_idx * local_num_pages

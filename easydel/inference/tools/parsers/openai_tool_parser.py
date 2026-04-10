@@ -111,6 +111,8 @@ class OpenAIToolParser(ToolParser):
         self.current_tool_id: int = -1
         self.current_tool_name_sent: bool = False
         self.streamed_args_for_tool: list[str] = []
+        self.tool_call_start_token = "["
+        self.tool_call_end_token = "]"
 
     @staticmethod
     def _extract_json_candidate(text: str) -> tuple[str | None, str | None]:

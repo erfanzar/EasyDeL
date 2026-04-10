@@ -71,6 +71,7 @@ class FalconMambaConfig(EasyDeLBaseConfig):
         rescale_prenorm_residual: bool = False,
         use_cache: bool = True,
         use_falcon_mambapy: bool = False,
+        use_associative_scan: bool = True,
         mixer_rms_eps: float = 1e-6,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         **kwargs,
@@ -102,6 +103,7 @@ class FalconMambaConfig(EasyDeLBaseConfig):
 
         self.use_cache = use_cache
         self.use_falcon_mambapy = use_falcon_mambapy
+        self.use_associative_scan = use_associative_scan
         self.mixer_rms_eps = mixer_rms_eps
         self.gradient_checkpointing = gradient_checkpointing
 
@@ -122,5 +124,22 @@ class FalconMambaConfig(EasyDeLBaseConfig):
 
         Returns:
             Partition rules as ``tuple[tuple[str, PartitionSpec], ...] | None``.
+        """
+        return None
+
+    @property
+    def layer_types(self) -> list[str]:
+        """Expose the recurrent-only layer layout for HF parity and cache helpers.
+
+        Returns:
+            List of ``"mamba"`` strings with length ``num_hidden_layers``.
+        """
+        return ["mamba"] * self.num_hidden_layers
+
+    def get_mask_details(self):
+        """Recurrent Mamba layers do not use attention-mask descriptors.
+
+        Returns:
+            Always ``None``, since Falcon Mamba layers have no attention masks.
         """
         return None

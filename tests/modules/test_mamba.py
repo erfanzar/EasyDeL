@@ -63,6 +63,10 @@ class TestMamba:
         )
         assert result.success, f"Mamba generation failed: {result.error_message}"
 
+    def test_mask_details_are_disabled_for_recurrent_layers(self, mamba_config):
+        """Recurrent layers should bypass attention-mask detail conversion."""
+        assert mamba_config.get_mask_details() is None
+
     def test_left_padding_invariance(self, mamba_config, small_model_config):
         """Mamba generation should be invariant to left padding when masked."""
         from transformers import GenerationConfig

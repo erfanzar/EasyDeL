@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
+from importlib import import_module
 from uuid import uuid4
 
 import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
@@ -101,9 +102,14 @@ class JambaToolParser(ToolParser):
                 in the tokenizer vocabulary.
         """
         super().__init__(tokenizer)
-        from mistral_common.tokens.tokenizers.mistral import MistralTokenizer  # pyright: ignore[reportMissingImports]
+        try:
+            mistral_module = import_module("mistral_common.tokens.tokenizers.mistral")
+        except ImportError:
+            MistralTokenizer = None
+        else:
+            MistralTokenizer = getattr(mistral_module, "MistralTokenizer", None)
 
-        if isinstance(self.model_tokenizer, MistralTokenizer):
+        if MistralTokenizer is not None and isinstance(self.model_tokenizer, MistralTokenizer):
             raise ValueError("Detected a MistralTokenizer tokenizer when using a Jamba model")
 
         self.current_tool_name_sent: bool = False

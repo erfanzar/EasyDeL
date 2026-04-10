@@ -45,6 +45,7 @@ Example:
 
 from __future__ import annotations
 
+import collections
 import collections.abc
 import copy
 import hashlib
@@ -58,6 +59,7 @@ import jax
 import numpy as np
 from eformer.escale import PartitionAxis
 from eformer.loggings import get_logger
+from eformer.mpric import DTYPE_TO_STRING_MAP
 from eformer.pytree import auto_pytree
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import lax
@@ -65,6 +67,7 @@ from jax import numpy as jnp
 from jaxtyping import Array
 from transformers.generation.configuration_utils import GenerationConfig
 
+from easydel.axis import resolve_attention_data_parallel_axis
 from easydel.caching import (
     MLARaggedPagesCache,
     MLARaggedPagesCacheConfig,
@@ -89,6 +92,7 @@ from easydel.inference.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
+from easydel.utils import set_inference_mode
 
 from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutput
@@ -116,11 +120,15 @@ def _text_config_uses_mla(text_config: tp.Any) -> bool:
     if text_config is None:
         return False
 
+    _MLA_MECHANISMS = {
+        "multi_latent_ragged_page_attention_v1",
+        "multi_latent_ragged_page_attention_v2",
+    }
     attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
-    if attn_mechanism == "multi_latent_ragged_page_attention_v1":
+    if attn_mechanism in _MLA_MECHANISMS:
         return True
     mla_attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "mla_attn_mechanism", None))
-    if mla_attn_mechanism == "multi_latent_ragged_page_attention_v1":
+    if mla_attn_mechanism in _MLA_MECHANISMS:
         return True
 
     attention_type = getattr(text_config, "attention_type", None)
@@ -151,6 +159,25 @@ def _text_config_uses_mla(text_config: tp.Any) -> bool:
         return int(kv_lora_rank) > 0
     except Exception:
         return True
+
+
+def _uses_gradient_checkpointing(config: tp.Any) -> bool:
+    """Best-effort detection for configs with active remat/checkpointing.
+
+    Args:
+        config: Model configuration object to inspect. May be ``None``.
+
+    Returns:
+        ``True`` if ``config.gradient_checkpointing`` is set to a non-empty,
+        non-``None`` value, indicating that rematerialization is enabled.
+    """
+    if config is None:
+        return False
+    gradient_checkpointing = getattr(config, "gradient_checkpointing", None)
+    gradient_checkpointing = getattr(gradient_checkpointing, "value", gradient_checkpointing)
+    if gradient_checkpointing is None:
+        return False
+    return str(gradient_checkpointing).lower() not in {"", "none"}
 
 
 def _detect_mla_attention_mix(model: tp.Any, text_config: tp.Any = None) -> tuple[bool, bool]:
@@ -187,8 +214,761 @@ def _is_kv_attention_layer_type(layer_type: tp.Any) -> bool:
         "full" in layer_type_norm
         or "sliding" in layer_type_norm
         or layer_type_norm == "attention"
+        or layer_type_norm == "hybrid"
         or layer_type_norm == "parallel_hybrid"
     )
+
+
+def _resolve_positive_layer_config_value(
+    config: tp.Any,
+    *attribute_names: str,
+    layer_idx: int | None = None,
+) -> int | None:
+    """Resolve a positive scalar or per-layer integer config value.
+
+    Probes each name in *attribute_names* on *config* in order. If the
+    attribute is a list/tuple, the element at *layer_idx* (or the first
+    element when *layer_idx* is ``None``) is extracted. The first positive
+    integer found is returned.
+
+    Args:
+        config: Model configuration object to inspect.
+        *attribute_names: Ordered attribute names to probe on *config*.
+        layer_idx: Optional layer index for per-layer list attributes.
+            When ``None``, the first element of any list attribute is used.
+
+    Returns:
+        The first positive ``int`` value found, or ``None`` if no positive
+        value could be resolved from any of the given attribute names.
+    """
+    for attribute_name in attribute_names:
+        value = getattr(config, attribute_name, None)
+        if isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                continue
+            if layer_idx is None:
+                value = value[0]
+            elif 0 <= int(layer_idx) < len(value):
+                value = value[int(layer_idx)]
+            else:
+                continue
+        if value is None:
+            continue
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _resolve_standard_ragged_layer_geometry(
+    text_config: tp.Any,
+    layer_idx: int | None = None,
+) -> tuple[int, int]:
+    """Resolve standard-attention KV geometry for a specific layer.
+
+    Gemma4 uses wider heads for global/full-attention layers and can also
+    reduce KV head count when ``attention_k_eq_v=True``. Most architectures
+    still expose a single geometry for every layer, so this helper falls back
+    to the base ``num_key_value_heads``/``head_dim`` pair when no per-layer
+    variation is present.
+
+    Args:
+        text_config: Text model configuration with KV geometry attributes
+            (``num_kv_heads``, ``head_dim``, ``layer_types``, etc.).
+        layer_idx: Zero-based index of the transformer layer. When ``None``,
+            the representative (first-element) geometry is returned.
+
+    Returns:
+        A ``(num_kv_heads, head_dim)`` tuple for the requested layer.
+    """
+    layer_type = None
+    layer_types = getattr(text_config, "layer_types", None)
+    if layer_idx is not None and isinstance(layer_types, (list, tuple)) and 0 <= int(layer_idx) < len(layer_types):
+        layer_type = str(layer_types[int(layer_idx)]).lower()
+    elif layer_idx is None and isinstance(layer_types, (list, tuple)):
+        kv_layer_types = [
+            str(layer_type).lower() for layer_type in layer_types if _is_kv_attention_layer_type(layer_type)
+        ]
+        if kv_layer_types and all(layer_type == kv_layer_types[0] for layer_type in kv_layer_types):
+            layer_type = kv_layer_types[0]
+
+    is_full_attention = layer_type == "full_attention"
+
+    num_kv_heads = _resolve_positive_layer_config_value(
+        text_config,
+        "num_kv_heads",
+        "num_key_value_heads",
+        "num_attention_heads",
+        layer_idx=layer_idx,
+    )
+    if num_kv_heads is None:
+        num_kv_heads = 1
+
+    head_dim = getattr(text_config, "head_dim", None)
+    if head_dim is None:
+        hidden_size = getattr(text_config, "hidden_size", None)
+        num_heads = getattr(text_config, "num_attention_heads", None)
+        if hidden_size and num_heads:
+            head_dim = hidden_size // num_heads
+    if head_dim is None or int(head_dim) <= 0:
+        head_dim = 1
+
+    if is_full_attention:
+        global_head_dim = getattr(text_config, "global_head_dim", None)
+        if global_head_dim is not None and int(global_head_dim) > 0:
+            head_dim = int(global_head_dim)
+
+        if bool(getattr(text_config, "attention_k_eq_v", False)):
+            global_kv_heads = getattr(text_config, "num_global_key_value_heads", None)
+            if global_kv_heads is not None and int(global_kv_heads) > 0:
+                num_kv_heads = int(global_kv_heads)
+
+    return int(num_kv_heads), int(head_dim)
+
+
+def _resolve_standard_ragged_layer_geometries(
+    text_config: tp.Any,
+    layer_indices: tp.Iterable[int] | None = None,
+) -> dict[int, tuple[int, int]]:
+    """Resolve per-layer KV geometry for standard ragged attention layers.
+
+    Iterates over the specified (or all) layers and returns a mapping from
+    layer index to ``(num_kv_heads, head_dim)`` for every layer whose type
+    consumes KV pages (full, sliding, hybrid, etc.).
+
+    Args:
+        text_config: Text model configuration with layer geometry attributes.
+        layer_indices: Optional iterable of layer indices to inspect. When
+            ``None``, all layers ``0 .. num_hidden_layers - 1`` are checked.
+
+    Returns:
+        Dict mapping layer index to ``(num_kv_heads, head_dim)`` tuples.
+        If no KV-consuming layers are found, a single representative entry
+        at index ``0`` is returned.
+    """
+    num_hidden_layers = int(getattr(text_config, "num_hidden_layers", 1) or 1)
+    if layer_indices is None:
+        layer_indices = range(num_hidden_layers)
+
+    geometries: dict[int, tuple[int, int]] = {}
+    layer_types = getattr(text_config, "layer_types", None)
+    for layer_idx in layer_indices:
+        layer_idx = int(layer_idx)
+        if layer_idx < 0 or layer_idx >= num_hidden_layers:
+            continue
+        if isinstance(layer_types, (list, tuple)) and layer_idx < len(layer_types):
+            if not _is_kv_attention_layer_type(layer_types[layer_idx]):
+                continue
+        geometries[layer_idx] = _resolve_standard_ragged_layer_geometry(
+            text_config=text_config,
+            layer_idx=layer_idx,
+        )
+
+    if not geometries:
+        geometries[0] = _resolve_standard_ragged_layer_geometry(text_config=text_config, layer_idx=None)
+
+    return geometries
+
+
+def _has_mixed_standard_ragged_geometry(
+    text_config: tp.Any,
+    layer_indices: tp.Iterable[int] | None = None,
+) -> bool:
+    """Return True when standard ragged layers do not all share one geometry.
+
+    Args:
+        text_config: Text model configuration with layer geometry attributes.
+        layer_indices: Optional iterable of layer indices to inspect. When
+            ``None``, all layers are checked.
+
+    Returns:
+        ``True`` if at least two KV-consuming layers have different
+        ``(num_kv_heads, head_dim)`` geometries.
+    """
+    geometries = _resolve_standard_ragged_layer_geometries(text_config=text_config, layer_indices=layer_indices)
+    return len(set(geometries.values())) > 1
+
+
+def _create_mixed_standard_ragged_page_cache_configs(
+    text_config: tp.Any,
+    *,
+    max_length: int,
+    page_size: int,
+    hbm_utilization: float,
+    dtype: jnp.dtype,
+    version: tp.Literal["v3", "v2"],
+    layer_indices: tp.Iterable[int] | None = None,
+    num_pages_override: int | None = None,
+):
+    """Create per-layer ragged configs that share a common page pool budget.
+
+    Standard ragged cache metadata historically assumed every attention layer
+    used the same ``num_kv_heads`` and ``head_dim``. Gemma4 breaks that
+    assumption because its full-attention layers may use a different KV geometry
+    from sliding-window layers. This helper computes a single conservative
+    ``num_pages`` budget across the mixed layer set, then instantiates one
+    config per layer with the correct geometry and the shared page count.
+
+    Args:
+        text_config: Text model configuration with layer geometry attributes,
+            ``partition_manager``, and ``mesh``.
+        max_length: Maximum sequence length the model supports.
+        page_size: Number of tokens per cache page.
+        hbm_utilization: Fraction of free HBM to allocate for the page pool.
+        dtype: Data type for cache tensor elements.
+        version: Ragged page cache version (``"v3"`` or ``"v2"``).
+        layer_indices: Optional iterable of layer indices to consider. When
+            ``None``, all layers are inspected.
+        num_pages_override: If given, skip the automatic page budget
+            computation and use this value directly.
+
+    Returns:
+        A ``(representative, per_layer_configs)`` tuple where
+        *representative* is the ``RaggedPagesCacheConfig`` with the largest
+        per-page footprint and *per_layer_configs* is a dict mapping layer
+        index to its own ``RaggedPagesCacheConfig``.
+
+    Raises:
+        ValueError: If the computed page budget is non-positive.
+    """
+    from easydel.caching import RaggedPagesCacheConfig
+    from easydel.caching.ragged_page.cache import (
+        _canonicalize_dtype,
+        _dtype_to_string,
+        _mesh_axis_size,
+        _resolve_ragged_cache_layout,
+        cdiv,
+        get_num_slices_per_kv_cache_update_page,
+        get_page_size_bytes,
+    )
+
+    geometries = _resolve_standard_ragged_layer_geometries(text_config=text_config, layer_indices=layer_indices)
+    partition_manager = text_config.partition_manager
+    mesh = text_config.mesh
+
+    kvdtype = _canonicalize_dtype(dtype)
+    requested_kvdtype = kvdtype
+    data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
+    physical_kv_head_shards = _mesh_axis_size(mesh, partition_manager.paxis.kv_head_axis)
+    effective_kv_head_shards = physical_kv_head_shards
+
+    if version == "v3":
+        for num_kv_heads, head_dim in sorted(set(geometries.values())):
+            next_kvdtype, next_kv_head_shards = _resolve_ragged_cache_layout(
+                kvdtype,
+                version=version,
+                num_kv_heads=int(num_kv_heads),
+                k_headdim=int(head_dim),
+                kv_head_shards=physical_kv_head_shards,
+            )
+            if next_kv_head_shards == 1:
+                kvdtype = requested_kvdtype
+                effective_kv_head_shards = 1
+                break
+            kvdtype = next_kvdtype
+    elif version == "v2":
+        for num_kv_heads, head_dim in sorted(set(geometries.values())):
+            _next_kvdtype, next_kv_head_shards = _resolve_ragged_cache_layout(
+                kvdtype,
+                version=version,
+                num_kv_heads=int(num_kv_heads),
+                k_headdim=int(head_dim),
+                kv_head_shards=physical_kv_head_shards,
+            )
+            if next_kv_head_shards == 1:
+                effective_kv_head_shards = 1
+                break
+
+    if num_pages_override is not None:
+        if version == "v3" and kvdtype != requested_kvdtype:
+            logger.warning(
+                "Ignoring provided mixed ragged `num_pages=%s` because v3 cache dtype widened from %s to %s "
+                "during sharding compatibility resolution; recomputing page budget.",
+                num_pages_override,
+                _dtype_to_string(requested_kvdtype),
+                _dtype_to_string(kvdtype),
+            )
+            num_pages_override = None
+        elif effective_kv_head_shards != physical_kv_head_shards:
+            logger.warning(
+                "Ignoring provided mixed ragged `num_pages=%s` because KV cache head sharding fell back from %s to %s; "
+                "recomputing page budget.",
+                num_pages_override,
+                physical_kv_head_shards,
+                effective_kv_head_shards,
+            )
+            num_pages_override = None
+
+    if num_pages_override is None:
+        free = RaggedPagesCacheConfig._compute_free_hbm(
+            mesh=mesh,
+            partition_manager=partition_manager,
+            hbm_utilization=hbm_utilization,
+            kv_head_shards=effective_kv_head_shards,
+        )
+        bytes_av = jnp.finfo(kvdtype).bits // 8
+        page_bytes = (
+            2
+            * int(page_size)
+            * sum(int(num_kv_heads) * int(head_dim) for num_kv_heads, head_dim in geometries.values())
+            * bytes_av
+        )
+        num_pages = int(free) // int(page_bytes)
+        if data_parallel_size > 1:
+            num_pages = (num_pages // data_parallel_size) * data_parallel_size
+        if num_pages <= 0:
+            raise ValueError(
+                "Computed `num_pages` is non-positive for mixed standard ragged cache geometry; "
+                "increase `hbm_utilization` or reduce the per-layer page footprint."
+            )
+        logger.info(
+            "Creating mixed standard RaggedPagesCacheConfig with %s num_pages=%s page_bytes=%s sequence_capacity=%sK",
+            dict(collections.Counter(geometries.values())),
+            num_pages,
+            page_bytes,
+            int((num_pages * int(page_size)) / 1000),
+        )
+    else:
+        num_pages = int(num_pages_override)
+
+    def _build_config(num_kv_heads: int, head_dim: int) -> RaggedPagesCacheConfig:
+        """Create a ``RaggedPagesCacheConfig`` for one layer geometry.
+
+        Captures ``num_pages``, ``page_size``, ``kvdtype``, and other
+        outer-scope values from the enclosing function.
+
+        Args:
+            num_kv_heads: Number of KV heads for this layer group.
+            head_dim: Head dimension for this layer group.
+
+        Returns:
+            A fully populated ``RaggedPagesCacheConfig``.
+        """
+        return RaggedPagesCacheConfig(
+            num_hidden_layers=max(1, len(geometries)),
+            max_model_length=int(max_length),
+            num_kv_heads=int(num_kv_heads),
+            k_headdim=int(head_dim),
+            v_headdim=int(head_dim),
+            hbm_utilization=float(hbm_utilization),
+            data_parallel_size=int(data_parallel_size),
+            kv_head_shards=int(effective_kv_head_shards),
+            page_size=int(page_size),
+            num_pages=int(num_pages),
+            max_num_pages_per_req=cdiv(int(max_length), int(page_size)),
+            num_slices_per_kv_cache_update_page=get_num_slices_per_kv_cache_update_page(
+                get_page_size_bytes(
+                    page_size=int(page_size),
+                    num_kv_heads=int(num_kv_heads),
+                    head_size=int(head_dim),
+                    kv_cache_dtype=kvdtype,
+                )
+            ),
+            version=version,
+            _kvdtype_str=_dtype_to_string(kvdtype),
+        )
+
+    per_layer_configs = {
+        layer_idx: _build_config(num_kv_heads=num_kv_heads, head_dim=head_dim)
+        for layer_idx, (num_kv_heads, head_dim) in geometries.items()
+    }
+    representative_num_kv_heads, representative_head_dim = max(
+        geometries.values(),
+        key=lambda geometry: int(geometry[0]) * int(geometry[1]),
+    )
+    representative = _build_config(
+        num_kv_heads=representative_num_kv_heads,
+        head_dim=representative_head_dim,
+    )
+    representative._mixed_layer_configs = dict(per_layer_configs)
+    return representative, per_layer_configs
+
+
+def _create_mixed_standard_unified_attention_cache_configs(
+    text_config: tp.Any,
+    *,
+    max_length: int,
+    page_size: int,
+    hbm_utilization: float,
+    dtype: jnp.dtype,
+    layer_indices: tp.Iterable[int] | None = None,
+    num_pages_override: int | None = None,
+):
+    """Create per-layer unified configs that share one mixed-geometry page pool.
+
+    Analogous to ``_create_mixed_standard_ragged_page_cache_configs`` but for
+    the unified-attention cache backend.
+
+    Args:
+        text_config: Text model configuration with layer geometry attributes,
+            ``partition_manager``, and ``mesh``.
+        max_length: Maximum sequence length the model supports.
+        page_size: Number of tokens per cache page.
+        hbm_utilization: Fraction of free HBM to allocate for the page pool.
+        dtype: Data type for cache tensor elements.
+        layer_indices: Optional iterable of layer indices to consider.
+        num_pages_override: If given, use this page count directly.
+
+    Returns:
+        A ``(representative, per_layer_configs)`` tuple where
+        *representative* is the ``UnifiedAttentionCacheConfig`` with the
+        largest footprint and *per_layer_configs* maps layer index to its
+        ``UnifiedAttentionCacheConfig``.
+
+    Raises:
+        ValueError: If the computed page budget is non-positive.
+    """
+    from easydel.caching.unified_attention.cache import _mesh_axis_size, _previous_power_of_2, cdiv
+
+    geometries = _resolve_standard_ragged_layer_geometries(text_config=text_config, layer_indices=layer_indices)
+    partition_manager = text_config.partition_manager
+    mesh = text_config.mesh
+    kvdtype = dtype
+    data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
+    bytes_av = jnp.finfo(kvdtype).bits // 8
+
+    if num_pages_override is None:
+        free = UnifiedAttentionCacheConfig._compute_free_hbm(
+            mesh=mesh,
+            partition_manager=partition_manager,
+            hbm_utilization=hbm_utilization,
+        )
+        page_bytes = (
+            2
+            * int(page_size)
+            * sum(int(num_kv_heads) * int(head_dim) for num_kv_heads, head_dim in geometries.values())
+            * bytes_av
+        )
+        num_pages = int(free) // int(page_bytes)
+        if data_parallel_size > 1:
+            num_pages = (num_pages // data_parallel_size) * data_parallel_size
+        if num_pages <= 0:
+            raise ValueError(
+                "Computed `num_pages` is non-positive for mixed unified cache geometry; "
+                "increase `hbm_utilization` or reduce the per-layer page footprint."
+            )
+        logger.info(
+            "Creating mixed UnifiedAttentionCacheConfig with %s num_pages=%s page_bytes=%s sequence_capacity=%sK",
+            dict(collections.Counter(geometries.values())),
+            num_pages,
+            page_bytes,
+            int((num_pages * int(page_size)) / 1000),
+        )
+    else:
+        num_pages = int(num_pages_override)
+
+    num_hidden_layers = max(1, len(geometries))
+
+    def _build_config(num_kv_heads: int, head_dim: int) -> UnifiedAttentionCacheConfig:
+        """Create a ``UnifiedAttentionCacheConfig`` for one layer geometry.
+
+        Captures ``num_pages``, ``page_size``, ``kvdtype``, and other
+        outer-scope values from the enclosing function.
+
+        Args:
+            num_kv_heads: Number of KV heads for this layer group.
+            head_dim: Head dimension for this layer group.
+
+        Returns:
+            A fully populated ``UnifiedAttentionCacheConfig``.
+        """
+        page_size_bytes = 2 * int(page_size) * int(num_kv_heads) * int(head_dim) * bytes_av
+        slices_raw = (16 * 1024 * 1024) // max(1, int(page_size_bytes))
+        num_slices_per_page = min(64, _previous_power_of_2(int(slices_raw)))
+        dtype_key = kvdtype.type if hasattr(kvdtype, "type") else kvdtype
+        return UnifiedAttentionCacheConfig(
+            num_hidden_layers=num_hidden_layers,
+            max_model_length=int(max_length),
+            num_kv_heads=int(num_kv_heads),
+            head_dim=int(head_dim),
+            hbm_utilization=float(hbm_utilization),
+            data_parallel_size=int(data_parallel_size),
+            page_size=int(page_size),
+            num_pages=int(num_pages),
+            max_num_pages_per_req=cdiv(int(max_length), int(page_size)),
+            num_slices_per_kv_cache_update_page=int(num_slices_per_page),
+            _kvdtype_str=DTYPE_TO_STRING_MAP.get(dtype_key, str(jnp.dtype(kvdtype))),
+        )
+
+    per_layer_configs = {
+        layer_idx: _build_config(num_kv_heads=num_kv_heads, head_dim=head_dim)
+        for layer_idx, (num_kv_heads, head_dim) in geometries.items()
+    }
+    representative_num_kv_heads, representative_head_dim = max(
+        geometries.values(),
+        key=lambda geometry: int(geometry[0]) * int(geometry[1]),
+    )
+    representative = _build_config(
+        num_kv_heads=representative_num_kv_heads,
+        head_dim=representative_head_dim,
+    )
+    return representative, per_layer_configs
+
+
+def _create_mixed_turboquant_ragged_page_cache_configs(
+    text_config: tp.Any,
+    *,
+    max_length: int,
+    page_size: int,
+    hbm_utilization: float,
+    turboquant_config: tp.Any,
+    layer_indices: tp.Iterable[int] | None = None,
+    num_pages_override: int | None = None,
+):
+    """Create per-layer TurboQuant configs that share one mixed-geometry budget.
+
+    Analogous to ``_create_mixed_standard_ragged_page_cache_configs`` but for
+    the TurboQuant compressed-KV cache backend.
+
+    Args:
+        text_config: Text model configuration with layer geometry attributes,
+            ``partition_manager``, and ``mesh``.
+        max_length: Maximum sequence length the model supports.
+        page_size: Number of tokens per cache page.
+        hbm_utilization: Fraction of free HBM to allocate for the page pool.
+        turboquant_config: TurboQuant compression configuration (provides
+            ``qjl_dim`` and quantization parameters).
+        layer_indices: Optional iterable of layer indices to consider.
+        num_pages_override: If given, use this page count directly.
+
+    Returns:
+        A ``(representative, per_layer_configs)`` tuple where
+        *representative* is the ``TurboQuantRaggedPagesCacheConfig`` with the
+        largest footprint and *per_layer_configs* maps layer index to its
+        ``TurboQuantRaggedPagesCacheConfig``.
+
+    Raises:
+        ValueError: If the computed page budget is non-positive.
+    """
+    from easydel.caching.ragged_page.cache import _mesh_axis_size, cdiv, per_device_hbm_budget_bytes
+    from easydel.caching.turboquant_ragged_page import TurboQuantRaggedPagesCacheConfig
+
+    geometries = _resolve_standard_ragged_layer_geometries(text_config=text_config, layer_indices=layer_indices)
+    partition_manager = text_config.partition_manager
+    mesh = text_config.mesh
+    data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
+    kv_head_size = _mesh_axis_size(mesh, partition_manager.paxis.kv_head_axis)
+
+    def _page_bytes(num_kv_heads: int, head_dim: int) -> int:
+        """Estimate bytes consumed by one page of TurboQuant KV cache.
+
+        Accounts for key indices, key signs, key/value norms, and value
+        indices based on the outer ``turboquant_config`` and ``page_size``.
+
+        Args:
+            num_kv_heads: Number of KV heads for the layer.
+            head_dim: Per-head dimension for the layer.
+
+        Returns:
+            Total byte count for a single cache page.
+        """
+        head_dim = int(head_dim)
+        qjl_dim = int(turboquant_config.qjl_dim) if getattr(turboquant_config, "qjl_dim", None) is not None else head_dim
+        page_tokens = int(page_size) * int(num_kv_heads)
+        key_indices_bytes = page_tokens * (head_dim // 2)
+        key_signs_bytes = page_tokens * (qjl_dim // 8)
+        key_norms_bytes = page_tokens * 2 * 2
+        value_indices_bytes = page_tokens * (head_dim // 2)
+        value_norms_bytes = page_tokens * 2
+        return key_indices_bytes + key_signs_bytes + key_norms_bytes + value_indices_bytes + value_norms_bytes
+
+    if num_pages_override is None:
+        budget = per_device_hbm_budget_bytes(hbm_utilization, mode="free")
+        page_axis_size = data_parallel_size if data_parallel_size > 1 else 1
+        available_alloc = budget * kv_head_size * page_axis_size
+        page_bytes_total = sum(_page_bytes(num_kv_heads, head_dim) for num_kv_heads, head_dim in geometries.values())
+        num_pages = int(available_alloc) // int(page_bytes_total)
+        if data_parallel_size > 1:
+            num_pages = (num_pages // data_parallel_size) * data_parallel_size
+        if num_pages <= 0:
+            raise ValueError(
+                "Computed `num_pages` is non-positive for mixed TurboQuant ragged cache geometry; "
+                "increase `hbm_utilization` or reduce the per-layer page footprint."
+            )
+        logger.info(
+            "Creating mixed TurboQuant RaggedPagesCacheConfig with %s num_pages=%s page_bytes=%s sequence_capacity=%sK",
+            dict(collections.Counter(geometries.values())),
+            num_pages,
+            page_bytes_total,
+            int((num_pages * int(page_size)) / 1000),
+        )
+    else:
+        num_pages = int(num_pages_override)
+
+    def _build_config(num_kv_heads: int, head_dim: int) -> TurboQuantRaggedPagesCacheConfig:
+        """Create a ``TurboQuantRaggedPagesCacheConfig`` for one layer geometry.
+
+        Captures ``num_pages``, ``page_size``, ``turboquant_config``, and
+        other outer-scope values from the enclosing function.
+
+        Args:
+            num_kv_heads: Number of KV heads for this layer group.
+            head_dim: Head dimension for this layer group.
+
+        Returns:
+            A fully populated ``TurboQuantRaggedPagesCacheConfig``.
+        """
+        return TurboQuantRaggedPagesCacheConfig(
+            num_hidden_layers=max(1, len(geometries)),
+            max_model_length=int(max_length),
+            num_kv_heads=int(num_kv_heads),
+            k_headdim=int(head_dim),
+            v_headdim=int(head_dim),
+            hbm_utilization=float(hbm_utilization),
+            data_parallel_size=int(data_parallel_size),
+            page_size=int(page_size),
+            num_pages=int(num_pages),
+            max_num_pages_per_req=cdiv(int(max_length), int(page_size)),
+            num_slices_per_kv_cache_update_page=1,
+            version="v3",
+            _kvdtype_str="bfloat16",
+            turboquant_config=turboquant_config,
+        )
+
+    per_layer_configs = {
+        layer_idx: _build_config(num_kv_heads=num_kv_heads, head_dim=head_dim)
+        for layer_idx, (num_kv_heads, head_dim) in geometries.items()
+    }
+    representative_num_kv_heads, representative_head_dim = max(
+        geometries.values(),
+        key=lambda geometry: _page_bytes(*geometry),
+    )
+    representative = _build_config(
+        num_kv_heads=representative_num_kv_heads,
+        head_dim=representative_head_dim,
+    )
+    return representative, per_layer_configs
+
+
+def _materialize_mixed_standard_ragged_cache(
+    *,
+    text_config: tp.Any,
+    per_layer_configs: dict[int, RaggedPagesCacheConfig],
+    quantizer: tp.Any,
+) -> RaggedPagesCache:
+    """Allocate one standard ragged cache view per layer-specific config.
+
+    Args:
+        text_config: Text model configuration providing ``mesh`` and
+            ``partition_manager`` for sharded allocation.
+        per_layer_configs: Dict mapping layer index to a
+            ``RaggedPagesCacheConfig`` with layer-specific KV geometry.
+        quantizer: Quantizer instance used for weight compression during
+            cache initialization.
+
+    Returns:
+        A ``RaggedPagesCache`` whose views are ordered by layer index.
+    """
+    from easydel.caching import RaggedPagesCacheView
+
+    ordered_configs = [config for _, config in sorted(per_layer_configs.items(), key=lambda item: int(item[0]))]
+    views = [
+        RaggedPagesCacheView.init(
+            config=config,
+            layer_index=layer_index,
+            mesh=text_config.mesh,
+            partition_manager=text_config.partition_manager,
+            quantizer=quantizer,
+        )
+        for layer_index, config in enumerate(ordered_configs)
+    ]
+    return RaggedPagesCache(views=views)
+
+
+def _get_cached_mixed_standard_ragged_configs(
+    config: RaggedPagesCacheConfig | None,
+    *,
+    layer_indices: collections.abc.Iterable[int] | None = None,
+) -> dict[int, RaggedPagesCacheConfig] | None:
+    """Return cached mixed-geometry ragged configs when they cover the request."""
+    if config is None:
+        return None
+
+    cached_configs = getattr(config, "_mixed_layer_configs", None)
+    if not isinstance(cached_configs, dict) or not cached_configs:
+        return None
+
+    normalized = {int(layer_idx): layer_config for layer_idx, layer_config in cached_configs.items()}
+    if layer_indices is None:
+        return normalized
+
+    requested = [int(layer_idx) for layer_idx in layer_indices]
+    if any(layer_idx not in normalized for layer_idx in requested):
+        return None
+    return {layer_idx: normalized[layer_idx] for layer_idx in requested}
+
+
+def _materialize_mixed_unified_attention_cache(
+    *,
+    text_config: tp.Any,
+    per_layer_configs: dict[int, UnifiedAttentionCacheConfig],
+    quantizer: tp.Any,
+) -> UnifiedAttentionCache:
+    """Allocate one unified-attention cache view per layer-specific config.
+
+    Args:
+        text_config: Text model configuration providing ``mesh`` and
+            ``partition_manager`` for sharded allocation.
+        per_layer_configs: Dict mapping layer index to a
+            ``UnifiedAttentionCacheConfig`` with layer-specific KV geometry.
+        quantizer: Quantizer instance used for weight compression during
+            cache initialization.
+
+    Returns:
+        A ``UnifiedAttentionCache`` whose views are ordered by layer index.
+    """
+    from easydel.caching.unified_attention.cache import UnifiedAttentionCacheView
+
+    ordered_configs = [config for _, config in sorted(per_layer_configs.items(), key=lambda item: int(item[0]))]
+    views = [
+        UnifiedAttentionCacheView.init(
+            config=config,
+            layer_index=layer_index,
+            mesh=text_config.mesh,
+            partition_manager=text_config.partition_manager,
+            quantizer=quantizer,
+        )
+        for layer_index, config in enumerate(ordered_configs)
+    ]
+    return UnifiedAttentionCache(views=views)
+
+
+def _materialize_mixed_turboquant_ragged_cache(
+    *,
+    text_config: tp.Any,
+    per_layer_configs: dict[int, tp.Any],
+):
+    """Allocate one TurboQuant ragged cache view per layer-specific config.
+
+    Args:
+        text_config: Text model configuration providing ``mesh`` and
+            ``partition_manager`` for sharded allocation.
+        per_layer_configs: Dict mapping layer index to a
+            ``TurboQuantRaggedPagesCacheConfig`` with layer-specific geometry.
+
+    Returns:
+        A ``TurboQuantRaggedPagesCache`` whose views are ordered by layer
+        index.
+    """
+    from easydel.caching.turboquant_ragged_page import (
+        TurboQuantRaggedPagesCache,
+        TurboQuantRaggedPagesCacheView,
+    )
+
+    ordered_configs = [config for _, config in sorted(per_layer_configs.items(), key=lambda item: int(item[0]))]
+    views = [
+        TurboQuantRaggedPagesCacheView.init(
+            config=config,
+            layer_index=layer_index,
+            mesh=text_config.mesh,
+            partition_manager=text_config.partition_manager,
+        )
+        for layer_index, config in enumerate(ordered_configs)
+    ]
+    return TurboQuantRaggedPagesCache(views=views)
 
 
 @auto_pytree
@@ -433,8 +1213,23 @@ class EasyGenerationMixin:
         quantizer = self._quant_class(
             quantization_config=text_config.kv_cache_quantization_config,
         )
+        uses_mixed_standard_geometry = _has_mixed_standard_ragged_geometry(text_config=text_config)
 
         if isinstance(config, UnifiedAttentionCacheConfig):
+            if uses_mixed_standard_geometry:
+                _, per_layer_configs = _create_mixed_standard_unified_attention_cache_configs(
+                    text_config=text_config,
+                    max_length=int(getattr(config, "max_model_length", max_model_length)),
+                    page_size=int(getattr(config, "page_size", page_size)),
+                    hbm_utilization=float(getattr(config, "hbm_utilization", hbm_utilization)),
+                    dtype=getattr(config, "kvdtype", getattr(text_config, "kvdtype", jnp.bfloat16)),
+                    num_pages_override=getattr(config, "num_pages", None),
+                )
+                return _materialize_mixed_unified_attention_cache(
+                    text_config=text_config,
+                    per_layer_configs=per_layer_configs,
+                    quantizer=quantizer,
+                )
             return UnifiedAttentionCache.init_cache(
                 mesh=text_config.mesh,
                 config=config,
@@ -446,6 +1241,77 @@ class EasyGenerationMixin:
                 mesh=text_config.mesh,
                 config=config,
                 partition_manager=text_config.partition_manager,
+                quantizer=quantizer,
+            )
+
+        try:
+            from easydel.caching.turboquant_ragged_page import (
+                TurboQuantRaggedPagesCache,
+                TurboQuantRaggedPagesCacheConfig,
+            )
+            from easydel.layers.quantization import TurboQuantConfig
+        except ImportError:
+            TurboQuantRaggedPagesCache = None
+            TurboQuantRaggedPagesCacheConfig = None
+            TurboQuantConfig = None
+
+        if TurboQuantRaggedPagesCacheConfig is not None and isinstance(config, TurboQuantRaggedPagesCacheConfig):
+            if uses_mixed_standard_geometry:
+                _, per_layer_configs = _create_mixed_turboquant_ragged_page_cache_configs(
+                    text_config=text_config,
+                    max_length=int(getattr(config, "max_model_length", max_model_length)),
+                    page_size=int(getattr(config, "page_size", page_size)),
+                    hbm_utilization=float(getattr(config, "hbm_utilization", hbm_utilization)),
+                    turboquant_config=config.turboquant_config,
+                    num_pages_override=getattr(config, "num_pages", None),
+                )
+                return _materialize_mixed_turboquant_ragged_cache(
+                    text_config=text_config,
+                    per_layer_configs=per_layer_configs,
+                )
+            return TurboQuantRaggedPagesCache.init_cache(
+                mesh=text_config.mesh,
+                config=config,
+                partition_manager=text_config.partition_manager,
+                quantizer=quantizer,
+            )
+
+        if (
+            uses_mixed_standard_geometry
+            and TurboQuantConfig is not None
+            and isinstance(
+                text_config.kv_cache_quantization_config,
+                TurboQuantConfig,
+            )
+        ):
+            _, per_layer_configs = _create_mixed_turboquant_ragged_page_cache_configs(
+                text_config=text_config,
+                max_length=int(getattr(config, "max_model_length", max_model_length)),
+                page_size=int(getattr(config, "page_size", page_size)),
+                hbm_utilization=float(getattr(config, "hbm_utilization", hbm_utilization)),
+                turboquant_config=text_config.kv_cache_quantization_config,
+                num_pages_override=getattr(config, "num_pages", None),
+            )
+            return _materialize_mixed_turboquant_ragged_cache(
+                text_config=text_config,
+                per_layer_configs=per_layer_configs,
+            )
+
+        if uses_mixed_standard_geometry:
+            per_layer_configs = _get_cached_mixed_standard_ragged_configs(config)
+            if per_layer_configs is None:
+                _, per_layer_configs = _create_mixed_standard_ragged_page_cache_configs(
+                    text_config=text_config,
+                    max_length=int(getattr(config, "max_model_length", max_model_length)),
+                    page_size=int(getattr(config, "page_size", page_size)),
+                    hbm_utilization=float(getattr(config, "hbm_utilization", hbm_utilization)),
+                    dtype=getattr(config, "kvdtype", getattr(text_config, "kvdtype", jnp.bfloat16)),
+                    version=getattr(config, "version", "v3"),
+                    num_pages_override=getattr(config, "num_pages", None),
+                )
+            return _materialize_mixed_standard_ragged_cache(
+                text_config=text_config,
+                per_layer_configs=per_layer_configs,
                 quantizer=quantizer,
             )
 
@@ -507,9 +1373,22 @@ class EasyGenerationMixin:
                 page_size=page_size,
             )
 
-        quantizer = self._quant_class(
-            quantization_config=text_config.kv_cache_quantization_config,
-        )
+        quantizer = self._quant_class(quantization_config=text_config.kv_cache_quantization_config)
+
+        if _has_mixed_standard_ragged_geometry(text_config=text_config):
+            _, per_layer_configs = _create_mixed_standard_unified_attention_cache_configs(
+                text_config=text_config,
+                max_length=int(getattr(config, "max_model_length", max_model_length)),
+                page_size=int(getattr(config, "page_size", page_size)),
+                hbm_utilization=float(getattr(config, "hbm_utilization", hbm_utilization)),
+                dtype=getattr(config, "kvdtype", getattr(text_config, "kvdtype", jnp.bfloat16)),
+                num_pages_override=getattr(config, "num_pages", None),
+            )
+            return _materialize_mixed_unified_attention_cache(
+                text_config=text_config,
+                per_layer_configs=per_layer_configs,
+                quantizer=quantizer,
+            )
 
         return UnifiedAttentionCache.init_cache(
             mesh=text_config.mesh,
@@ -549,8 +1428,9 @@ class EasyGenerationMixin:
 
         text_config = self.config.get_text_config()
         cache_type = self.get_inference_cache_type()
+        uses_mixed_standard_geometry = _has_mixed_standard_ragged_geometry(text_config=text_config)
 
-        if cache_type == "transformer":
+        if cache_type == "transformer" and not uses_mixed_standard_geometry:
             return TransformerCache.init_cache(
                 mesh=text_config.mesh,
                 config=self.create_transformer_cache_config(
@@ -567,7 +1447,8 @@ class EasyGenerationMixin:
                 mask_type_details=text_config.get_mask_details(),
             )
         else:
-            # For hybrid/recurrent models, use init_operations_cache
+            # Mixed-geometry transformer stacks still need per-layer cache views,
+            # even when every layer is attention-only.
             return self.init_operations_cache(
                 batch_size=batch_size,
                 max_length=max_length,
@@ -609,6 +1490,7 @@ class EasyGenerationMixin:
         batch_size: int,
         max_length: int,
         pad_token_id: int | None = None,
+        layer_idx: int | None = None,
     ):
         """Create TransformerCacheConfig from model configuration.
 
@@ -616,6 +1498,8 @@ class EasyGenerationMixin:
             batch_size: Batch size for inference.
             max_length: Maximum sequence length.
             pad_token_id: Optional pad token id override.
+            layer_idx: Optional layer index for mixed-geometry transformer
+                stacks whose KV geometry varies by layer.
 
         Returns:
             TransformerCacheConfig configured for the model.
@@ -629,23 +1513,7 @@ class EasyGenerationMixin:
 
         num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
 
-        # Some configs (e.g. OpenELM) store per-layer KV head counts in `num_kv_heads`.
-        # Generation cache configs currently expect a single KV head count, so we
-        # use the first layer's value when a list/tuple is provided.
-        num_kv_heads = getattr(text_config, "num_kv_heads", None)
-        if isinstance(num_kv_heads, (list, tuple)):
-            num_kv_heads = int(num_kv_heads[0]) if len(num_kv_heads) > 0 else None
-        if num_kv_heads is None:
-            num_kv_heads = getattr(text_config, "num_key_value_heads", None)
-        if num_kv_heads is None:
-            num_kv_heads = getattr(text_config, "num_attention_heads", None)
-
-        head_dim = getattr(text_config, "head_dim", None)
-        if head_dim is None:
-            hidden_size = getattr(text_config, "hidden_size", None)
-            num_heads = getattr(text_config, "num_attention_heads", None)
-            if hidden_size and num_heads:
-                head_dim = hidden_size // num_heads
+        num_kv_heads, head_dim = _resolve_standard_ragged_layer_geometry(text_config=text_config, layer_idx=layer_idx)
 
         if num_kv_heads is None:
             raise ValueError(
@@ -1015,6 +1883,17 @@ class EasyGenerationMixin:
         attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
         version = "v2" if attn_mechanism == "ragged_page_attention_v2" else "v3"
 
+        if _has_mixed_standard_ragged_geometry(text_config=text_config):
+            representative, _ = _create_mixed_standard_ragged_page_cache_configs(
+                text_config=text_config,
+                max_length=max_length,
+                page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                dtype=dtype,
+                version=version,
+            )
+            return representative
+
         return RaggedPagesCacheConfig.create(
             mesh=text_config.mesh,
             partition_manager=text_config.partition_manager,
@@ -1052,21 +1931,22 @@ class EasyGenerationMixin:
         if num_hidden_layers <= 0:
             num_hidden_layers = 1
 
-        # ejkernel MLA kernel stores decompressed k_nope (qk_nope_head_dim) in
-        # cache pages, not compressed_kv (kv_lora_rank).  Use qk_nope_head_dim
-        # as the "kv_lora_rank" parameter so that the cache page dimension
-        # matches the kernel expectation: padded(qk_nope_head_dim) + padded(qk_rope_head_dim).
-        qk_nope_head_dim = getattr(text_config, "qk_nope_head_dim", None)
-        if qk_nope_head_dim is None:
-            # Fallback: some configs only expose kv_lora_rank.
-            qk_nope_head_dim = getattr(text_config, "kv_lora_rank", None)
-            if qk_nope_head_dim is None:
-                qk_nope_head_dim = getattr(text_config, "kv_lora_dim", None)
+        # Shared MLA models cache the compressed latent ``compressed_kv`` with
+        # width ``kv_lora_rank`` (or ``kv_lora_dim``) plus the RoPE branch.
+        # Some model-specific overrides intentionally use a different layout, but
+        # the generic helper must follow the shared compressed-KV path.
+        kv_lora_rank = getattr(text_config, "kv_lora_rank", None)
+        if kv_lora_rank is None:
+            kv_lora_rank = getattr(text_config, "kv_lora_dim", None)
+        if kv_lora_rank is None:
+            # Backward-compatible fallback for configs that only expose the
+            # non-RoPE query width.
+            kv_lora_rank = getattr(text_config, "qk_nope_head_dim", None)
         qk_rope_head_dim = getattr(text_config, "qk_rope_head_dim", None)
-        if qk_nope_head_dim is None or int(qk_nope_head_dim) <= 0:
+        if kv_lora_rank is None or int(kv_lora_rank) <= 0:
             raise ValueError(
-                "MLA ragged cache requires positive `qk_nope_head_dim` "
-                "(or `kv_lora_rank` / `kv_lora_dim`) on text config."
+                "MLA ragged cache requires positive `kv_lora_rank` "
+                "(or `kv_lora_dim` / `qk_nope_head_dim`) on text config."
             )
         if qk_rope_head_dim is None or int(qk_rope_head_dim) < 0:
             raise ValueError("MLA ragged cache requires non-negative `qk_rope_head_dim` on text config.")
@@ -1084,7 +1964,7 @@ class EasyGenerationMixin:
             num_hidden_layers=int(num_hidden_layers),
             num_kv_heads=int(mla_num_heads),
             max_model_length=max_length,
-            kv_lora_rank=int(qk_nope_head_dim),
+            kv_lora_rank=int(kv_lora_rank),
             qk_rope_head_dim=int(qk_rope_head_dim),
             hbm_utilization=hbm_utilization,
             page_size=page_size,
@@ -1102,7 +1982,7 @@ class EasyGenerationMixin:
         text_config = self.config.get_text_config()
         attn_mechanism = _normalize_attn_mechanism_value(getattr(text_config, "attn_mechanism", None))
 
-        if attn_mechanism == "multi_latent_ragged_page_attention_v1":
+        if attn_mechanism in ("multi_latent_ragged_page_attention_v1", "multi_latent_ragged_page_attention_v2"):
             return self._create_mla_ragged_page_cache_config(
                 max_length=max_length,
                 page_size=page_size,
@@ -1130,8 +2010,6 @@ class EasyGenerationMixin:
         This cache layout matches ejkernel's Triton UnifiedAttention kernel:
         `[num_blocks, block_size, num_kv_heads, head_dim]` for both K and V.
         """
-        from easydel.caching import UnifiedAttentionCacheConfig
-
         text_config = self.config.get_text_config()
 
         if dtype is None:
@@ -1139,20 +2017,22 @@ class EasyGenerationMixin:
             if isinstance(dtype, str):
                 dtype = getattr(jnp, dtype, jnp.bfloat16)
 
-        num_kv_heads = getattr(text_config, "num_key_value_heads", None)
-        head_dim = getattr(text_config, "head_dim", None)
-        if head_dim is None:
-            hidden_size = getattr(text_config, "hidden_size", None)
-            num_heads = getattr(text_config, "num_attention_heads", None)
-            if hidden_size and num_heads:
-                head_dim = hidden_size // num_heads
+        if _has_mixed_standard_ragged_geometry(text_config=text_config):
+            representative_config, _ = _create_mixed_standard_unified_attention_cache_configs(
+                text_config=text_config,
+                max_length=max_length,
+                page_size=page_size,
+                hbm_utilization=hbm_utilization,
+                dtype=dtype,
+            )
+            return representative_config
 
-        num_hidden_layers = _count_kv_layers(text_config)
+        num_kv_heads, head_dim = _resolve_standard_ragged_layer_geometry(text_config=text_config, layer_idx=None)
         return UnifiedAttentionCacheConfig.create(
             mesh=text_config.mesh,
             partition_manager=text_config.partition_manager,
             kvdtype=dtype,
-            num_hidden_layers=num_hidden_layers,
+            num_hidden_layers=_count_kv_layers(text_config),
             num_kv_heads=num_kv_heads,
             max_model_length=max_length,
             head_dim=head_dim,
@@ -1219,6 +2099,7 @@ class EasyGenerationMixin:
             UnifiedAttentionCacheConfig,
             UnifiedAttentionCacheView,
         )
+        from easydel.layers.quantization import TurboQuantConfig
 
         text_config = self.config.get_text_config()
         cache_view_mapping = self.get_operations_cache_view()
@@ -1274,21 +2155,41 @@ class EasyGenerationMixin:
 
         num_standard_ragged_layers = 0
         num_mla_ragged_layers = 0
+        standard_ragged_layer_indices: list[int] = []
+        unified_layer_indices: list[int] = []
         for layer_idx, view_class in cache_view_mapping.items():
             if view_class is RaggedPagesCacheView:
                 num_standard_ragged_layers += 1
+                standard_ragged_layer_indices.append(int(layer_idx))
             elif view_class is MLARaggedPagesCacheView:
                 num_mla_ragged_layers += 1
+            elif view_class is UnifiedAttentionCacheView:
+                unified_layer_indices.append(int(layer_idx))
             elif view_class is ParallelHybridCacheView:
                 attn_view_class = _resolve_parallel_hybrid_attention_view_class(layer_idx)
                 if attn_view_class is RaggedPagesCacheView:
                     num_standard_ragged_layers += 1
+                    standard_ragged_layer_indices.append(int(layer_idx))
                 elif attn_view_class is MLARaggedPagesCacheView:
                     num_mla_ragged_layers += 1
+                elif attn_view_class is UnifiedAttentionCacheView:
+                    unified_layer_indices.append(int(layer_idx))
 
         shared_ragged_config: RaggedPagesCacheConfig | None = None
         shared_mla_ragged_config: MLARaggedPagesCacheConfig | None = None
         shared_unified_config: UnifiedAttentionCacheConfig | None = None
+        per_layer_standard_ragged_configs: dict[int, RaggedPagesCacheConfig] = {}
+        per_layer_unified_configs: dict[int, UnifiedAttentionCacheConfig] = {}
+        user_provided_standard_ragged_config = False
+        user_provided_unified_config = False
+        has_mixed_standard_ragged = needs_standard_ragged and _has_mixed_standard_ragged_geometry(
+            text_config=text_config,
+            layer_indices=standard_ragged_layer_indices,
+        )
+        has_mixed_standard_unified = needs_unified and _has_mixed_standard_ragged_geometry(
+            text_config=text_config,
+            layer_indices=unified_layer_indices,
+        )
 
         if ragged_config is not None:
             # MLARaggedPagesCacheConfig subclasses RaggedPagesCacheConfig, so we must
@@ -1299,13 +2200,49 @@ class EasyGenerationMixin:
             elif isinstance(ragged_config, RaggedPagesCacheConfig):
                 shared_ragged_config = ragged_config
                 needs_standard_ragged = True
+                user_provided_standard_ragged_config = True
             else:
                 raise TypeError(
                     "`ragged_config` must be a RaggedPagesCacheConfig or MLARaggedPagesCacheConfig, "
                     f"got {type(ragged_config)}"
                 )
 
-        if needs_standard_ragged and shared_ragged_config is None:
+        # Check if TurboQuant KV cache quantization is configured
+        kv_quant_cfg = getattr(text_config, "kv_cache_quantization_config", None)
+        _is_turboquant = isinstance(kv_quant_cfg, TurboQuantConfig)
+
+        if needs_standard_ragged and _is_turboquant:
+            from easydel.caching.turboquant_ragged_page import TurboQuantRaggedPagesCacheConfig
+
+            if has_mixed_standard_ragged:
+                shared_ragged_config, per_layer_standard_ragged_configs = (
+                    _create_mixed_turboquant_ragged_page_cache_configs(
+                        text_config=text_config,
+                        max_length=int(getattr(shared_ragged_config, "max_model_length", max_length)),
+                        page_size=int(getattr(shared_ragged_config, "page_size", page_size)),
+                        hbm_utilization=float(getattr(shared_ragged_config, "hbm_utilization", hbm_utilization)),
+                        turboquant_config=getattr(shared_ragged_config, "turboquant_config", kv_quant_cfg),
+                        layer_indices=standard_ragged_layer_indices,
+                        num_pages_override=(
+                            getattr(shared_ragged_config, "num_pages", None)
+                            if user_provided_standard_ragged_config
+                            else None
+                        ),
+                    )
+                )
+            elif shared_ragged_config is None:
+                shared_ragged_config = TurboQuantRaggedPagesCacheConfig.create(
+                    mesh=text_config.mesh,
+                    partition_manager=text_config.partition_manager,
+                    turboquant_config=kv_quant_cfg,
+                    num_hidden_layers=max(1, num_standard_ragged_layers),
+                    num_kv_heads=text_config.num_key_value_heads,
+                    max_model_length=max_length,
+                    kv_head_dim_size=text_config.head_dim,
+                    hbm_utilization=hbm_utilization,
+                    page_size=page_size,
+                )
+        elif needs_standard_ragged and shared_ragged_config is None:
             shared_ragged_config = self._create_standard_ragged_page_cache_config(
                 max_length=max_length,
                 page_size=page_size,
@@ -1313,6 +2250,30 @@ class EasyGenerationMixin:
                 dtype=dtype,
                 num_hidden_layers_override=max(1, num_standard_ragged_layers),
             )
+        if needs_standard_ragged and has_mixed_standard_ragged and not _is_turboquant:
+            cached_per_layer_configs = _get_cached_mixed_standard_ragged_configs(
+                shared_ragged_config,
+                layer_indices=standard_ragged_layer_indices,
+            )
+            if cached_per_layer_configs is not None:
+                per_layer_standard_ragged_configs = cached_per_layer_configs
+            else:
+                shared_ragged_config, per_layer_standard_ragged_configs = (
+                    _create_mixed_standard_ragged_page_cache_configs(
+                        text_config=text_config,
+                        max_length=max_length,
+                        page_size=int(getattr(shared_ragged_config, "page_size", page_size)),
+                        hbm_utilization=float(getattr(shared_ragged_config, "hbm_utilization", hbm_utilization)),
+                        dtype=getattr(shared_ragged_config, "kvdtype", dtype),
+                        version=getattr(shared_ragged_config, "version", "v3"),
+                        layer_indices=standard_ragged_layer_indices,
+                        num_pages_override=(
+                            getattr(shared_ragged_config, "num_pages", None)
+                            if user_provided_standard_ragged_config
+                            else None
+                        ),
+                    )
+                )
         if needs_mla_ragged and shared_mla_ragged_config is None:
             shared_mla_ragged_config = self._create_mla_ragged_page_cache_config(
                 max_length=max_length,
@@ -1325,12 +2286,30 @@ class EasyGenerationMixin:
         if needs_unified:
             if unified_config is not None and not isinstance(unified_config, UnifiedAttentionCacheConfig):
                 raise TypeError(f"`unified_config` must be a UnifiedAttentionCacheConfig, got {type(unified_config)}")
-            shared_unified_config = unified_config or self.create_unified_attention_cache_config(
-                max_length=max_length,
-                page_size=page_size,
-                hbm_utilization=hbm_utilization,
-                dtype=dtype,
-            )
+            if unified_config is not None:
+                shared_unified_config = unified_config
+                user_provided_unified_config = True
+            if has_mixed_standard_unified:
+                shared_unified_config, per_layer_unified_configs = (
+                    _create_mixed_standard_unified_attention_cache_configs(
+                        text_config=text_config,
+                        max_length=int(getattr(shared_unified_config, "max_model_length", max_length)),
+                        page_size=int(getattr(shared_unified_config, "page_size", page_size)),
+                        hbm_utilization=float(getattr(shared_unified_config, "hbm_utilization", hbm_utilization)),
+                        dtype=getattr(shared_unified_config, "kvdtype", dtype),
+                        layer_indices=unified_layer_indices,
+                        num_pages_override=(
+                            getattr(shared_unified_config, "num_pages", None) if user_provided_unified_config else None
+                        ),
+                    )
+                )
+            elif shared_unified_config is None:
+                shared_unified_config = self.create_unified_attention_cache_config(
+                    max_length=max_length,
+                    page_size=page_size,
+                    hbm_utilization=hbm_utilization,
+                    dtype=dtype,
+                )
         with self.mesh:
             views_config = [None] * num_hidden_layers
 
@@ -1347,13 +2326,14 @@ class EasyGenerationMixin:
                     if attn_view_class is MLARaggedPagesCacheView:
                         t_config = shared_mla_ragged_config
                     elif attn_view_class is RaggedPagesCacheView:
-                        t_config = shared_ragged_config
+                        t_config = per_layer_standard_ragged_configs.get(idx, shared_ragged_config)
                     elif attn_view_class is UnifiedAttentionCacheView:
-                        t_config = shared_unified_config
+                        t_config = per_layer_unified_configs.get(idx, shared_unified_config)
                     else:
                         t_config = self.create_transformer_cache_config(
                             batch_size=batch_size,
                             max_length=max_length,
+                            layer_idx=idx,
                         )
                     if t_config is None:
                         raise ValueError(
@@ -1363,7 +2343,11 @@ class EasyGenerationMixin:
                     r_config = self.create_recurrent_cache_config(batch_size=batch_size)
                     views_config[idx] = (t_config, r_config)
                 elif view_class is TransformerCacheView:
-                    config = self.create_transformer_cache_config(batch_size=batch_size, max_length=max_length)
+                    config = self.create_transformer_cache_config(
+                        batch_size=batch_size,
+                        max_length=max_length,
+                        layer_idx=idx,
+                    )
                     views_config[idx] = config
                 elif view_class is RecurrentCacheView:
                     config = self.create_recurrent_cache_config(batch_size=batch_size)
@@ -1372,15 +2356,16 @@ class EasyGenerationMixin:
                     config = self.create_kda_cache_config(batch_size=batch_size)
                     views_config[idx] = config
                 elif view_class is RaggedPagesCacheView:
-                    if shared_ragged_config is None:
+                    config = per_layer_standard_ragged_configs.get(idx, shared_ragged_config)
+                    if config is None:
                         raise ValueError(f"Missing RaggedPagesCacheConfig for layer {idx}.")
-                    views_config[idx] = shared_ragged_config
+                    views_config[idx] = config
                 elif view_class is MLARaggedPagesCacheView:
                     if shared_mla_ragged_config is None:
                         raise ValueError(f"Missing MLARaggedPagesCacheConfig for layer {idx}.")
                     views_config[idx] = shared_mla_ragged_config
                 elif view_class is UnifiedAttentionCacheView:
-                    views_config[idx] = shared_unified_config
+                    views_config[idx] = per_layer_unified_configs.get(idx, shared_unified_config)
                 elif view_class is LightningCacheView:
                     config = self.create_lightning_cache_config(batch_size=batch_size)
                     views_config[idx] = config
@@ -1457,6 +2442,13 @@ class EasyGenerationMixin:
         )
         text_config = self.config.get_text_config()
         cache_view_mapping = self.get_operations_cache_view()
+        if masking_details is None:
+            masking_details = getattr(text_config, "get_mask_details", lambda: None)()
+
+        def _resolve_masking_details(layer_index: int):
+            if isinstance(masking_details, dict):
+                return masking_details.get(layer_index)
+            return masking_details
 
         if dtype is None:
             dtype = getattr(text_config, "kvdtype", jnp.bfloat16)
@@ -1468,9 +2460,78 @@ class EasyGenerationMixin:
             if num_hidden_layers is None:
                 num_hidden_layers = (max(cache_view_mapping.keys(), default=-1) + 1) if cache_view_mapping else 0
 
+            # KV-shared layers alias their donor's cache view — skip allocation.
+            kv_shared = text_config.get_kv_shared_layer_mapping()
+
             views = [None] * num_hidden_layers
 
+            # Pre-scan for TurboQuant layers and batch-allocate them
+            # (5 allocations total vs 5 * num_layers).
+            _tq_batch_views: dict[int, "TurboQuantRaggedPagesCacheView"] = {}
+            try:
+                from easydel.caching.turboquant_ragged_page import TurboQuantRaggedPagesCacheConfig as _TQCfg
+                from easydel.caching.turboquant_ragged_page import TurboQuantRaggedPagesCacheView as _TQView
+
+                def _tq_signature(_cfg: "_TQCfg") -> tuple[tp.Any, ...]:
+                    """Return a hashable identity tuple for dedup of TQ configs.
+
+                    Configs that share the same signature can reuse the same
+                    batch-allocated cache views, avoiding redundant allocations.
+
+                    Args:
+                        _cfg: A ``TurboQuantRaggedPagesCacheConfig`` instance.
+
+                    Returns:
+                        Tuple of key fields that uniquely identify the cache
+                        geometry and quantisation parameters.
+                    """
+                    _tq_cfg = _cfg.turboquant_config
+                    return (
+                        type(_cfg),
+                        int(_cfg.num_pages),
+                        int(_cfg.page_size),
+                        int(_cfg.num_kv_heads),
+                        int(_cfg.k_headdim),
+                        int(_cfg.v_headdim),
+                        int(_cfg.data_parallel_size),
+                        int(_cfg.max_model_length),
+                        int(getattr(_tq_cfg, "bits", 0)),
+                        getattr(_tq_cfg, "qjl_dim", None),
+                        int(getattr(_tq_cfg, "seed", 0)),
+                    )
+
+                _tq_groups: dict[tuple[tp.Any, ...], list[tuple[int, "_TQCfg"]]] = {}
+                for _i, _cfg in zip(range(num_hidden_layers), views_config, strict=False):
+                    _vc = cache_view_mapping.get(_i)
+                    if _vc in (RaggedPagesCacheView, MLARaggedPagesCacheView) and isinstance(_cfg, _TQCfg):
+                        _tq_groups.setdefault(_tq_signature(_cfg), []).append((_i, _cfg))
+
+                for _group in _tq_groups.values():
+                    if len(_group) <= 1:
+                        continue
+                    _layer_indices = [_li for _li, _ in _group]
+                    _batch_views = _TQView.init_all_layers(
+                        config=_group[0][1],
+                        num_layers=len(_group),
+                        mesh=text_config.mesh,
+                        partition_manager=text_config.partition_manager,
+                        layer_indices=_layer_indices,
+                    )
+                    for (_li, _), _bv in zip(_group, _batch_views, strict=False):
+                        _tq_batch_views[_li] = _bv
+            except ImportError:
+                pass
+
             for idx, config_classes in zip(range(num_hidden_layers), views_config, strict=False):
+                # KV-shared layers are aliased to their donor after allocation.
+                if int(idx) in kv_shared:
+                    continue
+
+                # Use batch-allocated TurboQuant view if available
+                if idx in _tq_batch_views:
+                    views[idx] = _tq_batch_views[idx]
+                    continue
+
                 view_class = cache_view_mapping.get(idx)
                 if view_class is None:
                     raise ValueError(
@@ -1522,7 +2583,7 @@ class EasyGenerationMixin:
                             dtype=dtype,
                             partition_manager=text_config.partition_manager,
                             quantizer=quantizer,
-                            masking_details=masking_details,
+                            masking_details=_resolve_masking_details(idx),
                             starts=starts,
                         )
 
@@ -1545,7 +2606,7 @@ class EasyGenerationMixin:
                         dtype=dtype,
                         partition_manager=text_config.partition_manager,
                         quantizer=quantizer,
-                        masking_details=masking_details,
+                        masking_details=_resolve_masking_details(idx),
                         starts=starts,
                     )
                 elif view_class is RecurrentCacheView:
@@ -1561,13 +2622,26 @@ class EasyGenerationMixin:
                         dtype=dtype,
                     )
                 elif view_class in (RaggedPagesCacheView, MLARaggedPagesCacheView):
-                    view = view_class.init(
-                        config=config_classes,
-                        layer_index=idx,
-                        mesh=text_config.mesh,
-                        partition_manager=text_config.partition_manager,
-                        quantizer=quantizer,
+                    from easydel.caching.turboquant_ragged_page import (
+                        TurboQuantRaggedPagesCacheConfig,
+                        TurboQuantRaggedPagesCacheView,
                     )
+
+                    if isinstance(config_classes, TurboQuantRaggedPagesCacheConfig):
+                        view = TurboQuantRaggedPagesCacheView.init(
+                            config=config_classes,
+                            layer_index=idx,
+                            mesh=text_config.mesh,
+                            partition_manager=text_config.partition_manager,
+                        )
+                    else:
+                        view = view_class.init(
+                            config=config_classes,
+                            layer_index=idx,
+                            mesh=text_config.mesh,
+                            partition_manager=text_config.partition_manager,
+                            quantizer=quantizer,
+                        )
                 elif view_class is UnifiedAttentionCacheView:
                     view = view_class.init(
                         config=config_classes,
@@ -1586,6 +2660,10 @@ class EasyGenerationMixin:
                     raise ValueError(f"Unknown cache view class: {view_class}")
 
                 views[idx] = view
+
+            # KV sharing: shared layers do NOT get their own cache views. They
+            # are left as None and the model loop passes the donor's cache view
+            # at runtime. This avoids duplicate JAX buffer donation errors.
 
             return HybridCache(views=views)
 
@@ -1925,12 +3003,80 @@ class EasyGenerationMixin:
         model_kwargs.pop("visual_pos_masks", None)
         return model_kwargs
 
+    @staticmethod
+    def _extract_generation_cache_indexs(past_key_values) -> jnp.ndarray | None:
+        """Return the current KV length vector from the first index-bearing cache view.
+
+        Generation stores cache state inside different containers depending on the
+        model and attention implementation. For one-token decode steps we only need
+        a single per-batch index vector, and all transformer-like layers should
+        advance in lockstep, so the first available ``indexs`` is sufficient.
+        """
+        views = getattr(past_key_values, "views", None)
+        if views is None:
+            return None
+
+        for view in views:
+            if view is None:
+                continue
+
+            indexs = getattr(view, "indexs", None)
+            if indexs is not None:
+                return indexs
+
+            transformer = getattr(view, "transformer", None)
+            indexs = getattr(transformer, "indexs", None)
+            if indexs is not None:
+                return indexs
+
+        return None
+
+    def _prepare_mask_info_for_generation_step(
+        self,
+        running_token,
+        call_kwargs: dict[str, tp.Any],
+    ) -> dict[str, tp.Any]:
+        """Derive a decode-step MaskInfo from the cached sequence length.
+
+        The base generation ``mask_info`` is created for the full prefill prompt
+        and padded to ``max_length``. Reusing that object unchanged for single-token
+        decode steps causes the cache layer to keep slicing the last prompt query
+        row instead of the current decode position. For cached decode we derive a
+        one-step query mask from the current cache lengths while leaving the stored
+        base ``mask_info`` untouched for subsequent steps.
+        """
+        mask_info = call_kwargs.get("mask_info")
+        past_key_values = call_kwargs.get("past_key_values")
+        if mask_info is None or past_key_values is None:
+            return call_kwargs
+
+        if getattr(running_token, "ndim", 0) < 2 or running_token.shape[1] != 1:
+            return call_kwargs
+
+        cache_indexs = self._extract_generation_cache_indexs(past_key_values)
+        if cache_indexs is None:
+            return call_kwargs
+
+        q_len = int(running_token.shape[1])
+        decode_end_index = cache_indexs + q_len
+        prepared_kwargs = dict(call_kwargs)
+        decode_mask_info = mask_info.apply_kv_lengths(
+            kv_lengths=decode_end_index,
+            q_len=q_len,
+            end_index=decode_end_index,
+        )
+        if getattr(mask_info, "_causal_baked", False):
+            object.__setattr__(decode_mask_info, "_causal_baked", True)
+        prepared_kwargs["mask_info"] = decode_mask_info
+        return prepared_kwargs
+
     def _call_generation_model_step(self, model, running_token, call_kwargs):
         """Run one generation step without forwarding incompatible prompt embeddings."""
-
-        if call_kwargs.get("inputs_embeds", None) is not None:
-            return model(**call_kwargs)
-        return model(running_token, **call_kwargs)
+        call_kwargs = self._prepare_mask_info_for_generation_step(running_token, call_kwargs)
+        with set_inference_mode():
+            if call_kwargs.get("inputs_embeds", None) is not None:
+                return model(**call_kwargs)
+            return model(running_token, **call_kwargs)
 
     def _create_required_props_from_kwargs(
         self, model_kwargs: dict[str, Array]
@@ -2306,6 +3452,30 @@ class EasyGenerationMixin:
         Return:
             [`~utils.ModelOutput`].
         """
+        use_generation_compatible_model = kwargs.pop("_use_generation_compatible_model", True)
+
+        text_config = self.config.get_text_config() if hasattr(self.config, "get_text_config") else self.config
+        if (
+            trace
+            and use_generation_compatible_model
+            and getattr(text_config, "model_type", None) == "openelm"
+            and _uses_gradient_checkpointing(self.config)
+        ):
+            compatible_model = self.merge_module(
+                self._generate_compatible_graphdef,
+                self.graphstate,
+                self._generate_compatible_graphother,
+            )
+            compatible_model.generation_config = self.generation_config
+            return compatible_model.generate(
+                input_ids=input_ids,
+                generation_config=generation_config,
+                prng_key=prng_key,
+                trace=trace,
+                logits_processor=logits_processor,
+                _use_generation_compatible_model=False,
+                **kwargs,
+            )
 
         if generation_config is None:
             if self.generation_config._from_model_config and self.generation_config._original_object_hash == hash(
@@ -2377,6 +3547,14 @@ class EasyGenerationMixin:
                 )
 
         batch_size = input_ids.shape[0]
+
+        # TPU MLA decoding currently hits an XLA/Jellyfish while_loop runtime bug
+        # during autoregressive generation. Fall back to the Python loop in that
+        # case so generation stays functional, especially for model tests and
+        # short-form inference workloads.
+        if trace and _resolve_backend_for_esurge(self.config) == "tpu" and _text_config_uses_mla(text_config):
+            logger.warning("Disabling traced generation loop for TPU MLA decoding due to a known XLA runtime issue.")
+            trace = False
 
         if self.config.is_encoder_decoder:
             # add encoder_outputs to model_kwargs
@@ -3212,8 +4390,9 @@ class EasyGenerationMixin:
                     (batch_size, num_beams, input_ids_length),
                 )
             )
-            # Leave mask_info as the base; cache layer will compute step-specific mask
-            model_outputs = model(input_token, **state.model_kwargs)
+            with set_inference_mode():
+                call_kwargs = self._prepare_mask_info_for_generation_step(input_token, state.model_kwargs)
+                model_outputs = model(input_token, **call_kwargs)
 
             logits = unflatten_beam_dim(model_outputs.logits[:, -1], batch_size, num_beams)
             cache = jax.tree_util.tree_map(
@@ -3313,13 +4492,16 @@ class EasyGenerationMixin:
         _mla_kernel_ok = int(_num_heads) > 0
         is_mla_model = has_mla_attention and _mla_kernel_ok
         if is_mla_model:
-            compatible = attn_mechanism == "multi_latent_ragged_page_attention_v1"
+            compatible = attn_mechanism in {
+                "multi_latent_ragged_page_attention_v1",
+                "multi_latent_ragged_page_attention_v2",
+            }
             if backend == "gpu":
                 compatible = compatible or attn_mechanism in {
                     "unified_attention",
                     "paged_flash_attention",
                 }
-            target_attn = "multi_latent_ragged_page_attention_v1"
+            target_attn = "multi_latent_ragged_page_attention_v2"
         elif backend == "tpu":
             compatible = attn_mechanism in [
                 "ragged_page_attention_v2",
@@ -3349,7 +4531,7 @@ class EasyGenerationMixin:
                     logger.warning(
                         "Detected mixed MLA and non-MLA full-attention layers, "
                         "forcing all inference layers to "
-                        "multi_latent_ragged_page_attention_v1."
+                        "multi_latent_ragged_page_attention_v2."
                     )
                 update_kwargs["decode_attn_mechanism"] = target_attn
                 update_kwargs["mla_attn_mechanism"] = target_attn
@@ -3415,13 +4597,16 @@ class EasyGenerationMixin:
         is_mla_model = has_mla_attention and _mla_kernel_ok
 
         if is_mla_model:
-            compatible = attn_mechanism == "multi_latent_ragged_page_attention_v1"
+            compatible = attn_mechanism in {
+                "multi_latent_ragged_page_attention_v1",
+                "multi_latent_ragged_page_attention_v2",
+            }
             if backend == "gpu":
                 compatible = compatible or attn_mechanism in {
                     "unified_attention",
                     "paged_flash_attention",
                 }
-            target_attn = "multi_latent_ragged_page_attention_v1"
+            target_attn = "multi_latent_ragged_page_attention_v2"
         elif backend == "tpu":
             compatible = attn_mechanism in [
                 "ragged_page_attention_v2",
@@ -3688,7 +4873,7 @@ class EasyGenerationMixin:
             num_heads = text_config.num_attention_heads or 0
             is_mla_model = has_mla_attention and int(num_heads) > 0
             if is_mla_model:
-                esurge_attn = "multi_latent_ragged_page_attention_v1"
+                esurge_attn = "multi_latent_ragged_page_attention_v2"
             elif backend == "gpu":
                 esurge_attn = "unified_attention"
             else:

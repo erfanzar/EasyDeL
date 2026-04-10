@@ -699,10 +699,13 @@ class BatchMetadataPreparer:
             if num_requests > 0:
                 is_decode = (scheduled[:num_requests] == 1) & (num_computed_tokens_cpu[:num_requests] > 0)
                 decode_count = int(np.sum(is_decode))
+                prefill_count = int(np.sum((scheduled[:num_requests] > 0) & (~is_decode)))
             else:
                 decode_count = 0
+                prefill_count = 0
+            prefill_end = decode_count + prefill_count
             request_distribution[0] = decode_count
-            request_distribution[1] = decode_count
+            request_distribution[1] = prefill_end
             request_distribution[2] = num_requests
 
         if self._use_slot_mapping:
@@ -743,14 +746,18 @@ class BatchMetadataPreparer:
         packed_misc_i32[1] = np.int32(padded_num_reqs)
         packed_misc_i32[2:5] = request_distribution
 
+        # Transfer full max_num_reqs arrays (not sliced to padded_num_reqs) so
+        # that BatchMetadata shapes are fixed and the backbone can be compiled
+        # once per num_tokens bucket.  The extra transfer is ~9KB at
+        # max_num_reqs=256 — negligible vs the compilation savings.
         if self._use_slot_mapping:
             host_payload = (
                 input_ids,
                 positions,
                 packed_qsl_seqlens,
                 pages_tables_payload,
-                packed_i32_padded[:, :padded_num_reqs],
-                packed_f32_padded[:, :padded_num_reqs],
+                packed_i32_padded,
+                packed_f32_padded,
                 packed_misc_i32,
                 slot_mapping_cpu if slot_mapping_cpu is not None else slot_mapping_placeholder,
                 num_kv_update_cpu,
@@ -763,8 +770,8 @@ class BatchMetadataPreparer:
                 positions,
                 packed_qsl_seqlens,
                 pages_tables_payload,
-                packed_i32_padded[:, :padded_num_reqs],
-                packed_f32_padded[:, :padded_num_reqs],
+                packed_i32_padded,
+                packed_f32_padded,
                 packed_misc_i32,
                 scheduled_full_cpu,
                 active_mask_full_cpu,
@@ -872,6 +879,13 @@ class BatchMetadataPreparer:
         host_build_took = time.time() - host_build_start
 
         device_put_start = time.time()
+
+        # Multi-host: broadcast host-side arrays from coordinator (process 0)
+        # so all hosts pass identical data to `device_put` with replicated sharding.
+        if jax.process_count() > 1:
+            from jax.experimental import multihost_utils
+
+            host_payload = multihost_utils.broadcast_one_to_all(host_payload)
 
         slot_mapping_dev = None
         num_kv_update_dev = None
@@ -1099,6 +1113,10 @@ class BatchMetadataPreparer:
         host_build_took = time.time() - host_build_start
 
         device_put_start = time.time()
+        if jax.process_count() > 1:
+            from jax.experimental import multihost_utils
+
+            host_payload = multihost_utils.broadcast_one_to_all(host_payload)
         self._pending_transfer = jax.device_put(host_payload, self._empty_sharding)
         device_put_took = time.time() - device_put_start
         self._pending_transfer_metadata = {
