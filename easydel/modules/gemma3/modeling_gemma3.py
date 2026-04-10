@@ -987,6 +987,20 @@ class Gemma3ForCausalLM(BaseCausalLMModule[Gemma3TextModel, Gemma3TextConfig]): 
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
         return lm_logits
 
+    def make_lm_head_fn(self):
+        """Trace-safe projection with Gemma-3 soft-capping."""
+        base_fn = super().make_lm_head_fn()
+        cap_value = self.config.final_logit_softcapping
+        if cap_value is None:
+            return base_fn
+
+        def _project(hidden_states):
+            logits = base_fn(hidden_states)
+            cap = jnp.array(cap_value, dtype=logits.dtype)
+            return cap * jax.nn.tanh(logits / cap)
+
+        return _project
+
     def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.
@@ -1825,6 +1839,21 @@ class Gemma3ForConditionalGeneration(BaseVisionLanguageModule[Gemma3Model, Gemma
             cap = jnp.array(self.config.get_text_config().final_logit_softcapping, dtype=lm_logits.dtype)
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
         return lm_logits
+
+    def make_lm_head_fn(self):
+        """Trace-safe projection with Gemma-3 VLM soft-capping (bypasses nn.remat)."""
+        _native = self.lm_head.native_forward
+        cap_value = self.config.get_text_config().final_logit_softcapping
+        _cap = self.apply_logit_cap
+
+        def _project(hidden_states):
+            lm_logits = _cap(_native(hidden_states))
+            if cap_value is not None:
+                cap = jnp.array(cap_value, dtype=lm_logits.dtype)
+                lm_logits = cap * jax.nn.tanh(lm_logits / cap)
+            return lm_logits
+
+        return _project
 
     def init_cache(
         self,

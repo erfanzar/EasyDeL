@@ -2827,6 +2827,55 @@ class EasyDeLBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
         w = self.get_embedding().embedding.value.T if tie_embeddings else None
         return self.get_lm_head()(hidden_states, w=w)
 
+    def make_lm_head_fn(self) -> "Callable[[Array], Array]":
+        """Return a trace-safe callable that projects hidden states to logits.
+
+        The returned function can safely be called from inside any JAX
+        traced region — ``jax.lax.scan``, ``jax.lax.fori_loop``,
+        ``jax.checkpoint``, and their compositions — without triggering
+        ``flax.errors.TraceContextError``.
+
+        **Why this is needed:**  When gradient checkpointing is enabled the
+        LM-head linear layer is wrapped with ``nn.remat``.  NNX's remat
+        uses a split/merge protocol that *mutates* Variables
+        (``update_from_state``) — which fails when the call site is inside
+        a different JAX trace level (e.g. ``lax.scan`` body under
+        ``jax.grad``).  This method bypasses the ``nn.remat`` wrapper by
+        calling the head's ``native_forward`` directly (reads-only on NNX
+        Variables — no mutation, no trace-context check).
+
+        The default implementation resolves tied-embedding weights and
+        calls ``native_forward`` on the LM head.  Model subclasses that
+        add post-processing (e.g. logit soft-capping or scaling) should
+        override this method so the returned function reproduces the same
+        semantics.
+
+        Trainers should call this method **once** before entering a
+        traced loop and use the returned function inside the loop body.
+
+        Returns:
+            A callable ``fn(hidden_states) -> logits`` that preserves
+            all model-specific projection semantics.
+        """
+        head = self.get_lm_head()
+
+        tie_embeddings = next(
+            (
+                getattr(self.config, key)
+                for key in ["tie_word_embeddings", "use_lm_head", "share_input_output_layers"]
+                if hasattr(self.config, key)
+            ),
+            False,
+        )
+        w = self.get_embedding().embedding.value.T if tie_embeddings else None
+
+        _native_forward = head.native_forward
+
+        def _project(hidden_states: "Array") -> "Array":
+            return _native_forward(hidden_states, w=w)
+
+        return _project
+
     @staticmethod
     def _recursive_config_children(config: EasyDeLBaseConfig) -> tuple[EasyDeLBaseConfig, ...]:
         """Collect nested config objects without evaluating dynamic properties.

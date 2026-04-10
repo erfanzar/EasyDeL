@@ -451,6 +451,7 @@ class BaseTrainer(BaseTrainerProtocol):
             return
 
         requested_step = int(requested_step_value)
+        force_step_start_point = self.arguments.force_step_start_point
         current_step = int(jax.device_get(self.model_state.step))
         step_dtype = getattr(self.model_state.step, "dtype", jnp.int32)
         normalized_step = jnp.asarray(requested_step, dtype=step_dtype)
@@ -458,10 +459,11 @@ class BaseTrainer(BaseTrainerProtocol):
             if not isinstance(self.model_state.step, jax.Array):
                 self.model_state = self.model_state.replace(step=normalized_step)
             return
-        if current_step != 0 and not self._resumed_from_checkpoint:
+        if current_step != 0 and not self._resumed_from_checkpoint and not force_step_start_point:
             logger.warning(
                 f"Ignoring step_start_point={requested_step} because model_state.step is already "
-                f"{current_step}. Use a fresh state or checkpoint resume instead."
+                f"{current_step}. Use a fresh state, checkpoint resume, or set "
+                "`force_step_start_point=True` to override it."
             )
             return
 
@@ -469,6 +471,11 @@ class BaseTrainer(BaseTrainerProtocol):
         if self._resumed_from_checkpoint:
             logger.info(
                 f"Overrode resumed checkpoint step from {current_step} to {requested_step} via step_start_point."
+            )
+        elif force_step_start_point and current_step != 0:
+            logger.info(
+                f"Force-overrode loaded state step from {current_step} to {requested_step} via "
+                "`force_step_start_point`."
             )
         else:
             logger.info(f"Initialized model_state.step to {requested_step} from step_start_point.")

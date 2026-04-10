@@ -823,6 +823,19 @@ class Cohere2ForCausalLM(BaseCausalLMModule[Cohere2Model, Cohere2Config]):
             lm_logits *= self.logit_scale
         return lm_logits
 
+    def make_lm_head_fn(self):
+        """Trace-safe projection with Cohere2 logit scaling."""
+        base_fn = super().make_lm_head_fn()
+        scale = self.logit_scale
+
+        def _project(hidden_states):
+            logits = base_fn(hidden_states)
+            if scale is not None:
+                logits = logits * scale
+            return logits
+
+        return _project
+
     def get_encoder(self) -> nn.Module:
         """
         Returns the encoder part of the model's graph definition.

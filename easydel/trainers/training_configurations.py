@@ -676,6 +676,17 @@ class TrainingArguments:
         default=None,
         metadata={"help": "The step to start training from (for resuming)."},
     )
+    force_step_start_point: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Force `step_start_point` onto a loaded nonzero state as well. "
+                "When enabled, the trainer overwrites both `state.step` and optimizer/scheduler "
+                "count leaves even if the incoming state was loaded manually rather than resumed "
+                "through the trainer's auto-resume path."
+            )
+        },
+    )
     resume_if_possible: bool = field(
         default=True,
         metadata={"help": "Automatically resume from the latest checkpoint if available."},

@@ -1014,3 +1014,13 @@ class Grok1ForCausalLM(BaseCausalLMModule[Grok1Model, Grok1Config]):  # type: ig
         lm_logits = super().apply_lm_head(hidden_states)
         lm_logits = lm_logits * self.output_multiplier_scale
         return lm_logits
+
+    def make_lm_head_fn(self):
+        """Trace-safe projection with Grok-1 output multiplier scaling."""
+        base_fn = super().make_lm_head_fn()
+        scale = self.output_multiplier_scale
+
+        def _project(hidden_states):
+            return base_fn(hidden_states) * scale
+
+        return _project

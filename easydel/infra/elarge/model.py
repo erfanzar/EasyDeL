@@ -1420,6 +1420,9 @@ class eLargeModel:
                 - warmup_steps: Number of warmup steps
                 - output_dir: Directory to save checkpoints
                 - step_start_point: Initialize training from an explicit global step
+                - force_step_start_point: Force `step_start_point` onto a loaded
+                  state and optimizer counters even when the state was loaded
+                  manually instead of resumed by the trainer
                 - resume_if_possible: Auto-resume from the latest checkpoint if one exists
                 DPO-specific:
                 - beta: KL regularization coefficient

@@ -1489,6 +1489,16 @@ class FalconH1ForCausalLM(BaseCausalLMModule[FalconH1Model, FalconH1Config]):  #
             past_key_values=outputs.past_key_values,
         )
 
+    def make_lm_head_fn(self):
+        """Trace-safe projection with Falcon-H1 muP lm_head_multiplier."""
+        base_fn = super().make_lm_head_fn()
+        multiplier = self.base_model.lm_head_multiplier
+
+        def _project(hidden_states):
+            return base_fn(hidden_states) * multiplier
+
+        return _project
+
     def prepare_inputs_for_generation(
         self,
         input_ids: Array,
