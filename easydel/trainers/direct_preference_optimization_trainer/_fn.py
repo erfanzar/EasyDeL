@@ -249,10 +249,15 @@ def _compute_dpo_outputs_from_hidden_states(
     batch_size, seq_len = labels.shape
     chunk_size = max(1, min(int(chunk_size), int(seq_len)))
 
+    _lm_head_fn = (
+        model.make_lm_head_fn() if hasattr(model, "make_lm_head_fn") else model.compute_lm_logits
+    )
+    _has_prepare = hasattr(model, "prepare_lm_head_inputs")
+
     def _project_chunk(chunk_hidden_states: Array) -> Array:
-        if hasattr(model, "prepare_lm_head_inputs"):
+        if _has_prepare:
             chunk_hidden_states = model.prepare_lm_head_inputs(chunk_hidden_states)
-        return model.compute_lm_logits(chunk_hidden_states)
+        return _lm_head_fn(chunk_hidden_states)
 
     _project_chunk = jax.checkpoint(_project_chunk, prevent_cse=False)
 

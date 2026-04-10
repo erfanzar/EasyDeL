@@ -77,7 +77,7 @@ from easydel.caching import (
     TransformerMetadata,
 )
 from easydel.infra.modeling_outputs import Seq2SeqLMOutput
-from easydel.infra.utils import auto_remat
+from easydel.infra.utils import auto_remat as auto_remat
 from easydel.layers import ColumnParallelLinear
 
 from ._base_task_module import BaseTaskModule, ConfigT, ModelT

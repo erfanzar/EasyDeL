@@ -115,6 +115,7 @@ def test_training_arguments_preserve_none_step_start_point_for_auto_resume():
     )
 
     assert args.step_start_point is None
+    assert args.force_step_start_point is False
 
 
 def test_elarge_build_training_arguments_preserves_step_start_point():
@@ -123,12 +124,14 @@ def test_elarge_build_training_arguments_preserves_step_start_point():
         "sft",
         total_batch_size=1,
         step_start_point=123,
+        force_step_start_point=True,
         resume_if_possible=False,
     )
 
     args = elm.build_training_arguments()
 
     assert args.step_start_point == 123
+    assert args.force_step_start_point is True
     assert args.resume_if_possible is False
 
 
@@ -142,6 +145,8 @@ def test_normalize_trainer_config_defaults_step_start_point_to_none():
 
     assert "step_start_point" in config
     assert config["step_start_point"] is None
+    assert "force_step_start_point" in config
+    assert config["force_step_start_point"] is False
 
 
 def test_normalize_trainer_config_defaults_lmhead_chunksize_to_none():

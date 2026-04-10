@@ -2765,6 +2765,32 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
         return lm_logits
 
+    def make_lm_head_fn(self):
+        """Trace-safe projection preserving Gemma-4 tied-embedding attend path and soft-capping."""
+        cap_value = self.config.final_logit_softcapping
+        if getattr(self.config, "tie_word_embeddings", False):
+            # Embed.attend only reads .value — already trace-safe.
+            _attend = self.get_embedding().attend
+
+            def _project(hidden_states):
+                lm_logits = _attend(hidden_states)
+                if cap_value is not None:
+                    cap = jnp.array(cap_value, dtype=lm_logits.dtype)
+                    lm_logits = cap * jax.nn.tanh(lm_logits / cap)
+                return lm_logits
+        else:
+            # Untied: delegate to base (native_forward bypass) + add capping.
+            base_fn = super().make_lm_head_fn()
+            if cap_value is None:
+                return base_fn
+
+            def _project(hidden_states):
+                logits = base_fn(hidden_states)
+                cap = jnp.array(cap_value, dtype=logits.dtype)
+                return cap * jax.nn.tanh(logits / cap)
+
+        return _project
+
     def get_encoder(self):
         """Not applicable for decoder-only models."""
         raise NotImplementedError("This is a decoder-only model and does not have an encoder.")
@@ -3217,6 +3243,20 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
             cap = jnp.array(cap, dtype=logits.dtype)
             logits = cap * jax.nn.tanh(logits / cap)
         return logits
+
+    def make_lm_head_fn(self):
+        """Trace-safe projection with Gemma-4 VLM soft-capping."""
+        base_fn = super().make_lm_head_fn()
+        cap_value = getattr(self.config.text_config, "final_logit_softcapping", None)
+        if cap_value is None:
+            return base_fn
+
+        def _project(hidden_states):
+            logits = base_fn(hidden_states)
+            cap = jnp.array(cap_value, dtype=logits.dtype)
+            return cap * jax.nn.tanh(logits / cap)
+
+        return _project
 
     def __call__(
         self,

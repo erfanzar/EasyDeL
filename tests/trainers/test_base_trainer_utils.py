@@ -256,7 +256,7 @@ def test_configure_state_resume_keeps_step_and_sets_runtime_tx_before_sharding()
 
 def test_apply_step_start_point_initializes_fresh_state_step():
     trainer = object.__new__(_PreviewTrainer)
-    trainer.arguments = SimpleNamespace(step_start_point=13)
+    trainer.arguments = SimpleNamespace(step_start_point=13, force_step_start_point=False)
     trainer._resumed_from_checkpoint = False
     trainer.model_state = _StateStub(opt_state=None, tx=None, step=0)
 
@@ -268,7 +268,7 @@ def test_apply_step_start_point_initializes_fresh_state_step():
 
 def test_apply_step_start_point_normalizes_matching_step_to_jax_array():
     trainer = object.__new__(_PreviewTrainer)
-    trainer.arguments = SimpleNamespace(step_start_point=13)
+    trainer.arguments = SimpleNamespace(step_start_point=13, force_step_start_point=False)
     trainer._resumed_from_checkpoint = False
     trainer.model_state = _StateStub(opt_state=None, tx=None, step=13)
 
@@ -380,7 +380,7 @@ def test_execute_train_step_annotates_memory_oom_with_supported_knobs():
 
 def test_apply_step_start_point_ignores_nonzero_state_step():
     trainer = object.__new__(_PreviewTrainer)
-    trainer.arguments = SimpleNamespace(step_start_point=13)
+    trainer.arguments = SimpleNamespace(step_start_point=13, force_step_start_point=False)
     trainer._resumed_from_checkpoint = False
     trainer.model_state = _StateStub(opt_state=None, tx=None, step=4)
 
@@ -392,9 +392,24 @@ def test_apply_step_start_point_ignores_nonzero_state_step():
     warning.assert_called_once()
 
 
+def test_apply_step_start_point_force_overrides_nonzero_loaded_state_step():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(step_start_point=13, force_step_start_point=True)
+    trainer._resumed_from_checkpoint = False
+    trainer.model_state = _StateStub(opt_state=None, tx=None, step=4)
+
+    with patch("easydel.trainers.base_trainer.logger.warning") as warning:
+        BaseTrainer._apply_step_start_point(trainer)
+
+    assert isinstance(trainer.model_state.step, jax.Array)
+    assert int(trainer.model_state.step) == 13
+    assert any("step" in call and int(call["step"]) == 13 for call in trainer.model_state.replace_calls)
+    warning.assert_not_called()
+
+
 def test_apply_step_start_point_overrides_resumed_checkpoint_step():
     trainer = object.__new__(_PreviewTrainer)
-    trainer.arguments = SimpleNamespace(step_start_point=13)
+    trainer.arguments = SimpleNamespace(step_start_point=13, force_step_start_point=False)
     trainer._resumed_from_checkpoint = True
     trainer.model_state = _StateStub(opt_state={"loaded": True}, tx="old-tx", step=4)
 
@@ -408,7 +423,7 @@ def test_apply_step_start_point_overrides_resumed_checkpoint_step():
 def test_configure_state_seeds_opt_state_counts_from_step_start_point():
     trainer = object.__new__(_PreviewTrainer)
     trainer.timer = _NoopTimer()
-    trainer.arguments = SimpleNamespace(init_tx=True, step_start_point=13)
+    trainer.arguments = SimpleNamespace(init_tx=True, step_start_point=13, force_step_start_point=False)
     trainer._resumed_from_checkpoint = False
     trainer.tx = "tx-object"
     trainer.model_state = _StateStub(opt_state=None, tx=None, step=jnp.asarray(13, dtype=jnp.int32))
@@ -424,7 +439,7 @@ def test_configure_state_seeds_opt_state_counts_from_step_start_point():
 def test_configure_state_resume_seeds_opt_state_counts_from_step_start_point():
     trainer = object.__new__(_PreviewTrainer)
     trainer.timer = _NoopTimer()
-    trainer.arguments = SimpleNamespace(init_tx=True, step_start_point=13)
+    trainer.arguments = SimpleNamespace(init_tx=True, step_start_point=13, force_step_start_point=False)
     trainer._resumed_from_checkpoint = True
     trainer.tx = "new-tx"
     trainer.model_state = _StateStub(
@@ -441,6 +456,30 @@ def test_configure_state_resume_seeds_opt_state_counts_from_step_start_point():
 
     assert trainer.model_state.init_tx_calls == []
     assert {"tx": "new-tx"} in trainer.model_state.replace_calls
+    assert int(trainer.model_state.opt_state[0].count) == 13
+    assert int(trainer.model_state.opt_state[1]["count"]) == 13
+
+
+def test_configure_state_force_seeds_opt_state_counts_from_loaded_nonzero_step():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.timer = _NoopTimer()
+    trainer.arguments = SimpleNamespace(init_tx=True, step_start_point=13, force_step_start_point=True)
+    trainer._resumed_from_checkpoint = False
+    trainer.tx = "tx-object"
+    trainer.model_state = _StateStub(
+        opt_state=(
+            _CountState(count=jnp.asarray(4, dtype=jnp.int32), payload={"loaded": True}),
+            {"count": jnp.asarray(4, dtype=jnp.int32)},
+        ),
+        tx="old-tx",
+        step=jnp.asarray(4, dtype=jnp.int32),
+    )
+    trainer._model = _ModelStub(rules=((".*", "pspec"),))
+
+    BaseTrainer._apply_step_start_point(trainer)
+    BaseTrainer._configure_state(trainer)
+
+    assert int(trainer.model_state.step) == 13
     assert int(trainer.model_state.opt_state[0].count) == 13
     assert int(trainer.model_state.opt_state[1]["count"]) == 13
 

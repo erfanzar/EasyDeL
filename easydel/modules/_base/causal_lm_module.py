@@ -75,7 +75,7 @@ from easydel.caching import (
     TransformerMetadata,
 )
 from easydel.infra.modeling_outputs import CausalLMOutput, MoeCausalLMOutput
-from easydel.infra.utils import auto_remat
+from easydel.infra.utils import auto_remat as auto_remat
 from easydel.layers import ColumnParallelLinear
 
 from ._base_task_module import BaseTaskModule, ConfigT, ModelT
@@ -250,7 +250,17 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
         # Store LM head name for dynamic access
         self._lm_head_name = lm_head_name
 
-        # Create LM head with optional gradient checkpointing
+        # Create LM head with optional gradient checkpointing.
+        #
+        # NOTE: nn.remat on the lm_head is important for large-vocab models
+        # (e.g. [B, 8192, 260k] → ~34 GB in bf16).  However, nn.remat's
+        # split/merge protocol mutates NNX Variables (update_from_state),
+        # which triggers flax.errors.TraceContextError when trainer chunked
+        # paths call lm_head.__call__ from inside jax.lax.scan / fori_loop.
+        #
+        # The model's make_lm_head_fn() provides a trace-safe bypass that
+        # calls native_forward directly (reads-only, no nn.remat wrapper),
+        # so trainers should use that contract inside traced loops.
 
         if self._gradient_checkpointing_feature.should_checkpoint():
             lm_head_class = auto_remat(
@@ -258,7 +268,6 @@ class BaseCausalLMModule(BaseTaskModule[ModelT, ConfigT]):
                 **self._gradient_checkpointing_feature.get_config(),
             )
 
-        # Create LM head with custom attribute name
         lm_head = lm_head_class(
             config.hidden_size,
             config.vocab_size,

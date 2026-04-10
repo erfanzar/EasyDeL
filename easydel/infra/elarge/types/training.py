@@ -257,6 +257,8 @@ class BaseTrainerCfg(TypedDict, total=False):
         aux_loss_enabled: Whether to enable auxiliary losses (e.g., for MoE).
         training_time_limit: Maximum training time as string (e.g., "2h30m").
         step_start_point: Step number to resume training from.
+        force_step_start_point: Whether to force ``step_start_point`` onto a
+            loaded nonzero state and reseed optimizer/scheduler counters.
         resume_if_possible: Whether to automatically resume from latest checkpoint.
         truncation_mode: How to truncate sequences that exceed max_length.
             "keep_end" preserves the end, "keep_start" preserves the beginning.
@@ -427,6 +429,7 @@ class BaseTrainerCfg(TypedDict, total=False):
     aux_loss_enabled: NotRequired[bool]
     training_time_limit: NotRequired[str | None]
     step_start_point: NotRequired[int | None]
+    force_step_start_point: NotRequired[bool]
     resume_if_possible: NotRequired[bool]
     truncation_mode: NotRequired[Literal["keep_end", "keep_start"]]
     max_length: NotRequired[int | None]
@@ -1529,6 +1532,7 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "train_on_inputs": True,
     "aux_loss_enabled": False,
     "step_start_point": None,
+    "force_step_start_point": False,
     "resume_if_possible": True,
     "truncation_mode": "keep_end",
     "max_length": 4096,

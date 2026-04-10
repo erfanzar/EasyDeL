@@ -855,6 +855,20 @@ class Gemma2ForCausalLM(BaseCausalLMModule[Gemma2Model, Gemma2Config]):
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
         return lm_logits
 
+    def make_lm_head_fn(self):
+        """Trace-safe projection with Gemma-2 soft-capping."""
+        base_fn = super().make_lm_head_fn()
+        cap_value = self.config.final_logit_softcapping
+        if cap_value is None:
+            return base_fn
+
+        def _project(hidden_states):
+            logits = base_fn(hidden_states)
+            cap = jnp.array(cap_value, dtype=logits.dtype)
+            return cap * jax.nn.tanh(logits / cap)
+
+        return _project
+
     def get_decoder(self):
         """
         Returns the decoder part of the model's graph definition.

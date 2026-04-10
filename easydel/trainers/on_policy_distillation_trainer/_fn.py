@@ -170,8 +170,8 @@ def on_policy_distillation_step(
             total_loss, loss_components = chunked_distillation_loss(
                 student_hidden=student_outputs.last_hidden_state,
                 teacher_hidden=teacher_hidden_for_kl,
-                student_lm_head_fn=module.apply_lm_head,
-                teacher_lm_head_fn=teacher_state.model.apply_lm_head,
+                student_lm_head_fn=module.make_lm_head_fn(),
+                teacher_lm_head_fn=teacher_state.model.make_lm_head_fn(),
                 attention_mask=attention_mask,
                 loss_mask=completion_mask,
                 labels=None,
