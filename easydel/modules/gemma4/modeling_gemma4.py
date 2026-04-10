@@ -1095,6 +1095,29 @@ class Gemma4Attention(UnifiedAttention):
             with_scale=False,
         )
 
+    @staticmethod
+    def _hf_sliding_window(sliding_window: int | None) -> tuple[int, int] | None:
+        """Convert HF Gemma4 sliding-window size to EasyDeL's inclusive tuple form."""
+        if sliding_window is None:
+            return None
+        return (max(int(sliding_window) - 1, 0), 0)
+
+    def _kernel_sliding_window(self) -> int | tuple[int, int] | None:
+        """Choose the sliding-window representation expected by the active attention kernel."""
+        if self.sliding_window is None:
+            return None
+
+        impl = getattr(getattr(self, "attention_performer", None), "impl", None)
+        impl_name = type(impl).__name__.lower() if impl is not None else ""
+
+        # ejkernel ragged/page backends accept an integer window size, but they
+        # still follow Gemma4's HF semantics where a window of N means the
+        # current token plus the previous N-1 cache positions.
+        if any(token in impl_name for token in ("ragged", "page", "decode", "unified")):
+            return max(int(self.sliding_window) - 1, 0)
+
+        return self._hf_sliding_window(self.sliding_window)
+
     @property
     def head_dim(self):
         """Per-head dimension, which varies between global and sliding layers."""
@@ -1200,9 +1223,11 @@ class Gemma4Attention(UnifiedAttention):
         """Apply Q/K/V normalization after projection and multi-head reshape.
 
         For standard layers, all three states are independently normalized.
-        For k_eq_v layers, the normalized key output is passed through the
-        scale-free v_norm to produce distinct value representations from the
-        same underlying projection.
+        For k_eq_v layers, value_states (which is the raw key projection
+        aliased by ``_preprocess_qkv``) is passed through the scale-free
+        v_norm *before* key_states is overwritten by k_norm.  This matches
+        the HuggingFace reference where ``v_norm`` operates on the raw
+        projection output, not the already-normed key.
 
         Args:
             query_states: Query tensor ``[batch, seq_len, num_heads, head_dim]``.
@@ -1213,10 +1238,15 @@ class Gemma4Attention(UnifiedAttention):
             Tuple of normalized (query, key, value) tensors.
         """
         query_states = self.q_norm(query_states)
-        key_states = self.k_norm(key_states)
         if self.use_alternative_attention:
-            value_states = self.v_norm(key_states)
+            # k_eq_v: value_states is the raw key projection (aliased in
+            # _preprocess_qkv).  Normalize it *before* k_norm overwrites
+            # key_states so that v_norm sees the raw projection, not a
+            # double-normed tensor.
+            value_states = self.v_norm(value_states)
+            key_states = self.k_norm(key_states)
         else:
+            key_states = self.k_norm(key_states)
             value_states = self.v_norm(value_states)
         return query_states, key_states, value_states
 
@@ -1313,7 +1343,7 @@ class Gemma4Attention(UnifiedAttention):
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
             causal_for_kernel = False
 
-        sliding_window_for_kernel = self.sliding_window
+        sliding_window_for_kernel = self._kernel_sliding_window()
         if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
             sliding_window_for_kernel = None
 
@@ -1333,6 +1363,8 @@ class Gemma4Attention(UnifiedAttention):
             mask_info=mask_info,
             sliding_window=sliding_window_for_kernel,
         )
+        if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+            sliding_window_for_kernel = None
 
         softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
         softmax_aux = getattr(softmax_aux, "value", softmax_aux)
@@ -1450,7 +1482,7 @@ class Gemma4Attention(UnifiedAttention):
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
             causal_for_kernel = False
 
-        sliding_window_for_kernel = self.sliding_window
+        sliding_window_for_kernel = self._kernel_sliding_window()
         if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
             sliding_window_for_kernel = None
 
@@ -1478,6 +1510,8 @@ class Gemma4Attention(UnifiedAttention):
                 mask_info=mask_info,
                 sliding_window=sliding_window_for_kernel,
             )
+            if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
+                sliding_window_for_kernel = None
 
         softmax_aux = getattr(self, "sinks", getattr(self, "softmax_aux", None))
         softmax_aux = getattr(softmax_aux, "value", softmax_aux)
@@ -2479,9 +2513,9 @@ class Gemma4TextModel(EasyDeLBaseModule):
 
             causal_mask_info = mask_info.apply_causal()
             mask_info_full = causal_mask_info.apply_token_type_ids(grouped_token_types)
-            mask_info_sliding = causal_mask_info.apply_sliding_window(self.config.sliding_window).apply_token_type_ids(
-                grouped_token_types
-            )
+            mask_info_sliding = causal_mask_info.apply_sliding_window(
+                Gemma4Attention._hf_sliding_window(self.config.sliding_window)
+            ).apply_token_type_ids(grouped_token_types)
             object.__setattr__(mask_info_full, "_causal_baked", True)
             object.__setattr__(mask_info_sliding, "_causal_baked", True)
 
@@ -2714,7 +2748,18 @@ class Gemma4ForCausalLM(BaseCausalLMModule[Gemma4TextModel, Gemma4TextConfig]):
         Returns:
             Vocabulary logits ``[batch, seq_len, vocab_size]``, optionally soft-capped.
         """
-        lm_logits = super().compute_lm_logits(hidden_states)
+        return self.apply_lm_head(hidden_states)
+
+    def apply_lm_head(self, hidden_states: Array) -> Array:
+        """Project hidden states to Gemma4 text logits for runtime sampling paths."""
+        if getattr(self.config, "tie_word_embeddings", False):
+            # Gemma4 checkpoints tie the text LM head to the input embedding
+            # matrix. Going through the generic ColumnParallelLinear `w=...`
+            # override can drift under TPU TP layouts, so use the embedding's
+            # native attend path directly for tied-text logits.
+            lm_logits = self.get_embedding().attend(hidden_states)
+        else:
+            lm_logits = super().apply_lm_head(hidden_states)
         if self.config.final_logit_softcapping is not None:
             cap = jnp.array(self.config.final_logit_softcapping, dtype=lm_logits.dtype)
             lm_logits = cap * jax.nn.tanh(lm_logits / cap)
@@ -3166,7 +3211,7 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
         Returns:
             Vocabulary logits ``[batch, seq_len, vocab_size]``.
         """
-        logits = self.lm_head(hidden_states)
+        logits = super().apply_lm_head(hidden_states)
         cap = getattr(self.config.text_config, "final_logit_softcapping", None)
         if cap is not None:
             cap = jnp.array(cap, dtype=logits.dtype)

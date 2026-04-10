@@ -467,12 +467,16 @@ class Gemma4Config(EasyDeLBaseConfig):
     """Top-level multimodal configuration for Gemma4.
 
     Bundles a ``Gemma4TextConfig`` (the language decoder), an optional
-    ``Gemma4VisionConfig`` (the vision encoder), and special-token IDs used
-    to locate image and video placeholder positions in the token sequence
-    during multimodal embedding merging.
+    ``Gemma4VisionConfig`` (the vision encoder), an optional audio config blob
+    kept for Hugging Face checkpoint/config compatibility, and special-token
+    IDs used to locate image/video/audio placeholder positions in the token
+    sequence during multimodal embedding merging.
 
     When ``vision_config`` is ``None``, the model is instantiated without a
-    vision tower and can only process text inputs.
+    vision tower and can only process text inputs. Audio-specific config fields
+    are accepted and preserved so upstream Gemma 4 configs can round-trip
+    cleanly, even though EasyDeL's local Gemma 4 implementation does not yet
+    expose an audio tower.
 
     Args:
         text_config: Configuration for the text decoder.  If ``None``, uses
@@ -480,6 +484,8 @@ class Gemma4Config(EasyDeLBaseConfig):
             will be unpacked into ``Gemma4TextConfig(**dict)``.
         vision_config: Configuration for the vision encoder.  ``None`` disables
             vision.  Can be a dictionary unpacked into ``Gemma4VisionConfig``.
+        audio_config: Optional audio tower configuration payload preserved for
+            Hugging Face Gemma 4 config compatibility.
         boi_token_id: Begin-of-image sentinel token index.
             Defaults to 255 999.
         eoi_token_id: End-of-image sentinel token index.
@@ -488,6 +494,14 @@ class Gemma4Config(EasyDeLBaseConfig):
             soft tokens during embedding merging.  Defaults to 258 880.
         video_token_id: Placeholder token index for video frames.
             Defaults to 258 884.
+        boa_token_id: Begin-of-audio sentinel token index.
+            Defaults to 256 000.
+        eoa_token_index: End-of-audio sentinel token index.
+            Defaults to 258 883.
+        audio_token_id: Placeholder token index for audio features.
+            Defaults to 258 881.
+        tie_word_embeddings: Whether top-level configs should advertise tied
+            embeddings like upstream Gemma 4. Defaults to ``True``.
         initializer_range: Standard deviation for weight initialisation.
             Defaults to 0.02.
     """
@@ -502,11 +516,16 @@ class Gemma4Config(EasyDeLBaseConfig):
         self,
         text_config: Gemma4TextConfig | dict | None = None,
         vision_config: Gemma4VisionConfig | dict | None = None,
+        audio_config: dict | None = None,
         boi_token_id: int = 255_999,
         eoi_token_id: int = 258_882,
         image_token_id: int = 258_880,
         video_token_id: int = 258_884,
+        boa_token_id: int = 256_000,
+        eoa_token_index: int = 258_883,
+        audio_token_id: int = 258_881,
         initializer_range: float = 0.02,
+        tie_word_embeddings: bool = True,
         **kwargs,
     ):
         if text_config is None:
@@ -519,13 +538,18 @@ class Gemma4Config(EasyDeLBaseConfig):
 
         self.text_config = text_config
         self.vision_config = vision_config
+        self.audio_config = dict(audio_config) if isinstance(audio_config, dict) else audio_config
         self.boi_token_id = boi_token_id
         self.eoi_token_id = eoi_token_id
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
+        self.boa_token_id = boa_token_id
+        self.eoa_token_index = eoa_token_index
+        self.audio_token_id = audio_token_id
         self.initializer_range = initializer_range
+        self.tie_word_embeddings = tie_word_embeddings
 
-        super().__init__(**kwargs)
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
     def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
         """Return tensor-parallelism partition rules.

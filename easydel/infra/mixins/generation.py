@@ -288,6 +288,12 @@ def _resolve_standard_ragged_layer_geometry(
     layer_types = getattr(text_config, "layer_types", None)
     if layer_idx is not None and isinstance(layer_types, (list, tuple)) and 0 <= int(layer_idx) < len(layer_types):
         layer_type = str(layer_types[int(layer_idx)]).lower()
+    elif layer_idx is None and isinstance(layer_types, (list, tuple)):
+        kv_layer_types = [
+            str(layer_type).lower() for layer_type in layer_types if _is_kv_attention_layer_type(layer_type)
+        ]
+        if kv_layer_types and all(layer_type == kv_layer_types[0] for layer_type in kv_layer_types):
+            layer_type = kv_layer_types[0]
 
     is_full_attention = layer_type == "full_attention"
 
@@ -1422,8 +1428,9 @@ class EasyGenerationMixin:
 
         text_config = self.config.get_text_config()
         cache_type = self.get_inference_cache_type()
+        uses_mixed_standard_geometry = _has_mixed_standard_ragged_geometry(text_config=text_config)
 
-        if cache_type == "transformer":
+        if cache_type == "transformer" and not uses_mixed_standard_geometry:
             return TransformerCache.init_cache(
                 mesh=text_config.mesh,
                 config=self.create_transformer_cache_config(
@@ -1440,7 +1447,8 @@ class EasyGenerationMixin:
                 mask_type_details=text_config.get_mask_details(),
             )
         else:
-            # For hybrid/recurrent models, use init_operations_cache
+            # Mixed-geometry transformer stacks still need per-layer cache views,
+            # even when every layer is attention-only.
             return self.init_operations_cache(
                 batch_size=batch_size,
                 max_length=max_length,
@@ -1482,6 +1490,7 @@ class EasyGenerationMixin:
         batch_size: int,
         max_length: int,
         pad_token_id: int | None = None,
+        layer_idx: int | None = None,
     ):
         """Create TransformerCacheConfig from model configuration.
 
@@ -1489,6 +1498,8 @@ class EasyGenerationMixin:
             batch_size: Batch size for inference.
             max_length: Maximum sequence length.
             pad_token_id: Optional pad token id override.
+            layer_idx: Optional layer index for mixed-geometry transformer
+                stacks whose KV geometry varies by layer.
 
         Returns:
             TransformerCacheConfig configured for the model.
@@ -1502,23 +1513,7 @@ class EasyGenerationMixin:
 
         num_hidden_layers = getattr(text_config, "num_hidden_layers", 1)
 
-        # Some configs (e.g. OpenELM) store per-layer KV head counts in `num_kv_heads`.
-        # Generation cache configs currently expect a single KV head count, so we
-        # use the first layer's value when a list/tuple is provided.
-        num_kv_heads = getattr(text_config, "num_kv_heads", None)
-        if isinstance(num_kv_heads, (list, tuple)):
-            num_kv_heads = int(num_kv_heads[0]) if len(num_kv_heads) > 0 else None
-        if num_kv_heads is None:
-            num_kv_heads = getattr(text_config, "num_key_value_heads", None)
-        if num_kv_heads is None:
-            num_kv_heads = getattr(text_config, "num_attention_heads", None)
-
-        head_dim = getattr(text_config, "head_dim", None)
-        if head_dim is None:
-            hidden_size = getattr(text_config, "hidden_size", None)
-            num_heads = getattr(text_config, "num_attention_heads", None)
-            if hidden_size and num_heads:
-                head_dim = hidden_size // num_heads
+        num_kv_heads, head_dim = _resolve_standard_ragged_layer_geometry(text_config=text_config, layer_idx=layer_idx)
 
         if num_kv_heads is None:
             raise ValueError(
@@ -2338,6 +2333,7 @@ class EasyGenerationMixin:
                         t_config = self.create_transformer_cache_config(
                             batch_size=batch_size,
                             max_length=max_length,
+                            layer_idx=idx,
                         )
                     if t_config is None:
                         raise ValueError(
@@ -2347,7 +2343,11 @@ class EasyGenerationMixin:
                     r_config = self.create_recurrent_cache_config(batch_size=batch_size)
                     views_config[idx] = (t_config, r_config)
                 elif view_class is TransformerCacheView:
-                    config = self.create_transformer_cache_config(batch_size=batch_size, max_length=max_length)
+                    config = self.create_transformer_cache_config(
+                        batch_size=batch_size,
+                        max_length=max_length,
+                        layer_idx=idx,
+                    )
                     views_config[idx] = config
                 elif view_class is RecurrentCacheView:
                     config = self.create_recurrent_cache_config(batch_size=batch_size)
@@ -2442,6 +2442,13 @@ class EasyGenerationMixin:
         )
         text_config = self.config.get_text_config()
         cache_view_mapping = self.get_operations_cache_view()
+        if masking_details is None:
+            masking_details = getattr(text_config, "get_mask_details", lambda: None)()
+
+        def _resolve_masking_details(layer_index: int):
+            if isinstance(masking_details, dict):
+                return masking_details.get(layer_index)
+            return masking_details
 
         if dtype is None:
             dtype = getattr(text_config, "kvdtype", jnp.bfloat16)
@@ -2576,7 +2583,7 @@ class EasyGenerationMixin:
                             dtype=dtype,
                             partition_manager=text_config.partition_manager,
                             quantizer=quantizer,
-                            masking_details=masking_details,
+                            masking_details=_resolve_masking_details(idx),
                             starts=starts,
                         )
 
@@ -2599,7 +2606,7 @@ class EasyGenerationMixin:
                         dtype=dtype,
                         partition_manager=text_config.partition_manager,
                         quantizer=quantizer,
-                        masking_details=masking_details,
+                        masking_details=_resolve_masking_details(idx),
                         starts=starts,
                     )
                 elif view_class is RecurrentCacheView:
@@ -2996,8 +3003,76 @@ class EasyGenerationMixin:
         model_kwargs.pop("visual_pos_masks", None)
         return model_kwargs
 
+    @staticmethod
+    def _extract_generation_cache_indexs(past_key_values) -> jnp.ndarray | None:
+        """Return the current KV length vector from the first index-bearing cache view.
+
+        Generation stores cache state inside different containers depending on the
+        model and attention implementation. For one-token decode steps we only need
+        a single per-batch index vector, and all transformer-like layers should
+        advance in lockstep, so the first available ``indexs`` is sufficient.
+        """
+        views = getattr(past_key_values, "views", None)
+        if views is None:
+            return None
+
+        for view in views:
+            if view is None:
+                continue
+
+            indexs = getattr(view, "indexs", None)
+            if indexs is not None:
+                return indexs
+
+            transformer = getattr(view, "transformer", None)
+            indexs = getattr(transformer, "indexs", None)
+            if indexs is not None:
+                return indexs
+
+        return None
+
+    def _prepare_mask_info_for_generation_step(
+        self,
+        running_token,
+        call_kwargs: dict[str, tp.Any],
+    ) -> dict[str, tp.Any]:
+        """Derive a decode-step MaskInfo from the cached sequence length.
+
+        The base generation ``mask_info`` is created for the full prefill prompt
+        and padded to ``max_length``. Reusing that object unchanged for single-token
+        decode steps causes the cache layer to keep slicing the last prompt query
+        row instead of the current decode position. For cached decode we derive a
+        one-step query mask from the current cache lengths while leaving the stored
+        base ``mask_info`` untouched for subsequent steps.
+        """
+        mask_info = call_kwargs.get("mask_info")
+        past_key_values = call_kwargs.get("past_key_values")
+        if mask_info is None or past_key_values is None:
+            return call_kwargs
+
+        if getattr(running_token, "ndim", 0) < 2 or running_token.shape[1] != 1:
+            return call_kwargs
+
+        cache_indexs = self._extract_generation_cache_indexs(past_key_values)
+        if cache_indexs is None:
+            return call_kwargs
+
+        q_len = int(running_token.shape[1])
+        decode_end_index = cache_indexs + q_len
+        prepared_kwargs = dict(call_kwargs)
+        decode_mask_info = mask_info.apply_kv_lengths(
+            kv_lengths=decode_end_index,
+            q_len=q_len,
+            end_index=decode_end_index,
+        )
+        if getattr(mask_info, "_causal_baked", False):
+            object.__setattr__(decode_mask_info, "_causal_baked", True)
+        prepared_kwargs["mask_info"] = decode_mask_info
+        return prepared_kwargs
+
     def _call_generation_model_step(self, model, running_token, call_kwargs):
         """Run one generation step without forwarding incompatible prompt embeddings."""
+        call_kwargs = self._prepare_mask_info_for_generation_step(running_token, call_kwargs)
         with set_inference_mode():
             if call_kwargs.get("inputs_embeds", None) is not None:
                 return model(**call_kwargs)
@@ -3063,9 +3138,7 @@ class EasyGenerationMixin:
                 param = valid_params[name]
                 if param.annotation != inspect.Parameter.empty:
                     try:
-                        if (
-                            getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None
-                        ):  # pyright: ignore[reportDeprecated]
+                        if getattr(param.annotation, "__origin__", None) is tp.Optional and value is not None:  # pyright: ignore[reportDeprecated]
                             expected_type = param.annotation.__args__[0]
                             if not isinstance(value, expected_type):
                                 print(
@@ -4318,8 +4391,8 @@ class EasyGenerationMixin:
                 )
             )
             with set_inference_mode():
-                # Leave mask_info as the base; cache layer will compute step-specific mask
-                model_outputs = model(input_token, **state.model_kwargs)
+                call_kwargs = self._prepare_mask_info_for_generation_step(input_token, state.model_kwargs)
+                model_outputs = model(input_token, **call_kwargs)
 
             logits = unflatten_beam_dim(model_outputs.logits[:, -1], batch_size, num_beams)
             cache = jax.tree_util.tree_map(

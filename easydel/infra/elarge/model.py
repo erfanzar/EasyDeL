@@ -59,6 +59,7 @@ from .builders import (
     to_data_mixture_kwargs,
     to_esurge_kwargs,
     to_from_pretrained_kwargs,
+    to_load_state_kwargs,
 )
 from .processing import (
     load_elm_config,
@@ -206,6 +207,7 @@ class eLargeModel:
             self._config = normalize(config)
 
         self._model = None
+        self._state = None
         self._tokenizer = None
 
     @staticmethod
@@ -1020,6 +1022,33 @@ class eLargeModel:
         """
         return to_from_pretrained_kwargs(self._config)
 
+    def get_load_state_kwargs(self) -> dict[str, Any]:
+        """Get kwargs for :meth:`EasyDeLState.load_state`.
+
+        This is the state-loading counterpart to
+        :meth:`get_from_pretrained_kwargs`. It exposes the fully materialized
+        checkpoint-restore arguments derived from the current eLarge
+        configuration, which is useful when callers want to inspect or override
+        restore behavior before calling :meth:`build_state`.
+
+        Returns:
+            Dictionary of load-state arguments derived from the current
+            normalized ELM configuration. The result is ready to be splatted
+            directly into ``EasyDeLState.load_state(...)``.
+
+        Example:
+            >>> elm = eLargeModel({"model": {"name_or_path": "/ckpt"}})
+            >>> kwargs = elm.get_load_state_kwargs()
+            >>> kwargs["load_directory"]
+            '/ckpt'
+
+        See Also:
+            - :meth:`build_state`: Uses these kwargs to load and cache a state.
+            - :func:`easydel.infra.elarge.builders.to_load_state_kwargs`: Shared
+              builder used by this method.
+        """
+        return to_load_state_kwargs(self._config)
+
     def get_esurge_kwargs(self) -> dict[str, Any]:
         """Get kwargs for eSurge initialization.
 
@@ -1087,6 +1116,81 @@ class eLargeModel:
                 raise ValueError("Model name/path must be set before building")
             self._model = build_model(self._config)
         return self._model
+
+    def build_state(
+        self,
+        force_rebuild: bool = False,
+        state_class: type[EasyDeLState] | None = None,
+        **load_state_overrides: Any,
+    ) -> EasyDeLState:
+        """Build an :class:`EasyDeLState` from a saved EasyDeL checkpoint.
+
+        This method is the checkpoint-oriented sibling of :meth:`build_model`.
+        Instead of loading a plain model object, it restores a full
+        :class:`EasyDeLState` from the checkpoint directory specified by
+        ``model.name_or_path`` using the current loader, sharding, platform,
+        base-config, and quantization settings.
+
+        The restored state is cached on ``self._state``. For convenience, the
+        embedded model from that state is also stored on ``self._model`` so the
+        rest of the eLarge surface can keep working without special-case wiring.
+        In practice this means:
+
+        - repeated calls reuse the cached state unless ``force_rebuild=True``
+        - :meth:`build_model` returns the model extracted from the loaded state
+        - :meth:`build_trainer` can reuse the loaded state directly
+        - :meth:`clear_cache` drops both the model and state caches
+
+        Args:
+            force_rebuild: Force reloading even if a state is already cached.
+                Useful when the checkpoint on disk changed or when different
+                restore overrides should be applied.
+            state_class: Optional custom EasyDeLState subclass to load.
+                Defaults to :class:`EasyDeLState`.
+            **load_state_overrides: Extra keyword arguments forwarded to
+                ``state_class.load_state(...)`` after the config-derived defaults
+                are assembled. This is the escape hatch for restore-time options
+                such as ``tx_template`` or explicit device overrides.
+
+        Returns:
+            Loaded EasyDeLState instance, cached on the eLargeModel instance for
+            later reuse.
+
+        Raises:
+            ValueError: If ``model.name_or_path`` is not configured.
+            Any exception raised by ``state_class.load_state(...)`` when the
+                checkpoint is invalid or incompatible with the supplied config.
+
+        Note:
+            ``model.name_or_path`` must point to an EasyDeL checkpoint directory
+            when using this method. For plain HuggingFace checkpoints, use
+            :meth:`build_model` instead.
+
+        Example:
+            >>> elm = eLargeModel({"model": {"name_or_path": "/checkpoints/step_4000"}})
+            >>> state = elm.build_state()
+            >>> model = elm.build_model()  # reuses state.model
+            >>> state is elm.build_state()
+            True
+
+            >>> # Override restore behavior for a one-off load
+            >>> state = elm.build_state(force_rebuild=True, tx_template=my_tx)
+
+        See Also:
+            - :meth:`get_load_state_kwargs`: Inspect the resolved restore kwargs.
+            - :meth:`build_model`: Loads a model directly rather than a state.
+        """
+        resolved_state_class = state_class or EasyDeLState
+
+        if self._state is None or force_rebuild:
+            if not self.model_name:
+                raise ValueError("Model name/path must be set before building state")
+            load_kwargs = self.get_load_state_kwargs()
+            if load_state_overrides:
+                load_kwargs.update(load_state_overrides)
+            self._state = resolved_state_class.load_state(**load_kwargs)
+            self._model = self._state.model
+        return self._state
 
     def build_tokenizer(self, force_rebuild: bool = False) -> AutoTokenizer:
         """Build or get the tokenizer for the model.
@@ -1289,6 +1393,7 @@ class eLargeModel:
         configurations or free memory after model operations.
         """
         self._model = None
+        self._state = None
         self._tokenizer = None
 
     def set_trainer(self, trainer_type: str, **kwargs) -> eLargeModel:
@@ -1590,9 +1695,9 @@ class eLargeModel:
             train_dataset = self.get_train_source()
 
         trainer_kwargs = {}
-        model = self._model
+        model = self._state if self._state is not None else self._model
 
-        if base_state_class is not None:
+        if base_state_class is not None and not isinstance(model, EasyDeLState):
             model = model.to_state(base_state_class)
         if trainer_type == "base":
             trainer_kwargs["arguments"] = training_args

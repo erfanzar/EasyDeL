@@ -14,7 +14,6 @@
 
 """Tests for eSurge output structures."""
 
-
 from easydel.inference.esurge.outputs import (
     LogprobsLists,
     swap_dict_values,

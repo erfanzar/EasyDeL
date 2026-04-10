@@ -699,10 +699,13 @@ class BatchMetadataPreparer:
             if num_requests > 0:
                 is_decode = (scheduled[:num_requests] == 1) & (num_computed_tokens_cpu[:num_requests] > 0)
                 decode_count = int(np.sum(is_decode))
+                prefill_count = int(np.sum((scheduled[:num_requests] > 0) & (~is_decode)))
             else:
                 decode_count = 0
+                prefill_count = 0
+            prefill_end = decode_count + prefill_count
             request_distribution[0] = decode_count
-            request_distribution[1] = decode_count
+            request_distribution[1] = prefill_end
             request_distribution[2] = num_requests
 
         if self._use_slot_mapping:

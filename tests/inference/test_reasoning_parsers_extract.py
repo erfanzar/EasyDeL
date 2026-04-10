@@ -263,7 +263,8 @@ def test_qwen3_strict_only_start_tag(dummy_tokenizer):
 
 def test_qwen3_streaming_content_deltas_stay_aligned_across_reasoning_boundary(dummy_tokenizer):
     parser = DelegatingParser(reasoning_parser=Qwen3ReasoningParser(dummy_tokenizer))
-    expected = "Hello! How can I assist you today?"
+    # Content after </think> is NOT stripped — leading \n\n is preserved
+    expected = "\n\nHello! How can I assist you today?"
     pieces = [
         "<think>",
         "short",

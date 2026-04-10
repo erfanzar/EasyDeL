@@ -15,8 +15,11 @@
 import jax
 import numpy as np
 import pytest
+import torch
 from jax import numpy as jnp
+from transformers import TopPLogitsWarper
 
+from easydel.inference.esurge.core.binary_search import apply_topp_mask
 from easydel.inference.esurge.core.sampler import (
     apply_history_penalties,
     apply_history_penalties_from_counts,
@@ -240,6 +243,23 @@ def test_execution_manager_sample_tokens_forwards_incremental_penalty_state():
     np.testing.assert_array_equal(np.asarray(args[17])[:2], np.array([0, 1], dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(result[1]), np.array([5, 7], dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(result[2]), np.array([True, True]))
+
+
+def test_apply_topp_mask_matches_hf_sorted_cumulative_rule():
+    probs = np.array([[0.40, 0.35, 0.15, 0.10]], dtype=np.float32)
+    logits = jnp.asarray(np.log(probs), dtype=jnp.float32)
+    top_p = 0.5
+
+    masked = apply_topp_mask(logits, p=jnp.array(top_p, dtype=jnp.float32), replace_val=-1e10)
+    hf_masked = TopPLogitsWarper(top_p=top_p)(None, torch.tensor(np.log(probs), dtype=torch.float32)).numpy()
+
+    np.testing.assert_array_equal(np.asarray(masked) > -1e9, np.isfinite(hf_masked))
+    np.testing.assert_allclose(
+        np.asarray(masked)[np.isfinite(hf_masked)],
+        hf_masked[np.isfinite(hf_masked)],
+        rtol=0.0,
+        atol=1e-6,
+    )
 
 
 def test_batch_metadata_exposes_penalty_rows():

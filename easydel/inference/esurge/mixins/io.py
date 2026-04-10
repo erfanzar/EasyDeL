@@ -609,6 +609,11 @@ class EngineIOMixin:
                 chat_template_kwargs=chat_template_kwargs,
             )
         else:
+            base_sampling_params = self._prepare_chat_sampling_params(
+                sampling_params or SamplingParams(max_tokens=128),
+                tools=tools,
+                tool_choice=tool_choice if isinstance(tool_choice, str) else None,
+            )
             prompt = self._format_chat_prompt(
                 messages,
                 tools=tools,
@@ -625,14 +630,14 @@ class EngineIOMixin:
             if stream:
                 return self.stream(
                     prompt,
-                    sampling_params=sampling_params,
+                    sampling_params=base_sampling_params,
                     request_id=request_id,
                     tool_parser_request=tool_parser_request,
                 )
             else:
                 outs = self.generate(
                     prompt,
-                    sampling_params=sampling_params,
+                    sampling_params=base_sampling_params,
                     request_id=request_id,
                     use_tqdm=False,
                     tool_parser_request=tool_parser_request,
@@ -764,7 +769,11 @@ class EngineIOMixin:
         if request_id is None:
             request_id = self._generate_request_id()
 
-        base_sampling_params = sampling_params or SamplingParams(max_tokens=128)
+        base_sampling_params = self._prepare_chat_sampling_params(
+            sampling_params or SamplingParams(max_tokens=128),
+            tools=tools,
+            tool_choice=tool_choice if isinstance(tool_choice, str) else None,
+        )
 
         images, videos = self._multimodal_manager.extract_media_from_messages(messages)
 

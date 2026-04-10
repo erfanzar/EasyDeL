@@ -174,6 +174,19 @@ def _axis_index(axis_names: tuple[str, ...]) -> jax.Array:
     return idx
 
 
+def _request_distribution_bounds(scheduled: Array, context_lens: Array) -> Array:
+    """Build the v3 request distribution `[decode_end, prefill_end, total]`."""
+    scheduled = jnp.asarray(scheduled, dtype=jnp.int32)
+    context_lens = jnp.asarray(context_lens, dtype=jnp.int32)
+
+    has_tokens = scheduled > 0
+    total = jnp.sum(has_tokens).astype(jnp.int32)
+    is_decode = (scheduled == 1) & (context_lens > 1) & has_tokens
+    decode = jnp.sum(is_decode).astype(jnp.int32)
+    prefill_count = jnp.sum(has_tokens & (~is_decode)).astype(jnp.int32)
+    return jnp.stack((decode, decode + prefill_count, total)).astype(jnp.int32)
+
+
 def _dp_page_axis(cache_view: RaggedPagesCacheView):
     """Resolve the logical page axis for the active cache view."""
     dp_size = max(1, int(getattr(cache_view.metadata, "data_parallel_size", 1)))
@@ -660,14 +673,8 @@ class _RaggedPageAttn(OperationImpl):
                 )
 
                 local_scheduled = local_query_start_loc[1:] - local_query_start_loc[:-1]
-                local_has_tokens = local_scheduled > 0
-                local_total = jnp.sum(local_has_tokens).astype(jnp.int32)
-
-                local_is_decode = (local_scheduled == 1) & (local_context_lens > 1)
-                row_mask = jnp.arange(rows_per_shard, dtype=jnp.int32) < local_total
-                local_decode = jnp.sum(local_is_decode & row_mask).astype(jnp.int32)
-                local_prefill = local_decode
-                local_distribution = jnp.stack((local_decode, local_prefill, local_total)).astype(jnp.int32)
+                local_distribution = _request_distribution_bounds(local_scheduled, local_context_lens)
+                local_total = local_distribution[2]
 
                 local_num_pages = jnp.int32(local_kv_pages.shape[0])
                 page_offset = shard_idx * local_num_pages

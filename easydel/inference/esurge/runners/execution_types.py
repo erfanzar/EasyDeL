@@ -310,7 +310,7 @@ class BatchMetadata:
         """Get request distribution for v3 attention kernel optimization.
 
         Returns:
-            jax.Array: Distribution triple [decode_count, chunked_prefill_end, total].
+            jax.Array: Distribution triple [decode_end, prefill_end, total].
                 Used by ragged page attention v3 to optimize memory access patterns
                 based on whether requests are in decode or prefill phase.
         """

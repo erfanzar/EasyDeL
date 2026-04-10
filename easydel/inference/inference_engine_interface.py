@@ -636,22 +636,48 @@ class BaseInferenceApiServer(ABC):
             request: The chat completion request containing tool definitions.
 
         Returns:
-            List of tool function dictionaries, or None if no tools are defined.
+            List of OpenAI-style tool dictionaries, or None if no tools are defined.
         """
         resolved_tools = []
         if request.tools is not None:
             for tool in request.tools:
-                tool_payload: dict[str, tp.Any] | None = None
-                if hasattr(tool, "function") and hasattr(tool.function, "model_dump"):
-                    candidate = tool.function.model_dump()
+                raw_tool: dict[str, tp.Any] | None = None
+                if hasattr(tool, "model_dump"):
+                    candidate = tool.model_dump(exclude_none=True)
                     if isinstance(candidate, dict):
-                        tool_payload = candidate
+                        raw_tool = candidate
                 elif isinstance(tool, dict):
-                    function_payload = tool.get("function")
-                    if isinstance(function_payload, dict):
-                        tool_payload = function_payload
-                if tool_payload is not None:
-                    resolved_tools.append(tool_payload)
+                    raw_tool = dict(tool)
+                if raw_tool is None:
+                    continue
+
+                function_payload = raw_tool.get("function")
+                if isinstance(function_payload, dict):
+                    resolved_tools.append(
+                        {"type": str(raw_tool.get("type") or "function"), "function": function_payload}
+                    )
+                    continue
+
+                if isinstance(raw_tool.get("name"), str):
+                    resolved_tools.append({"type": "function", "function": raw_tool})
+
+        if len(resolved_tools) == 0 and request.functions is not None:
+            for function in request.functions:
+                raw_function: dict[str, tp.Any] | None = None
+                if hasattr(function, "model_dump"):
+                    candidate = function.model_dump(exclude_none=True)
+                    if isinstance(candidate, dict):
+                        raw_function = candidate
+                elif isinstance(function, dict):
+                    raw_function = dict(function)
+                if raw_function is None or not isinstance(raw_function.get("name"), str):
+                    continue
+                resolved_tools.append(
+                    {
+                        "type": "function",
+                        "function": raw_function,
+                    }
+                )
         if len(resolved_tools) == 0:
             return None
         return resolved_tools
@@ -993,9 +1019,15 @@ class BaseInferenceApiServer(ABC):
         tools_for_template: list[dict[str, tp.Any]] = []
         for tool in raw_tools:
             if isinstance(tool, ToolDefinition):
-                tools_for_template.append(tool.function.model_dump(exclude_none=True))
-            else:
                 tools_for_template.append(tool.model_dump(exclude_none=True))
+            elif isinstance(tool, FunctionDefinition):
+                tools_for_template.append({"type": "function", "function": tool.model_dump(exclude_none=True)})
+            else:
+                payload = tool.model_dump(exclude_none=True)
+                if isinstance(payload, dict) and isinstance(payload.get("function"), dict):
+                    tools_for_template.append(payload)
+                else:
+                    tools_for_template.append({"type": "function", "function": payload})
 
         return list(raw_tools), tools_for_template or None
 

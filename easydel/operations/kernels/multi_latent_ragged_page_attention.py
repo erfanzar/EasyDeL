@@ -228,37 +228,34 @@ def _resolve_num_queries_per_block(
     return 1
 
 
+def _request_distribution_bounds(scheduled: jax.Array, context_lens: jax.Array) -> jax.Array:
+    """Compute a ``[decode_end, prefill_end, total]`` request distribution vector."""
+    scheduled = jnp.asarray(scheduled, dtype=jnp.int32)
+    context_lens = jnp.asarray(context_lens, dtype=jnp.int32)
+
+    has_tokens = scheduled > 0
+    total = jnp.sum(has_tokens).astype(jnp.int32)
+    is_decode = (scheduled == 1) & (context_lens > 1) & has_tokens
+    decode = jnp.sum(is_decode & has_tokens).astype(jnp.int32)
+    prefill_count = jnp.sum((~is_decode) & has_tokens).astype(jnp.int32)
+    prefill_end = decode + prefill_count
+    return jnp.stack((decode, prefill_end, total)).astype(jnp.int32)
+
+
 def _resolve_distribution(cache_metadata: RaggedPagesMetadata) -> jax.Array:
     """Compute a ``[decode_end, prefill_end, total]`` request distribution vector.
 
     If ``cache_metadata.request_distribution`` is already set, it is returned
-    directly (cast to int32).  Otherwise the distribution is inferred from
-    ``query_start_loc`` and ``context_lens``: a request with exactly 1 new
-    token and a context length > 1 is classified as *decode*; everything
-    else is *prefill*.
-
-    Args:
-        cache_metadata: Ragged-pages scheduling metadata for the current batch.
-
-    Returns:
-        An int32 array of shape ``(3,)`` containing
-        ``[num_decode, num_decode + num_prefill, total_requests]``.
+    directly (cast to int32). Otherwise the distribution is inferred from
+    ``query_start_loc`` and ``context_lens``.
     """
     if cache_metadata.request_distribution is not None:
         return jnp.asarray(cache_metadata.request_distribution, dtype=jnp.int32)
 
     context_lens = jnp.asarray(cache_metadata.context_lens, dtype=jnp.int32)
     query_start_loc = jnp.asarray(cache_metadata.query_start_loc, dtype=jnp.int32)
-
     scheduled = query_start_loc[1:] - query_start_loc[:-1]
-    has_tokens = scheduled > 0
-    total = jnp.sum(has_tokens).astype(jnp.int32)
-
-    is_decode = (scheduled == 1) & (context_lens > 1)
-    decode = jnp.sum(is_decode & has_tokens).astype(jnp.int32)
-    prefill_count = jnp.sum((~is_decode) & has_tokens).astype(jnp.int32)
-    prefill_end = decode + prefill_count
-    return jnp.stack((decode, prefill_end, total)).astype(jnp.int32)
+    return _request_distribution_bounds(scheduled, context_lens)
 
 
 @OperationRegistry.register
@@ -530,14 +527,8 @@ class MultiLatentRaggedPageAttn(OperationImpl):
                 )
 
                 local_scheduled = local_query_start_loc[1:] - local_query_start_loc[:-1]
-                local_has_tokens = local_scheduled > 0
-                local_total = jnp.sum(local_has_tokens).astype(jnp.int32)
-
-                local_is_decode = (local_scheduled == 1) & (local_context_lens > 1)
-                row_mask = jnp.arange(rows_per_shard, dtype=jnp.int32) < local_total
-                local_decode = jnp.sum(local_is_decode & row_mask).astype(jnp.int32)
-                local_prefill = local_decode
-                local_distribution = jnp.stack((local_decode, local_prefill, local_total)).astype(jnp.int32)
+                local_distribution = _request_distribution_bounds(local_scheduled, local_context_lens)
+                local_total = local_distribution[2]
 
                 local_num_pages = jnp.int32(local_kv_pages.shape[0])
                 page_offset = shard_idx * local_num_pages
@@ -1017,13 +1008,8 @@ class MultiLatentRaggedPageAttnV2(OperationImpl):
                 )
 
                 local_scheduled = local_query_start_loc[1:] - local_query_start_loc[:-1]
-                local_has_tokens = local_scheduled > 0
-                local_total = jnp.sum(local_has_tokens).astype(jnp.int32)
-                local_is_decode = (local_scheduled == 1) & (local_context_lens > 1)
-                row_mask = jnp.arange(rows_per_shard, dtype=jnp.int32) < local_total
-                local_decode = jnp.sum(local_is_decode & row_mask).astype(jnp.int32)
-                local_prefill = local_decode
-                local_distribution = jnp.stack((local_decode, local_prefill, local_total)).astype(jnp.int32)
+                local_distribution = _request_distribution_bounds(local_scheduled, local_context_lens)
+                local_total = local_distribution[2]
 
                 local_num_pages = jnp.int32(local_kv_pages.shape[0])
                 page_offset = shard_idx * local_num_pages
