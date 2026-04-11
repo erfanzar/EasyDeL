@@ -2248,6 +2248,15 @@ def causal_lm_loss_chunked_lm_head(
         vocab_size=vocab_size,
         config=config,
     )
+    # Clamp against the auto-resolver's budget even when the user provides
+    # an explicit chunk size — a manually-specified 4096 with a 248k vocab
+    # produces ~30 GB logit tensors that OOM during backward recomputation.
+    safe_chunk = resolve_causal_lm_chunk_token_size(
+        hidden_states=shift_hidden_states,
+        vocab_size=vocab_size,
+        config=config,
+    )
+    chunk_size = min(chunk_size, safe_chunk)
 
     _batch_size, seq_len, _hidden_dim = shift_hidden_states.shape
     pad_len = (-seq_len) % chunk_size
@@ -2549,10 +2558,19 @@ class CausalLMLossStrategy(BaseLossStrategy):
             else last_hidden_state
         )
 
+        # Use the trace-safe projection bypass.  module.compute_lm_logits
+        # goes through lm_head.__call__ which carries nn.remat — calling it
+        # from inside fori_loop / jax.checkpoint triggers TraceContextError.
+        _lm_head_fn = (
+            module.make_lm_head_fn()
+            if hasattr(module, "make_lm_head_fn")
+            else module.compute_lm_logits
+        )
+
         return causal_lm_loss_chunked_lm_head(
             hidden_states=lm_head_inputs,
             labels=labels,
-            lm_head_fn=module.compute_lm_logits,
+            lm_head_fn=_lm_head_fn,
             vocab_size=_resolve_module_vocab_size(module),
             attention_mask=batch.get("attention_mask"),
             config=loss_config,
