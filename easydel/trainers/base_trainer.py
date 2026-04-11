@@ -1897,6 +1897,19 @@ class BaseTrainer(BaseTrainerProtocol):
             Purified batch with only JAX-compatible array fields
         """
 
+        def _pad_value_for_batch_key(key: str, array: np.ndarray) -> int | bool | float:
+            """Choose a safe padding value for trainer-side list batch collation.
+
+            Labels must preserve the ignore index (``-100``) so padded positions do
+            not suddenly contribute loss after the trainer re-collates variable-length
+            examples. Other numeric sequence fields keep the legacy zero padding.
+            """
+            if key == "labels" or key.endswith("_labels"):
+                return -100
+            if np.issubdtype(array.dtype, np.bool_):
+                return False
+            return 0
+
         # Handle list of dicts (uncollated batch)
         if isinstance(batch, (list, tuple)) and len(batch) > 0 and isinstance(batch[0], dict):
             # Collate list of dicts into dict of arrays with padding
@@ -1915,8 +1928,7 @@ class BaseTrainer(BaseTrainerProtocol):
                         # Pad sequences to same length (for 1D arrays like input_ids)
                         if all(arr.ndim == 1 for arr in arrays):
                             max_len = max(len(arr) for arr in arrays)
-                            # Determine pad value (0 for input_ids, typically)
-                            pad_value = 0
+                            pad_value = _pad_value_for_batch_key(key, arrays[0])
                             padded = []
                             for arr in arrays:
                                 if len(arr) < max_len:

@@ -47,6 +47,8 @@ import jax
 import jax.numpy as jnp
 from eformer.escale import with_sharding_constraint
 from eformer.pytree import auto_pytree
+from ejkernel.kernels._pallas.tpu.ragged_gated_delta_rule._interface import _decode_path
+from ejkernel.kernels._xla.ragged_gated_delta_rule._xla_impl_fwd import _ragged_gdr_chunked_prefill
 from ejkernel.modules import gated_delta_rule, ragged_gated_delta_rule
 from ejkernel.modules.operations.configs import GatedDeltaRuleConfig
 from jax.experimental import pallas as pl
@@ -922,16 +924,12 @@ class GatedDeltaRuleOp(OperationImpl):
 
         platform = None
         if jax.default_backend() == "tpu" and kernel_cfg is None:
-            if check_bool_flag("EASYDEL_XLA_GDR", False):
+            if check_bool_flag("EASYDEL_GDR_XLA", False):
                 platform = "xla"
             else:
                 platform = "pallas"
 
-        # The chunked Neumann-series path produces NaN under eSurge's packed
-        # prefill JIT due to numerical instability in the intra-chunk inverse.
-        # Use the recurrent (scan) path which is mathematically equivalent and
-        # numerically stable.  Set EASYDEL_CHUNKED_GDR=1 to force chunked.
-        use_chunked_gdr = check_bool_flag("EASYDEL_CHUNKED_GDR", True) and not is_inference_mode()
+        use_chunked_gdr = check_bool_flag("EASYDEL_GDR_CHUNKED", False) and not is_inference_mode()
         outputs, new_recurrent_state = gated_delta_rule(
             query,
             key,
@@ -1016,12 +1014,6 @@ class GatedDeltaRuleOp(OperationImpl):
 
         mesh = self.metadata.mesh
         if mesh is not None:
-            from ejkernel.kernels._pallas.tpu.ragged_gated_delta_rule._interface import (
-                _decode_path,
-            )
-            from ejkernel.kernels._xla.ragged_gated_delta_rule._xla_impl_fwd import (
-                _ragged_gdr_chunked_prefill,
-            )
 
             mode = self.get_mode(query=jnp.expand_dims(query, 0), BTHD=False)
             shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
