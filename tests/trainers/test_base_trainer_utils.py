@@ -698,6 +698,46 @@ def test_normalize_prompts_list_of_strings():
     assert normalized == prompts
 
 
+def test_purify_batch_preserves_label_ignore_index_when_padding_list_batches():
+    trainer = object.__new__(_PreviewTrainer)
+
+    batch = [
+        {
+            "input_ids": np.asarray([11, 12, 13, 14], dtype=np.int32),
+            "attention_mask": np.asarray([1, 1, 1, 1], dtype=np.int32),
+            "labels": np.asarray([11, 12, 13, -100], dtype=np.int32),
+        },
+        {
+            "input_ids": np.asarray([21, 22], dtype=np.int32),
+            "attention_mask": np.asarray([1, 1], dtype=np.int32),
+            "labels": np.asarray([21, 22], dtype=np.int32),
+        },
+    ]
+
+    purified = BaseTrainer._purify_batch(trainer, batch)
+
+    np.testing.assert_array_equal(
+        np.asarray(purified["labels"]),
+        np.asarray(
+            [
+                [11, 12, 13, -100],
+                [21, 22, -100, -100],
+            ],
+            dtype=np.int32,
+        ),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(purified["input_ids"]),
+        np.asarray(
+            [
+                [11, 12, 13, 14],
+                [21, 22, 0, 0],
+            ],
+            dtype=np.int32,
+        ),
+    )
+
+
 def test_prepare_generation_input_accepts_chat_prompt_field():
     trainer = object.__new__(_PreviewTrainer)
     trainer.arguments = SimpleNamespace(max_length=8, generation_dataset_prompt_field="generation_prompt")
