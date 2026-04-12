@@ -90,3 +90,47 @@ def test_save_optimizer_preserves_tree_in_multiprocess_mode(tmp_path, monkeypatc
 
     assert len(saved_trees) == 1
     assert isinstance(saved_trees[0]["momentum"], jax.Array)
+
+
+def test_save_optimizer_skips_rank_zero_only_directory_creation_on_nonzero_process_for_remote_paths(monkeypatch):
+    saved_trees: list[dict[str, object]] = []
+    mkdir_calls: list[dict[str, object]] = []
+
+    class _MeshCtx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _CheckpointerStub:
+        def save_pytree(self, **kwargs):
+            saved_trees.append(kwargs["tree"])
+
+    class _FakePath:
+        def mkdir(self, *args, **kwargs):
+            mkdir_calls.append(dict(kwargs))
+
+        def __str__(self):
+            return "gs://bucket/fake-checkpoint"
+
+    state = type(
+        "_OptimizerStateStub",
+        (),
+        {
+            "opt_state": {"momentum": jnp.ones((2,), dtype=jnp.float32)},
+            "model": type("_Model", (), {"mesh": _MeshCtx()})(),
+        },
+    )()
+
+    monkeypatch.setattr("easydel.infra.base_state.ePath", lambda path: _FakePath())
+    monkeypatch.setattr("easydel.infra.base_state.jax.process_index", lambda: 1)
+
+    EasyDeLState.save_optimizer(
+        state,
+        save_directory="ignored",
+        checkpointer=_CheckpointerStub(),
+    )
+
+    assert mkdir_calls == []
+    assert len(saved_trees) == 1

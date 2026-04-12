@@ -125,6 +125,44 @@ def test_save_model_files_preserves_jax_arrays_in_multiprocess_mode(tmp_path, mo
     assert isinstance(saved_trees[0]["weight"], jax.Array)
 
 
+def test_save_model_files_skips_rank_zero_only_artifacts_on_nonzero_process_for_remote_paths(tmp_path, monkeypatch):
+    saved_trees: list[dict[str, object]] = []
+
+    class _ConfigRecorder(_ConfigStub):
+        def __init__(self):
+            super().__init__()
+            self.save_calls: list[Path] = []
+
+        def save_pretrained(self, save_directory):
+            self.save_calls.append(Path(save_directory))
+
+    class _CheckpointerStub:
+        def __init__(self, **kwargs):
+            pass
+
+        def save_pytree(self, *, tree, prefix, mesh, dtype):
+            saved_trees.append(tree)
+            return str(tmp_path / f"{prefix}.ckpt")
+
+    model = _BridgeModelStub()
+    model.config = _ConfigRecorder()
+
+    monkeypatch.setattr("easydel.infra.mixins.bridge.nn.split", lambda *args, **kwargs: (None, _StateStub()))
+    monkeypatch.setattr("easydel.infra.mixins.bridge.Checkpointer", _CheckpointerStub)
+    monkeypatch.setattr("easydel.infra.mixins.bridge.jax.process_index", lambda: 1)
+
+    EasyBridgeMixin._save_model_files(
+        model,
+        save_directory="gs://bucket/remote-model",
+        float_dtype=None,
+        step=None,
+    )
+
+    assert model.config.save_calls == []
+    assert not (tmp_path / "config.json").exists()
+    assert saved_trees == [{"weight": "raw"}]
+
+
 def test_save_model_files_normalizes_numpy_arrays_before_checkpoint_write(tmp_path, monkeypatch):
     saved_trees: list[dict[str, object]] = []
 
@@ -199,3 +237,40 @@ def test_save_model_files_offloads_numpy_arrays_to_cpu_before_checkpoint_write(t
     assert isinstance(device_put_calls[0][0], np.ndarray)
     assert device_put_calls[0][1] is cpu_device
     assert any("layer.weight" in str(call) for call in info_calls)
+
+
+def test_save_pretrained_skips_readme_write_on_nonzero_process_for_remote_paths(monkeypatch):
+    model = _BridgeModelStub()
+    save_model_calls: list[dict[str, object]] = []
+    model._save_model_files = lambda **kwargs: save_model_calls.append(dict(kwargs))
+    model._model_card = lambda repo_id, name: "card"
+
+    class _FakeRemotePath:
+        def __init__(self, path: str):
+            self.path = path
+            self.name = path.rstrip("/").split("/")[-1]
+
+        def is_file(self):
+            return False
+
+        def __truediv__(self, other):
+            return _FakeRemotePath(f"{self.path.rstrip('/')}/{other}")
+
+        def exists(self):
+            return False
+
+        def write_text(self, data):
+            raise AssertionError("README write should be skipped on nonzero process for remote paths")
+
+        def __str__(self):
+            return self.path
+
+    monkeypatch.setattr("easydel.infra.mixins.bridge.ePath", lambda path: _FakeRemotePath(str(path)))
+    monkeypatch.setattr("easydel.infra.mixins.bridge.jax.process_index", lambda: 1)
+
+    EasyBridgeMixin.save_pretrained(
+        model,
+        save_directory="gs://bucket/remote-model",
+    )
+
+    assert len(save_model_calls) == 1

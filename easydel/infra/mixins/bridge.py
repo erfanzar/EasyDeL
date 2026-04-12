@@ -104,6 +104,7 @@ except ImportError:  # transformers>=5 removed helper
 from transformers.utils.hub import PushToHubMixin
 
 from easydel.layers import QuantizationConfig
+from easydel.utils.helpers import is_remote_path
 from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
 from easydel.utils.traversals import (
     flatten_dict,
@@ -507,17 +508,18 @@ class EasyBridgeMixin(PushToHubMixin):
             step (int, optional): The training step number for versioned checkpoints.
                 Defaults to None.
         """
-        save_directory.mkdir(parents=True, exist_ok=True)
+        if not is_remote_path(save_directory) or jax.process_index() == 0:
+            save_directory.mkdir(parents=True, exist_ok=True)
 
-        config_to_save = deepcopy(self.config)
-        config_to_save.__dict__.pop("attn_dtype", None)
-        config_to_save.__dict__.pop("attn_softmax_dtype", None)
-        config_to_save.architectures = [self.__class__.__name__]
-        config_to_save.save_pretrained(str(save_directory))
+            config_to_save = deepcopy(self.config)
+            config_to_save.__dict__.pop("attn_dtype", None)
+            config_to_save.__dict__.pop("attn_softmax_dtype", None)
+            config_to_save.architectures = [self.__class__.__name__]
+            config_to_save.save_pretrained(str(save_directory))
 
-        if self.can_generate() and hasattr(self, "generation_config"):
-            if self.generation_config is not None:
-                _save_generation_config(self.generation_config, save_directory)
+            if self.can_generate() and hasattr(self, "generation_config"):
+                if self.generation_config is not None:
+                    _save_generation_config(self.generation_config, save_directory)
 
         state = nn.split(self, nn.Param, ...)[1]
         state_dict = state.to_pure_dict()
@@ -606,9 +608,10 @@ class EasyBridgeMixin(PushToHubMixin):
             float_dtype=float_dtype,
             step=step,
         )
-        readme_path = easy_directory / "README.md"
-        if not readme_path.exists():
-            readme_path.write_text(self._model_card(repo_id, repo_id))
+        if not is_remote_path(easy_directory) or jax.process_index() == 0:
+            readme_path = easy_directory / "README.md"
+            if not readme_path.exists():
+                readme_path.write_text(self._model_card(repo_id, repo_id))
 
         if push_to_hub and jax.process_index() == 0:
             self._upload_modified_files(
