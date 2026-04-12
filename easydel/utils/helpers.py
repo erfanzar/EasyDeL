@@ -29,6 +29,7 @@ Functions:
     set_loggers_level: Set logging level globally
     capture_time: Context manager for timing
     get_cache_dir: Get EasyDeL cache directory
+    is_remote_path: Return whether a path uses a non-local URI scheme
     quiet: Context manager to suppress output
     check_bool_flag: Parse boolean environment variables
 
@@ -70,6 +71,23 @@ except ModuleNotFoundError:
     wandb = None
 
 logger = get_logger(__name__)
+
+
+def is_remote_path(path: os.PathLike[str] | str | object) -> bool:
+    """Return whether a path targets a remote/object-store backend.
+
+    Treats URI-style paths with a non-``file`` scheme as remote, such as
+    ``gs://...`` or ``s3://...``. Plain filesystem paths are treated as local.
+    """
+    try:
+        path_str = os.fspath(path)
+    except TypeError:
+        path_str = str(path)
+
+    scheme_end = path_str.find("://")
+    if scheme_end <= 0:
+        return False
+    return path_str[:scheme_end].lower() != "file"
 
 
 @contextlib.contextmanager

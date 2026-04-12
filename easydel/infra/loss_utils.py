@@ -2561,11 +2561,7 @@ class CausalLMLossStrategy(BaseLossStrategy):
         # Use the trace-safe projection bypass.  module.compute_lm_logits
         # goes through lm_head.__call__ which carries nn.remat — calling it
         # from inside fori_loop / jax.checkpoint triggers TraceContextError.
-        _lm_head_fn = (
-            module.make_lm_head_fn()
-            if hasattr(module, "make_lm_head_fn")
-            else module.compute_lm_logits
-        )
+        _lm_head_fn = module.make_lm_head_fn() if hasattr(module, "make_lm_head_fn") else module.compute_lm_logits
 
         return causal_lm_loss_chunked_lm_head(
             hidden_states=lm_head_inputs,

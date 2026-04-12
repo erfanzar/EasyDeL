@@ -573,6 +573,38 @@ def test_trainer_save_state_forwards_standard_save_kwargs(tmp_path):
     assert save_calls[0]["save_optimizer"] is False
 
 
+def test_trainer_save_state_skips_rank_zero_only_artifacts_on_nonzero_process_for_remote_paths(monkeypatch):
+    trainer = object.__new__(_PreviewTrainer)
+    saved_arguments: list[Path] = []
+    saved_readmes: list[Path] = []
+    trainer.arguments = SimpleNamespace(
+        save_arguments=lambda path: saved_arguments.append(Path(path)),
+        save_optimizer_state=False,
+        _get_save_directory_milestone=lambda step, create=False: f"gs://bucket/run-{step}",
+    )
+    trainer._model = SimpleNamespace(param_dtype=jnp.bfloat16)
+    trainer._save_readme = lambda directory: saved_readmes.append(Path(directory))
+    save_calls: list[dict[str, object]] = []
+
+    class _State:
+        def save_state(self, **kwargs):
+            save_calls.append(dict(kwargs))
+
+    monkeypatch.setattr("easydel.trainers.base_trainer.jax.process_index", lambda: 1)
+
+    saved = BaseTrainer._save_state(
+        trainer,
+        state=_State(),
+        save_directory="gs://bucket/explicit",
+    )
+
+    assert saved == "gs://bucket/explicit"
+    assert saved_arguments == []
+    assert saved_readmes == []
+    assert len(save_calls) == 1
+    assert str(save_calls[0]["save_directory"]) == "gs://bucket/explicit"
+
+
 def test_get_current_step_uses_state_step_without_step_start_point_offset():
     trainer = object.__new__(_PreviewTrainer)
     trainer.arguments = SimpleNamespace(step_start_point=9)

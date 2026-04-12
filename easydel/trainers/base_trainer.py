@@ -62,7 +62,7 @@ from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLPreemptionSignal, E
 from easydel.infra.factory import TaskType
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
-from easydel.utils import Timers, readme_generator
+from easydel.utils import Timers, is_remote_path, readme_generator
 from easydel.utils.compiling_utils import ejit
 from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
@@ -474,8 +474,7 @@ class BaseTrainer(BaseTrainerProtocol):
             )
         elif force_step_start_point and current_step != 0:
             logger.info(
-                f"Force-overrode loaded state step from {current_step} to {requested_step} via "
-                "`force_step_start_point`."
+                f"Force-overrode loaded state step from {current_step} to {requested_step} via `force_step_start_point`."
             )
         else:
             logger.info(f"Initialized model_state.step to {requested_step} from step_start_point.")
@@ -4620,14 +4619,16 @@ class BaseTrainer(BaseTrainerProtocol):
         """
         if save_directory is None:
             step = self._get_current_step(state)
-            directory_name = self.arguments._get_save_directory_milestone(step=step, create=True)
+            directory_name = self.arguments._get_save_directory_milestone(step=step, create=False)
         else:
             directory_name = ePath(save_directory)
 
-        logger.info(f"saving state {directory_name}.")
-        directory_name.mkdir(exist_ok=True)
-        self.arguments.save_arguments(directory_name / DEFAULT_ARGS_JSON_NAME)
-        self._save_readme(directory_name)
+        should_single_writer = is_remote_path(directory_name)
+        if not should_single_writer or jax.process_index() == 0:
+            logger.info(f"saving state {directory_name}.")
+            directory_name.mkdir(parents=True, exist_ok=True)
+            self.arguments.save_arguments(directory_name / DEFAULT_ARGS_JSON_NAME)
+            self._save_readme(directory_name)
         state.save_state(
             save_directory=directory_name,
             float_dtype=self.model.param_dtype,
@@ -4741,12 +4742,15 @@ class BaseTrainer(BaseTrainerProtocol):
             - Sorts by modification time to determine which are oldest
             - Queues deletion asynchronously (non-blocking)
         """
+        save_dir = ePath(self.arguments._get_save_directory())
+        if is_remote_path(save_dir) and jax.process_index() != 0:
+            return
+
         if self.arguments.save_total_limit is None:
             return
 
         from eformer.serialization.checkpointer import _read_checkpoint_metadata
 
-        save_dir = ePath(self.arguments._get_save_directory())
         if not save_dir.exists():
             return
 

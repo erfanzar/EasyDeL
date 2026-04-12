@@ -68,7 +68,7 @@ from .compiling_utils import (
     load_compiled_fn,
     save_compiled_fn,
 )
-from .helpers import Timer, Timers, capture_time, check_bool_flag, get_cache_dir
+from .helpers import Timer, Timers, capture_time, check_bool_flag, get_cache_dir, is_remote_path
 from .inference_mode import is_inference_mode, set_inference_mode
 from .lazy_import import LazyModule, is_package_available
 from .parameters_transformation import ModelConverter, StateDictConverter, TensorConverter
@@ -93,6 +93,7 @@ __all__ = (
     "get_cache_dir",
     "is_inference_mode",
     "is_package_available",
+    "is_remote_path",
     "load_cached_functions",
     "load_compiled_fn",
     "save_compiled_fn",

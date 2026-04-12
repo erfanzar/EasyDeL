@@ -1014,7 +1014,6 @@ class GatedDeltaRuleOp(OperationImpl):
 
         mesh = self.metadata.mesh
         if mesh is not None:
-
             mode = self.get_mode(query=jnp.expand_dims(query, 0), BTHD=False)
             shardings_bthd = self.metadata.get_shardings(mode, layout="bthd")
             head_axis = shardings_bthd.query[2] if shardings_bthd.query is not None else None

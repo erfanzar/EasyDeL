@@ -97,6 +97,7 @@ from jax.sharding import PartitionSpec
 
 from easydel.infra.factory import TaskType
 from easydel.utils.compiling_utils import ejit
+from easydel.utils.helpers import is_remote_path
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 from .utils import materialize_meta_leaves, sanitize_partition_spec_for_shape
@@ -1100,7 +1101,8 @@ class EasyDeLState(struct.PyTreeNode):
                 step_policies=[],
             )
         if self.opt_state is not None:
-            save_directory.mkdir(parents=True, exist_ok=True)
+            if not is_remote_path(save_directory) or jax.process_index() == 0:
+                save_directory.mkdir(parents=True, exist_ok=True)
             optim_path = save_directory
             logger.info(f"Coordinated optimizer save through {optim_path}")
             try:
