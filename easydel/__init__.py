@@ -31,6 +31,7 @@ optional dependencies (e.g. ``deepspeed``).
 __version__ = "0.3.0"
 
 import os as _os
+import pickle as _pickle
 import sys as _sys
 import types as _types
 import typing as _tp
@@ -176,6 +177,63 @@ def _patch_transformers_init_weights_tie_signature() -> None:
 
 
 _patch_transformers_init_weights_tie_signature()
+
+
+def _patch_eformer_exception_serialization() -> None:
+    """Replace non-picklable remote exceptions with a safe fallback.
+
+    Some third-party exceptions, including
+    ``google.api_core.exceptions.RetryError``, do not round-trip through
+    ``pickle`` correctly because their constructor signatures do not match
+    their serialized ``Exception.args``. eFormer's Ray bridge stores the
+    original exception object inside ``ExceptionInfo``, so one such error can
+    break exception transport before the parent process sees the real failure.
+
+    This patch keeps the original traceback but swaps the exception object for
+    a plain ``RuntimeError`` when the original cannot be pickled and unpickled
+    safely.
+    """
+    try:
+        from eformer.executor.ray.types import ExceptionInfo as _ExceptionInfo
+    except Exception:
+        return
+
+    original_ser_exc_info = _ExceptionInfo.ser_exc_info.__func__
+    if getattr(original_ser_exc_info, "_easydel_picklable_exc_patch", False):
+        return
+
+    def _coerce_picklable_exception(exception: BaseException | None) -> BaseException | None:
+        if exception is None:
+            return None
+        try:
+            _pickle.loads(_pickle.dumps(exception))
+            return exception
+        except Exception:
+            exc_type = f"{exception.__class__.__module__}.{exception.__class__.__qualname__}"
+            try:
+                message = str(exception)
+            except Exception:
+                message = repr(exception)
+            fallback = RuntimeError(f"{exc_type}: {message}")
+            notes = getattr(exception, "__notes__", None)
+            if notes:
+                for note in notes:
+                    try:
+                        fallback.add_note(note)
+                    except Exception:
+                        break
+            return fallback
+
+    def _patched_ser_exc_info(cls, exception: BaseException | None = None):
+        exc_info = original_ser_exc_info(cls, exception)
+        exc_info.ex = _coerce_picklable_exception(exc_info.ex)
+        return exc_info
+
+    _patched_ser_exc_info._easydel_picklable_exc_patch = True  # type: ignore[attr-defined]
+    _ExceptionInfo.ser_exc_info = classmethod(_patched_ser_exc_info)
+
+
+_patch_eformer_exception_serialization()
 
 
 def _patch_transformers_autoconfig_gated_repo_skip() -> None:
