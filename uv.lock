@@ -750,7 +750,7 @@ tpu = [
 requires-dist = [
     { name = "cryptography", specifier = ">=45.0.6" },
     { name = "datasets", specifier = ">=3.6.0" },
-    { name = "eformer", specifier = "==0.0.99.5" },
+    { name = "eformer", specifier = "==0.0.99.10" },
     { name = "einops", specifier = "~=0.8.0" },
     { name = "ejkernel", specifier = "==0.0.78" },
     { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.78" },
@@ -795,7 +795,7 @@ provides-extras = ["torch", "cuda", "tpu", "tensorflow", "lm-eval", "profile", "
 
 [[package]]
 name = "eformer"
-version = "0.0.99.5"
+version = "0.0.99.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "braceexpand" },
@@ -817,9 +817,9 @@ dependencies = [
     { name = "tensorstore" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/48/cf/047b5c12d3add1e34589aa2cbbdf26a7973d9719083fedf811f975e6d62a/eformer-0.0.99.5.tar.gz", hash = "sha256:9491da26249eb395fd9e58a9f0150822666d01982e23c1ba3536c570d9ed4f30", size = 275511, upload-time = "2026-03-20T06:59:20.036Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/09/52/bf41c2a460975ae3c0c21a7715b2f85ee31102b78b6bf24b2ae63bd33fc4/eformer-0.0.99.10.tar.gz", hash = "sha256:d0759894e8b952b447390ad767ecc15119c26b3d47bb0e4a6cfe8fbcc7625784", size = 276223, upload-time = "2026-04-13T02:20:22.437Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b5/41/fc044b064049f675963cbef5896564273e46b15a621c56cce8374e16b261/eformer-0.0.99.5-py3-none-any.whl", hash = "sha256:b00fffb512dff1cb5a0f29431ce0406e158a221404cc796b191d4be5c015c108", size = 336692, upload-time = "2026-03-20T06:59:21.934Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/46/12272e92a2390f0ab809f7bd56a2b5374c0e23a799726bd971fea612a298/eformer-0.0.99.10-py3-none-any.whl", hash = "sha256:ada34784d441af6e6d57490e29b92742e1b668358c3540801e3f2c5dbcb547ef", size = 337473, upload-time = "2026-04-13T02:20:23.748Z" },
 ]
 
 [[package]]
