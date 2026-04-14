@@ -28,6 +28,7 @@ All functions are designed for JAX/Flax models and support distributed training.
 """
 
 import collections.abc
+import functools
 import typing as tp
 
 import jax
@@ -525,52 +526,69 @@ def distillation_step(
     request_attentions = attention_weight != 0.0
     use_chunked = logits_chunk_size is not None and logits_chunk_size > 0
 
-    teacher_call_kwargs = dict(batch)
-    teacher_call_kwargs.pop("labels", None)
-    teacher_call_kwargs.pop("completion_mask", None)
-    teacher_call_kwargs.pop("assistant_masks", None)
-    if use_chunked:
-        teacher_call_kwargs["apply_lm_head"] = False
-    if request_hidden_states:
-        teacher_call_kwargs["output_hidden_states"] = True
-    if request_attentions:
-        teacher_call_kwargs["output_attentions"] = True
-    teacher_call_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, teacher_call_kwargs)
-    teacher_call_kwargs = sanitize_model_call_kwargs(teacher_call_kwargs)
-    teacher_outputs = teacher_state.model(**teacher_call_kwargs)
-    teacher_outputs = _stop_gradient_tree(teacher_outputs)
+    def teacher_forward(minibatch: collections.abc.Mapping[str, jax.Array]) -> dict[str, tp.Any]:
+        teacher_call_kwargs = dict(minibatch)
+        teacher_call_kwargs.pop("labels", None)
+        teacher_call_kwargs.pop("completion_mask", None)
+        teacher_call_kwargs.pop("assistant_masks", None)
+        if use_chunked:
+            teacher_call_kwargs["apply_lm_head"] = False
+        if request_hidden_states:
+            teacher_call_kwargs["output_hidden_states"] = True
+        if request_attentions:
+            teacher_call_kwargs["output_attentions"] = True
+        teacher_call_kwargs = filter_kwargs_for_callable(teacher_state.model.__call__, teacher_call_kwargs)
+        teacher_call_kwargs = sanitize_model_call_kwargs(teacher_call_kwargs)
+        teacher_static_kwargs = {
+            key: teacher_call_kwargs.pop(key)
+            for key in list(teacher_call_kwargs)
+            if not hasattr(teacher_call_kwargs[key], "shape")
+        }
 
-    batch = dict(batch)
-    if use_chunked:
-        batch["_teacher_hidden_state"] = teacher_outputs.last_hidden_state
-    else:
-        batch["_teacher_logits"] = teacher_outputs.logits
-    if request_hidden_states:
-        teacher_hidden = getattr(teacher_outputs, "hidden_states", None)
-        if teacher_hidden is not None:
-            batch["_teacher_hidden_states"] = tuple(teacher_hidden)
-    if request_attentions:
-        teacher_attns = getattr(teacher_outputs, "attentions", None)
-        if teacher_attns is not None:
-            batch["_teacher_attentions"] = tuple(teacher_attns)
-    del teacher_outputs
+        @functools.partial(
+            jax.checkpoint,
+            prevent_cse=True,
+            policy=jax.checkpoint_policies.nothing_saveable,
+        )
+        def _teacher_fwd(kw, t_graphstate):
+            teacher_module = teacher_state.merge(t_graphstate)
+            teacher_outputs = teacher_module(**kw, **teacher_static_kwargs)
+            result: dict[str, tp.Any] = {}
+            if use_chunked:
+                result["hidden_for_kl"] = jax.lax.stop_gradient(teacher_outputs.last_hidden_state)
+            else:
+                result["logits"] = jax.lax.stop_gradient(teacher_outputs.logits)
+            if request_hidden_states:
+                teacher_hidden = getattr(teacher_outputs, "hidden_states", None)
+                if teacher_hidden is not None:
+                    result["hidden_states"] = _stop_gradient_tree(tuple(teacher_hidden))
+            if request_attentions:
+                teacher_attns = getattr(teacher_outputs, "attentions", None)
+                if teacher_attns is not None:
+                    result["attentions"] = _stop_gradient_tree(tuple(teacher_attns))
+            return result
+
+        return _teacher_fwd(
+            teacher_call_kwargs,
+            jax.lax.stop_gradient(teacher_state.graphstate),
+        )
 
     def loss_fn(tree, minibatch):
         if is_training and straight_through_emulator is not None:
             tree = straight_through_emulator(tree)
         module = student_state.merge(tree)
+        teacher_outputs = teacher_forward(minibatch)
         call_kwargs = dict(minibatch)
         call_kwargs.pop("labels", None)
         call_kwargs.pop("completion_mask", None)
         call_kwargs.pop("assistant_masks", None)
-        # Extract pre-computed teacher outputs from minibatch.
         if use_chunked:
-            teacher_hidden_for_kl = jax.lax.stop_gradient(call_kwargs.pop("_teacher_hidden_state"))
+            teacher_hidden_for_kl = teacher_outputs["hidden_for_kl"]
             call_kwargs["apply_lm_head"] = False
         else:
-            teacher_logits = jax.lax.stop_gradient(call_kwargs.pop("_teacher_logits"))
-        teacher_hiddens = call_kwargs.pop("_teacher_hidden_states", None)
-        teacher_attns = call_kwargs.pop("_teacher_attentions", None)
+            teacher_logits = teacher_outputs["logits"]
+        teacher_hiddens = teacher_outputs.get("hidden_states")
+        teacher_attns = teacher_outputs.get("attentions")
         if request_hidden_states:
             call_kwargs["output_hidden_states"] = True
         if request_attentions:
