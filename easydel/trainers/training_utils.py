@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import collections
 import collections.abc
 import inspect
 import typing as tp
@@ -737,7 +738,7 @@ def make_assertions_and_get_sizes(
     Validates the input parameters and computes the batch size, minibatch size, and batch partition specification.
     Args:
         batch (tp.Dict): A dictionary containing the batch data. The batch size is inferred from the
-            first element's shape.
+            dominant leading dimension across array leaves.
         gradient_accumulation_steps (int): The number of gradient accumulation steps. Must be greater than 0.
         batch_partition_spec (tp.Optional[PartitionSpec], optional): The partition specification for the batch.
             Defaults to None.
@@ -754,15 +755,7 @@ def make_assertions_and_get_sizes(
     if gradient_accumulation_steps <= 0:
         raise ValueError("`gradient_accumulation_steps` must be greater than 0.")
 
-    batch_size = None
-    for leaf in tu.tree_leaves(batch):
-        if hasattr(leaf, "shape") and len(getattr(leaf, "shape", ())) >= 1:
-            batch_size = leaf.shape[0]
-            break
-    if batch_size is None:
-        raise ValueError(
-            "Unable to infer batch size from `batch`; expected at least one array leaf with a leading batch dimension."
-        )
+    batch_size = _infer_batch_size(batch)
 
     minibatch_size = batch_size // gradient_accumulation_steps
     if minibatch_size * gradient_accumulation_steps != batch_size:
@@ -770,6 +763,21 @@ def make_assertions_and_get_sizes(
     if batch_partition_spec is None:
         batch_partition_spec = PartitionSpec(("dp", "fsdp"), "sp")
     return batch_size, minibatch_size, batch_partition_spec
+
+
+def _infer_batch_size(batch: tp.Any) -> int:
+    """Infer batch size from the most common leading dimension in the batch pytree."""
+
+    leading_dims = [
+        int(leaf.shape[0])
+        for leaf in tu.tree_leaves(batch)
+        if hasattr(leaf, "shape") and len(getattr(leaf, "shape", ())) >= 1
+    ]
+    if not leading_dims:
+        raise ValueError(
+            "Unable to infer batch size from `batch`; expected at least one array leaf with a leading batch dimension."
+        )
+    return collections.Counter(leading_dims).most_common(1)[0][0]
 
 
 def update_metrics(
@@ -857,17 +865,15 @@ def minibatch_call(
 ) -> tuple[jax.Array, LossMetrics]:
     """
     Processes batch in smaller chunks for gradient accumulation using jax.lax.scan.
-    Uses eval_shape to initialize accumulator structures efficiently.
+
+    Rather than reshaping the whole batch into
+    ``(num_accum_steps, minibatch_size, ...)``, this slices minibatches from the
+    original batch inside the scan body. That is friendlier to sharded arrays
+    coming from model forwards (for example cached teacher hidden states in
+    distillation), where introducing a new leading accumulation axis can confuse
+    downstream partitioned computations.
     """
-    batch_size = None
-    for leaf in tu.tree_leaves(batch):
-        if hasattr(leaf, "shape") and len(getattr(leaf, "shape", ())) >= 1:
-            batch_size = leaf.shape[0]
-            break
-    if batch_size is None:
-        raise ValueError(
-            "Unable to infer batch size from `batch`; expected at least one array leaf with a leading batch dimension."
-        )
+    batch_size = _infer_batch_size(batch)
     if minibatch_size <= 0:
         raise ValueError(f"`minibatch_size` must be > 0, got {minibatch_size}.")
 
@@ -878,30 +884,24 @@ def minibatch_call(
             f"({minibatch_size}) for gradient accumulation."
         )
     if num_accum_steps > 1:
+        def slice_minibatch(tree, start_index):
+            """Extract one minibatch while leaving shared/global leaves untouched."""
 
-        def reshape_to_minibatches(arr):
-            """Reshape leaves for gradient accumulation.
-
-            Leaves that already carry the batch dimension are split into
-            `(num_accum_steps, minibatch_size, ...)`.
-            Scalar/global leaves are broadcast across accumulation steps so
-            every scanned minibatch receives the same value.
-            """
-            if not hasattr(arr, "shape"):
+            def _slice_leaf(arr):
+                if not hasattr(arr, "shape") or arr.ndim == 0:
+                    return arr
+                if arr.shape[0] == batch_size:
+                    return lax.dynamic_slice_in_dim(arr, start_index, minibatch_size, axis=0)
                 return arr
-            if arr.ndim == 0:
-                return jnp.broadcast_to(arr, (num_accum_steps,))
-            if arr.shape[0] == batch_size:
-                batch_shape = (num_accum_steps, minibatch_size, *arr.shape[1:])
-                return jnp.reshape(arr, batch_shape)
-            return jnp.broadcast_to(arr, (num_accum_steps, *arr.shape))
 
-        batch = jax.tree_util.tree_map(reshape_to_minibatches, batch)
+            return jax.tree_util.tree_map(_slice_leaf, tree)
+
+        shape_minibatch = slice_minibatch(batch, 0)
 
         (_, metrics_shape), grads_shape = jax.eval_shape(
             grad_fn,
             state.graphstate,
-            jax.tree_util.tree_map(lambda x: x[0], batch),
+            shape_minibatch,
         )
 
         init_acc = {
@@ -909,8 +909,9 @@ def minibatch_call(
             "metrics": jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), metrics_shape),
         }
 
-        def accumulate_gradients(acc, minibatch):
+        def accumulate_gradients(acc, start_index):
             """Accumulate gradients and metrics for each minibatch."""
+            minibatch = slice_minibatch(batch, start_index)
             (_, step_aux), step_grads = grad_fn(state.graphstate, minibatch)
             new_acc = {
                 "grads": jax.tree_util.tree_map(jnp.add, acc["grads"], step_grads),
@@ -918,10 +919,11 @@ def minibatch_call(
             }
             return new_acc, step_aux
 
+        start_indices = jnp.arange(num_accum_steps, dtype=jnp.int32) * minibatch_size
         final_acc, _aux = jax.lax.scan(
             accumulate_gradients,
             init_acc,
-            batch,
+            start_indices,
             length=num_accum_steps,
         )
         gradients = jax.tree_util.tree_map(lambda x: x / num_accum_steps, final_acc["grads"])
