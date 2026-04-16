@@ -49,9 +49,12 @@ Example:
     >>> output = flash_attn(query, key, value, causal=True)
 """
 
+import typing as tp
+
 import jax
 from eformer import common_types
 from eformer.escale import with_sharding_constraint
+from eformer.loggings import get_logger
 from ejkernel.modules import flash_attention  # pyright: ignore[reportMissingTypeStubs]
 from ejkernel.types import MaskInfo  # pyright: ignore[reportMissingTypeStubs]
 from jax import lax
@@ -70,7 +73,10 @@ from ..requirements import (
     MetadataField,
     OperationRequirements,
 )
+from .scaled_dot_product_attention import ScaledDotProductAttn
 from .vanilla_attention import VanillaAttn
+
+logger = get_logger(__name__)
 
 
 @OperationRegistry.register
@@ -167,16 +173,40 @@ class FlashAttn(OperationImpl):
         """
         head_dim: int = query.shape[-1]
         softmax_scale_computed: float = softmax_scale if softmax_scale is not None else head_dim**-0.5
-
-        # Check dimension compatibility for MLA-style attention
         query_dim: int = query.shape[-1]
         key_dim: int = key.shape[-1]
         value_dim: int = value.shape[-1]
         dims_incompatible: bool = not (query_dim == key_dim == value_dim)
 
-        if dims_incompatible:
-            vanilla_attn: VanillaAttn = VanillaAttn(self.metadata)
-            fallback_output: AttentionOutput = vanilla_attn(
+        def _fallback_attention(
+            *,
+            warning_message: str | None = None,
+            preserve_varlen_semantics: bool = False,
+        ) -> AttentionOutput:
+            if not preserve_varlen_semantics and (cum_seqlens_q is not None or cum_seqlens_k is not None):
+                raise ValueError(
+                    "FLASH_ATTN2 cannot fall back to VANILLA on multi-host TPU for packed attention "
+                    "when query/key/value head dimensions differ."
+                )
+            if preserve_varlen_semantics:
+                unsupported_sdpa_features = ScaledDotProductAttn.get_unsupported_fallback_features(
+                    softmax_aux=softmax_aux,
+                    logits_soft_cap=logits_soft_cap,
+                    dropout_prob=dropout_prob,
+                    normalize_output=normalize_output,
+                )
+                if unsupported_sdpa_features:
+                    raise ValueError(
+                        "FLASH_ATTN2 cannot fall back to SDPA on multi-host TPU for packed attention "
+                        f"when {', '.join(unsupported_sdpa_features)} are requested."
+                    )
+            if warning_message is not None:
+                logger.warning_once(warning_message)
+            if preserve_varlen_semantics:
+                fallback_attn: ScaledDotProductAttn | VanillaAttn = ScaledDotProductAttn(self.metadata)
+            else:
+                fallback_attn = VanillaAttn(self.metadata)
+            fallback_kwargs: dict[str, tp.Any] = dict(
                 query=query,
                 key=key,
                 value=value,
@@ -186,10 +216,29 @@ class FlashAttn(OperationImpl):
                 logits_soft_cap=logits_soft_cap,
                 softmax_scale=softmax_scale_computed,
                 sliding_window=sliding_window,
+                dropout_prob=dropout_prob,
                 causal=causal,
-                **ignore,
             )
-            return fallback_output
+            if preserve_varlen_semantics:
+                fallback_kwargs["cum_seqlens_q"] = cum_seqlens_q
+                fallback_kwargs["cum_seqlens_k"] = cum_seqlens_k
+            else:
+                fallback_kwargs.update(ignore)
+            return fallback_attn(**fallback_kwargs)
+
+        if jax.default_backend() == "tpu" and jax.process_count() > 1:
+            has_varlen_inputs = cum_seqlens_q is not None or cum_seqlens_k is not None
+            return _fallback_attention(
+                warning_message=(
+                    "FLASH_ATTN2 on multi-host TPU may compile non-identical XLA programs across "
+                    "hosts and can fail at runtime; falling back to "
+                    + ("SDPA attention." if has_varlen_inputs and not dims_incompatible else "VANILLA attention.")
+                ),
+                preserve_varlen_semantics=has_varlen_inputs and not dims_incompatible,
+            )
+
+        if dims_incompatible:
+            return _fallback_attention()
 
         dtype: jnp.dtype = self.metadata.runtime_dtype
         model_mode: common_types.RUNTIME_MODE_TYPES = self.get_mode(query=query, BTHD=True)  # type: ignore

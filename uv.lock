@@ -750,7 +750,7 @@ tpu = [
 requires-dist = [
     { name = "cryptography", specifier = ">=45.0.6" },
     { name = "datasets", specifier = ">=3.6.0" },
-    { name = "eformer", specifier = "==0.0.99.10" },
+    { name = "eformer", specifier = "==0.0.99.11" },
     { name = "einops", specifier = "~=0.8.0" },
     { name = "ejkernel", specifier = "==0.0.78" },
     { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.78" },
@@ -795,7 +795,7 @@ provides-extras = ["torch", "cuda", "tpu", "tensorflow", "lm-eval", "profile", "
 
 [[package]]
 name = "eformer"
-version = "0.0.99.10"
+version = "0.0.99.11"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "braceexpand" },
@@ -817,9 +817,9 @@ dependencies = [
     { name = "tensorstore" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/09/52/bf41c2a460975ae3c0c21a7715b2f85ee31102b78b6bf24b2ae63bd33fc4/eformer-0.0.99.10.tar.gz", hash = "sha256:d0759894e8b952b447390ad767ecc15119c26b3d47bb0e4a6cfe8fbcc7625784", size = 276223, upload-time = "2026-04-13T02:20:22.437Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fa/6d/8d24e2d4afb6c12164fb0e2f755107d377a932ed12256240a83ca82f6b26/eformer-0.0.99.11.tar.gz", hash = "sha256:2564198bade50b8f97da55d3c9024ba544d86a546af14ebc52b3ef1dacb89140", size = 276251, upload-time = "2026-04-16T04:25:11.992Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d6/46/12272e92a2390f0ab809f7bd56a2b5374c0e23a799726bd971fea612a298/eformer-0.0.99.10-py3-none-any.whl", hash = "sha256:ada34784d441af6e6d57490e29b92742e1b668358c3540801e3f2c5dbcb547ef", size = 337473, upload-time = "2026-04-13T02:20:23.748Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/58/5b198bd43211db358446ce536e0e528d260581503bd7f97acd4ae1f72390/eformer-0.0.99.11-py3-none-any.whl", hash = "sha256:1be10b562ed45b77e2e451ce33b5735d5edf5610221bf698ab12e9dc0b1bfe09", size = 337513, upload-time = "2026-04-16T04:25:13.391Z" },
 ]
 
 [[package]]

@@ -127,6 +127,26 @@ class ScaledDotProductAttn(OperationImpl):
             cache_view_class=TransformerCacheView,
         )
 
+    @staticmethod
+    def get_unsupported_fallback_features(
+        *,
+        softmax_aux: tp.Any = None,
+        logits_soft_cap: float | None = None,
+        dropout_prob: float = 0.0,
+        normalize_output: bool = True,
+    ) -> tuple[str, ...]:
+        """Returns attention features that the SDPA fallback cannot preserve."""
+        unsupported_features: list[str] = []
+        if softmax_aux is not None:
+            unsupported_features.append("softmax_aux")
+        if logits_soft_cap is not None:
+            unsupported_features.append("logits_soft_cap")
+        if dropout_prob != 0.0:
+            unsupported_features.append("dropout_prob")
+        if not normalize_output:
+            unsupported_features.append("normalize_output=False")
+        return tuple(unsupported_features)
+
     @jax.named_scope("easydel-sdpa-impl-ejkernel")
     def forward_native(
         self,

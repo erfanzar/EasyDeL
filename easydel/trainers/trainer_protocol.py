@@ -841,6 +841,10 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
         pbar: BaseProgressBar,
         step: int,
         mode: str = "train",
+        *,
+        update_progress: bool = True,
+        log_to_backends: bool = True,
+        force_report: bool = False,
     ) -> None:
         """
         Log metrics and update progress bar.
@@ -850,6 +854,9 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
             pbar: Progress bar instance to update.
             step: Current step number.
             mode: "train" or "eval" to prefix metrics.
+            update_progress: Whether to update the local progress bar.
+            log_to_backends: Whether to forward metrics to external trackers.
+            force_report: Whether to bypass ``report_steps`` gating.
 
         Note:
             - Updates progress bar every log_steps
