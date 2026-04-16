@@ -551,9 +551,9 @@ class Trainer(BaseTrainer):
                 train_metrics = step_metrics.calculate(
                     metrics=metrics,
                     current_step=current_step,
-                    learning_rate=self.scheduler(current_step)
-                    if self.scheduler is not None
-                    else self.arguments.learning_rate,
+                    learning_rate=(
+                        self.scheduler(current_step) if self.scheduler is not None else self.arguments.learning_rate
+                    ),
                     epoch=epoch,
                     epoch_progress=min(max((current_step - epoch_start_step) / epoch_total_steps, 0.0), 1.0),
                     flops_per_token=self._backward_flops_per_token,
@@ -652,6 +652,16 @@ class Trainer(BaseTrainer):
             def data_collator(x):
                 return x
 
+        global_step = int(jax.device_get(state.step))
+        final_eval_metrics = None
+        summary_metric_sums: dict[str, float] = {}
+        summary_metric_counts: dict[str, int] = {}
+        summary_metrics_helper = (
+            step_metrics
+            if hasattr(step_metrics, "accumulate_summary_metric") and hasattr(step_metrics, "summarize_metrics")
+            else StepMetrics(self.arguments)
+        )
+
         for current_step in range(1, self.max_evaluation_steps + 1):
             try:
                 batch, eval_iter = self._get_next_batch(eval_iter, eval_dataset)
@@ -679,15 +689,40 @@ class Trainer(BaseTrainer):
                     mean_accuracy=mean_accuracy,
                     mode="eval",
                 )
+                for metric_name, metric_value in eval_metrics.items():
+                    summary_metrics_helper.accumulate_summary_metric(
+                        summary_metric_sums=summary_metric_sums,
+                        summary_metric_counts=summary_metric_counts,
+                        metric_name=metric_name,
+                        metric_value=metric_value,
+                        mode="eval",
+                    )
                 self.log_metrics(
                     metrics=eval_metrics,
                     pbar=pbar,
                     step=current_step,
                     mode="eval",
+                    log_to_backends=False,
                 )
+                final_eval_metrics = eval_metrics
                 yield eval_metrics
             except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
                 break
+        if final_eval_metrics is not None:
+            summary_eval_metrics = summary_metrics_helper.summarize_metrics(
+                last_metrics=final_eval_metrics,
+                summary_metric_sums=summary_metric_sums,
+                summary_metric_counts=summary_metric_counts,
+                mode="eval",
+            )
+            self.log_metrics(
+                metrics=summary_eval_metrics,
+                pbar=pbar,
+                step=global_step,
+                mode="eval",
+                update_progress=False,
+                force_report=True,
+            )
 
     def _execute_eval_step(self, state, batch) -> LossMetrics:
         """

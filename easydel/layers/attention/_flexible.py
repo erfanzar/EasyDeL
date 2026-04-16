@@ -75,7 +75,7 @@ from easydel.caching import (
 )
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
-from easydel.operations import AttentionOutput, OperationMetadata, OperationRegistry
+from easydel.operations import AttentionOutput, OperationMetadata, OperationRegistry, ScaledDotProductAttn
 
 from ..quantization import EasyQuantizer, TurboQuantConfig
 
@@ -212,7 +212,15 @@ def get_optimal_config() -> tuple[AttentionMechanisms, jnp.dtype]:
         case "tpu":
             is_tpu_v3: bool = tpu_version_check("v3")
             if is_tpu_v3:
-                result_mechanism: AttentionMechanisms = AttentionMechanisms.FLASH_ATTN2
+                if jax.process_count() > 1:
+                    logger.warning_once(
+                        "FLASH_ATTN2 on multi-host TPU v3 may compile non-identical XLA programs "
+                        "across hosts and can fail at runtime; falling back to VANILLA attention."
+                    )
+                    result_mechanism: AttentionMechanisms = AttentionMechanisms.VANILLA
+                    result_dtype: jnp.dtype = jnp.bfloat16
+                    return result_mechanism, result_dtype
+                result_mechanism = AttentionMechanisms.FLASH_ATTN2
                 result_dtype: jnp.dtype = jnp.float32
                 return result_mechanism, result_dtype
             result_mechanism_v4: AttentionMechanisms = AttentionMechanisms.BLOCKSPARSE
@@ -479,6 +487,42 @@ class FlexibleAttentionModule(nn.Module):
         else:
             policy_computed = policy
 
+        def _get_impl_names(impl: tp.Any) -> set[str]:
+            impl_name = getattr(impl, "get_impl_name", lambda: None)()
+            if isinstance(impl_name, tuple):
+                return {str(name) for name in impl_name}
+            if impl_name is None:
+                return set()
+            return {str(impl_name)}
+
+        def _maybe_route_varlen_multihost_tpu_attention(callable_attn: tp.Any) -> tp.Any:
+            if jax.default_backend() != "tpu" or jax.process_count() <= 1:
+                return callable_attn
+            if cum_seqlens_q is None and cum_seqlens_k is None:
+                return callable_attn
+            impl_names = _get_impl_names(callable_attn)
+            if AttentionMechanisms.VANILLA not in impl_names:
+                return callable_attn
+            if not (query_states.shape[-1] == key_states.shape[-1] == value_states.shape[-1]):
+                raise ValueError(
+                    "Cannot preserve cumulative-sequence attention on multi-host TPU with VANILLA "
+                    "attention when query/key/value head dimensions differ."
+                )
+            unsupported_sdpa_features = ScaledDotProductAttn.get_unsupported_fallback_features(
+                softmax_aux=softmax_aux,
+                logits_soft_cap=logits_soft_cap,
+            )
+            if unsupported_sdpa_features:
+                raise ValueError(
+                    "Cannot route cumulative-sequence attention through SDPA on multi-host TPU "
+                    f"because {', '.join(unsupported_sdpa_features)} are not supported by the SDPA fallback."
+                )
+            logger.warning_once(
+                "Routing cumulative-sequence attention through SDPA on multi-host TPU "
+                "because VANILLA attention does not support cum_seqlens_*."
+            )
+            return ScaledDotProductAttn(metadata=self.metadata)
+
         with self.config.mesh:  # pyright: ignore[reportOptionalContextManager]
             input_dict: dict[str, tp.Any] = dict(
                 query=query_states,
@@ -517,9 +561,11 @@ class FlexibleAttentionModule(nn.Module):
                     raise ValueError("Decode mode requires a cache_view, but None was provided.")
                 has_decode_impl: bool = self.impl_decode is not None
                 callable_attn: tp.Any = self.impl_decode if has_decode_impl else self.impl
+                callable_attn = _maybe_route_varlen_multihost_tpu_attention(callable_attn)
                 output = callable_attn(**input_dict)
             else:
-                output = self.impl(**input_dict)
+                callable_attn = _maybe_route_varlen_multihost_tpu_attention(self.impl)
+                output = callable_attn(**input_dict)
 
         target_dtype: jnp.dtype = self.impl.metadata.runtime_dtype
 

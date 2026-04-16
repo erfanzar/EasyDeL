@@ -5530,6 +5530,10 @@ class BaseTrainer(BaseTrainerProtocol):
         pbar: BaseProgressBar,
         step: int,
         mode: str = "train",
+        *,
+        update_progress: bool = True,
+        log_to_backends: bool = True,
+        force_report: bool = False,
     ):
         """Log metrics to configured backends and update the progress bar.
 
@@ -5542,9 +5546,12 @@ class BaseTrainer(BaseTrainerProtocol):
             pbar: Progress bar instance to update.
             step: Current training/evaluation step.
             mode: Either 'train' or 'eval' to prefix metrics.
+            update_progress: Whether to update the local progress bar.
+            log_to_backends: Whether to forward metrics to external trackers.
+            force_report: Whether to bypass ``report_steps`` gating.
         """
 
-        if step % self.arguments.log_steps == 0:
+        if update_progress and step % self.arguments.log_steps == 0:
             if step == 0:
                 pbar.reset()
             display_metrics = {
@@ -5562,5 +5569,5 @@ class BaseTrainer(BaseTrainerProtocol):
             pbar.set_postfix(**display_metrics)
             update_size = 0 if step == 0 else self.arguments.log_steps
             pbar.update(update_size)
-        if step % self.arguments.report_steps == 0:
+        if log_to_backends and (force_report or step % self.arguments.report_steps == 0):
             self.arguments.log_metrics(metrics=metrics, step=step)

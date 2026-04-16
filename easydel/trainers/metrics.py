@@ -201,6 +201,99 @@ class StepMetrics:
 
         return basic_metrics
 
+    @staticmethod
+    def _coerce_summary_scalar(metric_value: tp.Any) -> float | None:
+        if metric_value is None or isinstance(metric_value, bool):
+            return None
+        try:
+            scalar_array = np.asarray(metric_value)
+        except (TypeError, ValueError):
+            return None
+        if scalar_array.ndim != 0:
+            return None
+        scalar_value = scalar_array.item()
+        if isinstance(scalar_value, bool):
+            return None
+        try:
+            return float(scalar_value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _get_summary_metric_reduction(
+        metric_name: str,
+        mode: tp.Literal["eval", "train"] | None = None,
+    ) -> tp.Literal["ignore", "mean", "sum"]:
+        if mode is not None and metric_name.startswith(f"{mode}/"):
+            bare_metric_name = metric_name.removeprefix(f"{mode}/")
+            if bare_metric_name in {
+                f"{mode}_step",
+                "visited_tokens",
+                "loss",
+                "accuracy",
+                "perplexity",
+                "mean_loss",
+                "mean_accuracy",
+            }:
+                return "ignore"
+        if mode is not None and metric_name.startswith(f"{mode}-mlperf/"):
+            bare_metric_name = metric_name.removeprefix(f"{mode}-mlperf/")
+            if bare_metric_name == "total_time":
+                return "ignore"
+            if bare_metric_name in {"total_flops", "total_tokens"}:
+                return "sum"
+        return "mean"
+
+    def accumulate_summary_metric(
+        self,
+        summary_metric_sums: dict[str, float],
+        summary_metric_counts: dict[str, int],
+        metric_name: str,
+        metric_value: tp.Any,
+        mode: tp.Literal["eval", "train"] | None = None,
+    ) -> None:
+        if self._get_summary_metric_reduction(metric_name, mode=mode) == "ignore":
+            return
+        scalar_value = self._coerce_summary_scalar(metric_value)
+        if scalar_value is None:
+            return
+        summary_metric_sums[metric_name] = summary_metric_sums.get(metric_name, 0.0) + scalar_value
+        summary_metric_counts[metric_name] = summary_metric_counts.get(metric_name, 0) + 1
+
+    def summarize_metrics(
+        self,
+        last_metrics: dict[str, tp.Any],
+        summary_metric_sums: dict[str, float],
+        summary_metric_counts: dict[str, int],
+        mode: tp.Literal["eval", "train"] | None = None,
+    ) -> dict[str, tp.Any]:
+        summary_metrics = dict(last_metrics)
+        for metric_name, metric_total in summary_metric_sums.items():
+            reduction = self._get_summary_metric_reduction(metric_name, mode=mode)
+            if reduction == "ignore":
+                continue
+            if reduction == "sum":
+                summary_metrics[metric_name] = metric_total
+            else:
+                summary_metrics[metric_name] = metric_total / summary_metric_counts[metric_name]
+
+        if mode == "eval":
+            mlperf_prefix = "eval-mlperf/"
+            total_execution_time = summary_metric_sums.get(f"{mlperf_prefix}execution_time")
+            total_tokens = summary_metrics.get(f"{mlperf_prefix}total_tokens")
+            total_flops = summary_metrics.get(f"{mlperf_prefix}total_flops")
+            if total_execution_time is not None and total_tokens is not None and float(total_execution_time) > 0.0:
+                summary_metrics[f"{mlperf_prefix}throughput"] = float(total_tokens) / float(total_execution_time)
+            if total_execution_time is not None and total_flops is not None and float(total_execution_time) > 0.0:
+                summary_metrics[f"{mlperf_prefix}tflops"] = (float(total_flops) / float(total_execution_time)) / 1e12
+            if summary_metrics.get("eval/mean_loss") is not None:
+                summary_metrics["eval/loss"] = summary_metrics["eval/mean_loss"]
+                summary_metrics["eval/perplexity"] = float(jnp.exp(summary_metrics["eval/mean_loss"]))
+            if summary_metrics.get("eval/mean_accuracy") is not None:
+                summary_metrics["eval/accuracy"] = summary_metrics["eval/mean_accuracy"]
+
+        return summary_metrics
+
     def _calculate_detailed_metrics(self, metrics: LossMetrics):
         """Calculate additional detailed metrics.
 
@@ -254,7 +347,9 @@ class MetricsTracker:
     def __init__(self):
         """Initialize the metrics tracker with empty state."""
         self.loss_sum = None
+        self.loss_count = 0
         self.accuracy_sum = None
+        self.accuracy_count = 0
         self.metrics_history = defaultdict(list)
         self.step_offset = 0
 
@@ -273,16 +368,22 @@ class MetricsTracker:
         Note:
             Handles missing accuracy values gracefully.
         """
-        self.loss_sum = loss if self.loss_sum is None else self.loss_sum + loss
-        mean_loss = self.loss_sum / (step - self.step_offset)
-        if accuracy != float("inf"):
-            if accuracy is None:
-                accuracy = 0.0
-            self.accuracy_sum = accuracy if self.accuracy_sum is None else self.accuracy_sum + accuracy
-            mean_accuracy = self.accuracy_sum / (step - self.step_offset)
+        del step
 
-            return float(mean_loss), float(mean_accuracy)
-        return float(mean_loss)
+        loss_value = float(np.asarray(loss).item())
+        self.loss_sum = loss_value if self.loss_sum is None else self.loss_sum + loss_value
+        self.loss_count += 1
+        mean_loss = self.loss_sum / max(self.loss_count, 1)
+
+        mean_accuracy = None
+        if accuracy is not None:
+            accuracy_value = float(np.asarray(accuracy).item())
+            if np.isfinite(accuracy_value):
+                self.accuracy_sum = accuracy_value if self.accuracy_sum is None else self.accuracy_sum + accuracy_value
+                self.accuracy_count += 1
+                mean_accuracy = self.accuracy_sum / max(self.accuracy_count, 1)
+
+        return float(mean_loss), None if mean_accuracy is None else float(mean_accuracy)
 
     def reset(self, step):
         """Reset tracked metrics.
@@ -294,7 +395,9 @@ class MetricsTracker:
             Typically called at the start of each epoch or evaluation phase.
         """
         self.loss_sum = None
+        self.loss_count = 0
         self.accuracy_sum = None
+        self.accuracy_count = 0
         self.step_offset = step
 
 

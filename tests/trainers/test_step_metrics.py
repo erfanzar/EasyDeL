@@ -14,10 +14,8 @@
 
 from types import SimpleNamespace
 
-import jax.numpy as jnp
-
 from easydel.infra.loss_utils import LossMetrics
-from easydel.trainers.metrics import StepMetrics
+from easydel.trainers.metrics import MetricsTracker, StepMetrics
 
 
 def test_step_metrics_reports_fractional_epoch_progress(monkeypatch):
@@ -27,8 +25,8 @@ def test_step_metrics_reports_fractional_epoch_progress(monkeypatch):
     monkeypatch.setattr("easydel.trainers.metrics.time.time", lambda: 12.0)
 
     metrics = LossMetrics(
-        loss=jnp.asarray(1.0),
-        accuracy=jnp.asarray(0.5),
+        loss=1.0,
+        accuracy=0.5,
         execution_time=2.0,
     )
 
@@ -47,3 +45,27 @@ def test_step_metrics_reports_fractional_epoch_progress(monkeypatch):
 
     assert results["train/epoch"] == 0.25
     assert results["train/epoch_index"] == 0
+
+
+def test_metrics_tracker_counts_updates_and_ignores_missing_accuracy():
+    tracker = MetricsTracker()
+
+    mean_loss, mean_accuracy = tracker.update(loss=2.0, accuracy=None, step=50)
+
+    assert mean_loss == 2.0
+    assert mean_accuracy is None
+
+    mean_loss, mean_accuracy = tracker.update(loss=4.0, accuracy=0.5, step=51)
+
+    assert mean_loss == 3.0
+    assert mean_accuracy == 0.5
+
+
+def test_metrics_tracker_ignores_non_finite_accuracy():
+    tracker = MetricsTracker()
+
+    tracker.update(loss=1.0, accuracy=float("inf"), step=1)
+    mean_loss, mean_accuracy = tracker.update(loss=3.0, accuracy=0.75, step=2)
+
+    assert mean_loss == 2.0
+    assert mean_accuracy == 0.75
