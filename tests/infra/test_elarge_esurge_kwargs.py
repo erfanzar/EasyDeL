@@ -115,6 +115,17 @@ def test_to_esurge_kwargs_forwards_worker_startup_timeout():
     assert kwargs["worker_startup_timeout"] == 75.5
 
 
+def test_to_esurge_kwargs_forwards_async_scheduling():
+    cfg = {
+        "model": {"name_or_path": "dummy-model"},
+        "esurge": {"async_scheduling": False},
+    }
+
+    kwargs = to_esurge_kwargs(cfg)
+
+    assert kwargs["async_scheduling"] is False
+
+
 def test_to_esurge_kwargs_defaults_distributed_controls():
     cfg = {"model": {"name_or_path": "dummy-model"}}
 
