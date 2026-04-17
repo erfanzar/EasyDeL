@@ -351,8 +351,8 @@ def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
         - Memory: hbm_utilization, page_size
         - Batching: max_num_seqs, max_num_batched_tokens, min_input_pad
         - Caching: enable_prefix_caching, destroy_pages_on_pause
-        - Execution: compile_runner, overlap_execution, use_aot_forward,
-          bind_graphstate_for_aot
+        - Execution: compile_runner, async_scheduling, overlap_execution,
+          use_aot_forward, bind_graphstate_for_aot
         - Truncation: auto_truncate_prompt, truncate_mode, strict_context
         - Tokenization: detokenizer_max_states, worker_startup_timeout,
           extra_eos_token_ids, extra_stops
@@ -410,6 +410,7 @@ def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
     enable_prefix_caching_val = es.get("enable_prefix_caching")
     auto_shard_model_val = es.get("auto_shard_model")
     compile_runner_val = es.get("compile_runner")
+    async_scheduling_val = es.get("async_scheduling")
     overlap_execution_val = es.get("overlap_execution")
     sampler_metrics_val = es.get("sampler_metrics")
     auto_truncate_prompt_val = es.get("auto_truncate_prompt")
@@ -498,6 +499,7 @@ def to_esurge_kwargs(cfg_like: eLMConfig | Mapping[str, Any]) -> dict[str, Any]:
         auto_shard_model=True if auto_shard_model_val is None else bool(auto_shard_model_val),
         sharding_axis_dims=sharding_axis_dims,
         compile_runner=True if compile_runner_val is None else bool(compile_runner_val),
+        async_scheduling=True if async_scheduling_val is None else bool(async_scheduling_val),
         runner_verbose=runner_verbose,
         overlap_execution=False if overlap_execution_val is None else bool(overlap_execution_val),
         sampler_metrics=False if sampler_metrics_val is None else bool(sampler_metrics_val),

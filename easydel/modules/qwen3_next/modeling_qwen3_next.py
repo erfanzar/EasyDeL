@@ -1087,24 +1087,84 @@ def _apply_qwen3_next_packed_updates(
     from easydel.utils.helpers import check_bool_flag
 
     use_ragged = is_inference_mode() and check_bool_flag("EASYDEL_RAGGED_GDR", True)
-    _impl = _apply_qwen3_next_packed_updates_ragged if use_ragged else _apply_qwen3_next_packed_updates_unified
-    return _impl(
-        conv_states=conv_states,
-        recurrent_states=recurrent_states,
-        conv_input=conv_input,
-        beta=beta,
-        decay=decay,
-        kernel=kernel,
-        query_start_loc=query_start_loc,
-        num_requests=num_requests,
-        key_dim=key_dim,
-        num_k_heads=num_k_heads,
-        head_k_dim=head_k_dim,
-        num_v_heads=num_v_heads,
-        head_v_dim=head_v_dim,
-        expand_ratio=expand_ratio,
-        conv_output_dtype=conv_output_dtype,
-        gdr_op=gdr_op,
+    if not use_ragged:
+        return _apply_qwen3_next_packed_updates_unified(
+            conv_states=conv_states,
+            recurrent_states=recurrent_states,
+            conv_input=conv_input,
+            beta=beta,
+            decay=decay,
+            kernel=kernel,
+            query_start_loc=query_start_loc,
+            num_requests=num_requests,
+            key_dim=key_dim,
+            num_k_heads=num_k_heads,
+            head_k_dim=head_k_dim,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+            expand_ratio=expand_ratio,
+            conv_output_dtype=conv_output_dtype,
+            gdr_op=gdr_op,
+        )
+
+    max_req_idx = jnp.int32(query_start_loc.shape[0] - 1)
+    active_req_idx = jnp.clip(jnp.asarray(num_requests, dtype=jnp.int32), 0, max_req_idx)
+    total_tokens = query_start_loc[active_req_idx]
+    bucket_tokens = jnp.int32(conv_input.shape[1])
+    scheduled_tokens = query_start_loc[1:] - query_start_loc[:-1]
+    active_slots = jnp.arange(scheduled_tokens.shape[0], dtype=jnp.int32) < active_req_idx
+    has_prefill = jnp.any(active_slots & (scheduled_tokens > 1))
+
+    def _run_unified(_):
+        return _apply_qwen3_next_packed_updates_unified(
+            conv_states=conv_states,
+            recurrent_states=recurrent_states,
+            conv_input=conv_input,
+            beta=beta,
+            decay=decay,
+            kernel=kernel,
+            query_start_loc=query_start_loc,
+            num_requests=num_requests,
+            key_dim=key_dim,
+            num_k_heads=num_k_heads,
+            head_k_dim=head_k_dim,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+            expand_ratio=expand_ratio,
+            conv_output_dtype=conv_output_dtype,
+            gdr_op=gdr_op,
+        )
+
+    def _run_ragged(_):
+        return _apply_qwen3_next_packed_updates_ragged(
+            conv_states=conv_states,
+            recurrent_states=recurrent_states,
+            conv_input=conv_input,
+            beta=beta,
+            decay=decay,
+            kernel=kernel,
+            query_start_loc=query_start_loc,
+            num_requests=num_requests,
+            key_dim=key_dim,
+            num_k_heads=num_k_heads,
+            head_k_dim=head_k_dim,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+            expand_ratio=expand_ratio,
+            conv_output_dtype=conv_output_dtype,
+            gdr_op=gdr_op,
+        )
+
+    # The ragged GDR fast path expects the flat token tensors to contain only
+    # real packed tokens. Final prefill remainders are often compiled into a
+    # larger static bucket (for example 454 real tokens in a 512-token bucket),
+    # so keep those padded prefill batches on the unified implementation while
+    # preserving the faster ragged decode path for 1-token buckets like 1-in-4.
+    return jax.lax.cond(
+        (total_tokens < bucket_tokens) & has_prefill,
+        _run_unified,
+        _run_ragged,
+        operand=None,
     )
 
 

@@ -78,6 +78,8 @@ class eSurgeCfg(TypedDict, total=False):
         sharding_axis_dims: Axis dimensions for model sharding (e.g.,
             ``[1, 1, 1, -1]``).
         compile_runner: Whether to JIT-compile the runner step function.
+        async_scheduling: Enable async sampled-token scheduling/materialization
+            between scheduler iterations.
         runner_verbose: Enable verbose logging from the runner.
         verbose: Enable verbose logging from the engine.
         overlap_execution: Overlap decode execution with scheduling for
@@ -165,6 +167,7 @@ class eSurgeCfg(TypedDict, total=False):
     auto_shard_model: NotRequired[bool]
     sharding_axis_dims: NotRequired[collections.abc.Sequence[int]]
     compile_runner: NotRequired[bool]
+    async_scheduling: NotRequired[bool]
     runner_verbose: NotRequired[bool]
     verbose: NotRequired[bool]
     overlap_execution: NotRequired[bool]

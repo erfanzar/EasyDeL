@@ -20,15 +20,18 @@ from eformer.escale import PartitionAxis, PartitionManager
 from ejkernel.kernels._xla.gated_delta_rule._xla_impl_fwd import _single_step_gdr_fwd
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
+import easydel.modules.qwen3_next.modeling_qwen3_next as qwen3_next_modeling
 from easydel.modules.qwen3_next.modeling_qwen3_next import (
     _apply_qwen3_next_packed_slow_updates,
     _apply_qwen3_next_packed_updates,
+    _apply_qwen3_next_packed_updates_unified,
     _preserve_array_sharding,
     apply_grouped_single_step_gdr,
 )
 from easydel.modules.qwen3_next.qwen3_next_configuration import Qwen3NextConfig
 from easydel.operations import OperationMetadata
 from easydel.operations.kernels import GatedDeltaRuleOp
+from easydel.utils.inference_mode import set_inference_mode
 
 
 def _make_decode_inputs(dtype=jnp.bfloat16):
@@ -247,6 +250,53 @@ def _make_large_bucket_decode_inputs(dtype=jnp.bfloat16, bucket: int = 512):
     }
 
 
+def _make_partial_bucket_prefill_inputs(dtype=jnp.bfloat16, bucket: int = 512, actual_tokens: int = 454):
+    rng = jax.random.key(909)
+    num_slots = 4
+    num_requests = jnp.array(1, dtype=jnp.int32)
+    num_k_heads = 3
+    head_k_dim = 4
+    num_v_heads = 6
+    head_v_dim = 5
+    key_dim = num_k_heads * head_k_dim
+    conv_dim = key_dim * 2 + num_v_heads * head_v_dim
+    d_conv = 3
+
+    conv_states = jax.random.normal(rng, (num_slots, conv_dim, d_conv), dtype=jnp.float32).astype(dtype)
+    recurrent_states = jax.random.normal(
+        jax.random.fold_in(rng, 1),
+        (num_slots, num_v_heads, head_k_dim, head_v_dim),
+        dtype=jnp.float32,
+    ).astype(dtype)
+    conv_input = jax.random.normal(jax.random.fold_in(rng, 2), (1, bucket, conv_dim), dtype=jnp.float32).astype(dtype)
+    beta = jax.nn.sigmoid(
+        jax.random.normal(jax.random.fold_in(rng, 3), (1, bucket, num_v_heads), dtype=jnp.float32)
+    ).astype(dtype)
+    decay = (
+        -jax.nn.softplus(jax.random.normal(jax.random.fold_in(rng, 4), (1, bucket, num_v_heads), dtype=jnp.float32))
+    ).astype(dtype)
+    kernel = jax.random.normal(jax.random.fold_in(rng, 5), (conv_dim, d_conv), dtype=jnp.float32).astype(dtype)
+    query_start_loc = jnp.array([0, actual_tokens, actual_tokens, actual_tokens, actual_tokens], dtype=jnp.int32)
+
+    return {
+        "conv_states": conv_states,
+        "recurrent_states": recurrent_states,
+        "conv_input": conv_input,
+        "beta": beta,
+        "decay": decay,
+        "kernel": kernel,
+        "query_start_loc": query_start_loc,
+        "num_requests": num_requests,
+        "key_dim": key_dim,
+        "num_k_heads": num_k_heads,
+        "head_k_dim": head_k_dim,
+        "num_v_heads": num_v_heads,
+        "head_v_dim": head_v_dim,
+        "expand_ratio": num_v_heads // num_k_heads,
+        "conv_output_dtype": dtype,
+    }
+
+
 def _make_tp_grouped_decode_inputs(dtype=jnp.bfloat16, batch: int = 8):
     rng = jax.random.key(2026)
     num_k_heads = 4
@@ -418,6 +468,76 @@ def test_packed_updates_match_reference_loop_for_large_bucket_decode_like_schedu
     assert jnp.allclose(unified_conv.astype(jnp.float32), ref_conv.astype(jnp.float32), rtol=0.02, atol=0.05)
     assert jnp.allclose(unified_rec.astype(jnp.float32), ref_rec.astype(jnp.float32), rtol=0.02, atol=0.05)
     assert jnp.allclose(unified_out.astype(jnp.float32), ref_out.astype(jnp.float32), rtol=0.02, atol=0.05)
+
+
+def test_packed_updates_fall_back_to_unified_for_partial_prefill_bucket(monkeypatch):
+    packed_inputs = _make_partial_bucket_prefill_inputs(bucket=512, actual_tokens=454)
+    mesh = _make_runtime_mesh()
+
+    monkeypatch.setenv("EASYDEL_RAGGED_GDR", "1")
+
+    with mesh, set_inference_mode(True):
+        gdr_op = _make_gdr_op(mesh)
+        dispatched_conv, dispatched_rec, dispatched_out = _apply_qwen3_next_packed_updates(
+            **packed_inputs,
+            gdr_op=gdr_op,
+        )
+        unified_conv, unified_rec, unified_out = _apply_qwen3_next_packed_updates_unified(
+            **packed_inputs,
+            gdr_op=gdr_op,
+        )
+        ref_conv, ref_rec, _ref_out = _apply_qwen3_next_packed_slow_updates(
+            **packed_inputs,
+            gdr_op=gdr_op,
+        )
+
+    assert jnp.allclose(dispatched_conv.astype(jnp.float32), unified_conv.astype(jnp.float32), rtol=0.02, atol=0.05)
+    assert jnp.allclose(dispatched_rec.astype(jnp.float32), unified_rec.astype(jnp.float32), rtol=0.02, atol=0.05)
+    assert jnp.allclose(dispatched_out.astype(jnp.float32), unified_out.astype(jnp.float32), rtol=0.02, atol=0.05)
+    assert jnp.allclose(unified_conv.astype(jnp.float32), ref_conv.astype(jnp.float32), rtol=0.03, atol=0.06)
+    assert jnp.allclose(unified_rec.astype(jnp.float32), ref_rec.astype(jnp.float32), rtol=0.03, atol=0.06)
+    assert jnp.allclose(
+        dispatched_out[454:].astype(jnp.float32),
+        jnp.zeros_like(dispatched_out[454:], dtype=jnp.float32),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_packed_updates_keep_ragged_for_partial_decode_bucket(monkeypatch):
+    packed_inputs = _make_large_bucket_decode_inputs(bucket=512)
+
+    monkeypatch.setenv("EASYDEL_RAGGED_GDR", "1")
+
+    unified_marker = (
+        jnp.array([1], dtype=jnp.int32),
+        jnp.array([1], dtype=jnp.int32),
+        jnp.array([1], dtype=jnp.int32),
+    )
+    ragged_marker = (
+        jnp.array([2], dtype=jnp.int32),
+        jnp.array([2], dtype=jnp.int32),
+        jnp.array([2], dtype=jnp.int32),
+    )
+
+    monkeypatch.setattr(
+        qwen3_next_modeling,
+        "_apply_qwen3_next_packed_updates_unified",
+        lambda **_: unified_marker,
+    )
+    monkeypatch.setattr(
+        qwen3_next_modeling,
+        "_apply_qwen3_next_packed_updates_ragged",
+        lambda **_: ragged_marker,
+    )
+
+    with set_inference_mode(True):
+        dispatched = qwen3_next_modeling._apply_qwen3_next_packed_updates(
+            **packed_inputs,
+            gdr_op=object(),
+        )
+
+    assert int(dispatched[0][0]) == 2
 
 
 def test_preserve_array_sharding_matches_reference_array():
