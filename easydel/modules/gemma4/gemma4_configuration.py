@@ -165,6 +165,13 @@ class Gemma4TextConfig(EasyDeLBaseConfig):
             when ``enable_moe_block=True``.
         moe_intermediate_size: Inner dimension of each expert's feed-forward
             network.  Only used when ``enable_moe_block=True``.
+        activations_in_float32: Whether to upcast dense and expert MLP
+            pre-activation tensors to ``float32`` before applying the
+            nonlinearity, for optional stability path.
+            Defaults to ``True``.
+        float32_gate_logits: Whether to run the MoE router pre-projection
+            normalization/scaling path and gate projection in ``float32``.
+            Only used when ``enable_moe_block=True``. Defaults to ``False``.
         rope_parameters: Per-layer-type RoPE configuration dictionary mapping
             ``"sliding_attention"`` and ``"full_attention"`` to their
             respective ``rope_type``, ``rope_theta``, and optional
@@ -215,6 +222,8 @@ class Gemma4TextConfig(EasyDeLBaseConfig):
         num_experts: int | None = None,
         top_k_experts: int | None = None,
         moe_intermediate_size: int | None = None,
+        activations_in_float32: bool = True,
+        float32_gate_logits: bool = False,
         rope_parameters: dict | None = None,
         gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
         bits: int | None = None,
@@ -262,6 +271,8 @@ class Gemma4TextConfig(EasyDeLBaseConfig):
         self.num_experts = num_experts
         self.top_k_experts = top_k_experts
         self.moe_intermediate_size = moe_intermediate_size
+        self.activations_in_float32 = activations_in_float32
+        self.float32_gate_logits = float32_gate_logits
 
         if use_bidirectional_attention == "all":
             self.sliding_window = (self.sliding_window // 2) + 1

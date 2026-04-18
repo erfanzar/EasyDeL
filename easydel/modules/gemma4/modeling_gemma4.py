@@ -1637,9 +1637,13 @@ class Gemma4MLP(nn.Module):
             dynamic_axes=common_types.HiddenStateSharding,
             partition_manager=self.config.partition_manager,
         )
-        gate = checkpoint_name(self.act(self.gate_proj(hidden_states)), "mlp_gate")
+        gate = self.gate_proj(hidden_states)
         up = checkpoint_name(self.up_proj(hidden_states), "mlp_up")
-        hidden_states = checkpoint_name(self.down_proj(gate * up), "mlp_down")
+        if self.config.activations_in_float32:
+            gate = gate.astype(jnp.float32)
+            up = up.astype(jnp.float32)
+        gate = checkpoint_name(self.act(gate), "mlp_gate")
+        hidden_states = checkpoint_name(self.down_proj((gate * up).astype(self.dtype)), "mlp_down")
         hidden_states = apply_logical_sharding(
             hidden_states,
             dynamic_axes=common_types.HiddenStateSharding,
@@ -1760,9 +1764,13 @@ class Gemma4TextMLPStack(nn.Module):
         Returns:
             Expert-processed hidden states ``(total_tokens, hidden_size)``.
         """
+        gate = self.gate_proj(hidden_states, group_sizes, sorted_experts)
+        up = self.up_proj(hidden_states, group_sizes, sorted_experts)
+        if self.config.activations_in_float32:
+            gate = gate.astype(jnp.float32)
+            up = up.astype(jnp.float32)
         return self.down_proj(
-            self.act_fn(self.gate_proj(hidden_states, group_sizes, sorted_experts))
-            * self.up_proj(hidden_states, group_sizes, sorted_experts),
+            (self.act_fn(gate) * up).astype(self.dtype),
             group_sizes,
             sorted_experts,
         )
@@ -1856,7 +1864,7 @@ class Gemma4TextRouter(BaseMoeModule):
             config.hidden_size,
             config.num_experts,
             use_bias=False,
-            dtype=dtype,
+            dtype=jnp.float32 if config.float32_gate_logits else dtype,
             param_dtype=param_dtype,
             precision=precision,
             rngs=rngs,
@@ -1883,7 +1891,14 @@ class Gemma4TextRouter(BaseMoeModule):
             Transformed hidden states ready for the gate projection.
         """
         hidden_states = self.norm(hidden_states)
-        return hidden_states * self.scale.value * self.router_scalar_root_size
+        if self.config.float32_gate_logits:
+            hidden_states = hidden_states.astype(jnp.float32)
+        router_dtype = hidden_states.dtype
+        return (
+            hidden_states
+            * self.scale.value.astype(router_dtype)
+            * jnp.asarray(self.router_scalar_root_size, dtype=router_dtype)
+        )
 
     def select_experts_with_scale(
         self,
