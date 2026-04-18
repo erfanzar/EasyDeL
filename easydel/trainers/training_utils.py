@@ -884,6 +884,7 @@ def minibatch_call(
             f"({minibatch_size}) for gradient accumulation."
         )
     if num_accum_steps > 1:
+
         def slice_minibatch(tree, start_index):
             """Extract one minibatch while leaving shared/global leaves untouched."""
 

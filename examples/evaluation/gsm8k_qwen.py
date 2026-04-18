@@ -16,7 +16,7 @@ import easydel as ed
 
 
 def main():
-    tokenizer_id = model_id = "Qwen/Qwen3-8B" # idk chose anymodel that u like ;/
+    tokenizer_id = model_id = "Qwen/Qwen3-8B"  # idk chose anymodel that u like ;/
     max_concurrent_decodes = 256
     max_length = 2**16
 

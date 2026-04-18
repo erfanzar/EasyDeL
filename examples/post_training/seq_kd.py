@@ -108,9 +108,7 @@ def format_prompts(example):
 
 
 def main():
-    parser = DataClassArgumentParser(
-        SeqKDArgs, description="Sequence-level Knowledge Distillation with EasyDeL"
-    )
+    parser = DataClassArgumentParser(SeqKDArgs, description="Sequence-level Knowledge Distillation with EasyDeL")
     (args,) = parser.parse_args_into_dataclasses()
 
     max_completion_length = args.max_length - args.max_prompt_length

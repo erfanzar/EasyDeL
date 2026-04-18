@@ -102,9 +102,7 @@ def format_chat(example):
 
 
 def main():
-    parser = DataClassArgumentParser(
-        DistillationArgs, description="Knowledge Distillation with EasyDeL"
-    )
+    parser = DataClassArgumentParser(DistillationArgs, description="Knowledge Distillation with EasyDeL")
     (args,) = parser.parse_args_into_dataclasses()
 
     elm = eLargeModel(

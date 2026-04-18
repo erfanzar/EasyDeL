@@ -39,7 +39,9 @@ class _TeacherModule:
         x = input_ids.astype(jnp.float32)
         logits = jnp.stack((x * 0.5 + 0.1, x * -0.25 - 0.2), axis=-1)
         hidden = jnp.stack((x, x + 1.0), axis=-1)
-        attention = attention_mask.astype(jnp.float32)[:, None, :, None] * attention_mask.astype(jnp.float32)[:, None, None, :]
+        attention = (
+            attention_mask.astype(jnp.float32)[:, None, :, None] * attention_mask.astype(jnp.float32)[:, None, None, :]
+        )
         return SimpleNamespace(
             logits=logits,
             last_hidden_state=hidden,
@@ -80,7 +82,9 @@ class _StudentModule:
         x = input_ids.astype(jnp.float32)
         logits = jnp.stack((x * self._scale + 0.3, x * self._scale - 0.4), axis=-1)
         hidden = jnp.stack((x * self._scale, x * self._scale + 0.5), axis=-1)
-        attention = attention_mask.astype(jnp.float32)[:, None, :, None] * attention_mask.astype(jnp.float32)[:, None, None, :]
+        attention = (
+            attention_mask.astype(jnp.float32)[:, None, :, None] * attention_mask.astype(jnp.float32)[:, None, None, :]
+        )
         return SimpleNamespace(
             logits=logits,
             last_hidden_state=hidden,

@@ -153,9 +153,7 @@ class GSM8KCodingEnv(AgenticEnvironment):
         example = self._dataset[idx]
         self._question = example["question"]
         answer_text = example["answer"]
-        self._gold = _normalize_number(
-            answer_text.split("####")[-1].strip() if "####" in answer_text else answer_text
-        )
+        self._gold = _normalize_number(answer_text.split("####")[-1].strip() if "####" in answer_text else answer_text)
         return ResetResult(observation=self._question)
 
     def step(self, action: str) -> StepResult:

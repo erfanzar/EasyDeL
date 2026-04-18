@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 from collections import namedtuple
 from pathlib import Path
 from types import SimpleNamespace
@@ -490,11 +492,11 @@ def test_save_checkpoint_for_step_updates_checkpointer_bookkeeping_for_callback_
     trainer.arguments = SimpleNamespace(_get_save_directory=lambda: Path("/tmp/easydel-checkpoints"))
     trainer.checkpointer = _CheckpointerStub()
 
-    saved_paths: list[str] = []
+    saved_paths: list[tuple[str, bool]] = []
     cleanup_calls: list[str] = []
 
-    def _save_state(*, state, save_directory):
-        saved_paths.append(save_directory)
+    def _save_state(*, state, save_directory, merge_lora_before_save=False):
+        saved_paths.append((save_directory, merge_lora_before_save))
         return save_directory
 
     trainer._save_state = _save_state
@@ -503,7 +505,7 @@ def test_save_checkpoint_for_step_updates_checkpointer_bookkeeping_for_callback_
     saved = BaseTrainer._save_checkpoint_for_step(trainer, state="state", step=7)
 
     assert saved == "/tmp/easydel-checkpoints/run-7"
-    assert saved_paths == ["/tmp/easydel-checkpoints/run-7"]
+    assert saved_paths == [("/tmp/easydel-checkpoints/run-7", False)]
     assert cleanup_calls == ["called"]
     assert trainer.checkpointer._last_save_step == 7
     assert trainer.checkpointer._last_save_time == "synced-now"
@@ -515,6 +517,187 @@ def test_save_checkpoint_for_step_updates_checkpointer_bookkeeping_for_callback_
             "force": False,
         }
     ]
+
+
+def test_save_checkpoint_for_step_restores_metadata_after_checkpointer_callback(tmp_path):
+    trainer = object.__new__(_PreviewTrainer)
+    trainer._model = SimpleNamespace(mesh="mesh")
+    trainer.arguments = SimpleNamespace(
+        _get_save_directory=lambda: tmp_path,
+        save_total_limit=None,
+    )
+
+    class _MetadataRewritingCheckpointer(_CheckpointerStub):
+        def on_step(self, *, mesh, pytree, step, force=False, true_callbacks):
+            self.calls.append(
+                {
+                    "mesh": mesh,
+                    "pytree": pytree,
+                    "step": step,
+                    "force": force,
+                }
+            )
+            dest = f"run-{step}"
+            for callback in true_callbacks:
+                callback(dest, mesh, {"step": step, "is_temporary": False})
+            (tmp_path / dest / "metadata.json").write_text(
+                json.dumps({"step": step, "timestamp": "checkpointer", "is_temporary": False})
+            )
+
+        def _queue_checkpoint_removal(self, path):
+            raise AssertionError(f"unexpected checkpoint removal queue for {path}")
+
+    trainer.checkpointer = _MetadataRewritingCheckpointer()
+
+    def _save_state(*, state, save_directory, merge_lora_before_save=False):
+        del state, merge_lora_before_save
+        path = Path(save_directory)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "step": 7,
+                    "timestamp": "state-save",
+                    "is_temporary": False,
+                    "has_optimizer_state": False,
+                    "has_resume_model": True,
+                }
+            )
+        )
+        return save_directory
+
+    trainer._save_state = _save_state
+
+    saved = BaseTrainer._save_checkpoint_for_step(trainer, state="state", step=7)
+
+    assert saved == str(tmp_path / "run-7")
+    metadata = json.loads((tmp_path / "run-7" / "metadata.json").read_text())
+    assert metadata["step"] == 7
+    assert metadata["is_temporary"] is False
+    assert metadata["has_optimizer_state"] is False
+    assert metadata["has_resume_model"] is True
+
+
+def test_save_checkpoint_for_step_runs_cleanup_after_temporary_metadata_is_restored(tmp_path):
+    trainer = object.__new__(_PreviewTrainer)
+    trainer._model = SimpleNamespace(mesh="mesh")
+    trainer.arguments = SimpleNamespace(
+        _get_save_directory=lambda: tmp_path,
+        save_total_limit=1,
+    )
+
+    old_checkpoint = tmp_path / "run-1"
+    old_checkpoint.mkdir(parents=True)
+    (old_checkpoint / "metadata.json").write_text(
+        json.dumps({"step": 1, "timestamp": "old", "is_temporary": False})
+    )
+    os.utime(old_checkpoint, (1, 1))
+
+    class _TemporaryMetadataCheckpointer(_CheckpointerStub):
+        def __init__(self):
+            super().__init__()
+            self.queued_removals: list[str] = []
+
+        def on_step(self, *, mesh, pytree, step, force=False, true_callbacks):
+            self.calls.append(
+                {
+                    "mesh": mesh,
+                    "pytree": pytree,
+                    "step": step,
+                    "force": force,
+                }
+            )
+            dest = f"run-{step}"
+            for callback in true_callbacks:
+                callback(dest, mesh, {"step": step, "is_temporary": True})
+            (tmp_path / dest / "metadata.json").write_text(
+                json.dumps({"step": step, "timestamp": "checkpointer", "is_temporary": True})
+            )
+
+        def _queue_checkpoint_removal(self, path):
+            self.queued_removals.append(path)
+
+    trainer.checkpointer = _TemporaryMetadataCheckpointer()
+
+    def _save_state(*, state, save_directory, merge_lora_before_save=False):
+        del state, merge_lora_before_save
+        path = Path(save_directory)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "step": 2,
+                    "timestamp": "state-save",
+                    "is_temporary": False,
+                    "has_optimizer_state": False,
+                    "has_resume_model": True,
+                }
+            )
+        )
+        return save_directory
+
+    trainer._save_state = _save_state
+
+    BaseTrainer._save_checkpoint_for_step(trainer, state="state", step=2)
+
+    metadata = json.loads((tmp_path / "run-2" / "metadata.json").read_text())
+    assert metadata["is_temporary"] is True
+    assert metadata["has_resume_model"] is True
+    assert trainer.checkpointer.queued_removals == []
+
+
+def test_save_checkpoint_for_step_uses_callback_metadata_when_final_metadata_write_is_missing(tmp_path):
+    trainer = object.__new__(_PreviewTrainer)
+    trainer._model = SimpleNamespace(mesh="mesh")
+    trainer.arguments = SimpleNamespace(
+        _get_save_directory=lambda: tmp_path,
+        save_total_limit=None,
+    )
+
+    class _CallbackOnlyCheckpointer(_CheckpointerStub):
+        def on_step(self, *, mesh, pytree, step, force=False, true_callbacks):
+            self.calls.append(
+                {
+                    "mesh": mesh,
+                    "pytree": pytree,
+                    "step": step,
+                    "force": force,
+                }
+            )
+            dest = f"run-{step}"
+            for callback in true_callbacks:
+                callback(dest, mesh, {"step": step, "is_temporary": True})
+
+        def _queue_checkpoint_removal(self, path):
+            raise AssertionError(f"unexpected checkpoint removal queue for {path}")
+
+    trainer.checkpointer = _CallbackOnlyCheckpointer()
+
+    def _save_state(*, state, save_directory, merge_lora_before_save=False):
+        del state, merge_lora_before_save
+        path = Path(save_directory)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "step": 3,
+                    "timestamp": "state-save",
+                    "is_temporary": False,
+                    "has_optimizer_state": False,
+                    "has_resume_model": True,
+                }
+            )
+        )
+        return save_directory
+
+    trainer._save_state = _save_state
+
+    BaseTrainer._save_checkpoint_for_step(trainer, state="state", step=3)
+
+    metadata = json.loads((tmp_path / "run-3" / "metadata.json").read_text())
+    assert metadata["step"] == 3
+    assert metadata["is_temporary"] is True
+    assert metadata["has_resume_model"] is True
 
 
 def test_fast_forward_batches_replays_iterator_with_wraparound_semantics():
@@ -567,10 +750,11 @@ def test_trainer_save_state_forwards_standard_save_kwargs(tmp_path):
 
     assert saved == str(tmp_path / "explicit")
     assert len(save_calls) == 1
-    assert set(save_calls[0]) == {"save_directory", "float_dtype", "save_optimizer"}
+    assert set(save_calls[0]) == {"save_directory", "float_dtype", "merge_lora_before_save", "save_optimizer"}
     assert str(save_calls[0]["save_directory"]) == str(tmp_path / "explicit")
     assert save_calls[0]["float_dtype"] is jnp.bfloat16
     assert save_calls[0]["save_optimizer"] is False
+    assert save_calls[0]["merge_lora_before_save"] is False
 
 
 def test_trainer_save_state_skips_rank_zero_only_artifacts_on_nonzero_process_for_remote_paths(monkeypatch):
@@ -603,6 +787,7 @@ def test_trainer_save_state_skips_rank_zero_only_artifacts_on_nonzero_process_fo
     assert saved_readmes == []
     assert len(save_calls) == 1
     assert str(save_calls[0]["save_directory"]) == "gs://bucket/explicit"
+    assert save_calls[0]["merge_lora_before_save"] is False
 
 
 def test_get_current_step_uses_state_step_without_step_start_point_offset():
@@ -614,11 +799,17 @@ def test_get_current_step_uses_state_step_without_step_start_point_offset():
 
 def test_save_tpu_preemption_checkpoint_uses_standard_checkpoint_naming():
     trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        merge_lora_before_save=True,
+        merge_lora_before_tpu_preemption_save=True,
+    )
     trainer._preemption_checkpoint_path = None
     save_calls: list[dict[str, object]] = []
 
-    def _save_checkpoint_for_step(*, state, step, force=False):
-        save_calls.append({"state": state, "step": step, "force": force})
+    def _save_checkpoint_for_step(*, state, step, force=False, merge_lora_before_save=False):
+        save_calls.append(
+            {"state": state, "step": step, "force": force, "merge_lora_before_save": merge_lora_before_save}
+        )
         return f"/tmp/easydel-checkpoints/run-{step}"
 
     trainer._save_checkpoint_for_step = _save_checkpoint_for_step
@@ -628,11 +819,34 @@ def test_save_tpu_preemption_checkpoint_uses_standard_checkpoint_naming():
 
     assert saved == "/tmp/easydel-checkpoints/run-9"
     assert trainer._preemption_checkpoint_path == "/tmp/easydel-checkpoints/run-9"
-    assert save_calls == [{"state": "state", "step": 9, "force": True}]
+    assert save_calls == [{"state": "state", "step": 9, "force": True, "merge_lora_before_save": True}]
     assert [call.args[0] for call in sync_global_devices.call_args_list] == [
         "tpu-preemption-save-9-start",
         "tpu-preemption-save-9-done",
     ]
+
+
+def test_save_tpu_preemption_checkpoint_uses_dedicated_merge_flag():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        merge_lora_before_save=True,
+        merge_lora_before_tpu_preemption_save=False,
+    )
+    trainer._preemption_checkpoint_path = None
+    save_calls: list[dict[str, object]] = []
+
+    def _save_checkpoint_for_step(*, state, step, force=False, merge_lora_before_save=False):
+        save_calls.append(
+            {"state": state, "step": step, "force": force, "merge_lora_before_save": merge_lora_before_save}
+        )
+        return f"/tmp/easydel-checkpoints/run-{step}"
+
+    trainer._save_checkpoint_for_step = _save_checkpoint_for_step
+
+    with patch("jax.experimental.multihost_utils.sync_global_devices"):
+        BaseTrainer._save_tpu_preemption_checkpoint(trainer, state="state", step=9)
+
+    assert save_calls == [{"state": "state", "step": 9, "force": True, "merge_lora_before_save": False}]
 
 
 def test_should_save_tpu_preemption_checkpoint_uses_jax_sync_point():
@@ -671,7 +885,11 @@ def test_should_save_tpu_preemption_checkpoint_disables_on_missing_jax_service()
 
 def test_prepare_training_output_prefers_preemption_checkpoint_without_extra_last_save():
     trainer = object.__new__(_PreviewTrainer)
-    trainer.arguments = SimpleNamespace(do_last_save=True, save_directory="/tmp/easydel-checkpoints")
+    trainer.arguments = SimpleNamespace(
+        do_last_save=True,
+        save_directory="/tmp/easydel-checkpoints",
+        merge_lora_before_save=True,
+    )
     trainer._model = SimpleNamespace(mesh="mesh")
     trainer._preemption_checkpoint_path = "/tmp/easydel-checkpoints/run-9"
 
@@ -690,9 +908,68 @@ def test_prepare_training_output_prefers_preemption_checkpoint_without_extra_las
     assert output.last_save_file_name == "/tmp/easydel-checkpoints/run-9"
 
 
+def test_prepare_training_output_final_save_forwards_merge_lora_before_save():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        do_last_save=True,
+        save_directory="/tmp/easydel-checkpoints",
+        merge_lora_before_save=True,
+    )
+    trainer._model = SimpleNamespace(mesh="mesh")
+    trainer._preemption_checkpoint_path = None
+
+    save_calls: list[tuple[object, int, bool, bool]] = []
+
+    def _save_checkpoint_for_step(*, state, step, force=False, merge_lora_before_save=False):
+        save_calls.append((state, step, force, merge_lora_before_save))
+        return "run-12"
+
+    trainer._save_checkpoint_for_step = _save_checkpoint_for_step
+
+    output = BaseTrainer._prepare_training_output(
+        trainer,
+        state=SimpleNamespace(step=12),
+        run_exception=None,
+    )
+
+    assert save_calls == [(SimpleNamespace(step=12), 12, True, True)]
+    assert output.last_save_file_name == "run-12"
+    assert output.checkpoint_path == "/tmp/easydel-checkpoints/run-12"
+
+
+def test_prepare_training_output_uses_existing_relative_checkpoint_path_without_duplication():
+    trainer = object.__new__(_PreviewTrainer)
+    trainer.arguments = SimpleNamespace(
+        do_last_save=True,
+        save_directory="EasyDeL-Checkpoints",
+        merge_lora_before_save=True,
+    )
+    trainer._model = SimpleNamespace(mesh="mesh")
+    trainer._preemption_checkpoint_path = None
+
+    def _save_checkpoint_for_step(*, state, step, force=False, merge_lora_before_save=False):
+        del state, step, force, merge_lora_before_save
+        return "EasyDeL-Checkpoints/run-12"
+
+    trainer._save_checkpoint_for_step = _save_checkpoint_for_step
+
+    output = BaseTrainer._prepare_training_output(
+        trainer,
+        state=SimpleNamespace(step=12),
+        run_exception=None,
+    )
+
+    assert output.last_save_file_name == "EasyDeL-Checkpoints/run-12"
+    assert output.checkpoint_path == "EasyDeL-Checkpoints/run-12"
+
+
 def test_prepare_training_output_treats_plain_stop_iteration_as_runtime_error():
     trainer = object.__new__(_PreviewTrainer)
-    trainer.arguments = SimpleNamespace(do_last_save=False, save_directory="/tmp/easydel-checkpoints")
+    trainer.arguments = SimpleNamespace(
+        do_last_save=False,
+        save_directory="/tmp/easydel-checkpoints",
+        merge_lora_before_save=True,
+    )
     trainer._model = SimpleNamespace(mesh="mesh")
     trainer._preemption_checkpoint_path = None
 

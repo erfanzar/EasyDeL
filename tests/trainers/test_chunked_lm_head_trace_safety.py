@@ -25,16 +25,16 @@ class with ``auto_remat``.  NNX's ``nn.remat`` performs variable mutation
 called from a different JAX trace level (e.g., inside a ``lax.scan`` body
 that runs under ``jax.grad``).
 """
+
 from __future__ import annotations
-
-import pytest
-
-# Import easydel first so jax.distributed.initialize() runs before jax.devices()
-import easydel  # noqa: F401
 
 import jax
 import jax.numpy as jnp
+import pytest
 from flax import nnx
+
+# Import easydel first so jax.distributed.initialize() runs before jax.devices()
+import easydel  # noqa: F401
 
 _MESH = jax.sharding.Mesh(jax.devices(), ("dp",))
 
@@ -220,7 +220,7 @@ def test_lm_head_is_wrapped_with_remat():
 def test_make_lm_head_fn_bypasses_remat():
     """make_lm_head_fn must use native_forward, not __call__."""
     model = _make_model(tie=False, gradient_checkpointing="mlp_notsaveable")
-    fn = model.make_lm_head_fn()
+    model.make_lm_head_fn()
     # The closure should reference native_forward, not the wrapped __call__
     hidden = jnp.ones((B, L, model.config.hidden_size), dtype=jnp.float32)
     with _MESH:
