@@ -17,21 +17,28 @@ import json
 import jax
 import jax.numpy as jnp
 
-from easydel.infra.base_state import EasyDeLState
+from easydel.infra.base_state import RESUME_MODEL_SUBDIR, EasyDeLState
 
 
 class _ModelStub:
     def __init__(self):
         self.calls: list[dict[str, object]] = []
+        self.unwrap_calls: list[bool] = []
+        self.lora_is_enabled = False
 
     def save_pretrained(self, **kwargs):
         self.calls.append(dict(kwargs))
 
+    def unwrap_lora_to_layers(self, verbose: bool = False):
+        self.unwrap_calls.append(bool(verbose))
+        return self
+
 
 class _StateStub:
-    def __init__(self, model):
+    def __init__(self, model, *, opt_state: object | None = None):
         self.model = model
         self.step = jnp.array(7, dtype=jnp.int32)
+        self.opt_state = opt_state
 
     def save_optimizer(self, **kwargs):
         raise AssertionError("save_optimizer should not be called in this test")
@@ -55,6 +62,105 @@ def test_save_state_forwards_standard_save_kwargs_and_writes_metadata(tmp_path):
     metadata = json.loads((tmp_path / "metadata.json").read_text())
     assert metadata["step"] == 7
     assert metadata["is_temporary"] is False
+    assert metadata["has_optimizer_state"] is False
+    assert metadata["has_resume_model"] is False
+
+
+def test_save_state_merge_lora_before_save_writes_resume_copy_and_keeps_optimizer(tmp_path, monkeypatch):
+    original_model = _ModelStub()
+    original_model.lora_is_enabled = True
+    merged_copy = _ModelStub()
+    merged_copy.lora_is_enabled = True
+
+    optimizer_calls: list[dict[str, object]] = []
+    state = _StateStub(original_model, opt_state={"momentum": jnp.ones((1,), dtype=jnp.float32)})
+    state.save_optimizer = lambda **kwargs: optimizer_calls.append(dict(kwargs))
+
+    monkeypatch.setattr("easydel.infra.base_state.deepcopy_model", lambda model: merged_copy)
+
+    EasyDeLState.save_state(
+        state,
+        save_directory=tmp_path,
+        save_optimizer=True,
+        merge_lora_before_save=True,
+    )
+
+    assert len(optimizer_calls) == 1
+    assert str(optimizer_calls[0]["save_directory"]) == str(tmp_path)
+    assert optimizer_calls[0]["float_dtype"] is None
+    assert optimizer_calls[0]["step"] == 7
+    assert len(original_model.calls) == 1
+    assert str(original_model.calls[0]["save_directory"]) == str(tmp_path / RESUME_MODEL_SUBDIR)
+    assert original_model.unwrap_calls == []
+    assert merged_copy.unwrap_calls == [False]
+    assert len(merged_copy.calls) == 1
+    assert str(merged_copy.calls[0]["save_directory"]) == str(tmp_path)
+    metadata = json.loads((tmp_path / "metadata.json").read_text())
+    assert metadata["has_optimizer_state"] is True
+    assert metadata["has_resume_model"] is True
+
+
+def test_save_state_merge_lora_before_save_keeps_resume_copy_without_optimizer_state(tmp_path, monkeypatch):
+    original_model = _ModelStub()
+    original_model.lora_is_enabled = True
+    merged_copy = _ModelStub()
+    merged_copy.lora_is_enabled = True
+
+    optimizer_calls: list[dict[str, object]] = []
+    state = _StateStub(original_model, opt_state=None)
+    state.save_optimizer = lambda **kwargs: optimizer_calls.append(dict(kwargs))
+
+    monkeypatch.setattr("easydel.infra.base_state.deepcopy_model", lambda model: merged_copy)
+
+    EasyDeLState.save_state(
+        state,
+        save_directory=tmp_path,
+        save_optimizer=True,
+        merge_lora_before_save=True,
+    )
+
+    assert len(optimizer_calls) == 1
+    assert len(original_model.calls) == 1
+    assert str(original_model.calls[0]["save_directory"]) == str(tmp_path / RESUME_MODEL_SUBDIR)
+    assert original_model.unwrap_calls == []
+    assert merged_copy.unwrap_calls == [False]
+    assert len(merged_copy.calls) == 1
+    assert str(merged_copy.calls[0]["save_directory"]) == str(tmp_path)
+    metadata = json.loads((tmp_path / "metadata.json").read_text())
+    assert metadata["has_optimizer_state"] is False
+    assert metadata["has_resume_model"] is True
+
+
+def test_save_state_merge_lora_before_save_without_optimizer_writes_resume_copy_for_model_only_resume(
+    tmp_path,
+    monkeypatch,
+):
+    original_model = _ModelStub()
+    original_model.lora_is_enabled = True
+    merged_copy = _ModelStub()
+    merged_copy.lora_is_enabled = True
+
+    state = _StateStub(original_model)
+    state.save_optimizer = lambda **kwargs: (_ for _ in ()).throw(AssertionError("optimizer save should be skipped"))
+
+    monkeypatch.setattr("easydel.infra.base_state.deepcopy_model", lambda model: merged_copy)
+
+    EasyDeLState.save_state(
+        state,
+        save_directory=tmp_path,
+        save_optimizer=False,
+        merge_lora_before_save=True,
+    )
+
+    assert len(original_model.calls) == 1
+    assert str(original_model.calls[0]["save_directory"]) == str(tmp_path / RESUME_MODEL_SUBDIR)
+    assert original_model.unwrap_calls == []
+    assert merged_copy.unwrap_calls == [False]
+    assert len(merged_copy.calls) == 1
+    assert str(merged_copy.calls[0]["save_directory"]) == str(tmp_path)
+    metadata = json.loads((tmp_path / "metadata.json").read_text())
+    assert metadata["has_optimizer_state"] is False
+    assert metadata["has_resume_model"] is True
 
 
 def test_save_optimizer_preserves_tree_in_multiprocess_mode(tmp_path, monkeypatch):

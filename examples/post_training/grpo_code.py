@@ -131,10 +131,7 @@ def _run_code_against_tests(code: str, test_cases: list[dict]) -> float:
                 continue
             expected = case.get("output", "").strip()
             actual = result.stdout.strip()
-            if all(
-                a.strip() == e.strip()
-                for a, e in zip(actual.splitlines(), expected.splitlines(), strict=False)
-            ):
+            if all(a.strip() == e.strip() for a, e in zip(actual.splitlines(), expected.splitlines(), strict=False)):
                 passed += 1
         except (subprocess.TimeoutExpired, OSError):
             continue

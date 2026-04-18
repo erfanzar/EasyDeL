@@ -38,6 +38,7 @@ from .linears import (
     RowParallelLinear,
     RowParallelLinearQuantized,
     RowParallelMoELinear,
+    eLoRA,
 )
 from .moe import (
     BaseMoeModule,
@@ -130,6 +131,7 @@ __all__ = [
     "compute_phi3_frequencies",
     "compute_yarn_frequencies",
     "compute_yarn_inv_frequencies",
+    "eLoRA",
     "get_frequencies",
     "get_inv_frequencies",
     "get_moe_partition_spec",

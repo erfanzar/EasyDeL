@@ -120,9 +120,9 @@ def main():
     #   3. Provisions Grafana datasource+dashboard (port 3000)
     #   4. Optionally starts a Rich console monitor
     esurge.start_monitoring(
-        enable_prometheus=True,   # expose metrics for scraping
-        enable_console=False,      # rich terminal dashboard (non-blocking)
-        start_grafana=True,       # auto-provision Grafana
+        enable_prometheus=True,  # expose metrics for scraping
+        enable_console=False,  # rich terminal dashboard (non-blocking)
+        start_grafana=True,  # auto-provision Grafana
     )
 
     prompts = [

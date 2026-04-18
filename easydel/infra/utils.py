@@ -71,7 +71,7 @@ from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, DTypeLike, PRNGKeyArray
 from tqdm.auto import tqdm
 
-from easydel.layers import EasyQuantizer, ParallelLinear, QuantizationConfig
+from easydel.layers import EasyQuantizer, ParallelLinear, QuantizationConfig, eLoRA
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
@@ -449,19 +449,26 @@ def apply_lora_to_layers(
     verbose: bool = True,
     rngs: nn.Rngs | None = None,
 ) -> nn.Module:
-    """
-    Applies LoRA (Low-Rank Adaptation) to specified linear layers within a model.
+    """Wrap matching ``ParallelLinear`` modules with EasyDeL's LoRA adapter.
 
     Args:
         model: The EasyDeL model to modify.
-        lora_rank: The rank of the LoRA adapters.
+        lora_rank: Rank of the low-rank adapter matrices. Must be positive.
         lora_pattern: A regular expression pattern to match the names of
-                      modules to which LoRA should be applied. Defaults to ".*" (all linear layers).
-        verbose: Whether to display a progress bar.
-        rngs:  A `flax.nnx.Rngs` instance for random number generation. If None, initializes with a seed of 0.
+            modules to which LoRA should be applied. Defaults to ``".*"`` so
+            every ``ParallelLinear`` encountered is wrapped.
+        verbose: Whether to display a progress bar while traversing modules.
+        rngs: Random source used to initialize the LoRA adapter weights. When
+            omitted, ``nn.Rngs(0)`` is used.
 
     Returns:
-        The modified model with LoRA applied to the specified layers.
+        The input model after matching layers have been replaced in-place by
+        :class:`eLoRA` wrappers.
+
+    Notes:
+        The wrapper used here is EasyDeL's ``eLoRA`` instead of Flax's raw
+        ``nn.LoRA`` so the adapted layers continue to support EasyDeL-specific
+        call conventions such as keyword forwarding and ``native_forward``.
     """
     from easydel.utils.traversals import get_module_from_path, iter_module_search, set_module_from_path
 
@@ -484,7 +491,7 @@ def apply_lora_to_layers(
                 set_module_from_path(
                     model=model,
                     path=path,
-                    new_value=nn.LoRA(
+                    new_value=eLoRA(
                         base_module=base_module,
                         rngs=rngs,
                         dtype=base_module.dtype,

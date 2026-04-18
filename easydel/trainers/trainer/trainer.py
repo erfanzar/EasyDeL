@@ -593,7 +593,11 @@ class Trainer(BaseTrainer):
                 except Exception as exc:  # pragma: no cover - benchmarks must not interrupt training
                     logger.warning(f"Benchmark hook failed: {exc}")
 
-                self._save_checkpoint_for_step(state=state, step=current_step)
+                self._save_checkpoint_for_step(
+                    state=state,
+                    step=current_step,
+                    merge_lora_before_save=self.arguments.merge_lora_before_save,
+                )
                 if self._should_run_evaluation(current_step):
                     for _ in self.eval(model_state=state):
                         ...

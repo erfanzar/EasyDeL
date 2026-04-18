@@ -269,6 +269,13 @@ class BaseTrainerCfg(TypedDict, total=False):
         save_total_limit: Maximum number of checkpoints to keep.
         save_directory: Directory path for saving checkpoints.
         save_optimizer_state: Whether to include optimizer state in checkpoints.
+        merge_lora_before_save: Whether regular and final trainer checkpoints
+            should save a merged LoRA export at the checkpoint root while
+            keeping an unmerged ``_resume_model`` copy so state-loading can
+            resume the original LoRA graph with or without optimizer state.
+        merge_lora_before_tpu_preemption_save: Whether TPU preemption
+            checkpoints should also export merged LoRA weights instead of using
+            the faster resume-focused path.
         save_tpu_preemption_checkpoints: Whether JAX TPU preemption sync should
             force-save a standard EasyDeL checkpoint for auto-resume.
         remove_ckpt_after_load: Whether to remove checkpoint after loading.
@@ -440,6 +447,8 @@ class BaseTrainerCfg(TypedDict, total=False):
     save_total_limit: NotRequired[int | None]
     save_directory: NotRequired[str]
     save_optimizer_state: NotRequired[bool]
+    merge_lora_before_save: NotRequired[bool]
+    merge_lora_before_tpu_preemption_save: NotRequired[bool]
     save_tpu_preemption_checkpoints: NotRequired[bool]
     remove_ckpt_after_load: NotRequired[bool]
 
@@ -1538,6 +1547,8 @@ BASE_TRAINER_DEFAULTS: BaseTrainerCfg = {
     "max_length": 4096,
     "save_directory": "EasyDeL-Checkpoints",
     "save_optimizer_state": True,
+    "merge_lora_before_save": True,
+    "merge_lora_before_tpu_preemption_save": False,
     "save_tpu_preemption_checkpoints": True,
     "remove_ckpt_after_load": False,
     "log_steps": 10,

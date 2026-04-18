@@ -98,6 +98,7 @@ Example:
 from ._linear import ColumnParallelLinear, ParallelLinear, RowParallelLinear
 from ._linear_moe import ColumnParallelMoELinear, ParallelMoELinear, RowParallelMoELinear
 from ._linear_quantized import ColumnParallelLinearQuantized, ParallelLinearQuantized, RowParallelLinearQuantized
+from ._lora import eLoRA
 
 __all__ = (
     "ColumnParallelLinear",
@@ -109,4 +110,5 @@ __all__ = (
     "RowParallelLinear",
     "RowParallelLinearQuantized",
     "RowParallelMoELinear",
+    "eLoRA",
 )

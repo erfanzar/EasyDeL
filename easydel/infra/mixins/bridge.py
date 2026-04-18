@@ -103,13 +103,15 @@ except ImportError:  # transformers>=5 removed helper
 
 from transformers.utils.hub import PushToHubMixin
 
-from easydel.layers import QuantizationConfig
+from easydel.layers import QuantizationConfig, eLoRA
 from easydel.utils.helpers import is_remote_path
 from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
 from easydel.utils.traversals import (
     flatten_dict,
+    get_module_from_path,
     is_flatten,
     merge_model_and_tree,
+    set_module_from_path,
     string_key_to_int,
     tree_path_to_string,
     unflatten_dict,
@@ -243,6 +245,108 @@ def _normalize_checkpoint_leaf_to_jax(
     if cpu_device is not None:
         return jax.device_put(value, cpu_device)
     return jnp.asarray(value)
+
+
+def _collect_lora_checkpoint_paths(
+    flat_state: dict[tuple[tp.Any, ...], tp.Any],
+) -> dict[tuple[tp.Any, ...], dict[str, tp.Any]]:
+    """Extract LoRA adapter locations from a flattened checkpoint state.
+
+    Checkpoints are loaded as a flat mapping from tree paths to leaves. LoRA
+    adapters appear as sibling leaves such as ``(..., "lora_a")`` and
+    ``(..., "lora_b")``. This helper groups those leaves by their parent module
+    path and only returns entries where both adapter matrices are present.
+
+    Args:
+        flat_state: Flattened checkpoint mapping produced during load.
+
+    Returns:
+        A mapping from module path to a small dictionary containing the matched
+        ``lora_a`` and ``lora_b`` leaves for that module.
+    """
+    lora_paths: dict[tuple[tp.Any, ...], dict[str, tp.Any]] = {}
+    for key, value in flat_state.items():
+        if not isinstance(key, tuple) or not key:
+            continue
+        leaf_name = str(key[-1])
+        if leaf_name not in {"lora_a", "lora_b"}:
+            continue
+        entry = lora_paths.setdefault(key[:-1], {})
+        entry[leaf_name] = value
+    return {path: values for path, values in lora_paths.items() if {"lora_a", "lora_b"} <= set(values)}
+
+
+def _rebuild_lora_modules_from_checkpoint(
+    model: "EasyDeLBaseModule",
+    flat_state: dict[tuple[tp.Any, ...], tp.Any],
+) -> "EasyDeLBaseModule":
+    """Recreate LoRA wrappers before merging a LoRA checkpoint into a model.
+
+    ``from_pretrained`` first instantiates the plain base model and only then
+    merges checkpoint leaves into it. That is fine for standard checkpoints, but
+    LoRA checkpoints contain parameter paths like ``lm_head.lora_a`` that do not
+    exist on the plain model yet. This helper scans the checkpoint, identifies
+    which modules were LoRA-wrapped at save time, and rebuilds matching
+    :class:`eLoRA` wrappers on the live model so the subsequent parameter merge
+    lands on the correct paths.
+
+    Args:
+        model: Freshly initialized model instance that will receive checkpoint
+            weights.
+        flat_state: Flattened checkpoint mapping. Only the structure is
+            inspected here; values are merged later by the normal loader path.
+
+    Returns:
+        The same model instance, potentially mutated in-place with rebuilt LoRA
+        wrappers.
+    """
+    lora_paths = _collect_lora_checkpoint_paths(flat_state)
+    if not lora_paths:
+        return model
+
+    rebuilt = 0
+    for path in sorted(lora_paths, key=len):
+        module = get_module_from_path(model=model, path=path)
+        if module is None or isinstance(module, nn.LoRA):
+            continue
+
+        lora_a = lora_paths[path]["lora_a"]
+        shape = getattr(lora_a, "shape", None)
+        if shape is None or len(shape) < 2:
+            logger.warning(
+                "Skipping LoRA checkpoint path %s because lora_a has an unexpected shape %s.",
+                ".".join(str(part) for part in path),
+                shape,
+            )
+            continue
+        rank = shape[-1]
+        in_features = getattr(module, "in_features", None)
+        out_features = getattr(module, "out_features", None)
+        if rank is None or in_features is None or out_features is None:
+            logger.warning(
+                "Skipping LoRA checkpoint path %s because the target module does not expose linear dimensions.",
+                ".".join(str(part) for part in path),
+            )
+            continue
+
+        set_module_from_path(
+            model=model,
+            path=path,
+            new_value=eLoRA(
+                base_module=module,
+                rngs=nn.Rngs(0),
+                dtype=getattr(module, "dtype", None),
+                param_dtype=getattr(module, "param_dtype", getattr(lora_a, "dtype", jnp.float32)),
+                in_features=int(in_features),
+                lora_rank=int(rank),
+                out_features=int(out_features),
+            ),
+        )
+        rebuilt += 1
+
+    if rebuilt:
+        logger.info("Detected LoRA checkpoint; rebuilt %d LoRA wrapper(s) before parameter merge.", rebuilt)
+    return model
 
 
 def _build_safe_checkpoint_partition_rules(
@@ -932,6 +1036,7 @@ class EasyBridgeMixin(PushToHubMixin):
 
             state = flatten_dict(state)
             state = string_key_to_int(state)
+            model = _rebuild_lora_modules_from_checkpoint(model=model, flat_state=state)
 
             has_quantized_keys = any(
                 isinstance(k, tuple) and k and str(k[-1]).startswith("quant_") for k in state.keys()
@@ -1019,7 +1124,10 @@ class EasyBridgeMixin(PushToHubMixin):
                             quant_kernel.block_until_ready()
                         del kernel_value
 
-            required_params = set(flatten_dict(model.graphtree_params_shape))
+            # Use the full nn.Param tree here instead of model.graphtree_params_shape:
+            # LoRA-enabled models expose only LoRAParam leaves via graphstate_type,
+            # but checkpoints still contain the untouched base weights.
+            required_params = set(flatten_dict(nn.split(model, nn.Param, ...)[1].to_pure_dict()))
             unexpected_keys = set(state.keys()) - required_params
             for unexpected_key in unexpected_keys:
                 del state[unexpected_key]

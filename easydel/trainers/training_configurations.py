@@ -626,6 +626,25 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Whether to save the optimizer state along with the model."},
     )
+    merge_lora_before_save: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "When True, regular and final trainer checkpoints save a merged LoRA export at the checkpoint root. "
+                "Merged LoRA checkpoints also keep an unmerged LoRA copy under `_resume_model` so "
+                "`EasyDeLState.load_state()` can resume the original training graph with or without optimizer state."
+            )
+        },
+    )
+    merge_lora_before_tpu_preemption_save: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether TPU preemption checkpoints should also export merged LoRA weights. Defaults to False so "
+                "emergency saves stay on the faster resume-focused path."
+            )
+        },
+    )
     save_steps: int | None = field(
         default=None,
         metadata={"help": "Save a checkpoint every X steps."},

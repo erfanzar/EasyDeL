@@ -305,6 +305,7 @@ def test_training_arguments_default_tpu_preemption_checkpoint_settings():
     )
 
     assert args.save_tpu_preemption_checkpoints is True
+    assert args.merge_lora_before_tpu_preemption_save is False
 
 
 def test_training_arguments_default_training_generation_wandb_logging_enabled():

@@ -4597,7 +4597,14 @@ class BaseTrainer(BaseTrainerProtocol):
             config=self.model.config,
         )
 
-    def _save_state(self, state: EasyDeLState, save_directory: str | None = None, *args, **kwargs) -> str:
+    def _save_state(
+        self,
+        state: EasyDeLState,
+        save_directory: str | None = None,
+        *args,
+        merge_lora_before_save: bool = False,
+        **kwargs,
+    ) -> str:
         """
         Save the current model state to a checkpoint.
 
@@ -4633,6 +4640,7 @@ class BaseTrainer(BaseTrainerProtocol):
             save_directory=directory_name,
             float_dtype=self.model.param_dtype,
             save_optimizer=self.arguments.save_optimizer_state,
+            merge_lora_before_save=merge_lora_before_save,
         )
 
         return str(directory_name)
@@ -4665,9 +4673,51 @@ class BaseTrainer(BaseTrainerProtocol):
         *,
         step: int,
         force: bool = False,
+        merge_lora_before_save: bool = False,
     ) -> str | None:
         """Run checkpointer policy evaluation and serialize the current trainer state."""
         saved_directory = [None]
+        saved_metadata = [None]
+        checkpointer_metadata = [None]
+
+        def _restore_checkpoint_metadata(checkpoint_dir: str | os.PathLike | ePathLike) -> None:
+            """Restore metadata fields that trainer-side state saves add on top of checkpointer metadata.
+
+            ``Checkpointer.on_step(..., true_callbacks=...)`` invokes the callback
+            first and then rewrites ``metadata.json`` with its own bookkeeping
+            fields. That second write currently only preserves ``step``,
+            ``timestamp``, and ``is_temporary``, which would otherwise discard
+            the richer LoRA/resume metadata written by ``EasyDeLState.save_state``.
+            """
+            if jax.process_index() != 0:
+                return
+            extra_metadata = saved_metadata[0]
+            if not isinstance(extra_metadata, dict) or not extra_metadata:
+                return
+
+            metadata_path = ePath(checkpoint_dir) / "metadata.json"
+            final_metadata: dict[str, tp.Any] = {}
+            if metadata_path.exists():
+                try:
+                    loaded = json.loads(metadata_path.read_text())
+                    if isinstance(loaded, dict):
+                        final_metadata = loaded
+                except Exception as exc:
+                    logger.warning(f"Failed to read final checkpoint metadata from {metadata_path}: {exc}")
+
+            merged_metadata = dict(final_metadata)
+            merged_metadata.update(extra_metadata)
+            for key in ("step", "timestamp", "is_temporary"):
+                if key in final_metadata:
+                    merged_metadata[key] = final_metadata[key]
+            if isinstance(checkpointer_metadata[0], dict):
+                for key in ("step", "is_temporary"):
+                    if key in checkpointer_metadata[0]:
+                        merged_metadata[key] = checkpointer_metadata[0][key]
+            try:
+                metadata_path.write_text(json.dumps(merged_metadata))
+            except Exception as exc:
+                logger.warning(f"Failed to restore checkpoint metadata at {metadata_path}: {exc}")
 
         def save_callback(dest, mesh, meta, s=state):
             """Checkpointer callback that serializes trainer state to disk.
@@ -4675,12 +4725,28 @@ class BaseTrainer(BaseTrainerProtocol):
             Args:
                 dest: Relative checkpoint destination path.
                 mesh: Device mesh (unused, required by checkpointer API).
-                meta: Checkpoint metadata dict (unused, required by API).
+                meta: Checkpoint metadata dict provided by the checkpointer. The
+                    save-permanence decision from this payload is treated as
+                    authoritative when we reconstruct the final metadata file.
                 s: Model state to save (defaults to outer ``state``).
             """
+            if isinstance(meta, dict):
+                checkpointer_metadata[0] = dict(meta)
             full_path = str(self.arguments._get_save_directory() / dest)
-            saved_directory[0] = self._save_state(state=s, save_directory=full_path)
-            self._cleanup_old_checkpoints()
+            saved_directory[0] = self._save_state(
+                state=s,
+                save_directory=full_path,
+                merge_lora_before_save=merge_lora_before_save,
+            )
+            if jax.process_index() == 0:
+                metadata_path = ePath(full_path) / "metadata.json"
+                if metadata_path.exists():
+                    try:
+                        loaded = json.loads(metadata_path.read_text())
+                        if isinstance(loaded, dict):
+                            saved_metadata[0] = loaded
+                    except Exception as exc:
+                        logger.warning(f"Failed to snapshot checkpoint metadata from {metadata_path}: {exc}")
 
         self.checkpointer.on_step(
             mesh=self.mesh,
@@ -4690,6 +4756,8 @@ class BaseTrainer(BaseTrainerProtocol):
             true_callbacks=[save_callback],
         )
         if saved_directory[0] is not None:
+            _restore_checkpoint_metadata(saved_directory[0])
+            self._cleanup_old_checkpoints()
             self._sync_checkpointer_after_callback_save(step=step)
         return saved_directory[0]
 
@@ -4997,6 +5065,7 @@ class BaseTrainer(BaseTrainerProtocol):
             return self._save_state(
                 state=state,
                 save_directory=save_directory,
+                merge_lora_before_save=self.arguments.merge_lora_before_save,
             )
 
     def _save_to_torch(
@@ -5267,16 +5336,17 @@ class BaseTrainer(BaseTrainerProtocol):
             checkpoint_path = str(self._preemption_checkpoint_path)
             filename = str(self._preemption_checkpoint_path)
         elif self.arguments.do_last_save:
-            dire = ePath(self.arguments.save_directory)
             current_step = int(jax.device_get(state.step))
             filename = self._save_checkpoint_for_step(
                 state=state,
                 step=current_step,
                 force=True,
+                merge_lora_before_save=self.arguments.merge_lora_before_save,
             )
             if filename is not None:
-                if self.arguments.save_directory is not None:
-                    checkpoint_path = dire / filename
+                checkpoint_path = str(filename)
+                if self.arguments.save_directory is not None and os.path.dirname(checkpoint_path) == "":
+                    checkpoint_path = str(ePath(self.arguments.save_directory) / checkpoint_path)
 
         return TrainerOutput(
             state=state,
@@ -5444,6 +5514,7 @@ class BaseTrainer(BaseTrainerProtocol):
             state=state,
             step=step,
             force=True,
+            merge_lora_before_save=getattr(self.arguments, "merge_lora_before_tpu_preemption_save", False),
         )
         multihost_utils.sync_global_devices(sync_prefix + "-done")
         if saved_path is not None:
