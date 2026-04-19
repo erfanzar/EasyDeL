@@ -226,17 +226,6 @@ class FlashAttn(OperationImpl):
                 fallback_kwargs.update(ignore)
             return fallback_attn(**fallback_kwargs)
 
-        if jax.default_backend() == "tpu" and jax.process_count() > 1:
-            has_varlen_inputs = cum_seqlens_q is not None or cum_seqlens_k is not None
-            return _fallback_attention(
-                warning_message=(
-                    "FLASH_ATTN2 on multi-host TPU may compile non-identical XLA programs across "
-                    "hosts and can fail at runtime; falling back to "
-                    + ("SDPA attention." if has_varlen_inputs and not dims_incompatible else "VANILLA attention.")
-                ),
-                preserve_varlen_semantics=has_varlen_inputs and not dims_incompatible,
-            )
-
         if dims_incompatible:
             return _fallback_attention()
 
@@ -314,7 +303,6 @@ class FlashAttn(OperationImpl):
             logits_soft_cap=logits_soft_cap,
             normalize_output=normalize_output,
             precision=precision,
-            logits_dtype=jnp.bfloat16,
             cfg=self.metadata.get_operation_config("flash_attn2"),
             mesh=self.metadata.mesh,
             in_specs=(
