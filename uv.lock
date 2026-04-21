@@ -750,7 +750,7 @@ tpu = [
 requires-dist = [
     { name = "cryptography", specifier = ">=45.0.6" },
     { name = "datasets", specifier = ">=3.6.0" },
-    { name = "eformer", specifier = "==0.0.99.11" },
+    { name = "eformer", specifier = "==0.0.99.12" },
     { name = "einops", specifier = "~=0.8.0" },
     { name = "ejkernel", specifier = "==0.0.78" },
     { name = "ejkernel", extras = ["cuda", "triton"], marker = "extra == 'cuda'", specifier = "==0.0.78" },
@@ -795,7 +795,7 @@ provides-extras = ["torch", "cuda", "tpu", "tensorflow", "lm-eval", "profile", "
 
 [[package]]
 name = "eformer"
-version = "0.0.99.11"
+version = "0.0.99.12"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "braceexpand" },
@@ -817,9 +817,9 @@ dependencies = [
     { name = "tensorstore" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fa/6d/8d24e2d4afb6c12164fb0e2f755107d377a932ed12256240a83ca82f6b26/eformer-0.0.99.11.tar.gz", hash = "sha256:2564198bade50b8f97da55d3c9024ba544d86a546af14ebc52b3ef1dacb89140", size = 276251, upload-time = "2026-04-16T04:25:11.992Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/2a/3c/2149d36b348d4c53eb754309d5829abb1254cdd5d6a9d607e31b680c7398/eformer-0.0.99.12.tar.gz", hash = "sha256:cfc1eb9072203fcef0710d468f161696512c7a1f31e688f503bfcd967030dd9e", size = 276392, upload-time = "2026-04-21T10:09:03.728Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fa/58/5b198bd43211db358446ce536e0e528d260581503bd7f97acd4ae1f72390/eformer-0.0.99.11-py3-none-any.whl", hash = "sha256:1be10b562ed45b77e2e451ce33b5735d5edf5610221bf698ab12e9dc0b1bfe09", size = 337513, upload-time = "2026-04-16T04:25:13.391Z" },
+    { url = "https://files.pythonhosted.org/packages/61/08/2bc3cde42d15b624684ac6d976faf6c6492be2e367cbfdc5c2fff7cf0666/eformer-0.0.99.12-py3-none-any.whl", hash = "sha256:2baba3390a1ccfb38c161d2060f933cb9c60cedafb1ef9bab6fa155e098f9403", size = 337639, upload-time = "2026-04-21T10:09:05.335Z" },
 ]
 
 [[package]]
@@ -4933,7 +4933,7 @@ wheels = [
 
 [[package]]
 name = "xprof-nightly"
-version = "2.23.0a20260311"
+version = "2.23.2a20260421"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cheroot" },
@@ -4947,15 +4947,10 @@ dependencies = [
     { name = "werkzeug" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b8/62/991aa35d9016a0340ae51b84e97cf1397386b4fc28538886a24a414212d0/xprof_nightly-2.23.0a20260311-cp311-none-any.whl", hash = "sha256:1c0e4cb284f2d2ca52fd775f762f62948f227621ad4144640e7d8c55c9b0e90d", size = 21926794, upload-time = "2026-03-11T09:34:19.015Z" },
-    { url = "https://files.pythonhosted.org/packages/3d/80/20bd0d7ae1c5c6c409c70286718528ff95854ac3c9666c73ca61f998ff68/xprof_nightly-2.23.0a20260311-cp311-none-manylinux_2_27_x86_64.whl", hash = "sha256:21eefd1b15cfbbbb7e087e952557f7ff0a9dab6ad4712a6db5ba271238f6b6ab", size = 25851335, upload-time = "2026-03-11T09:12:58.302Z" },
-    { url = "https://files.pythonhosted.org/packages/15/b4/1f3fff2ccf4ee686739ec3b74e3e5e7a099a72a884ebf0202e6718c8bb17/xprof_nightly-2.23.0a20260311-cp311-none-manylinux_2_35_aarch64.whl", hash = "sha256:68a04f9f4153f12f4432e4aabd4cd97f24e4a1793e601a678950630db9ceff24", size = 26796208, upload-time = "2026-03-11T09:24:10.72Z" },
-    { url = "https://files.pythonhosted.org/packages/2c/0a/28d25aac34d52be7a1bf25755316bf2e891c5a09cc4361fc0033cc9ca509/xprof_nightly-2.23.0a20260311-cp312-none-any.whl", hash = "sha256:aa5316f530188506dcac889adcdffa337787ed0555777857f42333d4e62b04aa", size = 21925499, upload-time = "2026-03-11T09:33:51.951Z" },
-    { url = "https://files.pythonhosted.org/packages/c3/59/354f1c93ae12ee7ceff8a1de696c66acb7d1f47072bb96d77c6bf74110d3/xprof_nightly-2.23.0a20260311-cp312-none-manylinux_2_27_x86_64.whl", hash = "sha256:8118bd136507524d61d7b5b50bd6d08ab15f0836ab649970230fd8e9693a6507", size = 25851281, upload-time = "2026-03-11T09:10:50.644Z" },
-    { url = "https://files.pythonhosted.org/packages/3e/c8/32ccf9dcf95dc254421a8350903c836ca5ddd50c0efb0ed05815babb285f/xprof_nightly-2.23.0a20260311-cp312-none-manylinux_2_35_aarch64.whl", hash = "sha256:4f76f790a9a4d4e6f527c8e94b4769f67924b94ce590d0280d8dcd6b2284b08d", size = 26792698, upload-time = "2026-03-11T09:12:35.496Z" },
-    { url = "https://files.pythonhosted.org/packages/24/6c/586aaaa12a38b1790e9b79e9be026e0f067db2df53f32a69a39325593db0/xprof_nightly-2.23.0a20260311-cp313-none-any.whl", hash = "sha256:ed4f89b5507b77dbf195720178f8bc28486f5459a54ed1211e13ecac9e28394a", size = 21925509, upload-time = "2026-03-11T09:34:21.699Z" },
-    { url = "https://files.pythonhosted.org/packages/bd/4a/e0b9abebdd50384198dd6e95a9b96d057e3502dd72928a2791db4c852184/xprof_nightly-2.23.0a20260311-cp313-none-manylinux_2_27_x86_64.whl", hash = "sha256:afb419f437537cfb102f3922c4fe5515c57751dbc3c6310e3cf6e00274a0d5d4", size = 25851617, upload-time = "2026-03-11T09:08:21.007Z" },
-    { url = "https://files.pythonhosted.org/packages/2b/a0/e0866211a7ffff2f0ab8db33032b3641bf0c3c3dd493d785b0cea4e6e065/xprof_nightly-2.23.0a20260311-cp313-none-manylinux_2_35_aarch64.whl", hash = "sha256:b9e2e0e1bcb8ef19b5689138bac52a4a18467d1e765e9540aaa30339d77d3ac4", size = 26791930, upload-time = "2026-03-11T09:13:35.443Z" },
+    { url = "https://files.pythonhosted.org/packages/91/35/a5fe5edf2a0a796fbff84c089f82a279ca48e57e77f3d92032e24eb3396b/xprof_nightly-2.23.2a20260421-py3-none-macosx_11_0_arm64.whl", hash = "sha256:644d668297d3fd598b44e0dcea29f5c62457b007bd3a429c178c27b592f433c8", size = 36292470, upload-time = "2026-04-21T09:22:56.755Z" },
+    { url = "https://files.pythonhosted.org/packages/65/15/02307e188e43e8614de900fc8f0195beb53e689a63f8875f452c3f1b3d52/xprof_nightly-2.23.2a20260421-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:9a52893b487002bc5ae5b1b63f715d68ede23484fe6af7840919092a2d0fa0d1", size = 24854706, upload-time = "2026-04-21T09:11:52.244Z" },
+    { url = "https://files.pythonhosted.org/packages/66/45/344c91746c1dc7e40559785c2232929ae733e986ab1bf1313c9029d5719e/xprof_nightly-2.23.2a20260421-py3-none-manylinux_2_35_aarch64.whl", hash = "sha256:c2810afd9a974f9775c1602ab5c135334e33ec4c8be1862cf94000192f9ba4de", size = 42139207, upload-time = "2026-04-21T09:16:39.351Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/e3/56ddcbbd2e455fef4e61ccfa5a2b5c28c3ee687448ce982a4752dfe327fc/xprof_nightly-2.23.2a20260421-py3-none-win_amd64.whl", hash = "sha256:b732169021eb0530e9d67234fa6d21ff7041c52d97e32041dede1e326e006cb6", size = 21853755, upload-time = "2026-04-21T09:41:59.7Z" },
 ]
 
 [[package]]
