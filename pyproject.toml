@@ -32,7 +32,7 @@ dependencies = [
 	"jax>=0.9.2",
 	"jaxlib>=0.9.2",
 	"ray[default]==2.54.0",
-	"eformer==0.0.99.11",
+	"eformer==0.0.99.12",
 	"ejkernel==0.0.78",
 	"einops~=0.8.0",
 	"transformers~=5.5.0",
