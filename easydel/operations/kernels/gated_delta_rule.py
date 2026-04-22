@@ -1021,7 +1021,6 @@ class GatedDeltaRuleOp(OperationImpl):
             token_head_spec = PartitionSpec(None, head_axis, None)
             beta_spec = PartitionSpec(None, head_axis)
             state_spec = PartitionSpec(None, head_axis, None, None)
-            PartitionSpec()
             Ps = PartitionSpec
 
             @jax.named_scope("ragged_gdr_decode_shard_map")
