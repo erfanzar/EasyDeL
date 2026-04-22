@@ -635,6 +635,103 @@ def ragged_gated_delta_rule_mixed_prefill(
     return updated_recurrent_state, output
 
 
+def _pallas_gdn_decode_kernel(
+    q_ref, k_ref, v_ref, beta_ref, exp_g_ref, state_ref, valid_ref,
+    out_ref, new_state_ref,
+):
+    """Per-program: process `B_TOK` tokens (unrolled) with one slot's state each.
+
+    Block layout (per program):
+        q, k:        (B_TOK, H, D_K)      bf16
+        v:           (B_TOK, H, D_V)      bf16
+        beta, exp_g: (B_TOK, H, 128)      bf16  (padded — lane-align)
+        state:       (B_TOK, H, D_K, D_V) bf16
+        valid:       (B_TOK, 1, 128)      int32 (padded)
+
+    Outputs:
+        out:         (B_TOK, H, D_V)       bf16
+        new_state:   (B_TOK, H, D_K, D_V)  bf16  (for invalid tokens: unchanged)
+
+    Assumes identity state mapping (token i → slot i) — which matches the
+    Qwen3-Next ragged decode path where ``state_indices = arange(num_slots)``.
+    """
+    B = q_ref.shape[0]
+    for b_idx in range(B):
+        q = q_ref[b_idx]
+        k = k_ref[b_idx]
+        v = v_ref[b_idx]
+        beta_v = beta_ref[b_idx, :, 0]
+        exp_g_v = exp_g_ref[b_idx, :, 0].astype(jnp.float32)
+        state = state_ref[b_idx]
+        valid_bool = valid_ref[b_idx, 0, 0] != 0
+
+        state_f = state.astype(jnp.float32)
+        k_f = k.astype(jnp.float32)
+        q_f = q.astype(jnp.float32)
+        v_f = v.astype(jnp.float32)
+
+        # Pallas TPU matmul only supports 1 batch dim → iterate heads via (H, 1, D_K) @ (H, D_K, D_V).
+        k_state = jnp.matmul(k_f[:, None, :], state_f)[:, 0, :]  # (H, D_V)
+        q_state = jnp.matmul(q_f[:, None, :], state_f)[:, 0, :]
+
+        v_new = beta_v[..., None].astype(jnp.float32) * (v_f - exp_g_v[..., None] * k_state)
+        q_k = jnp.sum(q_f * k_f, axis=-1, keepdims=True)
+        out = exp_g_v[..., None] * q_state + q_k * v_new
+
+        k_v_new = k_f[..., None] * v_new[..., None, :]
+        new_state = state_f * exp_g_v[..., None, None] + k_v_new
+
+        out_masked = jnp.where(valid_bool, out, 0.0).astype(out_ref.dtype)
+        new_state_masked = jnp.where(valid_bool, new_state, state_f).astype(new_state_ref.dtype)
+
+        out_ref[b_idx] = out_masked
+        new_state_ref[b_idx] = new_state_masked
+
+
+_PALLAS_GDN_BTOK = 16
+
+
+def _pallas_gdn_decode_call(q, k, v, beta, exp_g, state, valid):
+    """Run the fused Pallas kernel. Returns (new_state_pool, outputs_3d).
+
+    Assumes:
+        - state_indices is identity: token i corresponds to slot i.
+        - ``q.shape[0]`` is divisible by ``_PALLAS_GDN_BTOK``.
+    """
+    T, H, D_K = q.shape
+    D_V = v.shape[-1]
+    b_tok = _PALLAS_GDN_BTOK
+    assert T % b_tok == 0, f"num_tokens={T} must be divisible by pallas b_tok={b_tok}"
+
+    beta_p = jnp.broadcast_to(beta[..., None], (T, H, 128)).astype(beta.dtype)
+    exp_g_p = jnp.broadcast_to(exp_g[..., None], (T, H, 128)).astype(exp_g.dtype)
+    valid_p = jnp.broadcast_to(valid[:, None, None], (T, 1, 128)).astype(jnp.int32)
+
+    return pl.pallas_call(
+        _pallas_gdn_decode_kernel,
+        grid=(T // b_tok,),
+        in_specs=[
+            pl.BlockSpec((b_tok, H, D_K), lambda i: (i, 0, 0)),
+            pl.BlockSpec((b_tok, H, D_K), lambda i: (i, 0, 0)),
+            pl.BlockSpec((b_tok, H, D_V), lambda i: (i, 0, 0)),
+            pl.BlockSpec((b_tok, H, 128), lambda i: (i, 0, 0)),
+            pl.BlockSpec((b_tok, H, 128), lambda i: (i, 0, 0)),
+            pl.BlockSpec((b_tok, H, D_K, D_V), lambda i: (i, 0, 0, 0)),
+            pl.BlockSpec((b_tok, 1, 128), lambda i: (i, 0, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((b_tok, H, D_V), lambda i: (i, 0, 0)),
+            pl.BlockSpec((b_tok, H, D_K, D_V), lambda i: (i, 0, 0, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((T, H, D_V), q.dtype),
+            jax.ShapeDtypeStruct((T, H, D_K, D_V), state.dtype),
+        ],
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=64 * 1024 * 1024),
+        name=f"pallas_gdn_decode_step_b{b_tok}",
+    )(q, k, v, beta_p, exp_g_p, state, valid_p)
+
+
 def recurrent_gated_delta_rule_step(
     query: jnp.ndarray,
     key: jnp.ndarray,
@@ -713,41 +810,77 @@ def ragged_gated_delta_rule_decode_only(
     """
     num_tokens = query.shape[0]
     max_reqs = recurrent_state.shape[0]
+    d_k = query.shape[-1]
+    d_v = value.shape[-1]
 
     token_idx = jnp.arange(num_tokens)
-    req_indices = jnp.clip(token_idx, 0, max_reqs - 1)
     valid_mask = token_idx < distribution[2]
 
-    beta = jax.nn.sigmoid(b_reshaped)
-    g = -jnp.exp(A_log.astype(jnp.float32)) * jax.nn.softplus(
-        a_reshaped.astype(jnp.float32) + dt_bias.astype(jnp.float32)
-    )
-
+    # Preprocess on-device (outside the Pallas kernel):
+    #   - sigmoid/softplus/exp applied here (Pallas TPU Mosaic struggles with
+    #     these on small per-head vectors)
+    #   - L2 normalization + scaling
     if use_qk_norm_in_gdn:
         query = l2norm(query)
         key = l2norm(key)
+    scale = jnp.asarray(d_k**-0.5, dtype=jnp.float32)
+    query = (query.astype(jnp.float32) * scale).astype(query.dtype)
+    beta = jax.nn.sigmoid(b_reshaped.astype(jnp.float32)).astype(b_reshaped.dtype)
+    g = -jnp.exp(A_log.astype(jnp.float32)) * jax.nn.softplus(
+        a_reshaped.astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, :]
+    )
+    exp_g = jnp.exp(g).astype(query.dtype)
 
-    # Gather the current states for the requests in this batch
+    # Fast path: identity state map (token i → slot i) + shape-compatible.
+    # Kernel produces the first `num_tokens` slots of the updated pool; we
+    # splice those into the pre-existing pool prefix, leaving slots
+    # `[num_tokens, max_reqs)` untouched (they hold stale state for idle
+    # requests not scheduled in this step).
+    use_pallas = (
+        jax.default_backend() == "tpu"
+        and d_k == 128
+        and d_v == 128
+        and num_tokens <= max_reqs
+        and num_tokens >= _PALLAS_GDN_BTOK
+        and num_tokens % _PALLAS_GDN_BTOK == 0
+    )
+    if use_pallas:
+        # Kernel expects slot[t] = recurrent_state[t] for t in [0, num_tokens).
+        # Slice the prefix for the kernel (and recompose afterwards).
+        state_prefix = recurrent_state[:num_tokens]
+        outputs_3d, new_state_prefix = _pallas_gdn_decode_call(
+            query, key, value, beta, exp_g, state_prefix, valid_mask,
+        )
+        outputs = outputs_3d.reshape(num_tokens, -1)
+        if num_tokens == max_reqs:
+            updated_pool = new_state_prefix.astype(recurrent_state.dtype)
+        else:
+            updated_pool = recurrent_state.at[:num_tokens].set(new_state_prefix)
+        return updated_pool.astype(recurrent_state.dtype), outputs
+
+    # Generic fallback (non-identity state map, smaller D_K/D_V, or non-TPU):
+    # original gather-compute-scatter implementation.
+    req_indices = jnp.clip(token_idx, 0, max_reqs - 1)
     req_state_indices = state_indices[req_indices]
     current_states = recurrent_state[req_state_indices]
 
-    # Call step function directly with the inputs (no scattering needed)
-    outputs, new_states = recurrent_gated_delta_rule_step(
-        query,
-        key,
-        value,
-        g,
-        beta,
-        state=current_states,
-    )
+    state_f = current_states.astype(jnp.float32)
+    k_f = key.astype(jnp.float32)
+    q_f = query.astype(jnp.float32)
+    v_f = value.astype(jnp.float32)
+    exp_g_f = exp_g.astype(jnp.float32)
 
-    # Mask outputs for invalid tokens
+    k_state = jnp.einsum("bhd,bhdm->bhm", k_f, state_f)
+    q_state = jnp.einsum("bhd,bhdm->bhm", q_f, state_f)
+    v_new = beta.astype(jnp.float32)[..., None] * (v_f - exp_g_f[..., None] * k_state)
+    q_k = jnp.sum(q_f * k_f, axis=-1, keepdims=True)
+    outputs = exp_g_f[..., None] * q_state + q_k * v_new
+    k_v_new = k_f[..., :, None] * v_new[..., None, :]
+    new_states = state_f * exp_g_f[..., None, None] + k_v_new
+
     outputs = jnp.where(valid_mask[:, None, None], outputs, 0.0)
     outputs = outputs.reshape(num_tokens, -1)
-
-    # Mask state for invalid tokens
-    states_to_set = jnp.where(valid_mask[:, None, None, None], new_states, current_states)
-
+    states_to_set = jnp.where(valid_mask[:, None, None, None], new_states, state_f)
     updated_recurrent_state = recurrent_state.at[req_state_indices].set(states_to_set)
 
     return updated_recurrent_state.astype(recurrent_state.dtype), outputs
