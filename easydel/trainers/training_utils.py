@@ -109,6 +109,10 @@ GENERATION_MODEL_INPUT_KEYS = (
     "video_hidden_states",
     "image_features",
     "video_features",
+    # Audio — consumed by Qwen3-Omni-style models as log-mel spectrograms
+    # shaped [batch, mel_bins, time]. Without this key the GRPO generation
+    # pipeline silently drops audio tensors before the model forward.
+    "input_features",
 )
 
 SHARED_GENERATION_MODEL_INPUT_KEYS = frozenset(
@@ -126,6 +130,11 @@ GROUPED_MULTIMODAL_MODEL_INPUT_KEYS = frozenset(
         "video_grid_thw",
         "image_grid_hws",
         "image_sizes",
+        # Audio mel spectrograms — collated alongside visual tensors so the
+        # GRPO data collator normalises/stacks them rather than routing them
+        # through the prompt-aligned left-pad branch (which would pad mel
+        # time to max_prompt_length, corrupting the signal).
+        "input_features",
     }
 )
 

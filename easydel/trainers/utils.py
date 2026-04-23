@@ -69,6 +69,12 @@ FLATTENABLE_MULTIMODAL_KEYS = frozenset(
         "video_grid_thw",
         "image_grid_hws",
         "image_sizes",
+        # Audio mel spectrograms from Qwen3-Omni-style processors arrive
+        # shaped [batch, mel_bins, time]. Including this here routes them
+        # through `_normalize_flattenable_multimodal_array` (which no-ops
+        # for audio's already-flat shape) instead of the else-branch that
+        # left-pads the trailing dim to prompt length.
+        "input_features",
     }
 ).intersection(GENERATION_MODEL_INPUT_KEYS)
 
