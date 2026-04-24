@@ -508,6 +508,7 @@ def test_packed_updates_keep_ragged_for_partial_decode_bucket(monkeypatch):
     packed_inputs = _make_large_bucket_decode_inputs(bucket=512)
 
     monkeypatch.setenv("EASYDEL_RAGGED_GDR", "1")
+    monkeypatch.setattr(qwen3_next_modeling.jax, "default_backend", lambda: "tpu")
 
     unified_marker = (
         jnp.array([1], dtype=jnp.int32),
@@ -535,6 +536,85 @@ def test_packed_updates_keep_ragged_for_partial_decode_bucket(monkeypatch):
         dispatched = qwen3_next_modeling._apply_qwen3_next_packed_updates(
             **packed_inputs,
             gdr_op=object(),
+            ragged_gdr_op=object(),
+        )
+
+    assert int(dispatched[0][0]) == 2
+
+
+def test_packed_updates_prefer_unified_on_cpu(monkeypatch):
+    packed_inputs = _make_large_bucket_decode_inputs(bucket=512)
+
+    monkeypatch.setenv("EASYDEL_RAGGED_GDR", "1")
+    monkeypatch.delenv("EASYDEL_RAGGED_GDR_FORCE_CPU", raising=False)
+    monkeypatch.setattr(qwen3_next_modeling.jax, "default_backend", lambda: "cpu")
+
+    unified_marker = (
+        jnp.array([1], dtype=jnp.int32),
+        jnp.array([1], dtype=jnp.int32),
+        jnp.array([1], dtype=jnp.int32),
+    )
+    ragged_marker = (
+        jnp.array([2], dtype=jnp.int32),
+        jnp.array([2], dtype=jnp.int32),
+        jnp.array([2], dtype=jnp.int32),
+    )
+
+    monkeypatch.setattr(
+        qwen3_next_modeling,
+        "_apply_qwen3_next_packed_updates_unified",
+        lambda **_: unified_marker,
+    )
+    monkeypatch.setattr(
+        qwen3_next_modeling,
+        "_apply_qwen3_next_packed_updates_ragged",
+        lambda **_: ragged_marker,
+    )
+
+    with set_inference_mode(True):
+        dispatched = qwen3_next_modeling._apply_qwen3_next_packed_updates(
+            **packed_inputs,
+            gdr_op=object(),
+            ragged_gdr_op=object(),
+        )
+
+    assert int(dispatched[0][0]) == 1
+
+
+def test_packed_updates_can_force_ragged_on_cpu(monkeypatch):
+    packed_inputs = _make_large_bucket_decode_inputs(bucket=512)
+
+    monkeypatch.setenv("EASYDEL_RAGGED_GDR", "1")
+    monkeypatch.setenv("EASYDEL_RAGGED_GDR_FORCE_CPU", "1")
+    monkeypatch.setattr(qwen3_next_modeling.jax, "default_backend", lambda: "cpu")
+
+    unified_marker = (
+        jnp.array([1], dtype=jnp.int32),
+        jnp.array([1], dtype=jnp.int32),
+        jnp.array([1], dtype=jnp.int32),
+    )
+    ragged_marker = (
+        jnp.array([2], dtype=jnp.int32),
+        jnp.array([2], dtype=jnp.int32),
+        jnp.array([2], dtype=jnp.int32),
+    )
+
+    monkeypatch.setattr(
+        qwen3_next_modeling,
+        "_apply_qwen3_next_packed_updates_unified",
+        lambda **_: unified_marker,
+    )
+    monkeypatch.setattr(
+        qwen3_next_modeling,
+        "_apply_qwen3_next_packed_updates_ragged",
+        lambda **_: ragged_marker,
+    )
+
+    with set_inference_mode(True):
+        dispatched = qwen3_next_modeling._apply_qwen3_next_packed_updates(
+            **packed_inputs,
+            gdr_op=object(),
+            ragged_gdr_op=object(),
         )
 
     assert int(dispatched[0][0]) == 2
