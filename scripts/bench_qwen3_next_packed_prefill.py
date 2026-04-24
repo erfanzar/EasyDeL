@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark Qwen3Next packed prefill legacy vs refactored helpers."""
+"""Benchmark Qwen3Next packed prefill kernels and dispatch decisions."""
 
 from __future__ import annotations
 
@@ -26,14 +26,18 @@ import jax.numpy as jnp
 import numpy as np
 
 from easydel.modules.qwen3_next.modeling_qwen3_next import (
+    _apply_qwen3_next_packed_slow_updates,
     _apply_qwen3_next_packed_updates,
-    _apply_qwen3_next_packed_updates_legacy,
+    _apply_qwen3_next_packed_updates_ragged,
+    _apply_qwen3_next_packed_updates_unified,
 )
 from easydel.modules.qwen3_next.qwen3_next_configuration import Qwen3NextConfig
 from easydel.operations import OperationMetadata
-from easydel.operations.kernels import GatedDeltaRuleOp
+from easydel.operations.kernels import GatedDeltaRuleOp, RaggedGatedDeltaRule
+from easydel.utils.inference_mode import set_inference_mode
 
 LAYOUT_AXIS_DIMS = {
+    "local1": (1, 1, 1, 1, 1),
     "fsdp4": (1, 4, 1, 1, 1),
     "tp4": (1, 1, 1, 4, 1),
 }
@@ -136,12 +140,10 @@ def _make_inputs(case: str, bucket: int, num_slots: int, dtype: jnp.dtype) -> di
         (1, bucket, conv_dim),
         dtype=jnp.float32,
     ).astype(dtype)
-    beta = jax.nn.sigmoid(
-        jax.random.normal(jax.random.fold_in(rng, 3), (1, bucket, num_v_heads), dtype=jnp.float32)
-    ).astype(dtype)
-    decay = (
-        -jax.nn.softplus(jax.random.normal(jax.random.fold_in(rng, 4), (1, bucket, num_v_heads), dtype=jnp.float32))
-    ).astype(dtype)
+    beta_raw = jax.random.normal(jax.random.fold_in(rng, 3), (1, bucket, num_v_heads), dtype=jnp.float32)
+    beta = jax.nn.sigmoid(beta_raw).astype(dtype)
+    alpha_raw = jax.random.normal(jax.random.fold_in(rng, 4), (1, bucket, num_v_heads), dtype=jnp.float32)
+    decay = (-jax.nn.softplus(alpha_raw)).astype(dtype)
     kernel = jax.random.normal(jax.random.fold_in(rng, 5), (conv_dim, d_conv), dtype=jnp.float32).astype(dtype)
 
     return {
@@ -149,7 +151,11 @@ def _make_inputs(case: str, bucket: int, num_slots: int, dtype: jnp.dtype) -> di
         "recurrent_states": recurrent_states,
         "conv_input": conv_input,
         "beta": beta,
+        "beta_raw": beta_raw.astype(dtype),
         "decay": decay,
+        "alpha_raw": alpha_raw.astype(dtype),
+        "A_log": jnp.zeros((num_v_heads,), dtype=jnp.float32),
+        "dt_bias": jnp.zeros((num_v_heads,), dtype=jnp.float32),
         "kernel": kernel,
         "query_start_loc": jnp.asarray(query_start_loc, dtype=jnp.int32),
         "num_requests": jnp.asarray(num_requests, dtype=jnp.int32),
@@ -194,7 +200,7 @@ def main() -> None:
     parser.add_argument(
         "--layout",
         choices=tuple(LAYOUT_AXIS_DIMS),
-        default="tp4",
+        default="local1" if len(jax.devices()) < 4 else "tp4",
         help="Logical mesh layout to benchmark.",
     )
     parser.add_argument(
@@ -209,6 +215,7 @@ def main() -> None:
     buckets = (512, 2048)
     dtype = jnp.bfloat16
     gdr_op = _make_gdr_op(args.layout, runtime_dtype=dtype, grouped_decode_backend=args.gdr_backend)
+    ragged_gdr_op = RaggedGatedDeltaRule(gdr_op.metadata)
     mesh = gdr_op.metadata.mesh
 
     print(
@@ -217,33 +224,64 @@ def main() -> None:
     )
     print(f"warmup={args.warmup} repeats={args.repeats} num_slots={args.num_slots} dtype={dtype}")
     print()
-    print("case           bucket   legacy_ms  unified_ms   speedup   outputs_match")
+    print("case           bucket    slow_ms  unified_ms   ragged_ms dispatch_ms  cpu_gain   match(u/r)")
 
     with mesh:
         for case in cases:
             for bucket in buckets:
                 inputs = _make_inputs(case, bucket, args.num_slots, dtype)
 
-                legacy_fn = jax.jit(
-                    lambda: _apply_qwen3_next_packed_updates_legacy(
-                        **inputs,  # noqa
+                slow_fn = jax.jit(
+                    lambda: _apply_qwen3_next_packed_slow_updates(
+                        **{k: v for k, v in inputs.items() if k not in {"alpha_raw", "beta_raw", "A_log", "dt_bias"}},
                         gdr_op=gdr_op,
                     )
                 )
-                ref_fn = jax.jit(
-                    lambda: _apply_qwen3_next_packed_updates(
-                        **inputs,  # noqa
+                unified_fn = jax.jit(
+                    lambda: _apply_qwen3_next_packed_updates_unified(
+                        **{k: v for k, v in inputs.items() if k not in {"alpha_raw", "beta_raw", "A_log", "dt_bias"}},
                         gdr_op=gdr_op,
                     )
                 )
+                ragged_fn = jax.jit(
+                    lambda: _apply_qwen3_next_packed_updates_ragged(
+                        conv_states=inputs["conv_states"],
+                        recurrent_states=inputs["recurrent_states"],
+                        conv_input=inputs["conv_input"],
+                        kernel=inputs["kernel"],
+                        query_start_loc=inputs["query_start_loc"],
+                        num_requests=inputs["num_requests"],
+                        num_k_heads=inputs["num_k_heads"],
+                        head_k_dim=inputs["head_k_dim"],
+                        num_v_heads=inputs["num_v_heads"],
+                        head_v_dim=inputs["head_v_dim"],
+                        conv_output_dtype=inputs["conv_output_dtype"],
+                        ragged_gdr_op=ragged_gdr_op,
+                        alpha_raw=inputs["alpha_raw"],
+                        beta_raw=inputs["beta_raw"],
+                        A_log=inputs["A_log"],
+                        dt_bias=inputs["dt_bias"],
+                    )
+                )
+                with set_inference_mode(True):
+                    dispatch_fn = jax.jit(
+                        lambda: _apply_qwen3_next_packed_updates(
+                            **inputs,
+                            gdr_op=gdr_op,
+                            ragged_gdr_op=ragged_gdr_op,
+                        )
+                    )
 
-                legacy_out, legacy_ms = _time_callable(legacy_fn, warmup=args.warmup, repeats=args.repeats)
-                unified_out, unified_ms = _time_callable(ref_fn, warmup=args.warmup, repeats=args.repeats)
-                speedup = ((legacy_ms - unified_ms) / legacy_ms * 100.0) if legacy_ms else 0.0
-                outputs_match = _allclose_tree(legacy_out, unified_out)
+                    dispatch_out, dispatch_ms = _time_callable(dispatch_fn, warmup=args.warmup, repeats=args.repeats)
+
+                slow_out, slow_ms = _time_callable(slow_fn, warmup=args.warmup, repeats=args.repeats)
+                unified_out, unified_ms = _time_callable(unified_fn, warmup=args.warmup, repeats=args.repeats)
+                ragged_out, ragged_ms = _time_callable(ragged_fn, warmup=args.warmup, repeats=args.repeats)
+                cpu_gain = ((ragged_ms - unified_ms) / ragged_ms * 100.0) if ragged_ms else 0.0
+                outputs_match = _allclose_tree(unified_out, ragged_out) and _allclose_tree(slow_out, unified_out)
 
                 print(
-                    f"{case:<14} {bucket:>6d} {legacy_ms:>10.2f} {unified_ms:>11.2f} {speedup:>8.2f}%   {outputs_match}"
+                    f"{case:<14} {bucket:>6d} {slow_ms:>10.2f} {unified_ms:>11.2f} {ragged_ms:>11.2f} {dispatch_ms:>10.2f} {cpu_gain:>8.2f}%   {outputs_match}"
                 )
 
 

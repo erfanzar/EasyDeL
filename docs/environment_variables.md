@@ -138,6 +138,8 @@ These are set during ejkernel import or profiler setup:
 | Env var                             | Default         | What it does                                                              | Use case                                          |
 | ----------------------------------- | --------------- | ------------------------------------------------------------------------- | ------------------------------------------------- |
 | `EASYDEL_TOPK_FOR_COMPUTE`          | `64`            | Limits top-k in efficient top-p sampling.                                 | Trade accuracy vs speed in sampling.              |
+| `EASYDEL_RAGGED_GDR`                | `true`          | Enables Qwen3Next ragged packed-update kernels in inference mode.         | Compare ragged vs unified packed updates.         |
+| `EASYDEL_RAGGED_GDR_FORCE_CPU`      | `false`         | Re-enables ragged packed updates on CPU when `EASYDEL_RAGGED_GDR=1`.      | Local benchmarking or debugging on CPU backends.  |
 | `EASURGE_MAX_SCHEDULER_ERRORS`      | `1`             | Max consecutive scheduler errors before eSurge stops.                     | Increase for resiliency in flaky environments.    |
 | `EASURGE_TOKENIZER_ENDPOINT`        | none            | Overrides tokenizer worker ZeroMQ endpoint.                               | Run tokenizer/detokenizer on custom endpoints.    |
 | `EASURGE_DETOKENIZER_ENDPOINT`      | none            | Overrides detokenizer worker ZeroMQ endpoint.                             | Same as above.                                    |

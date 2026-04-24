@@ -78,8 +78,10 @@ from easydel.layers import (
 )
 from easydel.layers.attention import UnifiedAttention
 from easydel.layers.linear_attention import (
+    apply_manual_depthwise_conv,
     apply_conv_with_state,
     apply_mask_to_padding_states,
+    shift_conv_state_left,
 )
 from easydel.layers.norms import lowfloats
 from easydel.modules._base import BaseCausalLMModule
@@ -192,6 +194,108 @@ def apply_grouped_single_step_gdr(
         output.reshape(batch_size, 1, num_v_heads, -1).astype(input_dtype),
         new_state,
     )
+
+
+def _apply_qwen3_next_packed_slow_updates(
+    *,
+    conv_states: Float[Array, "num_slots conv_dim d_conv"],
+    recurrent_states: Float[Array, "num_slots num_v_heads head_dim value_dim"],
+    conv_input: Float[Array, "batch seq_len conv_dim"],
+    beta: Float[Array, "batch seq_len num_v_heads"],
+    decay: Float[Array, "batch seq_len num_v_heads"],
+    kernel: Float[Array, "conv_dim d_conv"],
+    query_start_loc,
+    num_requests,
+    key_dim: int,
+    num_k_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+    expand_ratio: int,
+    conv_output_dtype: jnp.dtype,
+    gdr_op: GatedDeltaRuleOp,
+) -> tuple[
+    Float[Array, "num_slots conv_dim d_conv"],
+    Float[Array, "num_slots num_v_heads head_dim value_dim"],
+    Float[Array, "seq_len num_v_heads head_v_dim"],
+]:
+    """Slow reference path for packed updates used by tests and benchmarks."""
+    seq_len = conv_input.shape[1]
+    max_req_idx = query_start_loc.shape[0] - 1
+    total_tokens = query_start_loc[jnp.clip(num_requests, 0, max_req_idx)]
+
+    token_positions = jnp.arange(seq_len, dtype=jnp.int32)
+    token_slots = jnp.searchsorted(query_start_loc[1:], token_positions, side="right")
+    token_slots = jnp.clip(token_slots, 0, conv_states.shape[0] - 1)
+    token_active = token_positions < total_tokens
+
+    token_outputs = jnp.zeros((seq_len, num_v_heads, head_v_dim), dtype=jnp.float32)
+
+    def _body(idx: int, carry):
+        conv_states_c, recurrent_states_c, token_outputs_c = carry
+        slot = token_slots[idx]
+        is_active = token_active[idx]
+
+        def _update_states(inner_carry):
+            conv_states_i, recurrent_states_i, token_outputs_i = inner_carry
+
+            conv_state_i = jax.lax.dynamic_slice_in_dim(conv_states_i, slot, 1, axis=0)
+            recurrent_state_i = jax.lax.dynamic_slice_in_dim(recurrent_states_i, slot, 1, axis=0)
+            conv_token = jax.lax.dynamic_slice_in_dim(conv_input, idx, 1, axis=1)[:, 0, :]
+
+            conv_state_i = shift_conv_state_left(conv_state_i, conv_token.astype(conv_state_i.dtype))
+            conv_output_i = apply_manual_depthwise_conv(
+                conv_state_i,
+                kernel,
+                output_dtype=conv_output_dtype,
+            )
+
+            query_i = conv_output_i[:, :key_dim].reshape(1, 1, num_k_heads, head_k_dim)
+            key_i = conv_output_i[:, key_dim : key_dim * 2].reshape(1, 1, num_k_heads, head_k_dim)
+            value_i = conv_output_i[:, key_dim * 2 :].reshape(1, 1, num_v_heads, head_v_dim)
+            beta_i = beta[0, idx].reshape(1, 1, num_v_heads)
+            decay_i = decay[0, idx].reshape(1, 1, num_v_heads)
+
+            if expand_ratio > 1:
+                out_i, new_rec_i = apply_grouped_single_step_gdr(
+                    query=query_i,
+                    key=key_i,
+                    value=value_i,
+                    beta=beta_i,
+                    decay=decay_i,
+                    recurrent_state=recurrent_state_i,
+                    gdr_op=gdr_op,
+                )
+            else:
+                gdr_out_i: GatedDeltaRuleOutput = gdr_op(
+                    query=query_i,
+                    key=key_i,
+                    value=value_i,
+                    beta=beta_i,
+                    decay=decay_i,
+                    recurrent_state=recurrent_state_i,
+                )
+                out_i = gdr_out_i.attention_outputs
+                new_rec_i = gdr_out_i.recurrent_state
+
+            conv_states_i = jax.lax.dynamic_update_slice_in_dim(conv_states_i, conv_state_i, slot, axis=0)
+            recurrent_states_i = jax.lax.dynamic_update_slice_in_dim(
+                recurrent_states_i,
+                new_rec_i.astype(recurrent_states_i.dtype),
+                slot,
+                axis=0,
+            )
+            token_outputs_i = token_outputs_i.at[idx].set(out_i[0, 0].astype(token_outputs_i.dtype))
+            return conv_states_i, recurrent_states_i, token_outputs_i
+
+        return jax.lax.cond(
+            is_active,
+            _update_states,
+            lambda x: x,
+            (conv_states_c, recurrent_states_c, token_outputs_c),
+        )
+
+    return jax.lax.fori_loop(0, seq_len, _body, (conv_states, recurrent_states, token_outputs))
 
 
 QWEN3_NEXT_PACKED_PREFILL_BATCH_CAP = 8
@@ -831,7 +935,7 @@ def _apply_qwen3_next_packed_updates(
     expand_ratio: int,
     conv_output_dtype: jnp.dtype,
     gdr_op: GatedDeltaRuleOp,
-    ragged_gdr_op: RaggedGatedDeltaRule,
+    ragged_gdr_op: RaggedGatedDeltaRule | None = None,
     alpha_raw: Float[Array, "batch seq_len num_v_heads"] | None = None,
     beta_raw: Float[Array, "batch seq_len num_v_heads"] | None = None,
     A_log: Float[Array, "num_v_heads"] | None = None,
@@ -845,8 +949,12 @@ def _apply_qwen3_next_packed_updates(
 
     This is the public entry point called by ``Qwen3NextLinearAttention`` during
     packed-batch (continuous batching) inference. It delegates to either the
-    unified implementation or the ragged GDR fast path depending on the
-    ``EASYDEL_RAGGED_GDR`` flag and runtime mode.
+    unified implementation or the ragged GDR fast path depending on runtime
+    mode, backend, and the ``EASYDEL_RAGGED_GDR`` flag.
+
+    On CPU, the unified implementation is the default even in inference mode.
+    Set ``EASYDEL_RAGGED_GDR_FORCE_CPU=1`` to override that behavior for local
+    experiments.
 
     Args:
         conv_states: Per-slot conv state, shape ``[num_slots, conv_dim, d_conv]``.
@@ -874,6 +982,9 @@ def _apply_qwen3_next_packed_updates(
     """
 
     use_ragged = is_inference_mode() and check_bool_flag("EASYDEL_RAGGED_GDR", True)
+    if use_ragged and jax.default_backend() == "cpu":
+        use_ragged = check_bool_flag("EASYDEL_RAGGED_GDR_FORCE_CPU", False)
+
     if not use_ragged:
         return _apply_qwen3_next_packed_updates_unified(
             conv_states=conv_states,
@@ -893,6 +1004,9 @@ def _apply_qwen3_next_packed_updates(
             conv_output_dtype=conv_output_dtype,
             gdr_op=gdr_op,
         )
+
+    if ragged_gdr_op is None:
+        raise ValueError("ragged_gdr_op is required when ragged packed updates are enabled.")
 
     return _apply_qwen3_next_packed_updates_ragged(
         conv_states=conv_states,
