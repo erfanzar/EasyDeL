@@ -434,7 +434,7 @@ def get_dtype_size(dtype: jnp.dtype) -> int:
         >>> get_dtype_size(jnp.int64)
         8
     """
-    return jnp.finfo(dtype).bits // 8 if jnp.issubdtype(dtype, jnp.floating) else jnp.iinfo(dtype).bits // 8
+    return jnp.dtype(dtype).itemsize
 
 
 def truncate_tokens(tokens, target_len: int, mode: str = "left"):

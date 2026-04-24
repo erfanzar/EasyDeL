@@ -133,3 +133,73 @@ def test_unified_page_budget_scales_with_mesh_dp_axis(monkeypatch):
     assert cfg_no_dp.data_parallel_size == 1
     assert cfg_dp2.data_parallel_size == 2
     assert cfg_dp2.num_pages == cfg_no_dp.num_pages * 2
+
+
+def test_unified_page_budget_supports_fp4_kvdtype(monkeypatch):
+    monkeypatch.setattr(
+        unified_cache_mod,
+        "per_device_hbm_budget_bytes",
+        lambda *_args, **_kwargs: 1 << 20,
+    )
+
+    pm = _partition_manager()
+    cfg_bf16 = unified_cache_mod.UnifiedAttentionCacheConfig.create(
+        mesh=_mesh_tp_only(),
+        partition_manager=pm,
+        kvdtype=jnp.bfloat16,
+        num_hidden_layers=1,
+        num_kv_heads=1,
+        max_model_length=32,
+        head_dim=1,
+        hbm_utilization=0.9,
+        page_size=1,
+    )
+    cfg_fp4 = unified_cache_mod.UnifiedAttentionCacheConfig.create(
+        mesh=_mesh_tp_only(),
+        partition_manager=pm,
+        kvdtype=jnp.float4_e2m1fn,
+        num_hidden_layers=1,
+        num_kv_heads=1,
+        max_model_length=32,
+        head_dim=1,
+        hbm_utilization=0.9,
+        page_size=1,
+    )
+
+    assert cfg_fp4.num_pages > 0
+    assert cfg_fp4.num_pages == cfg_bf16.num_pages * 2
+
+
+def test_ragged_page_budget_supports_fp4_kvdtype(monkeypatch):
+    monkeypatch.setattr(
+        ragged_cache_mod,
+        "per_device_hbm_budget_bytes",
+        lambda *_args, **_kwargs: 1 << 20,
+    )
+
+    pm = _partition_manager()
+    cfg_bf16 = ragged_cache_mod.RaggedPagesCacheConfig.create(
+        mesh=_mesh_tp_only(),
+        partition_manager=pm,
+        kvdtype=jnp.bfloat16,
+        num_hidden_layers=1,
+        num_kv_heads=1,
+        max_model_length=32,
+        kv_head_dim_size=1,
+        hbm_utilization=0.9,
+        page_size=1,
+    )
+    cfg_fp4 = ragged_cache_mod.RaggedPagesCacheConfig.create(
+        mesh=_mesh_tp_only(),
+        partition_manager=pm,
+        kvdtype=jnp.float4_e2m1fn,
+        num_hidden_layers=1,
+        num_kv_heads=1,
+        max_model_length=32,
+        kv_head_dim_size=1,
+        hbm_utilization=0.9,
+        page_size=1,
+    )
+
+    assert cfg_fp4.num_pages > 0
+    assert cfg_fp4.num_pages == cfg_bf16.num_pages * 2

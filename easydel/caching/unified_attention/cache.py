@@ -350,7 +350,7 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
             partition_manager=partition_manager,
             hbm_utilization=hbm_utilization,
         )
-        bytes_av = jnp.finfo(kvdtype).bits // 8
+        bytes_av = jnp.dtype(kvdtype).itemsize
         # Two tensors (K+V) per layer.
         page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * head_dim * bytes_av
         num_pages = int(free) // int(page_bytes)
@@ -371,6 +371,8 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
         slices_raw = (16 * 1024 * 1024) // max(1, int(page_size_bytes))
         num_slices_per_page = min(64, _previous_power_of_2(int(slices_raw)))
 
+        dtype_key = kvdtype.type if hasattr(kvdtype, "type") else kvdtype
+
         return cls(
             num_hidden_layers=num_hidden_layers,
             max_model_length=max_model_length,
@@ -382,7 +384,7 @@ class UnifiedAttentionCacheConfig(BaseCacheConfig):
             num_pages=num_pages,
             max_num_pages_per_req=cdiv(max_model_length, page_size),
             num_slices_per_kv_cache_update_page=int(num_slices_per_page),
-            _kvdtype_str=DTYPE_TO_STRING_MAP[kvdtype.type if hasattr(kvdtype, "type") else kvdtype],
+            _kvdtype_str=DTYPE_TO_STRING_MAP.get(dtype_key, str(jnp.dtype(kvdtype))),
         )
 
     @property

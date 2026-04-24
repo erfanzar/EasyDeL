@@ -194,7 +194,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
             partition_manager=partition_manager,
             hbm_utilization=hbm_utilization,
         )
-        bytes_av = jnp.finfo(kvdtype).bits // 8
+        bytes_av = jnp.dtype(kvdtype).itemsize
         kv_dim_padded = align_to_multiple(int(kv_lora_rank), 128) + align_to_multiple(int(qk_rope_head_dim), 128)
         kv_packing = get_dtype_packing(kvdtype)
         page_size_per_kv_packing = cdiv(page_size, kv_packing)
@@ -214,6 +214,8 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
             f"sequence_capacity={int((num_pages * page_size) / 1000)}K"
         )
 
+        dtype_key = kvdtype.type if hasattr(kvdtype, "type") else kvdtype
+
         return cls(
             num_hidden_layers=num_hidden_layers,
             max_model_length=max_model_length,
@@ -229,7 +231,7 @@ class MLARaggedPagesCacheConfig(RaggedPagesCacheConfig):
                 packed_page_tokens * kv_dim_padded * bytes_av
             ),
             version="v1",
-            _kvdtype_str=DTYPE_TO_STRING_MAP[kvdtype.type if hasattr(kvdtype, "type") else kvdtype],
+            _kvdtype_str=DTYPE_TO_STRING_MAP.get(dtype_key, str(jnp.dtype(kvdtype))),
         )
 
     @property
