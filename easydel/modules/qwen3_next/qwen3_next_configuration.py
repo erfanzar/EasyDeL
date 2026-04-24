@@ -38,6 +38,19 @@ def _ensure_loss_tensor(result, gate_logits):
 def _patch_hf_qwen3_next_load_balancing_loss() -> None:
     """HF compatibility: guard Qwen3-Next aux-loss mask shape regressions."""
     try:
+        from transformers.utils import import_utils as hf_import_utils
+    except Exception:
+        hf_import_utils = None
+
+    if hf_import_utils is not None:
+        is_torch_available = getattr(hf_import_utils, "is_torch_available", None)
+        try:
+            if callable(is_torch_available) and not bool(is_torch_available()):
+                return
+        except Exception:
+            return
+
+    try:
         from transformers.models.qwen3_next import modeling_qwen3_next as hf_qwen3_next
     except Exception:
         return

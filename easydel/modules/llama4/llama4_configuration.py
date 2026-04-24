@@ -26,6 +26,19 @@ logger = get_logger(__name__)
 def _patch_hf_llama4_pooler_output() -> None:
     """HF compatibility: ensure Llama4 image features expose `pooler_output`."""
     try:
+        from transformers.utils import import_utils as hf_import_utils
+    except Exception:
+        hf_import_utils = None
+
+    if hf_import_utils is not None:
+        is_torch_available = getattr(hf_import_utils, "is_torch_available", None)
+        try:
+            if callable(is_torch_available) and not bool(is_torch_available()):
+                return
+        except Exception:
+            return
+
+    try:
         from transformers.modeling_outputs import BaseModelOutputWithPooling
         from transformers.models.llama4 import modeling_llama4 as hf_llama4
     except Exception:

@@ -24,6 +24,19 @@ from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 def _patch_hf_phimoe_rotary_mscale() -> None:
     """HF compatibility: initialize missing Phimoe rotary mscale attributes."""
     try:
+        from transformers.utils import import_utils as hf_import_utils
+    except Exception:
+        hf_import_utils = None
+
+    if hf_import_utils is not None:
+        is_torch_available = getattr(hf_import_utils, "is_torch_available", None)
+        try:
+            if callable(is_torch_available) and not bool(is_torch_available()):
+                return
+        except Exception:
+            return
+
+    try:
         from transformers.models.phimoe import modeling_phimoe as hf_phimoe
     except Exception:
         return
