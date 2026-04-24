@@ -509,7 +509,7 @@ def _create_mixed_standard_ragged_page_cache_configs(
             hbm_utilization=hbm_utilization,
             kv_head_shards=effective_kv_head_shards,
         )
-        bytes_av = jnp.finfo(kvdtype).bits // 8
+        bytes_av = jnp.dtype(kvdtype).itemsize
         page_bytes = (
             2
             * int(page_size)
@@ -628,7 +628,7 @@ def _create_mixed_standard_unified_attention_cache_configs(
     mesh = text_config.mesh
     kvdtype = dtype
     data_parallel_size = _mesh_axis_size(mesh, resolve_attention_data_parallel_axis(partition_manager))
-    bytes_av = jnp.finfo(kvdtype).bits // 8
+    bytes_av = jnp.dtype(kvdtype).itemsize
 
     if num_pages_override is None:
         free = UnifiedAttentionCacheConfig._compute_free_hbm(
@@ -4637,7 +4637,7 @@ class EasyGenerationMixin:
                 logger.warning(
                     "Mixed MLA and non-MLA full-attention layers detected, "
                     "forcing all inference layers to "
-                    "multi_latent_ragged_page_attention_v1."
+                    "multi_latent_ragged_page_attention_v2."
                 )
             update_kwargs["decode_attn_mechanism"] = target_attn
             update_kwargs["mla_attn_mechanism"] = target_attn
