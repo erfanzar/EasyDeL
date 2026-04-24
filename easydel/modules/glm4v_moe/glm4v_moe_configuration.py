@@ -24,6 +24,19 @@ from easydel.infra.factory import register_config
 def _patch_hf_glm4v_moe_router_logits_output() -> None:
     """HF compatibility: expose missing router_logits on GLM4V-MoE model output."""
     try:
+        from transformers.utils import import_utils as hf_import_utils
+    except Exception:
+        hf_import_utils = None
+
+    if hf_import_utils is not None:
+        is_torch_available = getattr(hf_import_utils, "is_torch_available", None)
+        try:
+            if callable(is_torch_available) and not bool(is_torch_available()):
+                return
+        except Exception:
+            return
+
+    try:
         from transformers.models.glm4v_moe import modeling_glm4v_moe as hf_glm4v_moe
     except Exception:
         return
