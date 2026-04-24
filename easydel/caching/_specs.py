@@ -257,7 +257,7 @@ class AttentionSpec(KVCacheSpec):
             int: Size of one attention cache page in bytes.
         """
         coef = 1 if self.use_mla else 2
-        return coef * self.page_size * self.num_kv_heads * self.head_size * (jax.numpy.finfo(self.dtype).bits // 8)
+        return coef * self.page_size * self.num_kv_heads * self.head_size * jax.numpy.dtype(self.dtype).itemsize
 
 
 @dataclass
@@ -506,7 +506,7 @@ class MambaSpec(KVCacheSpec):
         Raises:
             ValueError: If page_size_padded is less than required size.
         """
-        page_size = self.num_elements * (jax.numpy.finfo(self.dtype).bits // 8)
+        page_size = self.num_elements * jax.numpy.dtype(self.dtype).itemsize
         if self.page_size_padded is not None:
             if self.page_size_padded < page_size:
                 raise ValueError(

@@ -554,7 +554,7 @@ class RaggedPagesCacheConfig(BaseCacheConfig):
             hbm_utilization=hbm_utilization,
             kv_head_shards=effective_kv_head_shards,
         )
-        bytes_av = jnp.finfo(kvdtype).bits // 8
+        bytes_av = jnp.dtype(kvdtype).itemsize
         page_bytes = 2 * num_hidden_layers * page_size * num_kv_heads * kv_head_dim_size * bytes_av
         num_pages = int(free) // page_bytes
         if data_parallel_size > 1:
