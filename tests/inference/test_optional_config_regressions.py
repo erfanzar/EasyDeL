@@ -1044,3 +1044,45 @@ def test_esurge_compatible_model_updates_vlm_text_attn_recursively():
     model = _build_tiny_qwen35_vlm(source_attn)
     compatible = model.esurge_compatible_model
     assert compatible.config.get_text_config().attn_mechanism == expected_attn
+
+
+def test_esurge_compatible_model_logs_v2_for_mixed_mla(monkeypatch):
+    import easydel.infra.mixins.generation as generation_mod
+
+    warnings: list[str] = []
+
+    monkeypatch.setattr(generation_mod, "_resolve_backend_for_esurge", lambda _config: "cpu")
+    monkeypatch.setattr(generation_mod, "_detect_mla_attention_mix", lambda _self, _text_cfg: (True, True))
+    monkeypatch.setattr(
+        generation_mod.logger,
+        "warning",
+        lambda msg, *args, **kwargs: warnings.append(msg % args if args else msg),
+    )
+
+    text_config = SimpleNamespace(num_attention_heads=8, attn_mechanism="sdpa")
+
+    class _DummyModel:
+        def __init__(self):
+            self.config = SimpleNamespace(
+                attn_mechanism="sdpa",
+                get_text_config=lambda: text_config,
+            )
+            self.graphstate = object()
+            self.graphother = object()
+            self.last_update_kwargs = None
+
+        def new_graphdef(self, **kwargs):
+            self.last_update_kwargs = kwargs
+            return kwargs
+
+        def merge_module(self, compat_graphdef, graphstate, graphother):
+            return SimpleNamespace(graphdef=compat_graphdef, graphstate=graphstate, graphother=graphother)
+
+    dummy = _DummyModel()
+    generation_mod.EasyGenerationMixin.esurge_compatible_model.fget(dummy)
+
+    assert dummy.last_update_kwargs is not None
+    assert dummy.last_update_kwargs["attn_mechanism"] == "multi_latent_ragged_page_attention_v2"
+    assert dummy.last_update_kwargs["decode_attn_mechanism"] == "multi_latent_ragged_page_attention_v2"
+    assert dummy.last_update_kwargs["mla_attn_mechanism"] == "multi_latent_ragged_page_attention_v2"
+    assert any("multi_latent_ragged_page_attention_v2" in message for message in warnings)
